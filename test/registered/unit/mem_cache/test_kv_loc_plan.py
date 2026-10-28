@@ -112,6 +112,9 @@ class _HostStreamGather:
 
 
 class _FakeKVCache:
+    # A private pool, indexed by the allocator's ids as they are.
+    requires_physical_write_loc = False
+
     def __init__(self, max_slots):
         self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
         self.allocator = None
@@ -189,7 +192,6 @@ class TestKVLocPlan(CustomTestCase):
         draft_pool = UnifiedDraftKVPool(
             unified_buffer=pool,
             host_sub_pool_name="full",
-            host_allocator=self.allocator,
             layer_lanes={0: 0},
             page_size=_PS,
         )

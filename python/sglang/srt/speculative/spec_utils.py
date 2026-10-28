@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -55,6 +56,7 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_xpu,
+    next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
@@ -354,6 +356,64 @@ def resolve_draft_decode_window(model_runner) -> Tuple[int, int]:
             )
         return 0, 0
     return window_size, int(cfg.speculative_draft_sink_size or 0)
+
+
+def fill_draft_window_rail(
+    translator,
+    forward_batch,
+    window_kv_indices: torch.Tensor,
+    window_kv_indptr: torch.Tensor,
+    *,
+    topk: int,
+    num_steps: int,
+    page_size: int,
+    window: int,
+) -> None:
+    """Emit every draft step's window-clipped read ids into the per-step rows
+    of ``window_kv_indices`` and their indptr into ``window_kv_indptr``: step
+    i of a branch reads the last ``min(seq_len + i + 1, window)`` of its
+    tokens, from the storage window layers use (``translator.window_kv_kind``).
+    ``window`` is the number of tokens the backend's window layers attend."""
+    num_seqs = forward_batch.batch_size
+    width = num_seqs * topk * window
+    assert window_kv_indices.shape[1] >= width, (
+        f"window rail row {window_kv_indices.shape[1]} < "
+        f"{num_seqs * topk} branch(es) x window {window}"
+    )
+    src = translator.read_source(
+        forward_batch.kv_loc_plan,
+        req_pool_indices=forward_batch.req_pool_indices,
+        bs=num_seqs,
+        kind=translator.window_kv_kind,
+    )
+    generate_draft_decode_window_kv_indices[(num_steps, num_seqs, topk)](
+        src.row_ids,
+        src.ids,
+        forward_batch.seq_lens,
+        window_kv_indices,
+        window_kv_indptr,
+        forward_batch.positions,
+        src.row_stride,
+        window_kv_indices.shape[1],
+        window_kv_indptr.shape[1],
+        next_power_of_2(num_seqs),
+        next_power_of_2(num_steps),
+        next_power_of_2(num_seqs * topk),
+        page_size,
+        window,
+        ENTRY_PAGE_SIZE=src.entry_page_size,
+        v2p=src.v2p,
+        TRANSLATE=src.v2p is not None,
+    )
+    if (
+        not src.is_translated
+        and translator.window_kv_kind == IdSpaceKind.SLIDING_WINDOW
+    ):
+        # Static pool: the legacy full->swa translate, as the target's window
+        # reads apply it.
+        for i in range(num_steps):
+            row = window_kv_indices[i][:width]
+            row.copy_(translator.ids_in(IdSpaceKind.SLIDING_WINDOW, row))
 
 
 def record_stream_each(tensors, stream):

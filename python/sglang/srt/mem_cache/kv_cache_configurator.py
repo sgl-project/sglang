@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.arg_groups.kv_cache_hook import TRANSLATED_MHA_RAILS
+from sglang.srt.arg_groups.kv_cache_hook import draft_rows_refusal
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import (
@@ -465,6 +465,18 @@ class KVCacheConfigurator:
                     "CPU FP8 KV cache requires the intel_amx attention backend."
                 )
 
+        if self.is_draft_worker and get_memory().enable_page_major_kv_layout:
+            # The draft reads rows of its own model's geometry; it runs on its
+            # own backend if one is set, else on the target's.
+            draft_backend = get_spec().speculative_draft_attention_backend
+            reason = draft_rows_refusal(
+                has_asymmetric_kv=self.model_config.has_asymmetric_kv,
+                uses_mla=self.use_mla_backend,
+                backends=(draft_backend,) if draft_backend else attention_backends(),
+            )
+            if reason is not None:
+                raise ValueError(reason)
+
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert self.memory_pool_config is not None, (
                 "Draft worker requires memory_pool_config"
@@ -657,7 +669,8 @@ class KVCacheConfigurator:
                         placement=placement,
                         runner=runner,
                         unified_buffer=alloc.unified_buffer,
-                        host_allocator=alloc,
+                        owner=alloc.roles.owner,
+                        target_state=alloc.state,
                         model=self.model,
                         model_config=self.model_config,
                         req_to_token_pool=req_to_token_pool,
@@ -1117,9 +1130,9 @@ class KVCacheConfigurator:
                     "the fused region holds dense MHA K/V rows"
                 )
             )
-        # The draft runner's backend, resolved as its worker will: an EAGLE
-        # draft with no backend of its own runs the target's prefill/decode
-        # pair. The published draft backend carries model-hook declarations.
+        # The draft runner's backend, resolved as its worker will, enters the
+        # worker's own KV dtype rules below. The published draft backend
+        # carries model-hook declarations.
         if self.spec_algorithm.is_dflash_family():
             from sglang.srt.speculative.draft_worker_common import (
                 resolve_draft_worker_attention_backend,
@@ -1128,19 +1141,6 @@ class KVCacheConfigurator:
             draft_backend = resolve_draft_worker_attention_backend()
         else:
             draft_backend = get_spec().speculative_draft_attention_backend
-        draft_backends = (
-            {draft_backend} if draft_backend else set(attention_backends()) - {None}
-        )
-        # A fused draft reads its rows through the KV-index translator, which
-        # other backends miss on some draft path.
-        if not draft_backends <= TRANSLATED_MHA_RAILS:
-            return FusedDraftDecision(
-                declined=(
-                    f"the draft runs on {', '.join(sorted(draft_backends))}, "
-                    "off the translated MHA rails "
-                    f"({', '.join(sorted(TRANSLATED_MHA_RAILS))})"
-                )
-            )
         # Under DCP each rank's host rows hold only its share of the widened
         # id space, while the draft never joins the DCP group and needs every
         # token; its translator also leaves the read ids widened for a DCP
@@ -1193,74 +1193,41 @@ class KVCacheConfigurator:
             if self.model_config.is_multi_layer_eagle
             else 1
         )
-        # FA4's DFLASH-family KV always uses the draft's compute dtype. Its
-        # region has its own typed views inside the host's byte buffer, so
-        # price those rows in that dtype even when the target uses FP8.
-        # Other drafts retain the host dtype; an unresolved `auto` is checked
-        # when the draft binds, after its quant config is available.
-        region_kv_dtype = self.kv_cache_dtype
-        draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
-        if draft_kv_cache_dtype not in (None, "auto") or (
-            self.spec_algorithm.is_dflash_family() and draft_backend == "fa4"
-        ):
-            from sglang.srt.mem_cache.kv_cache_dtype import (
-                allow_target_draft_different_cache_dtype,
-                configure_kv_cache_dtype,
-            )
+        # The region holds the draft's own KV, in the dtype the draft runner
+        # resolves for itself by the same rules: its explicit dtype, else the
+        # host's dtype standing in for an `auto` (given or by default) that the
+        # draft resolves from its own quant config only when it loads (checked
+        # when the draft binds). A region has typed views of its own, so a
+        # draft dtype other than the host's still fuses.
+        from sglang.srt.mem_cache.kv_cache_dtype import (
+            TORCH_DTYPE_TO_KV_CACHE_STR,
+            configure_kv_cache_dtype,
+        )
 
-            _, draft_kv_dtype = configure_kv_cache_dtype(
-                server_args_kv_cache_dtype=get_model().kv_cache_dtype,
-                model=None,
-                model_dtype=aux.draft_model_config.dtype,
-                is_draft_worker=True,
-                is_dflash=self.spec_algorithm.is_dflash_family(),
-                speculative_draft_attention_backend=draft_backend,
-                speculative_draft_kv_cache_dtype=draft_kv_cache_dtype,
-            )
-            if draft_kv_dtype != self.kv_cache_dtype:
-                if allow_target_draft_different_cache_dtype(
-                    is_dflash=self.spec_algorithm.is_dflash_family(),
-                    speculative_draft_attention_backend=draft_backend,
-                ):
-                    region_kv_dtype = draft_kv_dtype
-                else:
-                    return FusedDraftDecision(
-                        declined=(
-                            f"the draft's KV cache dtype ({draft_kv_dtype}) differs "
-                            f"from the host's ({self.kv_cache_dtype})"
-                        )
-                    )
+        draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
+        if draft_kv_cache_dtype == "auto":
+            draft_kv_cache_dtype = None
+        _, region_kv_dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype=TORCH_DTYPE_TO_KV_CACHE_STR.get(
+                self.kv_cache_dtype, "auto"
+            ),
+            model=None,
+            model_dtype=aux.draft_model_config.dtype,
+            is_draft_worker=True,
+            is_dflash=self.spec_algorithm.is_dflash_family(),
+            speculative_draft_attention_backend=draft_backend,
+            speculative_draft_kv_cache_dtype=draft_kv_cache_dtype,
+        )
         return place_fused_draft(
             profile=profile,
             num_runners=num_runners,
             ctx=PlacementContext(
                 host_names=self._unified_host_names(),
                 target_window=self.model_config.sliding_window_size,
-                asymmetric_rows_ok=self._draft_backends_carry_v_head_dim(),
-                draft_backends=self._draft_attention_backends(),
             ),
             store_dtype=_store_dtype_for(region_kv_dtype),
             kv_dtype=region_kv_dtype,
         )
-
-    def _draft_attention_backends(self) -> tuple:
-        """The backends the draft worker may run on: its explicit one, else
-        the target's, which it inherits."""
-        explicit = get_spec().speculative_draft_attention_backend
-        if explicit is not None:
-            return (explicit,)
-        return tuple(sorted(b for b in attention_backends() if b is not None))
-
-    def _draft_backends_carry_v_head_dim(self) -> bool:
-        """Whether every resolved attention backend, the draft's included,
-        carries v_head_dim through to the kernel (ASYMMETRIC_KV_BACKENDS). The
-        draft worker inherits the target's backend unless one is set."""
-        from sglang.srt.arg_groups.kv_cache_hook import ASYMMETRIC_KV_BACKENDS
-
-        backends = set(attention_backends())
-        backends.add(get_spec().speculative_draft_attention_backend)
-        backends.discard(None)
-        return backends <= ASYMMETRIC_KV_BACKENDS
 
     def fused_entry_bytes(self, sub_pool_name: str) -> Optional[int]:
         """Per-token bytes of ``sub_pool_name``'s fused entry (host + draft +

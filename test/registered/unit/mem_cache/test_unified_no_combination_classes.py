@@ -22,8 +22,6 @@ _COMBINATION = re.compile(r"^Unified(Draft)?(SWA|MambaSWA|SWAMamba|Hybrid)\w*")
 
 # Remaining classes that name a combination, with what removes them.
 _ALLOWED = {
-    # The fused draft's pool: drafts are read per sub-pool instead.
-    "UnifiedDraftSWAKVPool",
     # The request table of a plan with state: rows and slot-id columns of
     # every sub-pool that holds per-request rows.
     "UnifiedHybridReqToTokenPool",

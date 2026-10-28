@@ -29,8 +29,11 @@ from sglang.kernels.ops.attention.trtllm_mha_page_table import (
 from sglang.kernels.ops.attention.utils import canonicalize_stride
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
+    STATIC_SPEC_COMBINATIONS,
     SharedReadEnds,
+    SpecMode,
     resolve_window_kv_pool,
+    spec_combinations,
 )
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
@@ -180,6 +183,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     supports_ragged_verify_graph: bool = True
 
+    # On translated storage: target verify, and a multi-step draft whose steps
+    # take their own window rails and write columns (checked on CPU, not run
+    # on Blackwell hardware). A draft extend is declared there without window
+    # layers only: its window page table is not checked.
+    implemented_spec_combinations = (
+        STATIC_SPEC_COMBINATIONS
+        | spec_combinations(
+            SpecMode.TARGET_VERIFY, SpecMode.DRAFT_DECODE, translated=(True,)
+        )
+        | spec_combinations(SpecMode.DRAFT_EXTEND, window=(False,), translated=(True,))
+    )
+
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
         if fm == ForwardMode.EXTEND:
@@ -193,6 +208,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         speculative_step_id: int = 0,
+        window_kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         # Capture workspace size before super().__init__() to preserve user's
         # SGLANG_FLASHINFER_WORKSPACE_SIZE setting (may be overridden by parent)
@@ -204,7 +220,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
 
         super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
+            model_runner,
+            skip_prefill,
+            kv_indptr_buf,
+            kv_last_page_len_buf,
+            window_kv_indptr_buf=window_kv_indptr_buf,
         )
         self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "prefill", "trtllm_mha"
@@ -2045,17 +2065,25 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     ):
         super().__init__(model_runner, topk, speculative_num_steps)
         for i in range(self.speculative_num_steps - 1):
+            # As the parent's step backends: a window model's step plans its
+            # window rail on a wrapper of its own.
             self.attn_backends[i] = TRTLLMHAAttnBackend(
                 model_runner,
                 skip_prefill=True,
                 kv_indptr_buf=self.kv_indptr[i],
                 kv_last_page_len_buf=self.kv_last_page_len,
                 speculative_step_id=i,
+                window_kv_indptr_buf=(
+                    self.window_kv_indptr[i] if self.window_rail else None
+                ),
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # Each step writes its window layers at its own slice of the draft's
+        # write ids, never a prefix of every step's.
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+            with self._step_writes(forward_batch, i):
+                self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps - 1):
@@ -2080,9 +2108,10 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             encoder_lens=forward_batch.encoder_lens,
         )
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_out_graph(
-                inner_fb, in_capture=in_capture
-            )
+            with self._step_writes(inner_fb, i):
+                self.attn_backends[i].init_forward_metadata_out_graph(
+                    inner_fb, in_capture=in_capture
+                )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
@@ -2096,5 +2125,8 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             forward_mode=ForwardMode.DECODE,
             encoder_lens=forward_batch.encoder_lens,
         )
+        # The captured metadata kernel derives each step's window write ids
+        # from that step's own slice of the draft's write ids.
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_in_graph(inner_fb)
+            with self._step_writes(inner_fb, i):
+                self.attn_backends[i].init_forward_metadata_in_graph(inner_fb)

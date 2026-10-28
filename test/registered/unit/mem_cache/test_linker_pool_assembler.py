@@ -691,6 +691,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         )
         draft = SimpleNamespace(
             token_to_kv_pool=no_state,
+            kv_index_translator=SimpleNamespace(is_fused_draft=False),
             model_config=SimpleNamespace(
                 num_nextn_predict_layers=0,
                 hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),

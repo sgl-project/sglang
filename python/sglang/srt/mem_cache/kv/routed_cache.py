@@ -29,10 +29,15 @@ class RoutedKVCache(KVCache):
 
     ``layer_maps`` lists the token KV sub-pools in plan order: each one's name,
     its view, and each routed model layer's index in that view, which is also
-    the layer id the view's methods take. The owner sub-pool's view answers
-    for the pool where one answer serves every layer (the value head dim, the
-    quantization method, the buffers a host stack anchors on).
+    the layer id the view's methods take. ``owner`` names the sub-pool whose
+    write ids arrive in ``loc``. The owner's view answers for the pool where
+    one answer serves every layer (the value head dim, the quantization method,
+    the buffers a host stack anchors on); a fused draft that routes no layer to
+    the owner has the first routed view answer instead.
     """
+
+    # Every view's write door takes physical ids, in its sub-pool's id space.
+    requires_physical_write_loc = True
 
     def __init__(
         self,
@@ -53,7 +58,7 @@ class RoutedKVCache(KVCache):
         self._owner = owner
         self._layer_maps = tuple(layer_maps)
         views = {name: view for name, view, _ in self._layer_maps}
-        self._owner_view = views[owner]
+        self._owner_view = views.get(owner, self._layer_maps[0][1])
         self.page_size = page_size
         self.start_layer = start_layer
         self.end_layer = end_layer

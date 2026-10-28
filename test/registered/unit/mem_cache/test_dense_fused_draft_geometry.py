@@ -32,7 +32,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftKVPool,
     UnifiedDraftMambaPool,
-    UnifiedDraftSWAKVPool,
+    routed_draft_pool,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
@@ -184,21 +184,17 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
         )
 
     def _draft_pool(self, pool):
-        sentinel_allocator = object()
-        dp = UnifiedDraftKVPool(
+        return UnifiedDraftKVPool(
             unified_buffer=pool,
             host_sub_pool_name="full",
-            host_allocator=sentinel_allocator,
             layer_lanes={0: 0},
             page_size=self.PS,
         )
-        return dp, sentinel_allocator
 
     def test_probe_surface_and_view_binding(self):
         pool = self._pool()
-        dp, alloc = self._draft_pool(pool)
+        dp = self._draft_pool(pool)
         spec = pool.mha_spec("full")
-        self.assertIs(dp.host_allocator, alloc)
         self.assertTrue(dp.requires_physical_write_loc)
         self.assertEqual(len(dp.k_buffer), 1)
         self.assertEqual(dp.k_buffer[0].shape[1:], (1, 24))
@@ -217,7 +213,7 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
         # marker written in page A arrives at page B after
         # host.move_kv_cache(B, A), with no draft-side move.
         pool = self._pool()
-        dp, _ = self._draft_pool(pool)
+        dp = self._draft_pool(pool)
         host = UnifiedMHATokenToKVPool(
             unified_buffer=pool, sub_pool_name="full", page_size=self.PS
         )
@@ -269,7 +265,6 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
         dp = UnifiedDraftKVPool(
             unified_buffer=pool,
             host_sub_pool_name="full",
-            host_allocator=object(),
             layer_lanes={0: 0},
             page_size=self.PS,
         )
@@ -538,7 +533,6 @@ class TestFusedMLAHost(unittest.TestCase):
         dp = UnifiedDraftKVPool(
             unified_buffer=pool,
             host_sub_pool_name="full",
-            host_allocator=alloc,
             layer_lanes={0: 0},
             page_size=self.PS,
         )
@@ -559,7 +553,6 @@ class TestFusedMLAHost(unittest.TestCase):
         dp = UnifiedDraftKVPool(
             unified_buffer=pool,
             host_sub_pool_name="full",
-            host_allocator=object(),
             layer_lanes={0: 0},
             page_size=self.PS,
         )
@@ -571,11 +564,10 @@ class TestFusedMLAHost(unittest.TestCase):
         )
 
 
-class TestUnifiedDraftSWAKVPool(unittest.TestCase):
-    """A draft with window layers binds one dense side per host sub-pool and
-    routes per layer like the target's composite: a window layer's write
-    needs the swa loc and lands in the swa entry's draft part, never in the
-    full entry."""
+class TestRoutedDraftPool(unittest.TestCase):
+    """A draft with window layers binds one dense view per host sub-pool and
+    routes per layer like the target's pool: a window layer's write needs the
+    swa loc and lands in the swa entry's draft part, never in the full entry."""
 
     PS = 2
     PAGES = 8
@@ -609,38 +601,36 @@ class TestUnifiedDraftSWAKVPool(unittest.TestCase):
         )
 
     def _draft_pool(self, pool):
-        return UnifiedDraftSWAKVPool(
+        return routed_draft_pool(
             unified_buffer=pool,
-            host_allocator=object(),
+            owner="full",
             page_size=self.PS,
-            full_layer_lanes={0: 0},
-            swa_layer_lanes={1: 0},
+            lanes_by_host={"full": {0: 0}, "swa": {1: 0}},
         )
 
     def test_routes_each_layer_to_its_side(self):
         pool = self._pool()
         dp = self._draft_pool(pool)
-        self.assertEqual(dp.layers_mapping, {0: (0, False), 1: (0, True)})
+        self.assertEqual(dp.layer_router.route(0).sub_pool, "full")
+        self.assertEqual(dp.layer_router.route(1).sub_pool, "swa")
+        self.assertEqual(dp.layer_router.route(1).index, 0)
         dk, _ = pool.build_dense_draft_views("swa")
         self.assertEqual(dp.get_key_buffer(1).data_ptr(), dk[0].data_ptr())
         self.assertEqual(dp.get_key_buffer(1).shape[1:], (1, 8))
         self.assertEqual(dp.get_key_buffer(0).shape[1:], (1, 24))
-        self.assertEqual(dp.swa_layer_nums, 1)
-        self.assertEqual(dp.full_layer_nums, 1)
 
     def test_a_window_only_draft_answers_its_own_v_width(self):
-        # MiMoV2MTP: no full layer at all; the composite still works.
+        # MiMoV2MTP: no full layer at all; the swa view answers for the pool.
         pool = self._pool()
-        swa_only = UnifiedDraftSWAKVPool(
+        swa_only = routed_draft_pool(
             unified_buffer=pool,
-            host_allocator=object(),
+            owner="full",
             page_size=self.PS,
-            full_layer_lanes={},
-            swa_layer_lanes={0: 0},
+            lanes_by_host={"swa": {0: 0}},
         )
-        self.assertIsNone(swa_only.full_kv_pool)
+        self.assertIsNone(swa_only.layer_router.sub_pool("full"))
         self.assertEqual(swa_only.get_v_head_dim(), 8)
-        self.assertEqual(swa_only.layers_mapping, {0: (0, True)})
+        self.assertEqual(swa_only.layer_router.route(0).sub_pool, "swa")
 
     def test_window_write_needs_the_swa_loc_and_stays_in_the_swa_entry(self):
         pool = self._pool()

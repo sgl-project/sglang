@@ -84,7 +84,6 @@ from sglang.srt.mem_cache.kv_loc_plan import (
     state_id_space,
     window_read_extent,
 )
-from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
 
@@ -139,11 +138,15 @@ class KVIndexTranslator:
             and token_to_kv_pool_allocator.hands_out_virtual_ids
             and token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool
         )
-        host_allocator = fused_draft_host_allocator(token_to_kv_pool)
-        is_fused_draft = (
-            host_allocator is not None and host_allocator is token_to_kv_pool_allocator
+        # A fused draft's pool views the target's sub-pools: it shares the
+        # target's allocator, and its writes take that allocator's physical ids.
+        self.is_fused_draft = (
+            not is_unified_target
+            and token_to_kv_pool_allocator is not None
+            and token_to_kv_pool_allocator.hands_out_virtual_ids
+            and token_to_kv_pool.requires_physical_write_loc
         )
-        self.is_translating = is_unified_target or is_fused_draft
+        self.is_translating = is_unified_target or self.is_fused_draft
         # Keyed by sub-pool name; a runner reads the token sub-pools its pool
         # routes layers to. A consumer outside an iteration's plan maps ids as
         # the pool does (`_call_spaces`): only an NPU DCP target's plan
@@ -161,7 +164,15 @@ class KVIndexTranslator:
             # runner shares the target's sub-pools, and so their keys. A fused
             # draft reads the ones its own pool routes layers to.
             alloc_spaces = alloc.id_spaces(defer_reads=self.defer_read_translate)
-            routed = alloc_spaces if is_unified_target else token_to_kv_pool.id_spaces()
+            # A fused draft's write ids are the owner's virtual ids, whichever
+            # sub-pools its layers read.
+            routed = (
+                alloc_spaces
+                if is_unified_target
+                else {IdSpaceKind.FULL}.union(
+                    sp.name for sp in token_to_kv_pool.layer_router.sub_pools()
+                )
+            )
             self._spaces = {
                 name: space for name, space in alloc_spaces.items() if name in routed
             }

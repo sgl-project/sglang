@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -22,7 +21,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SpecMode,
+    spec_combinations,
+)
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
@@ -40,12 +43,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
-from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+from sglang.srt.speculative.eagle_utils import draft_step_writes
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
+    fill_draft_window_rail,
     generate_draft_decode_kv_indices,
-    generate_draft_decode_window_kv_indices,
     resolve_draft_decode_window,
 )
 from sglang.srt.utils import (
@@ -146,6 +149,11 @@ class ForwardMetadata:
 
 
 class TritonAttnBackend(AttentionBackend):
+    # Every speculative forward, on static or translated storage: its index
+    # builders read through the translator, and window layers take their own
+    # read rails in every captured mode.
+    implemented_spec_combinations = spec_combinations(*SpecMode)
+
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False
@@ -2622,7 +2630,16 @@ class TritonMultiStepDraftBackend:
             TRANSLATE=src.v2p is not None,
         )
         if self.window_rail:
-            self._fill_window_rail(forward_batch, window_kv_indices_buffer, bs)
+            fill_draft_window_rail(
+                self.kv_index_translator,
+                forward_batch,
+                window_kv_indices_buffer,
+                self.window_kv_indptr,
+                topk=self.topk,
+                num_steps=self.speculative_num_steps,
+                page_size=self.page_size,
+                window=self.sliding_window_size,
+            )
 
         if call_fn is None:
             return
@@ -2641,87 +2658,14 @@ class TritonMultiStepDraftBackend:
                 ]
             call_fn(i, forward_batch)
 
-    @contextlib.contextmanager
     def _step_writes(self, forward_batch, step: int):
-        """Bind draft step ``step``'s slice of the batch's write ids, as
-        `EagleWorkerV2.draft_forward` slices them, and its columns of the
-        iteration's write window, while a per-step backend derives its write
-        targets (the swa ids included) from the batch."""
-        loc, cols = forward_batch.out_cache_loc, forward_batch.kv_loc_cols
-        if loc is None or not self.attn_backends[step].use_sliding_window_kv_pool:
-            yield
-            return
-        num_steps = self.speculative_num_steps
-        if cols is None:
-            # The draft's own window, each row laid out (topk, num_steps).
-            step_cols = slice(step, None, num_steps)
-        else:
-            # A chain draft writes the leading columns of the verify window.
-            assert self.topk == 1 and isinstance(cols, slice) and cols.step is None
-            step_cols = slice(cols.start + step, cols.start + step + 1)
-        forward_batch.out_cache_loc = per_step_draft_out_cache_loc(
-            loc, forward_batch.batch_size, self.topk, num_steps
-        )[step]
-        forward_batch.kv_loc_cols = step_cols
-        try:
-            yield
-        finally:
-            forward_batch.out_cache_loc, forward_batch.kv_loc_cols = loc, cols
-
-    def _fill_window_rail(
-        self,
-        forward_batch: ForwardBatch,
-        window_kv_indices_buffer: torch.Tensor,
-        bs: int,
-    ) -> None:
-        """Emit every step's window-clipped read ids into the per-step rows
-        of ``window_kv_indices_buffer`` and their indptr into
-        ``self.window_kv_indptr``. The reader selects FULL or SWA storage;
-        the layer's window determines which positions to gather."""
-        num_seqs = forward_batch.batch_size
-        width = bs * self.sliding_window_size
-        assert window_kv_indices_buffer.shape[1] >= width, (
-            f"window rail row {window_kv_indices_buffer.shape[1]} < "
-            f"{bs} branch(es) x window {self.sliding_window_size}"
+        return draft_step_writes(
+            forward_batch,
+            step,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            enabled=self.attn_backends[step].use_sliding_window_kv_pool,
         )
-        src = self.kv_index_translator.read_source(
-            forward_batch.kv_loc_plan,
-            req_pool_indices=forward_batch.req_pool_indices,
-            bs=num_seqs,
-            kind=self.kv_index_translator.window_kv_kind,
-        )
-        generate_draft_decode_window_kv_indices[
-            (self.speculative_num_steps, num_seqs, self.topk)
-        ](
-            src.row_ids,
-            src.ids,
-            forward_batch.seq_lens,
-            window_kv_indices_buffer,
-            self.window_kv_indptr,
-            forward_batch.positions,
-            src.row_stride,
-            window_kv_indices_buffer.shape[1],
-            self.window_kv_indptr.shape[1],
-            next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps),
-            next_power_of_2(bs),
-            self.page_size,
-            self.sliding_window_size,
-            ENTRY_PAGE_SIZE=src.entry_page_size,
-            v2p=src.v2p,
-            TRANSLATE=src.v2p is not None,
-        )
-        if (
-            not src.is_translated
-            and self.kv_index_translator.window_kv_kind == IdSpaceKind.SLIDING_WINDOW
-        ):
-            # Static pool: the legacy full->swa translate, as
-            # update_sliding_window_buffer applies it to the target's window.
-            for i in range(self.speculative_num_steps):
-                row = window_kv_indices_buffer[i][:width]
-                row.copy_(
-                    self.kv_index_translator.ids_in(IdSpaceKind.SLIDING_WINDOW, row)
-                )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(

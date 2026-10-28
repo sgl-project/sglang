@@ -38,7 +38,7 @@ PAGE_SIZE = 128
 
 @pytest.fixture
 def make_xqa_backend(monkeypatch):
-    def parent_init(self, *args):
+    def parent_init(self, *args, **kwargs):
         self.kv_cache_quant_method = SimpleNamespace(
             resolve_attention_access=lambda *args: SimpleNamespace(
                 kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN
