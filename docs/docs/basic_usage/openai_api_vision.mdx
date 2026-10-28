@@ -51,7 +51,9 @@ python3 -m sglang.launch_server \
   --mm-feature-transport cpu
 ```
 
-This is a memory-saving option, not a universally fastest configuration or a peak-VRAM limit. It does not move the vision encoder to CPU. CUDA IPC/VMM can still allocate GPU memory, and custom paths such as Kimi-K3 preprocessing do not yet follow this device option. Existing model-specific video placement remains in effect. Leave worker counts on auto initially; increasing concurrency can increase peak memory. `--disable-fast-image-processor` is a deprecated alias for `--image-processor-backend pil`, not a device selector.
+This is a memory-saving option, not a universally fastest configuration or a peak-VRAM limit. It does not move the vision encoder to CPU or guarantee a CUDA-context-free tokenizer process. CPU/GPU decode and resize can differ numerically; validate accuracy for your workload.
+
+CUDA IPC/VMM can still allocate GPU memory, and custom paths such as Kimi-K3 preprocessing do not yet follow this device option. Existing model-specific video placement remains in effect. Leave worker counts on auto initially; increasing concurrency can increase peak memory. `--disable-fast-image-processor` is a deprecated alias for `--image-processor-backend pil`, not a device selector.
 
 ## Using cURL
 
