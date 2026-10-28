@@ -69,7 +69,9 @@ class Mm(msgspec.Struct):
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(
-            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`, "
+            "and `video_preprocessing_device`, the device the token-space processor decodes and preprocesses "
+            'a video request on (e.g. `{"video_preprocessing_device": "cpu"}`)',
             type_parser=json.loads,
         ),
     ] = None

@@ -86,6 +86,9 @@ class TokenSpaceSGLangProcessor:
         serving_spec = self._serving_spec_class(hf_config)
         self._server_args = server_args
         mm = get_mm()
+        self._video_preprocessing_device = (mm.mm_process_config or {}).get(
+            "video_preprocessing_device", serving_spec.video_preprocessing_device
+        )
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
         self._feature_transport = MultimodalFeatureTransport(
             mm.mm_feature_transport,
@@ -173,12 +176,17 @@ class TokenSpaceSGLangProcessor:
             video_data = request_obj.video_data
         if audio_data is None and request_obj is not None:
             audio_data = request_obj.audio_data
+        image_device, video_device = self._image_device, None
+        # As legacy: a video request preprocesses all its media on the video device.
+        if video_data and self._video_preprocessing_device is not None:
+            image_device = video_device = self._video_preprocessing_device
         return await self._core.process(
             image_data,
             video_data,
             audio_data,
             input_ids=input_ids,
-            image_device=self._image_device,
+            image_device=image_device,
+            video_device=video_device,
             compute_mrope_positions=True,
             package_output=self._package_output,
         )
