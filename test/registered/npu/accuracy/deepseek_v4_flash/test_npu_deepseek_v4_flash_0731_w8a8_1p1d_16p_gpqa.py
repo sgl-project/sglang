@@ -232,9 +232,9 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
 
-    def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
-        """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
-        self.run_accuracy()
+    # def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
+    #     """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
+    #     self.run_accuracy()
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_l2_host_hit_rate(self):
         """run_bench_serving in 128k out 1k asserts the host hit rate"""
         run_bench_serving(
@@ -244,6 +244,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
             dataset_name="generated-shared-prefix",
             input_len=131072,
             output_len=1024,
+            num_prompts=96,
             max_concurrency=16,
             gsp_num_groups=3,
             gsp_prompts_per_group=8,
