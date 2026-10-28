@@ -263,18 +263,20 @@ def pad_mm_token_pairs(
     data_start_token_ids identifies new items, so slices can reuse an item's pad value.
     By default, every start token begins a new item.
     """
-    if data_start_token_ids is None:
-        data_start_token_ids = [s for s, _e in data_token_pairs]
     assert_int64_array(input_ids, "input_ids")
     pad_values = [item.pad_value for item in mm_inputs.mm_items]
     mm_inputs.data_offsets = []
-    if data_token_pairs is None:
-        data_token_pairs = [mm_inputs.im_start_id, mm_inputs.im_end_id]
+    if data_token_pairs is None and (
+        mm_inputs.im_start_id is not None and mm_inputs.im_end_id is not None
+    ):
+        data_token_pairs = [(mm_inputs.im_start_id, mm_inputs.im_end_id)]
     if data_token_pairs is None:
         print_warning_once(
             "No data_token_pairs provided, RadixAttention might be influenced."
         )
         return input_ids
+    if data_start_token_ids is None:
+        data_start_token_ids = [s for s, _e in data_token_pairs]
     start_token_ids = {s for s, _e in data_token_pairs}
     end_tokens_ids = {e for _s, e in data_token_pairs}
 
@@ -385,7 +387,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         """
         self.data_token_id_pairs = data_token_pairs
         self.data_start_token_ids = data_start_token_ids or [
-            s for s, _e in data_token_pairs
+            s for s, _e in data_token_pairs or []
         ]
 
     def pad_input_tokens(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
