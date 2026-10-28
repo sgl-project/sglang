@@ -40,7 +40,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _RecordingDelayer:
@@ -972,6 +972,7 @@ class TestPrefillAdder(CustomTestCase):
         extend_len = 1024
         prefix_len = context_len - extend_len
         kvc = SimpleNamespace(
+            is_draft_worker=False,
             page_size=4,
             model_config=SimpleNamespace(context_len=context_len),
         )
@@ -1163,6 +1164,28 @@ class TestPrefillAdder(CustomTestCase):
                     self.assertEqual(
                         queue._check_if_req_exceed_kv_capacity(req), not fits
                     )
+
+    def test_sharded_admission_reserves_scratch_before_load_back(self):
+        """A queued H2D must be consumed by its own batch, whose prefix gather
+        waits on the load: a host hit the scratch cannot hold never loads."""
+        adder = self.create_sharded_adder()
+        first = self.create_sharded_req("first")
+        self.assertEqual(
+            adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        req = self.create_sharded_req("host-hit", prefix_len=0, extend_len=16)
+        req.host_hit_length = 12
+        req.needs_host_load_back = MagicMock(return_value=True)
+        req.best_match_node = req.last_node
+
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.mock_tree_cache.init_load_back.assert_not_called()
+        self.assertEqual(adder.can_run_list, [first])
+        self.assertEqual(adder.kv_shard_block_bound_pages, 2)
 
     def _build_hybrid_swa_chunked_req(
         self,
@@ -1357,9 +1380,12 @@ class TestPrefillAdder(CustomTestCase):
                 return delivered, req.last_node
 
             self.mock_tree_cache.init_load_back.side_effect = load_back
-            verdict = adder.add_one_req(
-                req, has_chunked_req=False, truncation_align_size=None
-            )
+            with patch.object(
+                adder, "_kv_shard_reserve_scratch", side_effect=AssertionError
+            ):
+                verdict = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
             return verdict, list(adder.can_run_list), req
 
         # Promise kept: only the 8-token tail is prefilled, which fits.

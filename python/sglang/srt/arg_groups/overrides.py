@@ -1072,6 +1072,24 @@ def _deterministic_allreduce_fusion_disable(view: Any) -> dict:
 
 
 @register_post_process
+def _deterministic_rocm_rccl_check(view: Any) -> dict:
+    # Deterministic TP on ROCm relies on the one-stage custom all-reduce; above two ranks
+    # RCCL's results change with the batch, even with its algorithm and protocol pinned.
+    if (
+        view.enable_deterministic_inference
+        and get_platform().is_hip
+        and view.tp_size > 2
+        and view.disable_custom_all_reduce
+    ):
+        raise ValueError(
+            "--disable-custom-all-reduce cannot be combined with "
+            "--enable-deterministic-inference on ROCm when --tp-size is above 2: "
+            "the all-reduce would run through RCCL, which is not batch-invariant."
+        )
+    return {}
+
+
+@register_post_process
 def _deterministic_attention_backend(view: Any) -> dict:
     if not view.enable_deterministic_inference:
         return {}
@@ -1514,6 +1532,9 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
     Runs before the deprecated cutlass environment override.
     """
     runner = view.moe_runner_backend
+    if runner in ("lora_triton", "lora_cutedsl", "lora_marlin"):
+        logger.warning("LoRA MoE keeps shared experts separate for adapter attachment.")
+        return {"disable_shared_experts_fusion": True}
     if runner == "flashinfer_cutedsl":
         logger.warning(
             "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -1621,11 +1642,16 @@ def _speculative_moe_runner_default(view: Any) -> dict:
     with a quantized draft can set --speculative-moe-runner-backend explicitly.
     (DeepGEMM megamoe is selected via the a2a backend and falls back per-layer
     when its weights are not prepared, so it needs no override.)
+
+    A target-only lora_* runner defaults the draft to auto: the draft carries
+    no adapters, so it takes the regular runner chain.
     """
     if view.speculative_moe_runner_backend is None:
         default = view.moe_runner_backend
         if default == "flashinfer_megamoe":
             default = "flashinfer_trtllm"
+        elif default.startswith("lora_"):
+            default = "auto"
         return {"speculative_moe_runner_backend": default}
     return {}
 

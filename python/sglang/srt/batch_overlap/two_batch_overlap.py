@@ -775,6 +775,7 @@ class TboForwardBatchPreparer:
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
+            "contains_last_prefill_chunk",
             "spec_algorithm",
             "capture_hidden_mode",
             "defer_logits_to_eager",  # forward-level flag, inherited by both child batches
@@ -856,6 +857,8 @@ class TboForwardBatchPreparer:
                 next_token_logits_buffer=None,
                 # The aux packer runs in the parent model forward, not per child.
                 aux_hidden_states_buffer=None,
+                # A one-request batch's bound; a split batch has none to give.
+                attention_kv_len_lower_bound=None,
                 return_hidden_states_before_norm=False,
                 # TBO children start unplanned — planned by the TBO-aware init
                 # flow; a stale parent "ready" would wrongly skip that.
