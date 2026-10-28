@@ -1701,6 +1701,67 @@ requires_nvidia_jit = pytest.mark.skipif(
 )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.version.hip is not None
+    or torch.cuda.get_device_capability() != (12, 0),
+    reason="Qwen-Image 2.1 BF16 MLP packing is enabled on SM120 only",
+)
+@torch.no_grad()
+@pytest.mark.parametrize("tokens", [1024, 4096])
+def test_qwen21_bf16_mlp_packing_restore_and_lora(tokens):
+    from sglang.multimodal_gen.runtime.layers.lora.linear import wrap_with_lora_layer
+
+    if not model_parallel_is_initialized():
+        ensure_distributed_env_defaults()
+        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+    torch.manual_seed(42)
+    mlp = qwen_image21.QwenImage21FeedForward(4096, 3, None, "img_mlp").to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    for parameter in mlp.parameters():
+        parameter.normal_(0, 0.01)
+    x = torch.randn(1, tokens, 4096, device="cuda", dtype=torch.bfloat16)
+    reference = mlp.out(F.silu(mlp.gate_layer(x)[0]) * mlp.proj(x)[0])[0]
+    mlp.pack_gate_up_weights()
+    assert set(mlp.state_dict()) == {"gate_layer.weight", "proj.weight", "out.weight"}
+    with patch.object(
+        qwen_image21,
+        "fused_packed_silu_mul_bitexact",
+        wraps=qwen_image21.fused_packed_silu_mul_bitexact,
+    ) as fused:
+        torch.testing.assert_close(mlp(x, True), reference, atol=2e-2, rtol=2e-2)
+        assert fused.call_count == 1
+        assert torch.equal(mlp(x), reference)
+        prefix = x[:, :33].contiguous()
+        assert torch.equal(mlp(prefix, True), mlp(prefix))
+        assert fused.call_count == 1
+
+        compiled = torch.compile(mlp, backend="eager", fullgraph=True)
+        assert torch.equal(compiled(x, True), reference)
+        assert fused.call_count == 1
+
+        mlp.cpu().cuda()
+        torch.testing.assert_close(mlp(x, True), reference, atol=2e-2, rtol=2e-2)
+        assert fused.call_count == 2
+        mlp.proj.weight.data = mlp.proj.weight.data.clone()
+        assert torch.equal(mlp(x, True), reference)
+        assert fused.call_count == 2
+        mlp.pack_gate_up_weights()
+
+        wrapper = wrap_with_lora_layer(mlp.gate_layer, lora_rank=4, lora_alpha=4)
+        wrapper.set_lora_weights(
+            torch.randn(4, 4096, device=x.device, dtype=x.dtype) * 0.02,
+            torch.randn(12288, 4, device=x.device, dtype=x.dtype) * 0.02,
+            merge_weights=False,
+        )
+        mlp.gate_layer = wrapper
+        adapted = mlp(x)
+        assert not torch.equal(adapted, reference)
+        assert torch.equal(mlp(x, True), adapted)
+        assert fused.call_count == 2
+
+
 def _qwen21_rope(tokens: int, device: torch.device) -> torch.Tensor:
     angles = torch.randn(tokens, 64, device=device, dtype=torch.float32)
     return torch.polar(torch.ones_like(angles), angles)

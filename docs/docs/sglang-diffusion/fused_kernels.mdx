@@ -92,6 +92,7 @@ These fusion families mount under both `quality="lossless"` and
 | Linear + tanh-GELU | Bias-add and GELU into the GEMM epilogue (cublasLt), removing the `[tokens, 4*dim]` intermediate round trip |
 | Wan NVFP4 linear + GELU | Bias-add and GELU fused into Wan's NVFP4 FFN projection output |
 | Qwen-Image added-QKV | Added Q/K/V projections fused into joint-buffer production |
+| Qwen-Image 2.1 BF16 image MLP | One gate/up GEMM and packed SiLU-mul on SM120 for resident, unquantized TP1 projections and batch-one target sequences of 1024 or 4096 tokens. GEMM width can change rounding. Conditioning prefixes, `exact`/`lossless`, LoRA wrappers and `torch.compile` keep separate projections |
 | LayerNorm + modulate | `layer_norm(x, weight=(1 + scale), bias=shift)` in place of affine-free LN plus a separate modulate |
 | LTX-2 RMSNorm + modulate | `rms_norm(x) * (1 + scale) + shift` in one launch |
 | Gate RMSNorm (BF16-native) | `RMSNorm + tanh + mul + add` in one pass |

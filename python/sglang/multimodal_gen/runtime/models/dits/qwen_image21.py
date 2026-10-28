@@ -12,6 +12,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_qknorm_complex_rope_cuda,
     fused_complex_rope,
     fused_layernorm_modulate,
+    fused_packed_silu_mul_bitexact,
     fused_silu_mul_bitexact,
     qknorm_complex_rope_cuda,
     qknorm_complex_rope_pack_,
@@ -25,6 +26,7 @@ from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
     qknorm_complex_rope,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
 )
@@ -364,14 +366,32 @@ class QwenImage21FeedForward(nn.Module):
         )
 
     def pack_gate_up_weights(self):
-        """Share one [2F, C] INT8 weight and [2F, 1] scale storage between gate_layer
-        and proj so the comfy_kitchen path projects both with one GEMM.
+        """Share gate/up storage for SM120 BF16 or comfy_kitchen INT8 projections.
 
-        As with ``pack_qkv_weights``, parameters keep their names and shapes and
-        no reference to the shared storage is kept. Layers that are not plain
-        comfy_kitchen INT8 projections are left alone.
+        Parameter names and shapes stay intact. Views are re-derived from the
+        parameters so offload can release the storage, as with packed QKV.
         """
         gate, up = self.gate_layer, self.proj
+        if (
+            all(
+                type(layer) is ColumnParallelLinear
+                and isinstance(layer.quant_method, UnquantizedLinearMethod)
+                and layer.bias is None
+                and not layer.gather_output
+                and layer.tp_size == 1
+                and layer.weight.is_cuda
+                and layer.weight.dtype is torch.bfloat16
+                and layer.weight.shape == (12288, 4096)
+                and layer.weight.is_contiguous()
+                for layer in (gate, up)
+            )
+            and _is_cuda
+            and torch.cuda.get_device_capability(gate.weight.device) == (12, 0)
+        ):
+            if _stacked_rows(gate.weight, up.weight) is None:
+                weight = torch.cat([gate.weight.data, up.weight.data], dim=0)
+                gate.weight.data, up.weight.data = weight.chunk(2, dim=0)
+            return
         if self.packed_gate_up() is not None:
             return
         if not (
@@ -421,7 +441,23 @@ class QwenImage21FeedForward(nn.Module):
         self.pack_gate_up_weights()
         return module
 
-    def forward(self, x):
+    def forward(self, x, pack_bf16=False):
+        # GEMM width can change rounding. Only use the measured target lengths;
+        # exact/lossless and conditioning prefixes keep separate projections.
+        if (
+            pack_bf16
+            and not torch.compiler.is_compiling()
+            and x.dim() == 3
+            and x.shape[0] == 1
+            and x.shape[1] in (1024, 4096)
+            and can_project_into(self.gate_layer, x)
+            and can_project_into(self.proj, x)
+            and x.device == self.gate_layer.weight.device == self.proj.weight.device
+        ):
+            weight = _stacked_rows(self.gate_layer.weight, self.proj.weight)
+            if weight is not None:
+                hidden = fused_packed_silu_mul_bitexact(nn.functional.linear(x, weight))
+                return self.out(hidden)[0]
         # Storage-identity checks cannot be traced; a compiled graph keeps the
         # separate projections.
         packed = None if torch.compiler.is_compiling() else self.packed_gate_up()
@@ -877,6 +913,7 @@ class QwenImage21TransformerBlock(nn.Module):
         ropes,
         caches,
         prefix_pad,
+        pack_bf16_mlp=False,
     ):
         # Cache-DiT's UnifiedBlocks forwards the same args to every layer.
         # Slice here so prefix KV stays per-layer after that wrap.
@@ -901,7 +938,10 @@ class QwenImage21TransformerBlock(nn.Module):
         hidden_states = residual_gate_add(hidden_states, attention, gate1)
         hidden_states = residual_gate_add(
             hidden_states,
-            self.img_mlp(apply_modulation(hidden_states, self.img_norm2, scale2)),
+            self.img_mlp(
+                apply_modulation(hidden_states, self.img_norm2, scale2),
+                pack_bf16=pack_bf16_mlp,
+            ),
             gate2,
         )
         for state, attention in zip(prefix_states, prefix_attentions, strict=True):
@@ -1053,6 +1093,10 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         prefix_pad=None,
         **kwargs,
     ):
+        forward_batch = get_forward_context().forward_batch
+        pack_bf16_mlp = forward_batch is not None and quality_allows(
+            forward_batch.sampling_params.quality, "high"
+        )
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
         if prefix_kv is not None:
@@ -1113,6 +1157,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 ropes,
                 prefix_caches,
                 prefix_pad,
+                pack_bf16_mlp,
             )
         output = self.proj_out(self.norm_out(images, temb))
         if sp > 1:
