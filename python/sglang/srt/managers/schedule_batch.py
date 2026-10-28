@@ -119,6 +119,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
 from sglang.srt.model_executor.forward_batch_info import (
@@ -3485,8 +3486,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 reqs_to_abort.append(req)
                 free_member_rows(
                     req.beam_group,
-                    self.req_to_token_pool,
-                    self.token_to_kv_pool_allocator,
+                    kv_storage_of(
+                        self.req_to_token_pool, self.token_to_kv_pool_allocator
+                    ),
                 )
                 # Aborting, so a host backup to resume from would be wasted.
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
@@ -3528,8 +3530,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if last_req.beam_group is not None:
                 free_member_rows(
                     last_req.beam_group,
-                    self.req_to_token_pool,
-                    self.token_to_kv_pool_allocator,
+                    kv_storage_of(
+                        self.req_to_token_pool, self.token_to_kv_pool_allocator
+                    ),
                 )
             self.release_req(last_idx, 0, offload_kv=False)
             logger.warning(

@@ -303,6 +303,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -625,14 +626,15 @@ class Scheduler(
                 cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
-                if self.enable_unified_memory:
-                    # Keep device rows stable until host transfers are acknowledged.
-                    # Queue reads and relocation both run on the scheduler thread.
-                    storage = self.token_to_kv_pool_allocator.storage
-                    storage.add_pin_source(
-                        storage.sub_pool_names(),
-                        cache_controller.has_inflight_device_transfers,
-                    )
+                # Keep device rows stable until host transfers are acknowledged.
+                # Queue reads and relocation both run on the scheduler thread.
+                storage = kv_storage_of(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
+                storage.add_pin_source(
+                    storage.sub_pool_names(),
+                    cache_controller.has_inflight_device_transfers,
+                )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -1661,11 +1663,10 @@ class Scheduler(
 
     def maybe_init_disaggregation_pin_source(self):
         # A role switch rebuilds PD queues, but the allocator keeps its pins.
-        if (
-            self.enable_unified_memory
-            and self.disaggregation_mode != DisaggregationMode.NULL
-        ):
-            storage = self.token_to_kv_pool_allocator.storage
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            storage = kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
             storage.add_pin_source(
                 storage.sub_pool_names(), disagg_transfers_in_flight(self)
             )
@@ -2522,30 +2523,31 @@ class Scheduler(
         )
 
     def init_pool_stats_observer(self) -> None:
+        storage = kv_storage_of(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            shape=StaticPoolShape(
+                has_window=self.is_hybrid_swa,
+                has_state=self.is_hybrid_ssm,
+                # Match the allocator and radix counters' logical units.
+                token_capacity=self.max_total_num_tokens * self.kv_shard_widening,
+                full_tokens_per_layer=self.full_tokens_per_layer,
+                swa_tokens_per_layer=self.swa_tokens_per_layer,
+            ),
+        )
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
+            storage=storage,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            req_to_token_pool=self.req_to_token_pool,
             session_controller=self.session_controller,
             hisparse_coordinator=self.hisparse_coordinator,
-            is_hybrid_swa=self.is_hybrid_swa,
-            is_hybrid_ssm=self.is_hybrid_ssm,
             enable_hisparse=self.enable_hisparse,
-            full_tokens_per_layer=self.full_tokens_per_layer,
-            swa_tokens_per_layer=self.swa_tokens_per_layer,
-            # Match the allocator and radix counters' logical units.
-            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
         )
 
     def init_invariant_checker(self) -> None:
         self.invariant_checker = SchedulerInvariantChecker(
-            is_hybrid_swa=self.is_hybrid_swa,
-            is_hybrid_ssm=self.is_hybrid_ssm,
             disaggregation_mode=self.disaggregation_mode,
             page_size=self.page_size,
-            full_tokens_per_layer=self.full_tokens_per_layer,
-            swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
@@ -5381,10 +5383,10 @@ class Scheduler(
                 if has_leak:
                     self.invariant_checker._report_leak("pool", "\n".join(messages))
                 self.invariant_checker._check_req_pool()
-                # Byte-conservation diagnostic (allocator-owned; static pools
-                # return [] — the token identity above can't see byte leaks).
+                # Byte-conservation diagnostic (static pools return [] — the
+                # token identity above can't see byte leaks).
                 byte_violations = (
-                    self.token_to_kv_pool_allocator.verify_byte_accounting()
+                    self.pool_stats_observer.storage.accounting_violations()
                 )
                 if byte_violations:
                     self.invariant_checker._report_leak(

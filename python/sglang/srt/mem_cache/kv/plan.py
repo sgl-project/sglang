@@ -48,21 +48,26 @@ _SUB_POOL_NAMES: Dict[Type, str] = {
 
 class SubPoolExternal(msgspec.Struct, frozen=True, kw_only=True):
     """The names a sub-pool goes by outside this process, at the values peers,
-    host stores and the radix tree already use: its HiCache host pool (also the
-    suffix of its L3 keys), its radix tree component, and the PD state type it
-    travels as (None for the sub-pool whose token KV PD registers as the
-    transfer's KV entries)."""
+    host stores, the radix tree and metrics already use: its HiCache host pool
+    (also the suffix of its L3 keys), its radix tree component, the family its
+    usage is reported under, and the PD state type it travels as (None for the
+    sub-pool whose token KV PD registers as the transfer's KV entries)."""
 
     host_pool: str
     tree_component: str
+    metrics: str
     wire: Optional[str] = None
 
 
 _EXTERNAL: Dict[Type, SubPoolExternal] = {
-    FullLifetime: SubPoolExternal(host_pool="kv", tree_component="FULL"),
-    WindowLifetime: SubPoolExternal(host_pool="swa", tree_component="SWA", wire="swa"),
+    FullLifetime: SubPoolExternal(
+        host_pool="kv", tree_component="FULL", metrics="full"
+    ),
+    WindowLifetime: SubPoolExternal(
+        host_pool="swa", tree_component="SWA", metrics="swa", wire="swa"
+    ),
     StateLifetime: SubPoolExternal(
-        host_pool="mamba", tree_component="MAMBA", wire="mamba"
+        host_pool="mamba", tree_component="MAMBA", metrics="mamba", wire="mamba"
     ),
 }
 

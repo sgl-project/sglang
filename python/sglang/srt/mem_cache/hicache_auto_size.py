@@ -78,20 +78,16 @@ def _estimate_hicache_bytes(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None
 ) -> int:
     """Device bytes whose host mirrors scale with the HiCache ratio."""
+    # Every token KV view the pool routes to, and the recurrent state beside it.
     pool = params.token_to_kv_pool_allocator.get_kvcache()
-    storage = params.token_to_kv_pool_allocator.storage
-    if storage is not None:
-        # A unified pool mirrors every sub-pool of its plan.
-        total = sum(_leaf_bytes(storage.view(s.name)) for s in storage.sub_pools())
-    else:
-        if not (isinstance(pool, _SIZEABLE_POOLS) or _sub_pool_views(pool)):
-            raise ValueError(
-                f"HiCache auto-sizing does not support {type(pool).__name__}; "
-                "set --hicache-ratio or --hicache-size explicitly."
-            )
-        total = _pool_bytes(pool)
-        if params.req_to_token_pool.holds_state_slots:
-            total += _leaf_bytes(params.token_to_kv_pool_allocator.state.pool)
+    if not (isinstance(pool, _SIZEABLE_POOLS) or _sub_pool_views(pool)):
+        raise ValueError(
+            f"HiCache auto-sizing does not support {type(pool).__name__}; "
+            "set --hicache-ratio or --hicache-size explicitly."
+        )
+    total = _pool_bytes(pool)
+    if params.req_to_token_pool.holds_state_slots:
+        total += _leaf_bytes(params.token_to_kv_pool_allocator.state.pool)
     drafts = params.mtp_draft_device_pools
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools

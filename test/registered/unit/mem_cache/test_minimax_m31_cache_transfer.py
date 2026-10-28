@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
     MiniMaxM3Nvfp4IndexKPoolHost,
     MiniMaxM3Nvfp4MainKVPoolHost,
 )
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -149,6 +150,12 @@ class CopyingKVManager:
         return 0
 
 
+def static_storage(pool) -> StaticKVStorage:
+    """The storage a static pool registers with PD peers through."""
+    allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+    return StaticKVStorage(None, allocator)
+
+
 @pytest.mark.parametrize("length,prefix", [(257, 0), (257, 128), (256, 256)])
 def test_pd_transfer_sends_the_suffix_with_all_scales(length, prefix):
     src, dst = make_pool(), make_pool()
@@ -163,30 +170,32 @@ def test_pd_transfer_sends_the_suffix_with_all_scales(length, prefix):
     destination_pages = minimax_index_transfer_pages(
         destination_slots, page_size=128, prefix_len=prefix
     )
+    src_storage, dst_storage = static_storage(src), static_storage(dst)
     src_args, dst_args = KVArgs(), KVArgs()
-    setup_state_kv_args(src_args, src)
-    setup_state_kv_args(dst_args, dst)
+    setup_state_kv_args(src_args, src_storage)
+    setup_state_kv_args(dst_args, dst_storage)
     assert src_args.state_types == [StateType.MINIMAX_INDEX_K]
 
     def state(args):
         return args.state_data_ptrs[0], args.state_data_lens[0], args.state_item_lens[0]
 
-    def kv_layer_ids(pool):
+    def kv_layer_ids(pool, storage):
         return build_kv_layer_ids(
             token_to_kv_pool=pool,
             draft_token_to_kv_pool=None,
             num_draft_entries=0,
             num_hidden_layers=2,
+            storage=storage,
         )
 
     # Main rows pair by layer id like production; the index state is flat.
     channels = [
         (
-            get_kv_transfer_buf_infos(src),
-            get_kv_transfer_buf_infos(dst),
+            get_kv_transfer_buf_infos(src_storage),
+            get_kv_transfer_buf_infos(dst_storage),
             False,
-            kv_layer_ids(src),
-            kv_layer_ids(dst),
+            kv_layer_ids(src, src_storage),
+            kv_layer_ids(dst, dst_storage),
         ),
         (state(src_args), state(dst_args), True, None, None),
     ]

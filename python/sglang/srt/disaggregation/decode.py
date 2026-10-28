@@ -637,14 +637,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_hisparse
             else self.token_to_kv_pool
         )
-        # HiSparse registers its host pool instead; unified memory refuses it.
-        storage = (
-            None
-            if self.scheduler.enable_hisparse
-            else self.token_to_kv_pool_allocator.storage
+        storage = kv_storage_of(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            draft_token_to_kv_pool=self.draft_token_to_kv_pool,
+            num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
-        kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
-            transfer_kv_pool, storage
+        # HiSparse registers its host pool instead; unified memory refuses it.
+        kv_data_ptrs, kv_data_lens, kv_item_lens = (
+            transfer_kv_pool.get_contiguous_buf_infos()
+            if self.scheduler.enable_hisparse
+            else get_kv_transfer_buf_infos(storage)
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
@@ -694,14 +697,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.metadata_buffers.get_buf_infos()
         )
 
-        state = self.token_to_kv_pool_allocator.state
         setup_state_kv_args(
             kv_args,
-            self.token_to_kv_pool,
+            storage,
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
-            state_pool=None if state is None else state.pool,
-            storage=storage,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -754,11 +754,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_retraction_max_tokens(
                         self.req_to_token_pool,
                         # The one state entry here is the window's.
-                        (
-                            pool.swa_kv_pool
-                            if storage is None
-                            else storage.view(storage.wire_entries()[0].sub_pool)
-                        ),
+                        storage.view(storage.wire_entries()[0].sub_pool),
                     ),
                     ceil_align(
                         self.scheduler.sliding_window_size + pool.page_size - 1,

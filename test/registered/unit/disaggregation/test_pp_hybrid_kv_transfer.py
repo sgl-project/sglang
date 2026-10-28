@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.runtime_context import get_memory, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -275,7 +276,15 @@ def _hybrid_pool_with_ids(*, layer_ids: list) -> HybridLinearKVPool:
         layer_id: index for index, layer_id in enumerate(layer_ids)
     }
     pool.use_mla = False
+    # No buffers: the layer ids are what these tests read.
+    pool.get_contiguous_buf_infos = lambda: ([], [], [])
     return pool
+
+
+def _static_storage(pool) -> StaticKVStorage:
+    """The storage a static pool registers with PD peers through."""
+    allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+    return StaticKVStorage(None, allocator)
 
 
 class TestBuildKvLayerIds(CustomTestCase):
@@ -293,8 +302,10 @@ class TestBuildKvLayerIds(CustomTestCase):
         """The EAGLE draft pool for a hybrid-linear model is itself a
         HybridLinearKVPool that numbers its single MTP layer from zero, so its
         raw ids collide with target layer 0 and must be remapped into the band."""
+        target = _hybrid_pool_with_ids(layer_ids=self._stage1_ids())
         ids = build_kv_layer_ids(
-            token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=self._stage1_ids()),
+            token_to_kv_pool=target,
+            storage=_static_storage(target),
             draft_token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=[0]),
             num_draft_entries=2,
             num_hidden_layers=60,
@@ -303,9 +314,11 @@ class TestBuildKvLayerIds(CustomTestCase):
         self.assertEqual(ids, stage1 + stage1 + [60, 60])
 
     def test_ragged_draft_registration_is_rejected(self):
+        target = _hybrid_pool_with_ids(layer_ids=self._stage1_ids())
         with self.assertRaises(RuntimeError):
             build_kv_layer_ids(
-                token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=self._stage1_ids()),
+                token_to_kv_pool=target,
+                storage=_static_storage(target),
                 draft_token_to_kv_pool=_plain_pool(layer_num=2),
                 num_draft_entries=3,
                 num_hidden_layers=60,
@@ -321,14 +334,18 @@ class TestDraftBandPairsAcrossPipelineStages(CustomTestCase):
     def test_stage1_pairs_onto_the_decode_layout(self):
         full = _full_attention_ids(num_layers=60, interval=4)
         stage1 = [lid for lid in full if lid >= 30]
+        target = _hybrid_pool_with_ids(layer_ids=stage1)
         src = build_kv_layer_ids(
-            token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=stage1),
+            token_to_kv_pool=target,
+            storage=_static_storage(target),
             draft_token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=[0]),
             num_draft_entries=2,
             num_hidden_layers=60,
         )
+        target = _hybrid_pool_with_ids(layer_ids=full)
         dst = build_kv_layer_ids(
-            token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=full),
+            token_to_kv_pool=target,
+            storage=_static_storage(target),
             draft_token_to_kv_pool=_hybrid_pool_with_ids(layer_ids=[0]),
             num_draft_entries=2,
             num_hidden_layers=60,

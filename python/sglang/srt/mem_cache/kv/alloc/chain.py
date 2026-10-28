@@ -82,13 +82,11 @@ def take_new_pages(
     *,
     copy_new_pages: bool,
 ) -> Optional[torch.Tensor]:
-    """Give a batch of requests the owner pages its next tokens need.
+    """Fill tail pages before taking new virtual pages for each request.
 
-    ``page_tokens`` runs a paging kernel over the owner's free virtual pages:
-    each request first fills its tail page, then takes new pages in order, and
-    the kernel returns the virtual token ids. The pages it took are then placed
-    in the owner's band (else v2p stays -1 and translation yields negative
-    ids)."""
+    Bind every new page in the owner band before translating its token ids;
+    otherwise its v2p entry remains -1.
+    """
     if num_new_pages > len(owner.free_virtual_ids):
         return None
     # Physical-capacity pre-check; on shortfall run the relief ladder.
@@ -158,8 +156,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
         self.arena = arena
         self.roles = roles
-        # Each sub-pool's view, by sub-pool name: what its band moves, zeroes
-        # and copies.
+        # Views used by each band's move, zero and copy operations.
         self.views = dict(views)
         self.lazy_compaction = lazy_compaction
         band = dict(
@@ -383,6 +380,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             rules=self.admission_rules(),
             num_mixed_decode_tokens=num_mixed_decode_tokens,
         )
+
+    def usage(self) -> Dict[str, Tuple[int, int]]:
+        """Each sub-pool's (capacity, available units), by sub-pool name."""
+        return self._policy.usage(self)
 
     def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
         return self._policy.swa_capacity_and_available(
@@ -641,9 +642,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             [torch.Tensor, torch.Tensor], torch.Tensor
         ] = lambda out, new_pages: new_pages,
     ) -> Optional[torch.Tensor]:
-        """The one path that takes token ids: price the demand on a snapshot and
-        realize what the price needs (`ensure_capacity`), then take on the owner
-        and bind the window for the owner's new virtual pages."""
+        """Price before taking owner ids, then bind their new window pages."""
         owner = self.full_attn_allocator
         if not self._policy.prices_before_take:
             # The owner prices and relieves its own shortfall.
