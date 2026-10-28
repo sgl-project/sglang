@@ -28,7 +28,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import get_kv_layers
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -327,7 +327,7 @@ class Qwen3Attention(nn.Module):
             and get_exec().deterministic.rl_on_policy_target is None
         )
         if can_try_aiter_fused:
-            k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)
+            k_cache, v_cache = get_kv_layers().read(self.attn.layer_id).kv()
             # The fused write targets the NHD layout in the activation dtype and
             # does not apply per-layer KV scales.
             use_aiter_fused = (
