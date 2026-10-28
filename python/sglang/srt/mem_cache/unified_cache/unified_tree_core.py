@@ -1607,7 +1607,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.evictable_device_leaves.discard(node)
 
         if self._is_host_leaf(node):
-            self.evictable_host_leaves.add(node)
+            if node not in self.evictable_host_leaves:
+                self.evictable_host_leaves.add(node)
+                self.components_by_type[BASE_COMPONENT_TYPE].on_host_leaf_added(node)
         else:
             self.evictable_host_leaves.discard(node)
 

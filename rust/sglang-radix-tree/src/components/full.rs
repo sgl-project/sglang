@@ -11,7 +11,6 @@ use crate::components::{ComponentType, FULL, Family};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
-use crate::unified_lru_list::PriorityKey;
 use crate::unified_tree_core::{
     CacheActions, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertResult,
     MatchPrefixParams, MatchResult, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
@@ -200,6 +199,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
     fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K>) {
         tree_core.set_evict_device_end(FULL);
         tree_core.full_evict_device_heap.clear();
+        tree_core.full_evict_host_heap = None;
     }
 
     fn reclaim_coexisting_host_values(
@@ -255,31 +255,32 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         cache_actions: &mut CacheActions,
     ) {
         let ct = FULL;
-        let arena = &tree_core.arena;
-        let strategy = &tree_core.eviction_strategy;
-        let mut heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>> = tree_core
-            .evictable_host_leaves
-            .iter()
-            .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
-            .collect();
+        if tree_core.full_evict_host_heap.is_none() {
+            let arena = &tree_core.arena;
+            let strategy = &tree_core.eviction_strategy;
+            tree_core.full_evict_host_heap = Some(
+                tree_core
+                    .evictable_host_leaves
+                    .iter()
+                    .map(|id| Reverse((strategy.get_priority(arena.node(id)), id)))
+                    .collect(),
+            );
+        }
         while tracker[&ct] < num_tokens {
-            let Some(Reverse((_, x))) = heap.pop() else {
+            let Some(Reverse((_, x))) = tree_core
+                .full_evict_host_heap
+                .as_mut()
+                .and_then(BinaryHeap::pop)
+            else {
                 break;
             };
             if !tree_core.evictable_host_leaves.contains(x) {
                 continue;
             }
-            // The parent id is captured before the eviction frees the leaf.
-            let parent = tree_core.arena.node(x).try_parent();
             tree_core.evict_host_leaf_(x, tracker, device_frees, host_frees, cache_actions);
-            if let Some(parent) = parent
-                && tree_core.evictable_host_leaves.contains(parent)
-            {
-                let key = tree_core
-                    .eviction_strategy
-                    .get_priority(tree_core.arena.node(parent));
-                heap.push(Reverse((key, parent)));
-            }
+        }
+        if !tree_core.component_state(FULL).is_evict_device_ongoing {
+            tree_core.full_evict_host_heap = None;
         }
     }
 

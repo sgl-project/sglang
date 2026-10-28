@@ -177,6 +177,31 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         cache.sanity_check()
 
     @requires_hicache
+    def test_hicache_write_back_walk_host_evicts_leaf_demoted_in_same_walk(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+
+        seqs_a = [self._make_seq(1000 * (i + 1), 1) for i in range(3)]
+        for seq in seqs_a:
+            self._insert(cache, allocator, req_to_token_pool, seq)
+        cache.evict(EvictParams(num_tokens=sum(len(seq) for seq in seqs_a)))
+        seqs_b = [self._make_seq(10000 * (i + 1), 1) for i in range(2)]
+        for seq in seqs_b:
+            self._insert(cache, allocator, req_to_token_pool, seq)
+        for seq in seqs_a:
+            self.assertEqual(match_prefix(cache, seq).host_hit_length, len(seq))
+
+        host_pool = cache.cache_controller.mem_pool_host
+        self.assertIsNotNone(host_pool.alloc(host_pool.available_size()))
+        cache.evict(EvictParams(num_tokens=sum(len(seq) for seq in seqs_b)))
+
+        host_hits = [match_prefix(cache, seq).host_hit_length for seq in seqs_a]
+        self.assertEqual(host_hits, [0, len(seqs_a[1]), len(seqs_a[2])])
+        self.assertEqual(match_prefix(cache, seqs_b[0]).host_hit_length, 0)
+        self.assertEqual(match_prefix(cache, seqs_b[1]).host_hit_length, len(seqs_b[1]))
+        cache.sanity_check()
+
+    @requires_hicache
     def test_hicache_write_back_drop_respects_pins_then_frees_subtree(self):
         """The host-pressure drop fallback declines while any node in the unbacked
         subtree is host-pinned, then reclaims the whole subtree once unpinned."""

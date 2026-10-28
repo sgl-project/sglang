@@ -626,6 +626,10 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) lru_lists: [UnifiedLRUList; NUM_VALUE_SLOTS],
     /// Device-eviction candidates; the lowest priority is popped first.
     pub(crate) full_evict_device_heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>>,
+    /// Full host-eviction candidates, live while a host eviction runs. New
+    /// H-leaves are pushed into it, so it is kept across one Full
+    /// device-eviction walk, where no priority changes.
+    pub(crate) full_evict_host_heap: Option<BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>>>,
     /// Eviction-priority strategy; lower priority evicts first.
     pub(crate) eviction_strategy: Box<dyn EvictionStrategy<K> + Send>,
     /// Keep path depths and branch high-water marks only for T-LRU.
@@ -1001,6 +1005,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             // Disabled components keep harmless empty lists, like component_states.
             lru_lists: Self::new_lru_lists(),
             full_evict_device_heap: BinaryHeap::new(),
+            full_evict_host_heap: None,
             eviction_strategy: get_eviction_strategy(
                 &params.eviction_policy,
                 params.slru_protected_threshold,
@@ -1043,6 +1048,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.tracked_unbacked_tokens = None;
         self.lru_lists = Self::new_lru_lists();
         self.full_evict_device_heap.clear();
+        self.full_evict_host_heap = None;
         self.namespaced_event_hashes.clear();
         self.ongoing_insert_walk_state = None;
     }
@@ -2549,7 +2555,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.evictable_device_leaves.discard(node_id);
         }
         if is_evictable_host_leaf {
-            self.evictable_host_leaves.add(node_id);
+            if !self.evictable_host_leaves.contains(node_id) {
+                self.evictable_host_leaves.add(node_id);
+                if let Some(heap) = self.full_evict_host_heap.as_mut() {
+                    let key = self
+                        .eviction_strategy
+                        .get_priority(self.arena.node(node_id));
+                    heap.push(Reverse((key, node_id)));
+                }
+            }
         } else {
             self.evictable_host_leaves.discard(node_id);
         }
