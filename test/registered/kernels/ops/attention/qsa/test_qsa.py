@@ -1,4 +1,5 @@
 import sys
+from collections import defaultdict
 from itertools import accumulate
 from types import MethodType, ModuleType, SimpleNamespace
 
@@ -647,6 +648,60 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
     torch.testing.assert_close(padded[:15], unpadded)
     torch.testing.assert_close(padded[15], torch.zeros(2, device="cuda"))
     assert kernel_shapes == [(15, 15, 15, 15), (15, 15, 15, 15)]
+
+
+def test_qsa_prefix_extend_shares_decode_sparse_kernel_variant(monkeypatch):
+    """A prefix-hit extend and a decode step with as many rows must reuse one
+    compiled _sparse_gqa_chunk_prefill variant (int32 cu_q/cu_k on both paths)."""
+    from sglang.srt.layers.attention.qsa import sparse_attn
+
+    device, heads, dim, topk, rows = "cuda", 4, 64, 16, 6
+    kernel = sparse_attn._sparse_gqa_chunk_prefill
+    monkeypatch.setattr(kernel, "device_caches", defaultdict(kernel.create_binder))
+    cache = kernel.device_caches[torch.cuda.current_device()][0]
+    pool_k = torch.randn(rows * topk, 1, dim, dtype=torch.bfloat16, device=device)
+    pool_v = torch.randn_like(pool_k)
+    backend = QwenSparseAttnBackend()
+    backend.token_to_kv_pool = routed(
+        SimpleNamespace(
+            get_key_buffer=lambda layer_id: pool_k,
+            get_value_buffer=lambda layer_id: pool_v,
+        )
+    )
+    backend.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.arange(rows * topk, dtype=torch.int32, device=device)[None]
+    )
+    layer = SimpleNamespace(tp_q_head_num=heads, head_dim=dim, layer_id=0, scaling=0.1)
+    indices = torch.arange(topk, dtype=torch.int32, device=device).expand(rows, -1)
+    # Decode replay of `rows` requests, as the CUDA-graph buffers pass it.
+    sparse_attn.sparse_gqa_packed_decode_triton(
+        torch.randn(rows, heads, dim, dtype=torch.bfloat16, device=device),
+        pool_k,
+        pool_v,
+        indices.contiguous(),
+        torch.arange(rows + 1, dtype=torch.int32, device=device),
+        torch.arange(0, (rows + 1) * topk, topk, dtype=torch.int32, device=device),
+        torch.full((rows,), topk, dtype=torch.int32, device=device),
+        0.1,
+    )
+    # One request: a 16-token cached prefix and `rows` new tokens.
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        extend_seq_lens=torch.tensor([rows], dtype=torch.int32, device=device),
+        extend_seq_lens_cpu=[rows],
+        seq_lens_cpu=[topk + rows],
+        req_pool_indices=torch.zeros(1, dtype=torch.int32, device=device),
+    )
+    backend.forward_extend(
+        torch.randn(rows, heads * dim, dtype=torch.bfloat16, device=device),
+        None,
+        None,
+        layer,
+        batch,
+        save_kv_cache=False,
+        topk_indices=indices,
+    )
+    assert len(cache) == 1
 
 
 def _make_paged_extend_backend():

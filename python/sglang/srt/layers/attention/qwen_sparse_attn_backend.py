@@ -1652,8 +1652,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         prefix_lens = [
             sequence_lens[i] - extend_lens[i] for i in range(len(extend_lens))
         ]
+        # int32 like HIP decode and CP: _sparse_gqa_chunk_prefill keys compiled
+        # variants on the pointer dtype.
         cu_seqlens_q = F.pad(
-            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
+            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(
+                0, dtype=torch.int32
+            ),
             (1, 0),
         ).contiguous()
         if not any(prefix_lens):
@@ -1673,7 +1677,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
-        cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        cu_seqlens_k = F.pad(
+            sequence_lens_tensor.cumsum(0, dtype=torch.int32), (1, 0)
+        ).contiguous()
         req_to_token = self.req_to_token_pool.req_to_token
         req_indices = forward_batch.req_pool_indices
         if self._kv_shard_pool is not None:
