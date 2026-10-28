@@ -183,7 +183,7 @@ def scopes_overlap(left: ResolvedTarget, right: ResolvedTarget):
                 if set(a.content.components).isdisjoint(b.content.components):
                     continue
                 # Unequal prefix hashes may still share an earlier physical
-                # prefix. Without tokens there is no proof of disjointness.
+                # prefix. Without tokens, these scopes may overlap.
                 return True
             else:
                 # A descriptor cannot prove it differs from a token scope.

@@ -62,7 +62,10 @@ class StorageAttachment:
 
         service = getattr(cache, "kv_control_service", None)
         if service is not None and service.has_pending:
-            return False, "Programmable KV operations must drain before changing storage."
+            return (
+                False,
+                "Programmable KV operations must drain before changing storage.",
+            )
 
         # Validate first: a rejected request must have no side effects.
         invalid = self._validate_policies(
@@ -201,7 +204,10 @@ class StorageAttachment:
         cache = self._cache
         service = getattr(cache, "kv_control_service", None)
         if service is not None and service.has_pending:
-            return False, "Programmable KV operations must drain before detaching storage."
+            return (
+                False,
+                "Programmable KV operations must drain before detaching storage.",
+            )
         controller = cache.cache_controller
         if controller is None:
             return False, "HiCache storage backend is not initialized."
