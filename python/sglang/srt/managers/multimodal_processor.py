@@ -67,7 +67,7 @@ def get_mm_processor_cls(hf_config, model_config=None):
     if get_mm().enable_token_space_processor and not uses_transformers_backend:
         strategy_class = strategy_for(hf_config)
         if strategy_class is not None:
-            return TokenSpaceSGLangProcessor.for_strategy(
+            return TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
                 strategy_class, serving_spec_for(hf_config)
             )
 

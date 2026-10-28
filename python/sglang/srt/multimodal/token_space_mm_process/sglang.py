@@ -65,15 +65,11 @@ class TokenSpaceSGLangProcessor:
     _serving_spec_class = TokenSpaceServingSpec
 
     @classmethod
-    def for_strategy(cls, strategy_class, serving_spec_class=TokenSpaceServingSpec):
-        return cls._for_model(strategy_class, serving_spec_class)
-
-    @classmethod
     @functools.cache
-    def _for_model(cls, strategy_class, serving_spec_class):
-        # Cached with both classes, so a defaulted spec maps to the same class.
+    def for_strategy_and_serving_spec(cls, strategy_class, serving_spec_class, /):
+        # Positional-only, so every call caches under one key per pair.
         return type(
-            f"{cls.__name__}[{strategy_class.__name__}]",
+            f"{cls.__name__}[{strategy_class.__name__}, {serving_spec_class.__name__}]",
             (cls,),
             {
                 "_strategy_class": strategy_class,

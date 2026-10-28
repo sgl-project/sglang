@@ -198,7 +198,7 @@ class TestTokenSpaceDevices(CustomTestCase):
                 mm_processor_worker_num=1,
             )
             publish(server_args, role="test")
-            wrapper = TokenSpaceSGLangProcessor.for_strategy(
+            wrapper = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
                 TokenSpaceProcessStrategy, _Spec
             )(
                 None,
