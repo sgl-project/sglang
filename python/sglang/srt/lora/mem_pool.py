@@ -376,7 +376,11 @@ class LoRAMemoryPool:
         should_apply_lora = getattr(base_model, "should_apply_lora", None)
         return any(
             isinstance(module, FusedMoE)
-            and (should_apply_lora is None or should_apply_lora(name))
+            # init_lora_modules() runs first, so wrapped experts sit at `<name>.base_layer`
+            and (
+                should_apply_lora is None
+                or should_apply_lora(name.removesuffix(".base_layer"))
+            )
             for name, module in base_model.named_modules()
         )
 

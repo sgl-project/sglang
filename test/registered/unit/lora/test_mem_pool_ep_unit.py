@@ -20,6 +20,7 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 import ast
 import itertools
+import re
 import types
 import unittest
 import unittest.mock as mock
@@ -1989,6 +1990,38 @@ class TestDenseMlpBuffersWithoutSharedExperts(unittest.TestCase):
         pool = self._pool(self._model(n_dense=0, n_moe=2))
         self.assertEqual(sorted(pool.A_buffer), ["down_proj_moe", "gate_up_proj_moe"])
         self.assertEqual(sorted(pool.B_buffer), ["down_proj_moe", "gate_up_proj_moe"])
+
+
+@mock.patch.dict(
+    "sys.modules", {"sglang.srt.layers.moe.fused_moe_triton.layer": _FUSED_MOE_STUB}
+)
+class TestHasMoeModuleAfterWrapping(unittest.TestCase):
+    """Experts already wrapped for LoRA must still get per-expert buffers when the
+    model's `should_apply_lora` pattern names `mlp.experts` (gpt-oss, MiMo-V2)."""
+
+    class _Wrapper(torch.nn.Module):
+        def __init__(self, base_layer):
+            super().__init__()
+            self.base_layer = base_layer
+
+    class _Model(torch.nn.Module):
+        def __init__(self, experts, lora_pattern):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+            self.model.layers[0].mlp = torch.nn.Module()
+            self.model.layers[0].mlp.experts = experts
+            self.should_apply_lora = lambda name: bool(lora_pattern.match(name))
+
+    PATTERN = re.compile(r"^model\.layers\.\d+\.mlp\.experts$")
+
+    def test_wrapped_experts_count_as_moe(self):
+        model = self._Model(self._Wrapper(_FakeFusedMoE()), self.PATTERN)
+        self.assertTrue(LoRAMemoryPool._has_moe_module(model))
+
+    def test_experts_the_model_excludes_stay_out(self):
+        model = self._Model(_FakeFusedMoE(), re.compile(r"^model\.embed_tokens$"))
+        self.assertFalse(LoRAMemoryPool._has_moe_module(model))
 
 
 if __name__ == "__main__":
