@@ -230,6 +230,26 @@ jobs:
             pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 "sacrebleu>=1.5.0" pytablewriter "peft>=0.2.0" "accelerate>=0.29.1"
             pip install jsonlines "evaluate>=0.4.0" numexpr dotenv
 
+            # sgl_eval downloads the MMLU archive with its own httpx client
+            # (ignores HF_ENDPOINT, no progress, no retries), so stage it here:
+            # the tests read SGLANG_EVAL_ARCHIVE_DIR and fall back to sgl_eval's
+            # own download when the copy is missing or stale. Xet storage is not
+            # proxied by the mirror (401), hence the classic HTTP path below.
+            SGLANG_EVAL_ARCHIVE_DIR=/tmp/sgl_eval_archives
+            mkdir -p "${SGLANG_EVAL_ARCHIVE_DIR}"
+            export HF_HUB_DISABLE_XET=1
+            if hf download cais/mmlu --repo-type dataset --include data.tar \
+                 --local-dir "${SGLANG_EVAL_ARCHIVE_DIR}" \
+               || curl -fL --retry 5 --retry-delay 5 --connect-timeout 10 \
+                    -o "${SGLANG_EVAL_ARCHIVE_DIR}/data.tar" \
+                    "${HF_ENDPOINT}/datasets/cais/mmlu/resolve/main/data.tar"; then
+              ls -lh "${SGLANG_EVAL_ARCHIVE_DIR}/data.tar"
+              sha256sum "${SGLANG_EVAL_ARCHIVE_DIR}/data.tar"
+            else
+              echo "::warning::MMLU archive prefetch failed; sgl_eval will download it itself"
+            fi
+            echo "SGLANG_EVAL_ARCHIVE_DIR=${SGLANG_EVAL_ARCHIVE_DIR}" >> "${GITHUB_ENV}"
+
             hf download MMMU/MMMU --repo-type dataset
           fi
 
