@@ -21,6 +21,8 @@ One row per test: what it pins, then the test.
             per-source frame and pixel options stay within the configured limits,
             and the configured fps or nframes wins over the item's other one
             -> test_video_preprocess_kwargs_cannot_raise_configured_limits
+            a video reader's own HF options reach the HF processor (Qwen2.5, Qwen3)
+            -> test_video_reader_items_keep_their_own_hf_options
     audio   feature mask and CNN chunk lengths
             -> test_omni_audio_mask_and_cnn_chunk_lengths
     video   the Qwen2 decoder keeps the legacy resize
@@ -910,6 +912,42 @@ class TestQwenTokenizedMedia(CustomTestCase):
         self.assertEqual(output["video_grid_thw"].tolist(), [[1, 4, 4]])
         for key in ("pixel_values_videos", "video_grid_thw"):
             self.assert_tensor_bytes_equal(output[key], reference[key])
+
+    @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
+    def test_video_reader_items_keep_their_own_hf_options(self, _is_cpu):
+        """An item's do_normalize must reach the HF processor, not only its sampling.
+
+        Video readers take a separate route from frame tensors on both families.
+        """
+        frames = (
+            torch.arange(8 * 64 * 64 * 3)
+            .remainder(251)
+            .to(torch.uint8)
+            .reshape(8, 64, 64, 3)
+        )
+        for processor_class, patch_size, model_type in (
+            (Qwen2_5_VLProcessor, 14, "qwen2_5_vl"),
+            (Qwen3VLProcessor, 16, "qwen3_vl"),
+        ):
+            with self.subTest(model_type=model_type):
+                processor = _make_hf_processor(
+                    processor_class, patch_size, model_type=model_type
+                )
+                strategy = processor._core.strategy
+                strategy.video_config = {"nframes": 2}
+                per_item = _process_media(
+                    processor,
+                    videos=[_VideoDecoder(frames, fps=8)],
+                    preprocess_kwargs={"videos": [{"do_normalize": False}]},
+                )
+                strategy.video_config = {"nframes": 2, "do_normalize": False}
+                configured = _process_media(
+                    processor, videos=[_VideoDecoder(frames, fps=8)]
+                )
+                self.assert_tensor_bytes_equal(
+                    per_item["pixel_values_videos"],
+                    configured["pixel_values_videos"],
+                )
 
     @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
     def test_omni_seconds_per_grid_follow_the_item_fps(self, _is_cpu):
