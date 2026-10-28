@@ -124,7 +124,6 @@ class TestSiluAndMulClampTriton(CustomTestCase):
 G, R, D = 2, 1024, 4096
 
 
-
 def _weights(seed: int, r: int = R) -> torch.Tensor:
     torch.manual_seed(seed)
     return (torch.randn(G, r, D, device="cuda") * 0.02).bfloat16()
