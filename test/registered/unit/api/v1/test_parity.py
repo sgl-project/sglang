@@ -63,6 +63,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "min_dynamic_patch",
         "mm_content_hashes",
         "mm_processor_kwargs",
+        "mm_token_expansion_start_len",
         "multi_item_delimiter_indices",
         "need_wait_for_mm_inputs",
         "no_logs",

@@ -167,6 +167,13 @@ class TokenSpaceSGLangProcessor:
         """The processor entry; `input_text` holds the request's input_ids when it has them."""
         if input_ids is None and isinstance(input_text, list):
             input_ids = input_text
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        mm_token_expansion_start_len = (
+            request_obj.mm_token_expansion_start_len
+            if isinstance(request_obj, GenerateReqInput)
+            else 0
+        )
         if video_data is None and request_obj is not None:
             video_data = request_obj.video_data
         if audio_data is None and request_obj is not None:
@@ -180,6 +187,7 @@ class TokenSpaceSGLangProcessor:
             video_data,
             audio_data,
             input_ids=input_ids,
+            mm_token_expansion_start_len=mm_token_expansion_start_len,
             image_device=image_device,
             video_device=video_device,
             compute_mrope_positions=True,
