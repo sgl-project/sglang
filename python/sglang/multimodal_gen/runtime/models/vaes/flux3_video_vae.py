@@ -354,10 +354,6 @@ class Natten3D(nn.Module):
                         (ref_q, ref_k, ref_v),
                         equal=tensors_equal,
                         logger=logger,
-                        mismatch_msg=(
-                            "FLUX 3 video VAE QKV norm+RoPE is not bit-exact "
-                            "here; using eager"
-                        ),
                     )
         return self._eager_qkv(qkv, temporal_offset)
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import functools
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -25,6 +25,7 @@ from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.moe.mega_gate import run_mega_gate, should_use_mega_gate
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
@@ -125,6 +126,7 @@ def _get_mega_moe_symm_buffer(
     num_shared_experts: int = 0,
     *,
     mma_type: str,
+    activation: str = "swiglu",
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -137,6 +139,7 @@ def _get_mega_moe_symm_buffer(
             hidden,
             intermediate_hidden,
             mma_type,
+            activation,
             num_shared_experts,
             deep_gemm.get_num_sms(),
         )
@@ -151,7 +154,7 @@ def _get_mega_moe_symm_buffer(
                 intermediate_hidden,
                 num_shared_experts=num_shared_experts,
                 mma_type=mma_type,
-                activation="swiglu",
+                activation=activation,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
@@ -250,6 +253,88 @@ def forward_mega_moe(
     return y
 
 
+def _mega_moe_buffer(moe: DeepseekV2MoE):
+    from sglang.srt.runtime_context import get_parallel
+
+    return _get_mega_moe_symm_buffer(
+        get_parallel().moe_ep_group.device_group,
+        num_experts=moe.experts.num_experts,
+        num_max_tokens_per_rank=(
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        ),
+        num_topk=moe.config.num_experts_per_tok + moe.num_fused_shared_experts,
+        hidden=moe.config.hidden_size,
+        intermediate_hidden=moe.config.moe_intermediate_size,
+        num_shared_experts=(
+            0 if moe.mega_shared_l1_weights is None else moe.n_shared_experts
+        ),
+        mma_type=_mega_moe_mma_type(moe.experts),
+    )
+
+
+MEGA_MOE_INPUT_TAG = "_mega_moe_input_in_buffer"
+
+
+class MegaMoeInput(NamedTuple):
+    buf: SymmBuffer
+    num_tokens: int
+    x: torch.Tensor
+    routed_sf: torch.Tensor
+    shared_sf: torch.Tensor
+    shared_block_m: int
+
+    def views(self):
+        return (self.x, self.routed_sf, self.shared_sf, self.shared_block_m)
+
+    def mark(self, rows: torch.Tensor) -> None:
+        setattr(rows, MEGA_MOE_INPUT_TAG, (self.buf, self.num_tokens))
+
+
+def _mega_moe_input_in_buffer(rows: torch.Tensor, buf, num_tokens: int) -> bool:
+    tag = getattr(rows, MEGA_MOE_INPUT_TAG, None)
+    return tag is not None and tag[0] is buf and tag[1] == num_tokens
+
+
+def mega_moe_input_target(
+    moe: DeepseekV2MoE, hidden_states: torch.Tensor, forward_batch
+) -> Optional[MegaMoeInput]:
+    if not (
+        should_use_mega_gate(moe, hidden_states, forward_batch)
+        and get_moe_a2a_backend().is_megamoe()
+        and is_mega_moe_experts_ready(moe.experts)
+        and moe.mega_shared_l1_weights is not None
+        and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
+    ):
+        return None
+    import deep_gemm
+
+    buf = _mega_moe_buffer(moe)
+    num_tokens = hidden_states.shape[0]
+    x = buf.x[:num_tokens]
+    if x.dtype != torch.float8_e4m3fn:
+        x = x.view(torch.float8_e4m3fn)
+    routed_sf = buf.x_sf[:num_tokens]
+    if not routed_sf.is_contiguous():
+        return None
+    shared_block_m = deep_gemm.get_block_m_for_mega_moe(
+        num_ranks=buf.group.size(),
+        num_experts=buf.num_experts,
+        num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+        num_tokens=num_tokens,
+        num_topk=buf.num_topk,
+        mma_type=buf.mma_type,
+        global_num_tokens=_mega_moe_global_tokens_hint(buf),
+    )
+    return MegaMoeInput(
+        buf,
+        num_tokens,
+        x,
+        routed_sf,
+        buf.shared_l1_acts_sf[:num_tokens],
+        shared_block_m,
+    )
+
+
 def _run_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -259,7 +344,26 @@ def _run_mega_routed(
 ) -> torch.Tensor:
     hidden_size = moe.config.hidden_size
 
-    if num_tokens > 0:
+    routing = None
+    if should_use_mega_gate(moe, hidden_states, forward_batch):
+        import deep_gemm
+
+        # Only the fp8xfp4 pre-dispatch can skip its top-k copy (kCopyTopk).
+        buf = (
+            _mega_moe_buffer(moe)
+            if _mega_moe_mma_type(moe.experts) == "fp8xfp4"
+            else None
+        )
+        with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+            routing = run_mega_gate(
+                moe, hidden_states, input_ids_global, buf, forward_batch
+            )
+
+    if routing is not None:
+        topk_ids = routing.topk_ids
+        topk_weights = routing.topk_weights
+        routed_scaling_factor = routing.routed_scaling_factor
+    elif num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
         if (
@@ -282,6 +386,12 @@ def _run_mega_routed(
     else:
         topk_ids = None
         topk_weights = None
+    if routing is None:
+        routed_scaling_factor = (
+            1.0
+            if moe.routed_scaling_factor_fused_in_topk
+            else float(moe.routed_scaling_factor)
+        )
 
     return run_mega_routed_experts(
         moe.experts,
@@ -293,16 +403,13 @@ def _run_mega_routed(
         top_k=moe.config.num_experts_per_tok + moe.num_fused_shared_experts,
         num_tokens=num_tokens,
         activation_clamp=moe.experts.moe_runner_config.swiglu_limit,
-        routed_scaling_factor=(
-            1.0
-            if moe.routed_scaling_factor_fused_in_topk
-            else float(moe.routed_scaling_factor)
-        ),
+        routed_scaling_factor=routed_scaling_factor,
         num_shared_experts=(
             0 if moe.mega_shared_l1_weights is None else moe.n_shared_experts
         ),
         shared_l1_weights=moe.mega_shared_l1_weights,
         shared_l2_weights=moe.mega_shared_l2_weights,
+        routing_in_buffer=routing is not None and routing.in_buffer,
     )
 
 
@@ -318,9 +425,11 @@ def run_mega_routed_experts(
     num_tokens: int,
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
+    activation: str = "swiglu",
     num_shared_experts: int = 0,
     shared_l1_weights=None,
     shared_l2_weights=None,
+    routing_in_buffer: bool = False,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
@@ -349,9 +458,13 @@ def run_mega_routed_experts(
         intermediate_hidden=intermediate_size,
         num_shared_experts=num_shared_experts,
         mma_type=mma_type,
+        activation=activation,
     )
 
-    if num_tokens > 0:
+    if routing_in_buffer:
+        assert num_tokens > 0 and _device_sm != 90 and mma_type == "fp8xfp4"
+        topk_ids_in = topk_weights_in = None
+    elif num_tokens > 0:
         topk_ids_in = topk_ids.to(torch.int32)
         topk_weights_in = topk_weights.to(torch.float32)
     else:
@@ -372,8 +485,10 @@ def run_mega_routed_experts(
         )
 
     if routed_scaling_factor != 1.0:
+        assert not routing_in_buffer
         topk_weights_in = topk_weights_in * routed_scaling_factor
 
+    global_num_tokens = _mega_moe_global_tokens_hint(buf)
     mega_kwargs = {"recipe": (1, 1, 32)}
     if mma_type == "nvfp4xnvfp4":
         # Per-token outer scales go to buf.x_scales; the kernel folds them with
@@ -398,6 +513,8 @@ def run_mega_routed_experts(
             "l2_alphas": experts.mega_l2_alphas,
             "l2_act_scales": experts.mega_l2_act_scales,
         }
+        if experts._mega_moe_trtllm_layout:
+            mega_kwargs["weight_layout"] = "trtllm"
     elif mma_type == "mxf4xmxf4":
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
@@ -426,21 +543,30 @@ def run_mega_routed_experts(
                 num_tokens=max(num_tokens, 1),
                 num_topk=buf.num_topk,
                 mma_type=buf.mma_type,
+                global_num_tokens=global_num_tokens,
             )
-        mega_moe_pre_dispatch(
-            hidden_states,
-            topk_ids_in,
-            topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            quant_group_size=32,
-            shared_x_sf=(
-                buf.shared_l1_acts_sf if shared_l1_weights is not None else None
-            ),
-            shared_block_m=shared_block_m,
-        )
+        if not (
+            routing_in_buffer
+            and _mega_moe_input_in_buffer(hidden_states, buf, num_tokens)
+        ):
+            mega_moe_pre_dispatch(
+                hidden_states,
+                buf.topk_idx if routing_in_buffer else topk_ids_in,
+                buf.topk_weights if routing_in_buffer else topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                quant_group_size=32,
+                shared_x_sf=(
+                    buf.shared_l1_acts_sf if shared_l1_weights is not None else None
+                ),
+                shared_block_m=shared_block_m,
+                copy_topk=not routing_in_buffer,
+            )
+
+    if global_num_tokens is not None:
+        mega_kwargs["global_num_tokens"] = global_num_tokens
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
@@ -457,12 +583,21 @@ def run_mega_routed_experts(
             buf,
             shared_l1_weights=shared_l1_weights,
             shared_l2_weights=shared_l2_weights,
-            activation="swiglu",
+            activation=activation,
             activation_clamp=activation_clamp,
             fast_math=True,
             **mega_kwargs,
         )
     return y[:num_tokens]
+
+
+def _mega_moe_global_tokens_hint(buf) -> Optional[int]:
+    counts = get_dp_global_num_tokens()
+    if not counts or len(counts) != buf.group.size():
+        return None
+    if get_is_capture_mode() or is_dsa_enable_prefill_cp():
+        return None
+    return min(int(sum(counts)), buf.group.size() * buf.num_max_tokens_per_rank)
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
