@@ -1913,7 +1913,7 @@ class KimiK3DeltaAttention(nn.Module):
             return False
         if not self.use_full_rank_gate:
             return False
-        if not (self.do_fuse_qkvbfg or get_exec().kernel.monokernel_backend):
+        if not (self.do_fuse_qkvbfg or get_exec().kernel.enable_amd_monokernel):
             return False
         # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
