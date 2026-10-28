@@ -18,9 +18,14 @@ class EngramReplication:
 
 
 class EngramLookup:
-    COLLECTIVE = "collective"
+    AUTO = "auto"
+    ALL_REDUCE = "all_reduce"
+    REDUCE_SCATTER = "reduce_scatter"
+    ALL_TO_ALL = "all_to_all"
     PEER_READ = "peer_read"
-    ALL = (COLLECTIVE, PEER_READ)
+    ALL = (AUTO, ALL_REDUCE, REDUCE_SCATTER, ALL_TO_ALL, PEER_READ)
+    # AUTO's name before the collectives could be chosen, still accepted.
+    COLLECTIVE = "collective"
 
 
 def _choice(default: str, choices: tuple):
@@ -31,10 +36,12 @@ def _choice(default: str, choices: tuple):
 class EngramConfig:
     placement: str = _choice(EngramPlacement.GPU, EngramPlacement.ALL)
     replication: str = _choice(EngramReplication.NONE, EngramReplication.ALL)
-    lookup: str = _choice(EngramLookup.COLLECTIVE, EngramLookup.ALL)
+    lookup: str = _choice(EngramLookup.AUTO, EngramLookup.ALL)
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "EngramConfig":
+        if raw.get("lookup") == EngramLookup.COLLECTIVE:
+            raw = {**raw, "lookup": EngramLookup.AUTO}
         choices = {f.name: f.metadata["choices"] for f in dataclasses.fields(cls)}
         invalid = [f"{k}={v!r}" for k, v in raw.items() if v not in choices.get(k, ())]
         if invalid:

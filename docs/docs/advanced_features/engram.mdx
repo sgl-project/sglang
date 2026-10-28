@@ -21,7 +21,7 @@ defaults:
 |---|---|---|
 | `placement` | Where do the rows live? | `gpu` (default): device memory. `cpu`: pinned host memory, which the GPU reads in place; the HBM goes to the KV cache. |
 | `replication` | How many copies are there? | `none` (default): one table, its rows split across the TP group. `per_node`: each node holds the whole table, mapped by all of its ranks. |
-| `lookup` | How does a rank get rows another rank holds? Only with `replication` `none`. | `collective` (default): every rank looks up the rows it holds for all tokens, and a reduction assembles them. `peer_read`: each rank reads its tokens' rows straight from the owning GPU's shard, with no collective. |
+| `lookup` | How does a rank get rows another rank holds? Only with `replication` `none`. | `auto` (default): a collective SGLang picks for each step. `all_reduce`, `reduce_scatter`, `all_to_all`: that collective (see below). `peer_read`: each rank reads its tokens' rows straight from the owning GPU's shard over NVLink, with no collective. |
 
 The resolved configuration is logged at startup as `DeepSeek-V4.1 Engram tables: ...`.
 
@@ -47,6 +47,29 @@ sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 8 --attn-dp-
   runs per step, a cost that grows with the group size.
 - **Latency-bound serving with memory to spare**: the default keeps every lookup in device memory.
 
+## How `auto` picks the collective
+
+Under DP attention, every rank needs rows for its own tokens, but each table is split across the
+TP group. The lookup gathers every rank's hash ids, looks up rows, and exchanges them:
+
+- `all_reduce`: every rank looks up the rows it holds for all tokens, zero for the rest, and an
+  all-reduce sums the buffers; each rank keeps its own slice.
+- `reduce_scatter`: the same lookup, summed with a reduce-scatter that hands each rank only its own
+  tokens' rows.
+- `all_to_all`: each rank looks up only the hash columns it holds, for all tokens, and sends each
+  rank its part. It moves `1 / tp_size` of the bytes the other two move, and needs the 24 hash
+  columns to divide over the TP group (DP 2, 3, 4, 6, 8 and 12).
+
+On CUDA, `auto` uses `all_to_all` for eager prefill batches whenever the columns divide, and
+elsewhere keeps the collective it used before (a reduce-scatter for decode batches, an all-reduce
+otherwise). Measured on GB300, B300 and H200 at DP 2-8 with host tables, from 512 to 65,536 tokens
+per rank, `all_to_all` was the fastest or within a few percent of it, and at 8,192 tokens per rank
+and up 6-60% faster than the all-reduce. Every choice returns the same rows.
+
+An explicit `all_reduce`, `reduce_scatter` or `all_to_all` applies to the same eager prefill
+lookups; decode batches and CUDA-graph replays keep their collective, and without DP attention the
+lookup is always an all-reduce.
+
 ## Requirements and limits
 
 - **`placement` `cpu`**: host RAM for the whole table across the node's ranks, and a longer load.
@@ -55,6 +78,8 @@ sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 8 --attn-dp-
 - **`replication` `per_node`**: one shared memory file per TP group, which the other ranks open
   through `/proc`. The TP group must sit on one node (`--nnodes 1`) and the ranks must share a PID
   namespace. This mapping usually gets no huge pages unless shmem transparent huge pages are on.
+- **`lookup` `reduce_scatter` or `all_to_all`**: DP attention on CUDA; `all_to_all` also needs the
+  hash columns to divide over `--tp-size`.
 - **`lookup` `peer_read`**: CUDA with peer access between the GPUs (POSIX handles within a node,
   fabric handles across an NVLink domain). Each GPU holds `1 / tp_size` of the table. With TP1
   there is no peer, and the setting has no effect.

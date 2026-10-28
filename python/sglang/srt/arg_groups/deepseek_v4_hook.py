@@ -116,6 +116,20 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
         config = EngramConfig.from_dict(raw)
     if config.lookup == EngramLookup.PEER_READ and not get_platform().is_cuda:
         raise ValueError("--engram-config: lookup 'peer_read' needs CUDA.")
+    if config.lookup in (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL) and (
+        cfg.attn_dp_size <= 1 or not get_platform().is_cuda
+    ):
+        raise ValueError(
+            f"--engram-config: lookup {config.lookup!r} applies to DP attention on CUDA."
+        )
+    if config.lookup == EngramLookup.ALL_TO_ALL:
+        text_config = model_config_of(server_args).hf_text_config
+        columns = text_config.engram_n_heads * (text_config.engram_max_ngram_size - 1)
+        if columns % cfg.tp_size:
+            raise ValueError(
+                f"--engram-config: lookup 'all_to_all' needs the {columns} hash "
+                f"columns to divide over --tp-size {cfg.tp_size}."
+            )
     # One mapping per TP group, which its ranks open through /proc.
     if config.replication == EngramReplication.PER_NODE and cfg.nnodes > 1:
         raise ValueError(
