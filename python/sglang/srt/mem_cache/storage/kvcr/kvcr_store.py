@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     resume_boundaries,
     storage_namespace,
 )
+from sglang.srt.mem_cache.storage.kvcr.inventory import KVCRInventory
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,18 @@ class KVCRStore(HiCacheStorage):
         self._closed = False
         self._pinning = _NoFrameworkPinning()
         self._extra = dict(storage_config.extra_config or {})
+        self.publishes_kv_events = self._extra.get("publish_inventory", False)
+        if type(self.publishes_kv_events) is not bool:
+            raise ValueError("publish_inventory must be a boolean")
+        if self.publishes_kv_events and (
+            self._extra.get("enable_remote_hint", True) is not True
+            or self._extra.get("control_advertise_host") is None
+        ):
+            raise ValueError(
+                "KVCR inventory requires enabled remote hints and an explicit "
+                "control_advertise_host"
+            )
+        self._inventory = KVCRInventory() if self.publishes_kv_events else None
         if "startup_timeout_seconds" in self._extra and (
             type(self._extra["startup_timeout_seconds"]) is not int
             or self._extra["startup_timeout_seconds"] <= 0
@@ -171,6 +184,12 @@ class KVCRStore(HiCacheStorage):
         self.requires_rank_local_backup = not self._share_replicated_mla
         self._source_offset = 0 if self._share_replicated_mla else self._offset
         self._agent_name = f"sglang-kvcr-{uuid.uuid4().hex}"
+        self.kv_event_shard = self._offset
+        self.kv_event_shard_count = (
+            1
+            if self._share_replicated_mla
+            else storage_config.tp_size * storage_config.attn_cp_size
+        )
         if storage_config.should_split_heads:
             raise ValueError("KVCR does not support heterogeneous TP head splitting")
         if storage_config.pp_size != 1:
@@ -191,11 +210,23 @@ class KVCRStore(HiCacheStorage):
         ):
             return None
         host, port = control_address(self.config, self._extra)
-        return {
+        source = {
             "dp_rank": self.config.dp_rank,
             "capabilities": ["router_hint"],
             "source_control_endpoint": f"tcp://{host}:{port}",
         }
+        if self.publishes_kv_events:
+            namespace = storage_namespace(
+                self.config, self._layouts, shared_mla=self._share_replicated_mla
+            )
+            source["capabilities"].append("kvcr_inventory")
+            # This adapter's pool is process-local: a cold engine must get a new
+            # owner, never inherit a previous engine's retained routing state.
+            source["cache_owner_id"] = (
+                f"{namespace[:32]}:{namespace[32:]}/0000000000000000/"
+                f"{self._agent_name.rsplit('-', 1)[-1]}"
+            )
+        return source
 
     def register_mem_host_pool_v2(self, host_pool, host_pool_name):
         name = str(host_pool_name)
@@ -234,6 +265,11 @@ class KVCRStore(HiCacheStorage):
         self._namespace = storage_namespace(
             self.config, self._layouts, shared_mla=self._share_replicated_mla
         )
+        if self._inventory is not None:
+            self._inventory.configure(
+                self._namespace,
+                [name for name in self._layouts if name not in _TRAILING_POOLS],
+            )
         total = sum(
             component.size * component.count
             for layout in self._layouts.values()
@@ -328,8 +364,8 @@ class KVCRStore(HiCacheStorage):
                             DiagnosticStats if self._diagnostic_telemetry else None
                         ),
                         inventory_sink=(
-                            self._diagnostic_inventory
-                            if self._diagnostic_telemetry
+                            self._record_inventory
+                            if self.publishes_kv_events or self._diagnostic_telemetry
                             else None
                         ),
                     ),
@@ -455,6 +491,34 @@ class KVCRStore(HiCacheStorage):
                 )
                 os._exit(1)
             self._stop_poll.wait(0.001)
+
+    def _record_inventory(self, event):
+        if self._inventory is not None and event.tier.value == "DRAM":
+            self._inventory.update(event)
+        if self._diagnostic_telemetry:
+            self._diagnostic_inventory(event)
+
+    def pending_kv_events(self):
+        with self._lock:
+            return len(self._inventory.events) if self._inventory is not None else 0
+
+    def take_kv_events(self):
+        with self._lock:
+            return self._inventory.take() if self._inventory is not None else []
+
+    @contextmanager
+    def _inventory_operation(self, extra_info, blocks):
+        retained = set()
+        if self._inventory is not None:
+            extra = getattr(extra_info, "extra_info", None) or {}
+            retained = self._inventory.register(
+                extra.get("kv_event_metadata", {}), blocks
+            )
+        try:
+            yield
+        finally:
+            if self._inventory is not None:
+                self._inventory.release(retained)
 
     def _diagnostic_inventory(self, event):
         # Called on the public main side. Full storage keys permit exact offline
@@ -585,7 +649,10 @@ class KVCRStore(HiCacheStorage):
                 ]
                 self._runner.align_sequence(sequence, use_current_time=True)
             aligned = time.perf_counter() if diagnostic else None
-            with self._hint(extra_info, keys=None if is_set else blocks) as request_id:
+            with (
+                self._inventory_operation(extra_info, blocks),
+                self._hint(extra_info, keys=None if is_set else blocks) as request_id,
+            ):
                 prepared = time.perf_counter() if diagnostic else None
                 handle = (
                     self._runner.deposit(blocks)

@@ -390,6 +390,19 @@ class TestKVCRStorage(CustomTestCase):
                 self.addCleanup(backend.close)
                 backend.get_kv_hint_source()
 
+    def test_inventory_requires_discoverable_hint_source(self):
+        for extra in (
+            {},
+            {"enable_remote_hint": False, "control_advertise_host": "worker-a"},
+        ):
+            config = copy.copy(self.config)
+            config.extra_config = {"publish_inventory": True, **extra}
+            with (
+                self.subTest(extra=extra),
+                self.assertRaisesRegex(ValueError, "inventory requires"),
+            ):
+                KVCRStore(config, self.pool)
+
     def test_confirmed_mamba_boundary_is_not_shortened_by_host_capacity(self):
         """A full-boundary Mamba claim cannot validate a smaller KV staging cut.
 
