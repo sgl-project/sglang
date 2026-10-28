@@ -374,7 +374,7 @@ def test_fp8_reference_kv_dequantizes_into_the_attention_buffer():
     q8, scale = _quantize_fp8_per_token_head(padded)
     assert q8.dtype == torch.float8_e4m3fn and tuple(scale.shape) == (
         1,
-        layout.padded_reference_video_len,
+        layout.reference_video_f * layout.max_tokens_per_frame,
         2,
         1,
     )
@@ -404,8 +404,10 @@ def test_fp8_reference_kv_dequantizes_into_the_attention_buffer():
             scale,
         )
     start = layout.padded_generation_video_len
+    end = start + dequant.shape[1]
     for t in (captured["k"], captured["v"]):
-        torch.testing.assert_close(t.transpose(1, 2)[:, start:], dequant)
+        torch.testing.assert_close(t.transpose(1, 2)[:, start:end], dequant)
+        assert t.transpose(1, 2)[:, end:].abs().sum() == 0
 
 
 @pytest.mark.parametrize(

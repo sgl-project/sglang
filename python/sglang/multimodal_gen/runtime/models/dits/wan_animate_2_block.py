@@ -90,21 +90,18 @@ def _reference_video_key_mask(
 
 
 def _pad_reference_video_kv(x: torch.Tensor, layout: _InContextLayout) -> torch.Tensor:
-    """``[B, S_reference_video, H, D]`` -> the zero-padded per-frame-slot layout
-    ``[B, padded_reference_video_len, H, D]`` that _in_context_attention consumes, so the
-    static reference half of the flex K/V is copied as one contiguous block per call."""
+    """``[B, S_reference_video, H, D]`` -> this clip's reference frames in the zero-padded
+    per-frame-slot layout ``[B, reference_video_f * max_tokens_per_frame, H, D]`` that
+    _in_context_attention consumes, so the reference half of the flex K/V is one contiguous
+    copy per call. Sized to this clip, not the full clip, so a short clip's cache stays small."""
     batch_size, _, num_heads, head_dim = x.shape
     f = layout.reference_video_f
     tokens_per_frame = layout.reference_video_tokens_per_frame
     slot = layout.max_tokens_per_frame
-    out = x.new_zeros(
-        batch_size, layout.padded_reference_video_len, num_heads, head_dim
-    )
-    out[:, : f * slot].view(batch_size, f, slot, num_heads, head_dim)[
-        :, :, :tokens_per_frame
-    ] = x[:, : f * tokens_per_frame].view(
-        batch_size, f, tokens_per_frame, num_heads, head_dim
-    )
+    out = x.new_zeros(batch_size, f * slot, num_heads, head_dim)
+    out.view(batch_size, f, slot, num_heads, head_dim)[:, :, :tokens_per_frame] = x[
+        :, : f * tokens_per_frame
+    ].view(batch_size, f, tokens_per_frame, num_heads, head_dim)
     return out
 
 
@@ -365,13 +362,13 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         q: torch.Tensor,  # [B, seq_len, H, D] (gen-RoPE'd)
         k: torch.Tensor,  # [B, seq_len, H, D] (gen-RoPE'd)
         v: torch.Tensor,  # [B, seq_len, H, D]
-        # [B, padded_reference_video_len, H, D] (reference-video RoPE'd), in the zero-padded
+        # [B, reference_video_f * max_tokens_per_frame, H, D] (reference-video RoPE'd), in the zero-padded
         # slot layout of _pad_reference_video_kv; FP8 when the scales are given.
         reference_video_k: torch.Tensor,
         reference_video_v: torch.Tensor,
         block_mask: BlockMask,
         layout: _InContextLayout,
-        # [B, padded_reference_video_len, H, 1] fp32 when the reference K/V are FP8.
+        # [B, reference_video_f * max_tokens_per_frame, H, 1] fp32 when the reference K/V are FP8.
         reference_video_k_scale: torch.Tensor | None = None,
         reference_video_v_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -445,10 +442,12 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
             (k_padded, reference_video_k, reference_video_k_scale),
             (v_padded, reference_video_v, reference_video_v_scale),
         ):
-            reference_half = padded[:, padded_generation_video_len:]
+            reference_end = padded_generation_video_len + cached.shape[1]
+            reference_half = padded[:, padded_generation_video_len:reference_end]
             reference_half.copy_(cached)
             if cached_scale is not None:
                 reference_half.mul_(cached_scale)
+            padded[:, reference_end:].zero_()
 
         # At 0.0 the bias is an exact identity, so the kernel is not asked to apply it;
         # otherwise the cached partial keeps the identity compiled flex guards on (_make_score_mod).
@@ -485,7 +484,7 @@ class WanAnimate2TransformerBlock(WanTransformerBlock):
         q: torch.Tensor,  # [1, seq_len, H, D] (gen-RoPE'd)
         k: torch.Tensor,
         v: torch.Tensor,
-        reference_video_k: torch.Tensor,  # [1, padded_reference_video_len, H, D]
+        reference_video_k: torch.Tensor,  # [1, reference_video_f * max_tokens_per_frame, H, D]
         reference_video_v: torch.Tensor,
         layout: _InContextLayout,
         reference_video_k_scale: torch.Tensor | None,
