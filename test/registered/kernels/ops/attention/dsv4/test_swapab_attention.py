@@ -4,6 +4,7 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import MAX_BATCH
 from sglang.kernels.ops.attention.dsv4.norm_rope import fused_rope_inplace
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -246,7 +247,12 @@ class TestSwapABAttention(CustomTestCase):
                 self.check_case(*case, heads=32)
         self.check_case(6, 64, 192, 512, graph=True, heads=32)
 
-    @unittest.skipIf(is_hip(), "the gfx950 kernel keeps the 8-row cap")
+    @unittest.skipUnless(is_hip(), "the gfx950 router cap")
+    def test_rows_up_to_gfx950_cap(self):
+        self.check_case(MAX_BATCH, 64, 192, 512)
+        self.check_case(MAX_BATCH, 64, 192, 512, graph=True)
+
+    @unittest.skipIf(is_hip(), "the gfx950 router has its own cap")
     def test_rows_up_to_cap(self):
         """SM100 admits up to 40 rows: DSpark verify at TP4 bs <= 8."""
         for case in ((20, 16, 133, 0), (40, 128, 192, 1024)):
