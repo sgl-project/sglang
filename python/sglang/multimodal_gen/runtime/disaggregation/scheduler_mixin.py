@@ -417,6 +417,7 @@ class SchedulerDisaggMixin:
         from sglang.multimodal_gen.runtime.disaggregation.metrics import DisaggMetrics
 
         self._disagg_role = server_args.disagg_role
+        self._disagg_encode_only = server_args.disagg_encode_only
         self._disagg_sampling_params_cls = SamplingParams
         self._disagg_metrics = None
         self._pool_work_pull = None
@@ -1503,6 +1504,12 @@ class SchedulerDisaggMixin:
                 self._disagg_metrics.record_request_failed(request_id)
             return
 
+        if self._disagg_returns_encoded(result):
+            self._disagg_send_encoded(result, request_id)
+            if self._disagg_metrics:
+                self._disagg_metrics.record_request_complete(request_id)
+            return
+
         # Stage denoiser output for decoder transfer (async staging)
         tensor_fields, scalar_fields = extract_transfer_fields(result)
 
@@ -1709,6 +1716,13 @@ class SchedulerDisaggMixin:
                 self._disagg_metrics.record_request_failed(request_id)
             return
 
+        if self._disagg_returns_encoded(req_result):
+            if self._pool_result_push is not None:
+                self._disagg_send_encoded(req_result, request_id)
+            if self._disagg_metrics:
+                self._disagg_metrics.record_request_complete(request_id)
+            return
+
         # Pack and send encoder output (rank 0 only sends)
         tensor_fields, scalar_fields = extract_transfer_fields(req_result)
 
@@ -1730,6 +1744,16 @@ class SchedulerDisaggMixin:
             self._disagg_metrics.record_request_complete(request_id)
 
         logger.debug("Pool ENCODER: processed %s", request_id)
+
+    def _disagg_returns_encoded(self: Scheduler, req: Req) -> bool:
+        return self._disagg_encode_only and not (
+            self._disagg_role == RoleType.PROMPT_ENCODER and req.image_path
+        )
+
+    def _disagg_send_encoded(self: Scheduler, req: Req, request_id: str) -> None:
+        tensor_fields, scalar_fields = {}, {"request_id": request_id}
+        extract_extra_tensors(req.extra, tensor_fields, scalar_fields)
+        send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
 
     def _disagg_encoder_transfer_stage(
         self: Scheduler, request_id: str, tensor_fields: dict, scalar_fields: dict

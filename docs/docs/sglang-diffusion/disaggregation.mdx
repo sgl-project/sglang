@@ -162,8 +162,8 @@ T2I bypasses the image encoder and goes directly from prompt encoder to denoiser
 Stages within one request run sequentially; different requests can occupy
 different worker pools concurrently. This is not a latency optimization for a
 single request: separation adds transfers and allows independent placement and
-scaling. The head still serves complete image-generation requests; this is not
-a standalone API for returning training embeddings or VAE latents.
+scaling. The head serves complete image-generation requests unless
+[encode-only serving](#encode-only) is enabled.
 
 Use the same FLUX.3 package, variant, and numerical settings on every process.
 Each host currently needs a complete package on disk, even though a worker
@@ -243,6 +243,18 @@ The BF16 flow-map package has been validated on H200 with same-node,
 multi-process Mooncake RDMA: concurrent T2I, reference-size-preserving i2i,
 and both three-role and four-role topologies matched the monolithic API's
 output pixels with `quality=exact`. Cross-node execution has not been validated.
+
+### Encode-only serving {#encode-only}
+
+Pass `--disagg-encode-only` to the head and to every encoder worker to return
+encoder outputs instead of images. The last encoder role on a request's path
+(`encoder`, `prompt_encoder` for text-only requests, or `image_encoder` for
+requests with images) returns its request extras through the head, so the head
+needs no `--denoiser-urls` or `--decoder-urls`. `POST /encode` accepts `prompt`,
+optional `image_path`, `width`, `height`, and `extra_sampling_params`, and
+returns msgpack with `request_id` and `encoded`, whose tensors use the
+`/rollout/generate` serialization. Use `/model_info` and `/server_info` to key
+caches of encoded outputs.
 
 ## Multiple Instances per Role
 

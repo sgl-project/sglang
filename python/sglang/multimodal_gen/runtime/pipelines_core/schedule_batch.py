@@ -498,6 +498,8 @@ class OutputBatch:
     # Decoded LiDAR of a joint camera/LiDAR request: file paths and metadata,
     # plus range_m/intensity/validity arrays when the client asked for frames.
     lidar: dict[str, Any] | None = None
+    # request extras returned by an encode-only encoder role
+    encoded: dict[str, Any] | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional[RequestMetrics] = None

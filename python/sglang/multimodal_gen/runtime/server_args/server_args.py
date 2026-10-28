@@ -613,6 +613,7 @@ class ServerArgs(DisaggServerArgsMixin):
     disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
+    disagg_encode_only: bool = False
     disagg_instance_id: int = 0
     disagg_max_slots_per_instance: int = 8
     disagg_transfer_redundancy: float = 1.25
@@ -3904,6 +3905,16 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_disagg_capability()
 
     def _validate_disagg_capability(self) -> None:
+        if self.disagg_encode_only and self.disagg_role not in (
+            RoleType.SERVER,
+            RoleType.ENCODER,
+            RoleType.PROMPT_ENCODER,
+            RoleType.IMAGE_ENCODER,
+        ):
+            raise ValueError(
+                "--disagg-encode-only applies to the server and encoder roles, "
+                f"got {self.disagg_role.value!r}"
+            )
         if self.pipeline_config is None:
             return
         if (

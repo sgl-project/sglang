@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
     run_progress_listener,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training import (
+    encode_api,
     rollout_api,
     weights_api,
 )
@@ -539,6 +540,8 @@ def create_app(
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
+    if server_args.disagg_encode_only:
+        app.include_router(encode_api.router)
 
     app.state.server_args = server_args
     app.state.prompt_enhancer = None

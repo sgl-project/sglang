@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     PoolDispatcher,
     create_dispatch_policy,
 )
+from sglang.multimodal_gen.runtime.disaggregation.extra_tensors import (
+    restore_extra_tensors,
+)
 from sglang.multimodal_gen.runtime.disaggregation.request_state import (
     RequestState,
     RequestTracker,
@@ -186,6 +189,7 @@ class DiffusionServer:
         image_encoder_work_endpoints: list[str] | None = None,
         prompt_encoder_result_endpoint: str | None = None,
         image_encoder_result_endpoint: str | None = None,
+        encode_only: bool = False,
     ):
         split_encoding = bool(
             prompt_encoder_work_endpoints or image_encoder_work_endpoints
@@ -214,6 +218,7 @@ class DiffusionServer:
         self._num_denoisers = len(denoiser_work_endpoints)
         self._num_decoders = len(decoder_work_endpoints)
         self._timeout_s = timeout_s
+        self._encode_only = encode_only
 
         self._tracker = RequestTracker(
             init_metrics(server_args, role="server")
@@ -222,7 +227,7 @@ class DiffusionServer:
         )
         self._dispatcher = PoolDispatcher(
             num_encoders=max(1, self._num_encoders),
-            num_denoisers=self._num_denoisers,
+            num_denoisers=max(1, self._num_denoisers),
             num_decoders=max(1, self._num_decoders),
             policy_name=dispatch_policy_name,
         )
@@ -510,8 +515,10 @@ class DiffusionServer:
 
         if self._glm_distributed_state is not None and role == RoleType.DENOISER:
             self._handle_glm_denoiser_result(tensor_fields, scalar_fields)
-        elif role == RoleType.DECODER:
-            self._handle_decoder_result(tensor_fields, scalar_fields)
+        elif role == RoleType.DECODER or (
+            self._encode_only and "_disagg_error" not in scalar_fields
+        ):
+            self._handle_final_result(tensor_fields, scalar_fields, role)
         else:
             # Non-transfer frames from encoder/denoiser are error results
             # sent via send_tensors (e.g., _disagg_error).
@@ -882,26 +889,38 @@ class DiffusionServer:
             pass
         self._tracker.remove(request.client_request_id)
 
-    def _handle_decoder_result(self, tensor_fields: dict, scalar_fields: dict) -> None:
+    def _handle_final_result(
+        self, tensor_fields: dict, scalar_fields: dict, role: RoleType
+    ) -> None:
         request_id = scalar_fields["request_id"]
-        logger.debug("DiffusionServer: decoder result %s", request_id)
-        self._release_assignment(request_id, RoleType.DECODER)
+        logger.debug("DiffusionServer: %s result %s", role.value, request_id)
+        self._release_assignment(request_id, role)
         self._assignments.pop(request_id, None)
         p2p = self._transfer_state.get(request_id)
-        self._recycle_prealloc_slot(p2p, RoleType.DECODER)
+        self._recycle_prealloc_slot(p2p, role)
 
-        output_batch = OutputBatch(
-            output=tensor_fields.get("output"),
-            audio=tensor_fields.get("audio"),
-            audio_sample_rate=scalar_fields.get("audio_sample_rate"),
-            error=scalar_fields.get("error"),
-        )
+        if role == RoleType.DECODER:
+            output_batch = OutputBatch(
+                output=tensor_fields.get("output"),
+                audio=tensor_fields.get("audio"),
+                audio_sample_rate=scalar_fields.get("audio_sample_rate"),
+                error=scalar_fields.get("error"),
+            )
+        else:
+            encoded = {}
+            restore_extra_tensors(encoded, tensor_fields, scalar_fields)
+            for key in [k for k in scalar_fields if k.startswith("_extra_")]:
+                encoded[key[len("_extra_") :]] = scalar_fields.pop(key)
+            output_batch = OutputBatch(
+                encoded=encoded or None, error=scalar_fields.get("error")
+            )
         if (
             output_batch.output is None
             and output_batch.audio is None
+            and output_batch.encoded is None
             and not output_batch.error
         ):
-            output_batch.error = "Decoder returned no output"
+            output_batch.error = f"{role.value} returned no output"
 
         try:
             if output_batch.error:
@@ -918,7 +937,8 @@ class DiffusionServer:
 
         if client_identity is None:
             logger.warning(
-                "DiffusionServer: no pending client for decoder result %s",
+                "DiffusionServer: no pending client for %s result %s",
+                role.value,
                 request_id,
             )
             self._tracker.remove(request_id)

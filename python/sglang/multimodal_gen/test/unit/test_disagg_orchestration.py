@@ -10,6 +10,9 @@ import pytest
 import torch
 import zmq
 
+from sglang.multimodal_gen.runtime.disaggregation.extra_tensors import (
+    extract_extra_tensors,
+)
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import DiffusionServer
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
@@ -291,6 +294,135 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
                     len(pool.peers[0]["free_preallocated_slots"]) == 1
                     for pool in server._pools.values()
                 )
+    finally:
+        server.stop()
+        for sock in sockets:
+            sock.close(linger=0)
+        context.destroy(linger=0)
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_encode_only_returns_last_encoder_outputs(split):
+    """Without denoisers, the last encoder hop answers the client and frees its slot."""
+    context = zmq.Context()
+    sockets = []
+
+    def socket(kind):
+        sock = context.socket(kind)
+        sock.setsockopt(zmq.RCVTIMEO, 5000)
+        sock.setsockopt(zmq.LINGER, 0)
+        sockets.append(sock)
+        return sock
+
+    def bind(sock):
+        port = sock.bind_to_random_port("tcp://127.0.0.1")
+        return f"tcp://127.0.0.1:{port}"
+
+    roles = (
+        [RoleType.PROMPT_ENCODER, RoleType.IMAGE_ENCODER]
+        if split
+        else [RoleType.ENCODER]
+    )
+    work = {role: socket(zmq.PULL) for role in roles}
+    endpoints = {role: bind(sock) for role, sock in work.items()}
+    holders = [socket(zmq.PULL) for _ in range(6)]
+    frontend, *results = [bind(sock) for sock in holders]
+    for holder in holders:
+        holder.close()
+    server = DiffusionServer(
+        frontend_endpoint=frontend,
+        encoder_work_endpoints=[] if split else [endpoints[RoleType.ENCODER]],
+        denoiser_work_endpoints=[],
+        decoder_work_endpoints=[],
+        encoder_result_endpoint=results[0],
+        denoiser_result_endpoint=results[1],
+        decoder_result_endpoint=results[2],
+        prompt_encoder_work_endpoints=[endpoints[RoleType.PROMPT_ENCODER]]
+        if split
+        else None,
+        image_encoder_work_endpoints=[endpoints[RoleType.IMAGE_ENCODER]]
+        if split
+        else None,
+        prompt_encoder_result_endpoint=results[3],
+        image_encoder_result_endpoint=results[4],
+        encode_only=True,
+    )
+    try:
+        server.start()
+        assert server.wait_ready(5)
+        result = {role: socket(zmq.PUSH) for role in roles}
+        for role, sock in result.items():
+            sock.connect(server._pools[role].result_endpoint)
+            sock.send_multipart(
+                encode_transfer_msg(
+                    dict(
+                        msg_type="transfer_register",
+                        role=role.value,
+                        work_endpoint=endpoints[role],
+                        session_id=role.value,
+                        pool_ptr=1000,
+                    )
+                )
+            )
+        deadline = time.monotonic() + 5
+        while not all(server._pools[role].peers for role in roles):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        client = socket(zmq.REQ)
+        client.connect(frontend)
+        image_path = ["reference.png"] if split else None
+        client.send_pyobj([Req(request_id="0", prompt="test", image_path=image_path)])
+        work[roles[0]].recv_multipart()
+        if split:
+            sender, receiver = roles
+            result[sender].send_multipart(
+                encode_transfer_msg(
+                    dict(
+                        msg_type="transfer_staged",
+                        request_id="0",
+                        data_size=64,
+                        manifest={},
+                        scalar_fields={"image_path": image_path},
+                    )
+                )
+            )
+            assert decode_transfer_msg(work[receiver].recv_multipart())
+            result[receiver].send_multipart(
+                encode_transfer_msg(
+                    dict(
+                        msg_type="transfer_allocated",
+                        request_id="0",
+                        session_id=receiver.value,
+                        pool_ptr=1000,
+                        slot_offset=0,
+                    )
+                )
+            )
+            assert decode_transfer_msg(work[sender].recv_multipart())
+            result[sender].send_multipart(
+                encode_transfer_msg(dict(msg_type="transfer_pushed", request_id="0"))
+            )
+            assert decode_transfer_msg(work[receiver].recv_multipart())
+        tensor_fields, scalar_fields = {}, {"request_id": "0"}
+        extract_extra_tensors(
+            {"text": [(torch.ones(2, 3), torch.arange(4))], "crop": [1, 2]},
+            tensor_fields,
+            scalar_fields,
+        )
+        send_tensors(result[roles[-1]], tensor_fields, scalar_fields)
+        output = client.recv_pyobj()
+        assert output.error is None
+        torch.testing.assert_close(output.encoded["text"][0][0], torch.ones(2, 3))
+        torch.testing.assert_close(output.encoded["text"][0][1], torch.arange(4))
+        assert output.encoded["crop"] == [1, 2]
+        deadline = time.monotonic() + 5
+        while server._tracker.get("0") is not None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert not server._assignments
+        assert not server._transfer_state
+        assert [server._pools[role].free_slots[0] for role in roles] == [4] * len(roles)
+        assert server._thread.is_alive()
     finally:
         server.stop()
         for sock in sockets:
