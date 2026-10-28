@@ -69,9 +69,11 @@ Some other notes:
 """
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
-# DeepGEMM's paged-MQA metadata kernel cannot schedule more rows than this on
-# SM120 (shared-memory cap), so SM120 always splits larger batches.
+# DeepGEMM's paged-MQA metadata kernel cannot schedule more rows than this
+# (shared-memory cap), so larger batches always split. SM100 keeps two ints per
+# row in shared memory and fails past ~29k rows.
 _SM120_INDEXER_M_CHUNK = 4096
+_SM100_INDEXER_M_CHUNK = 16384
 
 
 def plan_indexer_row_chunks(
@@ -79,16 +81,16 @@ def plan_indexer_row_chunks(
     num_rows: int,
     num_cols: int,
     budget_bytes: Optional[int],
-    sm120_row_cap: Optional[int],
+    row_cap: Optional[int],
 ) -> Optional[int]:
     """Query rows per paged-indexer chunk; None runs the whole batch in one call.
 
     The fp32 logits are [num_rows, num_cols] per layer, so the chunk is the
-    smaller of the SM120 kernel cap and what the memory budget allows.
+    smaller of the metadata kernel's row cap and what the memory budget allows.
     """
     rows_per_chunk = None
-    if sm120_row_cap is not None and num_rows > sm120_row_cap:
-        rows_per_chunk = sm120_row_cap
+    if row_cap is not None and num_rows > row_cap:
+        rows_per_chunk = row_cap
     if budget_bytes is not None:
         need_chunk, budget_bytes = mqa_logits_should_chunk(
             num_rows=num_rows,
@@ -249,7 +251,13 @@ class PagedIndexerMetadata:
                 if mx
                 else self.max_compressed_seq_len,
                 budget_bytes=self.mqa_logits_budget_bytes,
-                sm120_row_cap=_SM120_INDEXER_M_CHUNK if _IS_SM120 else None,
+                row_cap=(
+                    _SM120_INDEXER_M_CHUNK
+                    if _IS_SM120
+                    else _SM100_INDEXER_M_CHUNK
+                    if mx and not use_jit_indexer
+                    else None
+                ),
             )
             if self.rows_per_chunk is not None and group > 1:
                 self.rows_per_chunk = max(group, self.rows_per_chunk // group * group)

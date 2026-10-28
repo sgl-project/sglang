@@ -59,6 +59,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_TOTAL_MEM_FRACTION,
     mqa_logits_budget_bytes,
     mqa_logits_free_mem_fraction,
+    mqa_logits_ragged_budget_cols,
     mqa_logits_should_chunk,
     mqa_logits_static_budget_bytes,
 )
@@ -1323,7 +1324,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         use_dg_native = (
             not use_cute_dsl
-            and not self.mx_mqa_logits
             and _is_cuda
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
@@ -1606,8 +1606,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
-        # SM100 also holds DeepGEMM's BF16 logits while they widen to FP32
-        budget_cols = k_offset * 3 // 2 if self.mx_mqa_logits else k_offset
+        budget_cols = mqa_logits_ragged_budget_cols(
+            k_offset,
+            mx=self.mx_mqa_logits,
+            deep_gemm=_is_cuda and not _use_torch_mqa_logits(),
+        )
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=q_offset,
             num_cols=budget_cols,

@@ -32,8 +32,9 @@ register_cuda_ci(est_time=40, stage="nightly", runner_config="4-gpu-b200")
 def _run_deepgemm_paged_mqa_logits(data, batch_size, next_n, num_heads, max_model_len):
     """Mirrors the DEEPGEMM dispatch in
     sglang.srt.layers.attention.dsa.dsa_indexer.Indexer._get_topk_paged:
-    next_n>=2 (target-verify) goes through the native wrapper before SM100,
-    everything else goes through the split wrapper with one row per token."""
+    next_n>=2 (target-verify) goes through the native wrapper with a schedule built
+    from the same [batch, next_n] lengths, everything else through the split
+    wrapper with one row per token."""
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
     kv_fused = data["kv_fused"]
     if uses_mx_mqa_logits(kv_fused.device):
@@ -50,7 +51,7 @@ def _run_deepgemm_paged_mqa_logits(data, batch_size, next_n, num_heads, max_mode
     )
     q_rows = data["q_fp8"].view(batch_size * next_n, num_heads, HEAD_DIM)
     block_tables_expanded = data["block_table"].repeat_interleave(next_n, dim=0)
-    if next_n >= 2 and not uses_mx_mqa_logits(kv_fused.device):
+    if next_n >= 2:
         return deepgemm_paged_mqa_logits_native(
             fp8_paged_mqa_logits,
             q_rows,

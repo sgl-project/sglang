@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsv4.indexer import (
     topk_transform_pytorch_vectorized,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
+    _SM100_INDEXER_M_CHUNK,
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
     iter_row_chunks,
@@ -690,7 +691,7 @@ class TestMqaLogitsBudgetArithmetic(CustomTestCase):
             budget_bytes=budget,
         )
         cases = (
-            # (num_rows, num_cols, budget_bytes, sm120_row_cap) -> rows_per_chunk
+            # (num_rows, num_cols, budget_bytes, row_cap) -> rows_per_chunk
             ((8192, 1024, None, None), None),
             ((8192, 1024, None, 4096), 4096),
             ((4096, 1024, None, 4096), None),
@@ -704,7 +705,7 @@ class TestMqaLogitsBudgetArithmetic(CustomTestCase):
                         num_rows=num_rows,
                         num_cols=num_cols,
                         budget_bytes=budget_bytes,
-                        sm120_row_cap=cap,
+                        row_cap=cap,
                     ),
                     expected,
                 )
@@ -779,7 +780,7 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
                     self.assertEqual(result, 4096)
                     budget.assert_called_once_with(device_index=0, allow_sync=True)
 
-    def _build(self, *, num_rows: int, budget, use_topk_v2: bool):
+    def _build(self, *, num_rows: int, budget, use_topk_v2: bool, mx: bool = False):
         deep_gemm = SimpleNamespace(
             get_num_sms=MagicMock(return_value=1),
             get_paged_mqa_logits_metadata=MagicMock(
@@ -797,6 +798,7 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
             patch(f"{_METADATA}.is_hip", return_value=False),
             patch(f"{_METADATA}.is_xpu", return_value=False),
             patch(f"{_METADATA}._IS_SM120", False),
+            patch(f"{_METADATA}.uses_mx_mqa_logits", return_value=mx),
             patch.object(
                 PagedIndexerMetadata, "_mqa_logits_budget", return_value=budget
             ),
@@ -870,6 +872,18 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
         self.assertIsInstance(metadata.deep_gemm_metadata, torch.Tensor)
         deep_gemm.get_paged_mqa_logits_metadata.assert_called_once()
         plan_topk_v2.assert_called_once()
+
+    def test_sm100_caps_rows_per_deep_gemm_schedule(self):
+        num_rows = _SM100_INDEXER_M_CHUNK + 1
+        metadata, deep_gemm, _ = self._build(
+            num_rows=num_rows, budget=None, use_topk_v2=False, mx=True
+        )
+        self.assertEqual(metadata.rows_per_chunk, _SM100_INDEXER_M_CHUNK)
+        schedule_rows = [
+            call.args[0].shape[0]
+            for call in deep_gemm.get_paged_mqa_logits_metadata.call_args_list
+        ]
+        self.assertEqual(schedule_rows, [_SM100_INDEXER_M_CHUNK, 1])
 
 
 class TestChunkedTopKMatchesUnchunked(CustomTestCase):

@@ -20,6 +20,7 @@ torch = pytest.importorskip("torch")
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool  # noqa: E402
 from sglang.srt.layers.attention.mqa_logits_utils import (  # noqa: E402
     MQA_LOGITS_MAX_BYTES_ROCM,
+    mqa_logits_ragged_budget_cols,
     mqa_logits_row_bytes,
     mqa_logits_should_chunk,
 )
@@ -51,6 +52,12 @@ def test_the_ceiling_is_the_largest_logits_aiter_still_takes():
 def test_a_smaller_memory_budget_still_wins():
     one_gib = 2**30
     assert _decide(16_384, 32_767, mem_budget=one_gib) == (True, one_gib)
+
+
+def test_ragged_budget_counts_the_compressed_logits_deep_gemm_keeps_live():
+    assert mqa_logits_ragged_budget_cols(1024, mx=True, deep_gemm=True) == 1536
+    assert mqa_logits_ragged_budget_cols(1024, mx=False, deep_gemm=True) == 2048
+    assert mqa_logits_ragged_budget_cols(1024, mx=False, deep_gemm=False) == 1024
 
 
 def test_off_rocm_the_budget_is_untouched():
