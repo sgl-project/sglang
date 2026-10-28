@@ -118,8 +118,15 @@ def partial_gluon(
     qh = gl.arange(0, H, gl.SliceLayout(1, kv_layout))
     qd = gl.arange(0, 512, gl.SliceLayout(0, kv_layout))
     q = gl.load(Q + b * QS + qh[:, None] * QH + qd[None, :])
+    # transposed=False: a lane holds 4 consecutive d of one head in the PV result,
+    # so `value` stores to PART [h, d] without an LDS relayout
     mf: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[4, 1]
+        version=4, instr_shape=[16, 16, 32], transposed=False, warps_per_cta=[4, 1]
+    )
+    # every warp holds all BT tokens, and k_width 4 is the accumulator's token
+    # order, so P feeds the PV MFMA from registers
+    mp: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4, instr_shape=[16, 16, 32], transposed=False, warps_per_cta=[1, 4]
     )
     kv_smem = gl.allocate_shared_memory(
         gl.bfloat16,
@@ -136,34 +143,29 @@ def partial_gluon(
         * SCALE
     )
     valid = gl.convert_layout(valid, gl.SliceLayout(1, mf))
-    scores = gl.where(valid[:, None], scores, -float("inf"))
+    scores = gl.convert_layout(gl.where(valid[:, None], scores, -float("inf")), mp)
     mx = gl.max(scores, 0)
     mx = gl.where(mx == -float("inf"), 0.0, mx)
     prob = gl.exp(scores - mx[None, :])
     denom = gl.sum(prob, 0)
     hi = prob.to(gl.bfloat16)
     kv_t = kv_smem.permute((1, 0))
-    # not transposed: a lane holds 4 consecutive d of one head, so O stores to
-    # PART [h, d] without an LDS relayout
-    pv: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=False, warps_per_cta=[4, 1]
-    )
     value = gl.amd.cdna4.mfma(
-        kv_t.load(gl.DotOperandLayout(0, pv, 8)),
-        gl.convert_layout(hi, gl.DotOperandLayout(1, pv, 8)),
-        gl.zeros((512, H), gl.float32, pv),
+        kv_t.load(gl.DotOperandLayout(0, mf, 4)),
+        gl.convert_layout(hi, gl.DotOperandLayout(1, mf, 4), assert_trivial=True),
+        gl.zeros((512, H), gl.float32, mf),
     )
     if COMPENSATE:
         lo = (prob - hi.to(gl.float32)).to(gl.bfloat16)
         value = gl.amd.cdna4.mfma(
-            kv_t.load(gl.DotOperandLayout(0, pv, 8)),
-            gl.convert_layout(lo, gl.DotOperandLayout(1, pv, 8)),
+            kv_t.load(gl.DotOperandLayout(0, mf, 4)),
+            gl.convert_layout(lo, gl.DotOperandLayout(1, mf, 4), assert_trivial=True),
             value,
         )
-    d = gl.arange(0, 512, gl.SliceLayout(1, pv))
-    h = gl.arange(0, H, gl.SliceLayout(0, pv))
+    d = gl.arange(0, 512, gl.SliceLayout(1, mf))
+    h = gl.arange(0, H, gl.SliceLayout(0, mf))
     gl.store(PART + ((b * NT + t) * H + h[None, :]) * 512 + d[:, None], value)
-    hs = gl.arange(0, H, gl.SliceLayout(0, mf))
+    hs = gl.arange(0, H, gl.SliceLayout(0, mp))
     gl.store(MAX + (b * NT + t) * H + hs, mx)
     gl.store(SUM + (b * NT + t) * H + hs, denom)
 
