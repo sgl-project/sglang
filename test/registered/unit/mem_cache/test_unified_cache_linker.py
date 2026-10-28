@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
     LayerWiseLoadCounter,
+    TransferReady,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
@@ -1652,14 +1653,14 @@ class TestTransferReadyEvents(CustomTestCase):
 
     def test_transfer_waits_on_the_forward_using_the_pages(self):
         forward_stream = MagicMock(name="forward_stream")
-        indices_ready, forward_done = self._record(forward_stream)
+        indices_ready, forward_done = self._record(forward_stream).events
         indices_ready.record.assert_called_once_with()
         forward_done.record.assert_called_once_with(forward_stream)
         # The transfer thread waits; the forward stream's own order is untouched.
         self.assertEqual(forward_stream.mock_calls, [])
 
     def test_transfer_without_a_forward_stream_waits_on_the_current_one(self):
-        (indices_ready,) = self._record(None)
+        (indices_ready,) = self._record(None).events
         indices_ready.record.assert_called_once_with()
 
     def test_mooncake_offload_thread_waits_on_every_event(self):
@@ -1671,7 +1672,12 @@ class TestTransferReadyEvents(CustomTestCase):
         linker.offload_results = queue.Queue()
         linker.offload_queue = queue.Queue()
         linker.offload_queue.put(
-            (["transfer"], 1, [order.indices_ready, order.kv_written], "session-a")
+            (
+                ["transfer"],
+                1,
+                TransferReady([order.indices_ready, order.forward_done]),
+                "session-a",
+            )
         )
         linker.offload_queue.put(None)
         linker.offload_thread_func()
@@ -1679,7 +1685,7 @@ class TestTransferReadyEvents(CustomTestCase):
             order.mock_calls,
             [
                 call.indices_ready.synchronize(),
-                call.kv_written.synchronize(),
+                call.forward_done.synchronize(),
                 call.storage.batch_set_v2(
                     ["transfer"],
                     HiCacheStorageExtraInfo(extra_info={"session_id": "session-a"}),
@@ -1692,10 +1698,9 @@ class TestTransferReadyEvents(CustomTestCase):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
         order = MagicMock()
         linker.record_transfer_ready = order.record_transfer_ready
-        order.record_transfer_ready.return_value = [
-            order.indices_ready,
-            order.forward_done,
-        ]
+        order.record_transfer_ready.return_value = TransferReady(
+            [order.indices_ready, order.forward_done]
+        )
         linker.load_layer_wise = order.load_layer_wise
         linker.layer_done_counter = MagicMock()
         linker.layer_done_counter.update_producer.return_value = 3
@@ -1717,6 +1722,33 @@ class TestTransferReadyEvents(CustomTestCase):
             ],
         )
         linker.layer_done_counter.fail.assert_not_called()
+
+    def test_mla_broadcast_waits_on_every_event_before_the_first_layer(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        order = MagicMock()
+        linker.mla_broadcaster = order.broadcaster
+        linker.num_layers = 2
+        ready = TransferReady([order.indices_ready, order.forward_done])
+        linker.broadcast_loads = {3: (0, "prepared", ready)}
+        device = MagicMock(name="device_module")
+        device.current_stream.return_value = order.stream
+        with patch(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker.device_module",
+            device,
+        ):
+            linker._broadcast_loaded_layers(3, 0)
+            linker._broadcast_loaded_layers(3, 1)
+        # The peers' copies are queued behind every event, and only once.
+        self.assertEqual(
+            order.mock_calls,
+            [
+                call.stream.wait_event(order.indices_ready),
+                call.stream.wait_event(order.forward_done),
+                call.broadcaster.broadcast_loaded_layer(0, "prepared"),
+                call.broadcaster.broadcast_loaded_layer(1, "prepared"),
+            ],
+        )
+        self.assertEqual(linker.broadcast_loads, {})
 
 
 if __name__ == "__main__":

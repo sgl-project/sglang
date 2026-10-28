@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
+    TransferReady,
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
@@ -91,7 +92,7 @@ class _PoolRangePlan:
 
 
 # One queued offload: the pools it resolved to, and the events gating the read.
-_OffloadTask = tuple[list[PoolTransfer], list[object]]
+_OffloadTask = tuple[list[PoolTransfer], TransferReady]
 
 
 def _offload_task_pages(expanded: list[PoolTransfer]) -> int:
@@ -500,9 +501,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._freeze_gc_once()
         pending = self._pending
         plans = self._build_load_plans(list(pending.values()))
-        ready_events = self.record_transfer_ready()
+        ready = self.record_transfer_ready()
         counter_index = self.layer_done_counter.update_producer()
-        self._load_queue.put((counter_index, plans, ready_events))
+        self._load_queue.put((counter_index, plans, ready))
         self._pending = {}
         self._stats["load"] += len(pending)
         return counter_index
@@ -644,8 +645,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, plans, ready_events = task
-                self._run_layer_wise_batch(counter_index, plans, ready_events)
+                counter_index, plans, ready = task
+                self._run_layer_wise_batch(counter_index, plans, ready)
             finally:
                 self._load_queue.task_done()
 
@@ -779,14 +780,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return max(1, RANGES_PER_CALL // max(1, ranges_per_object))
 
     def _run_layer_wise_batch(
-        self,
-        counter_index: int,
-        plans: list[_PoolRangePlan],
-        ready_events: list[object],
+        self, counter_index: int, plans: list[_PoolRangePlan], ready: TransferReady
     ) -> None:
         try:
-            for event in ready_events:
-                event.synchronize()
+            ready.synchronize()
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
             for plan in plans:
                 for logical_layer in self.pool_layers[plan.name]:
@@ -843,8 +840,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self._freeze_gc_once()
-        ready_events = self.record_transfer_ready()
-        self._offload_queue.put((expanded, ready_events))
+        ready = self.record_transfer_ready()
+        self._offload_queue.put((expanded, ready))
         return True
 
     def _take_offload_batch(self) -> tuple[list[_OffloadTask], bool]:
@@ -898,9 +895,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 self._offload_results.put(success)
 
     def _run_offload(self, tasks: list[_OffloadTask]) -> bool:
-        for _, ready_events in tasks:
-            for event in ready_events:
-                event.synchronize()
+        for _, ready in tasks:
+            ready.synchronize()
         next_slot = 0
 
         def materialize_indices(indices: torch.Tensor) -> torch.Tensor:
