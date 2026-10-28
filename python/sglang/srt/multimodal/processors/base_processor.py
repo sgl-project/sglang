@@ -1970,7 +1970,7 @@ class BaseMultimodalProcessor(ABC):
                         feature=feature,
                         format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
                         offsets=dict_item.pop("offsets", None),
-                        # Trusted media identity for KV trie reuse and KV-event hashes.
+                        # Legacy hint; actual tensor contents determine cache identity.
                         hash=dict_item.pop("hash", None),
                         model_specific_data=dict_item,
                     )
