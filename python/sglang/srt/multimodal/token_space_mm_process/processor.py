@@ -253,9 +253,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         output["mm_spans"] = mm_spans
         if compute_mrope_positions:
             mrope_positions, mrope_position_delta = (
-                self.strategy.compute_mrope_positions(
-                    expanded_input_ids, media_features
-                )
+                self.strategy.compute_mrope_positions(output)
             )
             if mrope_positions is not None:
                 output["mrope_positions"] = mrope_positions
