@@ -271,7 +271,7 @@ def preprocess_qwen3_vl_video_sync(
         video_config, total_frames=total_frames, video_fps=video_fps
     )
     indices = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
-    video = torch.as_tensor(vr.get_frames_at(indices)).permute(0, 3, 1, 2)
+    video = vr.get_frames_as_tensor(indices).permute(0, 3, 1, 2)
 
     nframes, _, height, width = video.shape
     factor_area = image_factor * image_factor
