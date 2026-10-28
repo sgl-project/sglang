@@ -427,8 +427,10 @@ def moe_fused_gate(
 
     from sglang.srt.environ import envs
 
+    # the fast paths below read one 2-D score tensor, not split-K partials
     if (
-        envs.SGLANG_OPT_SM120_MTP_ROUTER_TOP22.get()
+        split_k == 1
+        and envs.SGLANG_OPT_SM120_MTP_ROUTER_TOP22.get()
         and scores.is_cuda
         and torch.cuda.get_device_capability(scores.device) == (12, 0)
         and 2 <= scores.shape[0] <= 16
@@ -466,7 +468,8 @@ def moe_fused_gate(
     # kernels are order-insensitive). It is 3.1-3.5x faster than the Triton
     # kernel at [1..8192, 896] top-16 on B200.
     if (
-        scoring_func.lower() == "sigmoid"
+        split_k == 1
+        and scoring_func.lower() == "sigmoid"
         and num_fused_shared_experts == 0
         and num_expert_group <= 1
         and moe_softcapping == 0.0
