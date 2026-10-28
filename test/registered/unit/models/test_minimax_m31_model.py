@@ -288,12 +288,23 @@ class TestMiniMaxM31Rocm(CustomTestCase):
             _minimax_m3_overrides(rocm_server_args(tp_size=8), NVFP4)
 
     def test_quark_mxfp4_keeps_custom_all_reduce(self):
-        """RCCL slows the Quark path's decode; MXFP8 keeps its default."""
+        """RCCL slows the Quark path's decode on gfx950, where it was measured; MXFP8 and
+        other ROCm GPUs keep the default."""
         with gfx950(), envs.SGLANG_M3_ALLOW_CUSTOM_AR.override(False):
             quark = _minimax_m3_overrides(
                 rocm_server_args(quantization="quark_mxfp4"), MXFP8
             )
             mxfp8 = _minimax_m3_overrides(rocm_server_args(quantization="mxfp8"), MXFP8)
+        with (
+            override_platform(
+                is_blackwell=False, is_sm100=False, is_hip=True, is_gfx95=False
+            ),
+            envs.SGLANG_M3_ALLOW_CUSTOM_AR.override(False),
+        ):
+            quark_gfx942 = _minimax_m3_overrides(
+                rocm_server_args(quantization="quark_mxfp4"), MXFP8
+            )
+        self.assertTrue(quark_gfx942["disable_custom_all_reduce"])
         self.assertNotIn("disable_custom_all_reduce", quark)
         self.assertTrue(mxfp8["disable_custom_all_reduce"])
 
