@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.layers.cp.utils import cp_live_store_rows
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -164,7 +165,7 @@ def pcg_dsa_indexer_prefill_split(
     # the live rows are stored.
     n_store = extend_num_tokens
     if in_cp:
-        n_store = min(n_store, key.shape[0], forward_batch.out_cache_loc.shape[0])
+        n_store = cp_live_store_rows(forward_batch, key.shape[0], "indexer K")
     indexer._store_index_k_cache(
         forward_batch=forward_batch,
         layer_id=layer_id,

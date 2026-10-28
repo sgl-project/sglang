@@ -347,6 +347,48 @@ def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
     return strategy.shard_position_ids(complete_position_ids, forward_batch)
 
 
+def cp_local_rope_positions(forward_batch, positions: Any, local_k: Any) -> Any:
+    """Return the CP-local positions matching the local K shard, row for row.
+
+    The breakable prefill graph adapter stamps the local, physically padded
+    rows on attn_cp_metadata (``presharded_positions``); eager CP leaves it
+    unset and hands over the full-sequence positions, which are sharded here.
+    """
+    assert is_cp_active(forward_batch)
+    metadata = forward_batch.attn_cp_metadata
+    presharded = getattr(metadata, "presharded_positions", None)
+    if presharded is not None:
+        positions = presharded
+    else:
+        positions = cp_shard_position_ids(positions, forward_batch)
+    assert positions.shape[0] == local_k.shape[0], (
+        "CP prefill: rope positions do not match the local K shard "
+        f"(positions={positions.shape[0]}, k={local_k.shape[0]}, "
+        f"presharded={presharded is not None})"
+    )
+    return positions
+
+
+def cp_live_store_rows(forward_batch, gathered_rows: int, what: str) -> int:
+    """Rows to write to the KV cache after a CP all-gather: the live tokens.
+
+    The gathered tensor may carry padded bucket rows at its tail and BCG replay
+    hands over a bucket-sized static out_cache_loc; both must cover the live
+    rows and only those rows are written.
+    """
+    assert is_cp_active(forward_batch)
+    n_store = int(forward_batch.attn_cp_metadata.total_seq_lens)
+    n_loc = int(forward_batch.out_cache_loc.shape[0])
+    assert n_store <= gathered_rows, (
+        f"CP prefill ({what}): gathered rows {gathered_rows} < live tokens {n_store}"
+    )
+    assert n_store <= n_loc, (
+        f"CP prefill ({what}): out_cache_loc has {n_loc} rows < live tokens "
+        f"{n_store}; padding must sit at the tail of out_cache_loc"
+    )
+    return n_store
+
+
 def cp_interleave_input_ids(input_ids: Any, forward_batch):
     assert is_cp_active(forward_batch)
     if not get_moe_a2a_backend().is_none():
