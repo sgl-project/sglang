@@ -81,7 +81,7 @@ def test_matches_unfused_across_thread_transitions(quant: bool):
 
 
 def test_gate_skips_batch_invariant_and_large_batches(monkeypatch):
-    import sglang.srt.batch_invariant_ops as bio
+    import sglang.srt.models.deepseek_v4_mhc as mhc
     from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import MAX_ROWS
     from sglang.srt.models.deepseek_v4_mhc import (
         HcConfig,
@@ -89,11 +89,11 @@ def test_gate_skips_batch_invariant_and_large_batches(monkeypatch):
     )
 
     cfg = HcConfig(4, 20, 1e-6, 1e-6, HIDDEN, True, False)
-    monkeypatch.setattr(bio, "is_batch_invariant_mode_enabled", lambda: False)
+    monkeypatch.setattr(mhc, "is_batch_invariant_mode_enabled", lambda: False)
     assert _can_use_decode_post_combine(cfg, MAX_ROWS)
     assert not _can_use_decode_post_combine(cfg, MAX_ROWS + 1)
     assert not _can_use_decode_post_combine(cfg, 0)
-    monkeypatch.setattr(bio, "is_batch_invariant_mode_enabled", lambda: True)
+    monkeypatch.setattr(mhc, "is_batch_invariant_mode_enabled", lambda: True)
     assert not _can_use_decode_post_combine(cfg, 1)
 
 

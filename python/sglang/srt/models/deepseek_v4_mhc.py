@@ -30,10 +30,17 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
+from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
+    MAX_ROWS as DECODE_POST_COMBINE_MAX_ROWS,
+)
+from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
+    mhc_post_combine_norm_decode,
+)
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
@@ -656,6 +663,7 @@ def _can_use_mega_mhc(cfg: HcConfig) -> bool:
         envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
         and get_platform().is_sm100
         and not cfg.cp_prefill
+        and (get_forward().is_extend_in_batch or is_in_prefill_graph_scope())
     )
 
 
@@ -671,21 +679,11 @@ def _decode_post_combine_supported(cfg: HcConfig) -> bool:
 
 
 def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
-    from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import MAX_ROWS
-    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-
     return (
-        0 < rows <= MAX_ROWS
+        envs.SGLANG_OPT_DSV41_MHC_POST_COMBINE_DECODE.get()
+        and 0 < rows <= DECODE_POST_COMBINE_MAX_ROWS
         and _decode_post_combine_supported(cfg)
         and not is_batch_invariant_mode_enabled()
-    )
-
-
-def _mega_mhc_takes_extend(cfg: HcConfig, next: HcNextBoundary) -> bool:
-    return (
-        next.hc is not None
-        and _can_use_mega_mhc(cfg)
-        and (get_forward().is_extend_in_batch or is_in_prefill_graph_scope())
     )
 
 
@@ -701,33 +699,6 @@ def _post_fusion(
     combine computes itself."""
     cfg = hc.cfg
     pre, post_mix, comb = coefficients
-    if (
-        next is not None
-        and next.norm_fusable
-        and envs.SGLANG_OPT_DSV41_MHC_POST_COMBINE_DECODE.get()
-        and _can_use_decode_post_combine(cfg, y.shape[0])
-        and not _mega_mhc_takes_extend(cfg, next)
-    ):
-        from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
-            mhc_post_combine_norm_decode,
-        )
-
-        quant = next.accepts_mxfp8
-        updated, normalized, q, sf = mhc_post_combine_norm_decode(
-            y,
-            residual,
-            post_mix,
-            comb,
-            pre,
-            next.norm.weight,
-            next.norm.variance_epsilon,
-            quant=quant,
-        )
-        if quant:
-            return HcState(
-                updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
-            )
-        return HcState(updated, pre, HcNormed(normalized))
     if (
         next is not None
         and next.norm_fusable
@@ -764,6 +735,27 @@ def _post_fusion(
         if moe_input is not None:
             moe_input.mark(normalized)
         return HcState(updated, pre, HcNormed(normalized), stats)
+    if (
+        next is not None
+        and next.norm_fusable
+        and _can_use_decode_post_combine(cfg, y.shape[0])
+    ):
+        quant = next.accepts_mxfp8
+        updated, normalized, q, sf = mhc_post_combine_norm_decode(
+            y,
+            residual,
+            post_mix,
+            comb,
+            pre,
+            next.norm.weight,
+            next.norm.variance_epsilon,
+            quant=quant,
+        )
+        if quant:
+            return HcState(
+                updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
+            )
+        return HcState(updated, pre, HcNormed(normalized))
     if (
         next is not None
         and next.norm_fusable
