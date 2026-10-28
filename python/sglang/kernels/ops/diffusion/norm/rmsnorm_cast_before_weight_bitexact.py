@@ -30,9 +30,15 @@ def _ordered_rstd(
     M: tl.constexpr,
     DIM: tl.constexpr,
     ROWS: tl.constexpr,
+    HEADS: tl.constexpr = 1,
+    TOKEN_STRIDE: tl.constexpr = 0,
     EPS: tl.constexpr = 1e-6,
 ):
     rows = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
+    if TOKEN_STRIDE == 0 or TOKEN_STRIDE == HEADS * DIM:
+        offsets = rows * DIM
+    else:
+        offsets = (rows // HEADS) * TOKEN_STRIDE + (rows % HEADS) * DIM
     lanes = tl.arange(0, 32)
     parts = tl.arange(0, 4)
     acc = tl.full((ROWS, 32, 4), 0, tl.float32)
@@ -41,7 +47,7 @@ def _ordered_rstd(
     for chunk in tl.static_range(DIM // 128):
         cols = chunk * 128 + lanes[:, None] * 4 + parts[None, :]
         x = tl.load(
-            X + rows[:, None, None] * DIM + cols[None, :, :], rows[:, None, None] < M, 0
+            X + offsets[:, None, None] + cols[None, :, :], rows[:, None, None] < M, 0
         ).to(tl.float32)
         acc = acc + mul_rn_f32(x, x)
     even, odd = tl.split(tl.reshape(acc, (ROWS, 32, 2, 2)))
@@ -69,7 +75,7 @@ def _ordered_norm_kernel(
     EPS: tl.constexpr,
 ):
     rows = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
-    rstd = _ordered_rstd(X, M, DIM, ROWS, EPS)
+    rstd = _ordered_rstd(X, M, DIM, ROWS, EPS=EPS)
 
     cols = tl.arange(0, BLOCK)
     mask = (rows[:, None] < M) & (cols[None, :] < DIM)
@@ -111,12 +117,25 @@ def _norm_modulate_kernel(
 
 
 @triton.jit
-def _norm_rope_kernel(X, Weight, Cos, Sin, Out, M: tl.constexpr, HEADS: tl.constexpr):
+def _norm_rope_kernel(
+    X,
+    Weight,
+    Cos,
+    Sin,
+    Out,
+    M: tl.constexpr,
+    HEADS: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+):
     rows = tl.program_id(0).to(tl.int64) * 16 + tl.arange(0, 16)
     cols = tl.arange(0, 128)
     mask = rows[:, None] < M
-    rstd = _ordered_rstd(X, M, 128, 16)
-    x = tl.load(X + rows[:, None] * 128 + cols[None, :], mask, 0).to(tl.float32)
+    rstd = _ordered_rstd(X, M, 128, 16, HEADS, TOKEN_STRIDE)
+    if TOKEN_STRIDE == HEADS * 128:
+        offsets = rows * 128
+    else:
+        offsets = (rows // HEADS) * TOKEN_STRIDE + (rows % HEADS) * 128
+    x = tl.load(X + offsets[:, None] + cols[None, :], mask, 0).to(tl.float32)
     weight = tl.load(Weight + cols).to(tl.float32)
     norm = mul_rn_f32(x, rstd[:, None]).to(tl.bfloat16).to(tl.float32)
     norm = mul_rn_f32(norm, weight[None, :]).to(tl.bfloat16).to(tl.float32)
@@ -204,7 +223,9 @@ def can_use_rmsnorm_cast_before_weight_rope(
     )
 
 
-def _valid_rmsnorm_cast_before_weight(x: torch.Tensor, weight: torch.Tensor) -> bool:
+def _valid_rmsnorm_cast_before_weight(
+    x: torch.Tensor, weight: torch.Tensor, *, require_contiguous: bool = True
+) -> bool:
     return (
         is_cuda()
         and x.is_cuda
@@ -213,7 +234,7 @@ def _valid_rmsnorm_cast_before_weight(x: torch.Tensor, weight: torch.Tensor) -> 
         and x.dtype == weight.dtype == torch.bfloat16
         and x.ndim >= 2
         and weight.shape == (x.shape[-1],)
-        and x.is_contiguous()
+        and (not require_contiguous or x.is_contiguous())
         and weight.is_contiguous()
         and x.numel() > 0
     )
@@ -241,9 +262,13 @@ def _valid_rmsnorm_cast_before_weight_modulate(x, weight, scale, shift):
 
 def _valid_rmsnorm_cast_before_weight_rope(x, weight, cos, sin):
     return (
-        _valid_rmsnorm_cast_before_weight(x, weight)
+        _valid_rmsnorm_cast_before_weight(x, weight, require_contiguous=False)
         and x.ndim == 4
         and x.shape[-1] == 128
+        and x.stride(-1) == 1
+        and x.stride(-2) == 128
+        and x.stride(1) >= x.shape[2] * 128
+        and (x.shape[0] == 1 or x.stride(0) == x.shape[1] * x.stride(1))
         and 16 <= x.numel() // 128
         and x.numel() < 2**29
         and cos.shape == sin.shape == (x.shape[0] * x.shape[1], 128)
@@ -255,7 +280,7 @@ def _valid_rmsnorm_cast_before_weight_rope(x, weight, cos, sin):
 
 
 def _fake_rmsnorm_epilogue(x, weight, first, second):
-    return torch.empty_like(x)
+    return torch.empty_like(x, memory_format=torch.contiguous_format)
 
 
 @register_custom_op(
@@ -298,7 +323,7 @@ def rmsnorm_cast_before_weight_rope_bitexact(
     if not _valid_rmsnorm_cast_before_weight_rope(x, weight, cos, sin):
         raise ValueError("Unsupported MOSSImage RMSNorm + RoPE inputs.")
     with torch.cuda.device(x.device):
-        out = torch.empty_like(x)
+        out = torch.empty_like(x, memory_format=torch.contiguous_format)
         rows = x.numel() // 128
         _norm_rope_kernel[(triton.cdiv(rows, 16),)](
             x,
@@ -308,6 +333,7 @@ def rmsnorm_cast_before_weight_rope_bitexact(
             out,
             rows,
             x.shape[2],
+            x.stride(1),
             num_warps=4,
             enable_fp_fusion=False,
         )

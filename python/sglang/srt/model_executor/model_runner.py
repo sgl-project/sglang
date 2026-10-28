@@ -120,6 +120,7 @@ from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.forward_observer import ForwardObserver
 from sglang.srt.model_executor.graph_memory_usage import (
     replace_graph_memory_usage,
     replace_graph_time_usage,
@@ -198,6 +199,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -341,6 +343,32 @@ class ModelRunner:
         """Whether this runner's sampling path publishes observer output."""
         return get_exec().dllm.dllm_algorithm is None and self.spec_algorithm.is_none()
 
+    @property
+    def forward_observer(self) -> Optional[ForwardObserver]:
+        return self._forward_observer
+
+    @forward_observer.setter
+    def forward_observer(self, observer: Optional[ForwardObserver]) -> None:
+        if observer is not None and not self.supports_forward_observer():
+            raise ValueError(
+                "forward observers are not supported by the configured forward path"
+            )
+        self._forward_observer = observer
+
+    def supports_forward_observer(self) -> bool:
+        """Whether this runner's forward path publishes forward-observer output."""
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+        return (
+            not self.is_draft_worker
+            and self.is_generation
+            and not use_mlx()
+            and not get_disagg().enable_pdmux
+            and get_exec().dllm.dllm_algorithm is None
+            and self.spec_algorithm.is_none()
+            and get_parallel().pp_size == 1
+        )
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -414,6 +442,7 @@ class ModelRunner:
         # space and must not construct a second sparse coordinator.
         self.enable_hisparse = get_memory().enable_hisparse and not is_draft_worker
         self._sampling_observer: Optional[SamplingObserver] = None
+        self._forward_observer: Optional[ForwardObserver] = None
         self.sampling_prewarm_result = SamplingPrewarmResult()
 
         self.init_startup_observability()
@@ -422,7 +451,7 @@ class ModelRunner:
 
         self.init_msprobe()
 
-        # auxiliary hidden capture mode. TODO: expose this to server args?
+        # Auxiliary hidden capture: from the draft, or --enable-return-aux-hidden-states.
         self.init_spec_aux_hidden_state()
 
         # Apply the rank zero filter to logger
@@ -1112,7 +1141,7 @@ class ModelRunner:
             eagle_aux_hidden_state_layer_ids=self.spec_aux_config.eagle_aux_hidden_state_layer_ids,
             dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
             dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
-            is_dspark=self.spec_algorithm.is_dspark(),
+            is_dspark=self.spec_aux_config.is_dspark,
         )
         # Resolve before building: backends read the pair off the runner while
         # they construct (the FlashInfer KV-access check).

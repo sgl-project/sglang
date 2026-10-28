@@ -508,6 +508,43 @@ def test_cutedsl_scale_residual_gate_index_modes(norm_type, index_mode):
     _run_cute(True, norm_type=norm_type, gate_mode=index_mode)
 
 
+@pytest.mark.parametrize("norm_type", NORM_TYPES)
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_cutedsl_norm_chunks_per_warp_keep_bits(monkeypatch, norm_type, with_residual):
+    """A warp walking several 256-column chunks keeps the bits of one chunk per warp."""
+    fused_norm_scale_shift, fused_scale_residual_norm_scale_shift = _import_cutedsl()
+    from sglang.kernels.ops.diffusion.norm import scale_residual_norm_cutedsl
+
+    B, S, D = 2, 300, 5120  # 20 chunks per row
+    g = torch.Generator(device=DEVICE).manual_seed(0)
+    x, residual = (
+        torch.randn(B, S, D, generator=g, device=DEVICE).mul(4).bfloat16()
+        for _ in range(2)
+    )
+    gate = torch.randn(B, 1, D, generator=g, device=DEVICE)
+    weight, bias = (torch.randn(D, generator=g, device=DEVICE) for _ in range(2))
+    scale, shift = (torch.randn(B, 1, D, generator=g, device=DEVICE) for _ in range(2))
+
+    def run():
+        if with_residual:
+            return fused_scale_residual_norm_scale_shift(
+                residual, x, gate, weight, bias, scale, shift, norm_type, EPS
+            )
+        return (fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, EPS),)
+
+    outs = {}
+    for chunks_per_warp in (1, 2, 4, 5):
+        monkeypatch.setattr(
+            scale_residual_norm_cutedsl,
+            "_chunks_per_warp",
+            lambda D, gated_affine, c=chunks_per_warp: c,
+        )
+        outs[chunks_per_warp] = run()
+    for chunks_per_warp in (2, 4, 5):
+        for out, ref in zip(outs[chunks_per_warp], outs[1]):
+            assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+
+
 def test_validate_scale_shift_rejects_non_divisible_frames():
     _import_cutedsl()
     from sglang.kernels.ops.diffusion import validate_scale_shift
@@ -830,7 +867,7 @@ def _moss_image_norm_eager(x, weight):
 
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
-@pytest.mark.parametrize("epilogue", ["modulate", "rope"])
+@pytest.mark.parametrize("epilogue", ["modulate", "rope", "rope_packed"])
 @pytest.mark.parametrize("batch,seq", [(1, 16), (2, 17), (1, 3643)])
 @pytest.mark.parametrize("amplitude", [1.0, 1e-38, 1e19])
 def test_moss_image_norm_epilogues_exact(epilogue, batch, seq, amplitude):
@@ -841,7 +878,11 @@ def test_moss_image_norm_epilogues_exact(epilogue, batch, seq, amplitude):
 
     torch.manual_seed(0)
     shape = (batch, seq, 3072) if epilogue == "modulate" else (batch, seq, 24, 128)
+    if epilogue == "rope_packed":
+        shape = (batch, seq, 3, 24, 128)
     x = (torch.randn(shape, device="cuda") * amplitude).bfloat16()
+    if epilogue == "rope_packed":
+        x = x[:, :, 1]
     weight = torch.randn(shape[-1], device="cuda", dtype=torch.bfloat16)
     norm = _moss_image_norm_eager(x, weight)
     if epilogue == "modulate":
@@ -910,6 +951,13 @@ def test_moss_image_norm_epilogue_guards(epilogue):
     )
     with pytest.raises(ValueError, match="Unsupported MOSSImage"):
         kernel(x, weight, a, a)
+
+    if epilogue == "rope":
+        packed = torch.randn(4, 17, 3, 24, 128, device="cuda", dtype=torch.bfloat16)
+        for x in (packed[::2, :, 1], packed[:, :, 1, ::2]):
+            a = torch.randn(x.shape[0] * x.shape[1], 128, device="cuda", dtype=x.dtype)
+            with pytest.raises(ValueError, match="Unsupported MOSSImage"):
+                kernel(x, weight, a, a)
 
 
 if __name__ == "__main__":
