@@ -189,6 +189,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                     with patch.object(tm, "TRTLLMHAAttnBackend", side_effect=step):
                         backend = tm.TRTLLMHAAttnMultiStepDraftBackend(runner, 1, 3)
         self.bound_pool = bound.token_to_kv_pool
+        self.runner, self.layer = runner, layer
         self.allocator, self.virtual, self.reader = allocator, virtual, reader
         rows = torch.zeros(1, dtype=torch.int64, device="cuda")
         seq_lens = torch.tensor([300], dtype=torch.int32, device="cuda")
@@ -448,6 +449,61 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                         step.kwargs["kv_indptr_buf"].data_ptr(),
                         backend.kv_indptr[i].data_ptr(),
                     )
+
+    def test_trtllm_window_draft_extend_reads_the_window_ids(self):
+        """A trtllm_mha draft extend on translated storage reads a window layer
+        through the plan's window page table, refreshed on every replay, as its
+        target verify does, and its spec-decode kernel masks each query to the
+        layer's window. Checked on the replay prep: the window table's live
+        window holds the window sub-pool's ids of the request's tokens, not the
+        owner's."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        window, seq_len = 64, 300
+        self._fixture(window, 128)
+        reader, virtual = self.reader, self.virtual
+        rows = torch.zeros(1, dtype=torch.int64, device="cuda")
+        seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+        plan = reader.plan(
+            req_pool_indices=rows,
+            seq_lens=seq_lens,
+            seq_lens_cpu=None,
+            write_virtual=None,
+            read_extent=0,
+        )
+        backend = object.__new__(tm.TRTLLMHAAttnBackend)
+        backend.kv_index_translator = reader
+        backend.use_sliding_window_kv_pool = False
+        metadata = SimpleNamespace(
+            page_table=torch.full((1, 512), -1, dtype=torch.int32, device="cuda"),
+            swa_page_table=torch.full((1, 512), -1, dtype=torch.int32, device="cuda"),
+        )
+        backend.draft_extend_metadata = {1: metadata}
+        batch = SimpleNamespace(
+            batch_size=1,
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            spec_info=None,
+            kv_loc_plan=plan,
+            out_cache_loc=None,
+        )
+        backend.init_forward_metadata_out_graph(batch, in_capture=False)
+        self.assertIs(backend.forward_metadata, metadata)
+        window_ids = reader.space(IdSpaceKind.SLIDING_WINDOW).ids(virtual)
+        owner_ids = self.allocator.translate_kv_loc(virtual)
+        live = slice(seq_len - window, seq_len)
+        self.assertTrue(
+            torch.equal(
+                metadata.swa_page_table[0, live].to(torch.int64),
+                window_ids[live].to(torch.int64),
+            )
+        )
+        self.assertFalse(torch.equal(window_ids[live], owner_ids[live]))
+        self.assertTrue(
+            torch.equal(
+                metadata.page_table[0, :seq_len].to(torch.int64),
+                owner_ids[:seq_len].to(torch.int64),
+            )
+        )
 
     def test_a_trtllm_step_hands_its_window_rail_to_its_wrappers(self):
         """The trtllm_mha step backend passes the window indptr to the
