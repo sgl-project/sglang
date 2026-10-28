@@ -209,6 +209,16 @@ class TestIntreeAdditions(CustomTestCase):
         self.assertFalse(out.duplicated(subset=it._KEY_COLS).any())
         self.assertEqual(out.loc[2, "kernelName"], stock.loc[2, "kernelName"])
 
+    def test_a_shape_repeated_in_tree_is_added_once(self):
+        """aiter refuses a table with a duplicate key, so a second in-tree row for the
+        same new shape counts as missing instead of being added again."""
+        stock = _as_stock(_intree())
+        new = stock.iloc[[0, 0]].copy()
+        new["M"] = [1, 1]
+        out, stats = it.apply_intree_rows(stock, new)
+        self.assertEqual((stats[it.ADDED], stats[it.MISSING]), (1, 1))
+        self.assertFalse(out.duplicated(subset=it._KEY_COLS).any())
+
 
 @unittest.skipUnless(_HAS_AITER, "aiter not installed")
 class TestMiniMaxM31Tables(CustomTestCase):
