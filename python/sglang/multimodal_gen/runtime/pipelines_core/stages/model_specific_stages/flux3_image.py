@@ -17,6 +17,27 @@ from PIL import Image, ImageOps
 from torch import Tensor
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+
+# PROBE (not for merge): log a content hash of each stage boundary.
+def _probe_hash(tag, t):
+    if os.environ.get("SGLANG_FLUX3_HASH_PROBE") != "1" or t is None:
+        return
+    if isinstance(t, (list, tuple)):
+        for i, x in enumerate(t):
+            _probe_hash(f"{tag}[{i}]", x)
+        return
+    if not isinstance(t, torch.Tensor):
+        return
+    data = t.detach().float().contiguous().cpu().numpy().tobytes()
+    print(
+        f"[flux3-hash] {tag} shape={tuple(t.shape)} dtype={t.dtype} "
+        f"sha1={hashlib.sha1(data).hexdigest()[:12]} "
+        f"absmean={t.detach().float().abs().mean().item():.8f}",
+        flush=True,
+    )
+
+
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
     run_cfg_parallel,
@@ -197,6 +218,8 @@ def denoise_packed(
             "packed CFG requires an unconditional and conditional sample per output"
         )
     device_type = packed.data[mode].device.type
+    for _m, _d in packed.data.items():
+        _probe_hash(f"3_denoise_input[{_m}]", _d)
     with torch.autocast(
         device_type="cuda",
         dtype=torch.bfloat16,
@@ -215,8 +238,11 @@ def denoise_packed(
                     )[mode]
                 else:
                     unconditional, conditional = dit(packed=packed)[mode].chunk(2)
+            _probe_hash(f"4_step{step}_uncond", unconditional)
+            _probe_hash(f"4_step{step}_cond", conditional)
             velocity = unconditional + guidance * (conditional - unconditional)
             image = packed.data[mode].chunk(2)[0] + delta * velocity
+            _probe_hash(f"4_step{step}_latent", image)
             packed.data[mode] = torch.cat((image, image))
     return packed.data[mode].chunk(2)[0]
 
@@ -269,7 +295,9 @@ def vae_decode(vae, tokens: Tensor, ids: Tensor, *, batched: bool = False) -> Te
         .permute(0, 3, 1, 2)
         .to(next(vae.parameters()).dtype)
     )
+    _probe_hash("5_decode_input", latent)
     decoded = vae.decode(latent)
+    _probe_hash("6_decoded", decoded)
     return decoded if batched else decoded[0]
 
 
@@ -597,6 +625,17 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
             batch.extra["flux3_condition"] = None
             return batch
         references, reference_size, crop = load_references(_image_paths(batch))
+        _probe_hash("1_reference_pixels", references)
+        if os.environ.get("SGLANG_FLUX3_HASH_PROBE") == "1" and not getattr(
+            self.vae, "_probe_hooked", False
+        ):
+            # Every leaf layer of the VAE encoder, in execution order.
+            for _name, _mod in self.vae.encoder.named_modules():
+                if not list(_mod.children()):
+                    _mod.register_forward_hook(
+                        lambda m, i, o, n=_name: _probe_hash(f"1b_vae_enc.{n}", o)
+                    )
+            self.vae._probe_hooked = True
         # As in the reference, an unset side takes the first reference's.
         explicit = batch.sampling_params._explicit_fields
         width, height, crop = output_size(
@@ -623,6 +662,7 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
                     self.package_config.dit.image_rope_scale,
                     get_local_torch_device(),
                 )
+        _probe_hash("2_condition_tokens", batch.extra["flux3_condition"])
         return batch
 
 
