@@ -26,6 +26,7 @@ _TRITON_KERNELS = [
     ("eagle", "fill_accept_out_cache_loc"),
     ("chain_verify", "greedy_chain_verify"),
     ("gather_spec_extras", "gather_spec_extras"),
+    ("gather_spec_extras", "scatter_spec_extras"),
     ("multi_layer_eagle", "rotate_input_ids"),
     ("spec_tree", "sgl_build_tree_kernel_efficient_triton"),
     ("spec_tree", "verify_tree_greedy_kernel_triton"),
