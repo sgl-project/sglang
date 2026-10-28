@@ -37,7 +37,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
     define_config_test_classes,
