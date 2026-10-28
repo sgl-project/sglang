@@ -21,7 +21,8 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
 # PROBE (not for merge): log a content hash of each stage boundary.
 def _probe_hash(tag, t):
-    if os.environ.get("SGLANG_FLUX3_HASH_PROBE") != "1" or t is None:
+    path = os.environ.get("SGLANG_FLUX3_HASH_PROBE_FILE")
+    if not path or t is None:
         return
     if isinstance(t, (list, tuple)):
         for i, x in enumerate(t):
@@ -30,12 +31,12 @@ def _probe_hash(tag, t):
     if not isinstance(t, torch.Tensor):
         return
     data = t.detach().float().contiguous().cpu().numpy().tobytes()
-    print(
-        f"[flux3-hash] {tag} shape={tuple(t.shape)} dtype={t.dtype} "
-        f"sha1={hashlib.sha1(data).hexdigest()[:12]} "
-        f"absmean={t.detach().float().abs().mean().item():.8f}",
-        flush=True,
-    )
+    with open(path, "a") as fh:
+        fh.write(
+            f"[flux3-hash] {tag} shape={tuple(t.shape)} dtype={t.dtype} "
+            f"sha1={hashlib.sha1(data).hexdigest()[:12]} "
+            f"absmean={t.detach().float().abs().mean().item():.8f}\n"
+        )
 
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -626,7 +627,7 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
             return batch
         references, reference_size, crop = load_references(_image_paths(batch))
         _probe_hash("1_reference_pixels", references)
-        if os.environ.get("SGLANG_FLUX3_HASH_PROBE") == "1" and not getattr(
+        if os.environ.get("SGLANG_FLUX3_HASH_PROBE_FILE") and not getattr(
             self.vae, "_probe_hooked", False
         ):
             # Every leaf layer of the VAE encoder, in execution order.

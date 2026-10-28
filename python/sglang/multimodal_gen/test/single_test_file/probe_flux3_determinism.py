@@ -48,13 +48,17 @@ def _edit(port: int, reference: bytes) -> bytes:
 
 
 def _hash_lines(log_path) -> list[tuple]:
+    if not os.path.exists(log_path):
+        return []
     with open(log_path, errors="replace") as fh:
         return [m.groups() for m in map(_LINE.search, fh) if m]
 
 
 class ProbeFlux3EditStages(CustomTestCase):
     def test_edit_stage_hashes(self):
-        os.environ["SGLANG_FLUX3_HASH_PROBE"] = "1"
+        hash_file = tds._LOG_DIR / "flux3_hashes.txt"
+        hash_file.unlink(missing_ok=True)
+        os.environ["SGLANG_FLUX3_HASH_PROBE_FILE"] = str(hash_file)
         cluster = tds.DisaggCluster(
             model=MODEL,
             name="flux3_hash_probe",
@@ -87,24 +91,28 @@ class ProbeFlux3EditStages(CustomTestCase):
                 path="/v1/models",
                 timeout=cluster.startup_timeout,
             )
-            marks = [len(_hash_lines(log))]
+            marks = [len(_hash_lines(hash_file))]
             t2i = tds._generate_image(port, MODEL, **KW)
-            marks.append(len(_hash_lines(log)))
+            marks.append(len(_hash_lines(hash_file)))
             ref = BytesIO()
             Image.open(BytesIO(t2i)).crop((0, 0, 247, 239)).save(ref, format="PNG")
             for _ in range(EDITS):
                 _edit(port, ref.getvalue())
-                marks.append(len(_hash_lines(log)))
+                marks.append(len(_hash_lines(hash_file)))
         finally:
             cluster.stop()
 
-        lines = _hash_lines(log)
+        lines = _hash_lines(hash_file)
         runs = [lines[marks[i] : marks[i + 1]] for i in range(1, len(marks) - 1)]
         print(
             f"[flux3-probe] edit runs: {len(runs)}, hashes per run: "
             f"{[len(r) for r in runs]}",
             flush=True,
         )
+        if not any(runs):
+            print("[flux3-probe] no hashes recorded; server log tail:", flush=True)
+            print(tds._tail_log(log, n=120), flush=True)
+            return
         base = runs[0]
         for k, run in enumerate(runs[1:], start=2):
             first = None
