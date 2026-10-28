@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import weakref
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union, cast
 
 import torch
 
@@ -545,6 +545,7 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
         shared_index_layers: Optional[List[bool]] = None,
+        sliding_window_size: Optional[int] = None,
         num_draft_tokens: int = 0,
     ):
         self.req_to_token_pool = req_to_token_pool
@@ -553,6 +554,7 @@ class HiSparseCoordinator:
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.swap_in_block_size = swap_in_block_size
+        self.sliding_window_size = sliding_window_size
         # Timing probe: skip the host->device KV bytes to measure the "IO is
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
@@ -1398,6 +1400,300 @@ class HiSparseCoordinator:
             self.abort_staging_request(req)
         else:
             self.request_finished(req)
+
+    def _indexer_pool(self):
+        """The DSV4 C4 indexer pool backing the top-k selection, or None."""
+        if not self.is_dsv4_hisparse:
+            return None
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        return getattr(kvcache, "c4_indexer_kv_pool", None)
+
+    def _swa_pool(self):
+        """The DSV4 SWA pool (device logical-slot space), or None."""
+        if not self.is_dsv4_hisparse:
+            return None
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        return getattr(kvcache, "swa_kv_pool", None)
+
+    def _swa_window_rows(self, req_pool_idx: int, allocated_len: int):
+        """SWA rows covering the request's live window.
+
+        Returns ``(swa_locs, full_start)``: the SWA-side locations of the last
+        ``window_size`` tokens (page-aligned start), and the full-space start
+        position they correspond to. Attending decode layers read exactly this
+        window through ``full_to_swa_index_mapping``.
+        """
+        window_size = self.sliding_window_size
+        if window_size is None or window_size <= 0 or allocated_len == 0:
+            return None, 0
+        page_size = self.token_to_kv_pool_allocator.page_size
+        start = max(0, allocated_len - window_size)
+        start = (start // page_size) * page_size
+        full_locs = self.req_to_token_pool.req_to_token[
+            req_pool_idx, start:allocated_len
+        ]
+        swa_allocator = cast(
+            "DeepSeekV4HiSparseTokenToKVPoolAllocator",
+            self.token_to_kv_pool_allocator,
+        )
+        swa_locs = swa_allocator.translate_loc_from_full_to_swa(full_locs)
+        return swa_locs, start
+
+    def _backup_swa_rows(self, req: Req, allocated_len: int, req_pool_idx: int) -> None:
+        """Copy the live SWA window rows to a CPU sidecar.
+
+        The SWA KV also lives in device logical-slot space (prefill transfers
+        it; HiSparse does not offload it), so a resume's fresh window would
+        read garbage. Only the live window matters -- older SWA positions are
+        never read again.
+        """
+        pool = self._swa_pool()
+        if pool is None:
+            return
+        swa_locs, _start = self._swa_window_rows(req_pool_idx, allocated_len)
+        if swa_locs is None or swa_locs.numel() == 0:
+            return
+        if getattr(req, "hisparse_swa_backup", None) is not None:
+            return  # already backed up
+        page_size = self.token_to_kv_pool_allocator.page_size
+        # Whole page rows (the pool's row granularity).
+        page_rows = swa_locs[::page_size] // page_size
+        req.hisparse_swa_backup = [
+            buf[page_rows].to("cpu", non_blocking=False).pin_memory()
+            for buf in pool.kv_buffer
+        ]
+        req.hisparse_swa_backup_full_len = allocated_len
+
+    def _restore_swa_rows(self, req: Req, req_pool_idx: int) -> None:
+        """Write the SWA window sidecar into the fresh window's rows."""
+        backup = getattr(req, "hisparse_swa_backup", None)
+        if backup is None:
+            return
+        pool = self._swa_pool()
+        assert pool is not None
+        allocated_len = req.kv.kv_allocated_len
+        swa_locs, _start = self._swa_window_rows(req_pool_idx, allocated_len)
+        assert swa_locs is not None and swa_locs.numel() > 0
+        page_size = self.token_to_kv_pool_allocator.page_size
+        page_rows = swa_locs[::page_size] // page_size
+        assert page_rows.numel() == len(backup[0]), (
+            f"SWA backup page mismatch: {page_rows.numel()} new vs "
+            f"{len(backup[0])} backed up"
+        )
+        for buf, rows in zip(pool.kv_buffer, backup):
+            buf[page_rows] = rows.to(buf.device, non_blocking=True)
+        restore_done = device_module.Event()
+        restore_done.record(device_module.current_stream())
+        restore_done.synchronize()
+        req.hisparse_swa_backup = None
+
+    def _indexer_page_rows(self, req_pool_idx: int, allocated_len: int):
+        """Device indexer-K page rows covering ``[0, allocated_len)``.
+
+        Returns ``(page_indices, num_pages)`` where ``page_indices[k]`` is the
+        indexer-K page holding tokens ``[k*page_size, (k+1)*page_size)``.
+        ``allocated_len`` counts full-space tokens; the indexer pool's page
+        size is the C4 (compressed) page size.
+        """
+        full_locs = self.req_to_token_pool.req_to_token[req_pool_idx, :allocated_len]
+        page_size = self.token_to_kv_pool_allocator.page_size
+        # Mirror kv_to_page_indices(): positional page IDs from full locs.
+        page_indices = full_locs[::page_size] // page_size
+        return page_indices, page_indices.numel()
+
+    def _backup_indexer_rows(
+        self, req: Req, allocated_len: int, req_pool_idx: int
+    ) -> None:
+        """Copy the request's indexer-K page rows to a CPU sidecar.
+
+        One-shot, retraction-time only (~136B/token vs 584B/token for the C4
+        KV). The rows are stored in position order so resume can write them
+        into the freshly allocated logical slots' pages regardless of which
+        physical pages those turn out to be.
+        """
+        pool = self._indexer_pool()
+        if pool is None or allocated_len == 0:
+            return
+        if getattr(req, "hisparse_indexer_backup", None) is not None:
+            return  # already backed up (e.g. double retract)
+        page_indices, num_pages = self._indexer_page_rows(req_pool_idx, allocated_len)
+        if num_pages == 0:
+            return
+        if pool.index_k_with_scale_buffer is not None:
+            # One pinned CPU tensor per layer: [num_pages, page_bytes].
+            req.hisparse_indexer_backup = [
+                buf[page_indices].to("cpu", non_blocking=False).pin_memory()
+                for buf in pool.index_k_with_scale_buffer
+            ]
+        else:
+            # FP4 layout: payload + scale buffers, whole pages only.
+            req.hisparse_indexer_backup = [
+                buf[page_indices].to("cpu") for buf in pool.index_k_payload_buffer
+            ] + [buf[page_indices].to("cpu") for buf in pool.index_k_scale_buffer]
+
+    def _restore_indexer_rows(self, req: Req, req_pool_idx: int) -> None:
+        """Write the CPU sidecar back into the fresh logical slots' pages.
+
+        The backup rows are position-ordered, so row k maps to the k-th page of
+        the new allocation -- the same computation the prefill->decode RDMA
+        transfer performs (device_page_indices in _pre_alloc's caller).
+        """
+        backup = getattr(req, "hisparse_indexer_backup", None)
+        if backup is None:
+            return
+        pool = self._indexer_pool()
+        assert pool is not None
+        allocated_len = req.kv.kv_allocated_len
+        page_indices, num_pages = self._indexer_page_rows(req_pool_idx, allocated_len)
+        assert num_pages == len(backup[0]), (
+            f"indexer backup page mismatch: {num_pages} new vs "
+            f"{len(backup[0])} backed up"
+        )
+        if pool.index_k_with_scale_buffer is not None:
+            for buf, rows in zip(pool.index_k_with_scale_buffer, backup):
+                buf[page_indices] = rows.to(buf.device, non_blocking=True)
+        else:
+            n = len(pool.index_k_payload_buffer)
+            for buf, rows in zip(pool.index_k_payload_buffer, backup[:n]):
+                buf[page_indices] = rows.to(buf.device, non_blocking=True)
+            for buf, rows in zip(pool.index_k_scale_buffer, backup[n:]):
+                buf[page_indices] = rows.to(buf.device, non_blocking=True)
+        # The restore is a H2D copy on the current stream (async). The first
+        # forward's indexer reads must observe it: record+wait an event so the
+        # restore is complete before any subsequent kernel on this stream.
+        restore_done = device_module.Event()
+        restore_done.record(device_module.current_stream())
+        restore_done.synchronize()
+        req.hisparse_indexer_backup = None
+
+    def retract_req_state_preserving(self, req: Req) -> None:
+        """Retract a request while keeping its host-pool recovery state.
+
+        HiSparse already maintains a host copy of every committed token via
+        staging/eager backup, so a memory-pressure retraction must not bulk-copy
+        the device KV to CPU, and must not drop the request's
+        ``req_to_host_pool`` row (that row IS the backup). Only the device side
+        is released here:
+
+        - the request's device buffer indices go back to the hisparse allocator
+        - the full->device mapping entries for its logical slots are cleared
+        - the logical (full-space) slots return to the logical allocator so
+          other requests can use them
+
+        The host row and its allocated length stay untouched, keyed by the
+        unchanged ``req_pool_idx`` row, so the request can be resumed later by
+        re-allocating logical slots and swap-in from host on demand.
+        """
+        # release resources only after the execution of a potential overlapped batch
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        self.wait_for_pending_backup()
+
+        allocated_len = req.kv.kv_allocated_len
+        req_pool_idx = req.kv.req_pool_idx
+        assert req_pool_idx is not None
+
+        # Preserve the indexer K (DSA top-k selection data). Unlike the C4 KV,
+        # it lives in the device logical-slot space (prefill transfers it over
+        # RDMA straight into device buffers; HiSparse does not offload it), so
+        # the fresh logical slots a resume allocates would read garbage and
+        # corrupt the top-k selection. Back up the request's page rows here
+        # in position order; resume writes them into the new slots' pages.
+        self._backup_indexer_rows(req, allocated_len, req_pool_idx)
+        # Same for the SWA window rows (device logical-slot space as well).
+        self._backup_swa_rows(req, allocated_len, req_pool_idx)
+
+        # release device buffer indices (same ownership union request_finished
+        # computes; over-allocation slots carry stale -1/0 entries that are
+        # filtered out below)
+        current_cap = int(self.req_device_buffer_size[req_pool_idx])
+        if current_cap > 0:
+            side_buf_hi = self.req_to_device_buffer[req_pool_idx, :current_cap]
+            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
+            if all_hi.numel() > 0:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
+
+        allocated_locs = self.req_to_token_pool.req_to_token[
+            req_pool_idx, :allocated_len
+        ]
+        # NOTE: the logical (full-space) slots themselves are released by the
+        # caller's release_kv_cache -> free_segment path; free_hisparse here
+        # would double-free them. We only clear the full->device mapping so
+        # stale resident entries cannot outlive the request's slot ownership.
+        self.token_to_kv_pool_allocator.free_hisparse_mapping_only(allocated_locs)
+
+        # clear device-side req info (host row is deliberately kept)
+        self.req_device_buffer_tokens[:, req_pool_idx, :] = -1
+        self.req_device_buffer_token_locs[:, req_pool_idx, :] = -1
+        self.req_to_device_buffer[req_pool_idx, :] = 0
+        self.req_device_buffer_size[req_pool_idx] = 0
+        self.lru_slots[:, req_pool_idx, :].copy_(self._lru_init)
+        self._skip_first_backup[req_pool_idx] = False
+
+        # Mark for the resume path: no retransfer from prefill is needed; the
+        # host pool already holds every committed token.
+        req.hisparse_retraction_pending = True
+
+    def discard_retracted_request(self, req: Req) -> None:
+        """Drop a state-preserving-retracted request entirely (abort/flush).
+
+        Frees the retained host-pool row and the kept req_to_token row that
+        retraction preserved, so an aborted retracted request leaks nothing.
+        """
+        if not getattr(req, "hisparse_retraction_pending", False):
+            return
+        assert req.kv.req_pool_idx is not None
+        # Drop the indexer-K CPU sidecar (no-op when never backed up).
+        req.hisparse_indexer_backup = None
+        # Drop the SWA-window sidecar likewise.
+        req.hisparse_swa_backup = None
+        req.hisparse_swa_backup_full_len = 0
+        host_indices = self.mem_pool_host.allocated_host_indices(
+            self.req_to_host_pool,
+            req.kv.req_pool_idx,
+            self.req_to_host_pool_allocated_len[req.kv.req_pool_idx],
+        )
+        if host_indices.numel() > 0:
+            self.mem_pool_host.free(host_indices)
+        self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
+        req.hisparse_retraction_pending = False
+        # Release the kept req_to_token row.
+        if req.kv.req_pool_idx is not None:
+            self.req_to_token_pool.free(req)
+
+    def resume_after_retraction(self, req: Req) -> None:
+        """Re-admit a state-preserving-retracted request.
+
+        The retained ``req_to_host_pool`` row is indexed by token position, so
+        it stays valid across the logical-slot reallocation done by
+        ``_pre_alloc``. A fresh device buffer is allocated and marked all-miss
+        so the swap-in kernel reloads top-k tokens from host on demand.
+        """
+        assert getattr(req, "hisparse_retraction_pending", False)
+        self.alloc_device_buffer(req)
+        host_len = self.host_token_len(req.kv.kv_allocated_len)
+        if host_len <= self.device_buffer_size:
+            self._preload_to_device_buffer(req)
+        else:
+            # Every slot a miss -> swap-in from host as needed
+            self.req_device_buffer_tokens[
+                :, req.kv.req_pool_idx, : self.device_buffer_size
+            ] = -1
+        # Restore the indexer-K rows into the fresh logical slots BEFORE the
+        # first forward pass: the DSA top-k selection reads the indexer K via
+        # the page table over those slots, and would otherwise score garbage.
+        assert req.kv.req_pool_idx is not None
+        self._restore_indexer_rows(req, req.kv.req_pool_idx)
+        # Restore the SWA window rows likewise (attention reads the window
+        # through the fresh slots' full->swa mapping).
+        self._restore_swa_rows(req, req.kv.req_pool_idx)
+        # The retained host row already covers every token up to
+        # kv_allocated_len (the fill length), so the first decode step after
+        # resume has nothing new to back up -- same as admit_request_direct.
+        self._skip_first_backup[req.kv.req_pool_idx] = True
+        req.hisparse_retraction_pending = False
+        req.hisparse_staging = False
 
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch

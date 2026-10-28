@@ -270,6 +270,17 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_hisparse_indices(hisparse_indices)
         self.full_to_hisparse_device_index_mapping[free_indices] = 0
 
+    def free_hisparse_mapping_only(self, free_indices: torch.Tensor):
+        """Clear full->device mapping entries without freeing device slots.
+
+        State-preserving retraction uses this after it already returned the
+        request's device buffer slots via free_hisparse_indices: the logical
+        slots are freed by the caller's release_kv_cache path, and this only
+        drops the stale full->device translation so a reused logical slot
+        cannot inherit a dead device index.
+        """
+        self.full_to_hisparse_device_index_mapping[free_indices] = 0
+
     def clear(self):
         self.logical_attn_allocator.clear()
         self.hisparse_attn_allocator.clear()
@@ -639,6 +650,18 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_kvcache.translate_loc_from_full_to_compressed(free_indices)
         )
         self.free_compressed(compressed_indices)
+
+    def free_hisparse_mapping_only(self, free_indices: torch.Tensor):
+        """Compressed-space variant of free_hisparse_mapping_only.
+
+        See HiSparseTokenToKVPoolAllocator.free_hisparse_mapping_only; the
+        full-space indices are translated to the compressed grid before the
+        mapping entries are cleared.
+        """
+        compressed_indices = (
+            self.hisparse_kvcache.translate_loc_from_full_to_compressed(free_indices)
+        )
+        self.full_to_hisparse_device_index_mapping[compressed_indices] = 0
 
     def clear(self):
         self.logical_attn_allocator.clear()
