@@ -6,7 +6,6 @@ import torch
 from transformers import BaseImageProcessor
 
 from sglang.srt import platforms
-from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_cpu, is_npu, is_xpu
 
 _is_cpu = is_cpu()
@@ -15,7 +14,10 @@ _is_xpu = is_xpu()
 
 
 def preprocessing_competes_with_the_scheduler(
-    processor, *, disable_fast_image_processor: bool
+    processor,
+    *,
+    disable_fast_image_processor: bool,
+    rl_on_policy_target: Optional[str],
 ) -> bool:
     """Whether image preprocessing contends with the serving accelerator.
 
@@ -23,7 +25,7 @@ def preprocessing_competes_with_the_scheduler(
     the same accelerator as the scheduler. A second preprocessing worker there
     adds device contention rather than CPU preprocessing parallelism.
     """
-    if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
+    if _is_cpu or rl_on_policy_target is not None:
         return False
     if disable_fast_image_processor:
         return False
@@ -60,21 +62,28 @@ def resolve_auto_mm_processor_worker_num(
     return 2 if declared is None else declared
 
 
-def fast_image_processor_device(processor, *, base_gpu_id: int) -> Optional[str]:
+def fast_image_processor_device(
+    processor, *, base_gpu_id: int, rl_on_policy_target: Optional[str]
+) -> Optional[str]:
     """The device for the fast image processor, or None to leave it unset."""
-    if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
+    if _is_cpu or rl_on_policy_target is not None:
         return "cpu"
     if _is_xpu:
         return "xpu"
-    if not _is_npu:
-        platform = platforms.current_platform
-        if not platform.is_cuda_alike():
-            return None
-        return f"{platform.device_type}:{base_gpu_id}"
+    if _is_npu:
+        return None if processor.__class__.__name__ == "Glm4vProcessor" else "npu"
+    platform = platforms.current_platform
+    if not platform.is_cuda_alike():
+        return None
+    return f"{platform.device_type}:{base_gpu_id}"
+
+
+def apply_npu_image_preprocess_patches(processor) -> None:
+    """Patch the processor for the Ascend dims limit before it runs on NPU."""
     if processor.__class__.__name__ == "MiniMaxVLProcessor":
         # MiniMax's image/video processors create 10-dim tensors during
         # patch extraction, exceeding the Ascend 8-dim limit; patch them
-        # (same pattern as qwen-vl / GLM-4.6V) and run on NPU.
+        # (same pattern as qwen-vl / GLM-4.6V).
         from sglang.srt.hardware_backend.npu.modules.minimax_m3_processor import (
             npu_apply_minimax_m3_image_preprocess_patch,
             npu_apply_minimax_m3_video_preprocess_patch,
@@ -86,8 +95,7 @@ def fast_image_processor_device(processor, *, base_gpu_id: int) -> Optional[str]
             and processor.video_processor is not None
         ):
             npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
-        return "npu"
-    if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
+    elif processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
         # For qwen-vl, the processor hits a reshape issue from the Ascend
         # dims restriction.
         from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
@@ -95,15 +103,12 @@ def fast_image_processor_device(processor, *, base_gpu_id: int) -> Optional[str]
         )
 
         npu_apply_qwen_image_preprocess_patch()
-        return "npu"
-    if processor.__class__.__name__ == "Glm46VProcessor":
+    elif processor.__class__.__name__ == "Glm46VProcessor":
         from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
             npu_apply_glm46v_image_preprocess_patch,
         )
 
         npu_apply_glm46v_image_preprocess_patch()
-        return "npu"
-    return None
 
 
 def resolve_hf_image_token_counts(processor, images: List) -> List[int]:

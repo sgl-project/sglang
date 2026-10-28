@@ -41,6 +41,7 @@ from sglang.srt.multimodal.multimodal_processor_mixin import (
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
 from sglang.srt.multimodal.serving_preprocessing import (
+    apply_npu_image_preprocess_patches,
     fast_image_processor_device,
     preprocessing_competes_with_the_scheduler,
     resolve_auto_mm_processor_worker_num,
@@ -51,6 +52,7 @@ from sglang.srt.multimodal.transport.feature_transport import (
     move_feature_to_cpu,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_mm,
     get_serving,
 )
@@ -627,6 +629,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         return preprocessing_competes_with_the_scheduler(
             self._processor,
             disable_fast_image_processor=self.disable_fast_image_processor,
+            rl_on_policy_target=get_exec().deterministic.rl_on_policy_target,
         )
 
     def _resolve_auto_mm_processor_worker_num(self) -> int:
@@ -637,9 +640,14 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
 
     def _fast_image_processor_device(self, processor) -> Optional[str]:
         # Engines sharing a tokenizer process each carry their own base_gpu_id.
-        return fast_image_processor_device(
-            processor, base_gpu_id=self.server_args.base_gpu_id
+        device = fast_image_processor_device(
+            processor,
+            base_gpu_id=self.server_args.base_gpu_id,
+            rl_on_policy_target=get_exec().deterministic.rl_on_policy_target,
         )
+        if device == "npu":
+            apply_npu_image_preprocess_patches(processor)
+        return device
 
     def process_mm_data(
         self,
