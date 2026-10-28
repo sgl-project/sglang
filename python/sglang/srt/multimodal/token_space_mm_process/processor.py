@@ -94,7 +94,9 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             image_device, video_device: Preprocessing devices; None keeps defaults.
             compute_mrope_positions: Also return M-RoPE positions; off for trainers
                 such as Megatron Bridge that compute them themselves.
-            package_output: Runs on the BatchFeature in the same worker task.
+            package_output: Runs on the BatchFeature in the same worker task,
+                concurrently with other requests; it may read only state fixed at
+                construction and the worker's own `processor` clone.
 
         Returns:
             The BatchFeature with `mm_modalities` and `mm_spans`, or what
