@@ -25,7 +25,10 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.managers.scheduler_components.pp_ring import (  # noqa: E402
+    PPRing,
+    RingSlot,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -34,18 +37,18 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg):
     """Device p2p ops one PP2 rank posts for one output exchange, in stream order."""
     ops = []
-    scheduler = SchedulerPPMixin()
-    scheduler._pp_spec_relay = spec_relay
-    scheduler.schedule_stream = None
-    scheduler.copy_stream = SimpleNamespace(
+    ring = PPRing.__new__(PPRing)
+    ring.pp_spec_relay = object() if spec_relay else None
+    ring.schedule_stream = None
+    ring.copy_stream = SimpleNamespace(
         wait_stream=lambda stream: None, wait_event=lambda event: None
     )
-    scheduler.copy_stream_ctx = nullcontext()
-    scheduler.device_module = SimpleNamespace(
+    ring.copy_stream_ctx = nullcontext()
+    ring.device_module = SimpleNamespace(
         Event=lambda: SimpleNamespace(record=lambda stream: None),
         current_stream=lambda: None,
     )
-    scheduler._pp_prep_batch_result = lambda *args: SimpleNamespace(logits_output=None)
+    ring._prep_batch_result = lambda *args: SimpleNamespace(logits_output=None)
 
     def send(*args):
         ops.append(("send", send_msg))
@@ -55,8 +58,8 @@ def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg):
         ops.append(("recv", recv_msg))
         return {}, None
 
-    scheduler._pp_send_output_to_next_stage = send
-    scheduler._pp_recv_dict_from_prev_stage = recv
+    ring._send_output_to_next_stage = send
+    ring.channel = SimpleNamespace(recv_output=recv)
     target = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         reqs=[object(), object()],
@@ -64,8 +67,18 @@ def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg):
         return_logprob=True,
     )
     with published_topology(role="scheduler", ranks={"world_rank": pp_rank}, pp_size=2):
-        scheduler._pp_send_recv_and_preprocess_output_tensors(
-            0, 1, [None, target], [None, None], deque(), None
+        ring._send_recv_and_preprocess_output_tensors(
+            0,
+            1,
+            [
+                RingSlot(schedule_slot=None),
+                RingSlot(
+                    schedule_slot=None,
+                    record=SimpleNamespace(step=target, result=None),
+                ),
+            ],
+            deque(),
+            None,
         )
     return ops
 
