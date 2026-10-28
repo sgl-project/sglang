@@ -362,7 +362,8 @@ def gemma_add_rmsnorm_fp8(
     zero_cols = 0
     if zeros is not None:
         assert zeros.is_contiguous() and zeros.shape[0] == m
-        zero_cols = zeros.numel() // m
+        # an idle DP-attention rank runs its layers on no tokens
+        zero_cols = zeros.numel() // m if m else 0
     block_n = triton.next_power_of_2(n)
     kernel, grid = _gemma_add_rmsnorm_fp8_kernel, m
     if m >= _FOUR_ROWS_MIN_ROWS:
