@@ -8,7 +8,10 @@ from typing import Any, Iterator, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.deep_gemm_mqa_logits import uses_mx_mqa_logits
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    get_paged_mqa_logits_metadata,
+    uses_mx_mqa_logits,
+)
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_budget_bytes,
     mqa_logits_needs_budget_check,
@@ -224,12 +227,10 @@ class PagedIndexerMetadata:
             )
             if use_jit_indexer:
                 from sglang.kernels.ops.attention.dsv4 import (
-                    get_paged_mqa_logits_metadata,
+                    get_paged_mqa_logits_metadata as schedule_fn,
                 )
             else:
-                from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
-                    get_paged_mqa_logits_metadata,
-                )
+                schedule_fn = get_paged_mqa_logits_metadata
 
             compressed_seq_lens = self.compressed_seq_lens.to(torch.int32)
             if compressed_seq_lens.dim() == 1:
@@ -264,7 +265,7 @@ class PagedIndexerMetadata:
             if self.rows_per_chunk is not None:
                 # Chunk metadata is shared by all indexer layers in this forward.
                 self.deep_gemm_metadata = [
-                    get_paged_mqa_logits_metadata(
+                    schedule_fn(
                         compressed_seq_lens[rows].view(-1, group),
                         self.compressed_page_size,
                         deep_gemm.get_num_sms(),
@@ -274,7 +275,7 @@ class PagedIndexerMetadata:
                     )
                 ]
             else:
-                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                self.deep_gemm_metadata = schedule_fn(
                     compressed_seq_lens.view(-1, group),
                     self.compressed_page_size,
                     deep_gemm.get_num_sms(),

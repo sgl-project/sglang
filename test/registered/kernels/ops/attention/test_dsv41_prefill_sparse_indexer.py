@@ -10,9 +10,14 @@ import torch
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
 )
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    index_logits_dtype,
+    index_weights_dtype,
+)
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import fp8_mqa_logits
 from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
     DeepGEMMPrefillData,
 )
@@ -48,12 +53,6 @@ class Case(NamedTuple):
 def make_case(rows, ctx, seed) -> Case:
     """One request: `rows` query tokens whose causal lengths end at `ctx`, its
     index K in the pool page layout [pages, PAGE * 64 payload | PAGE * 4 scale]."""
-    from sglang.kernels.ops.attention.dsv4.index_logits import (
-        index_logits_dtype,
-        index_weights_dtype,
-    )
-    from sglang.srt.layers.attention.deep_gemm_mqa_logits import fp8_mqa_logits
-
     torch.manual_seed(seed)
     dev = "cuda"
     n_slots = (ctx + PAGE - 1) // PAGE * PAGE

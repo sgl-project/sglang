@@ -6,6 +6,11 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    fp8_mqa_logits,
+    fp8_paged_mqa_logits,
+    get_paged_mqa_logits_metadata,
+)
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_needs_budget_check,
     mqa_logits_static_budget_bytes,
@@ -377,13 +382,11 @@ def resolve_num_sms() -> int:
 def resolve_paged_mqa_logits_metadata_fn(cutedsl: bool = False):
     # The CuTe DSL kernel walks 256-token KV splits; DeepGEMM's SM100 schedule uses 384
     if cutedsl or _use_torch_mqa_logits():
-        from sglang.kernels.ops.attention.dsv4 import get_paged_mqa_logits_metadata
+        from sglang.kernels.ops.attention.dsv4 import (
+            get_paged_mqa_logits_metadata as jit_paged_mqa_logits_metadata,
+        )
 
-        return get_paged_mqa_logits_metadata
-    from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
-        get_paged_mqa_logits_metadata,
-    )
-
+        return jit_paged_mqa_logits_metadata
     return get_paged_mqa_logits_metadata
 
 
@@ -460,8 +463,6 @@ def _fp8_paged_mqa_logits_torch(
 def resolve_fp8_paged_mqa_logits_fn():
     if _use_torch_mqa_logits():
         return _fp8_paged_mqa_logits_torch
-    from sglang.srt.layers.attention.deep_gemm_mqa_logits import fp8_paged_mqa_logits
-
     return fp8_paged_mqa_logits
 
 
@@ -502,6 +503,4 @@ def _fp8_mqa_logits_torch(
 def resolve_fp8_mqa_logits_fn():
     if _use_torch_mqa_logits():
         return _fp8_mqa_logits_torch
-    from sglang.srt.layers.attention.deep_gemm_mqa_logits import fp8_mqa_logits
-
     return fp8_mqa_logits

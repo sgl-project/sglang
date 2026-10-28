@@ -26,9 +26,11 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
     from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
+        IndexKScaleFmt,
         can_use_dsa_fused_store,
         fused_store_index_k_cache,
     )
+    from sglang.srt.layers.attention.deep_gemm_mqa_logits import pack_ue8m0_x4
 
     HAS_FUSED = True
 except ImportError:
@@ -460,9 +462,6 @@ def test_fused_store_ue8m0_scale_is_the_packed_power_of_two():
     """SM100 DeepGEMM reads MXFP8: the rounded store keeps the same FP8 bytes, and
     the packed one stores that power-of-two scale as 4 replicated UE8M0 bytes."""
     _skip_if_unavailable()
-    from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import IndexKScaleFmt
-    from sglang.srt.layers.attention.deep_gemm_mqa_logits import pack_ue8m0_x4
-
     torch.manual_seed(0)
     num_tokens = 200
     key = torch.randn(num_tokens, HEAD_DIM, device="cuda", dtype=torch.bfloat16)

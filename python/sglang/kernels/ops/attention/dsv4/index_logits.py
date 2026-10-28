@@ -10,6 +10,10 @@ from typing import Iterator, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    fp8_mqa_logits,
+    fp8_paged_mqa_logits,
+)
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
@@ -89,8 +93,6 @@ def flat_index_logits_tiles(
     ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
     garbage past the row's ``lengths``; the width is ``max(context_lengths)``
     aligned to ``FLAT_LOGITS_WIDTH_ALIGN``."""
-    from sglang.srt.layers.attention.deep_gemm_mqa_logits import fp8_mqa_logits
-
     rows = q[0].shape[0]
     width = ceil_align(max(context_lengths, default=0), FLAT_LOGITS_WIDTH_ALIGN)
     if rows == 0 or width == 0:
@@ -127,8 +129,6 @@ def deep_gemm_fp4_paged_mqa_logits(
     max_seq_len: int,
 ) -> torch.Tensor:
     """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one."""
-    from sglang.srt.layers.attention.deep_gemm_mqa_logits import fp8_paged_mqa_logits
-
     sl = seq_lens.to(torch.int32)
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)

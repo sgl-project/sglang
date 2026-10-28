@@ -18,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda
 
 UE8M0_ONE_X4 = 0x7F7F7F7F
@@ -73,8 +74,6 @@ def mx_q_and_weights(q: Any, weights: torch.Tensor) -> Tuple[Any, torch.Tensor]:
 def dsv4_fp8_index_cache_is_ue8m0() -> bool:
     """Whether the DSV4 C4 FP8 index cache stores packed UE8M0 scales: on SM100,
     unless a non-DeepGEMM indexer (tilelang / aiter / torch) reads it."""
-    from sglang.srt.environ import envs
-
     return uses_mx_mqa_logits(torch.device("cuda")) and not (
         envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
         or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
