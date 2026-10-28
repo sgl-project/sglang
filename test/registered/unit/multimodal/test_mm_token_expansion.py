@@ -479,9 +479,9 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
         with patch(
             "sglang.srt.multimodal.multimodal_processor_mixin.configure_media_url_security"
         ) as configure:
-            processor = TokenSpaceSGLangProcessor.for_strategy(_ImageWidthStrategy)(
-                None, server_args, _bare_tokenizer(), None
-            )
+            processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+                _ImageWidthStrategy, TokenSpaceServingSpec
+            )(None, server_args, _bare_tokenizer(), None)
         self.addCleanup(processor.shutdown)
         configure.assert_called_once_with(["media.example.com"], 7)
 
@@ -497,9 +497,9 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             mm_processor_worker_num=1,
         )
         publish(server_args, role="test")
-        processor = TokenSpaceSGLangProcessor.for_strategy(_ImageWidthStrategy)(
-            None, server_args, _bare_tokenizer(), None
-        )
+        processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+            _ImageWidthStrategy, TokenSpaceServingSpec
+        )(None, server_args, _bare_tokenizer(), None)
         self.addCleanup(processor.shutdown)
         output = asyncio.run(
             processor.process_mm_data_async(
