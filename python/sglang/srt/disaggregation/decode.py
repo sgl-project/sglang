@@ -136,7 +136,12 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
 )
-from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
+from sglang.srt.utils import (
+    ceil_align,
+    get_num_new_pages,
+    is_npu,
+    rank_consensus_checker,
+)
 from sglang.srt.utils.common import async_h2d
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -2833,9 +2838,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self._is_host_destination(decode_req):
             decode_req.kv_receiver.abort()
 
-    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+    def pop_transferred(
+        self, rids_to_check: Optional[Dict[str, bool]] = None
+    ) -> List[Req]:
+        transferred_reqs, _ = self.pop_transferred_with_outcomes(rids_to_check)
+        return transferred_reqs
+
+    def pop_transferred_with_outcomes(
+        self, rids_to_check: Optional[Dict[str, bool]] = None
+    ) -> Tuple[List[Req], Dict[str, bool]]:
+        """Return the admitted requests and {rid: failed} for every request
+        concluded here. rids_to_check is the PP consensus as {rid: failed}: only
+        these rids are concluded, and a rid failed on any stage is concluded as
+        failed on every stage, whatever this stage's own receiver reports."""
         if not self.queue:
-            return []
+            return [], {}
 
         if self.scheduler.enable_decode_hicache:
             self._process_hicache_local_restores(
@@ -2857,11 +2874,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # teardown below.
         deferred_indices = set()
         failed: List[Tuple[int, DecodeRequest, bool]] = []
+        outcomes: Dict[str, bool] = {}
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
-            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
-                continue
+            if rids_to_check is not None:
+                if decode_req.req.rid not in rids_to_check:
+                    continue
+                # Conclude with the stage-consensus outcome: another stage may
+                # have failed this transfer (e.g. its prefill stage aborted).
+                if rids_to_check[decode_req.req.rid]:
+                    poll = KVPoll.Failed
 
             if poll == KVPoll.Failed:
+                outcomes[decode_req.req.rid] = True
                 self._abort_failed_transfer(decode_req)
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
@@ -2928,6 +2952,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         decode_req.kv_receiver.clear()
                         decode_req.kv_receiver = None
                         indices_to_remove.add(i)
+                        outcomes[decode_req.req.rid] = True
                         continue
                     if not self.scheduler.disagg_decode_prealloc_queue.allocate_host_staged(
                         decode_req
@@ -2936,6 +2961,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
+                outcomes[decode_req.req.rid] = isinstance(
+                    decode_req.req.finished_reason, FINISH_ABORT
+                )
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
@@ -2994,7 +3022,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
 
-        return transferred_reqs
+        if rids_to_check is not None:
+            for rid, rid_failed in outcomes.items():
+                rank_consensus_checker.assert_same(
+                    "pp disagg decode transfer concluded rid=%s failed=%s",
+                    rid,
+                    rid_failed,
+                )
+        return transferred_reqs, outcomes
 
     def _defer_release(self, decode_req: DecodeRequest) -> None:
         start_time = time.monotonic()
