@@ -22,6 +22,9 @@ from sglang.srt.entrypoints.openai.transcription_adapters.qwen2_audio import (  
 from sglang.srt.entrypoints.openai.transcription_adapters.qwen3_asr import (  # noqa: F401
     Qwen3ASRAdapter,
 )
+from sglang.srt.entrypoints.openai.transcription_adapters.qwen3_omni import (  # noqa: F401
+    Qwen3OmniAdapter,
+)
 from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (  # noqa: F401
     WhisperAdapter,
 )
@@ -36,4 +39,5 @@ __all__ = [
     "GraniteSpeechAdapter",
     "Qwen2AudioAdapter",
     "GlmAsrAdapter",
+    "Qwen3OmniAdapter",
 ]
