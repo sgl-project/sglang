@@ -540,11 +540,14 @@ app.include_router(elastic_ep_router)
 
 
 def _anthropic_validation_message(raw_errors) -> str:
-    """Render Pydantic-style errors for an Anthropic /v1/messages route.
+    """Render Pydantic-style errors as a client-facing validation message.
 
     Builds a short ``loc: msg`` digest that names the offending fields without
     leaking file paths or Python internals (the default ``str(exc)`` includes
-    the dispatcher's ``File "/.../http_server.py"`` line).
+    the dispatcher's ``File "/.../http_server.py"`` line). Originally written
+    for the Anthropic /v1/messages envelope, it is also the message renderer
+    for the OpenAI envelopes below so every client-facing validation message
+    is scrubbed the same way.
     """
     parts: list[str] = []
     for err in raw_errors or []:
@@ -640,7 +643,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     file paths or Python internals from the default ``str(exc)`` representation
     never reach the client. For /v1/responses, keep OpenAI-style. For
     /v1/systemone, keep the 422 detail list that the System One API documents.
-    Otherwise use the legacy ErrorResponse shape.
+    Otherwise use the legacy ErrorResponse shape. All non-systemone branches
+    render the message from structured field errors only; the full error is
+    logged server-side instead of echoed to the client.
     """
     if request.url.path.startswith("/v1/messages"):
         return _anthropic_error_response(
@@ -662,13 +667,20 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             content={"detail": jsonable_encoder(detail)},
         )
 
-    exc_str = str(exc)
-    errors_str = str(exc.errors())
-
-    if errors_str and errors_str != exc_str:
-        message = f"{exc_str} {errors_str}"
-    else:
-        message = exc_str
+    # Render the message from structured field errors only. The default
+    # ``str(exc)`` appends the dispatching endpoint's source file, line, and
+    # function name, which belong in server-side diagnostics, not in the
+    # client response (see #47076). The input echo is left out for the same
+    # reason the /v1/systemone branch above drops it.
+    logger.warning(
+        "Request validation failed on %s: %s",
+        request.url.path,
+        [
+            {key: value for key, value in err.items() if key != "input"}
+            for err in exc.errors()
+        ],
+    )
+    message = _anthropic_validation_message(exc.errors())
 
     if request.url.path.startswith("/v1/responses"):
         # adapt specially, for v1/responses API only (notice the error key is different)
