@@ -96,3 +96,92 @@ def engram_gather(
             HAS_DST=dst is not None,
         )
     return out
+
+
+@triton.jit
+def _engram_gather_peer_kernel(
+    ids_ptr,
+    ids_stride,
+    out_ptr,
+    w_bias_ptr,
+    s_bias_ptr,
+    starts_ptr,
+    n_cols,
+    DIM: tl.constexpr,
+    BLK: tl.constexpr,
+    ROWS: tl.constexpr,
+    LOG2_WORLD: tl.constexpr,
+    E8M0_ZERO: tl.constexpr,
+):
+    tok = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+    col_ok = cols < n_cols
+    idx = tl.load(ids_ptr + tok * ids_stride + cols, mask=col_ok, other=0).to(tl.int64)
+    # Owner = the last shard whose first row is <= idx; starts is padded to a
+    # power of two with int64 max, so the search never runs past a real shard.
+    owner = tl.zeros([ROWS], dtype=tl.int32)
+    for step in tl.static_range(LOG2_WORLD):
+        probe = owner + (1 << (LOG2_WORLD - 1 - step))
+        start = tl.load(starts_ptr + probe)
+        owner = tl.where(start <= idx, probe, owner)
+    # Bases are pre-biased by each shard's first row, so a global id indexes them.
+    w_row = tl.load(w_bias_ptr + owner) + idx * DIM
+    s_row = tl.load(s_bias_ptr + owner) + idx * (DIM // BLK)
+    offs = tl.arange(0, DIM)
+    w = (w_row[:, None] + offs[None, :]).to(tl.pointer_type(tl.float8e4nv))
+    s = (s_row[:, None] + (offs // BLK)[None, :]).to(tl.pointer_type(tl.uint8))
+    mask = col_ok[:, None]
+    vals = tl.load(w, mask=mask, other=0.0).to(tl.float32)
+    exps = tl.load(s, mask=mask, other=0).to(tl.int32)
+    scale = (exps << 23).to(tl.float32, bitcast=True)
+    scale = tl.where(exps == 0, E8M0_ZERO, scale)
+    # -0 becomes +0, as the zero-fill + sum of the sharded lookup leaves it, so the
+    # two lookups agree bit for bit.
+    out = vals * scale
+    out = tl.where(out == 0.0, 0.0, out)
+    dst = out_ptr + (tok * n_cols + cols)[:, None].to(tl.int64) * DIM + offs[None, :]
+    tl.store(dst, out.to(tl.bfloat16), mask=mask)
+
+
+def engram_gather_peer(
+    ids: torch.Tensor,
+    out: torch.Tensor,
+    w_bias: torch.Tensor,
+    s_bias: torch.Tensor,
+    starts: torch.Tensor,
+    dim: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Gather ``ids`` ([T, C] int, unit column stride) into ``out`` ([T, C, dim]
+    bf16, contiguous), reading each id from the shard that owns it.
+
+    ``starts`` ([P] int64, P a power of two) holds each shard's first global row,
+    padded with int64 max; ``w_bias`` / ``s_bias`` ([P] int64) are each shard's fp8
+    row / e8m0 scale base address minus its first row's offset, so any rank's
+    shard (local or a peer mapping over NVLink) is addressed by the global id.
+    """
+    assert ids.dim() == 2 and ids.stride(1) == 1, (ids.shape, ids.stride())
+    assert ids.dtype in (torch.int32, torch.int64)
+    assert out.is_contiguous() and out.dtype == torch.bfloat16
+    assert out.shape == (*ids.shape, dim), (out.shape, ids.shape)
+    world = starts.numel()
+    assert world & (world - 1) == 0, world
+    t, c = ids.shape
+    if t and c:
+        rows = 8
+        _engram_gather_peer_kernel[(t, triton.cdiv(c, rows))](
+            ids,
+            ids.stride(0),
+            out,
+            w_bias,
+            s_bias,
+            starts,
+            c,
+            DIM=dim,
+            BLK=block_size,
+            ROWS=rows,
+            LOG2_WORLD=world.bit_length() - 1,
+            E8M0_ZERO=_E8M0_ZERO,
+            num_warps=4,
+        )
+    return out
