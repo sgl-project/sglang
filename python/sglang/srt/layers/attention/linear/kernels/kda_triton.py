@@ -186,13 +186,12 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_beta: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if is_npu():
-            q = q.contiguous()
-            k = k.contiguous()
-            v = v.contiguous()
-            a = a.contiguous()
-            b = b.contiguous()
-
+        # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
+        # mirroring the GDN triton verify path. Reads the committed state, writes
+        # per-draft-token intermediate states to the scratch buffer, does NOT mutate
+        # the committed pool (disable_state_update=True), and handles chain + tree
+        # (retrieve_parent_token). The verify kernel for the Triton / CuTe DSL KDA
+        # decode backends, and the reference the KDA correctness tests assert against.
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
