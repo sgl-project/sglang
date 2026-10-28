@@ -201,6 +201,8 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
+    # (capturing, seq_lens + max_q_len) for target-verify attention
+    verify_seqused_k: Optional[tuple] = None
     # ASM context-chunk prefill: KV slots to gather and cu_seqlens_k, computed
     # once per batch by AiterAttnBackend._asm_context_prefill_indices.
     asm_ctx_ready: bool = False
@@ -569,9 +571,9 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         self.scale = float(1.0 / (self.head_dim**0.5))
-        self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
-            self.device
-        )
+        self.q_scale = self.k_scale = self.v_scale = torch.tensor(
+            [1.0], dtype=torch.float32
+        ).to(self.device)
 
         self.logits_soft_cap = 0.0
 
@@ -744,6 +746,21 @@ class AiterAttnBackend(AttentionBackend):
         if self.kv_cache_dtype != fp8_dtype:
             return "auto"
         return "fp8_e4m3"
+
+    def _quantize_q_fp8(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize ``q`` to fp8 with the static q scale.
+
+        Returns ``(q_fp8, q_descale)``; ``q_descale`` must be passed as the
+        attention kernel's ``q_descale``. The KV cache ``k_scale`` is calibrated
+        for K, not q, so it cannot stand in for q's scale. The quant kernel
+        saturates, whereas ``.to(fp8)`` turns out-of-range values into NaN on
+        e4m3fnuz. ``q`` is often a strided view into the fused qkv output, and
+        the quant kernel reads its input as contiguous rows.
+        """
+        q_fp8, _ = scaled_fp8_quant(
+            q.reshape(q.shape[0], -1).contiguous(), self.q_scale
+        )
+        return q_fp8.view(q.shape), self.q_scale
 
     def _use_mla_decode_persist_metadata(self) -> bool:
         """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
@@ -4178,6 +4195,17 @@ class AiterAttnBackend(AttentionBackend):
                         and not layer.logit_cap
                         and sinks is None
                     )
+                    # One add per forward, shared by every layer, so the asm kernel's
+                    # per-forward seg-plan cache (keyed on this tensor) hits after layer 0.
+                    md = self.forward_metadata
+                    cap = torch.cuda.is_current_stream_capturing()
+                    hit = md.verify_seqused_k
+                    if hit is None or hit[0] != cap:
+                        hit = md.verify_seqused_k = (
+                            cap,
+                            forward_batch.seq_lens + md.max_q_len,
+                        )
+                    seqused_k = hit[1]
                     if use_unified_attention_3d_mtp:
                         unified_attention_3d_mtp_func(
                             q=q_unified,
@@ -4185,9 +4213,7 @@ class AiterAttnBackend(AttentionBackend):
                             v=v_unified,
                             out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                             cu_seqlens_q=self.forward_metadata.qo_indptr,
-                            seqused_k=(
-                                forward_batch.seq_lens + self.forward_metadata.max_q_len
-                            ),
+                            seqused_k=seqused_k,
                             max_seqlen_q=self.forward_metadata.max_q_len,
                             max_seqlen_k=max_kv_len,
                             softmax_scale=layer.scaling,
@@ -4216,9 +4242,7 @@ class AiterAttnBackend(AttentionBackend):
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=(
-                            forward_batch.seq_lens + self.forward_metadata.max_q_len
-                        ),
+                        seqused_k=seqused_k,
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
@@ -4572,8 +4596,7 @@ class AiterAttnBackend(AttentionBackend):
             # NHD path — original aiter paged batch_prefill.
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
-                q = q.to(fp8_dtype)
-                q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                q, q_descale = self._quantize_q_fp8(q)
 
             k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
@@ -4814,10 +4837,7 @@ class AiterAttnBackend(AttentionBackend):
                     return o
                 q_descale = None
                 if self.kv_cache_dtype == fp8_dtype:
-                    q_descale = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
-                    q, _ = scaled_fp8_quant(q, q_descale)
+                    q, q_descale = self._quantize_q_fp8(q)
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -4836,7 +4856,7 @@ class AiterAttnBackend(AttentionBackend):
                     causal=True,
                     window_size=window_size,
                     block_table=page_table,
-                    softcap=0,
+                    softcap=layer.logit_cap,
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
@@ -4865,8 +4885,8 @@ class AiterAttnBackend(AttentionBackend):
                     aiter_kv_str,
                     "NHD",
                     self.logits_soft_cap,
-                    self.k_scale,
-                    self.v_scale,
+                    k_descale if k_descale is not None else self.k_scale,
+                    v_descale if v_descale is not None else self.v_scale,
                     None,
                     _AITER_PARTITION_SIZE_ROCM,
                 )

@@ -215,6 +215,7 @@ class SchedulePolicy:
         waiting_queue: List[Req],
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
+        bootstrap_queue: List[Req] = [],
     ) -> None:
         policy = self._determine_active_policy(waiting_queue)
 
@@ -277,14 +278,20 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
 
-        self._touch_waiting_prefixes(policy, waiting_queue)
+        self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
 
-    def _touch_waiting_prefixes(self, policy: Policy, waiting_queue: List[Req]) -> None:
+    def _touch_waiting_prefixes(
+        self,
+        policy: Policy,
+        waiting_queue: List[Req],
+        bootstrap_queue: List[Req] = [],
+    ) -> None:
         # Head last, so LRU evicts in reverse admission order; cache-aware policies
         # already touch while matching, and other eviction strategies ignore recency.
+        bootstrap_max = envs.SGLANG_WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX.get()
         if (
             isinstance(policy, CacheAwarePolicy)
-            or not waiting_queue
+            or not (waiting_queue or (bootstrap_queue and bootstrap_max > 0))
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
             or get_disagg().disaggregation_mode == "decode"
             or get_memory().radix_eviction_policy.lower() != "lru"
@@ -298,6 +305,9 @@ class SchedulePolicy:
         self._waiting_prefix_refresh_calls += 1
         if not refresh:
             return
+        # Bootstrap-queued requests run after the waiting queue, so touch them first.
+        for r in reversed(bootstrap_queue[:bootstrap_max]):
+            touch_waiting_prefix(r, self.tree_cache)
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
 
@@ -1454,6 +1464,19 @@ class PrefillAdder:
             ):
                 return AddReqResult.OTHER
 
+            # Reserve sharded scratch before any load-back is queued: a load
+            # must be consumed by this batch, whose prefix gather waits on it.
+            if self.kv_shard_scratch_spec is not None:
+                scratch_mark = (
+                    self.kv_shard_block_bound_pages,
+                    self.kv_shard_chunk_pages,
+                )
+                reserved_for = (admission.prefix_len, admission.extend_len)
+                if not self._kv_shard_reserve_scratch(
+                    prefix_len=admission.prefix_len, extend_len=admission.extend_len
+                ):
+                    return AddReqResult.OTHER
+
             if req.needs_host_load_back():
                 load_max_new = min(max_new, admission.max_new_tokens)
                 # Reclaim can write back device victims and evict host leaves.
@@ -1557,11 +1580,19 @@ class PrefillAdder:
                 if self.tree_cache.load_back_is_cache_owned():
                     req.kv.cache_protected_len = req.prefix_len
 
-            # Sharded pools cannot load host KV; reserve scratch after all other gates.
-            if not self._kv_shard_reserve_scratch(
-                prefix_len=admission.prefix_len, extend_len=admission.extend_len
+            if (
+                self.kv_shard_scratch_spec is not None
+                and (admission.prefix_len, admission.extend_len) != reserved_for
             ):
-                return AddReqResult.OTHER
+                # No FULL was loaded (sharded trees have no aux components),
+                # so deferring here leaves no H2D without its consumer.
+                self.kv_shard_block_bound_pages, self.kv_shard_chunk_pages = (
+                    scratch_mark
+                )
+                if not self._kv_shard_reserve_scratch(
+                    prefix_len=admission.prefix_len, extend_len=admission.extend_len
+                ):
+                    return AddReqResult.OTHER
 
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)
 

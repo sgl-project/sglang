@@ -310,7 +310,6 @@ class RowBucketGraphRunner:
                     cuda_graph=graph,
                     pool=pool,
                     stream=ctx.stream,
-                    barrier_fn=tp_group.barrier,
                 ),
             ):
                 outputs = body()

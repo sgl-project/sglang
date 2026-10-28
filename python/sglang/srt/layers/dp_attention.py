@@ -268,7 +268,6 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
-
         dp = get_flags().dp
         dp.buffer_hidden_size = hidden_size
         dp.buffer_dtype = dtype
@@ -291,7 +290,6 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
-
         dp = get_flags().dp
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
@@ -337,17 +335,14 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_dp_hidden_size(cls) -> int:
-
         return get_flags().dp.buffer_hidden_size
 
     @classmethod
     def get_dp_dtype(cls) -> torch.dtype:
-
         return get_flags().dp.buffer_dtype
 
     @classmethod
     def get_dp_device(cls) -> torch.device:
-
         return get_flags().dp.buffer_device
 
     @classmethod
@@ -440,7 +435,6 @@ def set_is_extend_in_batch(is_extend_in_batch: bool):
 
 
 def get_is_extend_in_batch() -> bool:
-
     return get_forward().is_extend_in_batch
 
 
@@ -696,27 +690,22 @@ def _dp_gather_via_all_reduce(
             start, length = _cp_shard_rows(forward_batch, cp_shard_counts)
             global_tokens[start : start + length].copy_(local_tokens[:length])
 
-    # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     if world_dp_gather_enabled():
         torch.distributed.all_reduce(
             global_tokens,
             op=torch.distributed.ReduceOp.SUM,
             group=torch.distributed.group.WORLD,
         )
+    elif not local_tokens.dtype.is_floating_point:
+        # Integer rows (input ids, Engram hash ids) take the in-place NCCL path:
+        # the custom all-reduce kernels sum floating-point dtypes only.
+        from sglang.srt.distributed.parallel_state import inplace_all_reduce
+
+        inplace_all_reduce(
+            global_tokens, group_name=get_parallel().tp_group.unique_name
+        )
     else:
-        NUM_GPUS_PER_NODE = 8
-        if (
-            not local_tokens.dtype.is_floating_point
-            and get_parallel().tp_size <= NUM_GPUS_PER_NODE
-        ):
-            from sglang.srt.distributed.parallel_state import inplace_all_reduce
-
-            inplace_all_reduce(
-                global_tokens, group_name=get_parallel().tp_group.unique_name
-            )
-
-        else:
-            global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+        global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
 def _dp_gather_via_all_gather(
@@ -1181,7 +1170,6 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
 # deadlock on the RCCL communicator), each overlapping the other's compute.
 # ---------------------------------------------------------------------------
 def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
-
     return get_stream("dp_tbo_comm")
 
 
@@ -1192,7 +1180,6 @@ def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
 # ("...create internal OS-specific events"). Reuse one event per (kind, subbatch)
 # and just re-record it (mirrors the mori CommStreamPool event reuse).
 def _tbo_event(key) -> torch.cuda.Event:
-
     pool = get_resources().tbo_event_pool
     ev = pool.get(key)
     if ev is None:
@@ -1255,17 +1242,36 @@ def dp_reduce_scatterv_async(
     sizes: List[int],
     event_key=("combine", 0),
 ) -> torch.cuda.Event:
-    """Launch the variable-length reduce_scatterv (combine) on the shared DP TBO
-    comm stream; re-record + return a PERSISTENT event (keyed by `event_key`).
-    Matches the gatherv (SUM_LEN) path."""
+    """Launch the TBO variable-length combine on the shared comm stream.
+    ``sizes`` has one entry per full-TP rank: a shard of its DP-local rows."""
     comm = get_dp_tbo_comm_stream()
     compute = torch.cuda.current_stream()
     ev = _tbo_event(event_key)
+    parallel = get_parallel()
+    attn_tp_size = parallel.attn_tp_size
+    if attn_tp_size == 1:
+        output_shard = output_local
+    else:
+        shard_rows = sizes[parallel.tp_group.rank_in_group]
+        assert output_local.shape[0] == shard_rows * attn_tp_size
+        output_shard = get_tbo_persistent_buffer(
+            ("combine_shard", event_key),
+            shard_rows,
+            output_local.shape[1],
+            output_local.dtype,
+            output_local.device,
+        )
     with torch.cuda.stream(comm):
         comm.wait_stream(compute)
-        get_parallel().tp_group.reduce_scatterv(
-            global_tokens, output=output_local, sizes=sizes
+        parallel.tp_group.reduce_scatterv(
+            global_tokens, output=output_shard, sizes=sizes
         )
+        if attn_tp_size > 1:
+            # Not the group's custom all-gather: the other micro-batch's
+            # attention uses its buffers on the compute stream meanwhile.
+            all_gather_single(
+                output_local, output_shard, group=parallel.attn_tp_group.device_group
+            )
         ev.record(comm)
     return ev
 
