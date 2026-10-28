@@ -31,16 +31,17 @@ class AibrixKVCacheStorage(HiCacheStorage):
         else:
             self.is_mla_backend = False
             self.local_rank = 0
-        kv_cache = mem_pool.device_pool
         self.page_size = mem_pool.page_size
-        self.kv_cache_dtype = kv_cache.dtype
-        self.layer_num = kv_cache.layer_num
+        storage_info = mem_pool
+        self.kv_cache_dtype = storage_info.dtype
+        self.layer_num = mem_pool.target_layer_num
         self.kv_head_ids = [
-            self.local_rank * kv_cache.head_num + i for i in range(kv_cache.head_num)
+            self.local_rank * storage_info.head_num + i
+            for i in range(storage_info.head_num)
         ]
         if not self.is_mla_backend:
             self.layer_ids = range(
-                kv_cache.start_layer, kv_cache.end_layer
+                storage_info.start_layer, storage_info.end_layer
             )  # for pipeline parallel
 
             self.block_spec = KVCacheBlockSpec(
@@ -50,7 +51,7 @@ class AibrixKVCacheStorage(HiCacheStorage):
                 tensor_spec=KVCacheTensorSpec(
                     heads=self.kv_head_ids,
                     layers=self.layer_ids,
-                    head_size=kv_cache.head_dim,
+                    head_size=storage_info.head_dim,
                 ),
             )
             logger.info(self.block_spec)

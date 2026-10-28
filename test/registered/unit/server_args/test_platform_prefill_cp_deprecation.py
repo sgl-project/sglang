@@ -15,9 +15,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
-_ENV_GATE = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+_ENV_GATE = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
 
 
 def _cp_args(arch="DeepseekV4ForCausalLM", model_type="deepseek_v4", **overrides):
