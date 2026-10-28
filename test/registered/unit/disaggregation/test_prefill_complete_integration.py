@@ -22,12 +22,17 @@ from sglang.srt.disaggregation.mooncake.conn import (
 from sglang.srt.disaggregation.req_state import DisaggReqState
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.engine_state import LaunchCounters
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import prefill_owner_shell
+from sglang.test.scheduler_request_lists import make_request_retirer
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -381,7 +386,7 @@ class TestAllocationIntegration(CustomTestCase):
         req.cache_request_handle = CacheRequestHandle(rid="retry-mm", attempt_id=0)
         req.session = None
         req.multimodal_inputs = Mock()
-        req.prefill_attempt_count = 0
+        req.disagg = DisaggReqState(prefill_attempt_count=0, metadata_buffer_index=0)
         req.output_ids = [42]
         req.skip_radix_cache_insert = False
         req.kv = SimpleNamespace(cache_protected_len=16)
@@ -392,29 +397,31 @@ class TestAllocationIntegration(CustomTestCase):
         req.reset_for_retract = Mock()
         req.advance_cache_request_handle = Mock()
         req.time_stats = MagicMock()
-        scheduler = SimpleNamespace(
-            tree_cache=Mock(supports_mamba=Mock(return_value=False)),
+        tree_cache = Mock(supports_mamba=Mock(return_value=False))
+        owner = prefill_owner_shell(
+            tree_cache=tree_cache,
+            # The real requeue path: the retirer ends the cache attempt and
+            # frees the KV, keeping media and session.
+            request_retirer=make_request_retirer(
+                kv=SimpleNamespace(tree_cache=tree_cache)
+            ),
             clear_pending_chunk_send=Mock(),
-            waiting_queue=[],
-            disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
-            metrics_reporter=SimpleNamespace(enable_metrics=False),
-            processed_tokens_counter=0,
-        )
-        scheduler._release_aborted_request = MethodType(
-            Scheduler._release_aborted_request, scheduler
+            req_to_metadata_buffer_idx_allocator=Mock(),
+            metrics_sink=SimpleNamespace(enable_metrics=False),
+            counters=LaunchCounters(),
         )
         with (
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
-            patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+            ),
         ):
-            SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req
-            )
+            waiting = owner.optimistic_release_and_requeue(req, [])
 
-        self.assertEqual(scheduler.waiting_queue, [req])
+        self.assertEqual(waiting, [req])
         self.assertIsNotNone(req.multimodal_inputs)
         req.multimodal_inputs.release_features.assert_not_called()
-        scheduler.tree_cache.finish.assert_called_once_with(
+        tree_cache.finish.assert_called_once_with(
             req.cache_request_handle, CacheRequestOutcome.ABORT
         )
 
