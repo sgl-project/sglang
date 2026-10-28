@@ -72,12 +72,15 @@ class TestKernel(unittest.TestCase):
         blas = (x @ w.t()).float()
         self.assertEqual(out.shape, (1, n))
         self.assertEqual(out.dtype, torch.bfloat16)
+        err = (out.float() - ref).abs().max().item()
+        err_blas = (blas - ref).abs().max().item()
+        # One bf16 ulp at the output scale: the error both paths can reach from the
+        # final store alone, and it grows with sqrt(K) for the accumulated part.
+        step = max(ref.abs().max().item() * 2 ** -9, 1e-6)
+        self.assertLess(err, 10 * step, (n, k, err, step))
         # fp32 accumulation is at least as accurate as rocBLAS bf16 output.
-        self.assertLess((out.float() - ref).abs().max().item(), 0.05)
-        self.assertLessEqual(
-            (out.float() - ref).abs().max().item(),
-            (blas - ref).abs().max().item() * 2 + 1e-3,
-        )
+        self.assertLessEqual(err, err_blas * 2 + 1e-3, (n, k, err, err_blas))
+        self.assertFalse(torch.isnan(out).any().item(), (n, k))
 
     def test_decode_shapes(self):
         for n, k in DECODE_SHAPES:
