@@ -80,8 +80,8 @@ class LightOnOCRProcessor(PixtralProcessor):
             return result
 
         # Remove break/end tokens and fix multimodal item offsets
-        input_ids = result.get("input_ids", [])
-        mm_items = result.get("mm_items", [])
+        input_ids = result.input_ids or []
+        mm_items = result.mm_items or []
 
         new_input_ids = []
         old_to_new = {}
@@ -106,5 +106,5 @@ class LightOnOCRProcessor(PixtralProcessor):
             if new_indices:
                 mm_item.offsets = [(new_indices[0], new_indices[-1])]
 
-        result["input_ids"] = new_input_ids
+        result.input_ids = new_input_ids
         return result

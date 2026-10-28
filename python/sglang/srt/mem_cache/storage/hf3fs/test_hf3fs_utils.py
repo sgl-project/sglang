@@ -1,13 +1,15 @@
 import multiprocessing.shared_memory
+import sys
 from pathlib import Path
 
 import pytest
 import torch
-from torch.utils.cpp_extension import load
 from tqdm import tqdm
 
+from sglang.srt.utils.cpp_extension_loader import load_extension_with_recovery
+
 root = Path(__file__).parent.resolve()
-hf3fs_utils = load(
+hf3fs_utils = load_extension_with_recovery(
     name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"], verbose=True
 )
 
@@ -40,4 +42,4 @@ def test_rw_shm():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

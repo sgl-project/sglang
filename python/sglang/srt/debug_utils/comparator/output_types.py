@@ -277,7 +277,7 @@ class SummaryRecord(_OutputRecord):
     errored: int = 0
 
     @model_validator(mode="after")
-    def _validate_totals(self) -> "SummaryRecord":
+    def _validate_totals(self) -> SummaryRecord:
         expected: int = self.passed + self.failed + self.skipped + self.errored
         if self.total != expected:
             raise ValueError(

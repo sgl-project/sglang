@@ -15,11 +15,15 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.runtime_context import get_context, get_exec
+from sglang.srt.sampling.watermarking.core import (
+    WATERMARK_CONTAINER_FIELD_NAMES,
+    WATERMARK_SECRET_FIELD_NAMES,
+    redact_watermark_secrets,
+)
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 if TYPE_CHECKING:
@@ -36,7 +40,7 @@ WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
 
 
 def _extract_whitelisted_headers(
-    request: Optional["fastapi.Request"],
+    request: Optional[fastapi.Request],
 ) -> Optional[Dict[str, str]]:
     if request is None:
         return None
@@ -89,9 +93,9 @@ class RequestLogger:
 
     def log_received_request(
         self,
-        obj: Union["GenerateReqInput", "EmbeddingReqInput"],
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
         tokenizer: Any = None,
-        request: Optional["fastapi.Request"] = None,
+        request: Optional[fastapi.Request] = None,
     ) -> None:
         if not self.log_requests:
             return
@@ -133,7 +137,7 @@ class RequestLogger:
     def log_openai_received_request(
         self,
         obj: Any,
-        request: Optional["fastapi.Request"] = None,
+        request: Optional[fastapi.Request] = None,
     ) -> None:
         """Log the raw OpenAI request payload before request adaptation/tokenization."""
         max_length, _, _ = self.metadata
@@ -160,10 +164,9 @@ class RequestLogger:
 
     def log_finished_request(
         self,
-        obj: Union["GenerateReqInput", "EmbeddingReqInput"],
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
         out: Any,
-        is_multimodal_gen: bool = False,
-        request: Optional["fastapi.Request"] = None,
+        request: Optional[fastapi.Request] = None,
     ) -> None:
         if not self.log_requests:
             return
@@ -181,20 +184,15 @@ class RequestLogger:
             }
             if headers:
                 log_data["headers"] = headers
-            if not is_multimodal_gen:
-                log_data["out"] = _transform_data_for_logging(
-                    out, max_length, out_skip_names
-                )
+            log_data["out"] = _transform_data_for_logging(
+                out, max_length, out_skip_names
+            )
             log_json(self.targets, "request.finished", log_data)
         else:
             obj_str = _dataclass_to_string_truncated(
                 obj, max_length, skip_names=skip_names
             )
-            out_str = (
-                ""
-                if is_multimodal_gen
-                else f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
-            )
+            out_str = f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
             headers_str = f", headers={headers}" if headers else ""
             self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
 
@@ -213,6 +211,7 @@ class RequestLogger:
                     "input_embeds",
                     "image_data",
                     "audio_data",
+                    "video_data",
                     "lora_path",
                     "sampling_params",
                 }
@@ -225,6 +224,7 @@ class RequestLogger:
                     "input_embeds",
                     "image_data",
                     "audio_data",
+                    "video_data",
                     "lora_path",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}
@@ -243,10 +243,30 @@ class RequestLogger:
             target.info(msg)
 
 
-# TODO remove this?
-@lru_cache(maxsize=2)
-def disable_request_logging() -> bool:
-    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
+def _watermark_redaction_enabled() -> bool:
+    # Standalone formatting keeps redaction when no server config is published.
+    return (
+        not get_context().is_config_namespace_published("exec")
+        or get_exec().features.enable_watermark
+    )
+
+
+def _maybe_redact_watermark_secrets(data: Any) -> Any:
+    if not _watermark_redaction_enabled():
+        return data
+    return redact_watermark_secrets(data)
+
+
+def _redact_field(name: str, value: Any) -> Any:
+    # Redact by name instead of walking the whole object: requests carry
+    # ~100k-entry token-id lists, and the recursive walk costs tens of ms.
+    if not _watermark_redaction_enabled():
+        return value
+    if name in WATERMARK_SECRET_FIELD_NAMES:
+        return "<redacted>"
+    if name in WATERMARK_CONTAINER_FIELD_NAMES:
+        return redact_watermark_secrets(value, in_watermark_config=name == "watermark")
+    return value
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
@@ -264,32 +284,33 @@ def _dataclass_to_string_truncated(
     elif isinstance(data, (list, tuple)):
         if len(data) > max_length:
             half_length = max_length // 2
-            return str(data[:half_length]) + " ... " + str(data[-half_length:])
+            return (
+                str(_maybe_redact_watermark_secrets(data[:half_length]))
+                + " ... "
+                + str(_maybe_redact_watermark_secrets(data[-half_length:]))
+            )
         else:
-            return str(data)
+            return str(_maybe_redact_watermark_secrets(data))
     elif isinstance(data, dict):
-        return (
-            "{"
-            + ", ".join(
-                f"'{k}': {_dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-                if k not in skip_names
-            )
-            + "}"
-        )
+        parts = []
+        for k, v in data.items():
+            if k in skip_names:
+                continue
+            rendered = _dataclass_to_string_truncated(_redact_field(k, v), max_length)
+            parts.append(f"'{k}': {rendered}")
+        return "{" + ", ".join(parts) + "}"
     elif dataclasses.is_dataclass(data):
-        fields = dataclasses.fields(data)
-        return (
-            f"{data.__class__.__name__}("
-            + ", ".join(
-                f"{f.name}={_dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
-                if f.name not in skip_names
+        parts = []
+        for f in dataclasses.fields(data):
+            if f.name in skip_names:
+                continue
+            value = _redact_field(f.name, getattr(data, f.name))
+            parts.append(
+                f"{f.name}={_dataclass_to_string_truncated(value, max_length)}"
             )
-            + ")"
-        )
+        return f"{data.__class__.__name__}(" + ", ".join(parts) + ")"
     else:
-        return str(data)
+        return str(_maybe_redact_watermark_secrets(data))
 
 
 def _transform_data_for_logging(
@@ -305,22 +326,30 @@ def _transform_data_for_logging(
     elif isinstance(data, (list, tuple)):
         if len(data) > max_length:
             half_length = max_length // 2
-            return list(data[:half_length]) + ["..."] + list(data[-half_length:])
+            return (
+                [_transform_data_for_logging(v, max_length) for v in data[:half_length]]
+                + ["..."]
+                + [
+                    _transform_data_for_logging(v, max_length)
+                    for v in data[-half_length:]
+                ]
+            )
         return [_transform_data_for_logging(v, max_length) for v in data]
     elif isinstance(data, dict):
         return {
-            k: _transform_data_for_logging(v, max_length)
+            k: _transform_data_for_logging(_redact_field(k, v), max_length)
             for k, v in data.items()
             if k not in skip_names
         }
     elif dataclasses.is_dataclass(data):
-        fields = dataclasses.fields(data)
         return {
-            f.name: _transform_data_for_logging(getattr(data, f.name), max_length)
-            for f in fields
+            f.name: _transform_data_for_logging(
+                _redact_field(f.name, getattr(data, f.name)), max_length
+            )
+            for f in dataclasses.fields(data)
             if f.name not in skip_names
         }
     elif isinstance(data, (int, float, bool, type(None))):
         return data
     else:
-        return str(data)
+        return str(_maybe_redact_watermark_secrets(data))

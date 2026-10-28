@@ -5,15 +5,18 @@
 Input validation stage for diffusion pipelines.
 """
 
+from typing import Iterator
+
 import numpy as np
 import torch
-import torchvision.transforms.functional as TF
-from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
-from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
+from sglang.multimodal_gen.configs.task_type import get_request_task_type
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -23,7 +26,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import best_output_size
+from sglang.multimodal_gen.runtime.utils.vision import (
+    load_image,
+    load_video,
+    preprocess_image,
+)
 
 logger = init_logger(__name__)
 
@@ -32,6 +39,31 @@ V = StageValidators
 
 
 # TODO: since this might change sampling params after logging, should be do this beforehand?
+
+
+def _best_output_size(w, h, dw, dh, expected_area):
+    # float output size
+    ratio = w / h
+    ow = (expected_area * ratio) ** 0.5
+    oh = expected_area / ow
+
+    # process width first
+    ow1 = int(ow // dw * dw)
+    oh1 = int(expected_area / ow1 // dh * dh)
+    assert ow1 % dw == 0 and oh1 % dh == 0 and ow1 * oh1 <= expected_area
+    ratio1 = ow1 / oh1
+
+    # process height first
+    oh2 = int(oh // dh * dh)
+    ow2 = int(expected_area / oh2 // dw * dw)
+    assert oh2 % dh == 0 and ow2 % dw == 0 and ow2 * oh2 <= expected_area
+    ratio2 = ow2 / oh2
+
+    # compare ratios
+    if max(ratio / ratio1, ratio1 / ratio) < max(ratio / ratio2, ratio2 / ratio):
+        return ow1, oh1
+    else:
+        return ow2, oh2
 
 
 class InputValidationStage(PipelineStage):
@@ -47,6 +79,29 @@ class InputValidationStage(PipelineStage):
     def __init__(self, vae_image_processor=None):
         super().__init__()
         self.vae_image_processor = vae_image_processor
+
+    def load_condition_image(self, image):
+        return load_image(image)
+
+    def iter_sequential_requests(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Iterator[Req]:
+        if not server_args.pipeline_config.supports_sequential_multi_output_inference():
+            return iter((batch,))
+
+        num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
+        if num_outputs == 1:
+            return iter((batch,))
+
+        outputs = expand_request_outputs(
+            batch,
+            reuse_parent_trace_ctx=True,
+            preserve_parent_metrics=True,
+        )
+        # expansion resets generators after this stage has already validated them
+        for output in outputs:
+            self._generate_seeds(output, server_args)
+        return iter(outputs)
 
     @staticmethod
     def _calculate_dimensions_from_area(
@@ -68,17 +123,56 @@ class InputValidationStage(PipelineStage):
         return width, height
 
     def _generate_seeds(self, batch: Req, server_args: ServerArgs):
-        """Generate seeds for the inference"""
+        """Generate deterministic per-output seeds.
+
+        Batched requests pass one base seed per prompt through `extra`; each
+        prompt expands to `num_outputs_per_prompt` consecutive seeds.
+        """
         seed = batch.seed
         num_videos_per_prompt = batch.num_outputs_per_prompt
 
         assert seed is not None
-        seeds = [seed + i for i in range(num_videos_per_prompt)]
+
+        prompt_count = len(batch.prompt) if isinstance(batch.prompt, list) else 1
+        dynamic_batch_seeds = batch.extra.get("dynamic_batch_seeds")
+
+        if dynamic_batch_seeds is not None:
+            if (
+                not isinstance(dynamic_batch_seeds, list)
+                or len(dynamic_batch_seeds) != prompt_count
+            ):
+                raise ValueError(
+                    "dynamic_batch_seeds must be a list with one seed per prompt"
+                )
+            base_seeds = [int(item) for item in dynamic_batch_seeds]
+            seeds = []
+            for base_seed in base_seeds:
+                seeds.extend([base_seed + i for i in range(num_videos_per_prompt)])
+        elif isinstance(seed, list):
+            if len(seed) != num_videos_per_prompt:
+                raise ValueError(
+                    f"seed list length must match num_outputs_per_prompt "
+                    f"({num_videos_per_prompt}), got {len(seed)}"
+                )
+            seeds = [int(item) for item in seed]
+        else:
+            # Keep per-prompt seed streams deterministic and non-overlapping.
+            base_seeds = [
+                int(seed) + i * num_videos_per_prompt for i in range(prompt_count)
+            ]
+            seeds = []
+            for base_seed in base_seeds:
+                seeds.extend([base_seed + i for i in range(num_videos_per_prompt)])
         batch.seeds = seeds
 
         # Create generators based on generator_device parameter
         # Note: This will overwrite any existing batch.generator
         generator_device = batch.generator_device
+        if generator_device is None:
+            generator_device = (
+                getattr(server_args.pipeline_config, "generator_device", None)
+                or current_platform.device_type
+            )
 
         if generator_device == "cpu":
             device_str = "cpu"
@@ -101,8 +195,10 @@ class InputValidationStage(PipelineStage):
         NOTE: condition image resizing is only allowed in InputValidationStage
         """
         if batch.condition_image is not None and (
-            server_args.pipeline_config.task_type == ModelTaskType.I2I
-            or server_args.pipeline_config.task_type == ModelTaskType.TI2I
+            get_request_task_type(batch, server_args.pipeline_config)
+            == ModelTaskType.I2I
+            or get_request_task_type(batch, server_args.pipeline_config)
+            == ModelTaskType.TI2I
         ):
             # calculate new condition image size
             if not isinstance(batch.condition_image, list):
@@ -129,8 +225,13 @@ class InputValidationStage(PipelineStage):
             # adjust output image size
             if calculated_size is not None:
                 calculated_width, calculated_height = calculated_size
-                width = batch.width or calculated_width
-                height = batch.height or calculated_height
+                explicit_fields = set(batch.extra.get("explicit_fields", []))
+                width_is_explicit = "width" in explicit_fields
+                height_is_explicit = "height" in explicit_fields
+
+                width = batch.width if width_is_explicit else calculated_width
+                height = batch.height if height_is_explicit else calculated_height
+
                 multiple_of = (
                     server_args.pipeline_config.vae_config.get_vae_scale_factor() * 2
                 )
@@ -139,7 +240,10 @@ class InputValidationStage(PipelineStage):
                 batch.width = width
                 batch.height = height
 
-        elif server_args.pipeline_config.task_type == ModelTaskType.TI2V:
+        elif (
+            get_request_task_type(batch, server_args.pipeline_config)
+            == ModelTaskType.TI2V
+        ):
             if server_args.pipeline_config.skip_input_image_preprocess:
                 return
             # duplicate with vae_image_processor
@@ -157,21 +261,20 @@ class InputValidationStage(PipelineStage):
             )
             dh, dw = patch_size[1] * vae_stride, patch_size[2] * vae_stride
             max_area = 704 * 1280
-            ow, oh = best_output_size(iw, ih, dw, dh, max_area)
+            ow, oh = _best_output_size(iw, ih, dw, dh, max_area)
 
             scale = max(ow / iw, oh / ih)
-            img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
-            logger.debug("resized condition image to: %sx%s", img.height, img.width)
-
-            # center-crop
-            x1 = (img.width - ow) // 2
-            y1 = (img.height - oh) // 2
-            img = img.crop((x1, y1, x1 + ow, y1 + oh))
-            assert img.width == ow and img.height == oh
-
-            # to tensor
-            img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device).unsqueeze(1)
-            img = img.unsqueeze(0)
+            rw, rh = round(iw * scale), round(ih * scale)
+            img = (
+                preprocess_image(
+                    img,
+                    device=self.device,
+                    size=(rw, rh),
+                    crop=((rh - oh) // 2, (rw - ow) // 2, oh, ow),
+                )
+                .contiguous()
+                .unsqueeze(2)
+            )
             batch.height = oh
             batch.width = ow
             # TODO: should we store in a new field: pixel values?
@@ -191,8 +294,30 @@ class InputValidationStage(PipelineStage):
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
             )
+
+            # User-specified width/height controls the target area (scale),
+            # capped by max_area. Aspect ratio always comes from the
+            # condition image for I2V.
+            if batch.width is not None or batch.height is not None:
+                # If one dimension is provided, calculate the other based on the image's aspect ratio.
+                if batch.width is None:
+                    batch.width = round(batch.height / aspect_ratio)
+                elif batch.height is None:
+                    batch.height = round(batch.width * aspect_ratio)
+
+                target_area = min(batch.width * batch.height, max_area)
+                if batch.width * batch.height > max_area:
+                    logger.warning(
+                        "Requested resolution %dx%d exceeds max_area %d, "
+                        "clamping to max_area",
+                        batch.width,
+                        batch.height,
+                        max_area,
+                    )
+            else:
+                target_area = max_area
             width, height = self._calculate_dimensions_from_area(
-                max_area, aspect_ratio, mod_value
+                target_area, aspect_ratio, mod_value
             )
 
             batch.condition_image = batch.condition_image.resize((width, height))
@@ -242,7 +367,8 @@ class InputValidationStage(PipelineStage):
         self._generate_seeds(batch, server_args)
 
         if (
-            server_args.pipeline_config.task_type == ModelTaskType.I2M
+            get_request_task_type(batch, server_args.pipeline_config)
+            == ModelTaskType.I2M
             and batch.num_inference_steps is None
             and hasattr(server_args.pipeline_config, "shape_num_inference_steps")
         ):
@@ -252,7 +378,8 @@ class InputValidationStage(PipelineStage):
 
         # Ensure prompt is properly formatted (I2M can be image-only)
         if (
-            server_args.pipeline_config.task_type != ModelTaskType.I2M
+            get_request_task_type(batch, server_args.pipeline_config)
+            != ModelTaskType.I2M
             and batch.prompt is None
             and batch.prompt_embeds is None
         ):
@@ -281,6 +408,32 @@ class InputValidationStage(PipelineStage):
                 f"Guidance scale must be positive, but got {batch.guidance_scale}"
             )
 
+        # A request that leaves CFG off is servable under CFG parallelism: the
+        # dispatcher gives branch 0 to rank 0, and every other rank runs branch 0
+        # too so the all-gather has shapes to work with. Both ranks then read the
+        # owner's prediction, so the answer is the single-branch answer and the
+        # extra ranks are only redundant.
+        #
+        # This used to raise. That guard was added for a warmup hang (#23198)
+        # two weeks BEFORE the multi-branch refactor (#23736) taught the
+        # dispatcher to handle a single branch, and the warmup path has since
+        # grown its own fix -- the warmup builder forces CFG on whenever
+        # cfg-parallel is enabled. What was left was a server refusing traffic
+        # it could serve, and the runtime AUTO-enables cfg-parallel from the
+        # model's default sampling params, so `sglang serve --num-gpus 2` on a
+        # CFG-defaulting model rejected every guidance_scale=1.0 request while
+        # blaming a flag the user never passed.
+        if server_args.enable_cfg_parallel and not batch.do_classifier_free_guidance:
+            logger.warning_once(
+                "CFG parallelism is enabled but this request does not use "
+                "classifier-free guidance (guidance_scale=%s, true_cfg_scale=%s), "
+                "so it has one branch and the other CFG rank(s) recompute it "
+                "redundantly. Pass --cfg-parallel-size 1 to spend those GPUs on "
+                "another parallelism instead.",
+                batch.guidance_scale,
+                batch.true_cfg_scale,
+            )
+
         # for i2v, get image from image_path
         # @TODO(Wei) hard-coded for wan2.2 5b ti2v for now. Should put this in image_encoding stage
         if batch.image_path is not None:
@@ -288,9 +441,9 @@ class InputValidationStage(PipelineStage):
                 batch.condition_image = []
                 for path in batch.image_path:
                     if path.endswith(".mp4"):
-                        image = load_video(path)[0]
+                        image = load_video(path, max_frames=1)[0]
                     else:
-                        image = load_image(path)
+                        image = self.load_condition_image(path)
                     batch.condition_image.append(image)
 
                 # Use the first image for size reference
@@ -302,9 +455,9 @@ class InputValidationStage(PipelineStage):
                 )
             else:
                 if batch.image_path.endswith(".mp4"):
-                    image = load_video(batch.image_path)[0]
+                    image = load_video(batch.image_path, max_frames=1)[0]
                 else:
-                    image = load_image(batch.image_path)
+                    image = self.load_condition_image(batch.image_path)
                 batch.condition_image = image
                 condition_image_width, condition_image_height = (
                     image.width,
@@ -312,7 +465,10 @@ class InputValidationStage(PipelineStage):
                 )
                 batch.original_condition_image_size = image.size
 
-            if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+            if (
+                get_request_task_type(batch, server_args.pipeline_config)
+                != ModelTaskType.I2M
+            ):
                 self.preprocess_condition_image(
                     batch, server_args, condition_image_width, condition_image_height
                 )
@@ -333,19 +489,38 @@ class InputValidationStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify input validation stage inputs."""
         result = VerificationResult()
-        result.add_check("seed", batch.seed, [V.not_none, V.non_negative_int])
+        result.add_check(
+            "seed",
+            batch.seed,
+            [
+                V.not_none,
+                lambda x: (
+                    V.non_negative_int(x)
+                    if not isinstance(x, list)
+                    else bool(x) and all(V.non_negative_int(item) for item in x)
+                ),
+            ],
+        )
         result.add_check(
             "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
         )
-        if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+        if (
+            get_request_task_type(batch, server_args.pipeline_config)
+            != ModelTaskType.I2M
+        ):
             result.add_check(
                 "prompt_or_embeds",
                 None,
-                lambda _: V.string_or_list_strings(batch.prompt)
-                or V.list_not_empty(batch.prompt_embeds),
+                lambda _: (
+                    V.string_or_list_strings(batch.prompt)
+                    or V.list_not_empty(batch.prompt_embeds)
+                ),
             )
 
-        if server_args.pipeline_config.task_type != ModelTaskType.I2M:
+        if (
+            get_request_task_type(batch, server_args.pipeline_config)
+            != ModelTaskType.I2M
+        ):
             result.add_check(
                 "num_inference_steps", batch.num_inference_steps, V.positive_int
             )

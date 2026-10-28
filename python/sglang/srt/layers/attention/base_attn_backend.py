@@ -1,70 +1,363 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from abc import ABC
+from enum import Enum
+from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+    from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+        BaseIndexerMetadata,
+    )
+    from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.mem_cache.kv.router import KVLayerRouter
+    from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-class AttentionBackend(ABC):
-    """The base class of attention backends"""
+def resolve_window_kv_pool(model_runner: ModelRunner) -> Optional[KVCache]:
+    """The pool whose window sub-pool this runner's window layers address, or
+    None when there is none.
 
-    @abstractmethod
+    A draft runner shares the target's allocator for token bookkeeping but owns
+    a separate KV pool, so the allocator's pool is not its pool. A frozen-KV MTP
+    draft is the exception: it reads the target's KV directly.
+    """
+    active_pool = model_runner.token_to_kv_pool
+    if active_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+        return active_pool
+    if (
+        model_runner.is_draft_worker
+        and not model_runner.spec_algorithm.is_frozen_kv_mtp()
+    ):
+        return None
+    kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
+    if kvcache.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+        return kvcache
+    return None
+
+
+def resolve_window_id_space(
+    model_runner: ModelRunner, window_pool: Optional[KVCache]
+) -> Optional[IdSpace]:
+    """How ``window_pool``'s window sub-pool names the iteration's slots: by
+    its allocator's tables when the allocator hands out virtual ids and the
+    pool's writes take physical ones (the unified pool, and a draft fused into
+    it, view the sub-pools whose tables are the allocator's), else as the pool
+    maps them itself."""
+    if window_pool is None:
+        return None
+    allocator = model_runner.token_to_kv_pool_allocator
+    if allocator.hands_out_virtual_ids and window_pool.requires_physical_write_loc:
+        return allocator.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
+    return window_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
+
+
+class SharedReadEnds(Enum):
+    """Where an attention backend finishes reading the shared data"""
+
+    PRE_REPLAY = 1  # After the init_forward_metadata_out_graph
+    IN_REPLAY = 2  # After the init_forward_metadata_in_graph
+    POST_REPLAY = 3  # Metadata snapshot not implemented
+    UNKNOWN = 4  # not audited -> coarse whole-forward fence
+
+    @staticmethod
+    def max_of(items: Iterable[SharedReadEnds]) -> SharedReadEnds:
+        # Ordered by lateness: the latest end covers every child.
+        return max(items, key=lambda x: x.value)
+
+
+class AttentionBackend(ABC):
+    """The base class of attention backends.
+
+    Forward-data init contract (3 methods):
+
+      - ``init_forward_metadata(fb)`` — eager entry point. Default is a wrapper
+        that calls ``_out_graph(fb)`` then ``_in_graph(fb)``. Backends may
+        override to keep an independent eager body.
+      - ``init_forward_metadata_out_graph(fb, in_capture=False)`` — per-iter
+        metadata prep, runs outside ``with graph.capture():``. Capture
+        sites pass ``in_capture=True``; replay/eager use the default
+        ``False``. Backends read ``in_capture`` only when capture / replay
+        bodies diverge.
+      - ``init_forward_metadata_in_graph(fb)`` — graph-recordable static-shape
+        GPU op, runs inside ``with graph.capture():`` at capture time and
+        is auto-replayed by ``graph.replay()``. Default is no-op.
+
+    The legacy ``init_forward_metadata_capture_cuda_graph`` and
+    ``init_forward_metadata_replay_cuda_graph`` overrides are fully
+    deprecated and removed from the ABC: out-of-tree backends overriding
+    those must migrate to ``init_forward_metadata_out_graph(fb, in_capture)``.
+    """
+
+    # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
+    prefill_attention_backend_str: Optional[str] = None
+    decode_attention_backend_str: Optional[str] = None
+
+    supports_ragged_verify_graph: bool = False
+    # Whether target verify runs correctly under decode context parallelism:
+    # each rank reads its shard of the DCP-widened pages with the global causal
+    # bound and returns its LSE for the cross-rank merge.
+    supports_dcp_target_verify: bool = False
+    # DeepSeek-V4.1 encoder SWA replay: True if the backend floors the window and
+    # skips cached-row compression for replay rows folded into the extend.
+    folds_encoder_swa_replay: bool = False
+    # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
+    # fuse-rope checks) set these in __init__; declared here as None so callers
+    # can read them off ANY backend — including hybrid wrappers that don't set
+    # them — without defensive getattr. See trtllm_mla fuse-rope path.
+    data_type: Optional[torch.dtype] = None
+    kv_cache_dtype: Optional[torch.dtype] = None
+
+    # Wrapper backends (e.g. HybridLinearAttnBackend) set this to their child
+    # backends; leaves keep None. Lets generic code (metadata glue graph)
+    # enumerate every backend whose python-side forward_metadata must be
+    # snapshotted/restored around a captured metadata-prep replay.
+    attn_backend_list: Optional[list] = None
+
+    # Per-iter metadata produced by init_forward_metadata*; backends that use
+    # it assign their own type. Declared here so generic snapshot/restore code
+    # (metadata glue graph) can read it off any backend without hasattr.
+    forward_metadata: Optional[object] = None
+
+    # The runner's RunnerIds; backends that read through it set the
+    # instance attribute in __init__. None means "no translate" -- a backend
+    # that never set it cannot serve the unified pool, which the server-args
+    # allow-list enforces.
+    runner_ids = None
+
+    @property
+    def kv_layers(self) -> KVLayerRouter:
+        """Per-layer KV of ``token_to_kv_pool``, derived on every access: a
+        frozen-KV MTP draft swaps its backend's pool for the target's, and its
+        reads and writes must follow the swap."""
+        return self.token_to_kv_pool.layer_router
+
+    def get_fused_kv_write_buffers(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return token-major K/V buffers and physical slots for a fused writer."""
+        return None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
-        raise NotImplementedError()
+        """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
+
+        Backends may override to keep an independent eager body.
+        """
+        self.init_forward_metadata_out_graph(forward_batch)
+        self.init_forward_metadata_in_graph(forward_batch)
+
+    def glue_target_verify_metadata(self) -> str:
+        """Empty if the target verify prep may be captured into the metadata glue graph
+        (reads only runner slots and backend buffers), else the reason it may not."""
+        return "the attention backend declares no host-free target verify prep"
+
+    def glue_draft_metadata(self) -> str:
+        """Empty if the draft prep may be captured into the metadata glue graph (host
+        inputs constant per replay key), else the reason it may not."""
+        return "the attention backend declares no host-free draft prep"
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        """Per-iter metadata prep — runs outside ``with graph.capture():``.
+
+        Called at:
+          * capture: before ``with graph.capture():`` (caller passes
+            ``in_capture=True``).
+          * replay: before ``graph.replay()`` (``in_capture=False``).
+          * eager: via :py:meth:`init_forward_metadata` default wrapper
+            (``in_capture=False``).
+
+        Backends read ``in_capture`` only when capture / replay bodies
+        diverge (e.g., snapshot metadata, swap buffer pointers, install
+        temp workspace). Host op / dynamic-shape / non-graph-recordable
+        logic lives here.
+
+        Default: no-op.
+        """
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        """Graph-recordable static-shape GPU op.
+
+        Runs inside ``with graph.capture():`` at capture time; recorded
+        ops auto-execute at replay via ``graph.replay()``.
+
+        Lint contract for overrides: body must NOT call ``.item()`` /
+        ``.cpu()`` / ``.tolist()`` / dynamic-shape ``torch.empty()``.
+        Such ops belong in :py:meth:`init_forward_metadata_out_graph`; they
+        cannot be recorded into a cuda graph.
+
+        Default: no-op.
+        """
+
+    supports_draft_extend_metadata_staging: bool = False
+
+    def draft_extend_metadata_captured_in_graph(self) -> bool:
+        """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds
+        this backend's DRAFT_EXTEND_V2 replay metadata inside the captured
+        graph, so a replaying runner may skip the eager
+        :py:meth:`init_forward_metadata_out_graph` call."""
+        return False
+
+    # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
+    needs_cpu_seq_lens: bool = True
+
+    # True for backends that preallocate per-seq extend metadata at req-pool
+    # size (e.g. triton's kv_indptr): dummy extend batches must then keep
+    # batch_size <= req_to_token_pool.size.
+    extend_dummy_seqs_capped_by_req_pool: bool = False
+
+    # Most attention backends can rebuild and replace forward metadata before
+    # every forward. BCG capture is different: some backends expose metadata
+    # tensors to kernels across graph breaks, so the captured graph depends on
+    # those tensor addresses. Such backends opt in here, create the metadata
+    # object during capture, and refresh its dynamic fields before each replay.
+    use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+    # Most requests one replay of that captured metadata can carry (None: no
+    # bound). Fixed at init: the dp-attention replay vote checks it too.
+    prefill_cuda_graph_max_batch_size: Optional[int] = None
+
+    # Backends may keep MIXED prefill eager under DP attention when replaying
+    # the EXTEND graph is a known serving-performance regression.
+    prefer_eager_mixed_prefill_under_dp_attention: bool = False
+
+    # An idle DP rank replays the padded prefill graph without attention
+    # metadata; only backends whose replay reads none on such a rank opt in.
+    skips_prefill_metadata_on_idle_dp_rank: bool = False
+
+    # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
+    supports_prefill_cuda_graph_max_context_size: bool = False
+    # Replayed context limit when the user sets none; None when nothing the backend
+    # captures depends on the context length.
+    prefill_cuda_graph_default_max_seq_len: Optional[int] = None
+    dllm_attention = None
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        """Declare where this backend's scheduler-shared reads end per mode.
+        Override only for audited deviations from this conservative default."""
+        if fm.is_decode() or fm.is_target_verify():
+            return SharedReadEnds.IN_REPLAY
+        return SharedReadEnds.UNKNOWN
+
+    def resolve_prefill_shared_read_ends(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        num_qo_tokens: int,
+        build_snapshot: bool = True,
+    ) -> SharedReadEnds:
+        """Return this batch's prefill read end, building a snapshot when asked.
+
+        Spec algorithms with a later draft reader are gated at publish time.
+        """
+        if (
+            envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
+            or not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
+        ):
+            return SharedReadEnds.UNKNOWN
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return SharedReadEnds.UNKNOWN
+        if build_snapshot:
+            return self._snapshot_prefill_shared_reads(
+                forward_batch, num_qo_tokens=num_qo_tokens
+            )
+        return self.shared_read_ends(forward_batch.forward_mode)
+
+    def _snapshot_prefill_shared_reads(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> SharedReadEnds:
+        """Snapshot late shared reads; return PRE_REPLAY only if none remain.
+
+        Hook-skipping paths read ``shared_read_ends(EXTEND)``; keep it conservative.
+        """
+        return self.shared_read_ends(forward_batch.forward_mode)
+
+    # Chunked-prefix FullCG capture has a second model topology and stable
+    # prefix buffers. Backends must opt in explicitly so the runner does not
+    # assume that generic ForwardBatch metadata is sufficient for every
+    # attention implementation.
+    supports_full_cuda_graph_chunked_prefix: bool = False
+
+    def prepare_full_cuda_graph_chunked_prefix(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        in_capture: bool,
+    ) -> None:
+        """Prepare backend-private metadata for chunked-prefix FullCG.
+
+        Only called for backends that set
+        ``supports_full_cuda_graph_chunked_prefix``; the runner validates the
+        flag up front. The runner owns and refreshes the shared ForwardBatch
+        prefix buffers. Backends that need wrappers or other derived metadata
+        should override this hook for both capture and replay.
+        """
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
 
-    def init_forward_metadata_capture_cuda_graph(
+    def validate_elastic_cuda_graph_recapture(self) -> None:
+        return
+
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
+        forward_batch: ForwardBatch,
     ):
-        """Init the metadata for a forward pass for capturing a cuda graph."""
+        """Create forward metadata whose tensor addresses will be graph-captured."""
         raise NotImplementedError()
 
-    def init_forward_metadata_replay_cuda_graph(
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
         self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        """Init the metadata for a forward pass for replaying a cuda graph."""
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        """Refresh captured metadata for the current batch before BCG replay.
+
+        Implementations should update ``capture_metadata`` in place where graph
+        address stability is required, assign any safe per-replay objects, and
+        make the backend's active ``forward_metadata`` point to the captured
+        metadata object.
+        """
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
-    def get_verify_buffers_to_fill_after_draft(self):
-        """
-        Return buffers of verify attention kernels that needs to be filled after draft.
+    def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
+        """Rows this rank runs from a late-layer row switch on (DeepSeek-V4.1
+        decoder SWA bounded replay); None for backends without one."""
+        return None
 
-        Typically, these are tree mask and position buffers.
+    def on_after_cuda_graph_warmup(self):
+        """Hook between cuda graph warmup pass and the actual capture.
+
+        Override to undo state that warmup mutated or eagerly advanced
+        (e.g. dirty metadata buffers, raw->full upgrades) before capture
+        freezes the kernel pointers.
         """
-        return [None, None]
+        pass
+
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        """The mask the draft stage fills in place, if this backend has one."""
+        return None
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
@@ -130,6 +423,7 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run a forward for decode."""
         raise NotImplementedError()
@@ -142,6 +436,7 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run a forward for extend."""
         raise NotImplementedError()

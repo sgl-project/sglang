@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Optional, Union
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.server_args import ServerArgs
 
@@ -82,7 +83,10 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
         out_skip_names: Optional[set[str]],
     ):
         super().__init__(server_args, obj_skip_names, out_skip_names)
-        self.export_dir = getattr(server_args, "export_metrics_to_file_dir")
+        # Given at construction, not read from the process: the exporter is
+        # handed the directory it writes to, and a test builds several with
+        # different ones.
+        self.export_dir = server_args.export_metrics_to_file_dir
         os.makedirs(self.export_dir, exist_ok=True)
 
         # File handler state management
@@ -128,7 +132,7 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], out_dict: dict
     ):
         # Do not log health check requests, since they don't represent real user requests.
-        if isinstance(obj.rid, str) and "HEALTH_CHECK" in obj.rid:
+        if isinstance(obj.rid, str) and HEALTH_CHECK_RID_PREFIX in obj.rid:
             return
 
         try:

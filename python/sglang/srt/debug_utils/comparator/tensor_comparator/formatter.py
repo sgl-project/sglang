@@ -183,10 +183,10 @@ def _format_stats_comparison(baseline: TensorStats, target: TensorStats) -> list
 
 
 def _format_diff(diff: DiffInfo, prefix_text: str = "") -> list[str]:
-    rel_diff_marker: str = "❌" if diff.rel_diff > diff.diff_threshold else "✅"
+    marker: str = "✅" if diff.passed else "❌"
     lines: list[str] = [
         prefix_text
-        + f"{rel_diff_marker} rel_diff={diff.rel_diff}\t"
+        + f"{marker} rel_diff={diff.rel_diff}\t"
         + f"max_abs_diff={diff.max_abs_diff}\t"
         + f"mean_abs_diff={diff.mean_abs_diff}",
         f"max_abs_diff happens at coord={diff.max_diff_coord} with "

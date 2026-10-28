@@ -1,0 +1,308 @@
+"""
+SGLang SRT Hardware Platform Abstraction.
+
+Defines SRTPlatform — the base class for SRT (LLM inference) platform
+backends.  SRTPlatform inherits DeviceMixin for shared device operations
+and adds SRT-specific subsystem factory methods, a capability declaration,
+and configuration lifecycle hooks.
+
+Out-of-tree platforms register via setuptools entry_points under the
+"sglang.srt.platforms" group and should subclass SRTPlatform.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Type
+
+import msgspec
+
+from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
+
+if TYPE_CHECKING:
+    import torch
+
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+# Re-export for convenience
+__all__ = [
+    "KVPoolKind",
+    "PlatformCapabilities",
+    "SRTPlatform",
+    "PlatformEnum",
+    "require_out_of_tree_impl",
+    "reject_out_of_tree_path",
+]
+
+logger = logging.getLogger(__name__)
+
+KVPoolKind = Literal["mha", "mla", "dsa"]
+
+_LEGACY_KV_POOL_HOOKS: dict[str, str] = {
+    "mha": "get_mha_kv_pool_cls",
+    "mla": "get_mla_kv_pool_cls",
+    "dsa": "get_dsa_kv_pool_cls",
+}
+_warned_legacy_kv_pool_hooks: set[tuple[type, str]] = set()
+
+
+class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
+    """What the platform can do.
+
+    Core reads these before it constructs anything and picks a code path
+    the platform can serve, instead of announcing a decision and asking the
+    platform to honor it. Every field defaults to the conservative answer.
+
+    ``supports_triton``: Triton kernels can launch on this device. When
+    False, core uses the torch-native allocator and req-to-token writers.
+    ``graph_capture``: the decode graph runner (``get_graph_runner_cls``)
+    runs. ``piecewise_graph``: the prefill piecewise compilation backend
+    runs.
+    ``hicache_device_kernels``: the sgl_kernel HiCache transfer / write-back
+    kernels are available; otherwise the host pools skip their staging
+    buffers.
+    ``supports_pynccl``: model-parallel groups create a PyNccl communicator
+    when the caller does not choose. Read for out-of-tree platforms; in-tree
+    devices decide in ``parallel_state``.
+    """
+
+    supports_triton: bool = False
+    graph_capture: bool = False
+    piecewise_graph: bool = False
+    hicache_device_kernels: bool = False
+    supports_pynccl: bool = False
+
+
+class SRTPlatform(DeviceMixin):
+    """
+    Base class for SRT hardware platform backends.
+
+    Inherits device identity queries and operations from DeviceMixin.
+    Adds SRT-specific factory methods, a capability declaration, and
+    lifecycle hooks.
+
+    OOT platforms subclass SRTPlatform and override the methods relevant to
+    their hardware.
+    """
+
+    # SRT-specific class-level attributes
+    supported_quantization: list[str] = []
+    capabilities: PlatformCapabilities = PlatformCapabilities()
+
+    # ------------------------------------------------------------------
+    # Configuration lifecycle
+    # ------------------------------------------------------------------
+
+    def apply_server_args_defaults(self, server_args) -> None:
+        """Apply platform-specific default values to server arguments.
+
+        Called after ServerArgs is parsed.
+        """
+        pass
+
+    # ------------------------------------------------------------------
+    # Subsystem factory methods
+    # ------------------------------------------------------------------
+
+    def get_default_attention_backend(self) -> str:
+        """Return the default attention backend name for this platform."""
+        raise NotImplementedError
+
+    def get_default_speculative_draft_attention_backend(self, algorithm: str) -> str:
+        """Return the default draft attention backend for an algorithm."""
+        raise NotImplementedError
+
+    def get_graph_runner_cls(self) -> Optional[type]:
+        """Return the graph runner class, or None for the in-tree default.
+
+        ``None`` means "no platform opinion": the caller falls back to the
+        in-tree device-keyed selection. Adaptive speculative decoding also
+        builds one target verify runner per step count from this class, passing
+        ``attn_backend``, ``speculative_num_steps`` and
+        ``speculative_num_draft_tokens`` as keyword arguments.
+        """
+        return None
+
+    def get_full_graph_backend_cls(self) -> type[Any]:
+        """Return the full device-graph backend class for this platform."""
+        return None
+
+    def get_kv_pool_cls(self, *, kind: KVPoolKind) -> Optional[type]:
+        """Return this platform's KV pool class for ``kind``, or None.
+
+        The class must subclass the in-tree pool for that kind
+        (``MHATokenToKVPool`` / ``MLATokenToKVPool`` / ``DSATokenToKVPool``)
+        and is constructed by the configurator with exactly the keyword
+        arguments the in-tree class receives, at every site the in-tree
+        class is built (standalone, the SWA composite, the hybrid-linear
+        full-attention leaf). Override ``_create_buffers`` to change how the
+        backing storage is carved; the rest of the pool (addressing, index
+        translation, PD registration) stays core's. ``None`` (the default)
+        means the in-tree class, which allocates on ``device`` and is
+        correct for any torch device.
+
+        A platform that still overrides the removed
+        ``get_{mha,mla,dsa}_kv_pool_cls`` hooks is served from them, with a
+        deprecation warning.
+        """
+        hook = _LEGACY_KV_POOL_HOOKS[kind]
+        legacy = getattr(self, hook, None)
+        if legacy is None:
+            return None
+        key = (type(self), hook)
+        if key not in _warned_legacy_kv_pool_hooks:
+            _warned_legacy_kv_pool_hooks.add(key)
+            logger.warning(
+                "%s.%s() is deprecated and will be removed; override "
+                "get_kv_pool_cls(kind=%r) instead.",
+                type(self).__name__,
+                hook,
+                kind,
+            )
+        return legacy()
+
+    def get_paged_allocator_cls(self) -> Optional[type]:
+        """Return the paged allocator class, or None for the in-tree default.
+
+        Honored at every paged-allocator construction site, including
+        inside ``SWATokenToKVPoolAllocator``. The in-tree allocator already
+        falls back to torch-native kernels when ``capabilities.supports_triton``
+        is False, so most platforms need no override.
+        """
+        return None
+
+    def get_compile_backend(self, mode: str | None = None) -> str:
+        """Return the compilation backend identifier.
+
+        ``mode`` is an optional hint for the platform (e.g. "npugraph_ex").
+        """
+        return "inductor"
+
+    def get_piecewise_backend_cls(self) -> Optional[type]:
+        """Return the piecewise compilation backend class, or None for the
+        in-tree device-keyed default."""
+        return None
+
+    def get_speculative_cache_locs_fn(
+        self,
+    ) -> Optional[Callable[..., torch.Tensor]]:
+        """Return a platform implementation for speculative KV-cache locations."""
+        return None
+
+    def get_speculative_worker_cls(self, algorithm: str) -> Optional[type]:
+        """Return a worker class replacing the built-in one, or None to keep it.
+
+        Consulted for every speculative algorithm on out-of-tree platforms. The
+        class is constructed with the built-in worker's keyword arguments, must
+        expose the same scheduler-facing interface, and must reject flags it
+        cannot serve (for example multi-layer EAGLE).
+        """
+        return None
+
+    def get_speculative_graph_runner_cls(
+        self, algorithm: str, phase: str
+    ) -> Optional[type]:
+        """Return the EAGLE draft graph runner for ``phase``; None runs it eagerly.
+
+        ``phase`` is ``"draft_decode"`` or ``"draft_extend"``; the class is
+        constructed like the built-in runner for that phase. Not consulted when
+        ``capabilities.graph_capture`` is False.
+        """
+        return None
+
+    def get_quantization_config(
+        self, quantization: str
+    ) -> Optional[Type[QuantizationConfig]]:
+        """Return hardware-specific quantization config for the specific
+        quantization scheme, raise an error if not supported or return None
+        to use the default config."""
+        return None
+
+    # ------------------------------------------------------------------
+    # Speculative decoding support (safe conservative defaults)
+    # ------------------------------------------------------------------
+
+    def supports_speculative_algorithm(self, algorithm: str) -> bool:
+        """Whether this platform supports the named speculative algorithm."""
+        return False
+
+    def supports_speculative_draft_attention_backend(
+        self, algorithm: str, backend: str
+    ) -> bool:
+        """Whether this platform supports a draft backend for an algorithm."""
+        return False
+
+    def support_mamba_cache_extra_buffer(self) -> bool:
+        """Whether this out-of-tree platform supports Mamba cache snapshots."""
+        return False
+
+    # ------------------------------------------------------------------
+    # Distributed
+    # ------------------------------------------------------------------
+
+    def get_group_coordinator_device(self, local_rank: int) -> torch.device:
+        """Return the device a ``GroupCoordinator`` binds to on this rank.
+
+        Consulted only for out-of-tree platforms; in-tree devices are resolved
+        in ``parallel_state``. The default is CPU, which is what an unknown
+        device got before this hook existed.
+        """
+        import torch
+
+        return torch.device("cpu")
+
+    # ------------------------------------------------------------------
+    # Initialization
+    # ------------------------------------------------------------------
+
+    def init_backend(self) -> None:
+        """One-time backend initialization.  Called in each worker."""
+        pass
+
+    def post_load_model(self, model: torch.nn.Module) -> None:
+        """Called once after the model's weights are loaded, in the worker.
+
+        The place to relocate parameters, swap quant methods, or install
+        forward hooks on an in-tree model class; mutate ``model`` in place.
+        """
+        pass
+
+    # ------------------------------------------------------------------
+    # BaseFusedOp integration
+    # ------------------------------------------------------------------
+
+    def get_dispatch_key_name(self) -> str:
+        """Return the dispatch key name for BaseFusedOp
+        (``sglang.kernels.fused_op``).
+
+        Determines which ``forward_<key>()`` method is selected on an
+        out-of-tree platform. E.g. "cuda", "npu", "hip", "xpu", "cpu".
+        Forwards registered via ``BaseFusedOp.register_oot_forward`` with
+        this key take precedence over the method lookup.
+        """
+        return "native"
+
+
+def require_out_of_tree_impl(
+    platform: SRTPlatform, *, hook: str, subsystem: str
+) -> None:
+    """Reject "no platform opinion" from an out-of-tree platform; no-op in-tree."""
+    if not platform.is_out_of_tree():
+        return
+    raise NotImplementedError(
+        f"Out-of-tree platform {type(platform).__name__} (device "
+        f"{platform.device_name!r}) provides no {subsystem}. Override "
+        f"{hook} on your SRTPlatform subclass: the in-tree fallback is "
+        f"device-keyed and would hand this device the CUDA implementation."
+    )
+
+
+def reject_out_of_tree_path(platform: SRTPlatform, *, subsystem: str) -> None:
+    """Reject an in-tree-only path that has no platform seam; no-op in-tree."""
+    if not platform.is_out_of_tree():
+        return
+    raise NotImplementedError(
+        f"Out-of-tree platform {type(platform).__name__} (device "
+        f"{platform.device_name!r}) reached {subsystem}, which has no platform "
+        f"seam yet and would otherwise build in-tree classes that assume CUDA."
+    )

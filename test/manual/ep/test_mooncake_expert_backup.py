@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -24,6 +24,7 @@ class TestBackup(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_port = 20000
+        cls.base_url = f"http://127.0.0.1:{cls.base_port}"
         cls.num_processes = 2
         # TODO (stage 100): in the future, implement a specified multiprocess launcher
         cls.processes = [
@@ -35,8 +36,7 @@ class TestBackup(CustomTestCase):
                     "--trust-remote-code",
                     "--tp",
                     "4",
-                    "--enable-dp-attention",
-                    "--dp",
+                    "--attn-dp-size",
                     "4",
                     "--elastic-ep-backend",
                     "mooncake",
@@ -57,7 +57,7 @@ class TestBackup(CustomTestCase):
                     "50",
                     "--chunked-prefill-size",
                     "512",
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "128",
                     "--max-running-requests",
                     "512",
@@ -124,18 +124,17 @@ class TestBackup(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=self.base_port,
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
 
 if __name__ == "__main__":

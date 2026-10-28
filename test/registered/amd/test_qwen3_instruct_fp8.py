@@ -60,7 +60,7 @@ class TestQwen3Instruct2507FP8(CustomTestCase):
             num_questions=1319,
             parallel=1319,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -68,7 +68,7 @@ class TestQwen3Instruct2507FP8(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k ({self.model})\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k ({self.model})\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.95)
 
@@ -80,7 +80,7 @@ class TestQwen3Instruct2507FP8(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed ({self.model})\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed ({self.model})\n{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
                 self.assertGreater(speed, 40)

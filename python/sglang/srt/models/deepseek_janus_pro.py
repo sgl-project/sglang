@@ -19,6 +19,7 @@
 import collections
 import math
 import os
+from array import array
 from dataclasses import field
 from enum import Enum
 from functools import partial
@@ -48,8 +49,8 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -887,9 +888,9 @@ class VisionTransformer(nn.Module):
         if global_pool is not None:
             assert global_pool in ("", "avg", "token", "map")
             if global_pool == "map" and self.attn_pool is None:
-                assert (
-                    False
-                ), "Cannot currently add attention pooling in reset_classifier()."
+                assert False, (
+                    "Cannot currently add attention pooling in reset_classifier()."
+                )
             elif global_pool != "map " and self.attn_pool is not None:
                 self.attn_pool = None  # remove attention pooling
             self.global_pool = global_pool
@@ -987,7 +988,6 @@ def model_name_to_cls(cls_name):
         cls = CLIPVisionTower
 
     elif "VQ" in cls_name:
-
         cls = VQ_models[cls_name]
     elif "vision_head" in cls_name:
         cls = vision_head
@@ -1056,9 +1056,9 @@ def create_siglip_vit(
     ckpt_path: str = "",
     **kwargs,
 ):
-    assert (
-        model_name in SigLIP_MODEL_CONFIG.keys()
-    ), f"model name should be in {SigLIP_MODEL_CONFIG.keys()}"
+    assert model_name in SigLIP_MODEL_CONFIG.keys(), (
+        f"model name should be in {SigLIP_MODEL_CONFIG.keys()}"
+    )
 
     vision_cfg = SigLIPVisionCfg(**SigLIP_MODEL_CONFIG[model_name])
 
@@ -1918,7 +1918,6 @@ class MultiModalityPreTrainedModel(PreTrainedModel):
 # Copied and adapted from:
 # https://github.com/deepseek-ai/Janus/tree/main/janus/models/modeling_vlm.py
 class MultiModalityCausalLM(MultiModalityPreTrainedModel):
-
     def __init__(
         self,
         config: MultiModalityConfig,
@@ -1997,14 +1996,14 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
     def prepare_gen_img_embeds(self, image_ids: torch.LongTensor):
         return self.gen_aligner(self.gen_embed(image_ids))
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         im_start_id = image_inputs.im_start_id
         im_end_id = image_inputs.im_end_id
         media_token_pairs = [(im_start_id, im_end_id)]
 
-        helper = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-
-        return helper.pad_input_tokens(input_ids, image_inputs)
+        return pad_mm_token_pairs(
+            input_ids, image_inputs, data_token_pairs=media_token_pairs
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

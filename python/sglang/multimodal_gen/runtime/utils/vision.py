@@ -1,0 +1,357 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+
+# SPDX-License-Identifier: Apache-2.0
+
+import os
+import tempfile
+from collections.abc import Callable
+from contextlib import closing
+from io import BytesIO
+from urllib.parse import unquote, urlparse
+
+import imageio
+import numpy as np
+import PIL.Image
+import PIL.ImageOps
+import requests
+import torch
+from packaging import version
+
+from sglang.kernels import get_kernel
+from sglang.srt.environ import envs
+from sglang.srt.utils.common import get_image_bytes as srt_get_image_bytes
+
+if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
+    PIL_INTERPOLATION = {
+        "linear": PIL.Image.Resampling.BILINEAR,
+        "bilinear": PIL.Image.Resampling.BILINEAR,
+        "bicubic": PIL.Image.Resampling.BICUBIC,
+        "lanczos": PIL.Image.Resampling.LANCZOS,
+        "nearest": PIL.Image.Resampling.NEAREST,
+    }
+else:
+    PIL_INTERPOLATION = {
+        "linear": PIL.Image.LINEAR,
+        "bilinear": PIL.Image.BILINEAR,
+        "bicubic": PIL.Image.BICUBIC,
+        "lanczos": PIL.Image.LANCZOS,
+        "nearest": PIL.Image.NEAREST,
+    }
+
+
+def pil_to_numpy(images: list[PIL.Image.Image] | PIL.Image.Image) -> np.ndarray:
+    r"""
+    Convert a PIL image or a list of PIL images to NumPy arrays.
+
+    Args:
+        images (`PIL.Image.Image` or `List[PIL.Image.Image]`):
+            The PIL image or list of images to convert to NumPy format.
+
+    Returns:
+        `np.ndarray`:
+            A NumPy array representation of the images.
+    """
+    if not isinstance(images, list):
+        images = [images]
+    images = [np.array(image).astype(np.float32) / 255.0 for image in images]
+    images_arr: np.ndarray = np.stack(images, axis=0)
+
+    return images_arr
+
+
+def numpy_to_pt(images: np.ndarray) -> torch.Tensor:
+    r"""
+    Convert a NumPy image to a PyTorch tensor.
+
+    Args:
+        images (`np.ndarray`):
+            The NumPy image array to convert to PyTorch format.
+
+    Returns:
+        `torch.Tensor`:
+            A PyTorch tensor representation of the images.
+    """
+    if images.ndim == 3:
+        images = images[..., None]
+
+    images = torch.from_numpy(images.transpose(0, 3, 1, 2))
+    return images
+
+
+def normalize(images: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+    r"""
+    Normalize an image array to [-1,1].
+
+    Args:
+        images (`np.ndarray` or `torch.Tensor`):
+            The image array to normalize.
+
+    Returns:
+        `np.ndarray` or `torch.Tensor`:
+            The normalized image array.
+    """
+    return 2.0 * images - 1.0
+
+
+def preprocess_image(
+    image: PIL.Image.Image,
+    *,
+    device: torch.device,
+    size: tuple[int, int] | None = None,
+    crop: tuple[int, int, int, int] | None = None,
+) -> torch.Tensor:
+    """Pillow Lanczos resize, crop, and [-1, 1] normalization to [1, C, H, W].
+
+    Size is (width, height); crop is (top, left, height, width).
+    Non-RGB inputs and small images retain the CPU recipe.
+    """
+    width, height = size or image.size
+    if (
+        device.type != "cuda"
+        or torch.version.hip is not None
+        or envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+        or image.mode != "RGB"
+        or max(image.width * image.height, width * height) < 256 * 256
+    ):
+        if size is not None:
+            image = image.resize(size, PIL.Image.Resampling.LANCZOS)
+        if crop is not None:
+            top, left, height, width = crop
+            image = image.crop((left, top, left + width, top + height))
+        return normalize(numpy_to_pt(pil_to_numpy(image))).to(device)
+
+    # upload compact pixels; the lookup table preserves the CPU FP32 rounding
+    pixels = torch.from_numpy(np.array(image)).to(device, non_blocking=True)
+    resize_rgb = get_kernel("mm.lanczos_resize")
+    if crop == (0, 0, height, width):
+        crop = None
+    pixels = resize_rgb(
+        pixels,
+        height,
+        width,
+        crop=crop,
+        mean=(0.5, 0.5, 0.5),
+        std=(0.5, 0.5, 0.5),
+    )
+    return pixels.unsqueeze(0).permute(0, 3, 1, 2)
+
+
+# adapted from diffusers.utils import load_image
+def load_image(
+    image: str | bytes | PIL.Image.Image,
+    convert_method: Callable[[PIL.Image.Image], PIL.Image.Image] | None = None,
+) -> PIL.Image.Image:
+    """
+    Loads `image` to a PIL Image.
+
+    Args:
+        image (`str` or `PIL.Image.Image`):
+            The image to convert to the PIL Image format.
+        convert_method (Callable[[PIL.Image.Image], PIL.Image.Image], *optional*):
+            A conversion method to apply to the image after loading it. When set to `None` the image will be converted
+            "RGB".
+    """
+    if isinstance(image, (str, bytes)):
+        if isinstance(image, str) and os.path.isfile(image):
+            image = PIL.Image.open(image)
+        else:
+            # in-memory loading path
+            image = PIL.Image.open(BytesIO(srt_get_image_bytes(image)))
+    elif not isinstance(image, PIL.Image.Image):
+        raise ValueError(
+            "Incorrect format used for the image. Should be bytes, a URL, a local path, base64/data URL, or a PIL image."
+        )
+
+    image = PIL.ImageOps.exif_transpose(image)
+
+    if convert_method is not None:
+        image = convert_method(image)
+    else:
+        image = image.convert("RGB")
+
+    return image
+
+
+_VIDEO_DOWNLOAD_TIMEOUT_S = 60
+
+
+# adapted from diffusers.utils import load_video
+def load_video(
+    video: str,
+    convert_method: (
+        Callable[[list[PIL.Image.Image]], list[PIL.Image.Image]] | None
+    ) = None,
+    max_frames: int | None = None,
+) -> list[PIL.Image.Image]:
+    """
+    Loads `video` to a list of PIL Image.
+    Args:
+        video (`str`):
+            A URL or Path to a video to convert to a list of PIL Image format.
+        convert_method (Callable[[List[PIL.Image.Image]], List[PIL.Image.Image]], *optional*):
+            A conversion method to apply to the video after loading it. When set to `None` the images will be converted
+            to "RGB".
+        max_frames (`int`, *optional*):
+            Stop decoding after this many frames. Decoding is sequential, so a caller that only needs a prefix of a
+            long clip should pass it here instead of slicing the result; the frames returned are the same either way.
+    Returns:
+        `List[PIL.Image.Image]`:
+            The video as a list of PIL images.
+    """
+    if max_frames is not None and max_frames <= 0:
+        raise ValueError(f"max_frames must be positive, got {max_frames}.")
+    is_url = video.startswith("http://") or video.startswith("https://")
+    is_file = os.path.isfile(video)
+
+    if not (is_url or is_file):
+        raise ValueError(
+            f"Incorrect path or URL. URLs must start with `http://` or `https://`, and {video} is not a valid path."
+        )
+
+    if is_url:
+        parsed_url = urlparse(video)
+        file_name = os.path.basename(unquote(parsed_url.path))
+
+        suffix = os.path.splitext(file_name)[1] or ".mp4"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = os.path.join(temp_dir, f"video{suffix}")
+            with closing(
+                requests.get(video, stream=True, timeout=_VIDEO_DOWNLOAD_TIMEOUT_S)
+            ) as response:
+                if response.status_code != 200:
+                    raise ValueError(
+                        f"Failed to download video. Status code: {response.status_code}"
+                    )
+                with open(video_path, "wb") as temp_file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        temp_file.write(chunk)
+            pil_images = _read_video_frames(video_path, max_frames)
+    else:
+        pil_images = _read_video_frames(video, max_frames)
+
+    if convert_method is not None:
+        pil_images = convert_method(pil_images)
+
+    return pil_images
+
+
+def _read_video_frames(
+    video: str, max_frames: int | None = None
+) -> list[PIL.Image.Image]:
+    pil_images = []
+    if video.endswith(".gif"):
+        gif = PIL.Image.open(video)
+        try:
+            while max_frames is None or len(pil_images) < max_frames:
+                pil_images.append(gif.copy())
+                gif.seek(gif.tell() + 1)
+        except EOFError:
+            pass
+
+    else:
+        try:
+            imageio.plugins.ffmpeg.get_exe()
+        except AttributeError:
+            raise AttributeError(
+                "`Unable to find an ffmpeg installation on your machine. Please install via `pip install imageio-ffmpeg"
+            ) from None
+
+        with imageio.get_reader(video) as reader:
+            # Closing the reader early stops the ffmpeg subprocess, so a prefix
+            # costs only the frames it needs.
+            for frame in reader:
+                pil_images.append(PIL.Image.fromarray(frame))
+                if max_frames is not None and len(pil_images) >= max_frames:
+                    break
+
+    return pil_images
+
+
+def get_default_height_width(
+    image: PIL.Image.Image | np.ndarray | torch.Tensor,
+    vae_scale_factor: int,
+    height: int | None = None,
+    width: int | None = None,
+) -> tuple[int, int]:
+    r"""
+    Returns the height and width of the image, downscaled to the next integer multiple of `vae_scale_factor`.
+
+    Args:
+        image (`Union[PIL.Image.Image, np.ndarray, torch.Tensor]`):
+            The image input, which can be a PIL image, NumPy array, or PyTorch tensor. If it is a NumPy array, it
+            should have shape `[batch, height, width]` or `[batch, height, width, channels]`. If it is a PyTorch
+            tensor, it should have shape `[batch, channels, height, width]`.
+        height (`Optional[int]`, *optional*, defaults to `None`):
+            The height of the preprocessed image. If `None`, the height of the `image` input will be used.
+        width (`Optional[int]`, *optional*, defaults to `None`):
+            The width of the preprocessed image. If `None`, the width of the `image` input will be used.
+
+    Returns:
+        `Tuple[int, int]`:
+            A tuple containing the height and width, both resized to the nearest integer multiple of
+            `vae_scale_factor`.
+    """
+
+    if height is None:
+        if isinstance(image, PIL.Image.Image):
+            height = image.height
+        elif isinstance(image, torch.Tensor):
+            height = image.shape[2]
+        else:
+            height = image.shape[1]
+
+    if width is None:
+        if isinstance(image, PIL.Image.Image):
+            width = image.width
+        elif isinstance(image, torch.Tensor):
+            width = image.shape[3]
+        else:
+            width = image.shape[2]
+
+    width, height = (
+        x - x % vae_scale_factor for x in (width, height)
+    )  # resize to integer multiple of vae_scale_factor
+
+    return height, width
+
+
+def resize(
+    image: PIL.Image.Image | np.ndarray | torch.Tensor,
+    height: int,
+    width: int,
+    resize_mode: str = "default",  # "default", "fill", "crop"
+    resample: str = "lanczos",
+) -> PIL.Image.Image | np.ndarray | torch.Tensor:
+    """
+    Resize image.
+
+    Args:
+        image (`PIL.Image.Image`, `np.ndarray` or `torch.Tensor`):
+            The image input, can be a PIL image, numpy array or pytorch tensor.
+        height (`int`):
+            The height to resize to.
+        width (`int`):
+            The width to resize to.
+        resize_mode (`str`, *optional*, defaults to `default`):
+            The resize mode to use, can be one of `default` or `fill`. If `default`, will resize the image to fit
+            within the specified width and height, and it may not maintaining the original aspect ratio. If `fill`,
+            will resize the image to fit within the specified width and height, maintaining the aspect ratio, and
+            then center the image within the dimensions, filling empty with data from image. If `crop`, will resize
+            the image to fit within the specified width and height, maintaining the aspect ratio, and then center
+            the image within the dimensions, cropping the excess. Note that resize_mode `fill` and `crop` are only
+            supported for PIL image input.
+
+    Returns:
+        `PIL.Image.Image`, `np.ndarray` or `torch.Tensor`:
+            The resized image.
+    """
+    if resize_mode != "default" and not isinstance(image, PIL.Image.Image):
+        raise ValueError(
+            f"Only PIL image input is supported for resize_mode {resize_mode}"
+        )
+    assert isinstance(image, PIL.Image.Image)
+    if resize_mode == "default":
+        image = image.resize((width, height), resample=PIL_INTERPOLATION[resample])
+    else:
+        raise ValueError(f"resize_mode {resize_mode} is not supported")
+    return image

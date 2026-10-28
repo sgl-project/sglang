@@ -4,13 +4,14 @@ Test script to verify SGLang config file integration.
 
 import argparse
 import os
+import sys
 import tempfile
 
 import pytest
 import yaml
 
 from sglang.srt.server_args import ServerArgs, prepare_server_args
-from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 
 
 @pytest.fixture
@@ -162,4 +163,4 @@ def test_error_handling():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

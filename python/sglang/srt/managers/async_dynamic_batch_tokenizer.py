@@ -120,8 +120,9 @@ class AsyncDynamicbatchTokenizer:
     ) -> None:
         """Process a dynamic batch of encode requests for single string prompts."""
         # Check if all kwargs are identical for efficient batch processing
-        can_batch = len(set(str(sorted(kw.items())) for kw in kwargs_list)) == 1
-        kwargs = kwargs_list[0] if can_batch else None
+        first_kw = kwargs_list[0]
+        can_batch = all(kw == first_kw for kw in kwargs_list[1:])
+        kwargs = first_kw if can_batch else None
 
         try:
             # If every request uses identical kwargs we can run a single

@@ -13,6 +13,7 @@
 """Inference-only Ernie45-VL model compatible with HuggingFace weights."""
 
 import logging
+from array import array
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type
 
@@ -24,7 +25,11 @@ from einops import rearrange
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import QuickGELU
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -33,8 +38,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -50,7 +55,6 @@ logger = logging.getLogger(__name__)
 
 
 class Ernie4_5_VisionMLP(nn.Module):
-
     def __init__(
         self,
         in_features: int,
@@ -82,7 +86,6 @@ class Ernie4_5_VisionMLP(nn.Module):
 
 
 class Ernie4_5_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -123,6 +126,7 @@ class Ernie4_5_VisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -131,6 +135,7 @@ class Ernie4_5_VisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x = x + attn
@@ -139,7 +144,6 @@ class Ernie4_5_VisionBlock(nn.Module):
 
 
 class Ernie4_5_VisionPatchEmbed(nn.Module):
-
     def __init__(
         self,
         patch_size: int = 14,
@@ -346,7 +350,6 @@ class VariableResolutionResamplerModel(nn.Module):
 
 
 class Ernie4_5_VisionRotaryEmbedding(nn.Module):
-
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         self.inv_freq = 1.0 / theta ** (
@@ -362,7 +365,6 @@ class Ernie4_5_VisionRotaryEmbedding(nn.Module):
 
 
 class Ernie4_5_VisionTransformer(nn.Module):
-
     def __init__(
         self,
         vision_config: PretrainedConfig,
@@ -481,6 +483,9 @@ class Ernie4_5_VisionTransformer(nn.Module):
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=x.device
+        )
 
         # transformers
         x = x.unsqueeze(1)
@@ -490,6 +495,7 @@ class Ernie4_5_VisionTransformer(nn.Module):
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                forward_metadata=forward_metadata,
             )
 
         final_output = self.ln(x)
@@ -583,9 +589,8 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         else:
             self._visual_token_ids_tensor_cache = None
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def _vision_forward(
         self,
@@ -647,12 +652,12 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         )
 
         pad_values = []
-        if hasattr(forward_batch, "mm_inputs") and forward_batch.mm_inputs is not None:
+        if forward_batch.mm_inputs is not None:
             for mm_input in forward_batch.mm_inputs:
                 if mm_input is None:
                     continue
                 for item in mm_input.mm_items:
-                    pad_values.append(item.pad_value)
+                    pad_values.extend(item.padding_values())
         placeholder_tensor = torch.as_tensor(
             pad_values,
             device=input_ids.device,
@@ -705,9 +710,9 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
 
         self._set_visual_token_mask(input_ids, forward_batch)
 
-        assert (
-            input_ids.numel() == positions.shape[-1]
-        ), f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"
+        assert input_ids.numel() == positions.shape[-1], (
+            f"input_ids {input_ids.shape} and position_ids {positions.shape} should have the same length"
+        )
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,

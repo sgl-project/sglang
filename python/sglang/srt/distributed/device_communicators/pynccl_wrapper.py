@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
 # This file is a pure Python wrapper for the NCCL library.
@@ -70,6 +72,78 @@ def find_nccl_library() -> str:
 ncclResult_t = ctypes.c_int
 ncclComm_t = ctypes.c_void_p
 ncclWindow_t = ctypes.c_void_p
+
+
+# Sentinels NCCL uses to mark "use the default value", see
+# NCCL_CONFIG_UNDEF_INT / NCCL_CONFIG_UNDEF_PTR / NCCL_API_MAGIC in nccl.h.in.
+NCCL_CONFIG_UNDEF_INT = -(2**31)  # INT_MIN
+NCCL_CONFIG_UNDEF_PTR = None
+NCCL_API_MAGIC = 0xCAFEBEEF
+
+# Version code of the header layout the struct below was extracted from, i.e.
+# the equivalent of NCCL_VERSION_CODE baked into NCCL_CONFIG_INITIALIZER at
+# compile time. It declares which fields this initializer knows about, so a
+# (possibly older/newer) runtime libnccl.so honors exactly the fields this
+# struct exposes. Bump this together with the struct layout when re-extracting
+# from nccl.h.in.
+NCCL_CONFIG_VERSION = 23000  # NCCL_VERSION(2, 30, 0)
+
+# ncclConfig_t.CTAPolicy: run eligible collectives without SMs (copy engines).
+NCCL_CTA_POLICY_ZERO = 0x02
+
+
+class ncclConfig_t(ctypes.Structure):
+    """Mirror of ``ncclConfig_t`` (``ncclConfig_v22800``) from nccl.h.in.
+
+    Fields are append-only across NCCL versions, and NCCL only copies
+    ``min(config.size, sizeof(its own struct))`` bytes, so declaring the full
+    (newest) layout stays compatible with both older and newer libnccl.so.
+    """
+
+    _fields_ = [
+        # attributes that users should never touch.
+        ("size", ctypes.c_size_t),
+        ("magic", ctypes.c_uint),
+        ("version", ctypes.c_uint),
+        # attributes that users are able to customize.
+        ("blocking", ctypes.c_int),
+        ("cgaClusterSize", ctypes.c_int),
+        ("minCTAs", ctypes.c_int),
+        ("maxCTAs", ctypes.c_int),
+        ("netName", ctypes.c_char_p),
+        ("splitShare", ctypes.c_int),
+        ("trafficClass", ctypes.c_int),
+        ("commName", ctypes.c_char_p),
+        ("collnetEnable", ctypes.c_int),
+        ("CTAPolicy", ctypes.c_int),
+        ("shrinkShare", ctypes.c_int),
+        ("nvlsCTAs", ctypes.c_int),
+        ("nChannelsPerNetPeer", ctypes.c_int),
+        ("nvlinkCentricSched", ctypes.c_int),
+        ("graphUsageMode", ctypes.c_int),
+        ("numRmaCtx", ctypes.c_int),
+        ("maxP2pPeers", ctypes.c_int),
+    ]
+
+    @classmethod
+    def create(cls) -> "ncclConfig_t":
+        """Build a config equivalent to ``NCCL_CONFIG_INITIALIZER``.
+
+        All customizable fields are set to the UNDEF sentinels; callers may
+        override individual fields afterwards.
+        """
+        config = cls()
+        config.size = ctypes.sizeof(cls)
+        config.magic = NCCL_API_MAGIC
+        config.version = NCCL_CONFIG_VERSION
+        # Must explicitly set sentinels: ctypes zero-initializes, and 0 is a
+        # valid value for many fields (e.g. blocking=0 means non-blocking).
+        for name, ctype in cls._fields_[3:]:
+            if ctype is ctypes.c_char_p:
+                setattr(config, name, NCCL_CONFIG_UNDEF_PTR)
+            else:
+                setattr(config, name, NCCL_CONFIG_UNDEF_INT)
+        return config
 
 
 class ncclUniqueId(ctypes.Structure):
@@ -170,6 +244,20 @@ class NCCLLibrary:
             "ncclCommInitRank",
             ncclResult_t,
             [ctypes.POINTER(ncclComm_t), ctypes.c_int, ncclUniqueId, ctypes.c_int],
+        ),
+        # ncclResult_t ncclCommInitRankConfig(
+        #   ncclComm_t* comm, int nranks, ncclUniqueId commId, int rank,
+        #   ncclConfig_t* config);
+        Function(
+            "ncclCommInitRankConfig",
+            ncclResult_t,
+            [
+                ctypes.POINTER(ncclComm_t),
+                ctypes.c_int,
+                ncclUniqueId,
+                ctypes.c_int,
+                ctypes.POINTER(ncclConfig_t),
+            ],
         ),
         # ncclResult_t  ncclAllReduce(
         #   const void* sendbuff, void* recvbuff, size_t count,
@@ -321,6 +409,14 @@ class NCCLLibrary:
         ),
         # ncclResult_t ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win);
         Function("ncclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
+        # ncclResult_t ncclMemAlloc(void** ptr, size_t size);
+        Function(
+            "ncclMemAlloc",
+            ncclResult_t,
+            [ctypes.POINTER(buffer_type), ctypes.c_size_t],
+        ),
+        # ncclResult_t ncclMemFree(void* ptr);
+        Function("ncclMemFree", ncclResult_t, [buffer_type]),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -356,7 +452,9 @@ class NCCLLibrary:
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: Dict[str, Any] = {}
-            exported_functions = NCCLLibrary.exported_functions
+            # Copy: optional symbols of this library must not leak into the
+            # class list that another library path binds from.
+            exported_functions = list(NCCLLibrary.exported_functions)
             if hasattr(self.lib, "ncclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
             for func in exported_functions:
@@ -393,6 +491,24 @@ class NCCLLibrary:
         unique_id = ncclUniqueId()
         self.NCCL_CHECK(self._funcs["ncclGetUniqueId"](ctypes.byref(unique_id)))
         return unique_id
+
+    def ncclCommInitRankConfig(
+        self,
+        world_size: int,
+        unique_id: ncclUniqueId,
+        rank: int,
+        config: Optional[ncclConfig_t] = None,
+    ) -> ncclComm_t:
+        comm = ncclComm_t()
+        if config is None:
+            # Equivalent to NCCL_CONFIG_INITIALIZER (header-layout version).
+            config = ncclConfig_t.create()
+        self.NCCL_CHECK(
+            self._funcs["ncclCommInitRankConfig"](
+                ctypes.byref(comm), world_size, unique_id, rank, ctypes.byref(config)
+            )
+        )
+        return comm
 
     def ncclCommInitRank(
         self, world_size: int, unique_id: ncclUniqueId, rank: int
@@ -547,6 +663,14 @@ class NCCLLibrary:
     def ncclCommWindowDeregister(self, comm: ncclComm_t, window: ncclWindow_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommWindowDeregister"](comm, window))
 
+    def ncclMemAlloc(self, size: int) -> int:
+        ptr = buffer_type()
+        self.NCCL_CHECK(self._funcs["ncclMemAlloc"](ctypes.byref(ptr), size))
+        return ptr.value
+
+    def ncclMemFree(self, ptr: int) -> None:
+        self.NCCL_CHECK(self._funcs["ncclMemFree"](buffer_type(ptr)))
+
     def ncclGroupStart(self) -> None:
         self.NCCL_CHECK(self._funcs["ncclGroupStart"]())
 
@@ -559,6 +683,7 @@ __all__ = [
     "ncclDataTypeEnum",
     "ncclRedOpTypeEnum",
     "ncclUniqueId",
+    "ncclConfig_t",
     "ncclComm_t",
     "cudaStream_t",
     "buffer_type",

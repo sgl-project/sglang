@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/custom_all_reduce.py
 
 import ctypes
@@ -11,13 +13,15 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -35,6 +39,8 @@ logger = logging.getLogger(__name__)
 
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
+    # The kernels throw on other dtypes (csrc/allreduce/custom_all_reduce.cu, .hip).
+    _SUPPORTED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
     _MAX_CAR_SIZE = 8192 * 1024
     if _is_hip:
         # crossover is at 16MB buffer size for ROCm
@@ -63,6 +69,7 @@ class CustomAllreduce:
         self._IS_CAPTURING = False
         self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
         self.original_disabled = True  # To store the original state
+        self.use_amd_deterministic_impl = _use_amd_deterministic_impl()
 
         if not ops.IS_CUSTOM_AR_AVAILABLE:
             # disable because of missing custom allreduce library
@@ -255,6 +262,8 @@ class CustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
+        if inp.dtype not in self._SUPPORTED_DTYPES:
+            return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
@@ -269,66 +278,66 @@ class CustomAllreduce:
             return False
 
         if _is_hip:
+            if self.use_amd_deterministic_impl:
+                return True
             if self.full_nvlink:
                 return inp_size <= self.max_size
             return False
 
         return False
 
-    # all reduce, assuming inp tensor is IPC registered with register_buffer,
-    # or, in the context of cuda graphs, register_graph_buffers
-    def all_reduce_reg(self, inp: torch.Tensor, out: torch.Tensor = None):
-        if out is None:
-            out = torch.empty_like(inp)
-        ops.all_reduce_reg(self._ptr, inp, out)
+    def _all_reduce_impl(self, inp: torch.Tensor, registered: bool):
+        out = torch.empty_like(inp)
+        if not _is_hip:  # CUDA-like
+            if registered:
+                ops.all_reduce(self._ptr, inp, out, 0, 0)
+            else:
+                ops.all_reduce(
+                    self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
+                )
+        elif self.use_amd_deterministic_impl:
+            inp_size = inp.numel() * inp.element_size()
+            if inp_size <= self.max_size:
+                reg_buffer = self.buffer.view(inp.dtype)[: inp.numel()]
+                ops.deterministic_all_reduce_unreg(self._ptr, inp, reg_buffer, out)
+            else:
+                self._deterministic_all_reduce_oversized(inp, out)
+        else:  # normal AMD ROCm path
+            if registered:
+                ops.all_reduce_reg(self._ptr, inp, out)
+            else:
+                ops.all_reduce_unreg(self._ptr, inp, self.buffer, out)
         return out
 
-    # all reduce, assuming inp tensor is NOT IPC registered
-    def all_reduce_unreg(self, inp: torch.Tensor, out: torch.Tensor = None):
-        if out is None:
-            out = torch.empty_like(inp)
-        ops.all_reduce_unreg(self._ptr, inp, self.buffer, out)
-        return out
+    def _deterministic_all_reduce_oversized(
+        self, inp: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Reduce an input larger than `self.buffer` one piece at a time.
 
-    def all_reduce(
-        self,
-        inp: torch.Tensor,
-        *,
-        out: torch.Tensor = None,
-        registered: bool = False,
-    ):
-        """Performs an out-of-place all reduce.
-
-        If registered is True, this assumes inp's pointer is already
-        IPC-registered. Otherwise, inp is first copied into a pre-registered
-        buffer.
+        Registering the input instead would be cheaper per call, but each
+        registration permanently consumes a `rank_data` slot, so a server that
+        keeps seeing oversized inputs (a large `chunked_prefill_size` is enough
+        to produce one per forward pass) eventually dies with "Rank data buffer
+        is overflowed". Splitting cannot change the result of any element: an
+        all-reduce is elementwise, and the 1-stage kernel accumulates ranks in
+        a fixed order regardless of how many elements it is given.
         """
-        if out is None:
-            out = torch.empty_like(inp)
-        if registered:
-            ops.all_reduce(self._ptr, inp, out, 0, 0)
-        else:
-            ops.all_reduce(
-                self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
+        # `should_custom_ar` only guarantees weak contiguity, so alias the flat
+        # memory span the kernel reads rather than going through `view`.
+        flat_inp = inp.as_strided((inp.numel(),), (1,))
+        flat_out = out.as_strided((out.numel(),), (1,))
+        reg_buffer = self.buffer.view(inp.dtype)
+        # `max_size` is a multiple of 16 bytes, so every piece keeps the 16-byte
+        # size and alignment the kernel requires.
+        chunk = self.max_size // inp.element_size()
+        for beg in range(0, flat_inp.numel(), chunk):
+            piece = flat_inp[beg : beg + chunk]
+            ops.deterministic_all_reduce_unreg(
+                self._ptr,
+                piece,
+                reg_buffer[: piece.numel()],
+                flat_out[beg : beg + chunk],
             )
-        return out
-
-    def deterministic_all_reduce(
-        self,
-        inp: torch.Tensor,
-        *,
-        out: torch.Tensor = None,
-        registered: bool = False,
-    ):
-        """Deterministic all-reduce using 1-stage kernel with fixed ordering (AMD only)."""
-        if out is None:
-            out = torch.empty_like(inp)
-        if registered:
-            ops.deterministic_all_reduce_reg(self._ptr, inp, out)
-        else:
-            reg_buffer = self.buffer.view(inp.dtype)[: inp.numel()]
-            ops.deterministic_all_reduce_unreg(self._ptr, inp, reg_buffer, out)
-        return out
 
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         """The main allreduce API that provides support for cuda graph."""
@@ -337,39 +346,25 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                if _is_hip:
-                    if self.tms_cudagraph:
-                        return self.all_reduce_unreg(input)
-                    return self.all_reduce_reg(input)
-                else:
-                    return self.all_reduce(input, registered=not self.tms_cudagraph)
+                return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph
                 # but _IS_CAPTURING is still True. We need to do real all-reduce.
-                if is_in_piecewise_cuda_graph():
+                if is_in_tc_piecewise_cuda_graph():
                     # Split op execution - do real all-reduce
-                    if _is_hip:
-                        return self.all_reduce_unreg(input)
-                    else:
-                        return self.all_reduce(input, registered=False)
+                    return self._all_reduce_impl(input, registered=False)
                 else:
                     # True warmup - mimic the allocation pattern since custom
                     # allreduce is out-of-place.
                     return torch.zeros_like(input)
         else:
-            if _is_hip:
-                # note: outside of cuda graph context,
-                # custom allreduce incurs a cost of cudaMemcpy, which should
-                # be small(<=1% of overall latency) compared to the performance
-                # gains of using custom kernels
-                return self.all_reduce_unreg(input)
-            else:
-                return self.all_reduce(input, registered=False)
+            return self._all_reduce_impl(input, registered=False)
 
     def close(self):
         if not self.disabled and self._ptr:
-            ops.dispose(self._ptr)
+            if ops is not None:
+                ops.dispose(self._ptr)
             if _is_cuda:
                 self.free_shared_buffer(self.meta_ptrs)
                 self.free_shared_buffer(self.buffer_ptrs)
@@ -379,21 +374,29 @@ class CustomAllreduce:
         self.close()
 
 
-def dispatch_custom_allreduce():
+def dispatch_custom_allreduce(
+    group: ProcessGroup,
+    device: torch.device,
+):
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
 
-    On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
+    On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
     Otherwise use AiterCustomAllreduce if available.
 
-    Set SGLANG_USE_JIT_ALL_REDUCE=1 to use the JIT-compiled v2 implementation.
+    On CUDA, the JIT-compiled v2 implementation is used by default.
+    Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
+    Multi-node v2 is admitted only for a single NVLink clique (see
+    can_use_custom_all_reduce_v2); other cross-node groups fall back to NCCL.
     """
-    # HARDCODED: opt-in flag for v2 JIT all-reduce.
-    # Set SGLANG_USE_JIT_ALL_REDUCE=1 to enable.
-    if _is_cuda and get_bool_env_var("SGLANG_USE_JIT_ALL_REDUCE", default="false"):
-        from .custom_all_reduce_v2 import CustomAllReduceV2
+    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+        from .custom_all_reduce_v2 import (
+            CustomAllReduceV2,
+            can_use_custom_all_reduce_v2,
+        )
 
-        logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
-        return CustomAllReduceV2
+        if can_use_custom_all_reduce_v2(group=group, device=device):
+            logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
+            return CustomAllReduceV2
 
     if _is_cuda or _is_musa:
         return CustomAllreduce
@@ -414,15 +417,9 @@ def dispatch_custom_allreduce():
     else:
         logger.debug("[AR] All-reduce: default")
 
-    # Check if 1-stage AR should be used
-    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
-        use_1stage = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
-    else:
-        use_1stage = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-
     # On AMD with 1-stage AR, use sglang's CustomAllreduce
     # (AiterCustomAllreduce doesn't have deterministic_all_reduce method)
-    if use_1stage:
+    if _use_amd_deterministic_impl():
         return CustomAllreduce
 
     if get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
@@ -446,3 +443,12 @@ def dispatch_custom_allreduce():
             return CustomAllreduce
 
     return CustomAllreduce
+
+
+def _use_amd_deterministic_impl() -> bool:
+    if not _is_hip:  # CUDA is always deterministic
+        return False
+    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+        return envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+    else:
+        return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()

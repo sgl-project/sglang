@@ -1,6 +1,10 @@
 """
 Run few-shot GSM-8K evaluation.
 
+.. deprecated::
+    This module is deprecated. Use ``sgl-eval run gsm8k`` or
+    ``sglang.test.sgl_eval_utils.run_sgl_eval`` instead.
+
 Usage:
 python3 -m sglang.test.few_shot_gsm8k --num-questions 200
 """
@@ -9,6 +13,7 @@ import argparse
 import ast
 import re
 import time
+import warnings
 
 import numpy as np
 
@@ -50,6 +55,12 @@ def get_answer_value(answer_str):
 
 
 def run_eval(args):
+    warnings.warn(
+        "sglang.test.few_shot_gsm8k is deprecated. "
+        "Use `sgl-eval run gsm8k` or sglang.test.sgl_eval_utils.run_sgl_eval instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     # Select backend
     set_default_backend(RuntimeEndpoint(normalize_base_url(args.host, args.port)))
 

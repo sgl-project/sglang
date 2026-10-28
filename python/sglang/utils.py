@@ -11,7 +11,6 @@ import sys
 import time
 import traceback
 import urllib.request
-import warnings
 import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +29,43 @@ from tqdm import tqdm
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
+
+
+def load_diffusion_overlay_registry_from_env() -> dict[str, dict[str, Any]]:
+    raw_value = os.getenv("SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY", "").strip()
+    if not raw_value:
+        return {}
+
+    if raw_value.startswith("{"):
+        payload = json.loads(raw_value)
+    else:
+        with open(os.path.expanduser(raw_value), encoding="utf-8") as f:
+            payload = json.load(f)
+
+    if not isinstance(payload, dict):
+        return {}
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for source_model_id, spec in payload.items():
+        if isinstance(spec, str):
+            normalized[source_model_id] = {"overlay_repo_id": spec}
+        elif isinstance(spec, dict) and spec.get("overlay_repo_id"):
+            normalized[source_model_id] = dict(spec)
+    return normalized
+
+
+def has_diffusion_overlay_registry_match(
+    model_path: str, registry: dict[str, dict[str, Any]] | None = None
+) -> bool:
+    registry = (
+        load_diffusion_overlay_registry_from_env() if registry is None else registry
+    )
+    if model_path in registry:
+        return True
+    if not os.path.exists(model_path):
+        return False
+    base_name = os.path.basename(os.path.normpath(model_path))
+    return any(base_name == key.rsplit("/", 1)[-1] for key in registry)
 
 
 def execute_once(func):
@@ -125,14 +161,6 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
 def normalize_base_url(host: str, port: int) -> str:
     from sglang.srt.utils.network import NetworkAddress
 
-    if host.startswith("http://") or host.startswith("https://"):
-        warnings.warn(
-            f"Including the scheme in --host ('{host}') is deprecated. "
-            f"Pass just the hostname (e.g. '127.0.0.1') instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return f"{host}:{port}"
     return NetworkAddress(host, port).to_url()
 
 
@@ -204,7 +232,16 @@ def encode_image_base64(image_path: Union[str, bytes]):
     elif isinstance(image_path, bytes):
         return pybase64.b64encode(image_path).decode("utf-8")
     else:
-        # image_path is PIL.WebPImagePlugin.WebPImageFile
+        import torch
+
+        if isinstance(image_path, torch.Tensor):
+            # Convert GPU-decoded image tensor (C, H, W) uint8 to PIL Image
+            from PIL import Image
+
+            tensor = image_path.cpu() if image_path.device.type != "cpu" else image_path
+            image_path = Image.fromarray(tensor.permute(1, 2, 0).numpy())
+
+        # image_path is a PIL Image
         image = image_path
         buffered = BytesIO()
         image.save(buffered, format="PNG")
@@ -367,13 +404,16 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     chunk_size = 1024  # Download in chunks of 1KB
 
     # Use tqdm to display the progress bar
-    with open(filename, "wb") as f, tqdm(
-        desc=filename,
-        total=total_size,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
+    with (
+        open(filename, "wb") as f,
+        tqdm(
+            desc=filename,
+            total=total_size,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar,
+    ):
         for chunk in response.iter_content(chunk_size=chunk_size):
             f.write(chunk)
             bar.update(len(chunk))

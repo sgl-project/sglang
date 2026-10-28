@@ -1,26 +1,30 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=96, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=142, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 
 import time
 import unittest
-from types import SimpleNamespace
 
-from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.srt.utils import is_hip
+from sglang.test.kits.eval_accuracy_kit import MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 _is_hip = is_hip()
 
 
-class TestHiCache(CustomTestCase):
+class TestHiCache(CustomTestCase, MMLUMixin):
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
+    mmlu_num_threads = 32
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -33,31 +37,22 @@ class TestHiCache(CustomTestCase):
                 "--enable-hierarchical-cache",
                 "--mem-fraction-static",
                 0.7,
-                "--hicache-size",
-                100 if not _is_hip else 200,
+                # No fixed host-pool size on CUDA: the default ratio is
+                # reduced to fit the runner's memory (and cgroup limit), where
+                # a fixed 100 GB OOM-killed the server on smaller runners.
+                *(["--hicache-size", 200] if _is_hip else []),
                 "--page-size",
                 "64",
                 "--hicache-storage-backend",
                 "file",
             ],
+            env={"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"},
         )
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
         time.sleep(5)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
 
 
 if __name__ == "__main__":

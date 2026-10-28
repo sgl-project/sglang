@@ -12,7 +12,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine as SglangEngine
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
@@ -20,7 +20,12 @@ from sglang.test.test_utils import (
     find_available_port,
 )
 
-register_cuda_ci(est_time=64, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=65, stage="extra-b", runner_config="4-gpu-h100")
+register_amd_ci(
+    est_time=64,
+    suite="stage-c-test-4-gpu-amd",
+    disabled="torch_memory_saver incompatible with ROCm (libcuda.so.1 not found)",
+)
 
 TEST_SUITE = dict(
     model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -72,7 +77,9 @@ class EngineWrapper:
         self, named_tensors: Iterable[Tuple[str, torch.Tensor]]
     ):
         if self._tp_rank == 0:
+            self._engine.begin_weight_update()
             self._engine.update_weights_from_tensor(list(named_tensors))
+            self._engine.end_weight_update()
             self._engine.flush_cache()
         dist.barrier(group=self._device_mesh_cpu.get_group())
 

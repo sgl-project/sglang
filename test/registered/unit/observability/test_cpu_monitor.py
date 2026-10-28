@@ -3,7 +3,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=60, suite="stage-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=23, suite="base-a-test-cpu", nightly=True)
 
 
 class TestCpuMonitor(unittest.TestCase):

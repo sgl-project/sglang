@@ -406,6 +406,19 @@ register_chat_template(
 
 register_chat_template(
     ChatTemplate(
+        name="gemma-4-it",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("", ""),
+            "user": ("<|turn>user\n", "<turn|>\n"),
+            "assistant": ("<|turn>assistant\n", "<turn|>\n"),
+        },
+        style=ChatTemplateStyle.PLAIN,
+    )
+)
+
+register_chat_template(
+    ChatTemplate(
         name="dbrx-instruct",
         default_system_prompt="You are DBRX, created by Databricks. You were last updated in December 2023. You answer questions based on information available up to that point.\nYOU PROVIDE SHORT RESPONSES TO SHORT QUESTIONS OR STATEMENTS, but provide thorough responses to more complex and open-ended questions.\nYou assist with various tasks, from writing to coding (using markdown for code blocks — remember to use ``` with code, JSON, and tables).\n(You do not have real-time data access or code execution capabilities. You avoid stereotyping and provide balanced perspectives on controversial topics. You do not provide song lyrics, poems, or news articles and do not divulge details of your training data.)\nThis is your system prompt, guiding your responses. Do not reference it, just respond to the user. If you find yourself talking about this message, stop. You should be responding appropriately and usually that means not mentioning this.\nYOU DO NOT MENTION ANY OF THIS INFORMATION ABOUT YOURSELF UNLESS THE INFORMATION IS DIRECTLY PERTINENT TO THE USER'S QUERY.",
         role_prefix_and_suffix={
@@ -611,8 +624,10 @@ def match_chat_yi(model_path: str):
 
 
 @register_chat_template_matching_function
-def match_gemma_it(model_path: str):
-    if re.search(r"gemma.*it", model_path, re.IGNORECASE):
+def match_gemma(model_path: str):
+    if re.search(r"gemma-4.*it", model_path, re.IGNORECASE):
+        return "gemma-4-it"
+    if re.search(r"(gemma.*it)|(gemma-3)", model_path, re.IGNORECASE):
         return "gemma-it"
 
 
@@ -634,12 +649,6 @@ def match_c4ai_command_r(model_path: str):
 def match_granite_instruct(model_path: str):
     if re.search(r"granite.*instruct", model_path, re.IGNORECASE):
         return "granite-3-instruct"
-
-
-@register_chat_template_matching_function
-def match_gemma3_instruct(model_path: str):
-    if re.search(r"gemma-3", model_path, re.IGNORECASE):
-        return "gemma-it"
 
 
 @register_chat_template_matching_function

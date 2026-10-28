@@ -11,27 +11,23 @@ from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPTextConfig,
+    Flux2MistralTextConfig,
     T5Config,
-    TextEncoderConfig,
+    build_flux2_text_messages,
 )
-from sglang.multimodal_gen.configs.models.encoders.base import TextEncoderArchConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
-from sglang.multimodal_gen.configs.models.encoders.qwen_image import (
-    _is_transformer_layer,
-)
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
-    preprocess_text,
+    pack_latents_2x2,
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_postprocess_text,
-    clip_preprocess_text,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import _pack_latents
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.utils.vision import preprocess_image
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
@@ -53,6 +49,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
     dit_config: DiTConfig = field(default_factory=FluxConfig)
     # VAE
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
+    vae_precision: str = "bf16"
 
     enable_autocast: bool = False
 
@@ -65,8 +62,8 @@ class FluxPipelineConfig(ImagePipelineConfig):
         default_factory=lambda: ("bf16", "bf16")
     )
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (clip_preprocess_text, preprocess_text),
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None, None),
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
@@ -82,12 +79,58 @@ class FluxPipelineConfig(ImagePipelineConfig):
                 return_overflowing_tokens=False,
                 return_length=False,
             ),
-            None,
+            dict(
+                max_length=512,
+                padding="max_length",
+                truncation=True,
+                return_overflowing_tokens=False,
+                return_length=False,
+            ),
         ]
     )
 
+    def is_flux_v1(self) -> bool:
+        return True
+
+    def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
+        # Flux v1 does not use attention masks for text encoders.
+        return None
+
+    def build_text_conditioning_mask(
+        self,
+        text_inputs: dict,
+        text_encoder_attention_mask: "torch.Tensor | None",
+        prompt_embeds: "torch.Tensor",
+        encoder_index: int,
+    ) -> "torch.Tensor":
+        """Use all-valid fixed-length masks for Flux v1 text embeddings."""
+        if prompt_embeds.ndim < 2:
+            raise ValueError(
+                "prompt_embeds must have shape [batch, seq, ...] or [seq, ...]"
+            )
+        if prompt_embeds.ndim == 2:
+            shape = (1, prompt_embeds.shape[0])
+        else:
+            shape = prompt_embeds.shape[:2]
+        return torch.ones(shape, dtype=torch.bool)
+
+    @staticmethod
+    def seq_lens_from_text_conditioning_mask(mask: "torch.Tensor") -> list[int]:
+        if mask.ndim != 2:
+            raise ValueError("text conditioning mask must have shape [batch, seq]")
+        return [int(mask.shape[1])] * int(mask.shape[0])
+
+    def get_text_encoder_pooler_output(self, outputs, encoder_index):
+        return outputs.pooler_output
+
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
+
+    def get_classifier_free_guidance_scale(self, batch, guidance_scale: float) -> float:
+        # true_cfg_scale is the CFG weight when given, as in diffusers FluxPipeline.
+        if batch.true_cfg_scale is not None:
+            return batch.true_cfg_scale
+        return guidance_scale
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = 2 * (
@@ -105,7 +148,9 @@ class FluxPipelineConfig(ImagePipelineConfig):
         width = 2 * (batch.width // (self.vae_config.arch_config.vae_scale_factor * 2))
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
         # pack latents
-        return _pack_latents(latents, batch_size, num_channels_latents, height, width)
+        return pack_latents_2x2(
+            latents, batch_size, num_channels_latents, height, width
+        )
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[1]
@@ -135,7 +180,27 @@ class FluxPipelineConfig(ImagePipelineConfig):
 
         return latent_image_ids
 
-    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
+    @staticmethod
+    def _validate_fixed_text_seq_lens(prompt_embeds, txt_seq_lens):
+        if prompt_embeds.ndim < 3:
+            raise ValueError(
+                "Flux text conditioning expects prompt_embeds with shape [batch, seq, dim]"
+            )
+        batch_size, seq_len = prompt_embeds.shape[:2]
+        if len(txt_seq_lens) != batch_size:
+            raise ValueError(
+                f"Flux text sequence lengths have {len(txt_seq_lens)} entries, expected {batch_size}."
+            )
+        if any(int(seq_len_i) != seq_len for seq_len_i in txt_seq_lens):
+            raise ValueError(
+                "Flux currently requires fixed-length text conditioning; "
+                f"got seq_lens={txt_seq_lens}, expected all {seq_len}."
+            )
+
+    def get_freqs_cis(
+        self, prompt_embeds, width, height, device, rotary_emb, batch, txt_seq_lens
+    ):
+        self._validate_fixed_text_seq_lens(prompt_embeds, txt_seq_lens)
         txt_ids = torch.zeros(prompt_embeds.shape[1], 3, device=device)
         img_ids = self._prepare_latent_image_ids(
             original_height=height,
@@ -167,6 +232,21 @@ class FluxPipelineConfig(ImagePipelineConfig):
         return latents
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Build Flux positive-conditioning kwargs from encoded text state.
+
+        Flux v1 uses encoder index 1 (the T5 encoder) as the token stream that
+        is concatenated with image tokens for rotary position embeddings. The
+        text encoding stage stores per-request sequence lengths in
+        batch.prompt_seq_lens; read them here instead of inferring from padded
+        embeddings so grouped multi-output requests preserve their explicit
+        text-conditioning contract.
+        """
+        txt_seq_lens = self.require_text_seq_lens(
+            batch,
+            1,
+            negative=False,
+            expected_batch_size=batch.prompt_embeds[1].shape[0],
+        )
         return {
             "freqs_cis": self.get_freqs_cis(
                 batch.prompt_embeds[1],
@@ -175,13 +255,58 @@ class FluxPipelineConfig(ImagePipelineConfig):
                 device,
                 rotary_emb,
                 batch,
+                txt_seq_lens,
             ),
             "pooled_projections": (
                 batch.pooled_embeds[0] if batch.pooled_embeds else None
             ),
-        }
+        } | self.prepare_control_residual_kwargs(batch, device, dtype)
+
+    def prepare_control_residual_kwargs(self, batch, device, dtype):
+        """Map ComfyUI ControlNet residuals in ``batch.extra`` to DiT kwargs.
+
+        Residuals arrive full-length on the sender's device and dtype; move
+        them to the compute dtype and shard them like the image latents.
+        """
+        control = (batch.extra or {}).get("comfyui_control")
+        if not control:
+            return {}
+
+        # Blocks that share one residual object share one prepared tensor.
+        prepared: dict[int, torch.Tensor] = {}
+
+        def prepare_one(residual):
+            residual = residual.to(device=device, dtype=dtype)
+            if batch.did_sp_shard_latents:
+                residual, _ = self.shard_latents_for_sp(batch, residual)
+            return residual
+
+        def prepare(residuals):
+            out = []
+            for residual in residuals:
+                if residual is not None:
+                    key = id(residual)
+                    if key not in prepared:
+                        prepared[key] = prepare_one(residual)
+                    residual = prepared[key]
+                out.append(residual)
+            return out
+
+        kwargs = {}
+        if control.get("input"):
+            kwargs["controlnet_block_samples"] = prepare(control["input"])
+        if control.get("output"):
+            kwargs["controlnet_single_block_samples"] = prepare(control["output"])
+        return kwargs
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Build Flux negative-conditioning kwargs using T5 sequence lengths."""
+        txt_seq_lens = self.require_text_seq_lens(
+            batch,
+            1,
+            negative=True,
+            expected_batch_size=batch.negative_prompt_embeds[1].shape[0],
+        )
         return {
             "freqs_cis": self.get_freqs_cis(
                 batch.negative_prompt_embeds[1],
@@ -190,6 +315,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
                 device,
                 rotary_emb,
                 batch,
+                txt_seq_lens,
             ),
             "pooled_projections": (
                 batch.neg_pooled_embeds[0] if batch.neg_pooled_embeds else None
@@ -267,6 +393,13 @@ def _patchify_latents(latents):
         batch_size, num_channels_latents * 4, height // 2, width // 2
     )
     return latents
+
+
+def flux2_vae_bn_stats(vae, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    mean = vae.bn.running_mean.view(1, -1, 1, 1).to(like)
+    variance = vae.bn.running_var.view(1, -1, 1, 1)
+    std = torch.sqrt(variance + vae.config.arch_config.batch_norm_eps).to(like)
+    return mean, std
 
 
 def _unpatchify_latents(latents):
@@ -355,61 +488,6 @@ def flux2_klein_postprocess_text(
     return prompt_embeds
 
 
-@dataclass
-class Flux2MistralTextArchConfig(TextEncoderArchConfig):
-    stacked_params_mapping: list[tuple[str, str, str]] = field(
-        default_factory=lambda: [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-    )
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer]
-    )
-
-    def __post_init__(self):
-        self.tokenizer_kwargs = {
-            "padding": "max_length",
-            "truncation": True,
-            "max_length": 512,
-            "add_special_tokens": True,
-            "return_attention_mask": True,
-            "return_tensors": "pt",
-        }
-
-
-@dataclass
-class Flux2MistralTextConfig(TextEncoderConfig):
-    arch_config: TextEncoderArchConfig = field(
-        default_factory=Flux2MistralTextArchConfig
-    )
-
-
-def format_text_input(prompts: List[str], system_message: str = None):
-    # Remove [IMG] tokens from prompts to avoid Pixtral validation issues
-    # when truncation is enabled. The processor counts [IMG] tokens and fails
-    # if the count changes after truncation.
-    cleaned_txt = [prompt.replace("[IMG]", "") for prompt in prompts]
-
-    return [
-        [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": system_message}],
-            },
-            {"role": "user", "content": [{"type": "text", "text": prompt}]},
-        ]
-        for prompt in cleaned_txt
-    ]
-
-
-def flux_2_preprocess_text(prompt: str):
-    system_message = "You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object attribution and actions without speculation."
-    return format_text_input([prompt], system_message=system_message)
-
-
 # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._pack_latents
 def flux2_pack_latents(latents):
     batch_size, num_channels, height, width = latents.shape
@@ -424,25 +502,57 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     task_type: ModelTaskType = ModelTaskType.TI2I
 
+    vae_precision: str = "bf16"
+
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Flux2MistralTextConfig(),)
     )
     preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (flux_2_preprocess_text,),
+        default_factory=lambda: (None,),
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (flux2_postprocess_text,)
     )
     vae_config: VAEConfig = field(default_factory=Flux2VAEConfig)
+    text_encoder_extra_args: list[dict] = field(
+        default_factory=lambda: [
+            dict(
+                max_length=512,
+                padding="max_length",
+                truncation=True,
+                return_overflowing_tokens=False,
+                return_length=False,
+            )
+        ]
+    )
+
+    def is_flux_v1(self) -> bool:
+        return False
+
+    def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
+        # Flux2 uses standard attention masks (unlike Flux v1).
+        return text_inputs.get("attention_mask")
+
+    def get_text_encoder_pooler_output(self, outputs, encoder_index):
+        # Flux2 does not use pooler output.
+        return None
+
+    def supports_dynamic_batching(self):
+        """Allow batching for Flux2 text-only requests.
+
+        Flux2 is a TI2I pipeline, so image-input requests are rejected by the
+        scheduler's request-level batching checks.
+        """
+        return True
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
-        # flatten to 1-d list
-        prompts = [p for prompt in prompts for p in prompt]
+        messages = build_flux2_text_messages(prompts)
+        effective_max_length = tok_kwargs.pop("max_length", 512)
         inputs = tokenizer.apply_chat_template(
-            prompts,
+            messages,
             add_generation_prompt=False,
             tokenize=True,
             return_dict=True,
@@ -450,7 +560,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             padding="max_length",
             truncation=True,
             # 2048 from official github repo, 512 from diffusers
-            max_length=512,
+            max_length=effective_max_length,
         )
 
         return inputs
@@ -496,7 +606,44 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def preprocess_condition_image(
         self, image, target_width, target_height, vae_image_processor: VaeImageProcessor
     ):
-        img = image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+        target_area = 1024 * 1024
+        if image.mode == "RGB":
+            width, height = image.size
+            size = None
+            if width * height > target_area:
+                scale = math.sqrt(target_area / (width * height))
+                width, height = int(width * scale), int(height * scale)
+                size = (width, height)
+            multiple = self.vae_config.arch_config.vae_scale_factor * 2
+            out_w, out_h = width // multiple * multiple, height // multiple * multiple
+            # Flux2 crops to the aligned canvas without a second resample
+            pixels = preprocess_image(
+                image,
+                device=get_local_torch_device(),
+                size=size,
+                crop=(
+                    (height - out_h) // 2,
+                    (width - out_w) // 2,
+                    out_h,
+                    out_w,
+                ),
+            )
+            return pixels, (out_w, out_h)
+        img = image
+        if image.width * image.height > target_area:
+            resize_to_target_area = getattr(
+                vae_image_processor, "_resize_to_target_area", None
+            )
+            if callable(resize_to_target_area):
+                img = resize_to_target_area(image, target_area)
+            else:
+                scale = math.sqrt(target_area / (image.width * image.height))
+                resized_width = int(image.width * scale)
+                resized_height = int(image.height * scale)
+                img = image.resize(
+                    (resized_width, resized_height), PIL.Image.Resampling.LANCZOS
+                )
+
         image_width, image_height = img.size
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
         multiple_of = vae_scale_factor * 2
@@ -525,7 +672,10 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         image_latent_ids = image_latent_ids.repeat(batch.batch_size, 1, 1)
         batch.condition_image_latent_ids = image_latent_ids.to(get_local_torch_device())
 
-    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
+    def get_freqs_cis(
+        self, prompt_embeds, width, height, device, rotary_emb, batch, txt_seq_lens
+    ):
+        self._validate_fixed_text_seq_lens(prompt_embeds, txt_seq_lens)
         txt_ids = _prepare_text_ids(prompt_embeds).to(device=device)
 
         img_ids = batch.latent_ids
@@ -556,6 +706,19 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         return cos, sin
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Build Flux2 positive-conditioning kwargs from encoded text state.
+
+        Flux2 uses encoder index 0 for the Mistral text stream. The stored
+        sequence lengths are passed through to rotary-position preparation so
+        grouped requests use the same text-length metadata that was produced
+        during text encoding.
+        """
+        txt_seq_lens = self.require_text_seq_lens(
+            batch,
+            0,
+            negative=False,
+            expected_batch_size=batch.prompt_embeds[0].shape[0],
+        )
         return {
             "freqs_cis": self.get_freqs_cis(
                 batch.prompt_embeds[0],
@@ -564,6 +727,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
                 device,
                 rotary_emb,
                 batch,
+                txt_seq_lens,
             )
         }
 
@@ -580,6 +744,19 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         # patchify
         image_latents = _patchify_latents(image_latents)
         return image_latents
+
+    def normalize_vae_encode(self, image_latents, vae):
+        if not self._check_vae_has_bn(vae):
+            return None
+
+        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(
+            image_latents.device, image_latents.dtype
+        )
+        latents_bn_std = torch.sqrt(
+            vae.bn.running_var.view(1, -1, 1, 1)
+            + self.vae_config.arch_config.batch_norm_eps
+        ).to(image_latents.device, image_latents.dtype)
+        return (image_latents - latents_bn_mean) / latents_bn_std
 
     def _check_vae_has_bn(self, vae):
         """Check if VAE has bn attribute (cached check to avoid repeated hasattr calls)."""
@@ -650,8 +827,8 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
         default_factory=lambda: (Qwen3TextConfig(),)
     )
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (preprocess_text,),
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None,),
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
@@ -681,7 +858,9 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
         texts = [_apply_chat_template(prompt) for prompt in prompts]
 
         tok_kwargs = dict(tok_kwargs or {})
-        max_length = tok_kwargs.pop("max_length", 512)
+        tok_kwargs.pop("max_length", None)
+        # Flux2 Klein uses max_length 512.
+        max_length = 512
         padding = tok_kwargs.pop("padding", "max_length")
         truncation = tok_kwargs.pop("truncation", True)
         return_tensors = tok_kwargs.pop("return_tensors", "pt")
@@ -694,3 +873,86 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
             return_tensors=return_tensors,
             **tok_kwargs,
         )
+
+
+@dataclass
+class Flux2KleinBasePipelineConfig(Flux2KleinPipelineConfig):
+    # Undistilled Klein base model, with guidance embeddings
+    should_use_guidance: bool = True
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        txt_seq_lens = self.require_text_seq_lens(
+            batch,
+            0,
+            negative=True,
+            expected_batch_size=batch.negative_prompt_embeds[0].shape[0],
+        )
+        return {
+            "freqs_cis": self.get_freqs_cis(
+                batch.negative_prompt_embeds[0],
+                batch.width,
+                batch.height,
+                device,
+                rotary_emb,
+                batch,
+                txt_seq_lens,
+            )
+        }
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.flux import (
+        Flux2KleinBaseSamplingParams,
+        Flux2KleinSamplingParams,
+        Flux2SamplingParams,
+        FluxSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=FluxSamplingParams,
+        pipeline_config_cls=FluxPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.1-dev",
+        ],
+        model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=Flux2KleinSamplingParams,
+        pipeline_config_cls=Flux2KleinPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-4B",
+            "black-forest-labs/FLUX.2-klein-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                ("flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower())
+                and "base" not in hf_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Flux2KleinBaseSamplingParams,
+        pipeline_config_cls=Flux2KleinBasePipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-base-4B",
+            "black-forest-labs/FLUX.2-klein-base-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                ("flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower())
+                and "base" in hf_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Flux2SamplingParams,
+        pipeline_config_cls=Flux2PipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-dev",
+            "black-forest-labs/FLUX.2-dev-NVFP4",
+        ],
+        model_detectors=[
+            lambda hf_id: "flux.2" in hf_id.lower() and "klein" not in hf_id.lower()
+        ],
+    )

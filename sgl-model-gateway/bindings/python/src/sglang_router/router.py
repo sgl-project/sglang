@@ -1,6 +1,9 @@
+import logging
 from typing import Optional
 
 from sglang_router.router_args import RouterArgs
+
+logger = logging.getLogger(__name__)
 from sglang_router.sglang_router_rs import (
     BackendType,
     HistoryBackendType,
@@ -90,6 +93,22 @@ def build_control_plane_auth_config(
     has_api_keys = bool(api_keys)
     has_jwt = jwt_issuer is not None and jwt_audience is not None
 
+    # Warn when JWT-related fields are set but the required pair is missing —
+    # otherwise the silent drop here disables JWT auth without explanation.
+    jwt_partial = bool(
+        args_dict.get("jwt_jwks_uri")
+        or args_dict.get("jwt_role_mapping")
+        or (
+            args_dict.get("jwt_role_claim") is not None
+            and args_dict.get("jwt_role_claim") != "roles"
+        )
+    )
+    if jwt_partial and not has_jwt:
+        logger.warning(
+            "JWT-related fields set but jwt_issuer/jwt_audience missing; "
+            "JWT auth will NOT be enabled."
+        )
+
     if not has_api_keys and not has_jwt:
         return None
 
@@ -114,6 +133,7 @@ def build_control_plane_auth_config(
             issuer=jwt_issuer,
             audience=jwt_audience,
             jwks_uri=args_dict.get("jwt_jwks_uri"),
+            role_claim=args_dict.get("jwt_role_claim", "roles"),
             role_mapping=args_dict.get("jwt_role_mapping", {}),
         )
 
@@ -191,6 +211,7 @@ class Router:
         queue_size: Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately). Default: 100
         queue_timeout_secs: Maximum time (in seconds) a request can wait in queue before timing out. Default: 60
         rate_limit_tokens_per_second: Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests. Default: None
+        decode_dispatch_limit: Max requests per prefill worker in flight to decode (PD mode only). Default: None
         cors_allowed_origins: List of allowed origins for CORS. Empty list allows all origins. Default: []
         health_failure_threshold: Number of consecutive health check failures before marking worker unhealthy. Default: 3
         health_success_threshold: Number of consecutive health check successes before marking worker healthy. Default: 2
@@ -305,6 +326,7 @@ class Router:
             "jwt_issuer",
             "jwt_audience",
             "jwt_jwks_uri",
+            "jwt_role_claim",
             "jwt_role_mapping",
         ]
         for field in fields_to_remove:

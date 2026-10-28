@@ -5,16 +5,17 @@ from typing import Optional
 import torch
 
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
-from sglang.srt.mem_cache.sparsity.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
+from sglang.srt.mem_cache.sparsity.algorithms.deepseek_dsa import DeepSeekDSAAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
+    DSABackendAdaptor,
     FlashAttentionAdaptor,
-    NSABackendAdaptor,
 )
 from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,
     SparseCoordinator,
 )
+from sglang.srt.runtime_context import get_memory
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ _global_sparse_coordinator: Optional[SparseCoordinator] = None
 
 _ALGORITHM_REGISTRY = {
     "quest": lambda config, device, **kw: QuestAlgorithm(config, device, **kw),
-    "deepseek_nsa": lambda config, device, **kw: DeepSeekNSAAlgorithm(
+    "deepseek_dsa": lambda config, device, **kw: DeepSeekDSAAlgorithm(
         config, device, **kw
     ),
 }
@@ -49,8 +50,8 @@ def _create_backend_adaptor(
     req_to_token_pool,
 ):
     """Create backend adaptor."""
-    if isinstance(sparse_algorithm, DeepSeekNSAAlgorithm):
-        return NSABackendAdaptor(device, req_to_token_pool)
+    if isinstance(sparse_algorithm, DeepSeekDSAAlgorithm):
+        return DSABackendAdaptor(device, req_to_token_pool)
 
     if backend in ["fa3", "flashattention"]:
         return FlashAttentionAdaptor(device)
@@ -58,15 +59,15 @@ def _create_backend_adaptor(
     raise ValueError(f"Unknown attention backend: {backend}")
 
 
-def _parse_sparse_config(server_args) -> SparseConfig:
+def _parse_sparse_config() -> SparseConfig:
     """Parse hierarchical sparse config from JSON string.
 
     Required fields with defaults: top_k (2048), device_buffer_size (2*top_k),
-    host_to_device_ratio (2).
+    host_to_device_ratio (2), swap_in_block_size (960).
     Optional fields (default None): algorithm, backend, min_sparse_prompt_len,
     page_size. All remaining fields go to sparse_extra_config.
     """
-    extra_config_str = server_args.hisparse_config
+    extra_config_str = get_memory().hisparse_config
     if extra_config_str is not None:
         try:
             extra_config = json.loads(extra_config_str)
@@ -78,10 +79,19 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     top_k = extra_config.pop("top_k", 2048)
     device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
+    swap_in_block_size = extra_config.pop("swap_in_block_size", 960)
 
     if device_buffer_size < top_k:
         raise ValueError(
             f"device_buffer_size ({device_buffer_size}) must be no smaller than top_k ({top_k})"
+        )
+    if not isinstance(swap_in_block_size, int) or isinstance(swap_in_block_size, bool):
+        raise ValueError(
+            f"swap_in_block_size must be an integer, got {swap_in_block_size!r}"
+        )
+    if swap_in_block_size <= 0 or swap_in_block_size > 1024:
+        raise ValueError(
+            f"swap_in_block_size ({swap_in_block_size}) must be in the range [1, 1024]"
         )
 
     algorithm = extra_config.pop("algorithm", None)
@@ -93,6 +103,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         top_k=top_k,
         device_buffer_size=device_buffer_size,
         host_to_device_ratio=host_to_device_ratio,
+        swap_in_block_size=swap_in_block_size,
         algorithm=algorithm,
         backend=backend,
         page_size=page_size,
@@ -101,9 +112,9 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     )
 
 
-def parse_hisparse_config(server_args) -> SparseConfig:
-    """Parse hisparse config from server_args, returning defaults if no config provided."""
-    return _parse_sparse_config(server_args)
+def parse_hisparse_config() -> SparseConfig:
+    """The hisparse config as resolved, with defaults where none was given."""
+    return _parse_sparse_config()
 
 
 def create_sparse_coordinator(
@@ -112,10 +123,9 @@ def create_sparse_coordinator(
     token_to_kv_pool,
     start_layer: int,
     end_layer: int,
-    server_args,
     **kwargs,
 ) -> SparseCoordinator:
-    config = _parse_sparse_config(server_args)
+    config = _parse_sparse_config()
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
     backend_adaptor = _create_backend_adaptor(
         config.backend, device, algorithm, req_to_token_pool

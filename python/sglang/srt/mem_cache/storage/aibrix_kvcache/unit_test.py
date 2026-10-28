@@ -8,7 +8,7 @@ from aibrix_kvcache_storage import AibrixKVCacheStorage
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -51,7 +51,19 @@ class AIBrixKVCacheStorageTest:
                 0,
                 layer_num,
             )
-            mem_pool = MHATokenToKVPoolHost(kv_cache, 2, 0, page_size, "layer_first")
+            mem_pool = MHATokenToKVPoolHost(
+                kv_cache.get_device_pool_infos()[0].buffer_info,
+                2,
+                0,
+                page_size,
+                "layer_first",
+                device_capacity_tokens=kv_cache.size
+                if kv_cache.host_capacity_tokens is None
+                else kv_cache.host_capacity_tokens,
+                start_layer=kv_cache.start_layer,
+                end_layer=kv_cache.end_layer,
+                write_back_staging=kv_cache.hicache_write_back_staging,
+            )
             query_length = batch_size * 2
             partial = batch_size
             self.aibrix_kvcache = AibrixKVCacheStorage(config, mem_pool)

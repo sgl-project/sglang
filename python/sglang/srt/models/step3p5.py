@@ -1,30 +1,25 @@
-import logging
-import os
+from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
-)
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -52,12 +47,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    make_pp_layers,
+)
 
 Step3p5Config = None
 
-logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 
 
@@ -69,6 +67,9 @@ class Step3p5MLP(nn.Module):
         swiglu_limit: Optional[float] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -78,6 +79,7 @@ class Step3p5MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            parallel_group=parallel_group,
             prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
@@ -85,7 +87,9 @@ class Step3p5MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            parallel_group=parallel_group,
             prefix=add_prefix("down_proj", prefix),
+            reduce_results=reduce_results,
         )
         self.act_fn = SiluAndMul()
         self.limit = swiglu_limit
@@ -114,7 +118,7 @@ class Step3p5MoEMLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.layer_id = layer_id
 
         self.need_fp32_gate = config.need_fp32_gate
@@ -147,7 +151,7 @@ class Step3p5MoEMLP(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.moe_num_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.moe_top_k,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -156,6 +160,10 @@ class Step3p5MoEMLP(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
             gemm1_clamp_limit=self.limit,
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
 
         self.gate = ReplicatedLinear(
@@ -168,10 +176,9 @@ class Step3p5MoEMLP(nn.Module):
 
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
-            self.ep_size = get_moe_expert_parallel_world_size()
+            self.ep_size = get_parallel().moe_ep_size
             self.moe_num_experts = (
-                config.moe_num_experts
-                + get_global_server_args().ep_num_redundant_experts
+                config.moe_num_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.top_k = config.moe_top_k
 
@@ -179,19 +186,16 @@ class Step3p5MoEMLP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
+        shared_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         if (
             not get_moe_a2a_backend().is_deepep()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
-            return self.forward_normal(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
+            return self.forward_normal(hidden_states, shared_output)
         else:
-            return self.forward_deepep(hidden_states, forward_batch)
+            return self.forward_deepep(hidden_states, forward_batch, shared_output)
 
     def get_moe_weights(self):
         return [
@@ -206,8 +210,7 @@ class Step3p5MoEMLP(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
+        shared_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -220,6 +223,8 @@ class Step3p5MoEMLP(nn.Module):
             # router_logits: (batch * sequence_length, n_experts)
             router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        if hasattr(topk_output, "to_standard"):
+            topk_output = topk_output.to_standard(layer_id=self.layer_id)
         if self.routed_scaling_factor != 1.0:
             topk_output = StandardTopKOutput(
                 topk_weights=topk_output.topk_weights * self.routed_scaling_factor,
@@ -227,29 +232,29 @@ class Step3p5MoEMLP(nn.Module):
                 router_logits=topk_output.router_logits,
             )
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        if shared_output is not None:
+            final_hidden_states += shared_output
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_deepep(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        shared_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
+            if self.need_fp32_gate:
+                router_logits = torch.matmul(
+                    hidden_states.to(torch.float32),
+                    self.gate.weight.t().to(torch.float32),
+                )
+            else:
+                router_logits, _ = self.gate(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -257,73 +262,12 @@ class Step3p5MoEMLP(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+        if shared_output is not None:
+            shared_output.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = shared_output
+        else:
+            final_hidden_states *= self.routed_scaling_factor
         return final_hidden_states
-
-    def op_gate(self, state):
-        if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
-        ):
-            # router_logits: (num_tokens, n_experts)
-            state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
-        else:
-            state.router_logits = None
-
-    def op_select_experts(self, state):
-        router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
-        if router_logits is not None:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.topk_output = self.topk(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
-                )
-        else:
-            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
-
-    def op_dispatch_a(self, state):
-        if self.ep_size > 1:
-            self.experts.dispatcher.dispatch_a(
-                hidden_states=state.pop("hidden_states_mlp_input"),
-                topk_output=state.pop("topk_output"),
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-
-    def op_dispatch_b(self, state):
-        if self.ep_size > 1:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.dispatch_output = self.experts.dispatcher.dispatch_b(
-                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
-                )
-
-    def op_experts(self, state):
-        state.combine_input = self.experts.run_moe_core(
-            dispatch_output=state.dispatch_output,
-        )
-
-    def op_combine_a(self, state):
-        if self.ep_size > 1:
-            self.experts.dispatcher.combine_a(
-                combine_input=state.pop("combine_input"),
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-            state.pop("dispatch_output")
-
-    def op_combine_b(self, state):
-        if self.ep_size > 1:
-            state.hidden_states_after_combine = self.experts.dispatcher.combine_b(
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-
-    def op_output(self, state):
-        state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
 
 class Step3p5Attention(nn.Module):
@@ -347,10 +291,8 @@ class Step3p5Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        self.tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_size = get_parallel().attn_tp_size
 
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -370,7 +312,6 @@ class Step3p5Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.tp_rank = get_tensor_model_parallel_rank()
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -381,8 +322,7 @@ class Step3p5Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -390,8 +330,8 @@ class Step3p5Attention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
+            reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -401,8 +341,7 @@ class Step3p5Attention(nn.Module):
                 hidden_size,
                 self.total_num_heads,
                 bias=False,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=add_prefix("g_proj", prefix),
             )
 
@@ -483,10 +422,10 @@ class Step3p5DecoderLayer(nn.Module):
         rope_theta = config.rope_theta
         max_position_embeddings = config.max_position_embeddings
         head_dim = config.head_dim
-        moe_layers_list = [int(x) for x in config.moe_layers_enum.split(",")]
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_attention_groups
-        self.is_moe_layer = layer_id in moe_layers_list
+        self.is_moe_layer = self._is_moe_layer(config, layer_id)
+        self.is_next_layer_sparse = self._is_moe_layer(config, layer_id + 1)
         num_hidden_layers = config.num_hidden_layers
 
         if (
@@ -540,12 +479,28 @@ class Step3p5DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
+            # The MoE block adds the shared expert's output to the routed output
+            # before its one reduction. Where the routed output arrives complete
+            # on each rank's own tokens, the shared expert is not TP-sharded.
             self.share_expert = Step3p5MLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.share_expert_dim,
                 swiglu_limit=swiglu_limit_shared,
                 quant_config=quant_config,
                 prefix=add_prefix("share_expert", prefix),
+                reduce_results=False,
+                **(
+                    dict(parallel_group="replicated")
+                    if get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_nixl()
+                    or get_moe_a2a_backend().is_mori()
+                    or get_moe_a2a_backend().is_ascend_fuseep()
+                    or get_moe_a2a_backend().is_flashinfer()
+                    or get_moe_a2a_backend().is_flashinfer_megamoe()
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    else {}
+                ),
             )
             self.use_moe = True
         else:
@@ -555,6 +510,7 @@ class Step3p5DecoderLayer(nn.Module):
                 swiglu_limit=swiglu_limit_shared,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
 
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -562,100 +518,62 @@ class Step3p5DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=(
-                config.num_hidden_layers if layer_id < config.num_hidden_layers else 1
-            ),  # 1 is for mtp
-            is_layer_sparse=False,
-            is_previous_layer_sparse=False,
-            is_next_layer_sparse=False,
-        )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
         self.layer_id = layer_id
-        self.dump_intermediate = (
-            os.environ.get("SGLANG_DUMP_STEP3P5_INTERMEDIATE") == "1"
-        )
-        self._dump_step = 0
 
-    def _dump_tensor(
-        self,
-        name: str,
-        tensor: Optional[torch.Tensor],
-        step_id: Optional[int] = None,
-    ) -> None:
-        if not self.dump_intermediate or tensor is None or not torch.is_tensor(tensor):
-            return
-        dump_dir = "/sgl-workspace/sgl"
-        try:
-            os.makedirs(dump_dir, exist_ok=True)
-            tp_rank = get_tensor_model_parallel_rank()
-            step_part = f"_step{step_id}" if step_id is not None else ""
-            path = os.path.join(
-                dump_dir,
-                f"step3p5_layer{self.layer_id}{step_part}_{name}_tp{tp_rank}.pt",
-            )
-            torch.save(tensor.detach().cpu(), path)
-        except Exception:
-            logger.exception(
-                "Failed to dump tensor %s for layer %s", name, self.layer_id
-            )
+    @classmethod
+    def stage_facts(cls, config: Step3p5Config, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_moe_layer(config, layer_id),
+                next_layer_sparse=cls._is_moe_layer(config, layer_id + 1),
+            ),
+        )
+
+    @staticmethod
+    def _is_moe_layer(config: Step3p5Config, layer_id: int) -> bool:
+        moe_layers_set = {int(x) for x in config.moe_layers_enum.split(",")}
+        return layer_id in moe_layers_set
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
         post_residual_addition: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            post_residual_addition=post_residual_addition,
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, post_residual_addition=post_residual_addition
         )
-        dump_step = None
-        if self.dump_intermediate:
-            dump_step = self._dump_step
-            self._dump_step += 1
-            self._dump_tensor("attn_input", hidden_states, dump_step)
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        self._dump_tensor("attn_output", hidden_states, dump_step)
         # Fully Connected
-        # hidden_states, residual = self.layer_communicator.prepare_mlp(
-        #     hidden_states,
-        #     residual,
-        #     forward_batch,
-        # )
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        self._dump_tensor("post_attn_residual", hidden_states, dump_step)
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        self._dump_tensor("mlp_input", hidden_states, dump_step)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+
         if self.use_moe:
             share_output = self.share_expert(hidden_states)
-            moe_output = self.moe(hidden_states)
-            hidden_states = moe_output + share_output
-        else:
-            hidden_states = self.mlp(hidden_states)
-        self._dump_tensor("mlp_output", hidden_states, dump_step)
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
-        self._dump_tensor("layer_output", hidden_states, dump_step)
-        return hidden_states, residual
+            hidden_states = self.moe(
+                hidden_states, forward_batch, shared_output=share_output
+            )
+            return self.ffn_boundary.finish(hidden_states, forward_batch)
+
+        hidden_states = self.mlp(hidden_states)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class Step3p5Model(nn.Module):
@@ -667,11 +585,10 @@ class Step3p5Model(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = get_stream("alt") if _is_cuda else None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -682,14 +599,14 @@ class Step3p5Model(nn.Module):
                 prefix=add_prefix("embed_tokens", prefix),
                 params_dtype=(
                     torch.float32
-                    if get_global_server_args().rl_on_policy_target is not None
+                    if get_exec().deterministic.rl_on_policy_target is not None
                     else None
                 ),
             )
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             # 1,
             lambda idx, prefix: Step3p5DecoderLayer(
@@ -699,9 +616,8 @@ class Step3p5Model(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(Step3p5DecoderLayer.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -730,47 +646,33 @@ class Step3p5Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            residual = None
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
+            hidden_states = layer(positions, hidden_states, forward_batch)
             # break
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            return residual_batch.to_pp(hidden_states, forward_batch)
         else:
+            hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             hidden_states_before_norm = None
             if not self.pp_group.is_last_rank:
-                return PPProxyTensors(
-                    {
-                        "hidden_states": hidden_states,
-                        "residual": residual,
-                    }
-                )
+                return residual_batch.to_pp(hidden_states, forward_batch)
             else:
                 if hidden_states.shape[0] > 0:
                     # if forward_batch.return_hidden_states_before_norm:
-                    hidden_states_before_norm = (
-                        hidden_states if residual is None else hidden_states + residual
+                    hidden_states_before_norm = residual_batch.snapshot(
+                        hidden_states, forward_batch
                     )
-                    if residual is None:
-                        hidden_states = self.norm(hidden_states)
-                    else:
-                        hidden_states, _ = self.norm(hidden_states, residual)
+                    hidden_states = residual_batch.final_norm(
+                        hidden_states, forward_batch, self.norm
+                    )
             return hidden_states, hidden_states_before_norm
 
 
@@ -794,6 +696,13 @@ class Step3p5ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.moe_num_experts,
+        )
+
     def __init__(
         self,
         config: Step3p5Config,
@@ -801,7 +710,7 @@ class Step3p5ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = Step3p5Model(
@@ -820,7 +729,7 @@ class Step3p5ForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:
@@ -1019,7 +928,13 @@ class Step3p5ForCausalLM(nn.Module):
                         )
                         loaded_params.add(actual_param_name)
 
-        print_params = set(params_dict.keys()) - loaded_params
+        # Derived parameters (e.g. blockscale_swizzled from NVFP4 quantization)
+        # are computed in process_weights_after_loading, not loaded from checkpoint.
+        print_params = {
+            p
+            for p in set(params_dict.keys()) - loaded_params
+            if "blockscale_swizzled" not in p
+        }
         assert len(print_params) == 0, f"Some parameters are not loaded: {print_params}"
 
     def get_embed_and_head(self):

@@ -172,9 +172,9 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             ret_num_top_logprobs = len(
                 response.choices[0].logprobs.content[0].top_logprobs
             )
-            assert (
-                ret_num_top_logprobs == logprobs
-            ), f"{ret_num_top_logprobs} vs {logprobs}"
+            assert ret_num_top_logprobs == logprobs, (
+                f"{ret_num_top_logprobs} vs {logprobs}"
+            )
 
         assert len(response.choices) == parallel_sample_num
         assert response.choices[0].message.role == "assistant"
@@ -223,9 +223,9 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             data = response.choices[0].delta
 
             if is_firsts.get(index, True):
-                assert (
-                    data.role == "assistant"
-                ), "data.role was not 'assistant' for first chunk"
+                assert data.role == "assistant", (
+                    "data.role was not 'assistant' for first chunk"
+                )
                 is_firsts[index] = False
                 continue
 
@@ -240,9 +240,9 @@ The SmartHome Mini is a compact smart home assistant available in black or white
                 ret_num_top_logprobs = len(
                     response.choices[0].logprobs.content[0].top_logprobs
                 )
-                assert (
-                    ret_num_top_logprobs == logprobs
-                ), f"{ret_num_top_logprobs} vs {logprobs}"
+                assert ret_num_top_logprobs == logprobs, (
+                    f"{ret_num_top_logprobs} vs {logprobs}"
+                )
 
             assert (
                 isinstance(data.content, str)
@@ -254,14 +254,14 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             assert response.created
 
         for index in range(parallel_sample_num):
-            assert not is_firsts.get(
-                index, True
-            ), f"index {index} is not found in the response"
+            assert not is_firsts.get(index, True), (
+                f"index {index} is not found in the response"
+            )
 
         for index in range(parallel_sample_num):
-            assert (
-                index in finish_reason_counts
-            ), f"No finish_reason found for index {index}"
+            assert index in finish_reason_counts, (
+                f"No finish_reason found for index {index}"
+            )
             assert finish_reason_counts[index] == 1, (
                 f"Expected 1 finish_reason chunk for index {index}, "
                 f"got {finish_reason_counts[index]}"

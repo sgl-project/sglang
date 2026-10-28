@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 
 
@@ -43,10 +45,7 @@ class PetitNvFp4Config(QuantizationConfig):
     ) -> None:
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         if is_checkpoint_nvfp4_serialized:
-            logger.warning(
-                "Detected nvfp4 checkpoint. Please note that the "
-                "format is experimental and subject to change."
-            )
+            logger.info("Detected nvfp4 checkpoint.")
         self.group_size = group_size
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.exclude_modules = exclude_modules
@@ -176,7 +175,7 @@ class PetitNvFp4LinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         if input_size_per_partition % 16 != 0:
             raise ValueError(
-                "Unsupported model when in features size is " "not multiple of 16"
+                "Unsupported model when in features size is not multiple of 16"
             )
 
         weight_dtype = (

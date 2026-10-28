@@ -1,0 +1,260 @@
+import copy
+import multiprocessing
+import os
+import traceback
+import unittest
+from multiprocessing import Process
+
+import sgl_kernel  # noqa: F401
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, find_available_port
+
+register_cpu_ci(est_time=43, suite="stage-a-test-cpu-intel")
+
+
+def run_distributed_test(
+    rank, world_size, master_port, output_writer, fn, init_legacy_shm=True
+):
+    try:
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(master_port)
+        os.environ["LOCAL_SIZE"] = str(world_size)
+
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+        if init_legacy_shm:
+            torch.ops.sgl_kernel.initialize(world_size, rank)
+        fn(rank, world_size)
+        execution_ok = True
+    except Exception as e:
+        print(f"subprocess[{rank=}] has error: {e}", flush=True)
+        traceback.print_exc()
+        execution_ok = False
+
+    output_writer.send(execution_ok)
+    output_writer.close()
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def all_reduce_fn(rank, world_size):
+    op = dist.ReduceOp.SUM
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        tensor = torch.randn(2, 10, dtype=dtype)
+        tensor_shm = copy.deepcopy(tensor)
+
+        dist.all_reduce(tensor, op=op)
+        torch.ops.sgl_kernel.shm_allreduce(tensor_shm, op)
+
+        torch.testing.assert_close(tensor, tensor_shm)
+
+
+def all_gather_fn(rank, world_size):
+    dim = -1
+
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        tensor = torch.randn(2, 10, dtype=dtype)
+
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += tensor.dim()
+
+        input_size = tensor.size()
+        output_size = (input_size[0] * world_size,) + input_size[1:]
+        output_tensor = torch.empty(
+            output_size, dtype=tensor.dtype, device=tensor.device
+        )
+        dist.all_gather_into_tensor(output_tensor, tensor)
+        output_tensor = output_tensor.reshape((world_size,) + input_size)
+        output_tensor = output_tensor.movedim(0, dim)
+        output_tensor = output_tensor.reshape(
+            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+        )
+
+        output_shm = torch.ops.sgl_kernel.shm_allgather(tensor, dim)
+
+        torch.testing.assert_close(output_tensor, output_shm)
+
+
+def all_gather_into_tensor_fn(rank, world_size):
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        tensor = torch.randn(2, 10, dtype=dtype)
+
+        input_size = tensor.size()
+        output_size = (input_size[0] * world_size,) + input_size[1:]
+        output_tensor = torch.empty(
+            output_size, dtype=tensor.dtype, device=tensor.device
+        )
+        output_shm = torch.empty(output_size, dtype=tensor.dtype, device=tensor.device)
+        dist.all_gather_into_tensor(output_tensor, tensor)
+
+        torch.ops.sgl_kernel.shm_allgather_into_tensor(output_shm, tensor)
+
+        torch.testing.assert_close(output_tensor, output_shm)
+
+
+def reduce_scatter_tensor_fn(rank, world_size):
+    op = dist.ReduceOp.SUM
+
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        N, D = 4, 10
+        input_size = (world_size * N, D)
+        tensor = torch.randn(input_size, dtype=dtype)
+
+        output_size = (N, D)
+        output_tensor = torch.empty(output_size, dtype=dtype)
+        output_shm = torch.empty_like(output_tensor)
+
+        dist.reduce_scatter_tensor(output_tensor, tensor, op=op)
+
+        torch.ops.sgl_kernel.shm_reduce_scatter_tensor(output_shm, tensor, op)
+
+        torch.testing.assert_close(output_tensor, output_shm)
+
+
+def init_group(rank):
+    group_ranks_list = [[0, 2], [1, 3]]
+
+    groups = [dist.new_group(ranks=ranks, backend="gloo") for ranks in group_ranks_list]
+
+    group_idx = rank % 2
+    group = groups[group_idx]
+    group_ranks = group_ranks_list[group_idx]
+
+    group_size = dist.get_world_size(group)
+    group_rank = dist.get_rank(group)
+
+    group_name = f"test_group_{os.environ['MASTER_PORT']}_" + "_".join(
+        map(str, group_ranks)
+    )
+
+    handle = torch.ops.sgl_kernel.shm_group_initialize(
+        group_name, group_size, group_rank
+    )
+
+    return group, handle
+
+
+def group_all_reduce_fn(rank, world_size):
+    group, handle = init_group(rank)
+
+    op = dist.ReduceOp.SUM
+
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        for size in [(2, 10), (600000,)]:
+            tensor = torch.randn(size, dtype=dtype)
+            tensor_shm = copy.deepcopy(tensor)
+
+            dist.all_reduce(tensor, op=op, group=group)
+
+            torch.ops.sgl_kernel.shm_allreduce(tensor_shm, op, handle)
+
+            torch.testing.assert_close(tensor, tensor_shm)
+
+
+def group_all_gather_fn(rank, world_size):
+    group, handle = init_group(rank)
+
+    group_size = dist.get_world_size(group)
+
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        tensor = torch.randn(2, 10, dtype=dtype)
+
+        input_size = tensor.size()
+        output_size = (input_size[0] * group_size,) + input_size[1:]
+
+        output_tensor = torch.empty(
+            output_size,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        output_shm = torch.empty(
+            output_size,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+
+        dist.all_gather_into_tensor(output_tensor, tensor, group=group)
+
+        torch.ops.sgl_kernel.shm_allgather_into_tensor(output_shm, tensor, handle)
+
+        torch.testing.assert_close(output_tensor, output_shm)
+
+
+def group_all_to_all_fn(rank, world_size):
+    group, handle = init_group(rank)
+
+    group_size = dist.get_world_size(group)
+
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        tensor = torch.randn(group_size * 2, 10, dtype=dtype)
+        output_tensor = torch.empty_like(tensor)
+        output_shm = torch.empty_like(tensor)
+
+        dist.all_to_all_single(output_tensor, tensor, group=group)
+
+        torch.ops.sgl_kernel.shm_alltoall(output_shm, tensor, handle)
+
+        torch.testing.assert_close(output_tensor, output_shm)
+
+
+class TestComm(CustomTestCase):
+    def _spawn_and_check(self, fn, world_size=2, init_legacy_shm=True):
+        mp.set_start_method("spawn", force=True)
+        master_port = find_available_port(23456)
+
+        processes = []
+        output_reader, output_writer = multiprocessing.Pipe(duplex=False)
+
+        for rank in range(world_size):
+            p = Process(
+                target=run_distributed_test,
+                kwargs=dict(
+                    rank=rank,
+                    world_size=world_size,
+                    master_port=master_port,
+                    output_writer=output_writer,
+                    fn=fn,
+                    init_legacy_shm=init_legacy_shm,
+                ),
+            )
+            p.start()
+            processes.append(p)
+
+        for _ in range(world_size):
+            self.assertTrue(output_reader.recv(), "Subprocess fail. Check logs above.")
+
+        for p in processes:
+            p.join()
+
+    def test_all_reduce(self):
+        self._spawn_and_check(all_reduce_fn, init_legacy_shm=True)
+
+    def test_all_gather(self):
+        self._spawn_and_check(all_gather_fn, init_legacy_shm=True)
+
+    def test_all_gather_into_tensor(self):
+        self._spawn_and_check(all_gather_into_tensor_fn, init_legacy_shm=True)
+
+    def test_reduce_scatter_tensor(self):
+        self._spawn_and_check(reduce_scatter_tensor_fn, init_legacy_shm=True)
+
+    def test_group_all_reduce(self):
+        self._spawn_and_check(group_all_reduce_fn, world_size=4, init_legacy_shm=False)
+
+    def test_group_all_gather(self):
+        self._spawn_and_check(group_all_gather_fn, world_size=4, init_legacy_shm=False)
+
+    def test_group_all_to_all(self):
+        self._spawn_and_check(group_all_to_all_fn, world_size=4, init_legacy_shm=False)
+
+
+if __name__ == "__main__":
+    unittest.main()

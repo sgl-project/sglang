@@ -1,28 +1,235 @@
 # adapted from
 # https://github.com/vllm-project/vllm/blob/82a1b1a82b1fbb454c82a9ef95730b929c9b270c/vllm/model_executor/layers/pooler.py
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class PoolingType(IntEnum):
     LAST = 0
     CLS = 1
+    MEAN = 2
 
 
 @dataclass
 class EmbeddingPoolerOutput:
+    """Output of pooler or score_and_pool.
+
+    Attributes:
+        embeddings: Pooled embeddings or classification logits.  May be a list
+            of tensors when per-request matryoshka dim truncation produces
+            different shapes, or when MIS yields a variable number of scores
+            per request.
+        pooled_hidden_states: Raw transformer hidden states *before* the
+            task-specific head, present only when
+            ``forward_batch.return_pooled_hidden_states`` is True.  Tensor
+            (standard path) or list of tensors (one per position — MIS: one per
+            delimiter; setwise / multi-position readout: one per pooled position).
+    """
+
     # Pooler can return list[tensor] instead of tensor if the dimension of each tensor in the batch is different
     # due to different per-request matryoshka dim truncation
     embeddings: torch.Tensor | list[torch.Tensor]
+    pooled_hidden_states: Optional[torch.Tensor | list[torch.Tensor]] = None
+
+
+def pool_hidden_states(
+    pooling_type: PoolingType,
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> torch.Tensor:
+    """Pool hidden_states by PoolingType (LAST/CLS/MEAN).
+
+    Raw pooling only — no normalize, no dim truncation.
+    Returns shape (batch_size, hidden_size).
+    """
+    if pooling_type == PoolingType.LAST:
+        last_token_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+        return hidden_states[last_token_indices]
+    elif pooling_type == PoolingType.CLS:
+        prompt_lens = forward_batch.extend_seq_lens
+        first_token_flat_indices = torch.zeros_like(prompt_lens)
+        first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
+        return hidden_states[first_token_flat_indices]
+    elif pooling_type == PoolingType.MEAN:
+        prompt_lens = forward_batch.extend_seq_lens
+        end_indices = torch.cumsum(prompt_lens, dim=0) - 1
+        cumulative_hidden_states = torch.cumsum(hidden_states, dim=0)
+        sums = cumulative_hidden_states[end_indices]
+        preceding_sums = torch.zeros_like(sums)
+        preceding_sums[1:] = cumulative_hidden_states[end_indices[:-1]]
+        return (sums - preceding_sums) / prompt_lens.unsqueeze(-1)
+    else:
+        raise ValueError(f"Unsupported pooling type: {pooling_type}")
+
+
+def pool_at_delimiter_positions(
+    data: torch.Tensor,
+    forward_batch: ForwardBatch,
+    device: torch.device,
+) -> List[torch.Tensor]:
+    """Pool a tensor at the position before each MIS delimiter for every request.
+
+    Uses pre-computed delimiter indices from ForwardBatch (CPU tensors),
+    moves to GPU with non_blocking=True to avoid CUDA syncs.
+
+    Args:
+        data: 2-D tensor [total_tokens, dim] — hidden states or logits.
+        forward_batch: Forward batch with extend_seq_lens_cpu and
+                       multi_item_delimiter_indices populated.
+        device: Device for the index tensor.
+
+    Returns:
+        One tensor per request, shaped [num_delimiters, dim].
+    """
+    all_index_tensors: List[torch.Tensor] = []
+    delim_counts: List[int] = []
+    offset = 0
+    for req_idx, req_seq_len in enumerate(forward_batch.extend_seq_lens_cpu):
+        indices_tensor = forward_batch.multi_item_delimiter_indices[req_idx]
+        n = len(indices_tensor)
+        if n > 0:
+            # Note: if the first delimiter is at position 0 (empty query),
+            # indices - 1 wraps to -1. This is harmless — the first delimiter
+            # entry is always discarded by _process_multi_item_scoring_results.
+            all_index_tensors.append(indices_tensor + (offset - 1))
+        delim_counts.append(n)
+        offset += req_seq_len
+
+    if all_index_tensors:
+        index_tensor = torch.cat(all_index_tensors).to(device, non_blocking=True)
+    else:
+        index_tensor = torch.tensor([], dtype=torch.long, device=device)
+    return list(data[index_tensor].split(delim_counts))
+
+
+def pool_at_positions(
+    data: torch.Tensor,
+    per_request_indices: List[torch.Tensor],
+    forward_batch: ForwardBatch,
+    device: torch.device,
+) -> List[torch.Tensor]:
+    """Pool a tensor exactly AT the given token positions for every request.
+
+    Unlike ``pool_at_delimiter_positions`` (which pools at delimiter - 1), this
+    pools at the position itself with no offset shift and no discarded entry.
+
+    Args:
+        data: 2-D tensor [total_tokens, dim] — hidden states or logits.
+        per_request_indices: Per-request anchor positions (CPU tensors), each
+            relative to the start of that request's sequence.
+        forward_batch: Forward batch with extend_seq_lens_cpu populated.
+        device: Device for the index tensor.
+
+    Returns:
+        One tensor per request, shaped [num_anchors, dim].
+    """
+    all_index_tensors: List[torch.Tensor] = []
+    counts: List[int] = []
+    offset = 0
+    for req_idx, req_seq_len in enumerate(forward_batch.extend_seq_lens_cpu):
+        indices_tensor = per_request_indices[req_idx]
+        n = len(indices_tensor)
+        if n > 0:
+            all_index_tensors.append(indices_tensor + offset)
+        counts.append(n)
+        offset += req_seq_len
+
+    if all_index_tensors:
+        index_tensor = torch.cat(all_index_tensors).to(device, non_blocking=True)
+    else:
+        index_tensor = torch.empty(0, dtype=torch.long, device=device)
+    return list(data[index_tensor].split(counts))
+
+
+def score_and_pool(
+    score_head: nn.Module,
+    pooler: Pooler,
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    input_ids: torch.Tensor,
+) -> EmbeddingPoolerOutput:
+    """Apply a classification/score head with MIS and pooled-hidden-states support.
+
+    Multi-position readout path (``token_indices_to_pool`` on forward_batch, e.g.
+    setwise scoring): pool the head AT each caller-specified position (no offset,
+    no discarded row), then split per-request.
+
+    MIS path (pre-computed delimiter indices on forward_batch): extract hidden
+    states at positions just before each delimiter, apply the score head, then
+    split per-request.
+
+    Standard path: pool hidden states, then apply the score head.
+
+    When ``forward_batch.return_pooled_hidden_states`` is True, the raw pooled
+    hidden states (before the score head) are included in the output.
+    """
+    if (
+        forward_batch.token_indices_to_pool is not None
+        and forward_batch.is_prefill_only
+    ):
+        # Setwise readout: pool the head AT each requested position (no -1 shift,
+        # no discarded boundary row). Concat to call the head once, then split.
+        per_request_phs = pool_at_positions(
+            hidden_states,
+            forward_batch.token_indices_to_pool,
+            forward_batch,
+            input_ids.device,
+        )
+        phs_flat = torch.cat(per_request_phs, dim=0)
+        scores_flat = score_head(phs_flat)
+        pos_counts = [t.shape[0] for t in per_request_phs]
+        per_request_scores = list(scores_flat.split(pos_counts))
+        return EmbeddingPoolerOutput(
+            embeddings=per_request_scores,
+            pooled_hidden_states=(
+                per_request_phs if forward_batch.return_pooled_hidden_states else None
+            ),
+        )
+
+    if (
+        forward_batch.multi_item_delimiter_indices is not None
+        and forward_batch.is_prefill_only
+    ):
+        # Pool hidden states at pre-delimiter positions, score only those —
+        # avoids wasting compute on tokens that never contribute to the output.
+        # pool_at_delimiter_positions returns one tensor per request; we concat
+        # to call score_head once, then split back per request.
+        per_request_phs = pool_at_delimiter_positions(
+            hidden_states, forward_batch, input_ids.device
+        )
+        phs_flat = torch.cat(per_request_phs, dim=0)
+        scores_flat = score_head(phs_flat)
+        delim_counts = [t.shape[0] for t in per_request_phs]
+        per_request_scores = list(scores_flat.split(delim_counts))
+        return EmbeddingPoolerOutput(
+            embeddings=per_request_scores,
+            pooled_hidden_states=(
+                per_request_phs if forward_batch.return_pooled_hidden_states else None
+            ),
+        )
+
+    # Standard classification path: pool hidden states, then score.
+    pooled_hs = pool_hidden_states(pooler.pooling_type, hidden_states, forward_batch)
+    scores = score_head(pooled_hs)
+    return EmbeddingPoolerOutput(
+        embeddings=scores,
+        pooled_hidden_states=(
+            pooled_hs if forward_batch.return_pooled_hidden_states else None
+        ),
+    )
 
 
 class Pooler(nn.Module):
@@ -32,7 +239,7 @@ class Pooler(nn.Module):
     2. Normalizes output if specified.
     3. Returns structured results as `PoolerOutput`.
     Attributes:
-        pooling_type: The type of pooling to use (LAST, AVERAGE, MAX).
+        pooling_type: The type of pooling to use (LAST, CLS, MEAN).
         normalize: Whether to normalize the pooled data.
     """
 
@@ -44,17 +251,9 @@ class Pooler(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> EmbeddingPoolerOutput:
-
-        if self.pooling_type == PoolingType.LAST:
-            last_token_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-            pooled_data = hidden_states[last_token_indices]
-        elif self.pooling_type == PoolingType.CLS:
-            prompt_lens = forward_batch.extend_seq_lens
-            first_token_flat_indices = torch.zeros_like(prompt_lens)
-            first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
-            pooled_data = hidden_states[first_token_flat_indices]
-        else:
-            raise ValueError(f"Invalid pooling type: {self.pooling_type}")
+        pooled_data = pool_hidden_states(
+            self.pooling_type, hidden_states, forward_batch
+        )
 
         if forward_batch.dimensions is not None:
             all_same_dimensions = len(set(forward_batch.dimensions)) == 1
