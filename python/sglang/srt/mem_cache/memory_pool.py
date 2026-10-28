@@ -2019,6 +2019,136 @@ class KVCache(abc.ABC):
         return self.custom_mem_pool
 
 
+def _set_mha_kv_buffer_prefix_valid(
+    pool,
+    layer: RadixAttention,
+    loc_2d: torch.Tensor,
+    commit_lens: torch.Tensor,
+    cache_k: torch.Tensor,
+    cache_v: torch.Tensor,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    layer_id_override: Optional[int] = None,
+):
+    if layer_id_override is not None:
+        layer_id = layer_id_override
+    else:
+        layer_id = layer.layer_id
+
+    if loc_2d.ndim != 2:
+        raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
+    if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
+        raise ValueError(
+            "commit_lens must match loc_2d batch size: "
+            f"{tuple(commit_lens.shape)=} {tuple(loc_2d.shape)=}."
+        )
+
+    num_rows = int(loc_2d.numel())
+    if cache_k.shape[0] != num_rows or cache_v.shape[0] != num_rows:
+        raise ValueError(
+            "KV rows must match loc_2d size: "
+            f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
+        )
+
+    if loc_2d.device != pool.k_buffer[0].device:
+        loc_2d = loc_2d.to(device=pool.k_buffer[0].device, non_blocking=True)
+    if commit_lens.device != pool.k_buffer[0].device:
+        commit_lens = commit_lens.to(device=pool.k_buffer[0].device, non_blocking=True)
+    if loc_2d.dtype != torch.int64:
+        loc_2d = loc_2d.to(torch.int64)
+    if commit_lens.dtype != torch.int32:
+        commit_lens = commit_lens.to(torch.int32)
+
+    if not (_is_cuda or _is_hip):
+        row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+        valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+        valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
+        if valid_idx.numel() == 0:
+            return
+        pool.set_kv_buffer(
+            layer,
+            KVWriteLoc(loc_2d.reshape(-1).index_select(0, valid_idx), physical=True),
+            cache_k.index_select(0, valid_idx),
+            cache_v.index_select(0, valid_idx),
+            k_scale,
+            v_scale,
+            layer_id_override=layer_id,
+        )
+        return
+
+    # The tiled kernel takes one ROW_BYTES for both tensors, so an asymmetric V
+    # row would be written at K's width and bleed into the next slot. Only this
+    # path needs the gate; the non-CUDA branch above handles both widths.
+    if pool.v_row_dim != pool.row_dim:
+        raise NotImplementedError(
+            "prefix-valid commit requires equal-width K/V rows, got "
+            f"head_dim={pool.head_dim} v_head_dim={pool.v_head_dim}."
+        )
+
+    fused_k_scale = _resolve_fused_scale(
+        k_scale,
+        getattr(layer, "k_scale", None),
+        getattr(layer, "k_scale_float", None),
+    )
+    fused_v_scale = _resolve_fused_scale(
+        v_scale,
+        getattr(layer, "v_scale", None),
+        getattr(layer, "v_scale_float", None),
+    )
+    # fuse quantization and writing into the same kernel
+    if (
+        cache_k.dtype != pool.dtype
+        and pool.dtype == fp8_dtype
+        and fused_k_scale is not None
+        and fused_v_scale is not None
+    ):
+        _set_kv_buffer_prefix_valid_impl_fp8(
+            cache_k,
+            cache_v,
+            pool.k_buffer[layer_id - pool.start_layer].view(pool.dtype),
+            pool.v_buffer[layer_id - pool.start_layer].view(pool.dtype),
+            fused_k_scale,
+            fused_v_scale,
+            loc_2d,
+            commit_lens,
+            row_dim=pool.row_dim,
+            k_scale_is_tensor=isinstance(k_scale, torch.Tensor) and k_scale.is_cuda,
+            v_scale_is_tensor=isinstance(v_scale, torch.Tensor) and v_scale.is_cuda,
+        )
+        return
+
+    # fallback: eager quantization
+    if cache_k.dtype != pool.dtype:
+        if k_scale is not None:
+            cache_k.div_(k_scale)
+        if v_scale is not None:
+            cache_v.div_(v_scale)
+        if pool.dtype == fp8_dtype:
+            # Saturate like the fused kernel above; see saturate_to_fp8_range.
+            cache_k = saturate_to_fp8_range(cache_k, pool.dtype)
+            cache_v = saturate_to_fp8_range(cache_v, pool.dtype)
+        cache_k = cache_k.to(pool.dtype)
+        cache_v = cache_v.to(pool.dtype)
+
+    if pool.store_dtype != pool.dtype:
+        cache_k = cache_k.contiguous().view(pool.store_dtype)
+        cache_v = cache_v.contiguous().view(pool.store_dtype)
+    else:
+        cache_k = cache_k.contiguous()
+        cache_v = cache_v.contiguous()
+
+    _set_kv_buffer_prefix_valid_impl(
+        cache_k,
+        cache_v,
+        pool.k_buffer[layer_id - pool.start_layer],
+        pool.v_buffer[layer_id - pool.start_layer],
+        loc_2d,
+        commit_lens,
+        row_dim=pool.row_dim,
+        store_dtype=pool.store_dtype,
+    )
+
+
 class MHATokenToKVPool(KVCache, MHAKVView):
     def __init__(
         self,
@@ -3139,124 +3269,16 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        if layer_id_override is not None:
-            layer_id = layer_id_override
-        else:
-            layer_id = layer.layer_id
-
-        if loc_2d.ndim != 2:
-            raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
-        if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
-            raise ValueError(
-                "commit_lens must match loc_2d batch size: "
-                f"{tuple(commit_lens.shape)=} {tuple(loc_2d.shape)=}."
-            )
-
-        num_rows = int(loc_2d.numel())
-        if cache_k.shape[0] != num_rows or cache_v.shape[0] != num_rows:
-            raise ValueError(
-                "KV rows must match loc_2d size: "
-                f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
-            )
-
-        if loc_2d.device != self.k_buffer[0].device:
-            loc_2d = loc_2d.to(device=self.k_buffer[0].device, non_blocking=True)
-        if commit_lens.device != self.k_buffer[0].device:
-            commit_lens = commit_lens.to(
-                device=self.k_buffer[0].device, non_blocking=True
-            )
-        if loc_2d.dtype != torch.int64:
-            loc_2d = loc_2d.to(torch.int64)
-        if commit_lens.dtype != torch.int32:
-            commit_lens = commit_lens.to(torch.int32)
-
-        if not (_is_cuda or _is_hip):
-            row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
-            valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
-            valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
-            if valid_idx.numel() == 0:
-                return
-            self.set_kv_buffer(
-                layer,
-                loc_2d.reshape(-1).index_select(0, valid_idx),
-                cache_k.index_select(0, valid_idx),
-                cache_v.index_select(0, valid_idx),
-                k_scale,
-                v_scale,
-                layer_id_override=layer_id,
-            )
-            return
-
-        # The tiled kernel takes one ROW_BYTES for both tensors, so an asymmetric V
-        # row would be written at K's width and bleed into the next slot. Only this
-        # path needs the gate; the non-CUDA branch above handles both widths.
-        if self.v_row_dim != self.row_dim:
-            raise NotImplementedError(
-                "prefix-valid commit requires equal-width K/V rows, got "
-                f"head_dim={self.head_dim} v_head_dim={self.v_head_dim}."
-            )
-
-        fused_k_scale = _resolve_fused_scale(
-            k_scale,
-            getattr(layer, "k_scale", None),
-            getattr(layer, "k_scale_float", None),
-        )
-        fused_v_scale = _resolve_fused_scale(
-            v_scale,
-            getattr(layer, "v_scale", None),
-            getattr(layer, "v_scale_float", None),
-        )
-        # fuse quantization and writing into the same kernel
-        if (
-            cache_k.dtype != self.dtype
-            and self.dtype == fp8_dtype
-            and fused_k_scale is not None
-            and fused_v_scale is not None
-        ):
-            _set_kv_buffer_prefix_valid_impl_fp8(
-                cache_k,
-                cache_v,
-                self.k_buffer[layer_id - self.start_layer].view(self.dtype),
-                self.v_buffer[layer_id - self.start_layer].view(self.dtype),
-                fused_k_scale,
-                fused_v_scale,
-                loc_2d,
-                commit_lens,
-                row_dim=self.row_dim,
-                k_scale_is_tensor=isinstance(k_scale, torch.Tensor) and k_scale.is_cuda,
-                v_scale_is_tensor=isinstance(v_scale, torch.Tensor) and v_scale.is_cuda,
-            )
-            return
-
-        # fallback: eager quantization
-        if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-            if self.dtype == fp8_dtype:
-                # Saturate like the fused kernel above; see saturate_to_fp8_range.
-                cache_k = saturate_to_fp8_range(cache_k, self.dtype)
-                cache_v = saturate_to_fp8_range(cache_v, self.dtype)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
-
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.contiguous().view(self.store_dtype)
-            cache_v = cache_v.contiguous().view(self.store_dtype)
-        else:
-            cache_k = cache_k.contiguous()
-            cache_v = cache_v.contiguous()
-
-        _set_kv_buffer_prefix_valid_impl(
-            cache_k,
-            cache_v,
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
+        _set_mha_kv_buffer_prefix_valid(
+            self,
+            layer,
             loc_2d,
             commit_lens,
-            row_dim=self.row_dim,
-            store_dtype=self.store_dtype,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override,
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
