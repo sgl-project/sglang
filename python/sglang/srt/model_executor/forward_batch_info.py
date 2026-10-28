@@ -996,11 +996,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         contains_last_prefill_chunk = False
         if batch.forward_mode.is_extend_without_speculative():
-            decoding_req_ids = {id(req) for req in (batch.decoding_reqs or ())}
+            # The decode rows a step carries do not complete a prefill.
             contains_last_prefill_chunk = any(
                 req.extend_end == len(req.full_untruncated_fill_ids)
-                for req in batch.reqs
-                if id(req) not in decoding_req_ids
+                for req in batch.prefill_reqs()
             )
 
         from sglang.srt.model_executor.model_runner import ModelRunner
