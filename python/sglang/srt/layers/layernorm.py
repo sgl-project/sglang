@@ -194,6 +194,12 @@ if _is_npu:
         npu_gemma_rms_norm = torch_npu.npu_gemma_rms_norm
 
 
+def gemma_rms_norm_uses_rocm_triton() -> bool:
+    """Whether GemmaRMSNorm.forward_hip runs the ROCm Triton Gemma kernels
+    (minimax_m3_rmsnorm), which fused producers must match bit for bit."""
+    return _use_aiter and _has_rocm_triton_gemma_rms_norm
+
+
 @lru_cache(maxsize=1)
 def _get_aiter_per_group_quant():
     """Resolve aiter's per-1x128 HIP quant functor + FP8 dtype on first use.
