@@ -16,6 +16,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layer_boundary import (
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -335,7 +336,7 @@ class KimiDeltaAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                parallel_group="attn_tp",
+                parallel_group=parallel_group,
                 v_head_size=self.head_v_dim,
                 prefix=f"{prefix}.qkv_proj",
             )
@@ -618,7 +619,16 @@ class KimiDecoderLayer(nn.Module):
             config, layer_idx + 1
         )
         return (
-            declare_attn(),
+            declare_attn(
+                tp_group=(
+                    SumGroup.TP
+                    if config.is_kda_layer(layer_idx)
+                    and get_parallel().enable_linear_attn_cp
+                    else SumGroup.ATTN_TP
+                ),
+                in_token_order=config.is_kda_layer(layer_idx)
+                and get_parallel().enable_linear_attn_cp,
+            ),
             declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
         )
 
@@ -700,12 +710,12 @@ class KimiLinearModel(nn.Module):
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if get_parallel().pp_group.is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
+            if input_embeds is not None:
+                hidden_states = input_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual_batch.start(forward_batch)
@@ -814,14 +824,14 @@ class KimiLinearForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids,
             positions,
             forward_batch,
-            inputs_embeds,
+            input_embeds,
             pp_proxy_tensors,
         )
         if self.pp_group.is_last_rank:

@@ -78,6 +78,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     USE_INITIAL_STATE: tl.constexpr,
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
+    SAVE_H: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     NT_BUCKET: tl.constexpr,
     USE_EXP2: tl.constexpr,
@@ -108,7 +109,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_h4 = tl.zeros([BV, 64], dtype=tl.float32)
 
     # calculate offset
-    h += ((boh * H + i_h) * V * K).to(tl.int64)
+    if SAVE_H:
+        h += ((boh * H + i_h) * V * K).to(tl.int64)
     v += ((bos * H + i_h) * V).to(tl.int64)
     k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
     w += ((bos * H + i_h) * K).to(tl.int64)
@@ -165,25 +167,36 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # main recurrence
     for i_t in range(NT):
-        p_h1 = tl.make_block_ptr(
-            h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
-        )
-        tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
-        if K > 64:
-            p_h2 = tl.make_block_ptr(
-                h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+        if SAVE_H:
+            p_h1 = tl.make_block_ptr(
+                h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
             )
-            tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
-        if K > 128:
-            p_h3 = tl.make_block_ptr(
-                h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
-            )
-            tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
-        if K > 192:
-            p_h4 = tl.make_block_ptr(
-                h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
-            )
-            tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
+            if K > 64:
+                p_h2 = tl.make_block_ptr(
+                    h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
+                )
+                tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
+            if K > 128:
+                p_h3 = tl.make_block_ptr(
+                    h + i_t * stride_h,
+                    (V, K),
+                    (K, 1),
+                    (i_v * BV, 128),
+                    (BV, 64),
+                    (1, 0),
+                )
+                tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
+            if K > 192:
+                p_h4 = tl.make_block_ptr(
+                    h + i_t * stride_h,
+                    (V, K),
+                    (K, 1),
+                    (i_v * BV, 192),
+                    (BV, 64),
+                    (1, 0),
+                )
+                tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
 
         if TRACK_STATE and i_t == i_track:
             p_t1 = tl.make_block_ptr(
@@ -357,6 +370,7 @@ def chunk_gated_delta_rule_fwd_h(
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     save_new_value: bool = True,
+    save_h: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
     use_exp2: bool = False,
@@ -394,7 +408,9 @@ def chunk_gated_delta_rule_fwd_h(
             chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, V, K)
+    # save_h=False: only the in-place final state is wanted (e.g. the segment
+    # fold of chunk_kda); skip the per-chunk state buffer and its stores.
+    h = k.new_empty(B, NT, H, V, K) if save_h else None
 
     v_new = torch.empty_like(u) if save_new_value else None
 
@@ -430,6 +446,7 @@ def chunk_gated_delta_rule_fwd_h(
         USE_INITIAL_STATE=initial_state is not None,
         INPLACE_UPDATE=inplace_update,
         SAVE_NEW_VALUE=v_new is not None,
+        SAVE_H=h is not None,
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
         USE_EXP2=use_exp2,

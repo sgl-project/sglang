@@ -66,6 +66,14 @@ def _is_vocab_parallel(node) -> bool:
     )
 
 
+def _is_boundary_transport(node) -> bool:
+    # A model-local transport implements the stage boundary's return move.
+    # Its reduction completes the transport's declared sum outside compute.
+    return isinstance(node, ast.ClassDef) and any(
+        ast.unparse(parent) == "ComputeTransport" for parent in node.bases
+    )
+
+
 def _call_name(node: ast.Call):
     func = node.func
     return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
@@ -104,6 +112,12 @@ def _unguarded_sums(source: str, completes_own_sum=frozenset()):
 
     def visit(node, guarded):
         if _is_vocab_parallel(node):
+            return
+        if _is_boundary_transport(node):
+            for child in node.body:
+                if isinstance(child, ast.FunctionDef) and child.name == "return_output":
+                    continue
+                visit(child, guarded)
             return
         if isinstance(node, ast.FunctionDef) and node.name in completes_own_sum:
             return
@@ -165,6 +179,25 @@ class TestStageProducersLeaveSums(CustomTestCase):
                 "10: tensor_model_parallel_all_reduce(x)",
                 "12: moe_finalize_all_reduce(x)",
                 "14: tensor_model_parallel_all_reduce(x)",
+            ],
+        )
+
+    def test_boundary_transport_sums_are_separate_from_model_compute(self):
+        source = (
+            "class Transport(ComputeTransport):\n"
+            "    def return_output(self, output):\n"
+            "        return tensor_model_parallel_all_reduce(output)\n"
+            "    def forward(self, output):\n"
+            "        return tensor_model_parallel_all_reduce(output)\n"
+            "class Producer:\n"
+            "    def return_output(self, output):\n"
+            "        return tensor_model_parallel_all_reduce(output)\n"
+        )
+        self.assertEqual(
+            _unguarded_sums(source),
+            [
+                "5: tensor_model_parallel_all_reduce(output)",
+                "8: tensor_model_parallel_all_reduce(output)",
             ],
         )
 

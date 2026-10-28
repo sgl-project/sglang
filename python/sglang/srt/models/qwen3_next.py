@@ -24,6 +24,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -59,7 +60,13 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_stream,
+    linear_attn_parallel_group,
+    linear_attn_tp_rank,
+    linear_attn_tp_size,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -128,8 +135,11 @@ class Qwen3GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.attn_tp_rank = get_parallel().attn_tp_rank
-        self.attn_tp_size = get_parallel().attn_tp_size
+        # CP ranks own additional linear-attention head shards. Retain the
+        # same group in projections and loaders as in the boundary's sum.
+        parallel_group = linear_attn_parallel_group()
+        self.attn_tp_rank = linear_attn_tp_rank()
+        self.attn_tp_size = linear_attn_tp_size()
         self.hidden_size = config.hidden_size
         self.num_v_heads = (
             config.linear_num_value_heads
@@ -159,7 +169,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             output_size=self.conv_dim,
             bias=False,
             quant_config=None,
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
             prefix=add_prefix("conv1d", prefix),
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
@@ -171,7 +181,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             value_dim=self.value_dim,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_qkvz", prefix),
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
         )
 
         self.in_proj_ba = MergedColumnParallelLinear(
@@ -180,7 +190,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_ba", prefix),
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
         )
 
         # Override weight_loader for packed checkpoint format.
@@ -220,11 +230,11 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
         )
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
         )
         self.norm = (
             RMSNormGated(
@@ -261,7 +271,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             quant_config=quant_config,
             input_is_parallel=True,
             reduce_results=False,
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
 
@@ -571,7 +581,17 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
+            (
+                declare_attn(
+                    tp_group=(
+                        SumGroup.TP
+                        if linear_attn_parallel_group() == "tp"
+                        else SumGroup.ATTN_TP
+                    ),
+                    in_token_order=get_parallel().enable_linear_attn_cp,
+                ),
+                self.input_layernorm,
+            ),
             (
                 declare_ffn(
                     sparse=self.is_layer_sparse,
@@ -967,14 +987,14 @@ class Qwen3NextModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         # mamba_cache_params: MambaCacheParams,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         # pass a sequence index tensor, that is required for
         # proper continuous batching computation including
         # chunked prefill
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+        if input_embeds is not None:
+            hidden_states = input_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
 
@@ -1093,10 +1113,10 @@ class Qwen3NextForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:

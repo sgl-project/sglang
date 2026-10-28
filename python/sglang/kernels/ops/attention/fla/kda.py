@@ -6,7 +6,8 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional
+import functools
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -22,6 +23,7 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
 )
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
+    prepare_lens,
 )
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.kernels.ops.attention.fla.op import exp, exp2, log
@@ -30,6 +32,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     check_shared_mem,
     is_intel,
     is_nvidia,
+    tensor_cache,
 )
 
 if is_intel:
@@ -1144,6 +1147,182 @@ def kda_gate_chunk_cumsum(
     return g if beta is None else (g, beta_out)
 
 
+@tensor_cache
+def prepare_segment_cu_seqlens(
+    cu_seqlens: torch.LongTensor, segments: int, chunk_size: int
+) -> Optional[torch.LongTensor]:
+    """Split every sequence of ``cu_seqlens`` into ``segments`` chunk-aligned pieces.
+
+    Returns ``[N * s + 1]`` boundaries with ``s = min(segments, min_len // chunk_size)``
+    so that no segment is empty (an empty sequence would shift the sequence ids
+    that ``prepare_chunk_indices`` derives from chunk-0 occurrences), or ``None``
+    when nothing can be split. Segment starts are multiples of ``chunk_size``
+    from their sequence start, so the global chunk enumeration (and therefore the
+    per-chunk state slots and ``v_new`` rows) is identical to the unsegmented one.
+    Cached per ``cu_seqlens`` object like the other varlen helpers (one host sync
+    per forward).
+    """
+    lens = prepare_lens(cu_seqlens)
+    s = min(int(segments), max(1, int(lens.min().item()) // chunk_size))
+    if s <= 1:
+        return None
+    j = torch.arange(s, device=cu_seqlens.device, dtype=lens.dtype)
+    starts = cu_seqlens[:-1, None] + (lens[:, None] * j // s) // chunk_size * chunk_size
+    return torch.cat([starts.reshape(-1), cu_seqlens[-1:]]).contiguous()
+
+
+@functools.lru_cache(maxsize=8)
+def _eye(K: int, device: str) -> torch.Tensor:
+    return torch.eye(K, device=device, dtype=torch.float32)
+
+
+def _zero_identity_state(n_slots: int, H: int, V: int, K: int, device) -> torch.Tensor:
+    """[n_slots, H, V + K, K] fp32: rows [0, V) zero, rows [V, V + K) identity."""
+    t = torch.zeros(n_slots, H, V + K, K, device=device, dtype=torch.float32)
+    t[:, :, V:, :] = _eye(K, str(device))
+    return t
+
+
+@tensor_cache
+def prepare_segment_plan(
+    cu_seqlens: torch.LongTensor,
+    seg_cu_seqlens: torch.LongTensor,
+    initial_state_indices: Optional[torch.Tensor],
+):
+    """Per-forward metadata of the segmented state pass (cached per object).
+
+    Returns ``(slot_perm, idx0, valid_f, valid_pos, valid_all)``: the scratch
+    slot of segment ``(n, s)`` in the kernel's n-major segment order (slots are
+    stored s-major, ``s * N + n``, so per-segment slices are contiguous); the
+    pool indices clamped at 0; a float mask of valid (``>= 0``) rows; their
+    positions when some are invalid; and whether all rows are valid. The one
+    host sync (``valid.all()``) happens once per forward, not per layer. Keyed
+    on tensor identity only (``tensor_cache`` compares arguments with ``is``).
+    """
+    N = cu_seqlens.numel() - 1
+    S = (seg_cu_seqlens.numel() - 1) // N
+    dev = seg_cu_seqlens.device
+    n = torch.arange(N, device=dev, dtype=torch.int64)
+    s = torch.arange(S, device=dev, dtype=torch.int64)
+    slot_perm = (s[None, :] * N + n[:, None]).reshape(-1).contiguous()
+    if initial_state_indices is None:
+        return slot_perm, None, None, None, True
+    idx = initial_state_indices.to(torch.int64)
+    valid = idx >= 0
+    valid_all = bool(valid.all())
+    valid_f = valid.to(torch.float32).view(N, 1, 1, 1)
+    valid_pos = None if valid_all else valid.nonzero(as_tuple=True)[0]
+    return slot_perm, idx.clamp_min(0), valid_f, valid_pos, valid_all
+
+
+def _segmented_chunk_fwd_h(
+    kg: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor,
+    initial_state: Optional[torch.Tensor],
+    initial_state_indices: Optional[torch.Tensor],
+    cu_seqlens: torch.LongTensor,
+    seg_cu_seqlens: torch.LongTensor,
+    chunk_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Recurrent-state pass with the sequences split into parallel segments.
+
+    ``chunk_gated_delta_rule_fwd_kernel_h`` is parallel only over (sequence,
+    head) and walks every chunk of a sequence serially, so with few heads per
+    rank it leaves most SMs idle. Per chunk the update is affine in the state
+    (``h[V, K] <- h @ (diag(exp2(g_last)) - w^T k~) + u^T k~``), so a segment
+    maps ``h_in -> h_in @ M_s + B_s``. Three parallel-over-segments passes:
+
+    1. one launch with a state of width ``V + K`` whose first ``V`` rows start
+       at zero with the real ``u`` (final state = ``B_s``) and whose last ``K``
+       rows start at the identity with ``u = 0`` (final state = ``M_s``);
+    2. a tiny sequential scan ``h_in[s+1] = h_in[s] @ M_s + B_s`` per sequence;
+    3. the standard launch per segment from its true incoming state, which
+       writes exactly the per-chunk ``h`` and ``v_new`` of the unsegmented run.
+
+    The caller keeps running the output kernel with the original ``cu_seqlens``.
+    The sequence final state (the last segment's slot after pass 3) is written
+    back into ``initial_state`` like the in-place update of the unsegmented
+    kernel; slot ``-1`` (padded rows) reads a zero state and is not written.
+    The KDA block is launch-bound at this head count, so the pass is kept to a
+    few launches and to no per-layer host sync.
+    """
+    N = cu_seqlens.numel() - 1
+    S = (seg_cu_seqlens.numel() - 1) // N
+    H, K = kg.shape[-2], kg.shape[-1]
+    V = u.shape[-1]
+    dev = kg.device
+    seg_indices = prepare_chunk_indices(seg_cu_seqlens, chunk_size)
+    slot_perm, idx0, valid_f, valid_pos, valid_all = prepare_segment_plan(
+        cu_seqlens, seg_cu_seqlens, initial_state_indices
+    )
+
+    # Pass 1: [B_s | M_s] in one launch of state width V + K (slots s-major).
+    u_ap = torch.cat([u, u.new_zeros(*u.shape[:-1], K)], dim=-1)
+    state_ap = _zero_identity_state(N * S, H, V, K, dev)
+    chunk_gated_delta_rule_fwd_h(
+        k=kg,
+        w=w,
+        u=u_ap,
+        gk=g,
+        initial_state=state_ap,
+        initial_state_indices=slot_perm,
+        save_new_value=False,
+        save_h=False,
+        cu_seqlens=seg_cu_seqlens,
+        chunk_indices=seg_indices,
+        use_exp2=True,
+    )
+    del u_ap
+    st = state_ap.view(S, N, H, V + K, K)
+    B_s = st[:, :, :, :V, :]
+    M_s = st[:, :, :, V:, :]
+
+    # Pass 2: incoming state of every segment (fp32; right-multiplication in the
+    # [V, K] layout). h_in[s] is the contiguous slot block of segment s.
+    h_in = torch.empty(S, N, H, V, K, device=dev, dtype=torch.float32)
+    if initial_state is None:
+        h_in[0].zero_()
+    else:
+        h_in[0].copy_(initial_state[idx0])
+        if not valid_all:
+            h_in[0].mul_(valid_f)
+    for s in range(S - 1):
+        torch.baddbmm(
+            B_s[s].reshape(N * H, V, K),
+            h_in[s].view(N * H, V, K),
+            M_s[s].reshape(N * H, K, K),
+            out=h_in[s + 1].view(N * H, V, K),
+        )
+    del st, B_s, M_s, state_ap
+
+    # Pass 3: the standard per-chunk h / v_new from the true incoming states.
+    h, v_new = chunk_gated_delta_rule_fwd_h(
+        k=kg,
+        w=w,
+        u=u,
+        gk=g,
+        initial_state=h_in.view(S * N, H, V, K),
+        initial_state_indices=slot_perm,
+        save_new_value=True,
+        cu_seqlens=seg_cu_seqlens,
+        chunk_indices=seg_indices,
+        use_exp2=True,
+    )
+    if initial_state is not None:
+        # The kernel left each segment's exact final state in its slot; the
+        # last segment's is the sequence final state.
+        final = h_in[S - 1]
+        if valid_all:
+            initial_state.index_copy_(0, idx0, final.to(initial_state.dtype))
+        elif valid_pos.numel() > 0:
+            initial_state.index_copy_(
+                0, idx0[valid_pos], final[valid_pos].to(initial_state.dtype)
+            )
+    return h, v_new
+
+
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1163,6 +1342,7 @@ def chunk_kda_fwd(
     beta_is_raw: bool = False,
     chunk_indices: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
+    state_segments: int = 1,
 ):
     chunk_size = 64
     # Pre-compute chunk indices once and thread through all downstream kernels.
@@ -1232,20 +1412,46 @@ def chunk_kda_fwd(
         fuse_recompute=_small_grid,
     )
 
-    h, v_new = chunk_gated_delta_rule_fwd_h(
-        k=kg,
-        w=w,
-        u=u,
-        gk=g,
-        initial_state=initial_state,
-        initial_state_indices=initial_state_indices,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        use_exp2=True,
-        track_state=track_state,
-        track_chunk_idx=track_chunk_idx,
-        chunk_offsets=chunk_offsets,
+    # Segmented state pass (SGLANG_KDA_STATE_SEGMENTS): only for varlen prefill
+    # without state tracking (track_chunk_idx is a per-sequence chunk index).
+    seg_cu_seqlens = (
+        prepare_segment_cu_seqlens(cu_seqlens, state_segments, chunk_size)
+        if (
+            state_segments > 1
+            and cu_seqlens is not None
+            and track_state is None
+            # Captured prefill metadata is rebuilt in place on graph replay.
+            and chunk_offsets is None
+        )
+        else None
     )
+    if seg_cu_seqlens is not None:
+        h, v_new = _segmented_chunk_fwd_h(
+            kg,
+            w,
+            u,
+            g,
+            initial_state,
+            initial_state_indices,
+            cu_seqlens,
+            seg_cu_seqlens,
+            chunk_size,
+        )
+    else:
+        h, v_new = chunk_gated_delta_rule_fwd_h(
+            k=kg,
+            w=w,
+            u=u,
+            gk=g,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=True,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
+            chunk_offsets=chunk_offsets,
+        )
     del w, u, kg
 
     o = chunk_gla_fwd_o_gk(
@@ -1291,6 +1497,7 @@ def chunk_kda(
     beta_is_raw: bool = False,
     chunk_indices: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
+    state_segments: int = 1,
     **kwargs,
 ):
     if scale is None:
@@ -1320,4 +1527,5 @@ def chunk_kda(
         beta_is_raw=beta_is_raw,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
+        state_segments=state_segments,
     )

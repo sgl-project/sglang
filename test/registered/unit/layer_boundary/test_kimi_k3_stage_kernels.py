@@ -79,14 +79,16 @@ def declare(layers, *, sp_moe, carries=False, config=CONFIG):
         if has_bank
         else None
     )
+    parallel = fixture.parallel_of(attn_dp=1, attn_tp=2, enable_linear_attn_cp=False)
     with (
+        patch.object(kimi_k3, "get_parallel", return_value=parallel),
         patch.object(k3_sp_collective, "enabled", return_value=True),
         patch.object(k3_ar_fusion, "enabled", return_value=True),
         patch.object(kimi_k3, "_shards_moe_rows", return_value=sp_moe),
         patch.object(kimi_k3, "_carries_bank_slices", return_value=carries),
         envs.SGLANG_K3_SP_ATTN_RES.override(carries),
         fixture.planning(
-            fixture.parallel_of(attn_dp=1, attn_tp=2),
+            parallel,
             a2a=sp_moe,
             boundary_reduction="ar",
         ),

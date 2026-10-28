@@ -293,6 +293,9 @@ class StageDeclaration:
             full token rows, including when TP shares the prefill CP group.
         in_token_order: Whether an attention reads the whole sequence in token
             order (a scan over it), e.g. linear attention under prefill CP.
+        replicated_cp_residual: The model retains full residual rows over CP
+            and moves only the attention operand itself. Every stage in that
+            stack must declare the same residual placement.
         dense_tp_size: Dense FFN compute width: None uses the configured width,
             1 means local compute, the attention TP size means compute on the
             attention's rows over attention TP, and the full TP size means TP
@@ -338,6 +341,9 @@ class StageDeclaration:
     gathers_attn_tp_input: bool = False
     tp_group: SumGroup = SumGroup.ATTN_TP
     in_token_order: bool = False
+    # The model keeps the residual replicated over CP and moves only the
+    # attention operand (e.g. K3's full-sequence residual and snapshot bank).
+    replicated_cp_residual: bool = False
     dense_tp_size: Optional[int] = None
     exit_rows: Optional[ExitRows] = None
     writes_at_handoff: bool = False
@@ -440,6 +446,7 @@ def declare_attn(
     tp_group=SumGroup.ATTN_TP,
     attn_tp_gather=None,
     in_token_order=False,
+    replicated_cp_residual=False,
     sum_impl=None,
     row_transport=None,
 ):
@@ -484,6 +491,7 @@ def declare_attn(
         tp_group=tp_group,
         attn_tp_gather=attn_tp_gather,
         in_token_order=in_token_order,
+        replicated_cp_residual=replicated_cp_residual,
         sum_impl=sum_impl,
         row_transport=row_transport,
     )
@@ -499,6 +507,7 @@ def declare_ffn(
     dense_tp_size=None,
     exit_rows=None,
     output_complete=False,
+    replicated_cp_residual=False,
     sum_impl=None,
     row_transport=None,
 ):
@@ -533,6 +542,7 @@ def declare_ffn(
         dense_tp_size=dense_tp_size,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
         output_complete=output_complete,
+        replicated_cp_residual=replicated_cp_residual,
         sum_impl=sum_impl,
         row_transport=row_transport,
     )
@@ -543,6 +553,14 @@ def _reject_unsupported(stage):
     cannot bind, naming the combination. The rejections that depend on the
     rows of one edge are made where that edge binds (``_bind_stage``)."""
     parallel = get_parallel()
+    if stage.row_transport is not None:
+        # Explicit transports declare and validate their own compute and
+        # return rows; restrictions on inferred MoE moves do not apply.
+        return
+    if stage.replicated_cp_residual:
+        if parallel.attn_dp_size != 1:
+            raise NotImplementedError("a replicated CP residual with attention DP")
+        return
     if stage.update.applied_at_exit:
         # CP-TP group sharing is the MoE-CP gather MHC has been run with.
         if (
@@ -627,6 +645,10 @@ def _custom_sum(stage, variant, group):
 def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
     """``stage``'s data flow for ``variant``, given what arrives at its entry
     and the stage after it (None when it ends the stack or a branch)."""
+    if stage.replicated_cp_residual and variant is BatchVariant.CONTEXT_PARALLEL:
+        # CP belongs to the attention operand, not the stack's residual rows.
+        # Keep a CP path so runtime batch selection still validates its layout.
+        variant = BatchVariant.ORDINARY
     axes, attention, local, full = _row_layouts(variant)
     _reject_unsupported(stage)
     if stage.row_transport is not None:
@@ -885,7 +907,15 @@ def _connect_line(
             raise
 
     if arrivals is None:
-        arrivals = {v: _stack_arrival(v) for v in variants}
+        first = before or line[0]
+        arrivals = {
+            v: _stack_arrival(
+                BatchVariant.ORDINARY
+                if first.replicated_cp_residual and v is BatchVariant.CONTEXT_PARALLEL
+                else v
+            )
+            for v in variants
+        }
         if before is not None:
             if (
                 before.output_transform is not None
