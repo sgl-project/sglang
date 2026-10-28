@@ -256,6 +256,12 @@ returns msgpack with `request_id` and `encoded`, whose tensors use the
 `/rollout/generate` serialization. Use `/model_info` and `/server_info` to key
 caches of encoded outputs.
 
+For FLUX.3 Image, the prompt encoder returns only the prompt branch of
+`flux3_text`, and the image encoder treats the request image as a training
+target: it fits the image to `width`x`height` (resize and center crop) and
+returns `flux3_target`, the VAE latent tokens with the position ids the denoiser
+uses for generated image tokens.
+
 ## Multiple Instances per Role
 
 Use semicolons in `--*-urls` to register multiple instances:

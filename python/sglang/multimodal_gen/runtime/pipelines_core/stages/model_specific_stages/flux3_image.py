@@ -544,6 +544,8 @@ class Flux3ImageTextEncodeStage(PipelineStage):
                         "the FLUX.3 flow-map DiT samples without CFG; drop negative_prompt"
                     )
                 prompts.append(prompt or "")
+            elif server_args.disagg_encode_only:
+                prompts.append(prompt or "")
             else:
                 prompts.extend([batch.negative_prompt or "", prompt or ""])
         with self.use_declared_component(
@@ -553,7 +555,11 @@ class Flux3ImageTextEncodeStage(PipelineStage):
         ):
             with torch.inference_mode():
                 encoded = self.text_encoder.encode_batch(prompts)
-        branches = 1 if self.package_config.dit.flow_map else 2
+        branches = (
+            1
+            if self.package_config.dit.flow_map or server_args.disagg_encode_only
+            else 2
+        )
         for index, batch in enumerate(batches):
             batch.extra["flux3_text"] = encoded[
                 index * branches : (index + 1) * branches
@@ -623,6 +629,41 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
                     self.package_config.dit.image_rope_scale,
                     get_local_torch_device(),
                 )
+        return batch
+
+
+class Flux3ImageTargetEncodeStage(Flux3ImageConditionEncodeStage):
+    """Encode the request image, fit to the request size, as a training target."""
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        paths = _image_paths(batch)
+        if paths is None:
+            return batch
+        if len(paths) != 1:
+            raise ValueError(f"FLUX.3 takes one target image, got {len(paths)}")
+        latent_shape(batch.height, batch.width)
+        image = ImageOps.fit(
+            ImageOps.exif_transpose(_open_reference(paths[0])).convert("RGB"),
+            (batch.width, batch.height),
+            Image.Resampling.LANCZOS,
+        )
+        with (
+            self.use_declared_component(
+                component_name="vae",
+                module=self.vae,
+                phase="condition_encode",
+            ),
+            use_vae_fast_path(self.vae, batch.quality != "exact"),
+        ):
+            with torch.inference_mode():
+                tokens, ids = vae_encode(
+                    self.vae, _to_tensor(image).to(get_local_torch_device())
+                )
+        batch.extra["flux3_target"] = (
+            tokens,
+            scaled_ids(ids, self.package_config.dit.image_rope_scale),
+        )
         return batch
 
 

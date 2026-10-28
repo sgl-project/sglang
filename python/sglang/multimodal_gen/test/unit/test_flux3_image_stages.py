@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -15,6 +16,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 from sglang.multimodal_gen.runtime.models.dits.flux3_image import TEXT, pack
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_image import (
     Flux3ImageDenoiseStage,
+    Flux3ImageTargetEncodeStage,
     build_timesteps,
     crop_output,
     denoise_flow_map,
@@ -107,6 +109,41 @@ class TestFlux3PackedConditioning(unittest.TestCase):
             output_size(None, None, None, crop=None, default=(1024, 1024)),
             (1024, 1024, None),
         )
+
+    def test_training_target_matches_the_denoised_image_stream(self):
+        """An encode-only target is fit to the request size and carries the ids
+        the denoiser gives its image tokens, so a trainer can use it as x0."""
+
+        class _VAE(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+
+            def encode(self, image):
+                return torch.nn.functional.avg_pool2d(image, 16).repeat(1, 4, 1, 1)
+
+        config = SimpleNamespace(
+            dit=SimpleNamespace(image_rope_scale=0.5, in_channels={"image": 12}),
+            vae=SimpleNamespace(dtype="fp32"),
+        )
+        stage = Flux3ImageTargetEncodeStage(vae=_VAE(), package_config=config)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "target.png")
+            Image.new("RGB", (1000, 300), (255, 0, 0)).save(path)
+            batch = SimpleNamespace(
+                image_path=[path], width=64, height=32, quality="exact", extra={}
+            )
+            with mock.patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages."
+                "model_specific_stages.flux3_image.get_local_torch_device",
+                return_value=torch.device("cpu"),
+            ):
+                stage.forward(batch, server_args=None)
+        tokens, ids = batch.extra["flux3_target"]
+        self.assertEqual(tuple(tokens.shape), (8, 12))
+        torch.testing.assert_close(tokens[:, 0], torch.ones(8))
+        (_, expected_ids), _ = noise_tokens(32, 64, 0, config, torch.device("cpu"))
+        torch.testing.assert_close(ids, expected_ids)
 
 
 class TestFlux3PackedSampler(unittest.TestCase):
