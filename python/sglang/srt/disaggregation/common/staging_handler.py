@@ -192,11 +192,12 @@ class DecodeStagingHandler:
         decode_req._staging_scatter_done = False
         decode_req._chunk_events = []
         # XPU only: the scatter reads this room's req_to_token row, which
-        # pre-alloc has just written on schedule_stream.
+        # pre-alloc has just written on the schedule stream, the stream the
+        # scheduler's event loop runs on.
         decode_req._req_to_token_ready = None
         if self.device.type == "xpu":
             decode_req._req_to_token_ready = create_device_event(self.device)
-            decode_req._req_to_token_ready.record(self.scheduler.schedule_stream)
+            decode_req._req_to_token_ready.record(self.device_module.current_stream())
         self._room_to_decode_req[room] = decode_req
         self._room_to_receiver[room] = decode_req.kv_receiver
         # Scatter offsets shift suffix-relative page_start by the decode prefix,
