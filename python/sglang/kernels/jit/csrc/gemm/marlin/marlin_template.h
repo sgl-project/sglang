@@ -269,6 +269,7 @@ __device__ inline void wait_negative_and_add(int* lock) {
 template <
     typename scalar_t,                   // compute dtype, half or nv_float16
     const host::ScalarTypeId w_type_id,  // weight ScalarType id
+    const host::ScalarTypeId s_type_id,  // weight scale ScalarType id
     const int threads,                   // number of threads in a threadblock
     const int thread_m_blocks,           // number of 16x16 blocks in the m
                                          // dimension (batchsize) of the
@@ -324,17 +325,29 @@ __global__ void Marlin(
   using FragZP = typename ScalarType<scalar_t>::FragZP;
 
   static constexpr auto w_type = host::ScalarType::from_id(w_type_id);
+  static constexpr auto s_type = host::ScalarType::from_id(s_type_id);
+  if constexpr (w_type == host::kFE2M1f) {
+    static_assert(s_type == host::kFE4M3fn && group_blocks == 1 || s_type == host::kFE8M0fnu && group_blocks == 2);
+  } else if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
+    static_assert(s_type == host::kBFloat16);
+  } else if constexpr (std::is_same<scalar_t, half>::value) {
+    static_assert(s_type == host::kFloat16);
+  }
+
   constexpr bool has_zp = w_type == host::kU4 || w_type == host::kU8;
-  constexpr bool is_int_type =
-      w_type == host::kU4 || w_type == host::kU8 || w_type == host::kU4B8 || w_type == host::kU8B128;
-  // see comments of dequant.h for more details
-  constexpr bool dequant_skip_flop = !is_int_type ||
+  // see comments of dequant.h for more details.
+  // The first two clauses enumerate the float weight types that can skip the flop
+  // rather than accepting every non-int type: validity depends on the scale
+  // encoding, so MXFP4 (kFE2M1f with E8M0 scales) is excluded here. A new float
+  // weight type gets false until its dequant path is analyzed.
+  constexpr bool dequant_skip_flop = w_type == host::kFE4M3fn || w_type == host::kFE2M1f && s_type == host::kFE4M3fn ||
                                      has_zp && !is_zp_float && !std::is_same<scalar_t, nv_bfloat16>::value ||
                                      has_zp && !is_zp_float && !(w_type == host::kU8);
 
   scalar_t2 global_scale;
 
-  if constexpr (w_type == host::kFE2M1f) {
+  // MXFP4 folds its scale into the E8M0 group scales; only NVFP4 has a global one.
+  if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
     uint16_t val = scale2_ptr[0];
     global_scale = Dtype::num2num2(*reinterpret_cast<scalar_t*>(&val));
   }
@@ -486,10 +499,10 @@ __global__ void Marlin(
   constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
 
   // Scale sizes/strides without act_order.
-  // NVFP4 packs FP8 (8-bit) scales into shared/global memory at twice the
-  // density of the half-precision scale path, so the strides scale with the
-  // element size.
-  constexpr bool is_8bit_scale = w_type == host::kFE2M1f;
+  // FP4 packs 8-bit scales (NVFP4 E4M3, MXFP4 E8M0) into shared/global memory at
+  // twice the density of the half-precision scale path, so the strides scale with
+  // the element size.
+  constexpr bool is_8bit_scale = s_type.size_bits() == 8;
   int s_gl_stride = prob_n / (is_8bit_scale ? 16 : 8);
   constexpr int s_sh_stride = 16 * thread_n_blocks / (is_8bit_scale ? 16 : 8);
   constexpr int s_tb_groups =
@@ -876,7 +889,9 @@ __global__ void Marlin(
 
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 
-          if constexpr (w_type_id != host::kFE2M1f.id()) {
+          // 8-bit scales are half as wide, so they read int2 rather than int4. This
+          // is a property of s_type, not of the weight type that usually implies it.
+          if constexpr (!is_8bit_scale) {
             reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
           } else {
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
@@ -1080,8 +1095,8 @@ __global__ void Marlin(
       int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
       int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
 
-      dequant_fp8_scales<scalar_t2>(s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
-      dequant_fp8_scales<scalar_t2>(s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
+      dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
+      dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
     }
 
 // We have the m dimension as the inner loop in order to encourage overlapping
@@ -1363,7 +1378,7 @@ __global__ void Marlin(
         res = __hmul2(res, s[0]);
       }
 
-      if constexpr (w_type == host::kFE2M1f) {
+      if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
         res = __hmul2(res, global_scale);
       }
 
