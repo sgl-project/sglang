@@ -30,12 +30,11 @@ from sglang.srt.runtime_context import (
     get_context,
     get_exec,
     get_flags,
-    get_forward,
     get_model,
     get_parallel,
 )
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDeepGemmMegaMoeApi(CustomTestCase):
@@ -142,6 +141,28 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertIs(buffers[2], buffers[3])
         self.assertIsNot(buffers[0], buffers[2])
         self.assertEqual(deep_gemm.get_symm_buffer_for_mega_moe.call_count, 2)
+
+    def test_buffer_cache_separates_activation_contracts(self):
+        self.deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=lambda *args, **kw: object()
+        )
+        group = object()
+        with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):
+            buffers = [
+                mega_moe._get_mega_moe_symm_buffer(
+                    group,
+                    num_experts=8,
+                    num_max_tokens_per_rank=64,
+                    num_topk=2,
+                    hidden=128,
+                    intermediate_hidden=256,
+                    mma_type="nvfp4xnvfp4",
+                    activation=activation,
+                )
+                for activation in ("swiglu", "swigluoai", "swiglu")
+            ]
+        self.assertIs(buffers[0], buffers[2])
+        self.assertIsNot(buffers[0], buffers[1])
 
     def test_buffer_allocation_without_sm_override(self):
         deep_gemm = self.deep_gemm
@@ -555,26 +576,22 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 self.assertFalse(use(moe, hidden, decode))
             with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True):
                 self.assertTrue(use(moe, hidden, decode))
-                self.assertTrue(
+                for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.EXTEND):
+                    self.assertTrue(
+                        use(moe, hidden, SimpleNamespace(forward_mode=mode))
+                    )
+                self.assertFalse(
                     use(
                         moe,
                         hidden,
-                        SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY),
+                        SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2),
                     )
                 )
                 self.assertFalse(use(moe, hidden.float(), decode))
-                self.assertFalse(
-                    use(moe, torch.zeros((4096, 256), dtype=torch.bfloat16), decode)
-                )
-                # Prefill graph capture runs with is_extend_in_batch cleared.
-                with get_forward().scoped(is_extend_in_batch=False):
-                    self.assertFalse(
-                        use(
-                            moe,
-                            hidden,
-                            SimpleNamespace(forward_mode=ForwardMode.EXTEND),
-                        )
-                    )
+                with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                    16
+                ):
+                    self.assertFalse(use(moe, hidden, decode))
                 self.assertFalse(use(moe, hidden, None))
 
     def test_mega_gate_routes_vision_hash_and_padding(self):
