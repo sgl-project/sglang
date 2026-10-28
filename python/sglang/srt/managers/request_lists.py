@@ -59,11 +59,18 @@ class RequestList:
     # The member stopped between two prefill chunks: the load counts its
     # prompt tokens still to prefill.
     partly_prefilled: bool = False
+    # The members finished and only their response is held (a deferred
+    # output). Only the output rank holds them, so they keep nothing busy
+    # (every rank must agree on idle), and the finished-request check skips
+    # them.
+    held_response: bool = False
 
     def keeps_busy(
         self, *, for_health_check: bool, ignore_waiting: bool, ignore_releasing: bool
     ) -> bool:
         """Whether its members keep the scheduler from being fully idle."""
+        if self.held_response:
+            return False
         if for_health_check and not self.health_check:
             return False
         if ignore_releasing and self.releasing:

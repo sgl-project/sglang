@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.request_lists import RequestList
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
 if TYPE_CHECKING:
@@ -52,6 +53,17 @@ class DeferredResponses:
 
     def has_pending(self) -> bool:
         return bool(self.held)
+
+    def lists(self) -> List[RequestList]:
+        """The held responses, which abort reaches."""
+        return [
+            RequestList(
+                name="deferred",
+                reqs=[req for req, _ in self.held.values()],
+                abort=self.abort,
+                held_response=True,
+            )
+        ]
 
     def stream_released(self) -> None:
         """Stream the held responses whose completion is done; a failed one

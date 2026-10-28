@@ -44,6 +44,7 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.hub.load_inquirer = MagicMock()
         s.parts.metrics_sink = MagicMock()
         s.parts.dp_attn_adapter = MagicMock()
+        s.parts.deferred_responses = MagicMock(**{"has_pending.return_value": False})
         s._last_stall_publish_ts = float("-inf")
         return s
 

@@ -17,7 +17,15 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    SchedulerWeightUpdaterManager,
+)
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils.weight_versions import (
+    WeightVersionSpan,
+    compute_weight_version_spans,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_request_lists import (
     make_request_registry,
@@ -66,7 +74,7 @@ def _sent_aborts(deferred):
 def _scheduler(deferred):
     scheduler = partial_scheduler()
     scheduler.parts.deferred_responses = deferred
-    scheduler.hub.request_registry = make_request_registry()
+    scheduler.hub.request_registry = make_request_registry(deferred_responses=deferred)
     return scheduler
 
 
@@ -181,6 +189,20 @@ def test_abort_cancels_only_matching_held_responses(abort_all, rust_frontend):
     with patch.object(SchedulerOutputStreamer, "_stream_output_generation") as stream:
         scheduler.stream_released_deferred_outputs()
     stream.assert_not_called()
+
+
+def test_held_tokens_keep_their_weight_version():
+    deferred = _deferred()
+    scheduler, req = _scheduler(deferred), _req("held")
+    scheduler.defer_response(req, Future())
+    updater = object.__new__(SchedulerWeightUpdaterManager)
+    updater.request_registry = scheduler.hub.request_registry
+
+    updater.record_weight_version_change("v2")
+
+    assert compute_weight_version_spans(
+        req.weight_version_events, get_serving().weight_version, len(req.output_ids)
+    ) == [WeightVersionSpan(version="v1", start=0, end=1)]
 
 
 def test_held_responses_do_not_change_idle_state():

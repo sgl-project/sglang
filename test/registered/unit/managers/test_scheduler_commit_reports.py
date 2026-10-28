@@ -32,6 +32,7 @@ def _scheduler(order: Mock, *, mode: str) -> Scheduler:
     s.hub.load_inquirer = Mock()
     s.parts.mode_owners.hisparse_coordinator = None
     s.parts.lists.waiting_queue = ["waiting"]
+    s.parts.deferred_responses = Mock(held={})
     order.disagg_prefill.commit_extend.return_value = ["requeued"]
     order.dllm.commit_extend.return_value = None
     order.processor.process_batch_result_prefill.return_value = None

@@ -90,7 +90,9 @@ def _processor():
     )
     processor = _CountingProcessor(
         is_generation=True,
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(
+            think_end_ids=None, self_opened_think_start_ids=None
+        ),
         kv=kv,
         services=SimpleNamespace(output_streamer=Mock()),
         decode_offload_manager=None,

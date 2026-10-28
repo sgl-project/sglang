@@ -351,9 +351,9 @@ class SchedulerInvariantChecker:
     def check_no_finished_reqs(lists: Dict[str, RequestList]) -> None:
         """After a host commit no request list holds a finished request: the
         commit moves each one out, except to a releasing list, which holds it
-        until its KV is released."""
+        until its KV is released, and to the held responses."""
         for entry in lists.values():
-            if entry.releasing:
+            if entry.releasing or entry.held_response:
                 continue
             finished = [req.rid for req in entry.reqs if req.finished()]
             assert not finished, (

@@ -335,7 +335,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             scheduler.disagg_decode.prealloc_queue.held_rebootstrap_reqs, [kept]
         )
         release_aborted_request.assert_called_once_with(held)
-        scheduler.parts.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+        retirer.output_streamer.send_abort_output.assert_called_once()
 
 
 class _GateReceiver:

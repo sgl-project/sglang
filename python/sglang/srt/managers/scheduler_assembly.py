@@ -826,6 +826,7 @@ def assemble_scheduler(
         pending=pending,
         decode_offload_manager=decode_offload_manager,
         mode_owners=mode_owners,
+        deferred_responses=deferred_responses,
     )
     invariant_checker = SchedulerInvariantChecker(
         capacity=capacity,

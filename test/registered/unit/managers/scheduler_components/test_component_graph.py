@@ -78,6 +78,7 @@ _DECLARED = {
     # The invariant checker is attached once both are built.
     "Watchdog": ["LaunchCounters", "EngineFlags", "InvariantChecker"],
     "PPSpecForward": ["Workers", "FutureMap", "KvResources", "Streams"],
+    "DeferredResponses": ["OutputStreamer", "RequestRetirer"],
     "RequestRetirer": [
         "BeamCoordinator",
         "HiSparse",
@@ -162,6 +163,7 @@ _DECLARED = {
     "RequestRegistry": [
         "CoreLists",
         "ModeOwners",
+        "DeferredResponses",
         "GrammarManager",
         "RequestRetirer",
         "IpcChannels",
@@ -299,6 +301,7 @@ _PARAM = {
     "BatchResultProcessor": ("batch_result_processor",),
     "MetricsReporter": ("metrics_reporter",),
     "RequestRetirer": ("request_retirer",),
+    "DeferredResponses": ("deferred_responses",),
     "RequestRegistry": ("request_registry", "abort_request"),
     "ModeOwners": ("mode_owners",),
     "RequestIntake": ("request_intake",),
@@ -351,6 +354,10 @@ _BUILT = {
     "RequestRetirer": (
         "managers/scheduler_components/request_retirer.py",
         "RequestRetirer",
+    ),
+    "DeferredResponses": (
+        "managers/scheduler_components/deferred_responses.py",
+        "DeferredResponses",
     ),
     "StepBuilder": ("managers/scheduler_components/step_builder.py", "StepBuilder"),
     "StepCounters": ("managers/scheduler_components/step_counters.py", "StepCounters"),

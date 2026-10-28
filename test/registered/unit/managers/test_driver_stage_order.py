@@ -305,6 +305,9 @@ class _Shell:
             run_batch=self.run_batch, launch_batch_sample_if_needed=self.sample
         )
         s._apply_war_barrier = lambda: self.log("war_barrier")
+        # A forward that publishes its shared-read event: the barrier keeps
+        # its place right after the launch.
+        s._war_barrier_is_coarse = lambda: False
         s.process_batch_result = self.process_batch_result
         s.parts.step_counters = SimpleNamespace(record=lambda record: None)
         s.parts.batch_result_processor = SimpleNamespace(

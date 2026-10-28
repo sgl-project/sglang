@@ -87,6 +87,11 @@ _OWNERS = {
         "HiSparseCoordinator.lists",
         {"managers/hisparse_coordinator.py": ["HiSparseCoordinator"]},
     ),
+    "deferred": (
+        "managers/scheduler_components/deferred_responses.py",
+        "DeferredResponses.lists",
+        {"managers/scheduler_components/deferred_responses.py": ["DeferredResponses"]},
+    ),
 }
 
 # The class each attribute of a declaring class names, for the lists declared

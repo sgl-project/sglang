@@ -8,7 +8,11 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List
 from unittest.mock import Mock
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.request_lists import CoreLists
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
 from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
 from sglang.srt.managers.scheduler_components.request_registry import (
@@ -51,6 +55,11 @@ def make_request_registry(**deps) -> RequestRegistry:
         pending=PendingSteps(),
         decode_offload_manager=None,
         mode_owners=ModeOwners(),
+        deferred_responses=DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=Mock(),
+            request_retirer=Mock(),
+        ),
     )
     args.update(deps)
     return RequestRegistry(**args)
@@ -84,6 +93,7 @@ _SCHEDULER_FIELDS = {
     "pending": "pending",
     "decode_offload_manager": "decode_offload_manager",
     "mode_owners": "mode_owners",
+    "deferred_responses": "deferred_responses",
 }
 
 

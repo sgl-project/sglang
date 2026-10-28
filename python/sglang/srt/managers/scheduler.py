@@ -1559,7 +1559,6 @@ class Scheduler:
 
     # The abort RPC handler.
     def abort_request(self, recv_req: AbortReq):
-        self.parts.deferred_responses.abort(recv_req)
         self.hub.request_registry.abort_request(recv_req)
 
     # The plugin API of deferred responses; see deferred_output.

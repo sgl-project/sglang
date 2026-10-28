@@ -22,6 +22,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.request_lists import CoreLists
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler_components.bundles import KvResources
+    from sglang.srt.managers.scheduler_components.deferred_responses import (
+        DeferredResponses,
+    )
     from sglang.srt.managers.scheduler_components.ipc_channels import (
         SchedulerIpcChannels,
     )
@@ -47,6 +50,7 @@ class RequestRegistry:
         pending: PendingSteps,
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
         mode_owners: ModeOwners,
+        deferred_responses: DeferredResponses,
     ):
         self.core_lists = core_lists
         self.grammar_manager = grammar_manager
@@ -58,6 +62,7 @@ class RequestRegistry:
         self.decode_offload_manager = decode_offload_manager
         # Read at call time: a PD role switch replaces the owners.
         self.mode_owners = mode_owners
+        self.deferred_responses = deferred_responses
 
     def reqs(self, where: Callable[[RequestList], bool]) -> List[Req]:
         """The members of the lists `where` selects, in list order (the same
@@ -143,6 +148,7 @@ class RequestRegistry:
             lists += self.mode_owners.dllm.lists()
         if self.mode_owners.hisparse_coordinator is not None:
             lists += self.mode_owners.hisparse_coordinator.lists()
+        lists += self.deferred_responses.lists()
         return {entry.name: entry for entry in lists}
 
     def abort_request(self, recv_req: AbortReq):
