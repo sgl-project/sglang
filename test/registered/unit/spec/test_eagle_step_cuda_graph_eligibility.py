@@ -33,6 +33,7 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.entrypoints import warmup as warmup_module
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components import (
     weight_updater as weight_updater_module,
 )
@@ -120,6 +121,21 @@ class TestServerArgs(CustomTestCase):
             self.assertFalse(
                 resolution_result(args, "enable_speculative_step_cuda_graph")
             )
+
+    def test_post_verify_graphs_and_compact_verify_sampling_turn_the_flag_off(self):
+        # The post-verify graphs run their own capture inside the verify, and the
+        # compact verify sampling picks its branch on the host per batch.
+        for env in (
+            envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH,
+            envs.SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING,
+        ):
+            with self.subTest(env=env.name), _cuda_platform(), env.override(True):
+                args = _server_args()
+                self.assertIn(env.name, step_cuda_graph_unsupported_reason(args))
+                handle_speculative_decoding(args)
+                self.assertFalse(
+                    resolution_result(args, "enable_speculative_step_cuda_graph")
+                )
 
 
 def _runner():

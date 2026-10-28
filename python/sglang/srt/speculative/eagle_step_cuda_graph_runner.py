@@ -122,6 +122,8 @@ _UNSUPPORTED_ENVS = (
     envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH,
     envs.SGLANG_ENABLE_CUDA_GRAPH_DEDUP,
     envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH,
+    envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH,
+    envs.SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING,
     envs.SGLANG_ENABLE_GRAPH_POOL_BORROW,
     envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM,
     envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION,
@@ -980,7 +982,7 @@ class EagleStepCudaGraphRunner:
         # Simulated acceptance (benchmarking): whenever the step applies it, the
         # length comes from this device scalar, drawn on the host per replay.
         sim_accept_len = torch.ones(1, dtype=torch.int32, device=self.device)
-        draw_args: List[Tuple[float, str, int]] = []
+        draw_args: List[Tuple[float, str, int, Optional[torch.Generator]]] = []
         overrides = {
             "spec_simulated_accept_index": self._simulated_accept_override(
                 sim_accept_len, draw_args
