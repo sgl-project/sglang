@@ -18,7 +18,7 @@ TokenSpaceProcessor.process(media, IDs)
   processor_output / precomputed_embedding source -> ValueError
   bare source instead of a list -> TypeError
   strategy loading options -> load kwargs
-  CUDA initialized on rank device d -> IO threads set device d; serving keeps cuda:0
+  worker_thread_device d -> IO and processor threads start on device d
 
 get_mm_processor -> TokenSpaceSGLangProcessor
   each strategy keeps its legacy processor's loader and worker defaults
