@@ -7,8 +7,12 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.dllm.algorithm.joint_threshold import JointThreshold
+from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.manager import DllmManager
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.dllm.req_state import DllmReqState
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -260,17 +264,20 @@ class TestDllmFdfoResolvedBlockKeepsRow(unittest.TestCase):
 
 
 class TestDllmCommittedTokens(unittest.TestCase):
-    @staticmethod
-    def make_req(prompt, output=()):
+    CONFIG = DllmConfig("LowConfidence", {}, 4, 99, 4)
+
+    @classmethod
+    def make_req(cls, prompt, output=()):
         req = Req(
             rid="committed-tokens",
             origin_input_text="",
             origin_input_ids=array("q", prompt),
             sampling_params=SamplingParams(max_new_tokens=16, temperature=0),
             vocab_size=128,
-            dllm_config=DllmConfig("LowConfidence", {}, 4, 99, 4),
         )
         req.output_ids.extend(output)
+        # The dLLM owner attaches the block state when it takes the request.
+        req.dllm = DllmReqState.for_req(req, cls.CONFIG, intake_seq=0)
         return req
 
     def test_cache_lookup_stops_before_partial_prompt_and_synthetic_masks(self):
@@ -284,63 +291,42 @@ class TestDllmCommittedTokens(unittest.TestCase):
             )
         )
         req = self.make_req([1, 2, 3, 4, 5])
-        req.init_next_round_input(cache)
+        req.dllm.init_next_round_input(req, cache)
         self.assertEqual(req.prefix_len, 4)
-        self.assertEqual(req.dllm_block_offset, 4)
-        self.assertFalse(req.is_dllm_prefill())
-        self.assertFalse(req.dllm_has_literal_mask)
+        self.assertEqual(req.dllm.block_offset, 4)
+        self.assertFalse(req.dllm.is_prefill())
+        self.assertFalse(req.dllm.has_literal_mask)
         self.assertEqual(list(req.full_untruncated_fill_ids[4:8]), [5, 99, 99, 99])
 
     def test_retraction_reencodes_committed_outputs_before_denoising(self):
         req = self.make_req([1, 99, 2], [7, 99, 8, 9, 10])
         req.reset_for_retract()
-        req.init_next_round_input()
+        # The retracted request is taken again with fresh block state.
+        req.dllm = DllmReqState.for_req(req, self.CONFIG, intake_seq=1)
+        req.dllm.init_next_round_input(req)
         self.assertEqual(list(req.output_ids), [7, 99, 8, 9, 10])
-        self.assertTrue(req.dllm_has_literal_mask)
-        self.assertTrue(req.is_dllm_prefill())
+        self.assertTrue(req.dllm.has_literal_mask)
+        self.assertTrue(req.dllm.is_prefill())
         # The second complete block consists of already-emitted output tokens.
         req.prefix_len = 4
-        req.determine_dllm_phase()
-        self.assertTrue(req.is_dllm_prefill())
+        req.dllm.determine_phase(req)
+        self.assertTrue(req.dllm.is_prefill())
         req.prefix_len = 8
-        req.determine_dllm_phase()
-        self.assertFalse(req.is_dllm_prefill())
+        req.dllm.determine_phase(req)
+        self.assertFalse(req.dllm.is_prefill())
 
     def test_repeated_denoise_passes_do_not_subtract_cache_hits(self):
         req = self.make_req([1, 2, 3, 4, 5])
-        req._init_fill_ids_for_dllm()
+        req.dllm.init_fill_ids(req)
         req.prefix_len = 4
         req.extend_end = 8
         req.already_computed = 8
         req.cached_tokens = 4
         req._cache_breakdown_computed = True
-        batch = ScheduleBatch(
-            reqs=[req],
-            device="cpu",
-            dllm_config=req.dllm_config,
-            model_config=SimpleNamespace(is_encoder_decoder=False, vocab_size=128),
-        )
-        execution = SimpleNamespace(
-            features=SimpleNamespace(enable_encoder_swa_bounded_replay=False),
-            mamba=SimpleNamespace(enable_mamba_extra_buffer=False),
-        )
-        # Allocation and sampling are collaborators; exercise the scheduler's
-        # real cache accounting on two revisits of the same fixed-size block.
-        with (
-            patch(
-                "sglang.srt.managers.schedule_batch.get_exec", return_value=execution
-            ),
-            patch(
-                "sglang.srt.managers.schedule_batch.alloc_for_extend",
-                return_value=(torch.arange(4), torch.tensor([0]), torch.tensor([0])),
-            ),
-            patch(
-                "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch"
-            ),
-        ):
-            for _ in range(2):
-                batch.prepare_for_extend()
-                self.assertEqual(req.cached_tokens, 4)
+        # Two admissions of the same fixed-size block.
+        for _ in range(2):
+            req.admit_prefill_chunk("cpu")
+            self.assertEqual(req.cached_tokens, 4)
 
     def test_literal_prompt_masks_are_preserved_and_not_emitted(self):
         class Runner:

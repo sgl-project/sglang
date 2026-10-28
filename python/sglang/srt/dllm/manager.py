@@ -506,6 +506,13 @@ class DllmManager:
                 for block_offset in (req.dllm.block_offset for req in can_run_list)
                 for i in range(block_offset, block_offset + block_size)
             ]
+            if any(req.dllm.has_literal_mask for req in can_run_list):
+                # Committed outputs are immutable too when a retracted request
+                # rebuilds its KV.
+                new_batch.dllm_committed_lens = [
+                    len(req.origin_input_ids) + len(req.output_ids)
+                    for req in can_run_list
+                ]
 
         # Record prefill stats for logging after forward
         from sglang.srt.managers.scheduler_components.metrics_reporter import (

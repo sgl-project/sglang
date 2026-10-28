@@ -31,6 +31,9 @@ class DllmReqState:
     algo_state: Any = None
     block_offset: int = 0
     initialized: bool = False
+    # A literal mask id among the committed tokens: committed tokens are
+    # immutable, so the block then needs an explicit prompt mask.
+    has_literal_mask: bool = False
     # The owner's waiting list keeps the order it took requests in.
     intake_seq: int = 0
 
@@ -51,15 +54,25 @@ class DllmReqState:
         the next block, and a separate-context model matches no prefix past
         its context."""
         self.init_fill_ids(req)
-        self.determine_phase(req)
         req.match_prefix(tree_cache, max_prefix_len=self.max_prefix_len())
         if tree_cache is not None:
             self.update_block_offset(req)
+        self.determine_phase(req)
 
     def max_prefix_len(self) -> Optional[int]:
         if self.config.requires_separate_context_encoding:
             return self.block_offset
         return None
+
+    def bound_prefix_len(self, req: Req, max_prefix_len: int) -> int:
+        """Appended masks and a partial prompt/output block are not reusable
+        KV: bidirectional attention depends on the rest of that block. Bound
+        the lookup by real tokens, even if another cached prompt happens to
+        contain the same token IDs as the synthetic masks."""
+        block_size = self.config.block_size
+        committed_len = len(req.origin_input_ids) + len(req.output_ids)
+        max_prefix_len = min(max_prefix_len, committed_len)
+        return max_prefix_len // block_size * block_size
 
     def is_prefill(self) -> bool:
         return self.phase in [
@@ -85,12 +98,13 @@ class DllmReqState:
         if len(req.full_untruncated_fill_ids) < min_required_length:
             return
 
-        input_block = req.full_untruncated_fill_ids[prefix_length:min_required_length]
-        self.phase = (
-            DllmReqPhase.STAGING_PREFILL
-            if self.config.mask_id not in input_block
-            else DllmReqPhase.STAGING_DECODE
-        )
+        # Retraction preserves output_ids while releasing KV. Re-encode all
+        # committed tokens, including literal mask IDs, before generating more.
+        committed_len = len(req.origin_input_ids) + len(req.output_ids)
+        if min_required_length <= committed_len:
+            self.phase = DllmReqPhase.STAGING_PREFILL
+        else:
+            self.phase = DllmReqPhase.STAGING_DECODE
 
     def init_fill_ids(self, req: Req):
         if self.incomplete_ids:
@@ -103,6 +117,13 @@ class DllmReqState:
             # (add_dllm_staging_req) before this req is scheduled, mirroring the
             # non-incomplete path which also defers it to the adder.
             return
+
+        if not self.initialized:
+            # Recomputed after retraction, which resets the state.
+            mask_id = self.config.mask_id
+            self.has_literal_mask = (
+                mask_id in req.origin_input_ids or mask_id in req.output_ids
+            )
 
         if self.config.requires_separate_context_encoding:
             req.refresh_fill_ids()

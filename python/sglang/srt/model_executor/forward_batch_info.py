@@ -1157,10 +1157,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # position path below.
         if batch.extend_positions is not None:
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
-            ret.positions = torch.tensor(
-                batch.extend_positions,
-                dtype=positions_dtype,
-            ).to(device, non_blocking=True)
+            num_positions = len(batch.extend_positions)
+            if batch.dllm_committed_lens is not None:
+                # Transfer the committed lengths with the block positions to
+                # avoid an extra, blocking H2D copy.
+                position_info = torch.tensor(
+                    batch.extend_positions + batch.dllm_committed_lens,
+                    dtype=positions_dtype,
+                    pin_memory=is_pin_memory_available(device),
+                ).to(device, non_blocking=True)
+                ret.positions = position_info[:num_positions]
+                committed_lens = position_info[num_positions:]
+                # A position below its request's committed length is a prompt
+                # (or committed output) token, even when its id is the mask id.
+                ret.dllm_prompt_mask = (
+                    ret.positions.view(len(committed_lens), -1)
+                    < committed_lens[:, None]
+                )
+            else:
+                # Without literal mask IDs among committed tokens, every mask
+                # ID in the block is still to be denoised.
+                ret.positions = torch.tensor(
+                    batch.extend_positions,
+                    dtype=positions_dtype,
+                ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None

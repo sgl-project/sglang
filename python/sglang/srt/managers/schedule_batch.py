@@ -1731,7 +1731,13 @@ class Req:
         # Only calculate cached_tokens once. Once retracted, the 'retracted_stain'
         # flag will always True
         if not self.retracted_stain:
-            self.cached_tokens += self.prefix_len - self.already_computed
+            new_cached = self.prefix_len - self.already_computed
+            if self.dllm is not None:
+                # Denoising revisits the current block while only earlier
+                # blocks are a reusable prefix. Recomputing that block must
+                # not subtract its size from cross-request cache hits.
+                new_cached = max(0, new_cached)
+            self.cached_tokens += new_cached
 
             # Calculate detailed breakdown of cached tokens by source (for HiCache)
             # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
@@ -1849,6 +1855,8 @@ class Req:
             max_prefix_len = min(max_prefix_len, cap)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.dllm is not None:
+            max_prefix_len = self.dllm.bound_prefix_len(self, max_prefix_len)
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -2848,6 +2856,9 @@ class ScheduleBatch:
     # Positions of the extend tokens when the build fixes them (a dLLM block);
     # None derives them from the prefix and extend lengths.
     extend_positions: Optional[List[int]] = None
+    # A dLLM block's committed length per request, when a request's committed
+    # tokens hold a literal mask id; None otherwise.
+    dllm_committed_lens: Optional[List[int]] = None
     extend_logprob_start_lens: List[int] = None
 
     # For DP attention
