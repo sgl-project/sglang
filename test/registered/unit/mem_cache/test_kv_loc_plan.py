@@ -43,6 +43,7 @@ from sglang.srt.mem_cache import kv_index_translator
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, TokenSpan
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -50,7 +51,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
-from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs

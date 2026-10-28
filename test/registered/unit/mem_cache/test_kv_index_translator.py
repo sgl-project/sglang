@@ -35,10 +35,11 @@ from test_multi_ended_allocator import _FakeKVCache, _FakeUnifiedSWAKVPool
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 from sglang.test.test_utils import CustomTestCase
 
@@ -485,7 +486,7 @@ class TestWriteIds(CustomTestCase):
         from sglang.srt.mem_cache.allocator.unified_mamba import (
             UnifiedMambaTokenToKVPoolAllocator,
         )
-        from sglang.srt.mem_cache.unified_memory_pool import MambaSubPoolSpec
+        from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
         from sglang.srt.runtime_context import get_parallel
 
         for dcp_size in (1, 2, 4):

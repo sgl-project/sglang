@@ -33,7 +33,8 @@ from test_swa_locked_full_recover_unified import _DEV, _FakeUnifiedSWAKVPool
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")

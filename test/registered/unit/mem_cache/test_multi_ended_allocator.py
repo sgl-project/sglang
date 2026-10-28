@@ -43,12 +43,12 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import kv_to_page_indices
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
-    MLASubPoolSpec,
     UnifiedKVPool,
     UnifiedMambaSlotAllocator,
 )

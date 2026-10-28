@@ -35,13 +35,14 @@ from test_multi_ended_allocator import _FakeUnifiedSWAKVPool  # sibling fixture
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverEvictedSWA,
     RecoverSWAWithLockedFull,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
-from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")

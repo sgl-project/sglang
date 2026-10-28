@@ -27,9 +27,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import ClassVar, Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -38,19 +36,19 @@ from sglang.kernels.ops.kvcache.copy_pages import copy_pages
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.layout.base import (
+    SubPoolSpec,
+    _store_dtype_for,
+)
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.fused_draft import (
-    DenseDraftRegion,
-    DraftRegion,
     DraftStateRegion,
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.layout.token_major import (
-    ROW_ALIGN_BYTES,
-    DenseEntryLayout,
-    DensePart,
-    align_entry_bytes,
-    align_part_offset,
     build_dense_views,
     build_mamba_entry_views,
 )
@@ -71,304 +69,6 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
-
-
-def _prod(iterable) -> int:
-    out = 1
-    for x in iterable:
-        out *= int(x)
-    return out
-
-
-def _check_row_alignment(sub_pool: str, **row_bytes: int) -> None:
-    """Entry parts are laid out in ROW_ALIGN_BYTES units; a model whose
-    per-rank rows are not cannot use the unified pool."""
-    for part, nbytes in row_bytes.items():
-        if nbytes % ROW_ALIGN_BYTES:
-            raise ValueError(
-                f"--enable-unified-memory needs every per-rank KV row to be a "
-                f"multiple of {ROW_ALIGN_BYTES} bytes; sub-pool {sub_pool!r} has a "
-                f"{nbytes}-byte {part} row. Run this model without "
-                "--enable-unified-memory."
-            )
-
-
-def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:
-    if kv_cache_dtype in (
-        torch.float8_e5m2,
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-    ):
-        return torch.uint8
-    return kv_cache_dtype
-
-
-@dataclass(frozen=True, kw_only=True)
-class SubPoolSpec(ABC):
-    """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`.
-
-    ``grow_direction`` places the sub-pool in the buffer's chain: the two
-    ``"up"``/``"down"`` END pools own the buffer's two ends and grow inward;
-    ``"float"`` middles live between the ends' frontiers (a float's position is
-    carried entirely by its allocator's two watermarks — every view spans the
-    whole buffer, so relocation never rebuilds views).
-    """
-
-    # Grow directions this subclass accepts. Scratch-class specs (e.g. the
-    # spec-decode band) narrow this to ("float",).
-    _allowed_grow_directions: ClassVar[Tuple[str, ...]] = ("up", "down", "float")
-
-    name: str
-    layer_num: int
-    grow_direction: str  # "up" | "down" | "float"
-    # Fused draft region riding in this sub-pool's entries; None = unfused.
-    # Each kind accepts the region kind its entry can lay out, after the host
-    # block at `draft_offset_in_entry()`.
-    draft_region: Optional[DraftRegion] = None
-
-    def __post_init__(self):
-        assert self.grow_direction in self._allowed_grow_directions, (
-            f"{type(self).__name__}.grow_direction must be one of "
-            f"{self._allowed_grow_directions}; got {self.grow_direction!r}"
-        )
-        assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
-
-    @abstractmethod
-    def entry_bytes(self) -> int:
-        """Bytes for one slot across all `layer_num` layers."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_dtype(self) -> torch.dtype:
-        """Storage dtype (informational). Multi-dtype subclasses return the dominant buffer's."""
-        raise NotImplementedError
-
-
-@dataclass(frozen=True, kw_only=True)
-class MHASubPoolSpec(SubPoolSpec):
-    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`.
-
-    With `draft_region` set, the draft model's K and V rows are two more
-    parts of every slot's entry, after the host parts:
-
-        [ K_0 | V_0 | ... | K_{Lh-1} | V_{Lh-1} | dK_0 | dV_0 | ... | pad ]
-
-    The slot stride stays the one entry, so host and draft views are indexed
-    by the same physical token id; only their offsets differ.
-    """
-
-    head_num: int
-    head_dim: int
-    store_dtype: torch.dtype
-    kv_cache_dtype: Optional[torch.dtype] = None
-    v_head_dim: Optional[int] = None
-
-    def __post_init__(self):
-        super().__post_init__()
-        assert self.head_num > 0, f"head_num must be positive; got {self.head_num}"
-        assert self.head_dim > 0, f"head_dim must be positive; got {self.head_dim}"
-        if self.kv_cache_dtype is None:
-            object.__setattr__(self, "kv_cache_dtype", self.store_dtype)
-        expected_store_dtype = _store_dtype_for(self.kv_cache_dtype)
-        assert self.store_dtype == expected_store_dtype, (
-            "MHASubPoolSpec.store_dtype must match the storage dtype required by "
-            f"kv_cache_dtype; got kv_cache_dtype={self.kv_cache_dtype}, "
-            f"store_dtype={self.store_dtype}, expected={expected_store_dtype}"
-        )
-        if self.v_head_dim is None:
-            object.__setattr__(self, "v_head_dim", self.head_dim)
-        assert self.v_head_dim > 0, (
-            f"v_head_dim must be positive; got {self.v_head_dim}"
-        )
-        if self.draft_region is not None:
-            assert isinstance(self.draft_region, DenseDraftRegion), (
-                "dense entries carry dense draft K/V rows, never a state region"
-            )
-            self.draft_region.validate()
-
-    def k_row_bytes(self) -> int:
-        return self.head_num * self.head_dim * self.store_dtype.itemsize
-
-    def v_row_bytes(self) -> int:
-        return self.head_num * self.v_head_dim * self.store_dtype.itemsize
-
-    def host_entry_bytes(self) -> int:
-        """Host (target-only) bytes for one slot, before any draft parts."""
-        return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
-
-    def draft_offset_in_entry(self) -> int:
-        """Byte offset of the fused draft parts inside one slot's entry."""
-        assert self.draft_region is not None
-        return align_part_offset(self.host_entry_bytes())
-
-    def entry_bytes(self) -> int:
-        if self.draft_region is None:
-            return align_entry_bytes(self.host_entry_bytes())
-        return align_entry_bytes(
-            self.draft_offset_in_entry() + self.draft_region.entry_bytes()
-        )
-
-    def page_bytes(self, page_size: int) -> int:
-        return page_size * self.entry_bytes()
-
-    def layout(self) -> DenseEntryLayout:
-        """Token-major entry ``[K_0 | V_0 | K_1 | V_1 | ...]`` per slot; a page
-        is ``page_size`` such entries back to back."""
-        _check_row_alignment(self.name, K=self.k_row_bytes(), V=self.v_row_bytes())
-        layer_stride = self.k_row_bytes() + self.v_row_bytes()
-        parts = (
-            DensePart(
-                name="k",
-                offset_bytes=0,
-                layer_stride_bytes=layer_stride,
-                layer_num=self.layer_num,
-                row_shape=(self.head_num, self.head_dim),
-                dtype=self.store_dtype,
-            ),
-            DensePart(
-                name="v",
-                offset_bytes=self.k_row_bytes(),
-                layer_stride_bytes=layer_stride,
-                layer_num=self.layer_num,
-                row_shape=(self.head_num, self.v_head_dim),
-                dtype=self.store_dtype,
-            ),
-        )
-        if self.draft_region is not None:
-            parts += self.draft_region.parts(self.draft_offset_in_entry())
-        return DenseEntryLayout(entry_bytes=self.entry_bytes(), parts=parts)
-
-    def get_dtype(self) -> torch.dtype:
-        return self.store_dtype
-
-
-@dataclass(frozen=True, kw_only=True)
-class MLASubPoolSpec(SubPoolSpec):
-    """Per-slot layout of one MLA-shaped sub-pool.
-
-    One latent row (``kv_lora_rank + qk_rope_head_dim``) per token per layer; V
-    is a prefix slice of the same row, so there is no separate V region. Not a
-    subclass of ``MHASubPoolSpec`` — the K+V byte math and the ``v_head_dim > 0``
-    invariant there do not apply. With `draft_region` set, the draft's K and V
-    parts follow the latent rows inside every slot's entry, as on an MHA host.
-    """
-
-    kv_lora_rank: int
-    qk_rope_head_dim: int
-    store_dtype: torch.dtype
-
-    def __post_init__(self):
-        super().__post_init__()
-        assert self.kv_lora_rank > 0, (
-            f"kv_lora_rank must be positive; got {self.kv_lora_rank}"
-        )
-        assert self.qk_rope_head_dim > 0, (
-            f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
-        )
-        if self.draft_region is not None:
-            assert isinstance(self.draft_region, DenseDraftRegion), (
-                "dense entries carry dense draft K/V rows, never a state region"
-            )
-            self.draft_region.validate()
-
-    @property
-    def kv_cache_dim(self) -> int:
-        return self.kv_lora_rank + self.qk_rope_head_dim
-
-    def row_bytes(self) -> int:
-        return self.kv_cache_dim * self.store_dtype.itemsize
-
-    def host_entry_bytes(self) -> int:
-        """Host (target-only) bytes for one slot, before any draft parts."""
-        return self.layer_num * self.row_bytes()
-
-    def draft_offset_in_entry(self) -> int:
-        """Byte offset of the fused draft parts inside one slot's entry."""
-        assert self.draft_region is not None
-        return align_part_offset(self.host_entry_bytes())
-
-    def entry_bytes(self) -> int:
-        if self.draft_region is None:
-            return align_entry_bytes(self.host_entry_bytes())
-        return align_entry_bytes(
-            self.draft_offset_in_entry() + self.draft_region.entry_bytes()
-        )
-
-    def layout(self) -> DenseEntryLayout:
-        _check_row_alignment(self.name, latent=self.row_bytes())
-        parts = (
-            DensePart(
-                name="kv",
-                offset_bytes=0,
-                layer_stride_bytes=self.row_bytes(),
-                layer_num=self.layer_num,
-                row_shape=(1, self.kv_cache_dim),
-                dtype=self.store_dtype,
-            ),
-        )
-        if self.draft_region is not None:
-            parts += self.draft_region.parts(self.draft_offset_in_entry())
-        return DenseEntryLayout(entry_bytes=self.entry_bytes(), parts=parts)
-
-    def get_dtype(self) -> torch.dtype:
-        return self.store_dtype
-
-
-@dataclass(frozen=True, kw_only=True)
-class MambaSubPoolSpec(SubPoolSpec):
-    """Per-slot layout of one Mamba-shaped sub-pool.
-
-    With `draft_region` (a `DraftStateRegion`) set, the draft's state block
-    follows the host's inside every slot's entry:
-
-        [ conv[0] x L | ... | temporal x L | draft conv[0] x Ld | ... | pad ]
-
-    Unfused, the entry keeps its raw (unaligned) size, byte-identical to before.
-    """
-
-    conv_state_shapes: Tuple[Tuple[int, ...], ...]  # one shape per conv tensor
-    conv_dtype: torch.dtype
-    temporal_state_shape: Tuple[int, ...]
-    temporal_dtype: torch.dtype
-    conv_slice_axis: int = 0
-
-    def __post_init__(self):
-        super().__post_init__()
-        assert len(self.conv_state_shapes) > 0, "conv_state_shapes must be non-empty"
-        if self.draft_region is not None:
-            assert isinstance(self.draft_region, DraftStateRegion), (
-                "mamba state entries carry a draft STATE region, never dense K/V rows"
-            )
-            self.draft_region.validate()
-
-    def conv_row_bytes(self, idx: int) -> int:
-        return _prod(self.conv_state_shapes[idx]) * self.conv_dtype.itemsize
-
-    def temporal_row_bytes(self) -> int:
-        return _prod(self.temporal_state_shape) * self.temporal_dtype.itemsize
-
-    def host_entry_bytes(self) -> int:
-        """Host (target-only) bytes for one slot, before any draft block."""
-        total = 0
-        for i in range(len(self.conv_state_shapes)):
-            total += self.layer_num * self.conv_row_bytes(i)
-        total += self.layer_num * self.temporal_row_bytes()
-        return total
-
-    def draft_offset_in_entry(self) -> int:
-        """Byte offset of the fused draft state block inside one slot's entry."""
-        assert self.draft_region is not None
-        return align_part_offset(self.host_entry_bytes())
-
-    def entry_bytes(self) -> int:
-        if self.draft_region is None:
-            return self.host_entry_bytes()
-        return align_entry_bytes(
-            self.draft_offset_in_entry() + self.draft_region.entry_bytes()
-        )
-
-    def get_dtype(self) -> torch.dtype:
-        return self.conv_dtype  # representative state dtype; matches MambaPool.dtype
 
 
 # ---------------------------------------------------------------------------

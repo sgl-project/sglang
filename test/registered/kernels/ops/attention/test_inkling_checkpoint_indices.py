@@ -12,11 +12,11 @@ from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
     InklingShortConvHybridAttnBackend,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
     UnifiedHybridReqToTokenPool,
     UnifiedKVPool,
     UnifiedMambaPool,
