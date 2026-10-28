@@ -99,9 +99,7 @@ def _is_disabled() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_RDNA_SPLITK_GEMV", "false")
 
 
-def use_rdna_splitk_gemv(
-    m: int, n: int, k: int, weight_dtype: torch.dtype
-) -> bool:
+def use_rdna_splitk_gemv(m: int, n: int, k: int, weight_dtype: torch.dtype) -> bool:
     """Whether a single-row bf16 GEMV should be routed to the split-K kernel."""
     if _is_disabled():
         return False
@@ -127,10 +125,19 @@ def rdna_splitk_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     partial = torch.empty((split_k, n), dtype=torch.float32, device=x.device)
     out = torch.empty((1, n), dtype=torch.bfloat16, device=x.device)
     _gemv_split_k_kernel[(triton.cdiv(n, _BLOCK_N), split_k)](
-        x_flat, weight, partial, weight.stride(0),
-        N=n, BLOCK_N=_BLOCK_N, BLOCK_K=_BLOCK_K,
+        x_flat,
+        weight,
+        partial,
+        weight.stride(0),
+        N=n,
+        BLOCK_N=_BLOCK_N,
+        BLOCK_K=_BLOCK_K,
     )
     _reduce_split_k_kernel[(triton.cdiv(n, _BLOCK_N),)](
-        partial, out, N=n, SPLIT_K=split_k, BLOCK_N=_BLOCK_N,
+        partial,
+        out,
+        N=n,
+        SPLIT_K=split_k,
+        BLOCK_N=_BLOCK_N,
     )
     return out
