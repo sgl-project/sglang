@@ -314,7 +314,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.mm_receiver = None
         scheduler.parts.grammar_manager = MagicMock()
         scheduler.parts.mode_owners.dllm = None
-        scheduler.parts.ipc_channels = MagicMock()
         release_aborted_request = MagicMock()
         retirer = RequestRetirer(
             kv=MagicMock(),
@@ -323,7 +322,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
             decode_offload_manager=None,
             pending=PendingSteps(),
             output_streamer=MagicMock(),
-            ipc_channels=scheduler.parts.ipc_channels,
         )
         retirer.release_aborted_request = release_aborted_request
         scheduler.disagg_decode.request_retirer = retirer

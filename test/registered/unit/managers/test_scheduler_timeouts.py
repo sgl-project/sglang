@@ -71,7 +71,6 @@ def _intake(waiting_queue):
     core_lists.waiting_queue = waiting_queue
     return make_request_intake(
         core_lists=core_lists,
-        ipc_channels=SimpleNamespace(send_to_tokenizer=MagicMock()),
     )
 
 
@@ -115,7 +114,6 @@ class TestQueuedLimitAbort(CustomTestCase):
             decode_offload_manager=None,
             pending=PendingSteps(),
             output_streamer=MagicMock(),
-            ipc_channels=intake.ipc_channels,
         )
 
         self.assertFalse(intake._abort_on_queued_limit(incoming))

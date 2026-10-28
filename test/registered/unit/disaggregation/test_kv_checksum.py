@@ -403,7 +403,6 @@ class TestChecksumMismatchRelease(unittest.TestCase):
                 decode_offload_manager=None,
                 pending=PendingSteps(),
                 output_streamer=None,
-                ipc_channels=None,
             ),
             output_streamer=SimpleNamespace(stream_output=lambda reqs, *args: None),
             metrics_sink=SimpleNamespace(enable_metrics=False),

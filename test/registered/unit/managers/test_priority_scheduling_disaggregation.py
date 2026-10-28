@@ -76,10 +76,8 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         get_context().override("test", enable_hierarchical_cache=False)
         get_context().override("test", enable_unified_cache_external_linker=False)
         tree_cache = MagicMock()
-        ipc_channels = MagicMock()
         intake = make_request_intake(
             kv=SimpleNamespace(tree_cache=tree_cache, token_to_kv_pool_allocator=None),
-            ipc_channels=ipc_channels,
             request_retirer=RequestRetirer(
                 kv=SimpleNamespace(tree_cache=tree_cache),
                 beam_coordinator=MagicMock(),
@@ -87,7 +85,6 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 decode_offload_manager=None,
                 pending=PendingSteps(),
                 output_streamer=MagicMock(),
-                ipc_channels=ipc_channels,
             ),
             mode_owners=ModeOwners(
                 disagg_prefill=(
@@ -496,7 +493,6 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         core_lists = CoreLists()
         core_lists.waiting_queue = [MagicMock(rid="req")]
         kv = SimpleNamespace(tree_cache=MagicMock())
-        ipc_channels = MagicMock()
         disagg_prefill = prefill_owner_shell(release_aborted_waiting_req=MagicMock())
         registry = make_request_registry(
             core_lists=core_lists,
@@ -508,9 +504,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 decode_offload_manager=None,
                 pending=PendingSteps(),
                 output_streamer=MagicMock(),
-                ipc_channels=ipc_channels,
             ),
-            ipc_channels=ipc_channels,
             kv=kv,
             mode_owners=ModeOwners(disagg_prefill=disagg_prefill),
         )

@@ -24,7 +24,6 @@ def make_request_intake(intake_class: type = RequestIntake, **deps) -> RequestIn
         counters=LaunchCounters(),
         kv=SimpleNamespace(tree_cache=MagicMock(), token_to_kv_pool_allocator=None),
         capacity=SimpleNamespace(sliding_window_size=None),
-        ipc_channels=MagicMock(),
         beam_coordinator=MagicMock(),
         session_controller=MagicMock(),
         grammar_manager=MagicMock(),

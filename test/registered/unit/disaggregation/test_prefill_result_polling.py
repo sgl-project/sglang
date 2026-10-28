@@ -326,7 +326,6 @@ class _Scheduler:
             decode_offload_manager=None,
             pending=PendingSteps(),
             output_streamer=None,
-            ipc_channels=None,
         )
         self.request_retirer.clear_finished_media = Mock()
         self.output_streamer = Mock(spec=["maybe_reply_health_check"])
@@ -977,7 +976,6 @@ class TestPrefillResultPolling(CustomTestCase):
                     decode_offload_manager=None,
                     pending=PendingSteps(),
                     output_streamer=None,
-                    ipc_channels=None,
                 )
                 scheduler.disagg_prefill.pending_chunk_rids = set()
                 scheduler.disagg_prefill.kv_senders.update(

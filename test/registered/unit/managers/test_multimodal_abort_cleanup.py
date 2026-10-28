@@ -94,11 +94,9 @@ def _rank(rank):
 def _intake(**deps):
     tree_cache = MagicMock()
     beam_coordinator = MagicMock()
-    ipc_channels = MagicMock()
     return make_request_intake(
         kv=SimpleNamespace(tree_cache=tree_cache, token_to_kv_pool_allocator=None),
         beam_coordinator=beam_coordinator,
-        ipc_channels=ipc_channels,
         request_retirer=RequestRetirer(
             kv=SimpleNamespace(tree_cache=tree_cache),
             beam_coordinator=beam_coordinator,
@@ -106,7 +104,6 @@ def _intake(**deps):
             decode_offload_manager=None,
             pending=PendingSteps(),
             output_streamer=MagicMock(),
-            ipc_channels=ipc_channels,
         ),
         **deps,
     )
@@ -117,7 +114,6 @@ def _queued_registry(req):
     core_lists.waiting_queue = [req]
     kv = SimpleNamespace(tree_cache=MagicMock())
     beam_coordinator = MagicMock()
-    ipc_channels = MagicMock()
     return make_request_registry(
         core_lists=core_lists,
         grammar_manager=MagicMock(),
@@ -128,9 +124,7 @@ def _queued_registry(req):
             decode_offload_manager=None,
             pending=PendingSteps(),
             output_streamer=MagicMock(),
-            ipc_channels=ipc_channels,
         ),
-        ipc_channels=ipc_channels,
         kv=kv,
     )
 

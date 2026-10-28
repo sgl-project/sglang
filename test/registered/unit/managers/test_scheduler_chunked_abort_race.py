@@ -108,7 +108,6 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         sched.parts.pending = []
         sched.parts.request_retirer = Mock()
         sched.parts.kv.tree_cache = None
-        sched.parts.ipc_channels = Mock()
         sched._process_hicache_events = Mock()
         sched.hub.step_planner = Mock()
         sched.hub.request_intake = Mock()

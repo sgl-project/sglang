@@ -36,7 +36,6 @@ def make_request_retirer(**deps) -> RequestRetirer:
         decode_offload_manager=None,
         pending=PendingSteps(),
         output_streamer=Mock(),
-        ipc_channels=Mock(),
     )
     args.update(deps)
     return RequestRetirer(**args)
@@ -49,7 +48,6 @@ def make_request_registry(**deps) -> RequestRegistry:
         core_lists=CoreLists(),
         grammar_manager=SimpleNamespace(grammar_queue=[], abort_requests=Mock()),
         request_retirer=Mock(),
-        ipc_channels=Mock(),
         kv=SimpleNamespace(tree_cache=Mock()),
         mm_receiver=None,
         pending=PendingSteps(),
@@ -88,7 +86,6 @@ _SCHEDULER_FIELDS = {
     "core_lists": "lists",
     "grammar_manager": "grammar_manager",
     "request_retirer": "request_retirer",
-    "ipc_channels": "ipc_channels",
     "mm_receiver": "mm_receiver",
     "pending": "pending",
     "decode_offload_manager": "decode_offload_manager",
@@ -127,7 +124,6 @@ _PLANNER_FIELDS = {
             "step_builder",
             "request_retirer",
             "metrics_sink",
-            "ipc_channels",
             "decode_offload_manager",
             "mode_owners",
             "spec_algorithm",

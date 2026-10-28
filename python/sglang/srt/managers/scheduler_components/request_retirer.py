@@ -52,9 +52,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler_components.bundles import KvResources
-    from sglang.srt.managers.scheduler_components.ipc_channels import (
-        SchedulerIpcChannels,
-    )
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
@@ -73,7 +70,6 @@ class RequestRetirer:
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
         pending: PendingSteps,
         output_streamer: SchedulerOutputStreamer,
-        ipc_channels: SchedulerIpcChannels,
     ):
         self.kv = kv
         self.tree_cache = kv.tree_cache
@@ -82,7 +78,6 @@ class RequestRetirer:
         self.decode_offload_manager = decode_offload_manager
         self.pending = pending
         self.output_streamer = output_streamer
-        self.ipc_channels = ipc_channels
 
     # ------------------------------------------------------------------
     # Entry points, one per outcome.

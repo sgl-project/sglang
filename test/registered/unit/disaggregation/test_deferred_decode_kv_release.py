@@ -998,7 +998,6 @@ class TestHiSparseRowsFreedWithKvRelease(CustomTestCase):
             decode_offload_manager=None,
             pending=PendingSteps(),
             output_streamer=None,
-            ipc_channels=None,
         )
         entry = _make_failed_req(mgr, room=11, idx=2, abort_notified=False)
         entry.req.kv = SimpleNamespace(req_pool_idx=5, holds_kv=True)

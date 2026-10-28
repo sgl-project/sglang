@@ -60,7 +60,6 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                         decode_offload_manager=None,
                         pending=PendingSteps(),
                         output_streamer=output_streamer,
-                        ipc_channels=MagicMock(),
                     ),
                 )
                 get_context().override("test", disaggregation_mode=mode.value)

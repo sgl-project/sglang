@@ -54,7 +54,6 @@ def _retirer(**deps) -> RequestRetirer:
         decode_offload_manager=None,
         pending=PendingSteps(),
         output_streamer=MagicMock(),
-        ipc_channels=MagicMock(),
     )
     args.update(deps)
     return RequestRetirer(**args)
@@ -201,7 +200,6 @@ class TestBeamGroupLeavesWithItsLeader(CustomTestCase):
         sched.parts.lists._pending_chunked_abort_req = leader
         sched.parts.request_retirer = _retirer(beam_coordinator=beam)
         sched.parts.kv.tree_cache = sched.parts.request_retirer.tree_cache
-        sched.parts.ipc_channels = Mock()
 
         with (
             patch(f"{_RETIRER}.release_kv_cache") as release,

@@ -25,9 +25,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.deferred_responses import (
         DeferredResponses,
     )
-    from sglang.srt.managers.scheduler_components.ipc_channels import (
-        SchedulerIpcChannels,
-    )
     from sglang.srt.managers.scheduler_components.mode_owners import ModeOwners
     from sglang.srt.managers.scheduler_components.pending_steps import PendingSteps
     from sglang.srt.managers.scheduler_components.request_retirer import (
@@ -44,7 +41,6 @@ class RequestRegistry:
         core_lists: CoreLists,
         grammar_manager: GrammarManager,
         request_retirer: RequestRetirer,
-        ipc_channels: SchedulerIpcChannels,
         kv: KvResources,
         mm_receiver: Optional[MMReceiverBase],
         pending: PendingSteps,
@@ -55,7 +51,6 @@ class RequestRegistry:
         self.core_lists = core_lists
         self.grammar_manager = grammar_manager
         self.request_retirer = request_retirer
-        self.ipc_channels = ipc_channels
         self.tree_cache = kv.tree_cache
         self.mm_receiver = mm_receiver
         self.pending = pending

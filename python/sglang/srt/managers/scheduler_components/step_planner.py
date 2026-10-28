@@ -66,9 +66,6 @@ if TYPE_CHECKING:
         EngineFlags,
         LaunchCounters,
     )
-    from sglang.srt.managers.scheduler_components.ipc_channels import (
-        SchedulerIpcChannels,
-    )
     from sglang.srt.managers.scheduler_components.lora_admission import (
         LoraAdmission,
     )
@@ -197,7 +194,6 @@ class StepPlanner:
         request_retirer: RequestRetirer,
         grammar_manager: GrammarManager,
         metrics_sink: MetricsSink,
-        ipc_channels: SchedulerIpcChannels,
         workers: Workers,
         decode_offload_manager: Optional[DecodeKVCacheOffloadManager],
         mode_owners: ModeOwners,
@@ -240,7 +236,6 @@ class StepPlanner:
         self.request_retirer = request_retirer
         self.grammar_manager = grammar_manager
         self.metrics_sink = metrics_sink
-        self.ipc_channels = ipc_channels
         self.tp_worker = workers.tp_worker
         self.draft_worker = workers.draft_worker
         self.decode_offload_manager = decode_offload_manager

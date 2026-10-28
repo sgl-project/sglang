@@ -794,7 +794,6 @@ def assemble_scheduler(
         decode_offload_manager=decode_offload_manager,
         pending=pending,
         output_streamer=output_streamer,
-        ipc_channels=ipc_channels,
     )
     deferred_responses = DeferredResponses(
         disaggregation_mode=disaggregation_mode,
@@ -820,7 +819,6 @@ def assemble_scheduler(
         core_lists=lists,
         grammar_manager=grammar_manager,
         request_retirer=request_retirer,
-        ipc_channels=ipc_channels,
         kv=kv,
         mm_receiver=mm_receiver,
         pending=pending,
@@ -923,7 +921,6 @@ def assemble_scheduler(
         counters=counters,
         kv=kv,
         capacity=capacity,
-        ipc_channels=ipc_channels,
         services=services,
         beam_coordinator=beam_coordinator,
         session_controller=session_controller,
@@ -955,7 +952,6 @@ def assemble_scheduler(
         request_retirer=request_retirer,
         grammar_manager=grammar_manager,
         metrics_sink=metrics_sink,
-        ipc_channels=ipc_channels,
         workers=workers,
         decode_offload_manager=decode_offload_manager,
         mode_owners=mode_owners,

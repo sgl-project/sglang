@@ -305,7 +305,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.parts.kv.token_to_kv_pool_allocator.check_decode_capacity.return_value = False
         scheduler.parts.kv.tree_cache.req_to_token_pool.mamba_allocator = None
         scheduler.parts.new_token_ratio_tracker = SimpleNamespace(current=1.0)
-        scheduler.parts.ipc_channels = MagicMock()
         scheduler.parts.beam_coordinator = MagicMock()
         scheduler.hub.step_planner.get_decode_step(scheduler.flat_slot)
 
