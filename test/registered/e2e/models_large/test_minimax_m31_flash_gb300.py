@@ -1,4 +1,4 @@
-"""MiniMax-M3.1-Flash on the B300 balanced recipe, with DSpark and HiCache.
+"""MiniMax-M3.1-Flash on GB300 with the B300 balanced recipe, DSpark and HiCache.
 
 Covers the Blackwell path: MSA sparse attention, the TRT-LLM NVFP4 MoE, the
 bundled DSpark draft, and HiCache moving the NVFP4 page rows (packed KV, block
@@ -16,14 +16,14 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=2200, stage="nightly", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=2200, stage="nightly", runner_config="4-gpu-gb300")
 
 _STORAGE_HIT_METRIC = re.compile(
     r"^sglang:storage_prefetch_hit_tokens_total(?:\{[^}]*\})? (\S+)$", re.M
 )
 
 
-class TestMiniMaxM31FlashB300(GSM8KMixin, DefaultServerBase):
+class TestMiniMaxM31FlashGB300(GSM8KMixin, DefaultServerBase):
     model = "MiniMaxAI/MiniMax-M3.1-Flash"
     other_args = [
         "--trust-remote-code",
