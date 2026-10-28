@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
     EvictLayer,
@@ -55,7 +56,7 @@ class UnifiedRadixCacheFixtures:
             sampling_params=sp,
         )
         self._rid += 1
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         return req
 
     def _apply_match_to_req(self, req, match):

@@ -8,7 +8,7 @@ use tch::Tensor;
 
 use crate::cache_action::{FreeComponentHostSlot, MambaEvictExcessPathStates};
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, FULL, MAMBA};
+use crate::components::{ComponentType, FULL, Family, MAMBA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -117,6 +117,10 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
 
     fn component_type(&self) -> ComponentType {
         MAMBA
+    }
+
+    fn family(&self) -> Family {
+        Family::State
     }
 
     fn needs_incremental_backup(&self, tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_) -> bool {
