@@ -132,14 +132,19 @@ jobs:
         timeout-minutes: 180
         run: |
           touch github_summary_ci.md
-          docker exec ci_sglang_xpu bash -c "
-            source /opt/venv/bin/activate &&
-            cd /sglang-checkout/test &&
-            GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary_ci.md \
-            SGLANG_IS_IN_CI=true \
-            ${{ inputs.ref && 'SGLANG_TEST_METRICS_FILE=/sglang-checkout/pr-ci-suites-metrics.jsonl' || '' }} \
-            python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
-          " || TEST_EXIT_CODE=$?
+          suites=stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu
+          # Release branch cut: one call per suite, so each metrics file maps to one suite.
+          if [ "${{ inputs.ref != '' }}" = true ]; then suites="${suites/,/ }"; fi
+          for suite in $suites; do
+            docker exec ci_sglang_xpu bash -c "
+              source /opt/venv/bin/activate &&
+              cd /sglang-checkout/test &&
+              GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary_ci.md \
+              SGLANG_IS_IN_CI=true \
+              ${{ inputs.ref && 'SGLANG_TEST_METRICS_FILE=/sglang-checkout/$suite-metrics.jsonl' || '' }} \
+              python3 run_suite.py --hw xpu --suite $suite --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+            " || TEST_EXIT_CODE=$?
+          done
           echo "$(<github_summary_ci.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -174,13 +179,24 @@ jobs:
       - name: Generate per-file results CSV
         if: always() && inputs.ref != ''
         run: |
-          docker exec ci_sglang_xpu bash -c "
-            source /opt/venv/bin/activate &&
-            cd /sglang-checkout &&
-            python3 scripts/ci/xpu/metrics_to_csv.py --out xpu-wheel-1-gpu-results.csv \
-              pr-ci-suites-metrics.jsonl:stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu \
-              nightly-xpu-kernel-wheel-1-gpu-metrics.jsonl:nightly-xpu-kernel-wheel-1-gpu
-          "
+          docker exec -i -w /sglang-checkout ci_sglang_xpu /opt/venv/bin/python3 - <<'EOF'
+          import csv, json, os
+          suites = ["stage-a-test-1-gpu-xpu", "stage-b-test-1-gpu-xpu", "nightly-xpu-kernel-wheel-1-gpu"]
+          rows = []
+          for suite in suites:
+              path = f"{suite}-metrics.jsonl"
+              if not os.path.exists(path):
+                  print(f"::warning::{path} not found")
+                  continue
+              for rec in map(json.loads, filter(str.strip, open(path))):
+                  if rec.get("kind") == "file":
+                      rows.append([rec["test_file"], suite, rec["status"], rec["duration"]])
+          with open("xpu-wheel-1-gpu-results.csv", "w", newline="") as f:
+              w = csv.writer(f)
+              w.writerow(["file_name", "suite", "status", "duration"])
+              w.writerows(rows)
+          print(f"Wrote {len(rows)} rows to xpu-wheel-1-gpu-results.csv")
+          EOF
 
       - name: Upload per-file results CSV
         if: always() && inputs.ref != ''
