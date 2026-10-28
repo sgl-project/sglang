@@ -23,7 +23,8 @@ defaults:
 | `replication` | How many copies are there? | `none` (default): one table, its rows split across the TP group. `per_node`: each node holds the whole table, mapped by all of its ranks. |
 | `lookup` | How does a rank get rows another rank holds? Only with `replication` `none`. | `auto` (default): `peer_read` for GPU tables whose TP group is one NVLink domain, otherwise a collective SGLang picks for each step. `all_reduce`, `reduce_scatter`, `all_to_all`: that collective (see below). `peer_read`: each rank reads its tokens' rows straight from the owning GPU's shard over NVLink, with no collective. |
 
-The resolved configuration is logged at startup as `DeepSeek-V4.1 Engram tables: ...`.
+The configuration is logged at startup as `DeepSeek-V4.1 Engram tables: ...`, and the lookup
+`auto` resolves to, once the model is built, as `Engram lookup auto -> ...`.
 
 ```bash
 # Default: rows split across the TP group in GPU memory; over NVLink, each rank reads its

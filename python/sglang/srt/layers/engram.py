@@ -7,6 +7,7 @@ sglang.kernels.ops.embeddings.engram_hash to produce identical hash ids.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import errno
 import functools
 import glob
@@ -74,7 +75,13 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
-from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_model,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -957,36 +964,51 @@ class _PeerShards:
         return out.view(*indices.shape, self.dim)
 
 
-def _reads_peer_shards(config: EngramConfig) -> bool:
-    """peer_read, chosen or picked by `auto` for device tables. Measured on GB300,
-    B300 and H200 at TP 2-8 and DP 8-32, it was faster than every collective, for
-    prefill and decode."""
-    if config.lookup == EngramLookup.PEER_READ:
-        return True
-    return (
-        config.lookup == EngramLookup.AUTO
-        and config.placement == EngramPlacement.GPU
+def resolve_engram_config(columns: int) -> EngramConfig:
+    """The engram_config the layers run. The one place `auto` becomes a lookup: once
+    per process, at model construction, when the parallel layout and the GPUs are
+    known; the result is recorded in the config so later layers read it."""
+    config = get_exec().offload.engram_config or EngramConfig()
+    if config.lookup != EngramLookup.AUTO:
+        return config
+    parallel = get_parallel()
+    tp = parallel.tp_size
+    lookup = EngramLookup.ALL_REDUCE
+    # Measured on GB300, B300 and H200 at TP 2-8 and DP 8-32, reading the owner's
+    # shard in place was faster than every collective, for prefill and decode.
+    if (
+        config.placement == EngramPlacement.GPU
         and is_cuda()
+        and tp > 1
         and _tp_in_one_nvlink_domain()
-    )
+    ):
+        lookup = EngramLookup.PEER_READ
+    # Measured on GB300, B300 and H200 at DP 2-8: fastest for prefill from 8K tokens
+    # per rank and for decode from DP 4; elsewhere within tens of microseconds.
+    elif (
+        is_cuda()
+        and tp > 1
+        and parallel.attn_dp_size == tp
+        and parallel.attn_cp_size == 1
+        and cols_per_rank(columns, tp) is not None
+    ):
+        lookup = EngramLookup.ALL_TO_ALL
+    config = dataclasses.replace(config, lookup=lookup)
+    get_context().override("resolve_engram_config", engram_config=config)
+    logger.info("Engram lookup auto -> %s", lookup)
+    return config
 
 
-@functools.cache
 def _tp_in_one_nvlink_domain() -> bool:
-    """Collective over the TP group, once per process."""
+    """Collective over the TP group."""
     from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
         in_one_nvlink_domain,
     )
 
-    found = in_one_nvlink_domain(
+    return in_one_nvlink_domain(
         get_parallel().tp_group.cpu_group,
         torch.device("cuda", torch.cuda.current_device()),
     )
-    logger.info(
-        "Engram lookup auto: %s",
-        "peer_read" if found else "collectives, the TP group is not one NVLink domain",
-    )
-    return found
 
 
 def shard_range(
@@ -1040,11 +1062,10 @@ class EngramEmbedding(nn.Module):
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
-        # Resolved by server args (_resolve_engram_config); None before that.
-        config = get_exec().offload.engram_config or EngramConfig()
+        config = resolve_engram_config(len(column_bounds) - 1)
         self.lookup = config.lookup
         self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
-        if self.tp_size > 1 and _reads_peer_shards(config):
+        if config.lookup == EngramLookup.PEER_READ and self.tp_size > 1:
             self.peer = _PeerShards(self.rows, dim, get_parallel().tp_group)
             weight, scale = self.peer.views()
             self.weight = nn.Parameter(weight, requires_grad=False)
@@ -1250,9 +1271,11 @@ class EngramEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Gather DP ranks' indices before looking up TP-sharded rows."""
         assert forward_batch is not None, "the DP engram lookup needs the batch"
-        sizes = self._dp_sizes(indices, forward_batch)
-        lookup = self._dp_lookup(sizes)
-        if lookup == EngramLookup.ALL_REDUCE:
+        exchanges = (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL)
+        sizes = (
+            self._dp_sizes(indices, forward_batch) if self.lookup in exchanges else None
+        )
+        if sizes is None:
             return self._dp_global_buffer_lookup(indices, forward_batch)
         if sum(sizes) == 0:
             return self.new_rows(indices)
@@ -1260,23 +1283,11 @@ class EngramEmbedding(nn.Module):
         get_parallel().tp_group.all_gatherv(
             indices.contiguous(), sizes=sizes, output=ids
         )
-        if lookup == EngramLookup.REDUCE_SCATTER:
+        if self.lookup == EngramLookup.REDUCE_SCATTER:
             out = self._dp_reduce_scatter_lookup(ids, sizes)
         else:
             out = self._dp_all_to_all_lookup(ids, sizes)
         return out.view(*indices.shape, self.dim)
-
-    def _dp_lookup(self, sizes: Optional[list[int]]) -> str:
-        """The lookup for per-rank `sizes`; `all_reduce` is the global-buffer path."""
-        if sizes is None or self.lookup == EngramLookup.ALL_REDUCE:
-            return EngramLookup.ALL_REDUCE
-        if self.lookup == EngramLookup.REDUCE_SCATTER:
-            return EngramLookup.REDUCE_SCATTER
-        # Measured on GB300, B300 and H200 at DP 2-8: fastest for prefill from 8K tokens
-        # per rank and for decode from DP 4; elsewhere within tens of microseconds.
-        if self._cols_per_rank is None:
-            return EngramLookup.ALL_REDUCE
-        return EngramLookup.ALL_TO_ALL
 
     def _dp_reduce_scatter_lookup(
         self, ids: torch.Tensor, sizes: list[int]
