@@ -290,7 +290,7 @@ class _Shell:
             requeue_ready_grammars=lambda: self.log("grammar")
         )
         s.hub.step_planner = SimpleNamespace(
-            should_defer_prefill=lambda: False,
+            should_defer_prefill=lambda slot: False,
             get_new_batch_prefill=lambda *slot: self.schedule_leaf("prefill"),
             get_decode_step=lambda *slot: self.schedule_leaf("decode"),
             arm_prefill_decode_interval=lambda step: self.log("arm_interval"),
@@ -462,7 +462,7 @@ class TestFlatDriverStageOrder(CustomTestCase):
         """A pass whose prefill the prefill/decode interval defers still
         queues the requests whose grammar is ready."""
         shell = _Shell("normal", 1)
-        shell.s.hub.step_planner.should_defer_prefill = lambda: True
+        shell.s.hub.step_planner.should_defer_prefill = lambda slot: True
         events = [e[1] for e in shell.run()]
         self.assertIn("grammar", events)
         self.assertNotIn("prefill", events)

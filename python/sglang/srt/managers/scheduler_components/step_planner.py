@@ -260,6 +260,9 @@ class StepPlanner:
         self.chunked_prefill_size = limits.chunked_prefill_size
         self.is_mixed_chunk = limits.is_mixed_chunk
         self.prefill_decode_interval = prefill_decode_interval
+        self.prefill_decode_interval_min_bs = (
+            get_schedule().prefill_decode_interval_min_bs
+        )
         self.max_prefill_tokens = limits.max_prefill_tokens
         self.enable_priority_preemption = enable_priority_preemption
         self.truncation_align_size = limits.truncation_align_size
@@ -272,8 +275,15 @@ class StepPlanner:
         # How a mixed step's decode part shares the step with prefill.
         self.composition_policy: CompositionPolicy = DecodeFirst()
 
-    def should_defer_prefill(self) -> bool:
+    def should_defer_prefill(self, slot: ScheduleSlot) -> bool:
         if self._prefill_decode_interval_remaining == 0:
+            return False
+
+        # A small running batch admits prefill every round so it can grow;
+        # the interval only protects decode once the batch is large enough.
+        running_reqs = slot.filter_decoding(self.core_lists.decoding)
+        if len(running_reqs) < self.prefill_decode_interval_min_bs:
+            self._prefill_decode_interval_remaining = 0
             return False
 
         self._prefill_decode_interval_remaining -= 1

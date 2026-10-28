@@ -131,7 +131,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
             [
                 call.drain(),
                 call.retry(),
-                call.defer(self.running_batch),
+                call.defer(ScheduleSlot()),
             ],
         )
 

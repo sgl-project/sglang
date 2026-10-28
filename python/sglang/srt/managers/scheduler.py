@@ -1060,7 +1060,7 @@ class Scheduler:
         self, slot: ScheduleSlot
     ) -> Optional[ScheduleBatch]:
         """Prefill admission, unless the prefill/decode interval defers it."""
-        if self.hub.step_planner.should_defer_prefill():
+        if self.hub.step_planner.should_defer_prefill(slot):
             return None
         return self.hub.step_planner.get_new_batch_prefill(slot)
 

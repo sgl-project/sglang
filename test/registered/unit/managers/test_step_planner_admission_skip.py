@@ -390,9 +390,10 @@ class TestNoKvRoom(_AdmissionCase):
         self.planner._no_kv_room.clear()
         self.planner.prefill_decode_interval = 1
         self.planner._prefill_decode_interval_remaining = 1
+        self.planner.prefill_decode_interval_min_bs = 0
 
-        self.assertTrue(self.planner.should_defer_prefill())
-        self.assertFalse(self.planner.should_defer_prefill())
+        self.assertTrue(self.planner.should_defer_prefill(ScheduleSlot()))
+        self.assertFalse(self.planner.should_defer_prefill(ScheduleSlot()))
         self.assertEqual(self._admit(), ["w0"])
 
 
