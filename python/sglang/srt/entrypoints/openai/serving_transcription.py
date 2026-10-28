@@ -420,7 +420,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
             self._finalize_text(request, ret.get("text", ""), strip=False)
             for ret in rets
         ]
-        text = "".join(texts)
+        text = self._adapter.chunk_separator(request).join(texts)
         if fused:
             text = text.strip()
 

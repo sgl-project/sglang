@@ -1599,6 +1599,13 @@ class ModelConfig:
                 self.hf_text_config, "decoder_layers", self.num_hidden_layers
             )
             self.num_attention_layers = encoder_layers + 2 * decoder_layers
+        if "CohereAsrForConditionalGeneration" in self.hf_config.architectures:
+            # Same split as Whisper, except the Conformer encoder runs plain
+            # SDPA with a relative-position bias that RadixAttention cannot
+            # express, so encoder layers claim no layer id:
+            # - Decoder self-attention:  0 to decoder_layers-1
+            # - Decoder cross-attention: decoder_layers to 2*decoder_layers-1
+            self.num_attention_layers = 2 * self.hf_text_config.decoder_layers
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
@@ -2391,6 +2398,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 multimodal_model_archs = [
     "CLIPModel",
     "Cohere2VisionForConditionalGeneration",
+    "CohereAsrForConditionalGeneration",
     "Cosmos3EdgeForConditionalGeneration",
     "DeepseekVL2ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
@@ -2533,6 +2541,7 @@ def is_audio_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
+        "CohereAsrForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 
@@ -2542,6 +2551,7 @@ def is_encoder_decoder_model(model_architectures: List[str]):
         "WhisperForConditionalGeneration",
         "MllamaForConditionalGeneration",
         "MossVLForConditionalGeneration",
+        "CohereAsrForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 

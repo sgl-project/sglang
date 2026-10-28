@@ -527,6 +527,31 @@ class TestLongAudioChunkedNonStreaming(CustomTestCase):
         self.assertEqual(result.text, "Hello")
         self.assertEqual(result.language, "en")
 
+    def test_chunked_stripped_transcripts_space_joined_except_spaceless(self):
+        # cohere-transcribe returns each chunk with no leading space, unlike
+        # Whisper; a bare in-order concatenation fuses the words at every seam.
+        # Spaceless scripts must still join with nothing.
+        for language, texts, expected in (
+            ("en", ["part one.", "part two."], "part one. part two."),
+            ("zh", ["你好", "世界"], "你好世界"),
+        ):
+            with self.subTest(language=language):
+                tm = _MockChunkTokenizerManager(
+                    [
+                        [{"text": t, "meta_info": {"finish_reason": {"type": "stop"}}}]
+                        for t in texts
+                    ]
+                )
+                tm.model_config.hf_config.architectures = [
+                    "CohereAsrForConditionalGeneration"
+                ]
+                result = self._create_transcription(
+                    tm, _long_wav_bytes(65.0), language=language
+                )
+                self.assertIsInstance(result, TranscriptionResponse, result)
+                self.assertEqual(result.text, expected)
+                self.assertEqual(len(tm.requests), len(texts))
+
 
 class TestLongAudioChunkedStreaming(CustomTestCase):
     """_generate_long_audio_stream: chunks transcribed sequentially, deltas

@@ -7,6 +7,9 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (  # noqa:
 )
 
 # Import built-in adapters so they self-register via @register_transcription_adapter.
+from sglang.srt.entrypoints.openai.transcription_adapters.cohere_asr import (  # noqa: F401
+    CohereAsrAdapter,
+)
 from sglang.srt.entrypoints.openai.transcription_adapters.glmasr import (  # noqa: F401
     GlmAsrAdapter,
 )
@@ -36,4 +39,5 @@ __all__ = [
     "GraniteSpeechAdapter",
     "Qwen2AudioAdapter",
     "GlmAsrAdapter",
+    "CohereAsrAdapter",
 ]

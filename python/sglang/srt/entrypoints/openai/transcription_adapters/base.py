@@ -125,6 +125,17 @@ class TranscriptionAdapter(ABC):
         """
         return text
 
+    def chunk_separator(self, request: TranscriptionRequest) -> str:
+        """Separator joining chunk transcripts when audio exceeded
+        ``max_audio_clip_s`` and was split.
+
+        Defaults to ``""``: Whisper-style models emit a leading space on every
+        chunk, which is already the correct seam. Override for models that
+        return stripped text, otherwise the words either side of a seam run
+        together.
+        """
+        return ""
+
     @abstractmethod
     def build_verbose_response(
         self,

@@ -597,7 +597,12 @@ def _fix_added_tokens_encoding(tokenizer):
             continue
         try:
             val = getattr(tokenizer, attr)
-        except (AttributeError, TypeError, ValueError):
+        except Exception:
+            # Pure discovery over every public attribute of a third-party
+            # tokenizer, so any property that refuses to evaluate is simply not
+            # a special-token string. Narrower catches let an unrelated getter
+            # abort startup: CohereAsrTokenizer raises AssertionError from
+            # max_len_sentences_pair because it rejects pair sequences.
             continue
         if not _is_special_token_attr(val):
             continue

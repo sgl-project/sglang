@@ -33,7 +33,10 @@ from sglang.srt.utils.hf_transformers.common import (
     resolve_hf_gguf_reference,
 )
 from sglang.srt.utils.hf_transformers.config import _apply_gemma4_attention_overrides
-from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
+from sglang.srt.utils.hf_transformers.tokenizer import (
+    _fix_added_tokens_encoding,
+    _fix_special_tokens_pattern,
+)
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -698,6 +701,47 @@ class TestFixSpecialTokensPattern(CustomTestCase):
         tok = SimpleNamespace(cls_token_id=None, sep_token_id=None)
         _fix_special_tokens_pattern(tok)
         self.assertFalse(hasattr(tok, "special_tokens_pattern"))
+
+
+# ---------------------------------------------------------------------------
+# _fix_added_tokens_encoding
+# ---------------------------------------------------------------------------
+
+
+class _TokenizerWithRaisingProperty:
+    """A tokenizer exposing a public property that refuses to evaluate.
+
+    Mirrors CohereAsrTokenizer, whose inherited ``max_len_sentences_pair``
+    raises AssertionError because the tokenizer rejects pair sequences.
+    ``slice_start`` sorts after it in ``dir()`` and encodes as two subwords, so
+    it still needs re-registering once discovery gets past the property.
+    """
+
+    unk_token_id = 0
+    slice_start = "<slice>"
+
+    def __init__(self):
+        self.added = []
+
+    @property
+    def max_len_sentences_pair(self):
+        raise AssertionError("Pair sequences not supported.")
+
+    def convert_tokens_to_ids(self, token):
+        return 7 if token == "<slice>" else self.unk_token_id
+
+    def encode(self, text, add_special_tokens=False):
+        return [1, 2]
+
+    def add_tokens(self, tokens, special_tokens=False):
+        self.added.extend(t.content for t in tokens)
+
+
+class TestFixAddedTokensEncoding(CustomTestCase):
+    def test_raising_property_skipped_and_discovery_continues(self):
+        tok = _TokenizerWithRaisingProperty()
+        _fix_added_tokens_encoding(tok)
+        self.assertEqual(tok.added, ["<slice>"])
 
 
 # ---------------------------------------------------------------------------

@@ -207,6 +207,12 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Alibaba's automatic speech recognition models supporting 52 languages. Served via the <code>/v1/audio/transcriptions</code> endpoint.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>cohere-transcribe</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>CohereLabs/cohere-transcribe-03-2026</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Cohere Labs' Conformer encoder-decoder ASR model covering 14 languages. Requires <code>--trust-remote-code</code> for the tokenizer and mel frontend, and <code>librosa</code> (<code>pip install librosa</code>), which that remote code imports. Served via the <code>/v1/audio/transcriptions</code> endpoint.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
+    </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Qwen3-Omni</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Qwen/Qwen3-Omni-30B-A3B-Instruct</code></td>
@@ -274,6 +280,11 @@ curl http://localhost:30000/v1/audio/transcriptions \
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Qwen3-ASR</strong> (0.6B, 1.7B)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Qwen/Qwen3-ASR-1.7B</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use <code>--trust-remote-code</code>. Supports 52 languages.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>cohere-transcribe</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>CohereLabs/cohere-transcribe-03-2026</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use <code>--trust-remote-code</code> and install <code>librosa</code>. Supports 14 languages (en, fr, de, es, it, pt, nl, pl, el, ar, ja, zh, vi, ko). The model does no language detection, so pass <code>language</code> on the request; it defaults to <code>en</code>. Audio longer than 35s is split at low-energy points and the transcripts are stitched.</td>
     </tr>
   </tbody>
 </table>
