@@ -1002,7 +1002,7 @@ def assert_metrics(self, metrics):
             "--speculative-num-draft-tokens not found in other_args "
             "while accept_rate baseline is set",
         )
-        self.assertGreaterEqual(
+        self.assertGreater(
             float(metrics["accept_length"]) / spec_num_draft_tokens,
             self.accept_rate,
         )

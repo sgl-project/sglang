@@ -99,7 +99,7 @@ jobs:
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.image_a5 }}" ]; then
-            echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-950" >> $GITHUB_OUTPUT
+            echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B106" >> $GITHUB_OUTPUT
           else
             echo "image_a5=${{ inputs.image_a5 }}" >> $GITHUB_OUTPUT
           fi
