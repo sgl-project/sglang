@@ -1,7 +1,7 @@
-"""Tests the RDNA (gfx11) split-K bf16 GEMV used for single-row decode projections.
+"""Tests the RDNA split-K bf16 GEMV used for single-row decode projections on gfx1151.
 
-The shape gate is exercised on every GPU (the arch check is patched out, so the
-accept/reject rules are covered on hosts without a gfx11 device); the kernel is
+The shape gate is exercised on every ROCm GPU (the arch check is patched out, so the
+accept/reject rules are covered on hosts without a gfx1151 device); the kernel is
 compared against an fp32 reference and rocBLAS on the shapes that occur in decode.
 """
 
@@ -12,11 +12,10 @@ import torch
 
 from sglang.kernels.ops.gemm import rdna_small_m_gemv as splitk
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 
 # Shapes from a 0.6B decode step: (n, k) of qkv / o / gate_up / down.
 DECODE_SHAPES = [(4096, 1024), (1024, 2048), (6144, 1024), (1024, 3072)]
@@ -24,9 +23,9 @@ DECODE_SHAPES = [(4096, 1024), (1024, 2048), (6144, 1024), (1024, 3072)]
 
 class TestGate(CustomTestCase):
     def setUp(self):
-        # The gate's last condition is the gfx11 arch check; pin it so the shape and
-        # dtype rules are testable on hosts without a gfx11 device.
-        patcher = mock.patch.object(splitk, "_is_rdna", return_value=True)
+        # The gate's last condition is the gfx1151 arch check; pin it so the shape and
+        # dtype rules are testable on hosts without that device.
+        patcher = mock.patch.object(splitk, "is_gfx1151_supported", return_value=True)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -58,7 +57,7 @@ class TestGate(CustomTestCase):
         self.assertFalse(splitk.use_rdna_splitk_gemv(1, 4096, 512, torch.bfloat16))
 
     def test_rejects_other_arches(self):
-        with mock.patch.object(splitk, "_is_rdna", return_value=False):
+        with mock.patch.object(splitk, "is_gfx1151_supported", return_value=False):
             self.assertFalse(splitk.use_rdna_splitk_gemv(1, 4096, 1024, torch.bfloat16))
 
     def test_env_var_disables_the_path(self):
@@ -105,7 +104,7 @@ class TestKernel(CustomTestCase):
         w = torch.randn(4096, 1024, dtype=torch.bfloat16, device="cuda") * 0.05
         a = splitk.rdna_splitk_gemv(x, w)
         splitk.rdna_splitk_gemv(
-            torch.randn(1, 1024, dtype=torch.bfloat16, device="cuda"),
+            torch.randn(1, 2048, dtype=torch.bfloat16, device="cuda"),
             torch.randn(1024, 2048, dtype=torch.bfloat16, device="cuda") * 0.05,
         )
         b = splitk.rdna_splitk_gemv(x, w)
