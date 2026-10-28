@@ -428,10 +428,13 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         if self.pending_remote_kv_layer_id == layer_id:
             self._finalize_pending_kv_broadcast(set_remote_layer_id=True)
         remote_kv_updatable = self.remote_kv_layer_id == layer_id

@@ -16,6 +16,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.fused_draft import (
     LAYER_WINDOW,
     DraftKVGeometry,
@@ -167,7 +168,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             spec_info=SimpleNamespace(window_kv_indices=None, window_kv_indptr=None),
         )
         full = allocator.translate_kv_loc(virtual)
-        swa = allocator.translate_loc_from_full_to_swa(virtual)
+        swa = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(virtual)
         self.assertFalse(torch.equal(full, swa))
         return backend, batch, full if host == "full" else swa
 

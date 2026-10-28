@@ -5,6 +5,8 @@ import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     KVCache,
@@ -165,6 +167,20 @@ class SWAKVPool(BaseSWAKVPool):
     def _wait_for_layer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+    def _build_layer_router(self) -> KVLayerRouter:
+        # Each side is indexed 0..n-1 in its own layer order, the index this
+        # pool's forwarding passes the side (`layers_mapping`).
+        full, swa = {}, {}
+        for layer_id, (index, is_swa_layer) in self.layers_mapping.items():
+            (swa if is_swa_layer else full)[layer_id] = index
+        return KVLayerRouter.from_layer_maps(
+            self,
+            [
+                (IdSpaceKind.FULL, self.full_kv_pool, full),
+                (IdSpaceKind.SLIDING_WINDOW, self.swa_kv_pool, swa),
+            ],
+        )
 
     def get_kv_size_bytes(self):
         def split_size(pool):

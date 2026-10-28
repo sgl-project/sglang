@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
@@ -872,7 +873,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertIsNotNone(swa_value)
         self.assertTrue(
             torch.equal(
-                allocator.translate_loc_from_full_to_swa(old_full_value),
+                allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(old_full_value),
                 swa_value,
             )
         )

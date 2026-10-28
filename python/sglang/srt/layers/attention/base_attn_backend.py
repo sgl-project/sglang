@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import is_npu
 
@@ -17,8 +18,32 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+def resolve_window_kv_pool(model_runner: ModelRunner) -> Optional[KVCache]:
+    """The pool whose window sub-pool this runner's window layers address, or
+    None when there is none.
+
+    A draft runner shares the target's allocator for token bookkeeping but owns
+    a separate KV pool, so the allocator's pool is not its pool. A frozen-KV MTP
+    draft is the exception: it reads the target's KV directly.
+    """
+    active_pool = model_runner.token_to_kv_pool
+    if active_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+        return active_pool
+    if (
+        model_runner.is_draft_worker
+        and not model_runner.spec_algorithm.is_frozen_kv_mtp()
+    ):
+        return None
+    kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
+    if kvcache.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+        return kvcache
+    return None
 
 
 class SharedReadEnds(Enum):

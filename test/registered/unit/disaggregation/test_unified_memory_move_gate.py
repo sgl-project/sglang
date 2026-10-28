@@ -373,7 +373,12 @@ class TestEverySwaAllocatorAnswersTheTransferTranslate(CustomTestCase):
         self.assertIn("SWATokenToKVPoolAllocator", classes)
         self.assertIn("ChainAllocator", classes)
         for name, cls in sorted(classes.items()):
-            if not hasattr(cls, "translate_loc_from_full_to_swa"):
+            # A chain translates window reads through its id spaces.
+            reads_window = (
+                hasattr(cls, "translate_loc_from_full_to_swa")
+                or name == "ChainAllocator"
+            )
+            if not reads_window:
                 continue
             with self.subTest(allocator=name):
                 self.assertTrue(

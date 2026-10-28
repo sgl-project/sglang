@@ -28,6 +28,10 @@ class _ReadStream:
     def __init__(self):
         self.tokens = torch.arange(64).view(4, 16)
 
+    def space(self, kind):
+        # A pool without a window sub-pool has no window id space.
+        return None
+
     def pack_read_stream(
         self,
         plan,

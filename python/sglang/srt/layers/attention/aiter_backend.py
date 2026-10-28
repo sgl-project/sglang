@@ -26,7 +26,10 @@ from sglang.kernels.ops.attention.kv_indices import (
     spec_kv_index_token_blocks,
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    resolve_window_kv_pool,
+)
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -93,7 +96,6 @@ from sglang.srt.layers.attention.aiter_utils import (
 )
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -507,9 +509,8 @@ class AiterAttnBackend(AttentionBackend):
         # sliding window attention. Resolve the SWA pool rather than reading it
         # straight off the active pool: a frozen-KV MTP draft worker's active
         # pool is its own draft pool, but its draft path reads target KV, so the
-        # SWA mapping must still come from the target allocator. Mirrors
-        # TRTLLMHAAttnBackend._resolve_swa_kv_pool.
-        self.swa_kv_pool = self._resolve_swa_kv_pool(model_runner)
+        # SWA mapping must still come from the target allocator.
+        self.swa_kv_pool = resolve_window_kv_pool(model_runner)
         # The window id space of that pool, which these reads map through.
         self.swa_space = (
             None
@@ -517,7 +518,8 @@ class AiterAttnBackend(AttentionBackend):
             else self.swa_kv_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
         )
         self.use_sliding_window_kv_pool = (
-            self.swa_kv_pool is not None and self.swa_kv_pool.swa_layer_nums > 0
+            self.swa_kv_pool is not None
+            and self.swa_kv_pool.layer_router.routes_to(IdSpaceKind.SLIDING_WINDOW)
         )
 
         # Detect SHUFFLE 5D ("vectorized") KV cache layout. When active
@@ -527,10 +529,10 @@ class AiterAttnBackend(AttentionBackend):
         # corresponding branch in forward_decode), since unified_attention's
         # 4D `.view(-1, page, H, D)` cannot be applied to a 5D pool.
         def _pool_is_vec5d(pool):
-            if isinstance(pool, SWAKVPool):
-                return getattr(pool.full_kv_pool, "kv_cache_layout", "nhd") == (
-                    "vectorized_5d"
-                )
+            # A pool with a window sub-pool reports its owner view's layout.
+            router = pool.layer_router
+            if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+                pool = router.view(IdSpaceKind.FULL)
             return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
 
         self.kv_cache_is_vectorized_5d = _pool_is_vec5d(model_runner.token_to_kv_pool)
@@ -3649,26 +3651,6 @@ class AiterAttnBackend(AttentionBackend):
                 "sharing (k/v are None). Use the unified verify path "
                 "(speculative_eagle_topk=1 and SGLANG_AITER_UNIFIED_VERIFY=1)."
             )
-
-    @staticmethod
-    def _resolve_swa_kv_pool(model_runner):
-        """Return the SWAKVPool to translate against, or None for non-SWA models.
-
-        EAGLE draft workers share the target allocator for token bookkeeping but
-        own a separate draft KV pool, so the target allocator's SWA mapping must
-        not be used for them. FROZEN_KV MTP is the exception: its draft path reads
-        target KV directly, so it still needs the allocator pool when the active
-        pool is not itself an SWAKVPool. Mirrors
-        ``TRTLLMHAAttnBackend._resolve_swa_kv_pool``.
-        """
-        active_pool = model_runner.token_to_kv_pool
-        if isinstance(active_pool, SWAKVPool):
-            return active_pool
-        if getattr(model_runner, "is_draft_worker", False):
-            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
-                return None
-        kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
-        return kvcache if isinstance(kvcache, SWAKVPool) else None
 
     @staticmethod
     def _reject_paged_decode_sliding_window(layer):

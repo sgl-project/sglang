@@ -197,8 +197,8 @@ def _build_full_state(
     )
     req_to_token_pool = _build_state_request_table(plan, shared_pool, ctx)
     if use_mla:
-        # start_layer stays 0: HybridLinearKVPool patches layer ids to the contiguous
-        # 0..N-1 index via _transfer_id_context before every MLA pool call.
+        # start_layer stays 0: HybridLinearKVPool addresses this view by the
+        # contiguous 0..N-1 index of its full-attention layers.
         unified_full_kv_pool = UnifiedMLATokenToKVPool(
             unified_buffer=shared_pool,
             sub_pool_name=full.name,

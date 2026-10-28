@@ -1099,23 +1099,23 @@ class TestWindowChainAllocator(unittest.TestCase):
 
     # -- `out=` parameter regression tests for the SWA composite --
 
-    def test_swa_translate_loc_from_full_to_swa_with_out_writes_inplace(self):
-        """Regression: `translate_loc_from_full_to_swa(v, out=buf)` must write
+    def test_window_id_space_write_with_out_writes_inplace(self):
+        """Regression: the window id space's `write(v, out=buf)` must write
         into `buf` and preserve its data_ptr; `out=` is int64, as every id is."""
         _, allocator, _ = self._build()
         v = allocator.alloc(4)
         self.assertIsNotNone(v)
         buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
         ptr_before = buf.data_ptr()
-        ret = allocator.translate_loc_from_full_to_swa(v, out=buf)
+        ret = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].write(v, out=buf)
         self.assertIs(ret, buf)
         self.assertEqual(buf.data_ptr(), ptr_before)
         # Byte-identical to the no-out form:
-        no_out = allocator.translate_loc_from_full_to_swa(v)
+        no_out = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
         self.assertEqual(no_out.dtype, torch.int64)
         self.assertTrue(bool((buf == no_out).all().item()))
 
-    def test_swa_translate_loc_from_full_to_swa_dtype_assertion(self):
+    def test_window_id_space_write_dtype_assertion(self):
         """Regression: a wrong-dtype `out=` (int32) must raise; the allocator
         emits int64 and consumers narrow at their own buffer."""
         _, allocator, _ = self._build()
@@ -1123,11 +1123,11 @@ class TestWindowChainAllocator(unittest.TestCase):
         self.assertIsNotNone(v)
         wrong_dtype = torch.empty(v.shape, dtype=torch.int32, device=_DEV)
         with self.assertRaises(AssertionError):
-            allocator.translate_loc_from_full_to_swa(v, out=wrong_dtype)
+            allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].write(v, out=wrong_dtype)
 
     # SWA side of the tombstone clamp: a tombstoned `v2p_swa[v] == -1` would
     # make the captured kernel read `swa_k_buffer[-1]`.
-    def test_swa_translate_loc_from_full_to_swa_clamps_tombstoned(self):
+    def test_window_id_space_write_clamps_tombstoned(self):
         _, allocator, _ = self._build()
         v = allocator.alloc(4)
         self.assertIsNotNone(v)
@@ -1135,16 +1135,16 @@ class TestWindowChainAllocator(unittest.TestCase):
         v_tomb = int(v[1].item())
         allocator.swa_attn_allocator.virtual_to_physical[v_tomb] = -1
         # No-out form: result must be int64 AND every entry >= 0.
-        out = allocator.translate_loc_from_full_to_swa(v)
+        out = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
         self.assertEqual(out.dtype, torch.int64)
         self.assertTrue(
             bool((out >= 0).all().item()),
-            "translate_loc_from_full_to_swa must clamp tombstoned to >=0",
+            "the window id space must clamp tombstoned to >=0",
         )
         self.assertEqual(int(out[1].item()), 0)
         # out= form must also clamp.
         buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
-        ret = allocator.translate_loc_from_full_to_swa(v, out=buf)
+        ret = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].write(v, out=buf)
         self.assertIs(ret, buf)
         self.assertTrue(bool((buf >= 0).all().item()))
         self.assertEqual(int(buf[1].item()), 0)
@@ -1159,7 +1159,10 @@ class TestWindowChainAllocator(unittest.TestCase):
         def check():
             self.assertTrue(torch.equal(allocator.translate_kv_loc(zeros64), zeros64))
             self.assertTrue(
-                torch.equal(allocator.translate_loc_from_full_to_swa(zeros64), zeros64)
+                torch.equal(
+                    allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(zeros64),
+                    zeros64,
+                )
             )
 
         check()
@@ -1971,10 +1974,10 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
 
         # The composite emits the swa sub-pool's PHYSICAL token ids (the
         # kernel-facing id space of the token-major views).
-        composite_out = allocator.translate_loc_from_full_to_swa(v_tokens)
+        composite_out = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v_tokens)
         self.assertTrue(
             bool((composite_out.long() == expected.long()).all().item()),
-            "REGRESSION: translate_loc_from_full_to_swa must emit the swa "
+            "REGRESSION: the window id space must emit the swa "
             "sub-pool's physical token ids (phys_page * ps + offset).",
         )
 
@@ -2454,7 +2457,9 @@ class TestWindowChainKernelIdSurface(unittest.TestCase):
         self.assertIsNotNone(v)
         v2p_swa = a.swa_attn_allocator.virtual_to_physical
         expected = v2p_swa[v // self.PS] * self.PS + v % self.PS
-        self.assertTrue(torch.equal(a.translate_loc_from_full_to_swa(v), expected))
+        self.assertTrue(
+            torch.equal(a.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v), expected)
+        )
 
     def test_swa_transfer_page_is_physical_not_kernel_scaled(self):
         a = self._build()
@@ -2474,7 +2479,7 @@ class TestWindowChainKernelIdSurface(unittest.TestCase):
 
         # The read path is physical too: the token-major entry leaves no
         # per-page block scale for a kernel id to carry.
-        kernel_tokens = a.translate_loc_from_full_to_swa(v)
+        kernel_tokens = a.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
         self.assertEqual(
             kv_to_page_indices(kernel_tokens, self.PS).tolist(),
             physical_pages.tolist(),
@@ -2488,7 +2493,7 @@ class TestWindowChainKernelIdSurface(unittest.TestCase):
         self.assertIsNotNone(v)
         tomb_page = int(v[0].item()) // self.PS
         a.swa_attn_allocator.virtual_to_physical[tomb_page] = -1
-        got = a.translate_loc_from_full_to_swa(v)
+        got = a.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(v)
         self.assertTrue(bool((got >= 0).all().item()))
         in_tomb = v // self.PS == tomb_page
         self.assertTrue(bool((got[in_tomb] == 0).all().item()))

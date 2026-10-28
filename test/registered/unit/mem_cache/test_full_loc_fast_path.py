@@ -262,7 +262,9 @@ class _RecordingMLAPool(_RecordingPool):
         super().__init__()
         self.mla_set_calls = []
 
-    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
+    def set_mla_kv_buffer(
+        self, layer, loc, cache_k_nope, cache_k_rope, layer_id_override=None
+    ):
         self.mla_set_calls.append(loc)
 
 
@@ -302,8 +304,8 @@ class TestHybridLinearMLARouting(CustomTestCase):
             wait_until=lambda layer_id: calls.append(("wait", layer_id))
         )
 
-        def read(layer, loc, dst_dtype=None):
-            calls.append(("read", layer.layer_id))
+        def read(layer, loc, dst_dtype=None, layer_id_override=None):
+            calls.append(("read", layer_id_override))
 
         pool.full_kv_pool.get_mla_kv_buffer = read
         layer = types.SimpleNamespace(layer_id=6)

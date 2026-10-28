@@ -67,6 +67,8 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
+from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
+from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.token_major import (
@@ -2062,6 +2064,15 @@ class KVCache(abc.ABC):
         translates: by the pool's own id, keyed by sub-pool name."""
         return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
 
+    @cached_property
+    def layer_router(self) -> KVLayerRouter:
+        """Routes each layer this pool serves to the sub-pool view holding it."""
+        return self._build_layer_router()
+
+    def _build_layer_router(self) -> KVLayerRouter:
+        # A plain pool is one sub-pool, and its own view.
+        return PlainPoolRouter(self, IdSpaceKind.FULL)
+
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
         """Persistent buffers for migrated host consumers; see device_pool_info.py.
 
@@ -2192,7 +2203,7 @@ class KVCache(abc.ABC):
         return self.custom_mem_pool
 
 
-class MHATokenToKVPool(KVCache):
+class MHATokenToKVPool(KVCache, MHAKVView):
     def __init__(
         self,
         size: int,
@@ -4486,6 +4497,20 @@ class HybridLinearKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+    def _build_layer_router(self) -> KVLayerRouter:
+        # Only the full-attention layers hold KV here; the recurrent state
+        # lives on the request pool.
+        return KVLayerRouter.from_layer_maps(
+            self,
+            [
+                (
+                    IdSpaceKind.FULL,
+                    self.full_kv_pool,
+                    self.full_attention_layer_id_mapping,
+                )
+            ],
+        )
+
     def get_key_buffer(self, layer_id: int, scale: Optional[float] = None):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
@@ -4580,6 +4605,8 @@ class HybridLinearKVPool(KVCache):
                 dcp_kv_mask=dcp_kv_mask,
             )
         else:
+            # MLA pools whose set_kv_buffer takes no layer_id_override (the
+            # FP4 and NPU ones) address the layer by `layer.layer_id`.
             with self._transfer_id_context(layer):
                 self.full_kv_pool.set_kv_buffer(
                     layer,
@@ -4626,10 +4653,14 @@ class HybridLinearKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
-        with self._transfer_id_context(layer):
-            self.full_kv_pool.set_mla_kv_buffer(
-                layer, loc_info, cache_k_nope, cache_k_rope
-            )
+        kv = self.layer_router.layer(layer.layer_id)
+        kv.view.set_mla_kv_buffer(
+            layer,
+            loc_info,
+            cache_k_nope,
+            cache_k_rope,
+            layer_id_override=kv.view_layer_id,
+        )
 
     def get_mla_kv_buffer(
         self,
@@ -4639,13 +4670,14 @@ class HybridLinearKVPool(KVCache):
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
         # Wait for HiCache load-back here; the inner pool's counter is disabled.
-        self._wait_for_layer(layer.layer_id)
+        kv = self.layer_router.read(layer.layer_id)
         # Read door -- same physical-id contract as the write door: `loc` is
         # a read-index tensor already translated at its production site
         # (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices); the
         # pool never translates.
-        with self._transfer_id_context(layer):
-            return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
+        return kv.view.get_mla_kv_buffer(
+            layer, loc, dst_dtype, layer_id_override=kv.view_layer_id
+        )
 
     def set_index_k_scale_buffer(
         self,
@@ -4763,7 +4795,7 @@ class HybridLinearKVPool(KVCache):
         )
 
 
-class MLATokenToKVPool(KVCache):
+class MLATokenToKVPool(KVCache, MLAKVView):
     def __init__(
         self,
         size: int,
@@ -5091,9 +5123,12 @@ class MLATokenToKVPool(KVCache):
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         kv_buffer = self.get_key_buffer(layer_id)
         dst_dtype = dst_dtype or self.dtype
         cache_k_nope = torch.empty(
@@ -5262,12 +5297,15 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(
             loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA-FP4)"
         )
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
 
         if self.dsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here

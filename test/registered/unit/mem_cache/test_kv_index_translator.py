@@ -86,7 +86,9 @@ def _build_composite(ps, n_full_pages=16, n_swa_pages=8):
     )
     # The fake IS the runner's token_to_kv_pool, and the real UnifiedSWAKVPool
     # carries the pool-level full->swa translate, so the fake must too.
-    kvcache.translate_loc_from_full_to_swa = allocator.translate_loc_from_full_to_swa
+    kvcache.translate_loc_from_full_to_swa = allocator.id_spaces()[
+        IdSpaceKind.SLIDING_WINDOW
+    ].write
     return allocator
 
 
@@ -471,7 +473,7 @@ class TestWriteIds(CustomTestCase):
         src = _make_source(allocator, req_to_token, ps)
         virt = allocator.alloc(-(-n // ps) * ps)[:n]
         want_full = allocator.translate_kv_loc(virt)
-        want_swa = allocator.translate_loc_from_full_to_swa(virt)
+        want_swa = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(virt)
         return src, allocator, rows, seq_lens, virt, want_full, want_swa
 
     def test_own_plan_translates_full_side_only(self):
