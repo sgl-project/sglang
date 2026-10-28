@@ -222,6 +222,31 @@ class TestIntreeAdditions(CustomTestCase):
         self.assertFalse(out.duplicated(subset=it._KEY_COLS).any())
 
 
+class TestHipblasltRows(CustomTestCase):
+    def test_another_rocm_skips_the_hipblaslt_rows(self):
+        """hipBLASLt solution indices belong to one hipBLASLt build and another rejects
+        them, so the M3.1 bf16 table keeps its hipBLASLt rows only on the ROCm that
+        numbered them."""
+        spec = next(t for t in m31.M31_TABLES if t.env == "AITER_CONFIG_GEMM_BF16")
+        rows = pd.read_csv(spec.csv)
+        hipblaslt = int((rows["libtype"] == "hipblaslt").sum())
+        self.assertGreater(hipblaslt, 0)
+        for rocm, kept in (
+            ((*spec.hipblaslt_rocm, 26015), len(rows)),
+            ((10, 0, 0), len(rows) - hipblaslt),
+        ):
+            with (
+                self.subTest(rocm=rocm),
+                mock.patch(
+                    "sglang.srt.utils.common.get_hip_version", return_value=rocm
+                ),
+            ):
+                out = it.read_intree_rows(spec)
+                self.assertEqual(len(out), kept)
+                if kept < len(rows):
+                    self.assertFalse((out["libtype"] == "hipblaslt").any())
+
+
 def _aiter_commit() -> str:
     try:
         version = importlib.metadata.version("amd-aiter")
@@ -276,7 +301,7 @@ class TestMiniMaxM31Tables(CustomTestCase):
                 effective = {}
                 for key, (_, row) in zip(index, table.iterrows()):
                     effective.setdefault(key, it._norm_kernel(row, kernels))
-                rows = pd.read_csv(spec.csv)
+                rows = it.read_intree_rows(spec)
                 for key, (_, row) in zip(
                     zip(*(rows[c].map(it._norm) for c in keys)), rows.iterrows()
                 ):

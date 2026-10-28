@@ -8,7 +8,8 @@ for, and where aiter has a row a measured kernel beats, the row carries aiter's 
 * a8w8 bpreshuffle: their rowwise-fp8 copy at decode sizes, (split-K) FlyDSL where >= 3%
   faster than aiter's minimax_m3 rows with cold weights.
 * bf16: lm_head (50016 x 6144) and the DSpark fc (1536 x 30720) up to M = 1024. Its hipBLASLt
-  solution indices are ROCm 7.2's; ROCm 10's hipBLASLt rejects them.
+  solution indices are ROCm 7.2's, which ROCm 10's hipBLASLt rejects, so other ROCm versions
+  install only its torch and FlyDSL rows.
 * fused MoE: the routed experts (128 x top-4, hidden 6144, intermediate 768, MXFP4,
   SwiGLU-OAI).
 
@@ -74,6 +75,7 @@ M31_TABLES = (
             "bpreshuffle",
         ),
         kernel_cols=("libtype", "solidx", "splitK", "kernelName"),
+        hipblaslt_rocm=(7, 2),
     ),
     IntreeTable(
         env="AITER_CONFIG_FMOE",
