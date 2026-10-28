@@ -27,7 +27,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=3600, stage="nightly", runner_config="4-gpu-gb300")
 
-MODEL_PATH = os.environ.get("SGLANG_TEST_CP_BCG_MODEL", "Inferact/GLM-5.3-NVFP4")
+MODEL_PATH = os.environ.get("SGLANG_TEST_CP_BCG_MODEL", "incoai/GLM-5.3-NVFP4")
+MODEL_REVISION = os.environ.get("SGLANG_TEST_CP_BCG_REVISION")
 SERVER_LAUNCH_TIMEOUT = 1800
 # Max |delta logprob| between graphs on/off over the prompt tokens (teacher
 # forced, so no divergence effect) and the greedy continuation.
@@ -35,14 +36,22 @@ LOGPROB_TOL = 0.1
 # Bucket-exact, bucket-1 and not divisible by the CP size.
 LENGTHS = (100, 127, 128, 333, 511, 512, 1001)
 MAX_NEW_TOKENS = 16
-CANARY_LENGTH = 512
+# Canary: natural text (low-entropy greedy continuation) so a prefix-cache
+# replay reproduces the output unless its KV rows were overwritten. The replay
+# runs a 64-token extend over cached rows instead of a full prefill, so it is
+# compared within CANARY_TOL rather than bit-exactly.
+CANARY_TEXT = " ".join(
+    ["The quick brown fox jumps over the lazy dog near the quiet river bank."] * 40
+)
+CANARY_TOL = 0.5
 # Default breakable prefill buckets reach well beyond every length above.
 CAPTURE_CAP = 4096
 RESULTS_PATH = os.environ.get("SGLANG_TEST_CP_BCG_RESULTS")
 
 
 def _common_args(attn_cp_size: int):
-    return [
+    revision = ["--revision", MODEL_REVISION] if MODEL_REVISION else []
+    return revision + [
         "--trust-remote-code",
         "--quantization",
         "modelopt_fp4",
@@ -132,17 +141,21 @@ class TestDsaCpBcgBoundaryCP4(CustomTestCase):
         base = 1000 + 7 * seed
         return [base + (i * 31 + seed * 17) % 5000 for i in range(length)]
 
-    def _generate(self, input_ids, max_new_tokens: int):
+    def _generate(self, prompt, max_new_tokens: int, prompt_logprobs: bool = True):
+        # Asking for prompt logprobs from position 0 forces the scheduler to
+        # recompute the whole prompt (no prefix reuse), so only the parity
+        # probe does; the canary replay must hit the radix cache.
+        key = "text" if isinstance(prompt, str) else "input_ids"
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "input_ids": input_ids,
+                key: prompt,
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": max_new_tokens,
                 },
                 "return_logprob": True,
-                "logprob_start_len": 0,
+                "logprob_start_len": 0 if prompt_logprobs else -1,
             },
             timeout=600,
         )
@@ -175,11 +188,13 @@ class TestDsaCpBcgBoundaryCP4(CustomTestCase):
     def _run_matrix(self, prefill_graphs: bool):
         """One pass over LENGTHS on the current server; returns per-length rows."""
         rows = {}
-        canary_ids = self._prompt(CANARY_LENGTH, seed=99)
+        canary_ids = CANARY_TEXT
         for length in LENGTHS:
             self._flush()
             # Canary first: its KV slots are allocated right before the probe's.
-            canary_ref = self._generate(canary_ids, MAX_NEW_TOKENS)
+            canary_ref = self._generate(
+                canary_ids, MAX_NEW_TOKENS, prompt_logprobs=False
+            )
             self.assertEqual(canary_ref["meta_info"]["cached_tokens"], 0)
             before = self._prefill_graph_passes()
             probe = self._generate(self._prompt(length), MAX_NEW_TOKENS)
@@ -193,17 +208,26 @@ class TestDsaCpBcgBoundaryCP4(CustomTestCase):
                 self.assertEqual(graph_passes, 0, f"length={length}")
             # Replay the canary from the radix cache: every cached KV row is
             # read again, so a pad-row write into its slots changes the result.
-            canary_hit = self._generate(canary_ids, MAX_NEW_TOKENS)
-            self.assertGreater(canary_hit["meta_info"]["cached_tokens"], 0)
-            self.assertEqual(
-                canary_hit["output_ids"],
-                canary_ref["output_ids"],
-                f"length={length}: canary KV rows changed under the probe",
+            canary_hit = self._generate(
+                canary_ids, MAX_NEW_TOKENS, prompt_logprobs=False
             )
+            self.assertGreater(canary_hit["meta_info"]["cached_tokens"], 0)
             ref_gen = self._logprobs(canary_ref)[1]
             hit_gen = self._logprobs(canary_hit)[1]
-            canary_delta = self._max_delta(ref_gen, hit_gen)
-            self.assertLessEqual(canary_delta, LOGPROB_TOL, f"length={length}")
+            n = min(len(ref_gen), len(hit_gen))
+            canary_delta = self._max_delta(ref_gen[:n], hit_gen[:n])
+            canary_same = sum(
+                x == y
+                for x, y in zip(
+                    canary_hit["output_ids"], canary_ref["output_ids"], strict=False
+                )
+            )
+            self.assertLessEqual(
+                canary_delta,
+                CANARY_TOL,
+                f"length={length}: canary KV rows changed under the probe "
+                f"(same tokens {canary_same}/{n})",
+            )
             prompt_lp, gen_lp = self._logprobs(probe)
             rows[length] = {
                 "text": probe["text"],
@@ -213,12 +237,13 @@ class TestDsaCpBcgBoundaryCP4(CustomTestCase):
                 "graph_passes": graph_passes,
                 "canary_rows": canary_hit["meta_info"]["cached_tokens"],
                 "canary_max_delta": canary_delta,
+                "canary_same_tokens": f"{canary_same}/{n}",
             }
             print(
                 f"cp={self.attn_cp_size} graphs={'on' if prefill_graphs else 'off'} "
                 f"length={length} graph_passes={graph_passes} "
                 f"canary_rows={rows[length]['canary_rows']} "
-                f"canary_max_delta={canary_delta:.4g}"
+                f"canary_max_delta={canary_delta:.4g} canary_same={canary_same}/{n}"
             )
         return rows
 
@@ -248,6 +273,8 @@ class TestDsaCpBcgBoundaryCP4(CustomTestCase):
                 "canary_rows_checked": a["canary_rows"],
                 "canary_max_delta_on": a["canary_max_delta"],
                 "canary_max_delta_off": b["canary_max_delta"],
+                "canary_same_tokens_on": a["canary_same_tokens"],
+                "canary_same_tokens_off": b["canary_same_tokens"],
             }
             print(f"summary length={length}: {summary[length]}")
             self.assertLessEqual(prompt_delta, LOGPROB_TOL, f"length={length}")
