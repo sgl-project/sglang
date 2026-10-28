@@ -554,9 +554,9 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             mm_processor_worker_num=1,
         )
         publish(server_args, role="test")
-        processor = TokenSpaceSGLangProcessor.for_strategy(_ImageWidthStrategy)(
-            None, server_args, _bare_tokenizer(), None
-        )
+        processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+            _ImageWidthStrategy, TokenSpaceServingSpec
+        )(None, server_args, _bare_tokenizer(), None)
         self.addCleanup(processor.shutdown)
 
         def image_part(width):
