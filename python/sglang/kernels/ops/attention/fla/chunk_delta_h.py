@@ -185,11 +185,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             )
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
 
-        # Nested ifs instead of `if TRACK_STATE and i_t == i_track:`:
-        # triton-ascend does not short-circuit `constexpr and runtime`, so the
-        # combined form compiles the body even when TRACK_STATE is False and
-        # crashes on make_block_ptr(p_track_base=None). A pure-constexpr outer
-        # if is pruned reliably on every Triton backend.
         if TRACK_STATE:
             if i_t == i_track:
                 p_t1 = tl.make_block_ptr(
