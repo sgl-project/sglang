@@ -4,7 +4,7 @@ sent before its commit waits for its forward."""
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.pd_pp_consensus import (
     _DisaggPrefillRing,
 )
 from sglang.srt.managers.scheduler_components.mode_stages import ScheduleSlot
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
@@ -129,6 +130,10 @@ class _PPHiCache:
         # Per load, when it finishes; the loads not yet reaped.
         self.done_at = []
         self.ack_load_queue = []
+        # Read only when a queued load-back starts no new copy.
+        self.cache_controller = SimpleNamespace(
+            layer_done_counter=SimpleNamespace(producer_index=-1)
+        )
 
     def check_hicache_events(self):
         if self.pp_rank == 0:
@@ -183,7 +188,7 @@ def _decode_rank(pp_rank, sent_counts, dma_time, rids):
         enable_host_receive=False,
         enable_hisparse=False,
         gloo_group=None,
-        metadata_buffers=SimpleNamespace(bootstrap_room=[None] * len(rids)),
+        metadata_buffers=SimpleNamespace(clear_slot=lambda idx: None),
         req_to_metadata_buffer_idx_allocator=Mock(),
         _deferred_releases=[],
         _commit_transfer_to_req=Mock(),
@@ -252,6 +257,92 @@ class TestDecodeHiCacheAcrossPPRanks(CustomTestCase):
         # PP0's load lands between the next slot's count and its release;
         # PP1's lands later.
         self._run_ring(pp0_dma_time=1, pp1_dma_time=2)
+
+
+def _ready_req(rid, *, backup=None, copied=None):
+    """A ready request; `copied` is whether its restore copy has finished on
+    this rank, None when it restores nothing."""
+    event = None if copied is None else SimpleNamespace(query=lambda: copied)
+    return SimpleNamespace(
+        rid=rid,
+        last_node=object(),
+        kv=SimpleNamespace(
+            kv_committed_len=None, retraction_backup=backup, restore_done_event=event
+        ),
+        init_next_round_input=Mock(),
+        time_stats=MagicMock(),
+    )
+
+
+@patch(f"{DECODE_MODULE}.start_restore_kv_cache")
+@patch(f"{DECODE_MODULE}.finish_restore_kv_cache")
+class TestHostRestoreAdmission(CustomTestCase):
+    """KV received into host memory is copied into its row before admission
+    without blocking the scheduler. The ranks sharing a request must admit it
+    in the same step, so it waits until every rank's copy has finished; PP
+    stages cannot agree, so they admit it and wait for the copy on the host."""
+
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=True
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _admit(self, ready, *, pp_size=1, reduce=None):
+        enter_scope(self, published_topology(pp_size=pp_size))
+        owner = decode_owner_shell(
+            enable_host_receive=True,
+            restore_on_forward_stream=False,
+            enable_priority_scheduling=False,
+            req_to_token_pool=SimpleNamespace(size=8),
+            max_running_requests=8,
+            core_lists=SimpleNamespace(decoding=[]),
+            tree_cache=Mock(),
+            attn_cp_cpu_group=None,
+            ready=list(ready),
+        )
+        with patch(
+            f"{DECODE_MODULE}.all_reduce_flags",
+            reduce or (lambda flags, group, op: flags),
+        ):
+            admitted = owner.pop_reqs_to_admit(ScheduleSlot())
+        return owner, admitted
+
+    def test_a_copy_unfinished_on_a_peer_rank_keeps_the_request_ready(
+        self, finish, start
+    ):
+        restored = _ready_req("restored", copied=True)
+        plain = _ready_req("plain")
+        owner, admitted = self._admit(
+            [restored, plain], reduce=lambda flags, group, op: [0] * len(flags)
+        )
+        self.assertEqual(admitted, [plain])
+        self.assertEqual(owner.ready, [restored])
+
+        owner, admitted = self._admit(owner.ready)
+        self.assertEqual(admitted, [restored])
+        finish.assert_called_with(restored, owner.tree_cache)
+
+    def test_pp_admits_a_pending_copy_and_waits_on_the_host(self, finish, start):
+        restored = _ready_req("restored", copied=False)
+        owner, admitted = self._admit([restored], pp_size=2)
+        self.assertEqual(admitted, [restored])
+        finish.assert_called_once_with(restored, owner.tree_cache)
+
+    def test_a_received_request_starts_its_copy_before_admission(self, finish, start):
+        def start_copy(req, tree_cache):
+            req.kv.retraction_backup = None
+            req.kv.restore_done_event = SimpleNamespace(query=lambda: False)
+
+        start.side_effect = start_copy
+        received = _ready_req("received", backup=object())
+        owner, admitted = self._admit([received])
+        start.assert_called_once_with(received, owner.tree_cache)
+        self.assertEqual(admitted, [])
+        self.assertEqual(owner.ready, [received])
+        finish.assert_not_called()
 
 
 class TestDisaggPrefillRing(CustomTestCase):

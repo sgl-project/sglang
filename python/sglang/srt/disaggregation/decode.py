@@ -20,6 +20,7 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import random
@@ -109,10 +110,12 @@ from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
     dsv4_needs_rebootstrap,
+    finish_restore_kv_cache,
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
     restore_kv_cache,
+    start_restore_kv_cache,
     suffix_page_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -3279,6 +3282,21 @@ class DisaggDecode:
         self.decode_offload_manager = decode_offload_manager
         self.request_retirer = request_retirer
         self.flags = flags
+        # KV received into host memory is copied into its row before the
+        # request is admitted, on the stream forwards run on with the kernel
+        # backend: the forward stream under overlap or PP, else the schedule
+        # stream.
+        self.enable_host_receive = (
+            get_disagg().disaggregation_decode_host_receive_threshold < 1
+        )
+        self.restore_on_forward_stream = get_memory().hicache_io_backend == "kernel"
+        self.schedule_stream = streams.schedule_stream
+        self.forward_stream = (
+            streams.forward_stream
+            if enable_overlap or get_parallel().pp_size > 1
+            else streams.schedule_stream
+        )
+        self.device_module = streams.device_module
         # The requests whose KV has arrived: they own it and wait for a row of
         # the running set.
         self.ready: List[Req] = []
@@ -3833,14 +3851,27 @@ class DisaggDecode:
         if self.enable_priority_scheduling:
             self.policy.calc_priority(ready, decoding)
 
+        restoring: Set[int] = set()
+        if self.enable_host_receive:
+            self._start_host_restores()
+            restoring = self._host_restores_in_flight()
+
         max_running_reqs = min(self.req_to_token_pool.size, self.max_running_requests)
         num_free_rows = max(max_running_reqs - len(decoding), 0)
-        reqs = ready[:num_free_rows]
-        self.ready = ready[num_free_rows:]
+        # A request restored from host memory waits until its copy has finished.
+        reqs: List[Req] = []
+        self.ready = []
+        for req in ready:
+            if len(reqs) < num_free_rows and id(req) not in restoring:
+                reqs.append(req)
+            else:
+                self.ready.append(req)
         if not reqs:
             return reqs
 
         for req in reqs:
+            if self.enable_host_receive:
+                finish_restore_kv_cache(req, self.tree_cache)
             # `pop_preallocated` matched and locked new requests; a retracted or
             # rebootstrapped one owns its row, and a re-match here takes no lock.
             if get_disagg().disaggregation_decode_enable_radix_cache:
@@ -3858,6 +3889,52 @@ class DisaggDecode:
 
         set_time_batch(reqs, "set_forward_entry_time")
         return reqs
+
+    def _start_host_restores(self) -> None:
+        """Start the host-to-device copy of every ready request received into
+        host memory; `_host_restores_in_flight` says which copies some rank
+        sharing the request has not finished."""
+        reqs = [req for req in self.ready if req.kv.retraction_backup is not None]
+        if not reqs:
+            return
+        # The rows were preallocated from the pools, which get a released row
+        # back only at the commit of the last pending step that writes it: no
+        # forward in flight writes them, so the copies need no fence behind it.
+        with contextlib.ExitStack() as placement:
+            if self.restore_on_forward_stream:
+                # With the kernel backend the copies and their index kernels
+                # run between two forwards, never beside one, and read rows
+                # allocated on the schedule stream. The direct backend reads
+                # the device indices on the host while preparing a copy, which
+                # there would wait for the in-flight forward, so its copies
+                # stay on the transfer engine's streams.
+                self.forward_stream.wait_stream(self.schedule_stream)
+                engine = self.tree_cache.cache_controller.l2_transfer_engine
+                placement.enter_context(self.device_module.stream(self.forward_stream))
+                placement.enter_context(engine.on_current_stream())
+            for req in reqs:
+                start_restore_kv_cache(req, self.tree_cache)
+
+    def _host_restores_in_flight(self) -> Set[int]:
+        """Ids of the ready requests whose restore copy has not finished on
+        some rank that shares them. Each rank admits on its own and all must
+        admit the same requests: the attention-TP ranks, then the attention-CP
+        ranks, agree through a MIN all-reduce of the finished flags.
+
+        PP stages cannot agree here: a stage picks a microbatch's requests
+        before the next stage starts it, so a collective would deadlock. Under
+        PP no restore counts as in flight, and admission
+        (`finish_restore_kv_cache`) waits for the copy on the host, so every
+        stage admits the same requests."""
+        if get_parallel().pp_size > 1:
+            return set()
+        pending = [req for req in self.ready if req.kv.restore_done_event is not None]
+        if not pending:
+            return set()
+        done = [int(req.kv.restore_done_event.query()) for req in pending]
+        for group in (self.attn_tp_cpu_group, self.attn_cp_cpu_group):
+            done = all_reduce_flags(done, group, dist.ReduceOp.MIN)
+        return {id(req) for req, flag in zip(pending, done) if not flag}
 
     def join_ready(self, slot: ScheduleSlot) -> List[Req]:
         """The ready requests that fit slot, with their prefill handoff
@@ -3890,20 +3967,6 @@ class DisaggDecode:
             # Admission into the slot: the history row replays the prefill
             # node's output token.
             self.penalty_store.alloc(req)
-
-        # The admitted requests' rows were preallocated from the pools, which
-        # get a released row back only at the commit of the last pending step
-        # that writes it; no forward in flight writes them.
-        if get_disagg().disaggregation_decode_host_receive_threshold < 1:
-            for req in reqs:
-                if req.kv.retraction_backup is not None:
-                    restore_kv_cache(
-                        req,
-                        self.tree_cache,
-                        self.req_to_token_pool,
-                        self.token_to_kv_pool_allocator,
-                        "host_pool",
-                    )
 
         # Verify after host restore and before the cache takes any KV.
         reqs = self._verify_kv_checksums(reqs)

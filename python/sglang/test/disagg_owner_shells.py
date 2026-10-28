@@ -47,6 +47,7 @@ def decode_owner_shell(**attrs) -> DisaggDecode:
     owner.releasing = []
     owner.decode_offload_manager = None
     owner.enable_decode_hicache = False
+    owner.enable_host_receive = False
     owner.flags = EngineFlags()
     owner.__dict__.update(attrs)
     return owner
