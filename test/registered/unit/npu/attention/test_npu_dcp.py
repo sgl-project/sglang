@@ -384,6 +384,7 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
 
     def test_pd_buffer_infos_expand_only_global_page_strides(self):
         pool = object.__new__(NPUMLATokenToKVPool)
+        pool.use_combined_kv_buffer = False
         pool.k_buffer = [torch.empty(4, 8, 1, 2)]
         pool.v_buffer = [torch.empty(4, 8, 1, 1)]
         pool.dcp_size = 4

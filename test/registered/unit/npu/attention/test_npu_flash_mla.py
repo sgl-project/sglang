@@ -17,6 +17,7 @@ for name in (
     "torch_npu.contrib",
     "sgl_kernel_npu",
     "sgl_kernel_npu.attention",
+    "sgl_kernel_npu.attention.flash_mla",
     "sgl_kernel_npu.attention.sinks_attention",
     "sglang.srt.speculative",
     "sglang.srt.speculative.decoupled_spec_io",
@@ -35,6 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 def backend():
     obj = mod.AscendAttnBackend.__new__(mod.AscendAttnBackend)
     obj.use_flash_mla = obj.use_mla = True
+    obj.use_paged_mtp = False
     obj.needs_cpu_seq_lens = False
     obj.device = "cpu"
     obj.tp_q_head_num = 2
@@ -55,18 +57,17 @@ def backend():
 
     def attention(query, cache, **kwargs):
         assert kwargs["layout_q"] == "TND"
-        assert kwargs["layout_out"] == "NTD"
+        assert kwargs["layout_out"] == "TND"
         assert query.dim() == 3
-        q_t, q_n, _ = query.shape
-        output = torch.ones(q_n, q_t, 512, dtype=query.dtype)
+        output = query[..., :512] + 1
         q_len = kwargs["cu_seqlens_q"].diff()
         inactive = (kwargs["seqused_q"] == 0).repeat_interleave(q_len)
-        output[:, inactive] = float("nan")
+        output[inactive] = float("nan")
         return output, torch.empty(0, dtype=torch.float32)
 
     obj.flash_mla = Mock(side_effect=attention)
     obj.token_to_kv_pool = SimpleNamespace(
-        get_flash_mla_buffer=Mock(return_value=torch.zeros(3, 128, 1, 576)),
+        get_combined_kv_buffer=Mock(return_value=torch.zeros(3, 128, 1, 576)),
     )
     return obj
 
@@ -75,7 +76,8 @@ def make_batch(mode, lengths):
     return SimpleNamespace(
         batch_size=len(lengths),
         forward_mode=mode,
-        seq_lens=torch.tensor(lengths, dtype=torch.int32),
+        # Match the int64 input lengths created by ScheduleBatch and graph buffers.
+        seq_lens=torch.tensor(lengths, dtype=torch.int64),
         seq_lens_cpu=None,
         spec_algorithm=SimpleNamespace(
             is_dflash=lambda: False, is_dflash_family=lambda: True
@@ -94,12 +96,8 @@ def make_batch(mode, lengths):
     "mode,expected",
     [(ForwardMode.TARGET_VERIFY, [133, 0]), (ForwardMode.IDLE, [0, 0])],
 )
-@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_eager_metadata_uses_device_lengths_without_cpu_mirror(
-    backend, mode, expected, dtype
-):
+def test_eager_metadata_uses_device_lengths_without_cpu_mirror(backend, mode, expected):
     batch = make_batch(mode, [125, 0] if mode.is_target_verify() else [0, 0])
-    batch.seq_lens = batch.seq_lens.to(dtype)
     with (
         patch.object(
             mod, "get_parallel", return_value=SimpleNamespace(dcp_enabled=False)
@@ -142,7 +140,7 @@ def test_flash_mla_reuses_cpu_mirror_for_page_table_extent(
         metadata.seq_lens, torch.tensor([129, 257], dtype=torch.int32)
     )
     torch.testing.assert_close(
-        batch.seq_lens, torch.tensor([121, 249], dtype=torch.int32)
+        batch.seq_lens, torch.tensor([121, 249], dtype=torch.int64)
     )
     torch.testing.assert_close(batch.seq_lens_cpu, original)
     assert metadata.seqused_q.tolist() == [8, 8]
@@ -184,6 +182,7 @@ def test_target_verify_dispatches_to_flash_mla_and_zeroes_padding(backend):
     width = 8
     tokens = 2 * width + 2  # DP padding.
     q = torch.zeros(tokens, 2, 512, dtype=torch.bfloat16)
+    q.copy_(torch.arange(tokens * 2).view(tokens, 2, 1))
     rope = torch.zeros(tokens, 2, 64, dtype=torch.bfloat16)
     layer = SimpleNamespace(layer_id=0, tp_q_head_num=2, v_head_dim=512, scaling=0.1)
     with (
@@ -194,7 +193,7 @@ def test_target_verify_dispatches_to_flash_mla_and_zeroes_padding(backend):
             q, None, None, layer, batch, save_kv_cache=False, q_rope=rope
         )
     assert output.shape == (tokens, 1024)
-    torch.testing.assert_close(output[:width], torch.ones_like(output[:width]))
+    torch.testing.assert_close(output[:width], q[:width].reshape(width, -1) + 1)
     assert torch.count_nonzero(output[width:]) == 0
     args, kwargs = backend.flash_mla.call_args
     assert args[0].shape == (2 * width, 2, 576)
@@ -320,30 +319,18 @@ def test_non_speculative_graph_metadata_keeps_host_lengths(backend):
     backend.flash_mla_metadata.assert_not_called()
 
 
-@pytest.mark.parametrize("arch35", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize(
-    "enabled,dspark,is_draft,force_cpu,mojo,needs_cpu",
-    [
-        (False, False, False, False, False, True),
-        (True, False, False, False, False, True),
-        (True, False, False, False, True, True),
-        (True, False, False, True, False, True),
-        (False, True, False, False, False, True),
-        (True, True, False, False, False, False),
-        (True, True, False, True, False, True),
-        (True, True, False, False, True, False),
-        (True, True, True, False, False, True),
-        (False, True, True, False, False, True),
-        (True, True, True, False, True, False),
-        (False, True, True, False, True, False),
-        (True, True, True, True, True, True),
-    ],
+    "dspark,is_draft", [(False, False), (False, True), (True, False), (True, True)]
 )
+@pytest.mark.parametrize("force_cpu", [False, True])
+@pytest.mark.parametrize("paged_mtp", [False, True])
 def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
-    enabled, dspark, is_draft, force_cpu, mojo, needs_cpu, arch35
+    dspark, is_draft, force_cpu, paged_mtp, enabled
 ):
     uses_flash_mla = enabled and dspark and not is_draft
-    uses_mojo = mojo and is_draft and dspark
+    uses_paged_mtp = paged_mtp and is_draft and dspark
+    needs_cpu = force_cpu or not (uses_flash_mla or uses_paged_mtp)
     spec = SimpleNamespace(
         is_dspark=lambda: dspark,
         is_none=lambda: not dspark,
@@ -387,21 +374,10 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
             kwargs["device"] = "cpu"
         return original_tensor(*args, **kwargs)
 
-    cann_module = SimpleNamespace(flash_mla=Mock(), flash_mla_metadata=Mock())
     kernel_module = SimpleNamespace(flash_mla=Mock(), flash_mla_metadata=Mock())
     with (
-        patch.dict(
-            sys.modules,
-            {
-                "cann_ops_transformer.ops.attention.flash_mla": (
-                    cann_module if uses_flash_mla and arch35 else None
-                ),
-                "sgl_kernel_npu.attention.flash_mla": (
-                    kernel_module if uses_flash_mla and not arch35 else None
-                ),
-            },
-        ),
-        patch.object(mod, "is_npu_arch35", return_value=arch35),
+        patch.object(mod, "flash_mla", kernel_module.flash_mla),
+        patch.object(mod, "flash_mla_metadata", kernel_module.flash_mla_metadata),
         patch.object(mod.torch, "tensor", side_effect=tensor_on_cpu),
         patch.object(mod, "is_deepseek_dsa", return_value=False),
         patch.object(mod, "is_sparsity_driven_kv_offload_enabled", return_value=False),
@@ -411,7 +387,9 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
             mod,
             "get_bool_env_var",
             side_effect=lambda name, *args: (
-                name == "ASCEND_USE_FIA" or (mojo and name == "ASCEND_USE_MOJO_MTP")
+                name == "ASCEND_USE_FIA"
+                or (paged_mtp and name == "ASCEND_USE_PAGED_MTP")
+                or (enabled and name == "SGLANG_NPU_USE_FLASH_MLA")
             ),
         ),
         patch.object(
@@ -433,7 +411,6 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
                 attn_cp_size=1, attn_tp_size=4, dcp_enabled=False
             ),
         ),
-        patch.object(mod.envs.SGLANG_NPU_USE_FLASH_MLA, "get", return_value=enabled),
         patch.object(mod.logger, "warning") as warning,
         patch.object(
             mod.envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS,
@@ -443,9 +420,9 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
     ):
         obj = mod.AscendAttnBackend(runner)
     assert obj.use_flash_mla is uses_flash_mla
-    assert obj.use_mojo_mtp is uses_mojo
+    assert obj.use_paged_mtp is uses_paged_mtp
     assert obj.needs_cpu_seq_lens is needs_cpu
-    if not force_cpu and not (uses_flash_mla or uses_mojo):
+    if not force_cpu and not (uses_flash_mla or uses_paged_mtp):
         warning.assert_called_once_with(
             "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
             "host-bound attention paths present; keeping the mirror."
@@ -453,9 +430,8 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
     else:
         warning.assert_not_called()
     if uses_flash_mla:
-        provider = cann_module if arch35 else kernel_module
-        assert obj.flash_mla is provider.flash_mla
-        assert obj.flash_mla_metadata is provider.flash_mla_metadata
+        assert obj.flash_mla is kernel_module.flash_mla
+        assert obj.flash_mla_metadata is kernel_module.flash_mla_metadata
 
 
 @pytest.mark.parametrize("draft_needs_cpu", [True, False])
@@ -510,17 +486,12 @@ def pool_factory():
             layer_num=2,
             device="cpu",
             enable_memory_saver=False,
-            use_flash_mla=True,
+            use_combined_kv_buffer=True,
         )
         arguments.update(overrides)
         with (
             patch.object(KVCache, "__init__", init_cache),
             patch.object(pool_mod.NPUMLATokenToKVPool, "_finalize_allocation_log"),
-            patch.object(
-                pool_mod.envs.SGLANG_NPU_USE_FLASH_MLA,
-                "get",
-                side_effect=AssertionError("pool must use the caller's resolved flag"),
-            ),
             patch.object(
                 pool_mod.envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD,
                 "get",
@@ -556,7 +527,7 @@ def test_merged_cache_preserves_split_views_and_page_boundary_writes(
         create=True,
     ):
         pool.set_kv_buffer(SimpleNamespace(layer_id=0), locations, key, rope)
-    combined = pool.get_flash_mla_buffer(0).view(-1, 1, 576)
+    combined = pool.get_combined_kv_buffer(0).view(-1, 1, 576)
     torch.testing.assert_close(combined[locations], torch.cat((key, rope), dim=-1))
     split_key, split_rope = pool.get_kv_buffer(0)
     assert (
@@ -584,9 +555,9 @@ def test_merged_cache_preserves_split_views_and_page_boundary_writes(
 
 
 @pytest.mark.parametrize("fia_nz", [False, True])
-def test_disabled_flash_mla_keeps_separate_cache_allocations(pool_factory, fia_nz):
-    pool = pool_factory(use_flash_mla=False, fia_nz=fia_nz)
-    assert pool.use_flash_mla is False
+def test_disabled_combined_kv_buffer_keeps_separate_allocations(pool_factory, fia_nz):
+    pool = pool_factory(use_combined_kv_buffer=False, fia_nz=fia_nz)
+    assert pool.use_combined_kv_buffer is False
     key, rope = pool.get_kv_buffer(0)
     assert key.is_contiguous() and rope.is_contiguous()
     assert key.untyped_storage().data_ptr() != rope.untyped_storage().data_ptr()
@@ -598,12 +569,17 @@ def test_disabled_flash_mla_keeps_separate_cache_allocations(pool_factory, fia_n
     "dspark,is_draft", [(False, False), (True, False), (True, True)]
 )
 @pytest.mark.parametrize("arch35", [False, True])
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("flash_mla_env", [None, "0", "1"])
 @pytest.mark.parametrize("hybrid", [False, True])
 def test_pool_configurator_only_merges_dspark_target_cache(
-    pool_factory, dspark, is_draft, arch35, enabled, hybrid
+    pool_factory, monkeypatch, dspark, is_draft, arch35, flash_mla_env, hybrid
 ):
     from sglang.srt.hardware_backend.npu import utils as npu_utils
+
+    if flash_mla_env is None:
+        monkeypatch.delenv("SGLANG_NPU_USE_FLASH_MLA", raising=False)
+    else:
+        monkeypatch.setenv("SGLANG_NPU_USE_FLASH_MLA", flash_mla_env)
 
     with patch.dict(
         sys.modules, {"sglang.srt.speculative.draft_parallel": MagicMock()}
@@ -636,9 +612,6 @@ def test_pool_configurator_only_merges_dspark_target_cache(
         patch.object(config_mod, "_is_npu", True),
         patch.object(
             config_mod.KVCacheConfigurator, "_build_mha_quant_method", return_value=None
-        ),
-        patch.object(
-            config_mod.envs.SGLANG_NPU_USE_FLASH_MLA, "get", return_value=enabled
         ),
         patch.object(npu_utils, "is_npu_arch35", return_value=arch35),
         patch.object(
@@ -680,10 +653,14 @@ def test_pool_configurator_only_merges_dspark_target_cache(
                 max_total_num_tokens=256, is_dsa_model=False
             )
     constructor.assert_called_once()
-    requested = enabled and dspark and not is_draft
-    assert constructor.call_args.kwargs.get("use_flash_mla", False) is requested
-    pool = pool_factory(**{**constructor.call_args.kwargs, "use_flash_mla": requested})
-    assert pool.use_flash_mla is requested
+    requested = flash_mla_env == "1" and dspark and not is_draft
+    assert (
+        constructor.call_args.kwargs.get("use_combined_kv_buffer", False) is requested
+    )
+    pool = pool_factory(
+        **{"use_combined_kv_buffer": False, **constructor.call_args.kwargs}
+    )
+    assert pool.use_combined_kv_buffer is requested
     key, rope = pool.get_kv_buffer(0)
     shares_storage = (
         key.untyped_storage().data_ptr() == rope.untyped_storage().data_ptr()
@@ -691,14 +668,14 @@ def test_pool_configurator_only_merges_dspark_target_cache(
     assert shares_storage is requested
 
 
-def test_k3_hybrid_pool_maps_model_layer_to_flash_mla_cache(pool_factory):
+def test_k3_hybrid_pool_maps_model_layer_to_combined_kv_cache(pool_factory):
     pool = pool_factory()
     hybrid = HybridLinearKVPool.__new__(HybridLinearKVPool)
     hybrid.full_kv_pool = pool
     hybrid.full_attention_layer_id_mapping = {3: 0, 7: 1}
     hybrid.start_layer = 0
     hybrid.layer_transfer_counter = Mock()
-    assert hybrid.get_flash_mla_buffer(7).data_ptr() == pool.kv_buffer[1].data_ptr()
+    assert hybrid.get_combined_kv_buffer(7).data_ptr() == pool.kv_buffer[1].data_ptr()
     hybrid.layer_transfer_counter.wait_until.assert_called_once_with(7)
 
 

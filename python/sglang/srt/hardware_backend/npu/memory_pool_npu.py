@@ -627,8 +627,6 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
-    use_flash_mla: bool = False
-
     def __init__(
         self,
         size: int,
@@ -647,7 +645,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
         is_draft_worker: bool = False,
-        use_flash_mla: bool = False,
+        use_combined_kv_buffer: bool = False,
     ):
         # MLAPO historically owned NZ writes. Keep the allocation unchanged and
         # write into the NZ-addressed view below so ordinary MLA (including
@@ -715,7 +713,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
-        self.use_flash_mla = use_flash_mla
+        self.use_combined_kv_buffer = use_combined_kv_buffer
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
         index_page_padding = global_page_padding if index_head_dim is not None else 1
@@ -732,7 +730,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             if self.enable_sparsity_driven_kv_offload:
                 self.k_buffer = None
                 self.v_buffer = None
-            elif self.use_flash_mla:
+            elif self.use_combined_kv_buffer:
                 self.kv_buffer = torch.zeros(
                     (
                         layer_num,
@@ -744,7 +742,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.store_dtype,
                     device=self.device,
                 )
-                # Split views share the FlashMLA cache allocation.
+                # Split views share the combined cache allocation.
                 self.k_buffer = self.kv_buffer[..., : self.kv_cache_dim]
                 self.v_buffer = self.kv_buffer[..., self.kv_cache_dim :]
             else:
@@ -814,10 +812,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     buffer.view(-1, 1, self.kv_cache_dim + self.kr_cache_dim)
                     for buffer in self.kv_buffer
                 )
-                if self.use_flash_mla
+                if self.use_combined_kv_buffer
                 else self._mla_native_buffers()
             ),
-            native_buffers=None if self.use_flash_mla else self._mla_native_buffers,
+            native_buffers=(
+                None if self.use_combined_kv_buffer else self._mla_native_buffers
+            ),
             data_ptrs=None,
             layer_indices=tuple(range(self.layer_num)),
             device_layer_num=self.layer_num,
@@ -898,13 +898,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.v_buffer[layer_id - self.start_layer],
         )
 
-    def get_flash_mla_buffer(self, layer_id: int):
+    def get_combined_kv_buffer(self, layer_id: int):
+        """Return combined MLA latent/RoPE cache: [pages, page_size, 1, dim]."""
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.kv_buffer[layer_id - self.start_layer]
 
     def _clear_buffers(self):
-        if self.use_flash_mla:
+        if self.use_combined_kv_buffer:
             del self.k_buffer, self.v_buffer
         super()._clear_buffers()
 
@@ -968,7 +969,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         """Return (buffer, uses_global_slots) entries in PD transfer order."""
         self._raise_if_native_kv_cache_disabled()
         global_kv = self.is_draft_worker
-        if self.use_flash_mla:
+        if self.use_combined_kv_buffer:
             return [(buffer, global_kv) for buffer in self.kv_buffer]
         entries = [(buffer, global_kv) for buffer in self.k_buffer]
         if not getattr(self, "dsa_kv_cache_store_fp8", False):
@@ -1001,7 +1002,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_kv_layer_ids(self):
         return (
             list(range(self.start_layer, self.start_layer + self.layer_num))
-            * (1 if self.use_flash_mla else 2)
+            * (1 if self.use_combined_kv_buffer else 2)
             + self.get_state_layer_ids()
         )
 
@@ -1071,9 +1072,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if self.use_flash_mla:
+        if self.use_combined_kv_buffer:
             torch_npu.npu_scatter_nd_update_(
-                self.get_flash_mla_buffer(layer_id).view(
+                self.get_combined_kv_buffer(layer_id).view(
                     -1, 1, self.kv_cache_dim + self.kr_cache_dim
                 ),
                 loc.view(-1, 1),

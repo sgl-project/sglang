@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
+from sgl_kernel_npu.attention.flash_mla import flash_mla, flash_mla_metadata
 from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_prefill_triton,
     attention_sinks_triton,
@@ -28,7 +29,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -315,9 +315,6 @@ def _cp_allgather_and_save_kv_npu(
 
 
 class AscendAttnBackend(AttentionBackend):
-    use_mojo_mtp: bool = False
-    use_flash_mla: bool = False
-
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -392,8 +389,8 @@ class AscendAttnBackend(AttentionBackend):
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
         )
-        self.use_mojo_mtp = (
-            get_bool_env_var("ASCEND_USE_MOJO_MTP", "False")
+        self.use_paged_mtp = (
+            get_bool_env_var("ASCEND_USE_PAGED_MTP", "False")
             and model_runner.is_draft_worker
             and model_runner.spec_algorithm.is_dspark()
         )
@@ -401,20 +398,9 @@ class AscendAttnBackend(AttentionBackend):
             self.use_mla
             and not self.is_draft_worker
             and model_runner.spec_algorithm.is_dspark()
-            and envs.SGLANG_NPU_USE_FLASH_MLA.get()
+            and get_bool_env_var("SGLANG_NPU_USE_FLASH_MLA", "False")
         )
         if self.use_flash_mla:
-            if is_npu_arch35():
-                from cann_ops_transformer.ops.attention.flash_mla import (
-                    flash_mla,
-                    flash_mla_metadata,
-                )
-            else:
-                from sgl_kernel_npu.attention.flash_mla import (
-                    flash_mla,
-                    flash_mla_metadata,
-                )
-
             self.flash_mla = flash_mla
             self.flash_mla_metadata = flash_mla_metadata
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
@@ -453,7 +439,7 @@ class AscendAttnBackend(AttentionBackend):
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
             # FIA host IntArrays consume the CPU mirror; keep it on instead of
             # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
-            if self.use_fia and not (self.use_flash_mla or self.use_mojo_mtp):
+            if self.use_fia and not (self.use_flash_mla or self.use_paged_mtp):
                 logger.warning(
                     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
                     "host-bound attention paths present; keeping the mirror."
@@ -781,8 +767,8 @@ class AscendAttnBackend(AttentionBackend):
             self._prepare_flash_mla_metadata(
                 self.forward_metadata, forward_batch.seq_lens
             )
-        elif self.use_mojo_mtp:
-            self._prepare_mojo_mtp_metadata(
+        elif self.use_paged_mtp:
+            self._prepare_paged_mtp_metadata(
                 self.forward_metadata, forward_batch.seq_lens
             )
         self.graph_mode = False
@@ -915,7 +901,7 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         if self.needs_cpu_seq_lens:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        if self.use_flash_mla or self.use_mojo_mtp:
+        if self.use_flash_mla or self.use_paged_mtp:
             metadata.seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
         else:
             metadata.seq_lens = seq_lens
@@ -1139,11 +1125,11 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
-        if self.use_flash_mla or self.use_mojo_mtp:
+        if self.use_flash_mla or self.use_paged_mtp:
             if self.use_flash_mla:
                 self._prepare_flash_mla_metadata(metadata, seq_lens[:bs])
             else:
-                self._prepare_mojo_mtp_metadata(metadata, seq_lens[:bs])
+                self._prepare_paged_mtp_metadata(metadata, seq_lens[:bs])
             self.forward_metadata = metadata
             self.graph_mode = True
             return
@@ -1170,7 +1156,7 @@ class AscendAttnBackend(AttentionBackend):
 
         self.graph_mode = True
 
-    def _prepare_mojo_mtp_metadata(
+    def _prepare_paged_mtp_metadata(
         self,
         metadata: ForwardMetadata,
         prefix_lens: torch.Tensor,
@@ -1187,8 +1173,10 @@ class AscendAttnBackend(AttentionBackend):
                 device=prefix_lens.device,
             )
 
-    def _forward_mojo_mtp(self, q, layer, forward_batch, sinks):
-        from sgl_kernel_npu.attention.mojo_mtp import mojo_paged_mtp_decode
+    def _forward_paged_mtp(self, q, layer, forward_batch, sinks):
+        from sgl_kernel_npu.attention.paged_mtp_attention import (
+            paged_mtp_attention_decode,
+        )
 
         query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
         padded_tokens = query.shape[0]
@@ -1196,7 +1184,7 @@ class AscendAttnBackend(AttentionBackend):
             query = query[: forward_batch.global_num_token_non_padded_cpu]
         width = self.speculative_num_draft_tokens
         bs = query.shape[0] // width
-        output = mojo_paged_mtp_decode(
+        output = paged_mtp_attention_decode(
             query=query,
             k_cache=self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
@@ -1287,7 +1275,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         output, _ = self.flash_mla(
             query,
-            self.token_to_kv_pool.get_flash_mla_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_combined_kv_buffer(layer.layer_id),
             block_table=metadata.block_tables,
             cache_seqlens=metadata.seq_lens,
             cu_seqlens_q=metadata.cu_seqlens_q,
@@ -1301,11 +1289,10 @@ class AscendAttnBackend(AttentionBackend):
             max_seqlen_kv=-1,
             layout_q="TND",
             layout_kv="PA_BBND",
-            layout_out="NTD",
+            layout_out="TND",
             return_softmax_lse=False,
         )
-        # FlashMLA returns NTD; convert to token-major TND.
-        output = output.permute(1, 0, 2).contiguous().view(batch_size, query_len, -1)
+        output = output.view(batch_size, query_len, -1)
         # Mask every query row of padded requests.
         inactive = (metadata.seqused_q == 0)[:, None, None]
         output = output.masked_fill(inactive, 0).reshape(num_tokens, -1)
@@ -2692,8 +2679,8 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_flash_mla and forward_batch.forward_mode.is_target_verify():
             return self._forward_flash_mla(q, q_rope, layer, forward_batch)
 
-        if self.use_mojo_mtp:
-            return self._forward_mojo_mtp(q, layer, forward_batch, sinks)
+        if self.use_paged_mtp:
+            return self._forward_paged_mtp(q, layer, forward_batch, sinks)
 
         if not self.use_mla:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(

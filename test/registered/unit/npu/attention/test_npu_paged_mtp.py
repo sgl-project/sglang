@@ -44,7 +44,7 @@ def source_method(path, cls, method, namespace):
 @pytest.fixture
 def backend():
     obj = mod.AscendAttnBackend.__new__(mod.AscendAttnBackend)
-    obj.use_mojo_mtp = True
+    obj.use_paged_mtp = True
     obj.use_flash_mla = obj.use_mla = False
     obj.is_draft_worker = True
     obj.needs_cpu_seq_lens = False
@@ -72,7 +72,8 @@ def batch(lengths=(127, 0)):
     return SimpleNamespace(
         batch_size=len(lengths),
         forward_mode=ForwardMode.TARGET_VERIFY,
-        seq_lens=torch.tensor(lengths, dtype=torch.int32),
+        # Match the int64 input lengths created by ScheduleBatch and graph buffers.
+        seq_lens=torch.tensor(lengths, dtype=torch.int64),
         seq_lens_cpu=None,
         req_pool_indices=torch.arange(len(lengths)),
         out_cache_loc=None,
@@ -118,10 +119,10 @@ def test_graph_refresh_keeps_storage_and_masks_reused_padding_slots(backend):
         backend.init_forward_metadata_out_graph(fb, in_capture=True)
         metadata = backend.forward_metadata
         pointers = (metadata.seq_lens.data_ptr(), metadata.cu_seqlens_q.data_ptr())
-        fb.seq_lens.copy_(torch.tensor([254, 127], dtype=torch.int32))
+        fb.seq_lens.copy_(torch.tensor([254, 127], dtype=torch.int64))
         backend.init_forward_metadata_out_graph(fb)
         updated = metadata.seq_lens.clone()
-        fb.seq_lens.copy_(torch.tensor([255, 0], dtype=torch.int32))
+        fb.seq_lens.copy_(torch.tensor([255, 0], dtype=torch.int64))
         backend.init_forward_metadata_out_graph(fb)
     assert updated.tolist() == [261, 134]
     assert metadata.seq_lens.tolist() == [262, 0]
@@ -190,10 +191,11 @@ def test_forward_uses_device_lengths_without_host_attention_and_restores_dp_padd
         else mod.AttentionType.ENCODER_ONLY,
     )
     kernel = Mock(side_effect=lambda **kw: torch.ones_like(kw["query"]))
-    module_name = "sgl_kernel_npu.attention.mojo_mtp"
+    module_name = "sgl_kernel_npu.attention.paged_mtp_attention"
     with (
         patch.dict(
-            sys.modules, {module_name: SimpleNamespace(mojo_paged_mtp_decode=kernel)}
+            sys.modules,
+            {module_name: SimpleNamespace(paged_mtp_attention_decode=kernel)},
         ),
         patch.object(torch.Tensor, "cpu", side_effect=AssertionError("unexpected D2H")),
         patch.object(

@@ -118,6 +118,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_available_gpu_memory,
+    get_bool_env_var,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
     is_hip,
@@ -356,6 +357,14 @@ class KVCacheConfigurator:
     kv_shard_group: Optional[GroupCoordinator] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+
+    @property
+    def use_combined_kv_buffer(self) -> bool:
+        return (
+            get_bool_env_var("SGLANG_NPU_USE_FLASH_MLA", "False")
+            and self.spec_algorithm.is_dspark()
+            and not self.is_draft_worker
+        )
 
     @property
     def draft_attn_tp_size(self) -> int:
@@ -2269,11 +2278,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            use_flash_mla=(
-                envs.SGLANG_NPU_USE_FLASH_MLA.get()
-                and self.spec_algorithm.is_dspark()
-                and not self.is_draft_worker
-            ),
+            use_combined_kv_buffer=self.use_combined_kv_buffer,
         )
         return token_to_kv_pool
 
@@ -2600,11 +2605,7 @@ class KVCacheConfigurator:
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
             if _is_npu:
-                extra_args["use_flash_mla"] = (
-                    envs.SGLANG_NPU_USE_FLASH_MLA.get()
-                    and self.spec_algorithm.is_dspark()
-                    and not self.is_draft_worker
-                )
+                extra_args["use_combined_kv_buffer"] = self.use_combined_kv_buffer
             if is_deepseek_dsa(self.model_config.hf_config):
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
