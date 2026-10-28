@@ -233,6 +233,8 @@ _flashinfer_autotuner = None
 _BF16_LOW_M_AUTOTUNE_MAX_M = 16
 # FlashInfer's cute-dsl mm_bf16 raises, rather than falling back, unless K % CTA_K == 0.
 _CUTE_DSL_BF16_CTA_K = 128
+_rdna_splitk_gemv = None
+_use_rdna_splitk_gemv = None
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
@@ -481,6 +483,17 @@ def initialize_bf16_gemm_config() -> None:
         _is_gfx95 and get_exec().deterministic.enable_deterministic_inference
     )
 
+    global _rdna_splitk_gemv, _use_rdna_splitk_gemv
+
+    if is_hip():
+        from sglang.kernels.ops.gemm.rdna_small_m_gemv import (
+            rdna_splitk_gemv,
+            use_rdna_splitk_gemv,
+        )
+
+        _rdna_splitk_gemv = rdna_splitk_gemv
+        _use_rdna_splitk_gemv = use_rdna_splitk_gemv
+
     backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
         backend_str = (
@@ -690,7 +703,17 @@ def _bf16_gemm_dispatch_impl(
     if output is not None:
         return output if addend is None else output.add_(addend)
     m = x.numel() // x.shape[-1]
-    if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
+    if (
+        _use_rdna_splitk_gemv is not None
+        and bias is None
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and _use_rdna_splitk_gemv(m, weight.shape[0], weight.shape[1], weight.dtype)
+    ):
+        output = _rdna_splitk_gemv(x.view(-1, x.shape[-1]), weight).view(
+            *x.shape[:-1], weight.shape[0]
+        )
+    elif _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
         output = _bf16_splitk_gemm(x, weight, bias)
