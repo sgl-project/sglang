@@ -106,6 +106,10 @@ def _make_batch_str_output() -> BatchStrOutput:
             None,
         ],
         token_steps=[[1], [2]],
+        prefill_weight_versions=[
+            [WeightVersionSpan(version="v0", start=0, end=7)],
+            None,
+        ],
     )
 
 
@@ -422,6 +426,25 @@ class TestMultiTokenizerMixin(CustomTestCase):
             [(target, obj.rids) for target, obj in sent],
             [("detok-a", ["embedding-rid-0"]), ("detok-a", ["embedding-rid-1"])],
         )
+
+    def test_batch_str_output_keeps_prefill_weight_versions_nested_per_request(self):
+        """Prefill spans split per request the same way the sampling spans do."""
+        output = _make_batch_str_output()
+
+        self.assertEqual(
+            _handle_output_by_index(output, 0).prefill_weight_versions,
+            [[WeightVersionSpan(version="v0", start=0, end=7)]],
+        )
+        self.assertEqual(
+            _handle_output_by_index(output, 1).prefill_weight_versions, [None]
+        )
+
+    def test_batch_str_output_without_prefill_weight_versions_stays_none(self):
+        """An output produced without the flag splits into None."""
+        output = _make_batch_str_output()
+        output.prefill_weight_versions = None
+
+        self.assertIsNone(_handle_output_by_index(output, 0).prefill_weight_versions)
 
     def test_router_keys_on_rid_without_tokenizer_worker_ipcs(self):
         output = _make_batch_str_output()

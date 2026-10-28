@@ -2694,6 +2694,32 @@ class TestHiCacheArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_first")
         self.assertIsNone(resolution_result(args, "decode_attention_backend"))
 
+    def test_prefill_weight_versions_rejects_hierarchical_cache(self):
+        """KV restored from a host or storage tier carries no weight version, so the two cannot combine."""
+        args = self._make_args(
+            enable_prefill_weight_versions=True,
+            enable_hierarchical_cache=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
+            handle_cache_compatibility(args)
+
+    def test_prefill_weight_versions_rejects_disaggregation(self):
+        """PD prefill workers do not stamp prompt tokens yet, so the flag is refused there."""
+        args = self._make_args(
+            enable_prefill_weight_versions=True,
+            disaggregation_mode="prefill",
+        )
+
+        with self.assertRaisesRegex(ValueError, "disaggregation"):
+            handle_cache_compatibility(args)
+
+    def test_prefill_weight_versions_alone_is_accepted(self):
+        """A plain engine may report prompt weight versions."""
+        args = self._make_args(enable_prefill_weight_versions=True)
+
+        handle_cache_compatibility(args)
+
     def test_decode_offload_rejects_host_pool_retraction(self):
         args = self._make_args(
             disaggregation_mode="decode",
@@ -5082,6 +5108,37 @@ class TestLazyReexports(CustomTestCase):
     def test_an_unknown_attribute_still_raises(self):
         with self.assertRaises(AttributeError):
             server_args_module.NotAThing
+
+
+class TestPrefillWeightVersionCompatibility(CustomTestCase):
+    def test_untracked_kv_paths_rejected(self) -> None:
+        """Reject paths that load or produce KV without preserving provenance."""
+        for overrides in [
+            {"enable_unified_memory": True},
+            {"enable_encoder_swa_bounded_replay": True},
+            {"enable_lmcache": True},
+            {"enable_unified_cache_external_linker": True},
+            {"enable_pdmux": True},
+            {"dllm_algorithm": "LowConfidence"},
+            {"speculative_algorithm": "NGRAM"},
+            {"speculative_algorithm": "UNO"},
+            {"speculative_algorithm": "DSPARK"},
+        ]:
+            with self.subTest(overrides=overrides):
+                args = ServerArgs(
+                    model_path="dummy", enable_prefill_weight_versions=True, **overrides
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "enable-prefill-weight-versions"
+                ):
+                    handle_cache_compatibility(args)
+
+    def test_rust_response_without_provenance_rejected(self) -> None:
+        """Reject the Rust response path that cannot serialize prompt versions."""
+        args = ServerArgs(model_path="dummy", enable_prefill_weight_versions=True)
+        with envs.SGLANG_RUST_SERVER.override(True):
+            with self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"):
+                handle_cache_compatibility(args)
 
 
 if __name__ == "__main__":

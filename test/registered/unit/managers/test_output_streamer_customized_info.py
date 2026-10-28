@@ -89,6 +89,7 @@ class _FakeReq:
         self.multimodal_inputs = None
         self.customized_info = customized_info
         self.weight_version_events = []
+        self.prefill_weight_versions = None
 
     def finished(self):
         return self._finished
@@ -778,6 +779,55 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                             received[i][0].extend(masks)
                             received[i][1].extend(logprobs)
                 self.assertEqual(received, expected)
+
+
+class TestOutputStreamerPrefillWeightVersions(unittest.TestCase):
+    def test_payload_carries_prefill_spans_for_finished_requests(self):
+        """Prefill spans computed before the KV release ride out with the finished request."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        finished_req = _FakeReq("r1", [20], finished=True)
+        finished_req.prefill_weight_versions = [
+            WeightVersionSpan(version="v0", start=0, end=4),
+            WeightVersionSpan(version="v1", start=4, end=6),
+        ]
+
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=streaming_req)
+        accumulator.accept(req=finished_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertEqual(
+            payload.prefill_weight_versions,
+            [
+                None,
+                [
+                    WeightVersionSpan(version="v0", start=0, end=4),
+                    WeightVersionSpan(version="v1", start=4, end=6),
+                ],
+            ],
+        )
+
+    def test_an_unfinished_request_withholds_its_prefill_spans(self):
+        """Spans of a request still generating must not ship before its finishing chunk."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        streaming_req.prefill_weight_versions = [
+            WeightVersionSpan(version="v0", start=0, end=4)
+        ]
+
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=streaming_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.prefill_weight_versions)
+
+    def test_payload_omits_prefill_spans_when_the_flag_is_off(self):
+        """With tracking disabled every request contributes None, so nothing goes on the wire."""
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=_FakeReq("r0", [10], finished=True))
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.prefill_weight_versions)
+        self.assertIsNotNone(payload.weight_versions)
 
 
 if __name__ == "__main__":

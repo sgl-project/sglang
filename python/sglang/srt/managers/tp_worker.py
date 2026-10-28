@@ -707,6 +707,7 @@ class TpModelWorker(BaseTpWorker):
                     if folded is None
                     else self.model_runner.runner_ids.own_plan(batch)
                 ),
+                kv_weight_version_record=out.kv_weight_version_record,
             )
             if (
                 batch is not None
