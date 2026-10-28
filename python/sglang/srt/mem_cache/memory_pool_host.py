@@ -248,6 +248,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         pin_memory: bool = True,
         allocator_type: str = "default",
         page_aligned_only: bool = False,
+        is_dummy: bool = False,
     ):
         if _is_xpu:
             require_kvcacheio_ops(
@@ -262,6 +263,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                     "(--enable-hierarchical-cache)."
                 )
         self.pool_name = pool_name
+        self._is_dummy = is_dummy
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
         # The token-granular copy below addresses the fused DSv4 C4 row. Neither
@@ -286,8 +288,21 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.device_buffers = device_buffers
         self.gpu_device = device_buffers[0].device if device_buffers else device
 
+        if is_dummy:
+            if layout not in ("layer_first", "page_first", "page_first_direct"):
+                raise ValueError(f"Unsupported layout: {layout}")
+            self.kv_buffer = None
+            self.data_refs = []
+            self.device_ptrs = None
+            self.data_ptrs = None
+            self.staging_buffer = None
+            self.can_use_jit = False
+            self.can_use_write_back_jit = False
+            self.clear()
+            return
+
         requested_bytes = self.layer_num * num_host_pages * self.item_bytes
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for V4 paged pool {pool_name}. "
@@ -458,6 +473,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         return self.kv_buffer
 
     def get_hybrid_pool_buffer(self):
+        if self._is_dummy:
+            return []
         return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
 
     def clear(self):
@@ -700,6 +717,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             )
 
     def get_data_page(self, index, flat=True):
+        assert not self._is_dummy, "Dummy V4 host pool has no physical storage"
         index = int(index) // self.slot_page_size
         if self.layout == "layer_first":
             data_page = torch.stack(
@@ -712,6 +730,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         return data_page.flatten() if flat else data_page
 
     def get_dummy_flat_data_page(self):
+        assert not self._is_dummy, "Dummy V4 host pool has no physical storage"
         return torch.zeros(
             (self.layer_num, self.item_bytes),
             dtype=self.dtype,
@@ -720,6 +739,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index, data_page):
+        assert not self._is_dummy, "Dummy V4 host pool has no physical storage"
         index = int(index) // self.slot_page_size
         if self.layout == "layer_first":
             data = data_page.view(self.dtype).reshape(self.layer_num, self.item_bytes)
@@ -737,6 +757,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_page_buffer_meta(self, indices):
+        assert not self._is_dummy, "Dummy V4 host pool has no physical storage"
         ptr_list = []
         rows = self._to_page_indices(indices).tolist()
         if self.layout == "layer_first":
@@ -780,6 +801,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
+        is_dummy: bool = False,
     ):
         if any(pool is None for pool in state_pools):
             raise ValueError(f"{pool_name} state_pools must not contain None")
@@ -789,6 +811,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             )
 
         self.pool_name = pool_name
+        self._is_dummy = is_dummy
         self.state_pools = state_pools
         self.layer_num = len(state_pools)
         self.num_host_pages = num_host_pages
@@ -811,8 +834,21 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self._init_device_page_views()
         self.size_per_token = self.state_page_bytes
 
+        if is_dummy:
+            if layout not in ("layer_first", "page_first", "page_first_direct"):
+                raise ValueError(f"Unsupported layout: {layout}")
+            self.kv_buffer = None
+            self.data_refs = []
+            self.device_ptrs = None
+            self.data_ptrs = None
+            self.staging_buffer = None
+            self.can_use_jit = False
+            self.can_use_write_back_jit = False
+            self.clear()
+            return
+
         requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for V4 state pool {pool_name}. "
@@ -987,6 +1023,8 @@ class DeepSeekV4StateHostPool(HostKVCache):
         return self.kv_buffer
 
     def get_hybrid_pool_buffer(self):
+        if self._is_dummy:
+            return []
         return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
 
     def clear(self):
@@ -1187,6 +1225,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             )
 
     def get_data_page(self, index, flat=True):
+        assert not self._is_dummy, "Dummy V4 host pool has no physical storage"
         index = int(index) // self.swa_page_size
         if self.layout == "layer_first":
             data_page = torch.stack(
@@ -1199,6 +1238,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         return data_page.flatten() if flat else data_page
 
     def get_dummy_flat_data_page(self):
+        assert not self._is_dummy, "Dummy V4 host pool has no physical storage"
         return torch.zeros(
             (self.layer_num, self.state_page_bytes),
             dtype=self.dtype,
@@ -1207,6 +1247,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index, data_page):
+        assert not self._is_dummy, "Dummy V4 host pool has no physical storage"
         index = int(index) // self.swa_page_size
         if self.layout == "layer_first":
             data = data_page.view(self.dtype).reshape(
@@ -1230,6 +1271,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_page_buffer_meta(self, indices):
+        assert not self._is_dummy, "Dummy V4 host pool has no physical storage"
         ptr_list = []
         rows = self._to_page_indices(indices).tolist()
         if self.layout == "layer_first":

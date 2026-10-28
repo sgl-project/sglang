@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
     MambaPool,
+    MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
@@ -66,6 +67,127 @@ class TestDeepSeekV4SWAPageLayout(CustomTestCase):
                 physical_page_size=64,
                 consumer="test consumer",
             )
+
+    def test_low_ratio_dummy_pools_keep_all_regions_without_host_buffers(self):
+        kv = SimpleNamespace(kv_buffer=[torch.zeros((4, 16), dtype=torch.uint8)])
+        index = SimpleNamespace(
+            page_size=2,
+            index_k_with_scale_buffer=None,
+            index_k_payload_buffer=[torch.zeros((4, 8), dtype=torch.uint8)],
+            index_k_scale_buffer=[torch.zeros((4, 4), dtype=torch.uint8)],
+        )
+        cache = SimpleNamespace(
+            sources_by_ratio={2: [3]},
+            start_layer=0,
+            kv_pools={2: kv},
+            index_pools={2: index},
+        )
+        with (
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    hicache_mem_layout="layer_first",
+                ),
+            ),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+        ):
+            entries = hybrid_pool_assembler._dsv4_low_ratio_entries(
+                cache,
+                4,
+                4,
+                8,
+                is_dummy=True,
+            )
+        self.assertEqual(
+            {entry.name for entry in entries},
+            {
+                PoolName.DEEPSEEK_V4_C2,
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+            },
+        )
+        for entry in entries:
+            pool = entry.host_pool
+            self.assertTrue(pool._is_dummy)
+            self.assertIsNone(pool.kv_buffer)
+            self.assertEqual(pool.layer_num, 1)
+            self.assertEqual(pool.alloc(4).tolist(), [0, 1, 2, 3])
+
+    def test_low_ratio_shared_sources_restore_once_with_stage_local_layers(self):
+        from sglang.srt.mem_cache.mla_host_dedup import V4HostDedupBroadcaster
+
+        # Global layers 8/14 own keys; later indexer layers only rescore them.
+        # Two source layers, four physical pages per source, split index scales.
+        kv = SimpleNamespace(
+            kv_buffer=[torch.zeros((4, 16), dtype=torch.uint8) for _ in range(2)]
+        )
+        index = SimpleNamespace(
+            page_size=2,
+            index_k_with_scale_buffer=None,
+            index_k_payload_buffer=[
+                torch.zeros((4, 8), dtype=torch.uint8) for _ in range(2)
+            ],
+            index_k_scale_buffer=[
+                torch.zeros((4, 4), dtype=torch.uint8) for _ in range(2)
+            ],
+        )
+        cache = SimpleNamespace(
+            sources_by_ratio={2: [8, 14]},
+            start_layer=8,
+            kv_pools={2: kv},
+            index_pools={2: index},
+        )
+        with (
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_mem_layout="layer_first"),
+            ),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+        ):
+            entries = hybrid_pool_assembler._dsv4_low_ratio_entries(
+                cache, 4, 4, 20, is_dummy=True
+            )
+        broadcaster = V4HostDedupBroadcaster.__new__(V4HostDedupBroadcaster)
+        broadcaster.device = "cpu"
+        broadcaster.is_src = False
+        broadcaster.src_global_rank = 0
+        broadcaster.group = object()
+        broadcaster.chunk_tokens = 8
+        broadcaster._page_staging = {}
+        # Restore noncontiguous physical pages 1/3, preserving pages 0/2.
+        indices = torch.tensor([4, 5, 6, 7, 12, 13, 14, 15])
+        calls = []
+
+        def receive(chunk, **kwargs):
+            calls.append(tuple(chunk.shape))
+            chunk.fill_(len(calls))
+
+        with patch("torch.distributed.broadcast", side_effect=receive):
+            for layer in range(20):
+                for entry in entries:
+                    broadcaster.broadcast_transfer(
+                        SimpleNamespace(
+                            host_pool=entry.host_pool,
+                            layer_mapper=entry.layer_mapper,
+                            device_indices=indices,
+                        ),
+                        layer,
+                    )
+                # Source IDs are stage-local 0/6; all other layers are aliases.
+                self.assertEqual(len(calls), 3 if layer < 6 else 6)
+        for region, entry in enumerate(entries):
+            self.assertTrue(entry.host_pool._is_dummy)
+            self.assertIsNone(entry.host_pool.kv_buffer)
+            for source, buffer in enumerate(entry.host_pool.device_buffers):
+                expected = torch.zeros_like(buffer)
+                expected[[1, 3]] = 1 + source * 3 + region
+                torch.testing.assert_close(buffer, expected)
 
     def test_matching_page_geometry_is_supported(self):
         _require_single_row_dsv4_swa_pages(
@@ -433,7 +555,12 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         seen = {}
 
         def fake_indexer_host(
-            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+            decl,
+            anchor_host,
+            *,
+            allocator_type,
+            packed_draft_device_pools=(),
+            is_dummy=False,
         ):
             self.assertIsInstance(decl, HostPoolDecl)
             self.assertIs(decl.device_pool, draft_kv_pool)
@@ -625,7 +752,12 @@ class TestDeclaredStackStructure(CustomTestCase):
             )
 
         def dummy_indexer_host(
-            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+            decl,
+            anchor_host,
+            *,
+            allocator_type,
+            packed_draft_device_pools=(),
+            is_dummy=False,
         ):
             return real_indexer_host(
                 decl,
@@ -724,6 +856,7 @@ class TestDeclaredStackStructure(CustomTestCase):
                 hybrid_pool_assembler,
                 "get_memory",
                 return_value=SimpleNamespace(
+                    enable_mla_hicache_host_dedup=False,
                     hicache_write_policy="write_through",
                     hicache_io_backend="kernel",
                     hicache_host_memory_mode="cache",
@@ -907,6 +1040,71 @@ class TestKvHostPoolRow(CustomTestCase):
             )
         return seen
 
+    def test_non_owner_uses_allocator_only_mla_geometry(self):
+        for pool_cls in (MLATokenToKVPool, DSATokenToKVPool):
+            for draft_count in (0, 1):
+                with self.subTest(pool=pool_cls.__name__, drafts=draft_count):
+                    fields = dict(
+                        size=128,
+                        page_size=64,
+                        dtype=torch.bfloat16,
+                        kv_lora_rank=128,
+                        qk_rope_head_dim=0,
+                        device="cpu",
+                        enable_memory_saver=False,
+                    )
+                    if pool_cls is DSATokenToKVPool:
+                        fields.update(
+                            index_head_dim=128, kv_cache_dim=128, index_buf_size=128
+                        )
+                    pool = pool_cls(**fields, layer_num=2)
+                    drafts = tuple(
+                        pool_cls(**fields, layer_num=1) for _ in range(draft_count)
+                    )
+                    with (
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "get_parallel",
+                            return_value=SimpleNamespace(dcp_enabled=False),
+                        ),
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "get_memory",
+                            return_value=SimpleNamespace(
+                                hicache_ratio=2,
+                                hicache_size=0,
+                                hicache_mem_layout="page_first_direct",
+                            ),
+                        ),
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "_get_allocator_type",
+                            return_value="default",
+                        ),
+                    ):
+                        host = hybrid_pool_assembler.build_kv_host_pool(
+                            kv_pool=pool,
+                            page_size=64,
+                            mtp_draft_device_pools=drafts,
+                            is_dummy=True,
+                        )
+                    self.addCleanup(host.destroy)
+                    self.assertTrue(host._is_dummy)
+                    self.assertIsNone(host.kv_buffer)
+                    self.assertEqual(host.layer_num, 2 + draft_count)
+                    self.assertEqual(host.device_capacity_tokens, pool.size)
+                    self.assertEqual(
+                        host.size_per_token,
+                        pool.kv_cache_dim
+                        * pool.store_dtype.itemsize
+                        * (2 + draft_count),
+                    )
+                    rows = host.alloc(64)
+                    self.assertEqual(len(rows), 64)
+                    self.assertEqual(host.available_size(), host.size - 64)
+                    host.free(rows)
+                    self.assertEqual(host.available_size(), host.size)
+
     def test_mla_row_width_comes_from_the_device_pool(self):
         pool = _dsa_pool_stub(layer_num=2)
         pool.kv_cache_dim = 656  # fp8 DSA store: 576 + fp32 scales
@@ -989,7 +1187,12 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
             )
 
         def dummy_indexer_host(
-            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+            decl,
+            anchor_host,
+            *,
+            allocator_type,
+            packed_draft_device_pools=(),
+            is_dummy=False,
         ):
             return real_indexer_host(
                 decl=decl,
@@ -1019,6 +1222,7 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
                     hicache_size=0,
                     hicache_ratio=2,
                     hicache_mem_layout="page_first",
+                    enable_mla_hicache_host_dedup=False,
                     hicache_write_policy="write_through",
                     hicache_io_backend="kernel",
                     hicache_host_memory_mode="cache",

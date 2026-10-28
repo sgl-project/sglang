@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4StateHostPool,
     LogicalHostPool,
 )
+from sglang.srt.mem_cache.mla_host_dedup import maybe_create_mla_host_dedup_context
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
@@ -33,7 +34,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
@@ -171,6 +172,7 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
+    is_dummy: bool = False,
 ):
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
@@ -206,6 +208,8 @@ def build_kv_host_pool(
         kwargs["page_unified_layout"] = geometry.page_unified_layout
         if not use_mla:
             kwargs["head_group_num"] = geometry.page_unified_layout.head_group_num
+    if is_dummy and not use_mla:
+        kwargs["is_dummy"] = True
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
@@ -223,6 +227,24 @@ def build_kv_host_pool(
             write_back_staging=kv_pool.hicache_write_back_staging,
             target_layer_num=geometry.target_layer_num,
         )
+        if is_dummy:
+            # Allocator-only MLA hosts take geometry rather than device buffers.
+            # Packed drafts still count toward logical capacity, but must not
+            # retain physical draft buffers on a non-owner rank.
+            draft_layer_num = len(kwargs["draft_buffer_infos"])
+            width = override_kv_cache_dim or host_input.kv_cache_dim
+            host_input = MLAHostAllocation(
+                dtype=host_input.dtype,
+                kv_lora_rank=host_input.kv_lora_rank,
+                qk_rope_head_dim=host_input.qk_rope_head_dim,
+                kv_cache_dim=width,
+                size_per_token=width
+                * host_input.dtype.itemsize
+                * (kwargs["target_layer_num"] + draft_layer_num),
+                draft_layer_num=draft_layer_num,
+                packed_fp8=host_input.packed_fp8,
+            )
+            kwargs["draft_buffer_infos"] = ()
     else:
         kwargs.update(mha_kwargs)
     if parallel.dcp_enabled:
@@ -302,6 +324,7 @@ def build_kv_only_group(
     override_kv_cache_dim: Optional[int] = None,
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
+    is_dummy: bool = False,
 ) -> HostPoolGroup:
     """Anchor-only host pool group for a flat MHA/MLA device pool."""
     transfer_layer_id_max = len(full_layer_mapping)
@@ -312,6 +335,7 @@ def build_kv_only_group(
         override_kv_cache_dim=override_kv_cache_dim,
         host_size=host_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        is_dummy=is_dummy,
     )
     if mtp_draft_device_pools:
         full_layer_mapping = with_packed_draft_layer_mapping(
@@ -532,6 +556,19 @@ def _mtp_swa_sidecar_specs(group: HostPoolGroup) -> list[SidecarPoolSpec]:
     return [SidecarPoolSpec(PoolName.DRAFT_SWA, indices_from_pool=PoolName.KV)]
 
 
+def _create_mla_dedup_context(kv_pool, params, storage_backend):
+    memory = get_memory()
+    return maybe_create_mla_host_dedup_context(
+        kv_pool,
+        params.tp_cache_group,
+        params.attn_cp_cache_group,
+        params.attn_tp_cache_group,
+        storage_backend,
+        enabled=memory.enable_mla_hicache_host_dedup,
+        pp_group=params.pp_cache_group,
+    )
+
+
 def build_kv_only_stack(
     *,
     params: CacheInitParams,
@@ -547,6 +584,7 @@ def build_kv_only_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_id_max = len(full_layer_mapping)
+    mla_dedup = _create_mla_dedup_context(kv_pool, params, storage_backend)
     host_pool_group = build_kv_only_group(
         page_size=params.page_size,
         kv_pool=kv_pool,
@@ -554,6 +592,7 @@ def build_kv_only_stack(
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
         mtp_draft_device_pools=params.mtp_draft_device_pools,
+        is_dummy=mla_dedup.is_dummy_rank if mla_dedup is not None else False,
     )
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -573,6 +612,7 @@ def build_kv_only_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        mla_dedup_context=mla_dedup,
     )
     return host_pool_group, cache_controller
 
@@ -874,7 +914,12 @@ def _dsv4_low_ratio_regions(
 
 
 def _dsv4_low_ratio_entries(
-    kvcache: Any, page_size: int, num_host_pages: int, transfer_layer_id_max: int
+    kvcache: Any,
+    page_size: int,
+    num_host_pages: int,
+    transfer_layer_id_max: int,
+    *,
+    is_dummy: bool = False,
 ):
     """Mirror shared KV; ratio-2 request state is rebuilt at page boundaries."""
     entries = []
@@ -893,6 +938,7 @@ def _dsv4_low_ratio_entries(
                     layout=get_memory().hicache_mem_layout,
                     allocator_type=_get_allocator_type(),
                     page_aligned_only=True,
+                    is_dummy=is_dummy,
                 ),
                 device_pool=device_pool,
                 layer_mapping=layer_mapping,
@@ -931,6 +977,7 @@ def _build_dsv4_rope_entry(
     num_host_pages: int,
     slot_page_size: int,
     transfer_layer_id_max: int,
+    is_dummy: bool = False,
 ) -> Optional[PoolEntry]:
     sibling = _dsv4_rope_sibling(kvcache, ratio)
     if sibling is None:
@@ -947,6 +994,7 @@ def _build_dsv4_rope_entry(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
             page_aligned_only=True,
+            is_dummy=is_dummy,
         ),
         device_pool=device_pool,
         layer_mapping=layer_mapping,
@@ -969,6 +1017,12 @@ def build_deepseek_v4_hicache_stack(
     enable_storage_metrics: bool = False,
     layer_mappings: Optional[_DeepSeekV4LayerMappings] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    if get_memory().enable_mla_hicache_host_dedup and params.mtp_draft_device_pools:
+        raise ValueError(
+            "V4 host dedup requires rank-local draft sidecars, not packed drafts"
+        )
+    mla_dedup = _create_mla_dedup_context(kvcache, params, storage_backend)
+    is_dummy = mla_dedup.is_dummy_rank if mla_dedup is not None else False
     page_size = params.page_size
     layer_mappings = layer_mappings or _resolve_deepseek_v4_layer_mappings(kvcache)
     transfer_layer_id_max = layer_mappings.transfer_layer_id_max
@@ -1048,6 +1102,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=kvcache.swa_page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            is_dummy=is_dummy,
             page_aligned_only=_dsv4_page_aligned_only(kvcache.swa_kv_pool),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
@@ -1080,6 +1135,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            is_dummy=is_dummy,
             page_aligned_only=is_unified_kv
             or _dsv4_page_aligned_only(kvcache.c4_kv_pool),
         )
@@ -1104,6 +1160,7 @@ def build_deepseek_v4_hicache_stack(
                         slot_page_size=region.slot_page_size,
                         layout=get_memory().hicache_mem_layout,
                         allocator_type=_get_allocator_type(),
+                        is_dummy=is_dummy,
                         page_aligned_only=region.page_aligned_only,
                     ),
                     device_pool=kvcache.c4_indexer_kv_pool,
@@ -1121,6 +1178,7 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
             transfer_layer_id_max=transfer_layer_id_max,
+            is_dummy=is_dummy,
         )
         if c4_rope_entry is not None:
             entries.append(c4_rope_entry)
@@ -1136,6 +1194,7 @@ def build_deepseek_v4_hicache_stack(
                 swa_page_size=kvcache.swa_page_size,
                 layout=get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(),
+                is_dummy=is_dummy,
             )
             c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
@@ -1147,6 +1206,7 @@ def build_deepseek_v4_hicache_stack(
                 swa_page_size=kvcache.swa_page_size,
                 layout=get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(),
+                is_dummy=is_dummy,
             )
             entries.extend(
                 [
@@ -1187,6 +1247,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=c128_slot_page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            is_dummy=is_dummy,
             page_aligned_only=is_unified_kv
             or _dsv4_page_aligned_only(kvcache.c128_kv_pool),
         )
@@ -1226,13 +1287,18 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=c128_num_host_pages,
             slot_page_size=c128_slot_page_size,
             transfer_layer_id_max=transfer_layer_id_max,
+            is_dummy=is_dummy,
         )
         if c128_rope_entry is not None:
             entries.append(c128_rope_entry)
 
     entries.extend(
         _dsv4_low_ratio_entries(
-            kvcache, page_size, num_host_pages, transfer_layer_id_max
+            kvcache,
+            page_size,
+            num_host_pages,
+            transfer_layer_id_max,
+            is_dummy=is_dummy,
         )
     )
 
@@ -1255,6 +1321,7 @@ def build_deepseek_v4_hicache_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        mla_dedup_context=mla_dedup,
     )
     return host_pool_group, cache_controller
 
@@ -1543,6 +1610,7 @@ def build_hybrid_mamba_swa_stack(
 def build_host_pool_group(
     *,
     config: HostPoolGroupConfig,
+    is_dummy: bool = False,
 ) -> HostPoolGroup:
     """Allocate host pools and transfer entries from prepared configs."""
     root = config.pools[0]
@@ -1550,6 +1618,7 @@ def build_host_pool_group(
         kv_pool=root.decl.device_pool,
         page_size=config.transfer_page_size,
         mtp_draft_device_pools=root.packed_draft_device_pools,
+        is_dummy=is_dummy,
     )
     return HostPoolGroup(
         _build_pool_entries(config=config, root_host_pool=root_host_pool)
@@ -2407,7 +2476,11 @@ class _DsaStrategy(StackStrategy):
             transfer_page_size=params.page_size,
             packed_draft_device_pools=params.mtp_draft_device_pools,
         )
-        host_pool_group = build_host_pool_group(config=config)
+        mla_dedup = _create_mla_dedup_context(kvcache, params, storage_backend)
+        host_pool_group = build_host_pool_group(
+            config=config,
+            is_dummy=mla_dedup.is_dummy_rank if mla_dedup is not None else False,
+        )
         cache_controller = HybridCacheController(
             params.token_to_kv_pool_allocator,
             host_pool_group,
@@ -2427,6 +2500,7 @@ class _DsaStrategy(StackStrategy):
             transfer_layer_id_max=kvcache.layer_num,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=get_memory().hicache_host_memory_mode,
+            mla_dedup_context=mla_dedup,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,

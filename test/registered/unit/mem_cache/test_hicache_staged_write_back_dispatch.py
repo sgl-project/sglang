@@ -197,6 +197,51 @@ class _FakeDeviceModule:
 
 
 class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
+    def test_dedup_transfer_bytes_exclude_dummy_pools(self):
+        for dummy in (False, True):
+            with self.subTest(dummy=dummy):
+                anchor = SimpleNamespace(size_per_token=128, _is_dummy=dummy)
+                op = SimpleNamespace(device_indices=range(4))
+                controller = SimpleNamespace(mem_pool_host=anchor, is_kv_sharded=False)
+                self.assertEqual(
+                    HiCacheController._transfer_num_bytes(controller, op),
+                    0 if dummy else 512,
+                )
+
+                def entry(size, is_dummy=False):
+                    return SimpleNamespace(
+                        host_pool=SimpleNamespace(
+                            size_per_token=size, _is_dummy=is_dummy
+                        )
+                    )
+
+                controller.mem_pool_host = SimpleNamespace(
+                    anchor_entry=SimpleNamespace(name=PoolName.KV, host_pool=anchor),
+                    entry_map={
+                        PoolName.DRAFT: entry(16),
+                        PoolName.MAMBA: entry(8),
+                        PoolName.INDEXER: entry(64, dummy),
+                    },
+                )
+                op.pool_transfers = [
+                    SimpleNamespace(
+                        name=name, indices_from_pool=PoolName.KV, host_indices=None
+                    )
+                    for name in (PoolName.DRAFT, PoolName.INDEXER)
+                ] + [
+                    SimpleNamespace(
+                        name=PoolName.MAMBA,
+                        indices_from_pool=None,
+                        host_indices=range(2),
+                    )
+                ]
+                # Rank-local draft and state still move bytes when their
+                # target KV/indexer pools are dummy; logical token counts stay.
+                self.assertEqual(
+                    HybridCacheController._transfer_num_bytes(controller, op),
+                    80 if dummy else 848,
+                )
+
     def setUp(self):
         transfer_module._timing_events_supported.cache_clear()
         self.addCleanup(transfer_module._timing_events_supported.cache_clear)
@@ -219,6 +264,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         op.pool_transfers = [transfer]
         controller = mock.Mock(spec=HybridCacheController)
         controller.is_kv_sharded = False
+        controller.mla_dedup_enabled = False
+
         controller.load_queue = [op, op]
         controller.layer_done_counter = mock.MagicMock()
         controller.layer_done_counter.update_producer.return_value = 0
@@ -359,6 +406,66 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "Unresolved L2 transfer"):
             controller._l2_transfers(empty, empty, [PoolTransfer(PoolName.DRAFT)])
 
+    def test_dedup_restore_finishes_before_publishing_ack(self):
+        # Regression for dev d53454d3de: a reused event slot alone does not
+        # establish completion of the current restore generation.
+        for fails in (False, True):
+            with self.subTest(broadcast_fails=fails):
+                controller = mock.Mock(spec=HiCacheController)
+                controller.mla_dedup_enabled = True
+
+                controller.mla_dedup = SimpleNamespace()
+                controller.load_queue = []
+                controller.ack_load_queue = []
+                controller.load_fence_stream = None
+                controller.transfer_layer_id_max = 1
+                controller.layer_done_counter = mock.MagicMock()
+                controller.layer_done_counter.update_producer.return_value = 0
+                controller._move_op_indices.side_effect = lambda op: (
+                    op.host_indices,
+                    op.device_indices,
+                    op.pool_transfers,
+                )
+                controller._num_tokens_by_pool.return_value = {}
+                controller._transfer_num_bytes.return_value = 0
+                controller.mem_pool_device_allocator = mock.Mock()
+                engine = controller.l2_transfer_engine = mock.Mock()
+                completion = SimpleNamespace(
+                    start_event=object(), finish_event=object(), timing_enabled=False
+                )
+                engine.submit_host_to_device.return_value = completion
+                publish = (
+                    controller.mem_pool_device_allocator.set_hicache_transfer_done_event
+                )
+                for generation in range(2):
+                    controller.load_queue.append(
+                        CacheOperation(_indices(0, 2), _indices(2, 4), generation)
+                    )
+
+                    def finish():
+                        self.assertEqual(len(controller.ack_load_queue), generation)
+                        self.assertEqual(publish.call_count, generation)
+                        if fails:
+                            raise RuntimeError("broadcast failed")
+
+                    engine.host_to_device_stream.synchronize.side_effect = finish
+                    if fails:
+                        with self.assertRaisesRegex(RuntimeError, "broadcast failed"):
+                            HiCacheController.start_loading(controller)
+                        self.assertEqual(controller.ack_load_queue, [])
+                        publish.assert_not_called()
+                        break
+                    self.assertEqual(HiCacheController.start_loading(controller), 0)
+                    self.assertEqual(
+                        [ack.node_ids for ack in controller.ack_load_queue],
+                        [[i] for i in range(generation + 1)],
+                    )
+                    self.assertEqual(publish.call_count, generation + 1)
+                self.assertEqual(
+                    engine.host_to_device_stream.synchronize.call_count,
+                    1 if fails else 2,
+                )
+
     def _short_swa_tail_pipeline(self, swa_page_size: int) -> BufferModePipeline:
         """Pipeline holding one staged span [2, 8) whose 4-slot trailing SWA
         window outruns the splice left by a device prefix of 6."""
@@ -428,6 +535,236 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                     window = req.staged_prefetch_plan.windows[ComponentType.SWA]
                     self.assertEqual((window.start, window.end), (4, 8))
                     pipeline.release_staged_hold.assert_not_called()
+
+    def test_mla_loader_keeps_dummy_ack_order_and_rank_local_draft(self):
+        for dummy in (False, True):
+            with self.subTest(dummy=dummy):
+                trace = []
+                controller = HiCacheController.__new__(HiCacheController)
+                broadcaster = SimpleNamespace(
+                    device_pool=None,
+                    layer_num=1,
+                    prepare_broadcast=lambda indices, stream: (indices, None),
+                    broadcast_loaded_layer=lambda layer, plan: trace.append(
+                        "broadcast"
+                    ),
+                )
+                controller.mla_dedup = SimpleNamespace(broadcaster=broadcaster)
+                with mock.patch.object(
+                    transfer_module, "device_module", _FakeDeviceModule
+                ):
+                    controller.l2_transfer_engine = L2TransferEngine("kernel")
+                transfers = []
+                for name, is_dummy in (("target", dummy), ("draft", False)):
+                    host = SimpleNamespace(
+                        _is_dummy=is_dummy,
+                        layer_num=1,
+                        load_to_device_per_layer_physical=lambda *args, name=name, **kw: (
+                            trace.append(name)
+                        ),
+                    )
+                    transfers.append(
+                        L2Transfer(
+                            host,
+                            None,
+                            _indices(0, 2),
+                            _indices(2, 4),
+                            layer_mapper={0: 0}.get if name == "target" else {1: 0}.get,
+                            is_draft=name == "draft",
+                        )
+                    )
+                load = controller._mla_layer_loader(_indices(2, 4))
+                load(transfers, 0)
+                load(transfers, 1)
+                self.assertEqual(
+                    trace, (["target"] if not dummy else []) + ["broadcast", "draft"]
+                )
+
+    def test_v4_loader_restores_all_side_pools_using_physical_indices(self):
+        from sglang.srt.mem_cache.mla_host_dedup import V4HostDedupBroadcaster
+
+        controller = HiCacheController.__new__(HiCacheController)
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            controller.l2_transfer_engine = L2TransferEngine("kernel")
+        broadcaster = V4HostDedupBroadcaster.__new__(V4HostDedupBroadcaster)
+        broadcaster.device_pool = object()
+        broadcaster.layer_num = 4
+        broadcaster.device = "cpu"
+        broadcaster.is_src = False
+        broadcaster.src_global_rank = 0
+        broadcaster.group = object()
+        broadcaster.chunk_tokens = 2
+        broadcaster._page_staging = {}
+        controller.mla_dedup = SimpleNamespace(broadcaster=broadcaster)
+        transfers = []
+        buffers = []
+        for page_size, item_bytes in ((2, 8), (4, 12)):
+            buffer = torch.zeros((4, item_bytes), dtype=torch.uint8)
+            pool = DeepSeekV4PagedHostPool(
+                "test", [buffer], item_bytes, 4, page_size, is_dummy=True
+            )
+            buffers.append(buffer)
+            transfers.append(
+                L2Transfer(
+                    pool,
+                    object(),
+                    _indices(0, page_size),
+                    _indices(2 * page_size, 3 * page_size),
+                    layer_mapper={3: 0}.get,
+                )
+            )
+        state_tensor = torch.zeros((8, 3), dtype=torch.int16)
+        state_pool = DeepSeekV4StateHostPool(
+            "state",
+            [
+                SimpleNamespace(
+                    kv_score_buffer=SimpleNamespace(kv_score=state_tensor), ring_size=2
+                )
+            ],
+            4,
+            4,
+            is_dummy=True,
+        )
+        transfers.append(
+            L2Transfer(
+                state_pool,
+                object(),
+                _indices(0, 4),
+                _indices(4, 8),
+                layer_mapper={3: 0}.get,
+            )
+        )
+        load = controller._mla_layer_loader(_indices(0, 4))
+
+        # Only the communication boundary is replaced: real pool mapping,
+        # staging and scatter must restore the destination physical rows.
+        def receive(tensor, **kwargs):
+            tensor.fill_(17)
+
+        with mock.patch.object(torch.distributed, "broadcast", side_effect=receive):
+            load(transfers, 2)
+            self.assertTrue(all(not bool(buf.any()) for buf in buffers))
+            self.assertFalse(bool(state_tensor.any()))
+            load(transfers, 3)
+        for buffer in buffers:
+            expected = torch.zeros_like(buffer)
+            expected[2].fill_(17)
+            self.assertTrue(torch.equal(buffer, expected))
+        expected_state = torch.zeros_like(state_pool.device_page_views[0])
+        expected_state[1].fill_(17)
+        self.assertTrue(torch.equal(state_pool.device_page_views[0], expected_state))
+
+    def test_custom_l2_loader_preserves_submission_lifetime(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                trace = []
+                released = []
+                stream = SimpleNamespace(synchronize=lambda: trace.append("drain"))
+
+                class Event(_FakeEvent):
+                    def record(self):
+                        trace.append("record")
+
+                    def wait(self, stream):
+                        trace.append("wait")
+
+                class Device(_FakeDeviceModule):
+                    @staticmethod
+                    def Stream():
+                        return stream
+
+                Device.Event = Event
+
+                def release(event, key):
+                    trace.append("release")
+                    released.append(event)
+
+                host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+                host.shared_allocation_domain = SimpleNamespace(
+                    acquire_layout=lambda: trace.append("acquire"),
+                    release_layout=release,
+                )
+
+                def prepare(host_indices, device_indices, backend):
+                    trace.append("prepare")
+                    return host_indices + 10, device_indices
+
+                host.prepare_transfer_indices = prepare
+                host.load_to_device_per_layer = mock.Mock()
+                transfer = L2Transfer(
+                    host_pool=host,
+                    device_pool=SimpleNamespace(
+                        device="cpu",
+                        host_transfer_translate=lambda indices: indices + 20,
+                    ),
+                    host_indices=_indices(0, 2),
+                    device_indices=_indices(2, 4),
+                    layer_mapper={1: 0}.get,
+                )
+
+                def load(transfers, layer_id):
+                    self.assertEqual(transfers[0].host_indices.tolist(), [10, 11])
+                    self.assertEqual(transfers[0].device_indices.tolist(), [22, 23])
+                    trace.append(("load", layer_id))
+                    if fail:
+                        raise RuntimeError("injected broadcast failure")
+                    engine._load_layer(transfers, layer_id)
+                    trace.append(("broadcast", layer_id))
+
+                with mock.patch.object(transfer_module, "device_module", Device):
+                    engine = L2TransferEngine("kernel")
+                    kwargs = dict(
+                        transfer_layer_id_max=2,
+                        start_event=Event(),
+                        load_layer=load,
+                        on_layer_done=lambda layer: trace.append(("done", layer)),
+                    )
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, "broadcast failure"):
+                            engine.submit_host_to_device([transfer], **kwargs)
+                    else:
+                        completion = engine.submit_host_to_device([transfer], **kwargs)
+
+                if fail:
+                    self.assertEqual(
+                        trace,
+                        [
+                            "acquire",
+                            "wait",
+                            "prepare",
+                            "record",  # Index preparation completes.
+                            "wait",  # The copy stream waits for those indices.
+                            "record",  # Copy/broadcast timing begins.
+                            ("load", 0),
+                            "drain",  # Index stream is quiescent before release.
+                            "drain",  # Copy/broadcast stream is also quiescent.
+                            "release",
+                        ],
+                    )
+                    self.assertEqual(released, [None])
+                else:
+                    self.assertEqual(
+                        trace,
+                        [
+                            "acquire",
+                            "wait",
+                            "prepare",
+                            "record",  # Index preparation completes.
+                            "wait",  # The copy stream waits for those indices.
+                            "record",  # Copy/broadcast timing begins.
+                            ("load", 0),
+                            ("broadcast", 0),
+                            ("done", 0),
+                            ("load", 1),
+                            ("broadcast", 1),
+                            ("done", 1),
+                            "record",
+                            "release",
+                        ],
+                    )
+                    self.assertEqual(released, [completion.finish_event])
+                    self.assertEqual(host.load_to_device_per_layer.call_count, 1)
+                    self.assertEqual(host.load_to_device_per_layer.call_args.args[3], 0)
 
     def test_l2_transfer_maps_global_layers(self):
         host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)

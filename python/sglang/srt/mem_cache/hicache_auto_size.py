@@ -14,6 +14,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.mla_host_dedup import (
+    mla_dedup_rank_and_size,
+    mla_host_dedup_eligible,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     host_memory_budget_bytes,
     host_memory_budget_scope,
@@ -60,23 +64,148 @@ def _draft_bytes(target, draft) -> int:
     return _pool_bytes(draft) * target.size // draft.size
 
 
+def _v4_host_bytes(params, pool) -> int:
+    """Physical host mirrors at ratio one, using the assembler's page geometry."""
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _dsv4_compressed_region_buffers,
+        _dsv4_indexer_regions,
+        _dsv4_rope_sibling,
+        _resolve_deepseek_v4_layer_mappings,
+    )
+
+    page_size = params.page_size
+    allocator = params.token_to_kv_pool_allocator
+    full_size = getattr(allocator, "size_full", pool.size)
+    full_pages = (full_size + page_size - 1) // page_size
+    swa_pages = (pool.swa_size + pool.swa_page_size - 1) // pool.swa_page_size
+    mappings = _resolve_deepseek_v4_layer_mappings(pool)
+    unified = getattr(pool, "_unified_kv", False)
+    total = 0
+    if not unified and pool.swa_kv_pool is not None:
+        total += (
+            swa_pages
+            * len(pool.swa_kv_pool.kv_buffer)
+            * pool.swa_kv_pool.bytes_per_page_padded
+        )
+    for ratio, mapping in ((4, mappings.c4), (128, mappings.c128)):
+        if not mapping:
+            continue
+        pages = full_pages
+        if ratio == 128 and getattr(allocator, "c128_attn_allocator", None) is not None:
+            pages = allocator.c128_attn_allocator.num_pages
+        buffers, item_bytes = _dsv4_compressed_region_buffers(pool, ratio)
+        total += pages * len(buffers) * item_bytes
+        rope = _dsv4_rope_sibling(pool, ratio)
+        if rope is not None:
+            _, buffers, item_bytes = rope
+            total += pages * len(buffers) * item_bytes
+    if mappings.c4:
+        for region in _dsv4_indexer_regions(pool, page_size):
+            total += full_pages * len(region.device_buffers) * region.item_bytes
+        if not unified:
+            for states in (
+                pool.compress_state_pools,
+                pool.indexer_compress_state_pools,
+            ):
+                for layer in mappings.c4_state_global_layers:
+                    state = states[layer]
+                    total += (
+                        swa_pages
+                        * state.ring_size
+                        * state.kv_score_buffer.kv_score[0].nbytes
+                    )
+    for ratio in (1, 2):
+        if not getattr(pool, "sources_by_ratio", {}).get(ratio):
+            continue
+        kv = pool.kv_pools[ratio]
+        total += full_pages * sum(
+            buf.shape[1] * buf.element_size() for buf in kv.kv_buffer
+        )
+        index = pool.index_pools[ratio]
+        index_pages = (page_size // ratio) // index.page_size
+        regions = (
+            [index.index_k_with_scale_buffer]
+            if index.index_k_with_scale_buffer is not None
+            else [index.index_k_payload_buffer, index.index_k_scale_buffer]
+        )
+        for buffers in regions:
+            total += full_pages * index_pages * sum(buf[0].nbytes for buf in buffers)
+    return int(total)
+
+
 def _estimate_hicache_bytes(
-    params: CacheInitParams, draft_plan: HiCacheDraftPlan | None
+    params: CacheInitParams,
+    draft_plan: HiCacheDraftPlan | None,
+    *,
+    physical: bool = False,
 ) -> int:
     """Device bytes whose host mirrors scale with the HiCache ratio."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
     pool = params.token_to_kv_pool_allocator.get_kvcache()
-    if not isinstance(pool, _SIZEABLE_POOLS):
+    is_v4 = isinstance(pool, DeepSeekV4TokenToKVPool)
+    if not is_v4 and not isinstance(pool, _SIZEABLE_POOLS):
         raise ValueError(
             f"HiCache auto-sizing does not support {type(pool).__name__}; "
             "set --hicache-ratio or --hicache-size explicitly."
         )
-    total = _pool_bytes(pool)
+    total = _v4_host_bytes(params, pool) if is_v4 else _pool_bytes(pool)
+    target_bytes = total
+    if physical and get_memory().enable_mla_hicache_host_dedup:
+        target = pool
+        rank, size = mla_dedup_rank_and_size()
+        if size > 1 and rank != 0 and mla_host_dedup_eligible(target, None):
+            # Only the target MLA/DSA mirror is deduplicated. Draft and linear
+            # state below remain physical allocations on every rank.
+            total -= target_bytes
     if isinstance(params.req_to_token_pool, HybridReqToTokenPool):
         total += _pool_bytes(params.req_to_token_pool.mamba_pool)
     drafts = params.mtp_draft_device_pools
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools
+    if is_v4:
+        # V4 draft sidecars mirror SWA only, with target host-page capacity.
+        swa_pages = (pool.swa_size + pool.swa_page_size - 1) // pool.swa_page_size
+        return total + sum(
+            swa_pages
+            * len(draft.swa_kv_pool.kv_buffer)
+            * draft.swa_kv_pool.bytes_per_page_padded
+            for draft in drafts
+            if draft.swa_kv_pool is not None
+        )
     return total + sum(_draft_bytes(pool, draft) for draft in drafts)
+
+
+def _dedup_host_budget(physical_bytes: int, rank_budget: int) -> tuple[float, int]:
+    """Share a host's allowance by physical demand before constructing any pool.
+
+    Use the smallest cgroup-bounded snapshot reported on a node. This stays
+    conservative when ranks have different visible container allowances.
+    """
+    # Pool byte counts may be NumPy int64 values. The proportional allocation
+    # multiplies two byte counts, which can exceed int64 even when each fits.
+    physical_bytes = int(physical_bytes)
+    rank_budget = int(rank_budget)
+    node_rank = get_parallel().node_rank
+    local = torch.tensor(
+        [node_rank, rank_budget * ranks_per_host(), physical_bytes], dtype=torch.int64
+    )
+    records = [local]
+    if torch.distributed.is_initialized():
+        group = get_parallel().world_group.cpu_group
+        records = [
+            torch.empty_like(local)
+            for _ in range(torch.distributed.get_world_size(group=group))
+        ]
+        torch.distributed.all_gather(records, local, group=group)
+    peers = [record.tolist() for record in records if record[0].item() == node_rank]
+    host_budget = min(record[1] for record in peers)
+    host_bytes = sum(record[2] for record in peers)
+    if host_bytes == 0:
+        # A node containing only dummy peers must not constrain an owner on a
+        # different node. It still participates in the subsequent global MIN.
+        return float("inf"), 0
+    return host_budget / host_bytes, host_budget * physical_bytes // host_bytes
 
 
 @contextmanager
@@ -85,18 +214,32 @@ def auto_size_hicache(
 ):
     """Reduce the default HiCache ratio until this machine's host pools fit.
 
-    Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size.
+    Explicit dedup ratios retain their capacity but share physical budgets.
+    Explicit --hicache-size still uses the original per-rank allocation check.
     """
-    fraction = get_memory().hicache_host_memory_fraction
-    if not enabled or fraction is None:
+    memory = get_memory()
+    fraction = memory.hicache_host_memory_fraction
+    dedup = memory.enable_mla_hicache_host_dedup
+    automatic = fraction is not None
+    if not enabled or (not automatic and (not dedup or memory.hicache_size > 0)):
         yield
         return
-    requested = get_memory().hicache_ratio
-    device_bytes = _estimate_hicache_bytes(params, draft_plan)
-    budget = int(host_memory_budget_bytes(auto_size=True) * fraction)
-    ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
-    # One collective before any pool is built: PP stages own different pool
-    # counts, so a per-pool collective could deadlock.
+    requested = memory.hicache_ratio
+    device_bytes = _estimate_hicache_bytes(params, draft_plan, physical=dedup)
+    budget = int(
+        host_memory_budget_bytes(auto_size=automatic) * (fraction if automatic else 1.0)
+    )
+    if dedup:
+        capacity_ratio, budget = _dedup_host_budget(device_bytes, budget)
+    else:
+        capacity_ratio = budget / device_bytes
+    ratio = (
+        min(requested, capacity_ratio * (1 - _ALLOCATION_SLACK_FRACTION))
+        if automatic
+        else capacity_ratio
+    )
+    # All collectives run before any pool is built: PP stages own different
+    # pool counts, so a per-pool collective could deadlock.
     if torch.distributed.is_initialized():
         value = torch.tensor([ratio], dtype=torch.float64)
         torch.distributed.all_reduce(
@@ -110,6 +253,18 @@ def auto_size_hicache(
             "No host memory is left for HiCache after the 10 GiB reserve; "
             "set --hicache-ratio or --hicache-size explicitly."
         )
+    if not automatic:
+        if requested > ratio:
+            raise ValueError(
+                f"Not enough host memory for explicit HiCache ratio {requested}; "
+                f"the deduplicated pools fit at most ratio {ratio:.3f} before "
+                "page rounding. Reduce --hicache-ratio."
+            )
+        # Honor the caller's explicit capacity; only redistribute its physical
+        # allocation allowance, without silently shrinking the ratio.
+        with host_memory_budget_scope(budget):
+            yield
+        return
     get_context().override("hicache.auto_size", hicache_ratio=ratio)
     logger.info(
         "HiCache auto-sizing: ratio %.3f -> %.3f; %.1f GiB host memory per rank "

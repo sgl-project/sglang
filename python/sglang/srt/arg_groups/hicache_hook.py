@@ -36,6 +36,23 @@ def handle_hicache(server_args: Any):
         )
 
         UnifiedCacheLinkerConfig.from_dict(config)
+    if cfg.enable_mla_hicache_host_dedup:
+        if not cfg.enable_hierarchical_cache:
+            raise ValueError("--enable-mla-hicache-host-dedup requires HiCache.")
+        if cfg.dcp_size > 1:
+            raise ValueError(
+                "MLA host dedup requires replicated KV across ranks; "
+                "--dcp-size > 1 stores distinct KV shards."
+            )
+        if cfg.enable_kv_cache_sharding:
+            raise ValueError(
+                "MLA host dedup requires replicated KV; "
+                "--enable-kv-cache-sharding stores distinct KV pages."
+            )
+        if cfg.enable_dsa_cache_layer_split:
+            raise ValueError("MLA host dedup cannot use DSA cache layer splitting.")
+        if cfg.hicache_storage_backend is not None:
+            raise ValueError("MLA host dedup storage requires the file L3 integration.")
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
@@ -98,6 +115,10 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+
+    cfg = resolving_view(server_args)
+    if cfg.enable_mla_hicache_host_dedup and cfg.hicache_mem_layout == "page_unified":
+        raise ValueError("MLA host dedup does not support the page_unified layout.")
 
 
 def handle_hicache_ratio_default(server_args: Any):

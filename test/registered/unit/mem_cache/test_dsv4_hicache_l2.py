@@ -264,6 +264,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
             c4_state_global_layers=[],
         )
         memory = SimpleNamespace(
+            enable_mla_hicache_host_dedup=False,
             hicache_mem_layout="page_first_direct",
             hicache_write_policy="write_through",
             hicache_io_backend="kernel_ascend",
