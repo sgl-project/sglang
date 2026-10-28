@@ -1197,7 +1197,6 @@ class HummingMoEMethod(FusedMoEMethodBase):
             return
         from sglang.srt.layers.quantization.humming_utils import (
             configure_humming_deepep_dispatch,
-            make_humming_deepep_input_schema,
         )
 
         use_deepep_fp8_dispatch = configure_humming_deepep_dispatch(layer)
@@ -1206,58 +1205,74 @@ class HummingMoEMethod(FusedMoEMethodBase):
         layer.weight_schemas = self.weight_schemas
         layer.input_schemas = self.input_schemas
         for sublayer_name, configs in layer.sublayer_configs.items():
-            prefix = sublayer_name + "_"
-            tensors = {
-                name.removeprefix(prefix): param.data
-                for name, param in layer.named_parameters(recurse=False)
-                if name.startswith(prefix)
-            }
-            stack_size = configs["stack_size"]
-            shape_n_stacks = [configs["shape_n"] // stack_size] * stack_size
-            weight_schema, input_schema, tensors = _convert_humming_tensors(
-                weight_schema=self.weight_schema,
-                input_schema=self.input_schema,
-                tensors=tensors,
-                shape_n_stacks=shape_n_stacks,
-                shape_k_stacks=[configs["shape_k"]],
-                param_dtype=layer.param_dtype,
-                num_experts=layer.num_experts,
-                force_weight_schema=self.force_weight_schema,
-                force_input_schema=self.force_input_schema,
+            self._process_sublayer_after_loading(
+                layer, sublayer_name, configs, use_deepep_fp8_dispatch
             )
-            self.weight_schemas[sublayer_name] = weight_schema
-
-            if use_deepep_fp8_dispatch:
-                input_schema = make_humming_deepep_input_schema(
-                    sublayer_name,
-                    configs["shape_k"],
-                    weight_schema=weight_schema,
-                    param_dtype=layer.param_dtype,
-                )
-                tensors.pop("input_scale", None)
-                tensors.pop("input_scale_2", None)
-            self.input_schemas[sublayer_name] = input_schema
-
-            # prepare layer config from humming kernel
-            HummingMethod.prepare_layer_meta(
-                layer=layer,
-                shape_n=configs["shape_n"],
-                shape_k=configs["shape_k"],
-                pad_n_to_multiple=256,
-                pad_k_to_multiple=128,
-                input_schema=input_schema,
-                weight_schema=weight_schema,
-                has_bias=layer.with_bias,
-                num_experts=layer.num_experts,
-                torch_dtype=layer.param_dtype,
-                sublayer_name=sublayer_name,
-                tensors=tensors,
-            )
-            _replace_humming_parameters(layer, tensors, sublayer_name)
-
-            # preprocess weight for inference
-            HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
         self.processed = True
+
+    def _process_sublayer_after_loading(
+        self,
+        layer: torch.nn.Module,
+        sublayer_name: str,
+        configs: dict[str, Any],
+        use_deepep_fp8_dispatch: bool,
+    ) -> None:
+        # Release old-weight references before the next sublayer.
+        from sglang.srt.layers.quantization.humming_utils import (
+            make_humming_deepep_input_schema,
+        )
+
+        prefix = sublayer_name + "_"
+        tensors = {
+            name.removeprefix(prefix): param.data
+            for name, param in layer.named_parameters(recurse=False)
+            if name.startswith(prefix)
+        }
+        stack_size = configs["stack_size"]
+        shape_n_stacks = [configs["shape_n"] // stack_size] * stack_size
+        weight_schema, input_schema, tensors = _convert_humming_tensors(
+            weight_schema=self.weight_schema,
+            input_schema=self.input_schema,
+            tensors=tensors,
+            shape_n_stacks=shape_n_stacks,
+            shape_k_stacks=[configs["shape_k"]],
+            param_dtype=layer.param_dtype,
+            num_experts=layer.num_experts,
+            force_weight_schema=self.force_weight_schema,
+            force_input_schema=self.force_input_schema,
+        )
+        self.weight_schemas[sublayer_name] = weight_schema
+
+        if use_deepep_fp8_dispatch:
+            input_schema = make_humming_deepep_input_schema(
+                sublayer_name,
+                configs["shape_k"],
+                weight_schema=weight_schema,
+                param_dtype=layer.param_dtype,
+            )
+            tensors.pop("input_scale", None)
+            tensors.pop("input_scale_2", None)
+        self.input_schemas[sublayer_name] = input_schema
+
+        # prepare layer config from humming kernel
+        HummingMethod.prepare_layer_meta(
+            layer=layer,
+            shape_n=configs["shape_n"],
+            shape_k=configs["shape_k"],
+            pad_n_to_multiple=256,
+            pad_k_to_multiple=128,
+            input_schema=input_schema,
+            weight_schema=weight_schema,
+            has_bias=layer.with_bias,
+            num_experts=layer.num_experts,
+            torch_dtype=layer.param_dtype,
+            sublayer_name=sublayer_name,
+            tensors=tensors,
+        )
+        _replace_humming_parameters(layer, tensors, sublayer_name)
+
+        # preprocess weight for inference
+        HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
 
     def create_moe_runner(
         self,

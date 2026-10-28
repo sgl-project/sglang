@@ -127,81 +127,101 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
     layer.weight_schemas = {}
     layer.input_schemas = {}
 
-    for sublayer_name in shape_config:
-        # Step 1: convert weight to humming standard format
-        checkpoint_tensors: dict[str, torch.Tensor] = dict(
-            (key.removeprefix(sublayer_name + "_"), value)
-            for key, value in layer.state_dict().items()
-            if key.startswith(sublayer_name + "_")
+    for sublayer_name, (shape_n, shape_k) in shape_config.items():
+        _prepare_humming_moe_sublayer(
+            layer=layer,
+            sublayer_name=sublayer_name,
+            shape_n=shape_n,
+            shape_k=shape_k,
+            weight_schema=weight_schema,
+            input_schema=input_schema,
+            use_deepep_fp8_dispatch=use_deepep_fp8_dispatch,
         )
 
-        shape_n, shape_k = shape_config[sublayer_name]
-        shape_n_stacks = [shape_n]
-        shape_k_stacks = [shape_k]
-        if sublayer_name == "w13":
-            shape_n_stacks = [shape_n // 2] * 2
+    if not hasattr(layer, "locks"):
+        device = layer.w13_weight.device
+        locks = torch.zeros(1024, dtype=torch.int32, device=device)
+        layer.register_buffer("locks", locks)
 
-        weight_schema_new, tensors = weight_schema.convert_humming(
+
+def _prepare_humming_moe_sublayer(
+    layer: FusedMoE,
+    sublayer_name: str,
+    shape_n: int,
+    shape_k: int,
+    weight_schema: BaseWeightSchema,
+    input_schema: HummingInputSchema,
+    use_deepep_fp8_dispatch: bool,
+) -> None:
+    # Release old-weight references before the next sublayer.
+    # Step 1: convert weight to humming standard format
+    checkpoint_tensors: dict[str, torch.Tensor] = dict(
+        (key.removeprefix(sublayer_name + "_"), value)
+        for key, value in layer.state_dict().items()
+        if key.startswith(sublayer_name + "_")
+    )
+
+    shape_n_stacks = [shape_n]
+    shape_k_stacks = [shape_k]
+    if sublayer_name == "w13":
+        shape_n_stacks = [shape_n // 2] * 2
+
+    weight_schema_new, tensors = weight_schema.convert_humming(
+        tensors=checkpoint_tensors,
+        shape_n_stacks=shape_n_stacks,
+        shape_k_stacks=shape_k_stacks,
+        num_experts=layer.num_local_experts,
+        param_dtype=layer.params_dtype,
+    )
+    tensors = tensors.copy()
+    tensors.pop("input_scale", None)
+    tensors.pop("input_scale_2", None)
+
+    layer.weight_schemas[sublayer_name] = weight_schema_new
+    if use_deepep_fp8_dispatch:
+        sub_input_schema = make_humming_deepep_input_schema(
+            sublayer_name,
+            shape_k,
+            weight_schema=weight_schema_new,
+            param_dtype=layer.params_dtype,
+        )
+    else:
+        sub_input_schema, input_tensors = input_schema.convert_humming(
             tensors=checkpoint_tensors,
             shape_n_stacks=shape_n_stacks,
             shape_k_stacks=shape_k_stacks,
             num_experts=layer.num_local_experts,
             param_dtype=layer.params_dtype,
         )
-        tensors = tensors.copy()
-        tensors.pop("input_scale", None)
-        tensors.pop("input_scale_2", None)
+        tensors.update(input_tensors)
+    layer.input_schemas[sublayer_name] = sub_input_schema
 
-        layer.weight_schemas[sublayer_name] = weight_schema_new
-        if use_deepep_fp8_dispatch:
-            sub_input_schema = make_humming_deepep_input_schema(
-                sublayer_name,
-                shape_k,
-                weight_schema=weight_schema_new,
-                param_dtype=layer.params_dtype,
-            )
-        else:
-            sub_input_schema, input_tensors = input_schema.convert_humming(
-                tensors=checkpoint_tensors,
-                shape_n_stacks=shape_n_stacks,
-                shape_k_stacks=shape_k_stacks,
-                num_experts=layer.num_local_experts,
-                param_dtype=layer.params_dtype,
-            )
-            tensors.update(input_tensors)
-        layer.input_schemas[sublayer_name] = sub_input_schema
+    # Preparing integer activations can replace E0Mx weight tensors. Register
+    # the resulting tensors only after this conversion has completed.
+    HummingMethod.prepare_layer_meta(
+        layer=layer,
+        shape_n=shape_n,
+        shape_k=shape_k,
+        pad_n_to_multiple=256,
+        pad_k_to_multiple=128,
+        input_schema=sub_input_schema,
+        weight_schema=weight_schema_new,
+        has_bias=layer.with_bias,
+        num_experts=layer.num_local_experts,
+        torch_dtype=layer.params_dtype,
+        sublayer_name=sublayer_name,
+        tensors=tensors,
+    )
 
-        # Preparing integer activations can replace E0Mx weight tensors. Register
-        # the resulting tensors only after this conversion has completed.
-        HummingMethod.prepare_layer_meta(
-            layer=layer,
-            shape_n=shape_n,
-            shape_k=shape_k,
-            pad_n_to_multiple=256,
-            pad_k_to_multiple=128,
-            input_schema=sub_input_schema,
-            weight_schema=weight_schema_new,
-            has_bias=layer.with_bias,
-            num_experts=layer.num_local_experts,
-            torch_dtype=layer.params_dtype,
-            sublayer_name=sublayer_name,
-            tensors=tensors,
-        )
+    for name, _ in list(layer.named_parameters()):
+        if not name.startswith(sublayer_name + "_"):
+            continue
+        delattr(layer, name)
 
-        for name, _ in list(layer.named_parameters()):
-            if not name.startswith(sublayer_name + "_"):
-                continue
-            delattr(layer, name)
+    for name, tensor in tensors.items():
+        name = f"{sublayer_name}_{name}"
+        param = torch.nn.Parameter(tensor, requires_grad=False)
+        setattr(layer, name, param)
 
-        for name, tensor in tensors.items():
-            name = f"{sublayer_name}_{name}"
-            param = torch.nn.Parameter(tensor, requires_grad=False)
-            setattr(layer, name, param)
-
-        # Step 2: transform weight (humming standard format) for forwarding
-        HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
-
-    if not hasattr(layer, "locks"):
-        device = layer.w13_weight.device
-        locks = torch.zeros(1024, dtype=torch.int32, device=device)
-        layer.register_buffer("locks", locks)
+    # Step 2: transform weight (humming standard format) for forwarding
+    HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
