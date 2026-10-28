@@ -435,7 +435,10 @@ class NemotronHConfig(PretrainedConfig):
         )
 
         return Mamba2CacheParams(
-            shape=shape, layers=self.mamba_layer_ids, dtype=mamba2_state_dtype(self)
+            is_mamba2=True,
+            shape=shape,
+            layers=self.mamba_layer_ids,
+            dtype=mamba2_state_dtype(self),
         )
 
     @property

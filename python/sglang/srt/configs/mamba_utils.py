@@ -17,6 +17,7 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+import msgspec
 import numpy as np
 import torch
 
@@ -111,6 +112,8 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
 class BaseLinearStateParams(ABC):
     dtype: Mamba2StateDType = field(default_factory=lambda: mamba2_state_dtype(None))
     layers: list[int]
+    # Mamba2CacheParams is also used by linear-attention models.
+    is_mamba2: bool = False
 
     @property
     def mamba_cache_per_req(self) -> int:
@@ -374,3 +377,65 @@ class KimiLinearCacheParams(BaseLinearStateParams):
     @property
     def is_kda(self) -> bool:
         return True
+
+
+def mamba2_spec_replay_enabled(enable_linear_replayssm_spec, cache_params):
+    """Select runtime replay from the resolved cache metadata."""
+    return enable_linear_replayssm_spec and cache_params.is_mamba2
+
+
+class Mamba2ReplaySizing(msgspec.Struct, frozen=True):
+    """Exact local-layer allocation costs, including physical conv scratch."""
+
+    persistent_per_slot: int
+    record_per_slot: int
+    conv_per_row: int
+    parameters: int
+
+    @classmethod
+    def from_params(cls, params, *, layers, width, activation_bytes):
+        shape = params.shape
+        heads, dim, dstate = shape.temporal
+        conv_dim = shape.conv[0][0]
+        groups = (conv_dim - heads * dim) // (2 * dstate)
+        persistent = (
+            heads * dim * dstate * params.dtype.temporal.itemsize
+            + conv_dim * (shape.conv_kernel - 1) * params.dtype.conv.itemsize
+        )
+        # FlashInfer 0.7: max_window >= verify width and ring = window + width.
+        # Eager mode uses the smallest legal ring (2 * width), with p=start=0.
+        # x/B/processed dt and two int32 values are PHYSICAL-SLOT indexed.
+        record = (
+            2 * width * ((heads * dim + groups * dstate) * activation_bytes + heads * 4)
+            + 2 * 4
+        )
+        conv_steps = (
+            width * (shape.conv_kernel - 1)
+            if shape.disable_conv_window_dedup
+            else width + shape.conv_kernel - 2
+        )
+        return cls(
+            persistent * layers,
+            record * layers,
+            conv_dim * conv_steps * params.dtype.conv.itemsize * layers,
+            (8 + heads * 4 + 11 * 8) * layers,  # seeds, A vectors, pointer tables
+        )
+
+    def bytes_for(self, slots, request_cap, slots_per_request):
+        rows = min(request_cap, slots // slots_per_request) + 1
+        return (
+            (slots + 1) * (self.persistent_per_slot + self.record_per_slot)
+            + rows * self.conv_per_row
+            + self.parameters
+        )
+
+    def solve(self, budget_bytes, request_cap, slots_per_request):
+        # Exact integer solve also handles saturation at the configured cap.
+        lo, hi = 0, max(0, int(budget_bytes) // self.persistent_per_slot)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.bytes_for(mid, request_cap, slots_per_request) <= budget_bytes:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo

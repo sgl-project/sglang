@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    model_config_of,
     resolving_view,
     supports_mamba_cache_extra_buffer,
 )
@@ -16,8 +17,79 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
+def mamba2_spec_replay_requested(cfg, model_type):
+    """Recognize Mamba2 replay requests before cache parameters are resolved."""
+    return cfg.enable_linear_replayssm_spec and model_type == "nemotron_h"
+
+
+def validate_mamba2_spec_replay(cfg, *, is_cuda, cache_params, activation_dtype):
+    """Validate the resolved replay configuration before allocating pools."""
+    import torch
+
+    if not cfg.enable_linear_replayssm_spec:
+        return
+    prefix = "--enable-linear-replayssm-spec for Mamba2 "
+    if not is_cuda:
+        raise ValueError(prefix + "requires CUDA.")
+    if cfg.mamba_backend != "flashinfer":
+        raise ValueError(prefix + "requires --mamba-backend flashinfer.")
+    if (cfg.speculative_algorithm or "").upper() not in ("EAGLE", "NEXTN"):
+        raise ValueError(
+            prefix + "requires the EAGLE/NEXTN accepted-state commit worker."
+        )
+    if cfg.speculative_eagle_topk != 1:
+        raise ValueError(
+            prefix + "requires a linear chain (--speculative-eagle-topk 1)."
+        )
+    if cfg.speculative_num_draft_tokens != 4:
+        raise ValueError(
+            prefix + "currently requires four speculative verify positions."
+        )
+    if cfg.disaggregation_mode != "null":
+        raise ValueError(prefix + "does not yet support PD disaggregation.")
+    if cfg.enable_unified_memory:
+        raise ValueError(prefix + "does not yet support unified memory pools.")
+    if cfg.enable_page_major_kv_layout:
+        raise ValueError(prefix + "requires contiguous layer-major Mamba pools.")
+    if cfg.enable_linear_replayssm:
+        raise ValueError(prefix + "cannot be combined with --enable-linear-replayssm.")
+    if cfg.speculative_adaptive:
+        raise ValueError(prefix + "does not yet support adaptive verify widths.")
+    if cfg.enable_int8_mamba_checkpoint:
+        raise ValueError(prefix + "does not yet support int8 checkpoint pools.")
+    if activation_dtype != torch.bfloat16:
+        raise ValueError(prefix + "requires BF16 model activations.")
+    if cache_params.dtype.temporal != torch.float16:
+        raise ValueError(prefix + "requires FP16 SSM state.")
+    shape = cache_params.shape
+    if shape.temporal[1:] != (64, 128):
+        raise ValueError(prefix + "requires head_dim64/state_dim128.")
+    if len(shape.conv) != 1:
+        raise ValueError(prefix + "requires one convolution state.")
+    heads, dim, dstate = shape.temporal
+    groups, remainder = divmod(shape.conv[0][0] - heads * dim, 2 * dstate)
+    if groups < 1 or remainder or heads % groups:
+        raise ValueError(prefix + "has unsupported state/conv geometry.")
+
+
 def handle_mamba_backend(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.enable_linear_replayssm_spec and mamba2_spec_replay_requested(
+        cfg, model_config_of(server_args).hf_text_config.model_type
+    ):
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if not get_platform().is_sm100:
+            raise ValueError(
+                "--enable-linear-replayssm-spec for Mamba2 requires SM100."
+            )
+        if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "--enable-linear-replayssm-spec for Mamba2 requires static-width verify."
+            )
     if cfg.mamba_cache_philox_rounds < 0:
         raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
 
