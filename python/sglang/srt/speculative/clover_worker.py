@@ -90,7 +90,6 @@ class CloverWorker(BaseSpecWorker):
         self.draft_backend = CloverPreviewBackend(self.model_runner, self.block_size)
 
     def init_cuda_graphs(self):
-        # The target runner already resolved whether decode graphs are enabled.
         if self.model_runner.decode_cuda_graph_runner is not None:
             from sglang.srt.model_executor.cuda_graph_config import Backend
 
@@ -171,6 +170,7 @@ class CloverWorker(BaseSpecWorker):
                 )
         # Own the candidate storage: verify reuses shared graph buffers.
         logits = output.full_logits.view(fb.batch_size, self.block_size, -1)
+        logits[..., self.mask_id] = float("-inf")
         apply_clover_penalties(
             logits,
             reqs,
@@ -207,8 +207,7 @@ class CloverWorker(BaseSpecWorker):
 
         if not (can_run_graph and logits.shape[0] == 1 and get_parallel().tp_size == 1):
             return compute()
-        # Candidates are newly allocated each round: own their stable storage.
-        # Keep just one graph, recapturing if the model's logits buffer changes.
+        # One graph, recaptured when the model's logits buffer moves.
         key = (
             logits.data_ptr(),
             tuple(logits.shape),
@@ -246,7 +245,7 @@ class CloverWorker(BaseSpecWorker):
                 batch, pp_proxy_tensors=pp_proxy_tensors
             )
             self._sync(result.next_token_ids)
-            result.new_seq_lens = batch.seq_lens.clone()
+            result.new_seq_lens = batch.seq_lens
             result.next_draft_input = CloverDraftInput.from_tokens(
                 result.next_token_ids, result.new_seq_lens
             )
@@ -316,6 +315,7 @@ class CloverWorker(BaseSpecWorker):
         if result.can_run_cuda_graph and self.verify_graph_replay_ct == 1:
             logger.info("CLOVER verify CUDA graph replay active")
         logits = result.logits_output.next_token_logits.view(bs, width, -1)
+        logits[..., self.mask_id] = float("-inf")
         apply_clover_penalties(logits, batch.reqs, candidates, state=self.penalty_state)
         greedy = (
             result.can_run_cuda_graph

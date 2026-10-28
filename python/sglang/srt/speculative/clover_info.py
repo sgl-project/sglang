@@ -45,7 +45,6 @@ class CloverPreviewInput(SpecInput):
 
     @property
     def draft_token_num(self):
-        # Hybrid attention metadata uses this shared draft/verify spelling.
         return self.num_tokens_per_req
 
     def __post_init__(self):
@@ -96,8 +95,7 @@ class CloverVerifyInput(DFlashVerifyInput):
 
     def prepare_for_verify(self, batch, target_worker):
         forward_batch, can_run_graph = super().prepare_for_verify(batch, target_worker)
-        # The inherited GPU path has already loaded the graph buffers (or
-        # initialized eager metadata). Do not repeat that work in execute().
+        # The inherited GPU path already loaded graph buffers or eager metadata.
         if not batch.forward_mode.is_idle():
             forward_batch.mark_forward_metadata_ready(replan_equivalent=True)
         return forward_batch, can_run_graph

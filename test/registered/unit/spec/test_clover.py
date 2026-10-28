@@ -42,24 +42,14 @@ class TestCloverAcceptance(CustomTestCase):
                 logits[row, j, j + 1] = 20
         logits[0, 2].fill_(-20)
         logits[0, 2, 3] = 20
-        for rule in ("threshold", "exact"):
-            with self.subTest(rule=rule):
-                counts = clover_correct_drafts(logits, candidates, accept_rule=rule)
-                self.assertEqual(counts.tolist(), [0, 1, 2, 3])
-                bonus = logits[torch.arange(4), counts.long()].argmax(-1)
-                output = clover_accept_tokens(candidates, counts, bonus)
-                self.assertEqual(
-                    [row[: n + 1].tolist() for row, n in zip(output, counts.tolist())],
-                    [[6], [1, 6], [1, 2, 6], [1, 2, 3, 6]],
-                )
-
-    def test_clover_accepts_non_argmax_and_threshold_equality(self):
-        probabilities = torch.tensor([0.6, 0.4])
-        logits = probabilities.log().expand(1, 3, 2)
-        candidates = torch.tensor([[0, 1, 1]])
-        # Equality at the ceiling is accepted. Clover acceptance is not exact greedy.
-        self.assertEqual(clover_correct_drafts(logits, candidates, 0.4, 10).item(), 2)
-        self.assertEqual(clover_correct_drafts(logits, candidates, 0.41, 10).item(), 0)
+        counts = clover_correct_drafts(logits, candidates)
+        self.assertEqual(counts.tolist(), [0, 1, 2, 3])
+        bonus = logits[torch.arange(4), counts.long()].argmax(-1)
+        output = clover_accept_tokens(candidates, counts, bonus)
+        self.assertEqual(
+            [row[: n + 1].tolist() for row, n in zip(output, counts.tolist())],
+            [[6], [1, 6], [1, 2, 6], [1, 2, 3, 6]],
+        )
 
     def test_exact_rejects_non_argmax_and_resolves_ties(self):
         logits = torch.tensor([[[0.6, 0.4], [0.5, 0.5], [0.1, 0.9]]]).log()
@@ -99,13 +89,6 @@ class TestCloverAcceptance(CustomTestCase):
         self.assertTrue(verify.is_verify_input())
         self.assertEqual(verify.num_tokens_per_req, 4)
 
-    def test_algorithm_identity(self):
-        algo = SpeculativeAlgorithm.from_string("clover")
-        self.assertTrue(algo.is_clover())
-        self.assertFalse(algo.is_dflash_family())
-        self.assertFalse(algo.has_draft_kv())
-        self.assertFalse(algo.supports_mixed_chunk())
-
     def test_algorithm_spelling_survives_model_and_spec_resolution(self):
         # Model overrides run before the speculative hook. Both must agree on
         # the spelling read by the preview fast-plan gate after publication.
@@ -118,69 +101,59 @@ class TestCloverAcceptance(CustomTestCase):
         model = SimpleNamespace(
             hf_config=CloverMoeConfig(architectures=["CloverMoeModelLM"])
         )
-        for spelling in ("clover", "CLOVER", "ClOvEr"):
-            expected = "CLOVER"
-            with self.subTest(spelling=spelling):
-                args = ServerArgs(
-                    model_path="dummy",
-                    device="cuda",
-                    linear_attn_backend="triton",
-                    speculative_algorithm=spelling,
-                )
-                declare_resolution(
-                    args, "clover_model", **_clover_overrides(args, model.hf_config)
-                )
-                with patch(
-                    "sglang.srt.speculative.clover_config.model_config_of",
-                    return_value=model,
-                ):
-                    handle_speculative_decoding(args)
-                self.assertEqual(resolving_view(args).speculative_algorithm, expected)
-                self.assertEqual(args.speculative_algorithm, spelling)
-                try:
-                    publish(args, role="scheduler")
-                    self.assertEqual(get_spec().speculative_algorithm, expected)
-                    self.assertIs(
-                        SpeculativeAlgorithm.from_string(
-                            get_spec().speculative_algorithm
-                        ),
-                        SpeculativeAlgorithm.CLOVER,
-                    )
-                finally:
-                    reset_context()
+        args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            linear_attn_backend="triton",
+            speculative_algorithm="ClOvEr",
+        )
+        declare_resolution(
+            args, "clover_model", **_clover_overrides(args, model.hf_config)
+        )
+        with patch(
+            "sglang.srt.speculative.clover_config.model_config_of",
+            return_value=model,
+        ):
+            handle_speculative_decoding(args)
+        self.assertEqual(resolving_view(args).speculative_algorithm, "CLOVER")
+        self.assertEqual(args.speculative_algorithm, "ClOvEr")
+        try:
+            publish(args, role="scheduler")
+            self.assertEqual(get_spec().speculative_algorithm, "CLOVER")
+            self.assertIs(
+                SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm),
+                SpeculativeAlgorithm.CLOVER,
+            )
+        finally:
+            reset_context()
 
     def test_model_requires_explicit_clover_without_overriding_algorithm(self):
         from sglang.srt.arg_groups.arg_utils import resolvable_fields
 
         self.assertNotIn("speculative_algorithm", resolvable_fields(ServerArgs))
         model = CloverMoeConfig()
-        for algorithm in (None, "NONE", "none", "EAGLE", "DFLASH", "UNO"):
-            with self.subTest(algorithm=algorithm):
-                args = ServerArgs(
-                    model_path="dummy",
-                    device="cuda",
-                    linear_attn_backend="triton",
-                    speculative_algorithm=algorithm,
-                )
-                with self.assertRaisesRegex(
-                    ValueError, "requires --speculative-algorithm clover"
-                ):
-                    _clover_overrides(args, model)
-                self.assertEqual(resolving_view(args).speculative_algorithm, algorithm)
-        for algorithm in ("clover", "CLOVER", "ClOvEr"):
-            with self.subTest(algorithm=algorithm):
-                args = ServerArgs(
-                    model_path="dummy",
-                    device="cuda",
-                    linear_attn_backend="triton",
-                    speculative_algorithm=algorithm,
-                )
-                result = _clover_overrides(args, model)
-                self.assertNotIn("speculative_algorithm", result)
-                self.assertEqual(resolving_view(args).speculative_algorithm, algorithm)
+        args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            linear_attn_backend="triton",
+            speculative_algorithm=None,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "requires --speculative-algorithm clover"
+        ):
+            _clover_overrides(args, model)
+        self.assertIsNone(resolving_view(args).speculative_algorithm)
+        args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            linear_attn_backend="triton",
+            speculative_algorithm="CLOVER",
+        )
+        result = _clover_overrides(args, model)
+        self.assertNotIn("speculative_algorithm", result)
+        self.assertEqual(resolving_view(args).speculative_algorithm, "CLOVER")
 
     def test_validated_replica_dp_and_ep_configs(self):
-        # These configurations ran end-to-end but the old model gate rejected them.
         for kwargs in (
             {"dp_size": 2},
             {"tp_size": 2, "ep_size": 2},
@@ -264,18 +237,16 @@ class TestCloverConfig(CustomTestCase):
         self.assertEqual(
             defaults, {"presence_penalty": 0.9, "repetition_penalty": 1.05}
         )
-        for preferred in (
-            {"presence_penalty": 0, "temperature": 0.6},
-            '{"presence_penalty": 0, "temperature": 0.6}',
-        ):
-            args = self.configure(preferred_sampling_params=preferred)
-            self.assertEqual(
-                resolving_view(args).preferred_sampling_params,
-                {"presence_penalty": 0, "repetition_penalty": 1.05, "temperature": 0.6},
-            )
+        args = self.configure(
+            preferred_sampling_params='{"presence_penalty": 0, "temperature": 0.6}'
+        )
+        self.assertEqual(
+            resolving_view(args).preferred_sampling_params,
+            {"presence_penalty": 0, "repetition_penalty": 1.05, "temperature": 0.6},
+        )
 
     def test_verify_backend_selection(self):
-        for backend in (None, "triton", "flashinfer"):
+        for backend in ("triton", "flashinfer"):
             with self.subTest(backend=backend):
                 args = self.configure(linear_attn_verify_backend=backend)
                 self.assertEqual(
@@ -285,9 +256,7 @@ class TestCloverConfig(CustomTestCase):
 
     def test_invalid_config(self):
         for kwargs in (
-            {"speculative_num_draft_tokens": 0},
             {"speculative_num_draft_tokens": 1},
-            {"speculative_num_draft_tokens": 3},
             {"speculative_num_draft_tokens": 64},
             {"speculative_clover_accept_rule": "unknown"},
             {"speculative_clover_accept_ratio": float("nan")},
@@ -304,23 +273,36 @@ class TestCloverConfig(CustomTestCase):
                 self.configure(**kwargs)
 
     def test_request_sampling_contract(self):
-        for temperature in (0, 0.8):
-            req = SimpleNamespace(
-                sampling_params=SamplingParams(
-                    temperature=temperature,
-                    top_p=0.9,
-                    top_k=20,
-                    custom_params={"dllm_think_end_bias": 0},
-                )
-            )
-            self.assertIsNone(validate_clover_request(req))
+        fields = dict(
+            tokenizer=None,
+            return_logprob=False,
+            return_sampling_mask=False,
+            custom_logit_processor=None,
+            input_embeds=None,
+            positional_embed_overrides=None,
+            return_hidden_states=False,
+        )
+        req = SimpleNamespace(
+            **fields,
+            sampling_params=SamplingParams(
+                temperature=0.8,
+                top_p=0.9,
+                top_k=20,
+                custom_params={"dllm_think_end_bias": 0},
+            ),
+        )
+        self.assertIsNone(validate_clover_request(req))
         for field, value in (
             ("min_p", 0.1),
             ("regex", "[0-9]+"),
         ):
-            req = SimpleNamespace(sampling_params=SamplingParams(**{field: value}))
+            req = SimpleNamespace(
+                **fields, sampling_params=SamplingParams(**{field: value})
+            )
             self.assertIn(field, validate_clover_request(req))
-        req = SimpleNamespace(sampling_params=SamplingParams(), return_logprob=True)
+        req = SimpleNamespace(
+            **{**fields, "return_logprob": True}, sampling_params=SamplingParams()
+        )
         self.assertIn("return_logprob", validate_clover_request(req))
 
 

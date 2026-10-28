@@ -74,9 +74,7 @@ class CloverPenaltyState:
         if old_len < len(output):
             delta = [t for t in output[old_len:] if 0 <= t < vocab_size]
             if delta:
-                # Fresh pinned storage is safe to release after nonblocking H2D:
-                # PyTorch's pinned allocator tracks the copy stream. Reusing a
-                # mutable host staging buffer here would race the pending copy.
+                # Fresh pinned storage outlives the async copy, a reused one races it.
                 ids = torch.tensor(
                     delta, dtype=torch.long, pin_memory=device.type == "cuda"
                 ).to(device, non_blocking=True)
@@ -107,7 +105,7 @@ def validate_clover_penalties(req):
         if type(value) is not int or value < minimum:
             return f"CLOVER custom_params.{key} must be an integer >= {minimum}"
     token = custom.get("dllm_think_end_token_id")
-    tokenizer = getattr(req, "tokenizer", None)
+    tokenizer = req.tokenizer
     if custom.get("dllm_think_end_bias", 0) > 0 and token is None:
         encoded = (
             tokenizer.encode("</think>", add_special_tokens=False)
@@ -124,16 +122,15 @@ def validate_clover_penalties(req):
             or (tokenizer is not None and token >= len(tokenizer))
         ):
             return "CLOVER dllm_think_end_token_id must be a valid vocabulary ID"
-        # Resolve once during request validation, not in the decode loop.
         custom["dllm_think_end_token_id"] = token
     sp.custom_params = custom
     return None
 
 
 def _stop_tokens(req, vocab_size):
-    tokenizer = getattr(req, "tokenizer", None)
+    tokenizer = req.tokenizer
     stops = set(req.sampling_params.stop_token_ids or ())
-    stops.update(getattr(req, "eos_token_ids", None) or ())
+    stops.update(req.eos_token_ids or ())
     stops.update(getattr(tokenizer, "additional_stop_token_ids", None) or ())
     stops.add(getattr(tokenizer, "eos_token_id", None))
     return sorted(t for t in stops if t is not None and 0 <= t < vocab_size)
@@ -169,8 +166,6 @@ def apply_clover_penalties(logits, reqs, visible_tokens, *, preview=False, state
         scores = logits[row]
         history = state.history(req, vocab_size)
         if sp.frequency_penalty or sp.presence_penalty or sp.repetition_penalty != 1:
-            # Only O(vocab) temporary state, never a full [batch, width, vocab]
-            # copy. No device-to-host transfer of visible candidate tokens.
             counts = state.committed_counts(req, vocab_size, logits.device)
             if (
                 scores.is_cuda
@@ -209,6 +204,7 @@ def apply_clover_penalties(logits, reqs, visible_tokens, *, preview=False, state
         if (
             length_bias
             and stops
+            and not sp.ignore_eos
             and first_position + width - 1
             > custom.get("dllm_length_penalty_start", 8192)
         ):

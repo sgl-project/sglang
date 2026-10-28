@@ -26,8 +26,7 @@ def _check_bd_gdn_softmax_scalars(
             f"expected {num_value_heads}, got {logit_scale.numel()} and "
             f"{history_bias.numel()}"
         )
-    # The kernel converts each loaded scalar to FP32. Avoid three separate
-    # conversion kernels per layer when the checkpoint stores these in BF16.
+    # The kernel converts these scalars to FP32 on load, so BF16 views pass unconverted.
     return logit_scale.reshape(-1), history_bias.reshape(-1)
 
 
@@ -131,8 +130,6 @@ def _clover_local_memory_kernel(
         tl.load(active_valid_ptr + token_indices, mask=token_mask, other=0) != 0
     ) & request_active
 
-    # Value heads may share Q/K heads. Clover maps pairs of value heads to
-    # one of 16 Q/K heads without materializing repeat_interleave.
     query_head = value_head // (NUM_V_HEADS // NUM_Q_HEADS)
     key_head = value_head // (NUM_V_HEADS // NUM_K_HEADS)
 
@@ -168,7 +165,7 @@ def _clover_local_memory_kernel(
         other=0.0,
     )
 
-    # Match the GDN epsilon and normalize before Tensor Core dot products.
+    # The 1e-6 epsilon matches the GDN L2 normalization.
     query_f32 = query.to(tl.float32)
     query_norm = tl.rsqrt(tl.sum(query_f32 * query_f32, axis=1) + 1.0e-6)
     query = (query_f32 * query_norm[:, None]).to(query.dtype)
@@ -336,11 +333,9 @@ def clover_local_memory_triton(
         device=value.device,
     )
 
-    # Tensor Core dot requires a K dimension of at least 16. Short generation
-    # blocks are zero-padded by token_mask, so the mathematical reduction still
-    # contains exactly block_size valid tokens.
+    # tl.dot needs K of at least 16, and token_mask zeroes the padded rows.
     block_t = max(16, triton.next_power_of_2(block_size))
-    block_q = 32 if block_size == 128 else block_t
+    block_q = block_t
     num_query_tiles = triton.cdiv(block_size, block_q)
     block_k = triton.next_power_of_2(key_dim)
     block_v = 128

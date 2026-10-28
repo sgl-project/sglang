@@ -1,8 +1,11 @@
 """Config-time override declarations for Clover."""
 
+import logging
 from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import _register_for, resolving_view
+
+logger = logging.getLogger(__name__)
 
 
 @_register_for("CloverMoeModelLM")
@@ -17,9 +20,6 @@ def _clover_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError(
             "Clover does not support --dllm-algorithm; use --speculative-algorithm clover"
         )
-    # Keep configurations outside the current validation scope gated pending
-    # targeted tests. An unvalidated configuration is not necessarily unsupported.
-    # CUDA is required by the preview kernels; the model wrapper requires PP=1.
     if cfg.device != "cuda" or cfg.dtype not in ("auto", "bfloat16"):
         raise ValueError(
             "Clover preview kernels require CUDA; serving dtypes other than BF16 are unvalidated"
@@ -58,11 +58,16 @@ def _clover_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError("Clover supports only unquantized models")
     if cfg.disaggregation_mode != "null" or cfg.enable_hierarchical_cache:
         raise ValueError("Clover with disaggregation or HiCache is unvalidated")
+    strategy = "no_buffer" if cfg.disable_radix_cache else "extra_buffer"
+    if cfg.mamba_radix_cache_strategy not in ("auto", strategy):
+        logger.warning(
+            "Clover requires mamba_radix_cache_strategy=%s, overriding %s.",
+            strategy,
+            cfg.mamba_radix_cache_strategy,
+        )
     overrides = {
         "attention_backend": "flashinfer",
-        "mamba_radix_cache_strategy": (
-            "no_buffer" if cfg.disable_radix_cache else "extra_buffer"
-        ),
+        "mamba_radix_cache_strategy": strategy,
     }
     if cfg.ep_size > 1:
         overrides["moe_runner_backend"] = "triton"

@@ -36,7 +36,7 @@ from sglang.srt.layers.linear import (
     resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend, reduce_moe_output
+from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -72,7 +72,6 @@ from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 
 def block_coreset(logits, block_size, top_k, top_p):
-    # Preserve the reference's boundary behavior (including top_p=1).
     if 0.0 < top_p < 1.0 and supports_clover_block_coreset_triton(
         logits, top_k=top_k, block_size=block_size
     ):
@@ -90,7 +89,6 @@ def _block_coreset_reference(logits, block_size, top_k, top_p):
     order = probs.argsort(dim=-1, descending=True, stable=True)
     ordered = probs.gather(-1, order)
     keep = ordered.cumsum(-1) - ordered < top_p
-    keep[:, 0] = True
     allowed = torch.zeros_like(keep).scatter(1, order, keep)
     return (
         logits.view_as(scores)
@@ -100,7 +98,6 @@ def _block_coreset_reference(logits, block_size, top_k, top_p):
 
 
 # Adapted from qwen3_5.py::_qwen3_5_stage_facts.
-# Clover declare every FFN sparse without Qwen model_type detection.
 def _clover_stage_facts(config, layer_id, *, attn_read=NORM_QUANT_READOUT):
     return declare_attn(read=attn_read), declare_ffn(
         sparse=True, next_layer_sparse=True
@@ -119,8 +116,7 @@ class CloverSparseMoeBlock(Qwen2MoeSparseMoeBlock):
         # Clover's layer boundaries do not install a deferred-finalize consumer.
         return False
 
-    # Reuse Qwen routing and shared-expert fusion, with coreset applied only
-    # to routed experts before top-k during diffusion.
+    # The coreset restricts routed experts only, before top-k, and only in preview.
     def _forward_router_experts(
         self,
         hidden_states: torch.Tensor,
@@ -176,20 +172,10 @@ class CloverSparseMoeBlock(Qwen2MoeSparseMoeBlock):
         forward_batch: Optional[ForwardBatch] = None,
         defer_finalize: bool = False,
     ) -> torch.Tensor:
-        # Clover's layer boundaries do not install a deferred-finalize consumer.
         if defer_finalize:
             raise RuntimeError("Clover does not use deferred MoE finalization")
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-
-        if self._use_mega_moe:
-            return self._forward_mega_moe(hidden_states, forward_batch)
-        if (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_deepep_v2()
-            or get_moe_a2a_backend().is_mori()
-        ):
-            return self._forward_deepep(hidden_states, forward_batch)
 
         use_fused_gate = self.shared_expert_gate is not None
         if hidden_states.shape[0] == 0:
@@ -231,7 +217,6 @@ class CloverSparseMoeBlock(Qwen2MoeSparseMoeBlock):
 
 class CloverRadixLinearAttention(RadixLinearAttention):
     def forward(self, forward_batch, mixed_qkv, a, b):
-        # Use conventional GDN for causal context encoding.
         if not forward_batch.forward_mode.is_dllm_extend():
             return super().forward(forward_batch, mixed_qkv, a, b)
 
@@ -296,7 +281,6 @@ class CloverRadixLinearAttention(RadixLinearAttention):
         )
 
 
-# Clover adds parameters for diffusion and replaces only the internal attention module.
 class CloverGatedDeltaNet(Qwen3_5GatedDeltaNet):
     def __init__(self, config, layer_id, quant_config=None, alt_stream=None, prefix=""):
         super().__init__(config, layer_id, quant_config, alt_stream, prefix)
@@ -379,7 +363,6 @@ class CloverLinearDecoderLayer(Qwen3_5LinearDecoderLayer):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        # Qwen's optional CuTe DSL boundary fusion is currently not supported for Clover.
         if build_stages:
             attn, ffn = self.stage_facts(config, layer_id)
             self.attn_boundary, self.ffn_boundary = append_stages(
@@ -431,7 +414,6 @@ class CloverAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.layer_id = layer_id
 
-        # If rope_scaling doesn't specify a scaling type, treat as no scaling
         if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
             rope_scaling = None
 
@@ -448,8 +430,6 @@ class CloverAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             dtype=torch.get_default_dtype(),
         )
 
-        # Q stays sharded across attention TP ranks; K/V are replicated within
-        # each DCP group.
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
@@ -472,7 +452,7 @@ class CloverAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # Clover change: causal encoding and noncausal preview share projections.
+        # Causal encoding and noncausal preview share projections.
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -513,8 +493,6 @@ class CloverAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # Standard attention layers benefit from a fused quant epilogue only
-        # when qkv_proj can consume the returned quantized tuple.
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
         boundary_fusions = _layer_fusions(config, False)
         # A subclass that brings its own residual builds the stages itself.
@@ -534,8 +512,6 @@ class CloverAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         self.alt_stream = alt_stream
 
     # Adapted from Qwen3_5AttentionDecoderLayer.self_attention in qwen3_5.py.
-    # Clover selects attn_preview for diffusion; QKV preparation and output
-    # gate/projection behavior follow Qwen, including its FP8 input handling.
     def self_attention(self, positions, hidden_states, forward_batch):
         if not forward_batch.forward_mode.is_dllm_extend():
             return super().self_attention(positions, hidden_states, forward_batch)
@@ -546,7 +522,6 @@ class CloverAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             forward_batch=forward_batch,
         )
         attn_output = self.attn_preview(q, k, v, forward_batch)
-        # Output gate and projection input handling.
         if self.attn_output_gate:
             if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
                 attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
@@ -568,21 +543,9 @@ class CloverMoeModel(Qwen3_5MoeForCausalLM):
         "attention": CloverAttentionDecoderLayer,
     }
 
-    def get_hidden_dim(self, module_name, layer_idx):
-        if module_name == "gate_up_proj":
-            return (
-                self.config.hidden_size,
-                self.config.shared_expert_intermediate_size * 2,
-            )
-        if module_name == "down_proj":
-            return self.config.shared_expert_intermediate_size, self.config.hidden_size
-        return super().get_hidden_dim(module_name, layer_idx)
-
 
 class CloverMoeModelLM(nn.Module):
     fall_back_to_pt_during_load = False
-    packed_modules_mapping = Qwen3_5MoeForConditionalGeneration.packed_modules_mapping
-    supported_lora_modules = Qwen3_5MoeForConditionalGeneration.supported_lora_modules
 
     def __init__(
         self,
@@ -635,9 +598,7 @@ class CloverMoeModelLM(nn.Module):
         )
         return result
 
-    # Clover-owned loader. Projection mappings and expert shard conventions are
-    # adapted from qwen3_5.py::Qwen3_5MoeForCausalLM.load_weights.
-    # Clover changes: explicit supported checkpoint paths
+    # Adapted from qwen3_5.py::Qwen3_5MoeForCausalLM.load_weights.
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_mapping = (
             ("qkv_proj", "q_proj", "q"),

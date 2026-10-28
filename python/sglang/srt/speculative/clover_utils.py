@@ -23,8 +23,7 @@ def clover_correct_drafts(
     thresholds = torch.minimum(
         torch.full_like(entropy, accept_ratio), accept_delta * torch.exp(-entropy)
     )
-    # A hard penalty (e.g. min_new_tokens) must still reject an impossible
-    # candidate when ratio or delta is zero and therefore the threshold is zero.
+    # A zero threshold must still reject candidates a hard penalty blocked.
     matches = (proposal_probs >= thresholds) & (proposal_probs > 0)
     return matches.to(torch.int32).cumprod(dim=-1).sum(-1).to(torch.int32)
 

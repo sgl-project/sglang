@@ -21,8 +21,7 @@ from sglang.srt.speculative.clover_info import CloverPreviewInput
 class CloverPreviewFlashInferBackend(FlashInferAttnBackend):
     def __init__(self, runner, block_size):
         super().__init__(runner)
-        # Private backend configuration only: no dLLM scheduler or ServerArgs
-        # override. This instance is never used for causal verification.
+        # A private preview backend config, never published to ServerArgs.
         self.dllm_config = DllmConfig(
             "Clover",
             {},
@@ -32,9 +31,7 @@ class CloverPreviewFlashInferBackend(FlashInferAttnBackend):
             requires_separate_context_encoding=True,
         )
         self.is_dllm_model = True
-        # A preview writes its whole block before attending noncausally. One
-        # paged pass covers prefix+block; ragged+prefix would require two plans
-        # and a merge, and prevents using host-known fixed-width metadata.
+        # Paged mode lets one plan cover prefix and block with host metadata.
         self.use_paged = True
 
     def init_forward_metadata(self, forward_batch):
@@ -107,8 +104,7 @@ class CloverPreviewFlashInferBackend(FlashInferAttnBackend):
             and self.prefill_backend == "fa2"
             and self.dispatch_reason is None
         ):
-            # The initial plan must populate _cached_module before
-            # installing the sync-free replay planner for this preview wrapper.
+            # The first plan populates _cached_module, which the replay planner reads.
             for wrapper in self.prefill_cuda_graph_metadata[forward_batch.batch_size]:
                 wrapper.begin_forward = partial(fast_prefill_plan, wrapper)
 
@@ -138,8 +134,7 @@ class CloverDraftCudaGraphRunner(DecodeCudaGraphRunner):
     """Use native graph buffers/buckets, with Clover preview capture dispatch."""
 
     def capture(self):
-        # The base constructor sizes buffers using the speculative width B.
-        # Specialize the capture phase before it constructs any dummy batch.
+        # Set before the base constructor sizes buffers and dummy batches.
         self.capture_forward_mode = ForwardMode.DLLM_EXTEND
         self.is_dllm = True
         return super().capture()

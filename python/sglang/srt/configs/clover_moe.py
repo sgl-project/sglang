@@ -1,5 +1,6 @@
 from copy import deepcopy
 
+import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.linear_attn_model_registry import (
@@ -40,7 +41,7 @@ class CloverMoeConfig(PretrainedConfig):
         linear_value_head_dim=128,
         mamba_ssm_dtype="float32",
         mask_token_id=151669,
-        max_position_embeddings=262144,
+        max_position_embeddings=131072,
         moe_block_coreset_enabled=True,
         moe_block_coreset_top_p=0.9,
         moe_intermediate_size=512,
@@ -107,11 +108,9 @@ class CloverMoeConfig(PretrainedConfig):
         self.attention_backend = attention_backend
         self.norm_topk_prob = norm_topk_prob
         self.output_gate_type = output_gate_type
-        if num_shared_experts not in (0, 1):
-            raise ValueError("Clover supports zero or one shared expert")
-        self.shared_expert_intermediate_size = (
-            shared_expert_intermediate_size if num_shared_experts else 0
-        )
+        if num_shared_experts != 1:
+            raise ValueError("Clover requires exactly one shared expert")
+        self.shared_expert_intermediate_size = shared_expert_intermediate_size
 
         self.rope_parameters = deepcopy(
             rope_parameters
@@ -125,6 +124,17 @@ class CloverMoeConfig(PretrainedConfig):
         self.layer_types = deepcopy(layer_types)
         if not 0 < moe_block_coreset_top_p <= 1:
             raise ValueError("Clover coreset top_p must be in (0, 1]")
+        if mamba_ssm_dtype != "float32":
+            raise ValueError("Clover requires a float32 recurrent state")
+        if hidden_act != "silu" or attn_output_gate is not True:
+            raise ValueError("Clover requires SiLU and gated full attention")
+        if not 0 <= mask_token_id < vocab_size:
+            raise ValueError("Clover mask_token_id is outside the vocabulary")
+        if layer_types is not None and (
+            len(layer_types) != num_hidden_layers
+            or set(layer_types) - {"full_attention", "linear_attention"}
+        ):
+            raise ValueError("Clover layer_types must give one known type per layer")
 
     @property
     def layers_block_type(self):
@@ -172,9 +182,12 @@ class CloverMoeConfig(PretrainedConfig):
             conv_kernel=self.linear_conv_kernel_dim,
             conv_shard_groups=[key_dim, key_dim, value_dim],
         )
-        return Mamba2CacheParams(
-            shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
-        )
+        dtype = mamba2_state_dtype(self)
+        if dtype.temporal != torch.float32:
+            raise ValueError(
+                "Clover requires a float32 recurrent state, so unset SGLANG_MAMBA_SSM_DTYPE"
+            )
+        return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids, dtype=dtype)
 
 
 register_linear_attn_model(

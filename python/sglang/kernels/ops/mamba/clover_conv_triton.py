@@ -228,12 +228,9 @@ def clover_local_memory_conv(
         else weights
     )
     output = torch.empty_like(mixed_qkv)
-    block_t = 32 if block_size == 128 else triton.next_power_of_2(block_size)
+    block_t = triton.next_power_of_2(block_size)
     num_token_tiles = triton.cdiv(block_size, block_t)
-    # For the latency-critical MRR=1 / block-32 preview on Blackwell, a
-    # 64-channel tile gives the small convolution more parallel programs and
-    # is faster than the generic 128-channel tile.  Keep the established
-    # geometry for other request shapes.
+    # 64-channel tiles measured faster for the batch 1, block 32 preview on Blackwell.
     block_c = 64 if batch_size == 1 and block_size == 32 else 128
     grid = (triton.cdiv(channels, block_c), batch_size * num_token_tiles)
     _bd_gdn_preview_conv_kernel[grid](

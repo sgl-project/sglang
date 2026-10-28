@@ -12,27 +12,6 @@ For eager, add --disable-decode-cuda-graph. Save its output, then pass that
 file via --reference to compare greedy outputs with a subsequent graph run.
 The server is flushed between cases; use a dedicated test server.
 
-CLOVER shares the target weights and caches. It drafts B-1 tokens with the
-noncausal Clover preview, verifies B causal inputs, and emits the contiguous
-Clover-accepted prefix plus one sampled bonus. B defaults to checkpoint
-block_size and is configurable with --speculative-num-draft-tokens. Acceptance
-uses raw probabilities and min(ratio, delta * exp(-entropy)), with defaults
---speculative-clover-accept-ratio 1.0 and --speculative-clover-accept-delta 0.6.
-Temperature/top-k/top-p apply only to bonus sampling. This is approximate
-Clover acceptance, not distribution-preserving speculative sampling.
-
-Clover checkpoints require an explicit --speculative-algorithm clover.
-Pass --speculative-algorithm clover to enable Clover ARVerify.
-Clover does not support --dllm-algorithm on this branch.
-Omitting the algorithm, selecting NONE, or selecting another algorithm is rejected.
-
-Clover defaults: presence_penalty=0.9, repetition_penalty=1.05,
-dllm_length_penalty=10, dllm_think_end_bias=10, dllm_think_end_start=4096.
-Length start/window remain 8192/8192; think window remains 4096. Custom dllm_*
-controls are sampling_params.custom_params fields. To disable all penalties,
-explicitly pass presence_penalty=0, repetition_penalty=1 and custom_params
-{"dllm_length_penalty": 0, "dllm_think_end_bias": 0}. Request values override defaults.
-
 """
 
 import argparse
@@ -99,9 +78,7 @@ def check_server(base_url):
         {"temperature": 0.8, "top_k": 20, "top_p": 0.9, "max_new_tokens": 50},
     )
 
-    # Native BF16 prefill can change near-tied logits when the prefix is
-    # chunked differently. Compare two cache hits, and retain cold output for
-    # inspection instead of asserting cold/hit bitwise equivalence.
+    # BF16 prefill chunking can flip near ties, so two cache hits are compared.
     long_prompt = (
         "The following is a test of remembering context. " * 80
         + "\nWhat is 2 + 2? Answer:"
@@ -160,8 +137,7 @@ def check_server(base_url):
             if event.get("meta_info", {}).get("finish_reason") is not None:
                 finished = event["meta_info"]["finish_reason"]
         assert aborted and finished and finished["type"] == "abort", finished
-    # Reuse a slot immediately after cancellation; stale rejected state must
-    # not leak into another request.
+    # A slot reused right after an abort must carry no rejected state.
     after = generate("after_abort", prompts[0], greedy, flush=False)[0]
     assert after["output_ids"] == results["single"]["output_ids"]
     requests.get(base_url + "/health", timeout=30).raise_for_status()

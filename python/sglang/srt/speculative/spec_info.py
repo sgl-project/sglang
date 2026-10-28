@@ -175,12 +175,10 @@ class SpeculativeAlgorithm(Enum):
         return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
 
     def has_draft_kv(self) -> bool:
-        """Whether drafts need separate KV chains and per-topk page rounding.
-
-        NGRAM has no draft KV; CLOVER previews reuse the target verify window.
-        See get_alloc_len_per_decode.
-        """
-        return not (self.is_ngram() or self.is_clover())
+        """Whether the draft phase writes KV chains. NGRAM does not (its tree
+        lives only in the verify mask), so per-decode KV sizing needs no
+        per-topk page rounding; see get_alloc_len_per_decode."""
+        return not self.is_ngram()
 
     def carries_draft_hidden_states(self) -> bool:
         """Whether the disagg prefill->decode transfer carries draft hidden

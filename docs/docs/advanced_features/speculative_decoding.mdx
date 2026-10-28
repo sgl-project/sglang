@@ -700,6 +700,7 @@ Clover sets preferred sampling defaults of `presence_penalty=0.9` and `repetitio
 - Requires pipeline parallel size 1. Attention DP/CP, DCP, and all-to-all MoE backends are gated; EP is supported only with the Triton MoE runner.
 - Does not support quantized checkpoints, LoRA, `torch.compile`, adaptive speculation, a separate dLLM algorithm, disaggregation, HiCache, or watermarking.
 - Does not support `min_p`, structured-output constraints, logit bias, logprobs, returned hidden states or routed experts, custom logit processors, or input embedding overrides.
+- Disables the overlap scheduler and mixed chunked prefill, and runs one speculative step with top-k 1. Explicit step, top-k, and mixed chunked prefill values are overridden with a warning.
 
 ---
 

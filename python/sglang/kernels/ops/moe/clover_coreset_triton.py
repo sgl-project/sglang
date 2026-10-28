@@ -135,10 +135,6 @@ def _clover_select_coreset_kernel(
     total = tl.maximum(tl.sum(tl.where(valid, scores, 0.0), axis=0), 1.0e-9)
     cumulative = tl.cumsum(sorted_scores, axis=0)
     keep = (cumulative - sorted_scores) < top_p * total
-    # At top_p=1 the mathematical coreset is exactly the union of experts
-    # carrying positive top-k mass. Comparing two independently reduced FP32
-    # totals can admit zero-mass tails (or drop the last positive lane).
-    keep = tl.where(top_p >= 1.0, sorted_scores > 0.0, keep)
     keep = keep | (expert_offsets == 0)
     tl.store(
         block_allow_ptr + block_idx * NUM_EXPERTS + sorted_ids,
@@ -192,7 +188,7 @@ def supports_clover_block_coreset_triton(
         router_logits.is_cuda
         and router_logits.ndim == 2
         and router_logits.shape[1] == 256
-        and block_size in (4, 8, 16, 32, 128)
+        and block_size in (4, 8, 16, 32)
         and router_logits.shape[0] > 0
         and router_logits.shape[0] % block_size == 0
         and top_k == 8
@@ -215,11 +211,11 @@ def _apply_clover_block_coreset_triton(
         router_logits, top_k=top_k, block_size=block_size
     ):
         raise NotImplementedError(
-            "Clover coreset Triton supports CUDA, block_size in {4, 8, 16, 32, 128}, "
+            "Clover coreset Triton supports CUDA, block_size in {4, 8, 16, 32}, "
             "top_k=8, and 256 experts"
         )
-    if not 0.0 < top_p <= 1.0:
-        raise ValueError(f"Clover coreset top-p must be in (0, 1], got {top_p}")
+    if not 0.0 < top_p < 1.0:
+        raise ValueError(f"Clover coreset top-p must be in (0, 1), got {top_p}")
     num_tokens, num_experts = router_logits.shape
     if generation_block_ids.numel() != num_tokens:
         raise ValueError(
@@ -245,14 +241,10 @@ def _apply_clover_block_coreset_triton(
         router_logits.shape, dtype=router_logits.dtype, device=router_logits.device
     )
 
-    # The latency-critical MRR=1 / block-32 preview replays this four-kernel
-    # chain once per MoE layer inside a CUDA Graph.  On Blackwell, using four
-    # warps consistently across the chain together with a 32-expert score tile
-    # is faster than the generic 8-warp / 64-expert configuration.  Keep the
-    # generic launch geometry for other batch and block shapes.
+    # Four warps and 32-expert tiles measured faster for batch 1, block 32 on Blackwell.
     single_block_32 = batch_size == 1 and block_size == 32
     num_warps = 4 if single_block_32 else 8
-    score_block_e = 32 if single_block_32 or block_size == 128 else 64
+    score_block_e = 32 if single_block_32 else 64
     block_r = triton.next_power_of_2(block_size * top_k)
 
     _clover_router_topk_scores_kernel[(num_tokens,)](

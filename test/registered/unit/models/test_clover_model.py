@@ -6,7 +6,9 @@ import pytest
 import torch
 
 from sglang.srt.configs.clover_moe import CloverMoeConfig
+from sglang.srt.environ import envs
 from sglang.srt.models.clover_moe import block_coreset
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -25,6 +27,25 @@ def test_config_preserves_irregular_layers_and_rope():
 
     assert get_rope_config(c) == (12345, c.rope_parameters)
     assert c.model_type == "clover_moe"
+    for bad, message in (
+        ({"num_shared_experts": 0}, "shared expert"),
+        ({"mamba_ssm_dtype": "bfloat16"}, "float32 recurrent state"),
+        ({"hidden_act": "gelu"}, "SiLU"),
+        ({"attn_output_gate": False}, "SiLU"),
+        ({"mask_token_id": c.vocab_size}, "outside the vocabulary"),
+        ({"layer_types": ["full_attention"] * 2}, "layer_types"),
+        (
+            {"layer_types": ["full_attention", "sliding_attention", "full_attention"]},
+            "layer_types",
+        ),
+    ):
+        fields = {"num_hidden_layers": 3, "layer_types": c.layer_types, **bad}
+        with pytest.raises(ValueError, match=message):
+            CloverMoeConfig(**fields)
+    with get_context().override_server_args():
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            with pytest.raises(ValueError, match="float32 recurrent state"):
+                c.mamba2_cache_params
 
 
 def test_coreset_is_per_request_and_stable_on_ties():
@@ -39,89 +60,57 @@ def test_coreset_is_per_request_and_stable_on_ties():
     assert torch.isneginf(tied[:, 1:]).all()
 
 
-def test_tp2_right_convolution_loader_shards_q_k_v_independently():
-    from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-
-    full = torch.arange(16 * 3, dtype=torch.float32).reshape(16, 1, 3)
-    for rank in (0, 1):
-        local = torch.empty(8, 1, 3)
-        mamba_v2_sharded_weight_loader(
-            [(4, 0, False), (4, 0, False), (8, 0, False)], 2, rank
-        )(local, full)
-        expected = torch.cat([part.chunk(2)[rank] for part in full.split([4, 4, 8])])
-        torch.testing.assert_close(local, expected)
-
-
 class TestSharedExpertLoader(CustomTestCase):
     def test_shared_slot_and_missing_shard(self):
-        """Shared weights must occupy the extra slot for both HF expert layouts.
-
-        A packed routed tensor still contains only routed experts; marking it
-        loaded must not hide a missing shared-expert projection.
-        """
+        """The shared expert takes the slot after the packed routed experts."""
         from sglang.srt.models.clover_moe import CloverMoeModelLM
 
-        for packed in (False, True):
-            with self.subTest(packed=packed):
-                w13 = torch.nn.Parameter(torch.zeros(3, 2, 2, 2), requires_grad=False)
-                w2 = torch.nn.Parameter(torch.zeros(3, 2, 2), requires_grad=False)
+        w13 = torch.nn.Parameter(torch.zeros(3, 2, 2, 2), requires_grad=False)
+        w2 = torch.nn.Parameter(torch.zeros(3, 2, 2), requires_grad=False)
 
-                def loader(param, weight, name, *, shard_id, expert_id):
-                    target = param[expert_id]
-                    if shard_id != "w2":
-                        target = target[0 if shard_id == "w1" else 1]
-                    target.copy_(weight)
+        def loader(param, weight, name, *, shard_id, expert_id):
+            target = param[expert_id]
+            if shard_id != "w2":
+                target = target[0 if shard_id == "w1" else 1]
+            target.copy_(weight)
 
-                w13.weight_loader = loader
-                w2.weight_loader = loader
-                params = {
-                    "model.layers.0.mlp.experts.w13_weight": w13,
-                    "model.layers.0.mlp.experts.w2_weight": w2,
-                }
-                model = SimpleNamespace(
-                    config=SimpleNamespace(num_experts=2),
-                    num_fused_shared_experts=1,
-                    enable_shared_expert_fusion=True,
-                    named_parameters=lambda: params.items(),
-                    modules=lambda: (),
-                )
-                prefix = "model.layers.0.mlp."
-                gate = torch.arange(12.0).reshape(3, 2, 2)
-                up, down = gate + 20, gate + 40
-                if packed:
-                    weights = [
-                        (
-                            prefix + "experts.gate_up_proj",
-                            torch.cat((gate[:2], up[:2]), dim=1),
-                        ),
-                        (prefix + "experts.down_proj", down[:2]),
-                    ]
-                else:
-                    weights = [
-                        (prefix + f"experts.{i}.{proj}.weight", values[i])
-                        for i in range(2)
-                        for proj, values in (
-                            ("gate_proj", gate),
-                            ("up_proj", up),
-                            ("down_proj", down),
-                        )
-                    ]
-                shared = [
-                    (prefix + f"shared_expert.{proj}.weight", values[2])
-                    for proj, values in (
-                        ("gate_proj", gate),
-                        ("up_proj", up),
-                        ("down_proj", down),
-                    )
-                ]
-                CloverMoeModelLM.load_weights(model, weights + shared)
-                torch.testing.assert_close(w13[:, 0], gate)
-                torch.testing.assert_close(w13[:, 1], up)
-                torch.testing.assert_close(w2, down)
-                with self.assertRaisesRegex(ValueError, "missing shards"):
-                    CloverMoeModelLM.load_weights(
-                        model, weights + shared[:1] + shared[2:]
-                    )
+        w13.weight_loader = loader
+        w2.weight_loader = loader
+        params = {
+            "model.layers.0.mlp.experts.w13_weight": w13,
+            "model.layers.0.mlp.experts.w2_weight": w2,
+        }
+        model = SimpleNamespace(
+            config=SimpleNamespace(num_experts=2),
+            num_fused_shared_experts=1,
+            enable_shared_expert_fusion=True,
+            named_parameters=lambda: params.items(),
+            modules=lambda: (),
+        )
+        prefix = "model.layers.0.mlp."
+        gate = torch.arange(12.0).reshape(3, 2, 2)
+        up, down = gate + 20, gate + 40
+        weights = [
+            (
+                prefix + "experts.gate_up_proj",
+                torch.cat((gate[:2], up[:2]), dim=1),
+            ),
+            (prefix + "experts.down_proj", down[:2]),
+        ]
+        shared = [
+            (prefix + f"shared_expert.{proj}.weight", values[2])
+            for proj, values in (
+                ("gate_proj", gate),
+                ("up_proj", up),
+                ("down_proj", down),
+            )
+        ]
+        CloverMoeModelLM.load_weights(model, weights + shared)
+        torch.testing.assert_close(w13[:, 0], gate)
+        torch.testing.assert_close(w13[:, 1], up)
+        torch.testing.assert_close(w2, down)
+        with self.assertRaisesRegex(ValueError, "missing shards"):
+            CloverMoeModelLM.load_weights(model, weights + shared[:1] + shared[2:])
 
 
 if __name__ == "__main__":

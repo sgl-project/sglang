@@ -39,7 +39,6 @@ def _clover_parallel_causal_conv(
     SILU: tl.constexpr,
     BLOCK_D: tl.constexpr,
     USE_GDC: tl.constexpr = False,
-    UPDATE_STATE: tl.constexpr = True,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -50,8 +49,6 @@ def _clover_parallel_causal_conv(
         return
     inter_slot = tl.load(ISLOTS + b).to(tl.int64)
     t = tl.arange(0, T)
-    # Every CTA owns a disjoint channel range and all configured token rows.
-    # Consume the initial state before updating its final three-token window.
     if HAS_BIAS:
         acc = tl.broadcast_to(
             tl.load(BIAS + d, d < D, other=0).to(tl.float32)[None, :], (T, BLOCK_D)
@@ -94,11 +91,6 @@ def _clover_parallel_causal_conv(
         current,
         d[None, :] < D,
     )
-    tl.debug_barrier()
-    if UPDATE_STATE:
-        for j in tl.static_range(3):
-            last = tl.load(X + b * XS + (T - 3 + j) * XT + d * XD, d < D, other=0)
-            tl.store(STATE + slot * SS + d * SD + j * SW, last, d < D)
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -114,21 +106,9 @@ def clover_parallel_causal_conv(
     intermediate_conv_window,
     intermediate_state_indices,
     block_d=64,
-    update_state=True,
-    **kwargs,
 ):
     assert x.ndim == 3 and x.shape[2] in (16, 32) and weight.shape[1] == 4
     assert intermediate_conv_window.stride(1) == intermediate_conv_window.stride(3)
-    assert all(
-        kwargs.get(k) is None
-        for k in [
-            "cache_seqlens",
-            "num_accept_tokens",
-            "retrieve_next_token",
-            "retrieve_next_sibling",
-            "retrieve_parent_token",
-        ]
-    )
     assert activation in [None, False, True, "silu", "swish"]
     out = torch.empty_like(x)
     pdl = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
@@ -151,7 +131,6 @@ def clover_parallel_causal_conv(
         HAS_BIAS=bias is not None,
         SILU=activation in [True, "silu", "swish"],
         BLOCK_D=block_d,
-        UPDATE_STATE=update_state,
         num_warps=4,
         **pdl,
     )

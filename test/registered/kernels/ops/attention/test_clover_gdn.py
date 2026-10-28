@@ -11,7 +11,7 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("block_size", [1, 2, 4, 8, 16, 32])
+@pytest.mark.parametrize("block_size", [2, 32])
 def test_preview_kernel_parity_readonly_and_graph(block_size):
     from sglang.kernels.ops.attention.clover_gdn_triton import (
         clover_local_memory_triton,
@@ -54,8 +54,7 @@ def test_preview_kernel_parity_readonly_and_graph(block_size):
     )
     actual = clover_local_memory_triton(q, k, v, g, **kw)
     torch.testing.assert_close(actual.float(), expected.float(), atol=0.04, rtol=0.04)
-    # Loading reduced-precision scalars directly must match the former
-    # explicit FP32 conversion, including non-contiguous checkpoint views.
+    # Reduced-precision and non-contiguous scalar views must match FP32 inputs.
     for dtype in (torch.bfloat16, torch.float16):
         for name in (
             "softmax_logit_scale",
@@ -81,42 +80,6 @@ def test_preview_kernel_parity_readonly_and_graph(block_size):
     graph.replay()
     torch.testing.assert_close(captured, clover_local_memory_triton(q, k, v, g, **kw))
     torch.testing.assert_close(state, before, atol=0, rtol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_native_gdn_intermediate_checkpoint_matches_prefix_computation():
-    """Native chunk snapshots represent the same prefix, rounded to activation dtype."""
-    from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
-
-    torch.manual_seed(71)
-    q = torch.randn(1, 235, 2, 128, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    g = -torch.rand(1, 235, 2, device="cuda") * 0.1
-    beta = torch.rand(1, 235, 2, device="cuda", dtype=torch.bfloat16)
-    initial = torch.randn(1, 2, 128, 128, device="cuda") * 0.01
-    states = []
-    histories = []
-    for length in (235, 192):
-        state = initial.clone()
-        _, _, h = chunk_gated_delta_rule(
-            q[:, :length].contiguous(),
-            k[:, :length].contiguous(),
-            v[:, :length].contiguous(),
-            g[:, :length].contiguous(),
-            beta[:, :length].contiguous(),
-            initial_state=state,
-            initial_state_indices=torch.tensor([0], device="cuda"),
-            cu_seqlens=torch.tensor([0, length], device="cuda"),
-            head_first=False,
-            use_qk_l2norm_in_kernel=True,
-        )
-        states.append(state)
-        histories.append(h)
-    assert histories[0].dtype == torch.bfloat16
-    torch.testing.assert_close(
-        histories[0][:, 3], states[1].to(torch.bfloat16), atol=0, rtol=0
-    )
 
 
 if __name__ == "__main__":

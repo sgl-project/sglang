@@ -54,8 +54,7 @@ class CloverGDNAttnBackend(GDNAttnBackend):
         mamba_track_indices=None,
     ):
         preview = forward_mode.is_dllm_extend()
-        # Reuse slot translation/padding; preview offsets span a whole block,
-        # including padded rows, whose state index is the -1 sentinel.
+        # Preview offsets span whole blocks, and padded rows carry the -1 sentinel.
         metadata = super()._replay_metadata(
             bs,
             req_pool_indices,
@@ -75,8 +74,6 @@ class CloverGDNAttnBackend(GDNAttnBackend):
 
     def forward_extend(self, layer, forward_batch, mixed_qkv, a, b, **kwargs):
         spec = forward_batch.spec_info
-        # This specialization owns only Clover's linear verify chain. Other
-        # modes and tree verification retain their original path.
         if not (
             forward_batch.forward_mode.is_target_verify()
             and spec is not None
@@ -131,10 +128,8 @@ class CloverGDNAttnBackend(GDNAttnBackend):
             conv_state_indices=slots,
             intermediate_conv_window=windows,
             intermediate_state_indices=snapshot_slots,
-            update_state=False,
         ).transpose(1, 2)
-        # Use the selected generic recurrence after parallel convolution.
-        # Triton accepts strided Q/K/V views, avoiding a split kernel.
+        # The Triton recurrence takes strided Q, K, and V views without a split kernel.
         if isinstance(self.kernel_dispatcher.verify_kernel, TritonGDNKernel):
             query, key, value = packed.split(
                 [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1

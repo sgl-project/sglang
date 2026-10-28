@@ -111,6 +111,7 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA}),
         format_signature=FormatSignature(
             supported_dtypes=("float32",),
+            in_place=True,
             description="In-place Clover [width<=128,vocab] penalties using committed response counts only.",
         ),
     )

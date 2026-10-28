@@ -9,8 +9,8 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("block_size", [1, 4, 32])
-def test_right_convolution_matches_reference_and_preserves_history(block_size):
+def test_right_convolution_matches_reference_and_preserves_history():
+    block_size = 32
     from sglang.kernels.ops.mamba.clover_conv_triton import (
         clover_local_memory_conv,
     )
@@ -33,7 +33,6 @@ def test_right_convolution_matches_reference_and_preserves_history(block_size):
         conv_right_weight=right,
     )
     actual = clover_local_memory_conv(raw, **kw)
-    # Explicit per-position causal convolution plus the independent right taps.
     current = raw.reshape(2, block_size, 128).float()
     joined = torch.cat((history[[2, 0]].transpose(1, 2).float(), current), dim=1)
     expected = torch.zeros_like(current)

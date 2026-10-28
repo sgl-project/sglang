@@ -2,11 +2,14 @@
 """Launch and request constraints for single-model Clover speculation."""
 
 import json
+import logging
 import math
 
 from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 from sglang.srt.speculative.clover_penalty import validate_clover_penalties
+
+logger = logging.getLogger(__name__)
 
 
 def configure_clover(server_args):
@@ -46,7 +49,7 @@ def configure_clover(server_args):
         if cfg.speculative_num_draft_tokens is None
         else cfg.speculative_num_draft_tokens
     )
-    if width < 2 or width > checkpoint_width or checkpoint_width % width:
+    if width < 2 or checkpoint_width % width:
         raise ValueError(
             "CLOVER verify width must be >= 2 and divide checkpoint block_size"
         )
@@ -54,10 +57,18 @@ def configure_clover(server_args):
         raise ValueError("CLOVER accept rule must be threshold or exact")
     ratio = cfg.speculative_clover_accept_ratio
     delta = cfg.speculative_clover_accept_delta
-    if not math.isfinite(ratio) or not 0 <= ratio <= 1:
+    if not 0 <= ratio <= 1:
         raise ValueError("CLOVER accept ratio must be finite and in [0, 1]")
     if not math.isfinite(delta) or delta < 0:
         raise ValueError("CLOVER accept delta must be finite and non-negative")
+    for name in ("speculative_num_steps", "speculative_eagle_topk"):
+        value = getattr(cfg, name)
+        if value is not None and int(value) != 1:
+            logger.warning(
+                "CLOVER only supports %s == 1, overriding %s to 1.", name, value
+            )
+    if cfg.enable_mixed_chunk:
+        logger.warning("CLOVER does not support mixed chunked prefill, disabling it.")
     preferred = cfg.preferred_sampling_params or {}
     if isinstance(preferred, str):
         preferred = json.loads(preferred)
@@ -84,7 +95,7 @@ def validate_clover_request(req):
         if getattr(sp, name) != default:
             unsupported.append(name)
     for name in ("json_schema", "regex", "ebnf", "structural_tag", "logit_bias"):
-        if getattr(sp, name, None):
+        if getattr(sp, name):
             unsupported.append(name)
     for name in (
         "return_logprob",
@@ -94,7 +105,7 @@ def validate_clover_request(req):
         "positional_embed_overrides",
         "return_hidden_states",
     ):
-        value = getattr(req, name, None)
+        value = getattr(req, name)
         if value is not None and value is not False:
             unsupported.append(name)
     if unsupported:

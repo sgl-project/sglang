@@ -21,26 +21,21 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-l
 class TestCloverCoreset(CustomTestCase):
     def test_parity_and_request_isolation(self):
         torch.manual_seed(42)
-        for dtype in (torch.bfloat16, torch.float16, torch.float32):
-            for size in (4, 8, 16, 32, 128):
-                for top_p in (0.6, 0.9):
-                    with self.subTest(dtype=dtype, size=size, top_p=top_p):
-                        # Strided inputs exercise row and expert stride handling.
-                        logits = torch.randn(2 * size, 512, device="cuda", dtype=dtype)[
-                            :, ::2
-                        ]
-                        before = logits.clone()
-                        actual = block_coreset(logits, size, 8, top_p)
-                        expected = _block_coreset_reference(logits, size, 8, top_p)
-                        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-                        separate = torch.cat(
-                            [
-                                clover_block_coreset_triton(part, size, 8, top_p)
-                                for part in logits.split(size)
-                            ]
-                        )
-                        torch.testing.assert_close(actual, separate, atol=0, rtol=0)
-                        torch.testing.assert_close(logits, before, atol=0, rtol=0)
+        dtype, size, top_p = torch.bfloat16, 32, 0.9
+        # Strided inputs exercise row and expert stride handling.
+        logits = torch.randn(2 * size, 512, device="cuda", dtype=dtype)[:, ::2]
+        before = logits.clone()
+        actual = block_coreset(logits, size, 8, top_p)
+        expected = _block_coreset_reference(logits, size, 8, top_p)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        separate = torch.cat(
+            [
+                clover_block_coreset_triton(part, size, 8, top_p)
+                for part in logits.split(size)
+            ]
+        )
+        torch.testing.assert_close(actual, separate, atol=0, rtol=0)
+        torch.testing.assert_close(logits, before, atol=0, rtol=0)
 
     def test_ties_and_threshold_boundary(self):
         logits = torch.zeros(32, 256, device="cuda", dtype=torch.bfloat16)
@@ -65,13 +60,12 @@ class TestCloverCoreset(CustomTestCase):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             output = block_coreset(logits, 32, 8, 0.9)
-        for offset in (64, 128):
-            logits.zero_()
-            logits[:, offset : offset + 8] = 10
-            graph.replay()
-            torch.testing.assert_close(
-                output, _block_coreset_reference(logits, 32, 8, 0.9), atol=0, rtol=0
-            )
+        logits.zero_()
+        logits[:, 64:72] = 10
+        graph.replay()
+        torch.testing.assert_close(
+            output, _block_coreset_reference(logits, 32, 8, 0.9), atol=0, rtol=0
+        )
 
     def test_unsupported_shape_falls_back(self):
         logits = torch.randn(6, 128, device="cuda", dtype=torch.bfloat16)

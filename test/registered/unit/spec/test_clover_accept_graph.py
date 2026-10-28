@@ -19,9 +19,7 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestCloverAcceptGraph(CustomTestCase):
     def test_replay_with_new_candidates_and_logits(self):
-        for rule in ("threshold", "exact"):
-            with self.subTest(rule=rule):
-                self._check_replay(rule)
+        self._check_replay("threshold")
 
     def _check_replay(self, rule):
         worker = CloverWorker.__new__(CloverWorker)

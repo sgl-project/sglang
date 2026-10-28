@@ -16,9 +16,9 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("width", [4, 32])
-def test_preview_graph_refreshes_history_indices_valid_mask_and_coreset(width):
+def test_preview_graph_refreshes_history_indices_valid_mask_and_coreset():
     torch.manual_seed(57)
+    width = 32
     bs, heads, dim = 3, 2, 128
     raw = torch.randn(bs * width, 3 * heads * dim, device="cuda", dtype=torch.bfloat16)
     conv = torch.randn(5, raw.shape[1], 3, device="cuda", dtype=torch.bfloat16) * 0.1
@@ -28,7 +28,7 @@ def test_preview_graph_refreshes_history_indices_valid_mask_and_coreset(width):
     slots = torch.tensor([1, 2, -1], device="cuda", dtype=torch.int32)
     valid = torch.ones(bs * width, device="cuda", dtype=torch.bool)
     valid[-width:] = False
-    router = torch.randn(bs * width, 8, device="cuda")
+    router = torch.randn(bs * width, 256, device="cuda")
     g = -torch.rand(1, bs * width, heads, device="cuda")
     conv_kw = dict(
         clean_conv_states=conv,
@@ -60,7 +60,7 @@ def test_preview_graph_refreshes_history_indices_valid_mask_and_coreset(width):
         return (
             convolved,
             clover_local_memory_triton(q, k, v, g, **gdn_kw),
-            block_coreset(router, width, 2, 0.7),
+            block_coreset(router, width, 8, 0.7),
         )
 
     before = conv.clone(), state.clone()

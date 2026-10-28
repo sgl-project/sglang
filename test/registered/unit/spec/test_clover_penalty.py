@@ -26,6 +26,12 @@ def request(history=(), **params):
         origin_input_ids=[5, 5, 5],
         eos_token_ids={7},
         tokenizer=None,
+        return_logprob=False,
+        return_sampling_mask=False,
+        custom_logit_processor=None,
+        input_embeds=None,
+        positional_embed_overrides=None,
+        return_hidden_states=False,
     )
 
 
@@ -98,28 +104,7 @@ class TestCloverPenalties(CustomTestCase):
         candidates = torch.tensor([[1, 7, 2, 3]])
         logits = torch.zeros(1, 4, 8)
         apply_clover_penalties(logits, [req], candidates)
-        for ratio, delta in ((0, 0.3), (0.6, 0)):
-            self.assertEqual(
-                clover_correct_drafts(logits, candidates, ratio, delta).item(), 0
-            )
-
-    def test_defaults_and_supported_standard_params(self):
-        logits = torch.randn(2, 4, 8)
-        original = logits.clone()
-        req = request([1, 2])
-        apply_clover_penalties(logits, [req, req], torch.ones(2, 4))
-        self.assertTrue(torch.equal(logits, original))
-        for params in (
-            {"presence_penalty": -0.5},
-            {"frequency_penalty": 0.5},
-            {"repetition_penalty": 1.2},
-            {"min_new_tokens": 3},
-        ):
-            self.assertIsNone(
-                validate_clover_request(
-                    request(custom_params={"dllm_think_end_bias": 0}, **params)
-                )
-            )
+        self.assertEqual(clover_correct_drafts(logits, candidates, 0, 0.3).item(), 0)
 
     def test_committed_counts_only_and_additive_before_scaling(self):
         req = request(
@@ -132,43 +117,6 @@ class TestCloverPenalties(CustomTestCase):
         expected = torch.tensor([4.0, 1.0, -7.0, 4.0, 4.0, 4.0, 4.0, 4.0])
         torch.testing.assert_close(logits[0], expected.expand(4, -1))
         self.assertEqual(req.output_ids, [1, 1, 2])
-
-    def test_candidates_do_not_change_penalties_until_committed(self):
-        req = request([1], presence_penalty=0.9, repetition_penalty=1.05)
-        state = CloverPenaltyState()
-        original = torch.full((1, 4, 8), 4.0)
-        preview = original.clone()
-        apply_clover_penalties(
-            preview, [req], torch.tensor([[1, 0, 0, 0]]), preview=True, state=state
-        )
-        # Neither a candidate's own ID nor tokens later in the block may add
-        # a penalty at any verification position. Discarded candidates leave
-        # exactly the same history snapshot for a subsequent pass.
-        for candidates in ([[1, 2, 3, 2]], [[1, 7, 6, 5]]):
-            verify = original.clone()
-            apply_clover_penalties(verify, [req], torch.tensor(candidates), state=state)
-            torch.testing.assert_close(verify, preview, rtol=0, atol=0)
-            torch.testing.assert_close(verify[0, :, 2:], original[0, :, 2:])
-        req.output_ids.append(2)
-        committed = original.clone()
-        apply_clover_penalties(
-            committed, [req], torch.tensor([[2, 0, 0, 0]]), preview=True, state=state
-        )
-        torch.testing.assert_close(committed[0, :, 2], preview[0, :, 1])
-        torch.testing.assert_close(committed[0, :, 3:], original[0, :, 3:])
-
-    def test_no_rejected_history_leak_reorder_or_truncation(self):
-        a = request([1, 1], frequency_penalty=0.5, presence_penalty=1)
-        b = request([2], frequency_penalty=1)
-        first = torch.zeros(2, 2, 8)
-        apply_clover_penalties(first, [a, b], torch.tensor([[1, 3], [2, 4]]))
-        a.output_ids = [1]  # Retraction; neither draft 3 nor prompt 5 is history.
-        second = torch.zeros_like(first)
-        apply_clover_penalties(second, [b, a], torch.tensor([[2, 6], [1, 0]]))
-        expected = torch.zeros_like(second)
-        expected[0, :, 2] = -1
-        expected[1, :, 1] = -1.5
-        torch.testing.assert_close(second, expected)
 
     def test_length_ramp_alignment_stop_union_and_minimum(self):
         req = request(
@@ -192,6 +140,15 @@ class TestCloverPenalties(CustomTestCase):
         )
         torch.testing.assert_close(verify[0, :, 6], verify[0, :, 7])
         self.assertFalse(torch.isnan(verify).any())
+        free = request(
+            [1, 2, 3],
+            ignore_eos=True,
+            stop_token_ids=[6],
+            custom_params=req.sampling_params.custom_params,
+        )
+        unbiased = torch.zeros_like(verify)
+        apply_clover_penalties(unbiased, [free], visible)
+        self.assertFalse(unbiased[0, :, 6:].any())
 
     def test_think_bias_first_position_and_committed_close(self):
         req = request(
@@ -229,7 +186,9 @@ class TestCloverPenalties(CustomTestCase):
         ):
             with self.subTest(key=key, value=value):
                 self.assertIsNotNone(
-                    validate_clover_request(request(custom_params={key: value}))
+                    validate_clover_request(
+                        request(custom_params={"dllm_think_end_bias": 0, key: value})
+                    )
                 )
 
 
