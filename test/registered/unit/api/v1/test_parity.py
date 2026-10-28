@@ -37,7 +37,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams as PySamplingParams
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 FIXTURES = REPO_ROOT / "rust" / "sglang-api-types" / "testdata" / "json_parity.json"
@@ -288,6 +288,9 @@ class TestResponseParity(CustomTestCase):
                 "output_token_logprobs_length",
                 "weight_version",
                 "weight_versions",
+                "image_tokens",
+                "audio_tokens",
+                "video_tokens",
             ],
         )
 

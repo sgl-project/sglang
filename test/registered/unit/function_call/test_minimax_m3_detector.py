@@ -2,6 +2,7 @@ import json
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.minimax_m3 import MINIMAX_NS_TOKEN, MinimaxM3Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -580,6 +581,317 @@ class TestMinimaxM3TopLevelOneOf(CustomTestCase):
         calls, _ = _parse_segments(self.segments, self.tools)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["args"], self.expected)
+
+
+class TestMinimaxM3SchemaLessContainers(CustomTestCase):
+    """Members of a bare {"type": "object"} have no schema to type them by."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="api_fetch",
+                    description="Call an API endpoint",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string"},
+                            "body": {"type": "object"},
+                        },
+                        "required": ["url", "body"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="deep_think",
+                    description="Manage the todo list",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "todo_list": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                            },
+                        },
+                    },
+                ),
+            ),
+        ]
+
+    def _fetch(self, *body):
+        return (
+            "<tool_call>",
+            '<invoke name="api_fetch">',
+            "<url>http://127.0.0.1:1000",
+            "</url>",
+            "<body>",
+            *body,
+            "</body>",
+            "</invoke>",
+            "</tool_call>",
+        )
+
+    def _assert_body(self, segments, expected):
+        calls, _ = _parse_segments(segments, self.tools)
+        self.assertEqual(calls[0]["args"]["body"], expected)
+        self.assertEqual(_stream_segments(segments, self.tools), calls)
+
+    def test_two_dimensional_array_and_bool(self):
+        segments = self._fetch(
+            "<range>Q!M5:O5",
+            "</range>",
+            "<values>",
+            "<item>",
+            "<item>Allocated",
+            "</item>",
+            "<item>521",
+            "</item>",
+            "<item>Emerging",
+            "</item>",
+            "</item>",
+            "</values>",
+            "<flag>true",
+            "</flag>",
+        )
+        self._assert_body(
+            segments,
+            {
+                "range": "Q!M5:O5",
+                "values": [["Allocated", "521", "Emerging"]],
+                "flag": True,
+            },
+        )
+
+    def test_single_item_array(self):
+        segments = self._fetch("<tags>", "<item>red", "</item>", "</tags>")
+        self._assert_body(segments, {"tags": ["red"]})
+
+    def test_literals_convert_other_leaves_stay_verbatim(self):
+        segments = self._fetch(
+            "<off>false",
+            "</off>",
+            "<missing>null",
+            "</missing>",
+            "<count>521",
+            "</count>",
+            "<shout>True",
+            "</shout>",
+        )
+        self._assert_body(
+            segments,
+            {"off": False, "missing": None, "count": "521", "shout": "True"},
+        )
+
+    def test_item_beside_named_children_stays_object(self):
+        segments = self._fetch(
+            "<meta>",
+            "<item>a",
+            "</item>",
+            "<name>b",
+            "</name>",
+            "</meta>",
+        )
+        self._assert_body(segments, {"meta": {"item": "a", "name": "b"}})
+
+    def test_array_of_bare_objects(self):
+        segments = (
+            "<tool_call>",
+            '<invoke name="deep_think">',
+            "<todo_list>",
+            "<item>",
+            "<title>Outline",
+            "</title>",
+            "<done>true",
+            "</done>",
+            "</item>",
+            "<item>",
+            "<title>Draft",
+            "</title>",
+            "<done>false",
+            "</done>",
+            "</item>",
+            "</todo_list>",
+            "</invoke>",
+            "</tool_call>",
+        )
+        calls, _ = _parse_segments(segments, self.tools)
+        self.assertEqual(
+            calls[0]["args"],
+            {
+                "todo_list": [
+                    {"title": "Outline", "done": True},
+                    {"title": "Draft", "done": False},
+                ]
+            },
+        )
+        self.assertEqual(_stream_segments(segments, self.tools), calls)
+
+    _UNTYPED_PARAMS = (
+        "<tool_call>",
+        '<invoke name="{name}">',
+        "<flag>true",
+        "</flag>",
+        "<tags>",
+        "<item>a",
+        "</item>",
+        "<item>b",
+        "</item>",
+        "</tags>",
+        "<count>521",
+        "</count>",
+        "</invoke>",
+        "</tool_call>",
+    )
+
+    def _untyped_params(self, name):
+        return tuple(s.format(name=name) for s in self._UNTYPED_PARAMS)
+
+    def test_top_level_param_without_type(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="loose",
+                    description="Parameters declared without a type",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "flag": {"description": "no type"},
+                            "tags": {"description": "no type"},
+                        },
+                    },
+                ),
+            )
+        ]
+        segments = self._untyped_params("loose")
+        expected = {"flag": True, "tags": ["a", "b"], "count": "521"}
+        calls, _ = _parse_segments(segments, tools)
+        self.assertEqual(calls[0]["args"], expected)
+        self.assertEqual(_stream_segments(segments, tools), calls)
+
+    def test_untyped_string_keeps_its_whitespace_when_streamed(self):
+        """A schema-less value that turns out to be a string keeps its leading
+        whitespace when streamed, as when parsed whole; only spacing before a
+        nested tag is markup."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="loose",
+                    description="A parameter declared without a type",
+                    parameters={"type": "object", "properties": {"value": {}}},
+                ),
+            )
+        ]
+        wire = _wire(
+            "<tool_call>",
+            '<invoke name="loose">',
+            "<value>  hello\n  world",
+            "</value>",
+            "</invoke>",
+            "</tool_call>",
+        )
+        result = MinimaxM3Detector().detect_and_parse(wire, tools)
+        whole = json.loads(result.calls[0].parameters)
+        self.assertTrue(whole["value"].startswith("  hello"))
+        for size in (1, 7, len(wire)):
+            detector = MinimaxM3Detector()
+            calls = []
+            for i in range(0, len(wire), size):
+                calls += detector.parse_streaming_increment(
+                    wire[i : i + size], tools
+                ).calls
+            with self.subTest(chunk_size=size):
+                streamed = _collect_streamed_tool_calls(calls)[0]["parameters"]
+                self.assertEqual(json.loads(streamed), whole)
+
+    def test_undeclared_tool_streams_like_non_stream(self):
+        parser = FunctionCallParser(tools=[], tool_call_parser="minimax-m3")
+        wire = _wire(*self._untyped_params("undeclared"))
+        _, non_stream = parser.parse_non_stream(wire)
+
+        parser = FunctionCallParser(tools=[], tool_call_parser="minimax-m3")
+        streamed = []
+        for chunk in _segments(*self._untyped_params("undeclared")):
+            streamed += parser.parse_stream_chunk(chunk)[1]
+        streamed += parser.parse_stream_end()[1]
+        stream_args = _collect_streamed_tool_calls(streamed)[0]["parameters"]
+
+        expected = {"flag": True, "tags": ["a", "b"], "count": "521"}
+        self.assertEqual(json.loads(non_stream[0].parameters), expected)
+        self.assertEqual(json.loads(stream_args), expected)
+
+    def test_small_stream_chunks_match_non_stream(self):
+        segments = self._fetch(
+            "<values>",
+            "<item>",
+            "<item>Allocated",
+            "</item>",
+            "<item>521",
+            "</item>",
+            "</item>",
+            "</values>",
+            "<flag>true",
+            "</flag>",
+        )
+        expected, _ = _parse_segments(segments, self.tools)
+        wire = _wire(*segments)
+        for size in (1, 2, 3, 5, 7):
+            with self.subTest(chunk_size=size):
+                detector = MinimaxM3Detector()
+                streamed = []
+                for i in range(0, len(wire), size):
+                    chunk = wire[i : i + size]
+                    streamed += detector.parse_streaming_increment(
+                        chunk, self.tools
+                    ).calls
+                collected = _collect_streamed_tool_calls(streamed)
+                self.assertEqual(
+                    json.loads(collected[0]["parameters"]), expected[0]["args"]
+                )
+
+
+class TestMinimaxM3WithoutTools(CustomTestCase):
+    """A request that declares no tools still gets the model's tool call parsed."""
+
+    _CALL = ("<tool_call>", '<invoke name="list_skills">', "</invoke>", "</tool_call>")
+
+    def setUp(self):
+        self.parser = FunctionCallParser(tools=[], tool_call_parser="minimax-m3")
+
+    def test_non_stream_keeps_undeclared_call(self):
+        normal, calls = self.parser.parse_non_stream("Retrying." + _wire(*self._CALL))
+        self.assertEqual(normal, "Retrying.")
+        self.assertEqual(
+            [(c.name, json.loads(c.parameters)) for c in calls], [("list_skills", {})]
+        )
+
+    def test_stream_keeps_undeclared_call(self):
+        normal, calls = "", []
+        for chunk in ["Retrying."] + _segments(*self._CALL):
+            chunk_text, chunk_calls = self.parser.parse_stream_chunk(chunk)
+            normal += chunk_text
+            calls += chunk_calls
+        end_text, end_calls = self.parser.parse_stream_end()
+        self.assertEqual(normal + end_text, "Retrying.")
+        self.assertEqual(
+            [c["name"] for c in _collect_streamed_tool_calls(calls + end_calls)],
+            ["list_skills"],
+        )
+
+    def test_stream_end_releases_held_back_text(self):
+        """A trailing "]" held back as a possible marker start is released at stream end."""
+        parser = FunctionCallParser(tools=_make_tools(), tool_call_parser="minimax-m3")
+        normal = "".join(parser.parse_stream_chunk(c)[0] for c in ("[SILENCE", "]"))
+        self.assertEqual(normal + parser.parse_stream_end()[0], "[SILENCE]")
+
+    def test_other_parsers_skip_requests_without_tools(self):
+        text = '<tool_call>{"name": "lookup", "arguments": {}}</tool_call>'
+        parser = FunctionCallParser(tools=[], tool_call_parser="hermes")
+        self.assertEqual(parser.parse_non_stream(text), (text, []))
 
 
 if __name__ == "__main__":
