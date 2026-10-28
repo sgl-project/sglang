@@ -55,7 +55,9 @@ def rectangular_gather(cache, page_table, ratio, page_size):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestRaggedPrefill(unittest.TestCase):
     def test_gather_and_attention(self):
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        from sglang.kernels.ops.attention.flash_mla_interface import (
+            flash_mla_sparse_fwd,
+        )
 
         torch.manual_seed(42)
         device = "cuda"

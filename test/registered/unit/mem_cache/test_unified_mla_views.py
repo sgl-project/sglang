@@ -22,26 +22,21 @@ GPU parity of the read/write kernels (set_mla_kv_buffer TMA path etc.) lives in
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import arena_of
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 import unittest
 from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
-)
-from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv.alloc.band import Band
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
-from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MLASubPoolSpec,
-    UnifiedKVPool,
-    UnifiedMLATokenToKVPool,
-)
 from sglang.srt.runtime_context import get_parallel
 
 _DEV = "cpu"
@@ -87,7 +82,7 @@ def _make_unified(page_size=1, n_full_tokens=64, n_mamba_slots=8):
     full = _mla_spec()
     mamba = _mamba_spec()
     total = full.entry_bytes() * n_full_tokens + mamba.entry_bytes() * n_mamba_slots
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=total,
         sub_pool_specs=[full, mamba],
         device=_DEV,
@@ -167,23 +162,23 @@ class TestUnifiedKVPoolMLA(unittest.TestCase):
         )
         for spec in (full, mamba):
             self.assertGreaterEqual(
-                pool.min_slot_index(spec.name) * spec.entry_bytes(), floor
+                pool.first_entry(spec.name) * spec.entry_bytes(), floor
             )
 
     def test_mla_views_accessor(self):
         pool, full, _ = _make_unified(page_size=1)
-        views = pool.mla_views_for("full")
+        views = pool.spec("full").views(pool)
         self.assertEqual(len(views), _L)
-        self.assertIs(pool.mla_spec("full"), full)
+        self.assertIs(pool.spec("full"), full)
         self.assertEqual(views[0].stride(0) * _ITEM, full.entry_bytes())
 
 
-class TestUnifiedMLATokenToKVPool(unittest.TestCase):
+class TestMLAView(unittest.TestCase):
     def _make(self, ps=1):
         pool, full, mamba = _make_unified(page_size=ps)
-        kv_pool = UnifiedMLATokenToKVPool(
-            unified_buffer=pool,
-            sub_pool_name="full",
+        kv_pool = MLAView(
+            arena=pool,
+            spec=pool.spec("full"),
             kv_cache_dtype=_DTYPE,
             page_size=ps,
         )
@@ -193,7 +188,7 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
         pool, kv_pool = self._make(ps=1)
         self.assertEqual(len(kv_pool.kv_buffer), _L)
         self.assertEqual(kv_pool.get_kv_size_bytes(), 0)
-        self.assertEqual(kv_pool.size, pool.max_slots("full") - 1)
+        self.assertEqual(kv_pool.size, pool.num_entries("full") - 1)
         k = kv_pool.get_key_buffer(1)
         v = kv_pool.get_value_buffer(1)
         self.assertEqual(k.shape[-1], _D)
@@ -221,7 +216,7 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
                     ),
                 ):
                     saved = kv_pool.get_cpu_copy(phys)
-                    pool._raw.zero_()
+                    pool.raw.zero_()
                     kv_pool.load_cpu_copy(saved, phys)
 
                 for layer in range(_L):
@@ -231,14 +226,14 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
                         f"layer {layer} did not round-trip at page_size {ps}",
                     )
 
-    def test_move_kv_cache_moves_page_envelopes(self):
+    def test_arena_moves_page_envelopes(self):
         """Whole page envelopes relocate, in raw bytes and (at ps=4) as read
         back through the per-layer views at the destination ids."""
         for ps in (1, 4):
             pool, kv_pool = self._make(ps=ps)
-            num_pages = pool.max_slots("full") // ps
-            page_bytes = ps * pool.mla_spec("full").entry_bytes()
-            env = pool._raw[: num_pages * page_bytes].view(num_pages, page_bytes)
+            num_pages = pool.num_entries("full") // ps
+            page_bytes = ps * pool.spec("full").entry_bytes()
+            env = pool.raw[: num_pages * page_bytes].view(num_pages, page_bytes)
             src_pages = torch.tensor([num_pages - 2, num_pages - 4, num_pages - 3])
             dst_pages = torch.tensor([2, 3, 5])
             env[src_pages[0]] = 7
@@ -250,11 +245,7 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
                         kv_pool.kv_buffer[l][int(src_pages[2]) * ps + s] = float(
                             l * ps + s + 1
                         )
-            # page-major token runs, exactly how compaction expands pages
-            offsets = torch.arange(ps, dtype=torch.int64)
-            src_t = (src_pages[:, None] * ps + offsets).reshape(-1)
-            dst_t = (dst_pages[:, None] * ps + offsets).reshape(-1)
-            kv_pool.move_kv_cache(dst_t, src_t)
+            pool.move_units("full", dst_pages, src_pages)
             self.assertTrue(torch.all(env[dst_pages[0]] == 7), f"ps={ps}")
             self.assertTrue(torch.all(env[dst_pages[1]] == 9), f"ps={ps}")
             if ps == 4:
@@ -267,10 +258,18 @@ class TestUnifiedMLATokenToKVPool(unittest.TestCase):
 
 
 class _FakeKVCache:
-    def __init__(self, max_slots: int):
-        self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
+    def __init__(self, source, name=None):
+        # A bare size for a pool no arena moves; else the band of ``source``
+        # (a test arena) whose unit moves this buffer follows.
+        if name is None:
+            size = source
+        else:
+            size = source.num_entries(name)
+            source.follow(name, self)
+        # buf[p] == virtual id currently stored at physical slot p (-1 if free).
+        self.buf = torch.full((size,), -1, dtype=torch.int64)
 
-    def move_physical_pages(
+    def move_units(
         self, dst_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
     ):
         slots = torch.arange(page_size, device=dst_pages.device)
@@ -282,17 +281,15 @@ class _FakeKVCache:
 class TestTranslateKvLoc(unittest.TestCase):
     def _build(self, ps=1, n_full_tokens=64):
         pool, full, mamba = _make_unified(page_size=ps, n_full_tokens=n_full_tokens)
-        full_alloc = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("full")),
-            unified_buffer=pool,
+        full_alloc = Band(
+            arena=pool,
             sub_pool_name="full",
             device=_DEV,
             is_id_owner=True,
             page_size=ps,
         )
-        mamba_alloc = MultiEndedAllocator(
-            kvcache=_FakeKVCache(pool.max_slots("mamba")),
-            unified_buffer=pool,
+        mamba_alloc = Band(
+            arena=pool,
             sub_pool_name="mamba",
             device=_DEV,
             is_id_owner=True,
@@ -306,38 +303,38 @@ class TestTranslateKvLoc(unittest.TestCase):
             alloc = self._build(ps=ps)
             v = alloc.alloc(3 * ps)
             self.assertIsNotNone(v)
-            v2p = alloc.virtual_to_physical
+            v2p = alloc.ids.virtual_to_physical
             want = v2p[v // ps] * ps + v % ps
-            self.assertTrue(torch.equal(alloc.translate_kv_loc(v), want), f"ps={ps}")
+            self.assertTrue(torch.equal(alloc.ids.translate(v), want), f"ps={ps}")
 
     def test_tombstone_clamps_to_sink(self):
         alloc = self._build(ps=1)
         # never-allocated virtual ids -> v2p == -1 -> id 0
         virt = torch.tensor([alloc.min_slot_index + 1], dtype=torch.int64)
-        self.assertTrue(torch.all(alloc.translate_kv_loc(virt) == 0))
+        self.assertTrue(torch.all(alloc.ids.translate(virt) == 0))
 
     def test_out_matches_and_aliases(self):
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             v = alloc.alloc(2 * ps)
             self.assertIsNotNone(v)
-            no_out = alloc.translate_kv_loc(v)
+            no_out = alloc.ids.translate(v)
             out = torch.empty_like(v)
-            ret = alloc.translate_kv_loc(v, out=out)
+            ret = alloc.ids.translate(v, out=out)
             self.assertIs(ret, out)
             self.assertTrue(torch.all(out == no_out))
             # canonical in-place aliasing: translate(x, out=x)
             x = v.clone()
-            alloc.translate_kv_loc(x, out=x)
+            alloc.ids.translate(x, out=x)
             self.assertTrue(torch.all(x == no_out))
 
     def test_padding_loc_lands_on_the_sink(self):
         """A padded read table carries -1 in the slots a shorter sequence does
-        not use; `translate_kv_loc` resolves it to 0, the sink."""
+        not use; `UnitIds.translate` resolves it to 0, the sink."""
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             self.assertIsNotNone(alloc.alloc(4 * ps))
-            got = alloc.translate_kv_loc(torch.tensor([-1], dtype=torch.int64))
+            got = alloc.ids.translate(torch.tensor([-1], dtype=torch.int64))
             self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
 
     def test_a_loc_past_the_sentinel_lands_on_the_sink(self):
@@ -347,8 +344,8 @@ class TestTranslateKvLoc(unittest.TestCase):
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             self.assertIsNotNone(alloc.alloc(4 * ps))
-            alloc.virtual_to_physical[-2] = 7  # bind the last real page
-            got = alloc.translate_kv_loc(torch.tensor([-(ps + 1)], dtype=torch.int64))
+            alloc.ids.virtual_to_physical[-2] = 7  # bind the last real page
+            got = alloc.ids.translate(torch.tensor([-(ps + 1)], dtype=torch.int64))
             self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
 
     def test_an_out_of_range_loc_lands_on_the_sink(self):
@@ -357,8 +354,8 @@ class TestTranslateKvLoc(unittest.TestCase):
         for ps in (1, 4):
             alloc = self._build(ps=ps)
             self.assertIsNotNone(alloc.alloc(4 * ps))
-            past = int(alloc.virtual_to_physical.numel()) * ps * 4
-            got = alloc.translate_kv_loc(torch.tensor([past], dtype=torch.int64))
+            past = int(alloc.ids.virtual_to_physical.numel()) * ps * 4
+            got = alloc.ids.translate(torch.tensor([past], dtype=torch.int64))
             self.assertTrue(bool((got == 0).all()), f"ps={ps}: {got}")
 
     def test_translate_accepts_a_strided_page_table(self):
@@ -368,60 +365,56 @@ class TestTranslateKvLoc(unittest.TestCase):
             alloc = self._build(ps=ps)
             v = alloc.alloc(4 * ps)
             self.assertIsNotNone(v)
-            want = alloc.translate_kv_loc(v)
+            want = alloc.ids.translate(v)
             backing = torch.full((2, 2 * v.numel()), -1, dtype=torch.int64)
             view = backing[:, : v.numel() // 2]
             view.copy_(v.view(2, -1))
             self.assertFalse(view.is_contiguous())
-            got = alloc.translate_kv_loc(view)
+            got = alloc.ids.translate(view)
             self.assertEqual(got.shape, view.shape)
             self.assertTrue(torch.equal(got.reshape(-1), want))
 
 
-class _RecordingHybridPool:
-    """Stands in for `UnifiedHybridLinearKVPool`, recording the ids it is handed."""
+class _RecordingView(_FakeKVCache):
+    """Stands in for the owner sub-pool's view, recording the ids it is handed."""
 
-    def __init__(self, full_kv_pool, mamba_pool):
-        self.full_kv_pool = full_kv_pool
-        self.mamba_pool = mamba_pool
-        self.seen = None
+    seen = None
 
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+    def get_cpu_copy(self, indices, req_pool_index=None):
         self.seen = indices.clone()
-        return {"full": None}
+        return None
 
-    def load_cpu_copy(
-        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
-    ):
+    def load_cpu_copy(self, kv_cache_cpu, indices, req_pool_index=None):
         self.seen = indices.clone()
 
 
 class TestMambaAllocatorCpuCopyIsPhysical(unittest.TestCase):
     """REGRESSION: decode retraction calls the allocator's `get_cpu_copy` with
-    `req_to_token` rows, which hold VIRTUAL ids. This composite inherited the
-    raising base, and a plain delegate would have been just as wrong -- the
-    unified pools read those ids as PHYSICAL."""
+    `req_to_token` rows, which hold VIRTUAL ids; the owner's view reads ids
+    as PHYSICAL, so a plain delegate would read and restore other rows."""
 
     def _build(self, ps=1):
         pool, _, _ = _make_unified(page_size=ps)
-        kvcache = _RecordingHybridPool(
-            _FakeKVCache(pool.max_slots("full")),
-            _FakeKVCache(pool.max_slots("mamba")),
-        )
+        owner = _RecordingView(pool.num_entries("full"))
         with get_parallel().override(
             dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0
         ):
-            allocator = UnifiedMambaTokenToKVPoolAllocator(
-                unified_buffer=pool, kvcache=kvcache, device=_DEV, page_size=ps
+            allocator = ChainAllocator(
+                roles=ChainRoles(owner="full", state="mamba"),
+                arena=pool,
+                kvcache=owner,
+                views={"full": owner, "mamba": _FakeKVCache(pool, "mamba")},
+                device=_DEV,
+                page_size=ps,
             )
-        return allocator, kvcache
+        return allocator, owner
 
     def test_pool_is_handed_physical_token_ids(self):
         alloc, kvcache = self._build()
         virtual = alloc.alloc(4)
         self.assertIsNotNone(virtual)
         virtual = virtual.to(torch.int64)
-        physical = alloc.full_attn_allocator.translate_kv_loc(virtual)
+        physical = alloc.full_attn_allocator.ids.translate(virtual)
         # Not identity here, so a delegate that passed the virtual ids straight
         # through would read and restore other tokens' rows.
         self.assertFalse(torch.equal(physical, virtual))
@@ -429,7 +422,7 @@ class TestMambaAllocatorCpuCopyIsPhysical(unittest.TestCase):
         alloc.get_cpu_copy(virtual, req_pool_index=0)
         self.assertTrue(torch.equal(kvcache.seen, physical))
 
-        alloc.load_cpu_copy({"full": None}, virtual, req_pool_index=0)
+        alloc.load_cpu_copy((None, None), virtual, req_pool_index=0)
         self.assertTrue(torch.equal(kvcache.seen, physical))
 
 
