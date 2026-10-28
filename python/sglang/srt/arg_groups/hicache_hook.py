@@ -54,8 +54,12 @@ def handle_hicache(server_args: Any):
 
     validate_hicache_host_memory_mode(server_args)
 
-    if cfg.disaggregation_decode_host_receive_threshold < 1:
+    if (
+        cfg.disaggregation_decode_host_receive_threshold < 1
+        and cfg.hicache_mem_layout != "layer_first_kv_split"
+    ):
         # The shared host pool must match KV transfer's per-layer buffers.
+        # Preserve the NPU split layout already resolved by the platform hook.
         declare_resolution(
             server_args, "handle_hicache", hicache_mem_layout="layer_first"
         )
@@ -68,7 +72,7 @@ def handle_hicache(server_args: Any):
     resolve_unified_memory_layout_io(server_args)
     if (
         cfg.disaggregation_decode_host_receive_threshold < 1
-        and cfg.hicache_mem_layout != "layer_first"
+        and cfg.hicache_mem_layout not in ("layer_first", "layer_first_kv_split")
     ):
         raise ValueError(
             f"The resolved HiCache storage layout {cfg.hicache_mem_layout!r} "

@@ -925,6 +925,72 @@ def _build_dsv4_rope_entry(
     )
 
 
+def _reserve_dsv4_memfabric(
+    *,
+    kvcache: Any,
+    layer_mappings: _DeepSeekV4LayerMappings,
+    has_paged_swa: bool,
+    mtp_swa_device_buffers: list,
+    num_host_pages: int,
+    swa_num_host_pages: int,
+    c128_num_host_pages: int,
+    page_size: int,
+) -> None:
+    """Reserve the combined DSV4 host allocation before its first pool exists."""
+    from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+        ensure_memfabric_capacity,
+        memfabric_host_memory_enabled,
+    )
+
+    if (
+        not is_npu()
+        or get_memory().hicache_mem_layout != "layer_first_kv_split"
+        or not memfabric_host_memory_enabled()
+    ):
+        return
+
+    total = 0
+    if has_paged_swa:
+        total += (
+            (len(kvcache.swa_kv_pool.kv_buffer) + len(mtp_swa_device_buffers))
+            * swa_num_host_pages
+            * kvcache.swa_kv_pool.bytes_per_page_padded
+        )
+    if layer_mappings.c4:
+        buffers, item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
+        total += len(buffers) * num_host_pages * item_bytes
+        for region in _dsv4_indexer_regions(kvcache, page_size):
+            total += len(region.device_buffers) * num_host_pages * region.item_bytes
+        sibling = _dsv4_rope_sibling(kvcache, 4)
+        if sibling is not None:
+            _, buffers, item_bytes = sibling
+            total += len(buffers) * num_host_pages * item_bytes
+        if not getattr(kvcache, "_unified_kv", False):
+            for pools in (
+                kvcache.compress_state_pools,
+                kvcache.indexer_compress_state_pools,
+            ):
+                for layer_id in layer_mappings.c4_state_global_layers:
+                    pool = pools[layer_id]
+                    total += (
+                        swa_num_host_pages
+                        * pool.ring_size
+                        * pool.kv_score_buffer.kv_score[0].nbytes
+                    )
+    if layer_mappings.c128:
+        buffers, item_bytes = _dsv4_compressed_region_buffers(kvcache, 128)
+        total += len(buffers) * c128_num_host_pages * item_bytes
+        sibling = _dsv4_rope_sibling(kvcache, 128)
+        if sibling is not None:
+            _, buffers, item_bytes = sibling
+            total += len(buffers) * c128_num_host_pages * item_bytes
+
+    if total:
+        import torch
+
+        ensure_memfabric_capacity(total, torch.npu.current_device())
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -991,6 +1057,17 @@ def build_deepseek_v4_hicache_stack(
         kvcache=kvcache,
         page_size=page_size,
         swa_page_size=kvcache.swa_page_size,
+    )
+
+    _reserve_dsv4_memfabric(
+        kvcache=kvcache,
+        layer_mappings=layer_mappings,
+        has_paged_swa=has_paged_swa,
+        mtp_swa_device_buffers=mtp_swa_device_buffers,
+        num_host_pages=num_host_pages,
+        swa_num_host_pages=swa_num_host_pages,
+        c128_num_host_pages=c128_num_host_pages,
+        page_size=page_size,
     )
 
     logical_host_pool = LogicalHostPool(

@@ -210,8 +210,9 @@ class ModelSlimConfig(QuantizationConfig):
         Kimi-K3's upstream model uses ``mlp`` internally while its ModelSlim
         checkpoint retains the Hugging Face ``block_sparse_moe`` hierarchy.
         Some multimodal checkpoints also keep the outer ``language_model``
-        prefix.  Resolve those layout-only differences at the quantization
-        boundary.
+        prefix. GLM-5 multimodal checkpoints nest it under ``model`` as
+        ``model.language_model.layers.*``. Resolve those layout-only
+        differences at the quantization boundary.
         """
         candidates = [prefix]
         if ".mlp." in prefix:
@@ -222,6 +223,12 @@ class ModelSlimConfig(QuantizationConfig):
                 candidates.append(candidate.removeprefix("language_model."))
             else:
                 candidates.append(f"language_model.{candidate}")
+            if candidate.startswith("model.language_model."):
+                candidates.append("model." + candidate[len("model.language_model.") :])
+            elif candidate.startswith("model."):
+                candidates.append(
+                    "model.language_model." + candidate[len("model.") :]
+                )
 
         return list(dict.fromkeys(candidates))
 

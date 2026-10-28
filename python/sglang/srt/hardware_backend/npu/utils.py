@@ -180,7 +180,13 @@ def set_default_server_args(args: "ServerArgs"):
             "set_default_server_args",
             hicache_io_backend="kernel_ascend",
         )
-        if use_mla_backend(args):
+        if cfg.hicache_mem_layout == "layer_first":
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                hicache_mem_layout="layer_first_kv_split",
+            )
+        elif use_mla_backend(args):
             declare_resolution(
                 args,
                 "set_default_server_args",
