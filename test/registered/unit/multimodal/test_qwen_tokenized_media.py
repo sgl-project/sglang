@@ -8,6 +8,8 @@ One row per test: what it pins, then the test.
             -> test_omni_strategy_keeps_model_config_after_serving_unwraps_thinker
             registry picks token-space or legacy; M-RoPE hook matches legacy
             -> test_selected_token_space_processor_keeps_the_scheduler_mrope_hook
+    serving served output and core mm_spans == the legacy processor's
+            -> test_serving_output_matches_legacy_processor
     image   BatchFeature == processor(text, images)
             -> test_token_space_batch_feature_matches_hf_processor
             partial expansion, offsets and shared source views
@@ -42,6 +44,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import msgspec
 import numpy as np
 import torch
 from PIL import Image
@@ -59,6 +62,7 @@ from transformers import (
     WhisperFeatureExtractor,
 )
 
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.multimodal_processor import (
     PROCESSOR_MAPPING,
     get_mm_processor,
@@ -101,7 +105,7 @@ from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 IMAGE, VIDEO, AUDIO, START, END, EOS = 101, 102, 103, 104, 105, 106
 TOKEN_TEXT = {
@@ -112,6 +116,8 @@ TOKEN_TEXT = {
     END: "<|vision_end|>",
     EOS: "<|im_end|>",
 }
+# Set only when a processor computes a cache key; the two routes may differ.
+_CACHE_IDENTITY_ITEM_FIELDS = ("hash", "pad_value", "pad_values", "identity")
 
 
 QwenTokenSpaceCore = TokenSpaceProcessor.for_strategy(QwenTokenSpaceProcessStrategy)
@@ -362,6 +368,22 @@ def _make_hf_processor(processor_class, patch_size, *, model_type="qwen3_vl"):
     return processor
 
 
+def _qwen3_vl_config():
+    # What the legacy processor and the serving factory read from a Qwen3-VL config.
+    return SimpleNamespace(
+        architectures=["Qwen3VLForConditionalGeneration"],
+        model_type="qwen3_vl",
+        image_token_id=IMAGE,
+        video_token_id=VIDEO,
+        vision_start_token_id=START,
+        vision_end_token_id=END,
+        vision_config=SimpleNamespace(
+            spatial_merge_size=2, temporal_patch_size=2, tokens_per_second=25
+        ),
+        to_dict=lambda: {"model_type": "qwen3_vl"},
+    )
+
+
 class TestQwenTokenizedMedia(CustomTestCase):
     def setUp(self):
         # Serving hooks read the published runtime config.
@@ -435,18 +457,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
 
     def test_selected_token_space_processor_keeps_the_scheduler_mrope_hook(self):
         hf_processor = _make_hf_processor(Qwen3VLProcessor, 16)._processor
-        config = SimpleNamespace(
-            architectures=["Qwen3VLForConditionalGeneration"],
-            model_type="qwen3_vl",
-            image_token_id=IMAGE,
-            video_token_id=VIDEO,
-            vision_start_token_id=START,
-            vision_end_token_id=END,
-            vision_config=SimpleNamespace(
-                spatial_merge_size=2, temporal_patch_size=2, tokens_per_second=25
-            ),
-            to_dict=lambda: {"model_type": "qwen3_vl"},
-        )
+        config = _qwen3_vl_config()
         reset_context()
         self.addCleanup(reset_context)
         server_args = ServerArgs(
@@ -518,6 +529,91 @@ class TestQwenTokenizedMedia(CustomTestCase):
         self.assertEqual(positions.shape, (3, len(scheduler_ids)))
         self.assert_tensor_bytes_equal(positions, expected_positions)
         self.assert_tensor_bytes_equal(delta, expected_delta)
+
+    def test_serving_output_matches_legacy_processor(self):
+        """A model moved to token space must hand the scheduler the legacy output.
+
+        Every field is compared exactly: final and padded IDs, special token IDs,
+        M-RoPE, and each item's modality, offsets, feature and model-specific data.
+        """
+        hf_processor = _make_hf_processor(Qwen3VLProcessor, 16)._processor
+        config = _qwen3_vl_config()
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            model_impl="sglang",
+            mm_process_config={},
+            mm_feature_transport="cpu",
+            mm_preprocess_cache_size_mb=0,
+            disable_fast_image_processor=True,
+            mm_processor_worker_num=1,
+            enable_token_space_processor=True,
+        )
+        publish(server_args, role="test")
+        prompt = "Describe <|vision_start|><|image_pad|><|vision_end|> " * 2
+        images = [Image.new("RGB", (64, 64), (9, 99, 199)), Image.new("RGB", (64, 128))]
+        legacy_processor = QwenVLImageProcessor(config, server_args, hf_processor, None)
+        self.addCleanup(legacy_processor.shutdown)
+        native = QwenVLTokenSpaceProcessor(config, server_args, hf_processor, None)
+        self.addCleanup(native.shutdown)
+        input_ids = hf_processor.tokenizer.encode(prompt, add_special_tokens=False)
+
+        legacy = asyncio.run(
+            legacy_processor.process_mm_data_async(
+                image_data=images,
+                input_text=prompt,
+                request_obj=GenerateReqInput(text=prompt, image_data=images),
+            )
+        )
+        served = asyncio.run(
+            native.process_mm_data_async(image_data=images, input_text=input_ids)
+        )
+        self.assert_same_output(served, legacy)
+        # The core's spans are the legacy offsets, half-open.
+        core_output = asyncio.run(native._core.process(images, input_ids=input_ids))
+        self.assertEqual(
+            core_output["mm_spans"],
+            [
+                [(start, end + 1) for start, end in item.offsets]
+                for item in legacy.mm_items
+            ],
+        )
+
+    def assert_same_output(self, actual, expected):
+        actual, expected = (msgspec.structs.asdict(o) for o in (actual, expected))
+        actual_items, expected_items = actual.pop("mm_items"), expected.pop("mm_items")
+        # Padded IDs carry the cache identity too, so they follow the same rule.
+        if actual["padded_input_ids"] is None or expected["padded_input_ids"] is None:
+            actual.pop("padded_input_ids"), expected.pop("padded_input_ids")
+        self.assert_same_fields(actual, expected, "output")
+        self.assertEqual(len(actual_items), len(expected_items))
+        for index, (item, reference) in enumerate(zip(actual_items, expected_items)):
+            item, reference = (msgspec.structs.asdict(i) for i in (item, reference))
+            for name in _CACHE_IDENTITY_ITEM_FIELDS:
+                if item[name] is None or reference[name] is None:
+                    item.pop(name), reference.pop(name)
+            self.assert_same_fields(item, reference, f"mm_items[{index}]")
+
+    def assert_same_fields(self, actual, expected, where):
+        self.assertEqual(actual.keys(), expected.keys(), where)
+        for name in actual:
+            self.assert_same_value(actual[name], expected[name], f"{where}.{name}")
+
+    def assert_same_value(self, actual, expected, where):
+        if isinstance(expected, torch.Tensor):
+            self.assertIsInstance(actual, torch.Tensor, where)
+            self.assert_tensor_bytes_equal(actual, expected)
+        elif isinstance(expected, dict):
+            self.assert_same_fields(actual, expected, where)
+        elif isinstance(expected, (list, tuple)) and any(
+            isinstance(v, torch.Tensor) for v in expected
+        ):
+            self.assertEqual(len(actual), len(expected), where)
+            for index, (a, e) in enumerate(zip(actual, expected)):
+                self.assert_same_value(a, e, f"{where}[{index}]")
+        else:
+            self.assertEqual(actual, expected, where)
 
     def assert_tensor_bytes_equal(self, actual, expected):
         self.assertEqual(actual.dtype, expected.dtype)
