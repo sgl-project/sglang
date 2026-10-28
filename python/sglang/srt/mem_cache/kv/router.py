@@ -91,6 +91,20 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
             **kwargs,
         )
 
+    def store_prefix(
+        self, layer, loc_info, commit_lens, cache_k, cache_v, *args, **kwargs
+    ) -> None:
+        """Commit each request's live prefix using this layer's physical ids."""
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        write_loc = loc_info if self.plain else self._write_loc(layer, loc_info)
+        loc, _, _ = unwrap_write_loc(write_loc)
+        if not self.plain:
+            kwargs["layer_id_override"] = self.view_layer_id
+        self.view.set_kv_buffer_prefix_valid(
+            layer, loc, commit_lens, cache_k, cache_v, *args, **kwargs
+        )
+
     def store_mla(self, layer, loc_info, cache_k_nope, cache_k_rope) -> None:
         if self.plain:
             self.view.set_mla_kv_buffer(layer, loc_info, cache_k_nope, cache_k_rope)
