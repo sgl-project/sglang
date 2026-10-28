@@ -152,19 +152,21 @@ jobs:
           # exclusive (the prefill tuning crashed a DSPARK+decode-graph
           # server with ACL 507034 in DeepEP dispatch - run 39917316049),
           # so each scenario gets its own server and job.
-          # cann9.1.0-a3-B103 image: the main-cann9.1.0-a3 image fails to
-          # compile the kda_target_verify triton kernel (UB overflow) at
-          # graph capture.
+          # cann9.1.0-a3-B106 image (latest cann9.1.0 build on
+          # https://ascend.github.io/sglang/, 2026-10-26, sglang
+          # release/2026930 @ 545ed1c664). The older main-cann9.1.0-a3
+          # image failed to compile the kda_target_verify triton kernel
+          # (UB overflow) at graph capture; B103 was baked as a stopgap.
           - name: kimi_k3_w4a8_32p_mix_in128k_out1_prefill_aisbench
             node_size: 4
             test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1_prefill.py
             test_type: 'perf'
-            image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B103
+            image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B106
           - name: kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix_aisbench
             node_size: 4
             test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix.py
             test_type: 'perf'
-            image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B103
+            image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B106
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
