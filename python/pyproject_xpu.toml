@@ -113,6 +113,7 @@ test = [
   "pymupdf",
   "expecttest",
   "jsonlines",
+  "lm-eval[api]>=0.4.9.2",
   "matplotlib",
   # sgl-eval's math_verify grader needs 4.9.3 (latex2sympy2_extended fails on 4.7.x).
   "antlr4-python3-runtime==4.9.3",
