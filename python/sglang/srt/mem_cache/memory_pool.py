@@ -5050,6 +5050,28 @@ class MLATokenToKVPool(KVCache):
             cache_k_rope,
         )
 
+    def set_mla_kv_buffer_prefix_valid(
+        self,
+        layer: RadixAttention,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        if loc_2d.ndim != 2 or commit_lens.shape != (loc_2d.shape[0],):
+            raise ValueError(f"{tuple(loc_2d.shape)=} {tuple(commit_lens.shape)=}")
+        if cache_k_nope.shape[0] != loc_2d.numel():
+            raise ValueError(f"{tuple(cache_k_nope.shape)=} {tuple(loc_2d.shape)=}")
+        # Rows past commit_lens go to the reserved slot 0,
+        # which this pool's MLA writes skip, as they do for CUDA-graph padding.
+        offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+        loc = torch.where(
+            offsets < commit_lens[:, None].to(torch.int64), loc_2d.to(torch.int64), 0
+        ).reshape(-1)
+        self.set_mla_kv_buffer(
+            layer, KVWriteLoc(loc, physical=True), cache_k_nope, cache_k_rope
+        )
+
     def get_mla_kv_buffer(
         self,
         layer: RadixAttention,
