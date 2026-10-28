@@ -2094,8 +2094,8 @@ def _rust_server_startup_time_sink() -> Callable[[Dict[str, Any]], None]:
     TokenizerManager would."""
     if not get_observability().enable_metrics:
         return lambda startup_time: None
-    # Read at call time: a model package can replace the module's class after
-    # this module is imported.
+    # Read at call time: a plugin or model package may replace the module's
+    # collector class with its own subclass after this module is imported.
     collector_cls = resolve_collector_class(
         STAT_LOGGER_ROLE_TOKENIZER, metrics_collector.TokenizerMetricsCollector
     )
