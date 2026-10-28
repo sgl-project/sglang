@@ -51,9 +51,9 @@ from sglang.srt.mem_cache.pool_host.host_pool_decl import (
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -1294,7 +1294,7 @@ class TestTransferLayerSpan(CustomTestCase):
 
 
 def _build_unified_swa_pool(page_size: int = 4):
-    return init_unified_swa_pools(
+    return build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=2,

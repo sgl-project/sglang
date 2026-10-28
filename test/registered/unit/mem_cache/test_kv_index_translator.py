@@ -345,9 +345,9 @@ class TestPoolOwnership(unittest.TestCase):
         a factory returning a pool the allocator does not hold would silently
         disable the unified path for EVERY model. Pinned against the real
         factory, not this file's own construction."""
-        from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+        from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-        bundle = init_unified_swa_pools(
+        bundle = build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
             head_num=2,

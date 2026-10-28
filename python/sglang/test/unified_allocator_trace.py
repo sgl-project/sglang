@@ -106,7 +106,7 @@ class HostModel(msgspec.Struct, kw_only=True):
 
 
 class CompositeAdapter:
-    """The adapter for the composite allocators built by the pool factories."""
+    """The adapter for the composite allocators the unified pool builder builds."""
 
     name = "composite"
 

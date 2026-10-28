@@ -29,8 +29,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
@@ -40,7 +40,7 @@ _PAGE_SIZE = 4
 
 
 def _bundle(*, total_bytes: int, post_capture_active: bool):
-    return init_unified_swa_pools(
+    return build_test_unified_pools(
         device="cuda",
         kv_cache_dtype=torch.float16,
         head_num=2,

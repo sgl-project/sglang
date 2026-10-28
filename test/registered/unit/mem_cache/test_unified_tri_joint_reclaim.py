@@ -18,14 +18,12 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_memory_pool import (
-    init_unified_mamba_swa_pools,
-)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
+    build_test_unified_pools,
     build_tri_cache,
     setup_allocator_context,
 )
@@ -477,7 +475,7 @@ class TestTriJointReclaim(CustomTestCase):
                         ),
                         layers=[0, 1],
                     )
-                    bundle = init_unified_mamba_swa_pools(
+                    bundle = build_test_unified_pools(
                         device="cpu",
                         kv_cache_dtype=torch.float16,
                         head_num=1,

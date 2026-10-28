@@ -556,20 +556,46 @@ class TestBootLogReportsEveryPlacedHost(CustomTestCase):
         )
 
 
+def _fused_plan(cfg, placement, host):
+    """``host``'s spec in the plan the pool is built from, and the fused entry
+    the configurator prices for it."""
+    from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+
+    # A slotted dataclass: the decision is patched on the class.
+    with patch.object(
+        kcc.KVCacheConfigurator,
+        "_fused_draft_decision",
+        return_value=FusedDraftDecision(placement=placement),
+    ):
+        entry_bytes = cfg.fused_entry_bytes(host)
+    plan = plan_kv_storage(
+        cfg._kv_layer_decls(), page_size=cfg.page_size, fused_draft=placement
+    )
+    return plan.sub_pool(host).spec, entry_bytes
+
+
 class TestMambaHostPricing(CustomTestCase):
     """The mamba sub-pool's fused entry is priced from THIS runner's state
-    layers, as the mamba factory slices them; the whole model's list would
-    also count other pipeline ranks'."""
+    layers, as the pool slices them; the whole model's list would also count
+    other pipeline ranks'."""
 
     def test_a_mamba_region_prices_this_runners_state_layers(self):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
-        cfg.layer_info = SimpleNamespace(start_layer=2, end_layer=4)
+        cfg.is_hybrid_swa = False
+        cfg.use_mla_backend = False
+        cfg.kv_cache_dtype = _DTYPE
+        cfg.page_size = 1
+        cfg.layer_info = SimpleNamespace(start_layer=2, end_layer=5)
+        cfg.model_config = SimpleNamespace(
+            get_num_kv_heads=lambda tp, dcp: 2, head_dim=8, v_head_dim=8
+        )
         cfg.mambaish_config = SimpleNamespace(
+            full_attention_layer_ids=[4],
             mamba2_cache_params=SimpleNamespace(
                 layers=[0, 1, 2, 3],
                 shape=SimpleNamespace(conv=[(2, 2)], temporal=(2, 2)),
                 dtype=SimpleNamespace(conv=_DTYPE, temporal=_DTYPE),
-            )
+            ),
         )
         state = DraftStateRegion(
             lane_num=1,
@@ -580,9 +606,18 @@ class TestMambaHostPricing(CustomTestCase):
                 temporal_dtype=_DTYPE,
             ),
         )
-        spec = cfg._mamba_host_spec(state)
+        with get_parallel().override(attn_tp_size=1, attn_dcp_size=1):
+            spec, entry_bytes = _fused_plan(
+                cfg,
+                FusedDraftPlacement(
+                    runners=(RunnerLanes(ranges={"mamba": (0, 1)}),),
+                    regions={"mamba": state},
+                ),
+                "mamba",
+            )
         self.assertEqual(spec.layer_num, 2)
         self.assertIs(spec.draft_region, state)
+        self.assertEqual(entry_bytes, spec.entry_bytes())
 
 
 class TestUnifiedSWAHeadGeometry(CustomTestCase):
@@ -595,12 +630,19 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
         cfg.draft_parallel_layout = None
         cfg.is_hybrid_swa = True
         cfg.is_hybrid_swa_compress = False
+        cfg.mambaish_config = None
         cfg.use_mla_backend = False
         cfg.kv_cache_dtype = _DTYPE
+        cfg.page_size = 1
         cfg.layer_info = SimpleNamespace(
-            full_attention_layer_ids=[0, 3], swa_attention_layer_ids=[1, 2]
+            start_layer=0,
+            end_layer=4,
+            full_attention_layer_ids=[0, 3],
+            swa_attention_layer_ids=[1, 2],
         )
         cfg.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["MiMoV2FlashForCausalLM"]),
+            sliding_window_size=128,
             get_num_kv_heads=lambda tp, dcp: 4,
             head_dim=192,
             v_head_dim=128,
@@ -625,21 +667,39 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
             lane_num=1, head_num=4, head_dim=64, store_dtype=_DTYPE
         )
         with get_parallel().override(attn_tp_size=1, attn_dcp_size=1):
-            spec = self._configurator()._full_host_spec(region)
+            spec, entry_bytes = _fused_plan(
+                self._configurator(),
+                FusedDraftPlacement(
+                    runners=(RunnerLanes(ranges={"full": (0, 1)}),),
+                    regions={"full": region},
+                ),
+                "full",
+            )
         self.assertEqual(
             (spec.layer_num, spec.head_dim, spec.v_head_dim), (2, 192, 128)
         )
+        self.assertIs(spec.draft_region, region)
+        self.assertEqual(entry_bytes, spec.entry_bytes())
 
     def test_the_swa_fused_price_reads_this_runners_window_layers(self):
         region = DenseDraftRegion(
             lane_num=1, head_num=4, head_dim=64, store_dtype=_DTYPE
         )
         with get_parallel().override(attn_tp_size=1, attn_dcp_size=1):
-            spec = self._configurator()._swa_host_spec(region)
+            spec, entry_bytes = _fused_plan(
+                self._configurator(),
+                FusedDraftPlacement(
+                    runners=(RunnerLanes(ranges={"swa": (0, 1)}),),
+                    regions={"swa": region},
+                ),
+                "swa",
+            )
         self.assertEqual(
             (spec.layer_num, spec.head_num, spec.head_dim, spec.v_head_dim),
             (2, 8, 192, 128),
         )
+        self.assertIs(spec.draft_region, region)
+        self.assertEqual(entry_bytes, spec.entry_bytes())
 
 
 class TestFusedDraftDecision(CustomTestCase):
@@ -669,12 +729,29 @@ class TestFusedDraftDecision(CustomTestCase):
         cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
         cfg.draft_parallel_layout = draft_parallel_layout
         cfg.is_hybrid_swa = True
+        cfg.is_hybrid_swa_compress = False
         cfg.mambaish_config = None
         cfg.use_mla_backend = False
         cfg.is_draft_worker = False
         cfg.spec_algorithm = SpeculativeAlgorithm.from_string(algorithm)
+        # A hybrid sliding-window host: one full and one window layer, whose
+        # declarations name the sub-pools the draft may fuse into.
+        cfg.layer_info = SimpleNamespace(
+            start_layer=0,
+            end_layer=2,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+        )
         cfg.model_config = SimpleNamespace(
-            is_multi_layer_eagle=False, sliding_window_size=None
+            is_multi_layer_eagle=False,
+            sliding_window_size=128,
+            hf_config=SimpleNamespace(architectures=["GptOssForCausalLM"]),
+            get_num_kv_heads=lambda tp, dcp: 4,
+            head_dim=64,
+            v_head_dim=64,
+            get_swa_num_kv_heads=lambda tp: 4,
+            swa_head_dim=64,
+            swa_v_head_dim=64,
         )
         cfg.kv_cache_dtype = host_kv_dtype
         cfg.spec_aux_config = SimpleNamespace(

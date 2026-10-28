@@ -23,10 +23,10 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
     UnifiedMHATokenToKVPool,
     UnifiedMLATokenToKVPool,
-    init_unified_swa_pools,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 BF16_NAN = 0x7FC1  # LE bf16 NaN bit pattern, as SGLANG_DEBUG_POISON_POOL fills
 
@@ -34,7 +34,7 @@ BF16_NAN = 0x7FC1  # LE bf16 NaN bit pattern, as SGLANG_DEBUG_POISON_POOL fills
 def _build(device, page_size=1):
     """A tiny MLA+mamba unified pool + full-side allocator.
 
-    Mirrors init_unified_mamba_pools' construction just enough for the
+    Mirrors the unified pool builder's full + state stack just enough for the
     allocator hand-out path (the piece under test)."""
     layer_num = 2
     full_spec = MLASubPoolSpec(
@@ -182,7 +182,7 @@ def _build_tri(device, page_size=4):
 def _build_swa_poisoned(device, page_size=4):
     """A full + SWA unified pool built under SGLANG_DEBUG_POISON_POOL."""
     with envs.SGLANG_DEBUG_POISON_POOL.override(True):
-        return init_unified_swa_pools(
+        return build_test_unified_pools(
             device=device,
             kv_cache_dtype=torch.bfloat16,
             head_num=2,

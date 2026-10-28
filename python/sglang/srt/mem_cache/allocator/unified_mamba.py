@@ -102,7 +102,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.bind_peer(self.mamba_allocator)
         self.mamba_allocator.bind_peer(self.full_attn_allocator)
 
-        # `init_unified_mamba_pools` later wraps `self.mamba_allocator` in a
+        # The unified pool builder later wraps `self.mamba_allocator` in a
         # `UnifiedMambaSlotAllocator` owning the v2p translate; the KV pools get no
         # allocator (write locations resolve in the attention metadata).
 

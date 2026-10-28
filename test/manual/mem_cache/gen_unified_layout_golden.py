@@ -1,10 +1,10 @@
-"""Regenerate unified_layout_golden.json from the unified pool factories.
+"""Regenerate unified_layout_golden.json from the unified pool builder.
 
 The golden is a wire format (see test_unified_layout_golden.py). Regenerate it
 only for an intended byte-layout change, and say in the PR what moved and why:
     python test/manual/mem_cache/gen_unified_layout_golden.py
 
-The bs=1 floor terms are read from the factories' boot error at a one-byte
+The bs=1 floor terms are read from the builder's boot error at a one-byte
 budget, so the golden pins what a too-small budget reports.
 """
 
