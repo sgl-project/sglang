@@ -171,6 +171,8 @@ def handle_sail_backends(server_args: Any):
     # A captured prefill graph pins MLA to the absorbed path, which hands the
     # backend a non-None q_v; the SAIL FA3 interface rejects that argument, so
     # MLA prefill must stay eager on SAIL. DSA models keep their own policy.
+    # Decode has no eager escape hatch and is routed off fa3 afterwards, in
+    # handle_sail_attention_backend_compatibility.
     if use_mla_backend(server_args) and not is_deepseek_dsa(
         model_config_of(server_args).hf_config
     ):
@@ -184,12 +186,42 @@ def handle_sail_backends(server_args: Any):
 
 
 @register_post_process
-def _sail_fa3_flashmla_qv_fallback(view: Any) -> dict:
-    if not get_platform().is_sail or attention_backends_of(view) != (
-        "fa3",
-        "flashmla",
-    ):
+def _sail_fa3_qv_fallbacks(view: Any) -> dict:
+    """Keep MLA off the SAIL FA3 paths that hand the kernel a q_v.
+
+    The vendor FA3 build only accepts q_v on Hopper. Absorbed MLA decode always
+    passes qv=q_nope and, unlike prefill, has no eager route to dodge it, so
+    decode can never be fa3; prefill keeps fa3 only while it stays eager and
+    non-chunked.
+    """
+    if not get_platform().is_sail:
         return {}
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    overrides = {}
+    prefill_backend, decode_backend = attention_backends_of(view)
+
+    # Decode: absorbed MLA decode always passes q_v. DSA models keep their own
+    # backend policy (see handle_sail_backends).
+    if (
+        decode_backend == "fa3"
+        and use_mla_backend(view)
+        and not is_deepseek_dsa(model_config_of(view).hf_config)
+    ):
+        logger.warning(
+            "On SAIL, fa3 cannot serve MLA decode: absorbed MLA decode passes "
+            "q_v, which the SAIL FA3 kernel only supports for Hopper. Falling "
+            "back to --decode-attention-backend flashmla; fa3 stays the prefill "
+            "backend."
+        )
+        overrides["decode_attention_backend"] = "flashmla"
+        decode_backend = "flashmla"
+
+    # Prefill: a captured prefill graph or a disabled chunked prefix cache pins
+    # MLA to the absorbed path, so fa3 prefill survives only while it stays
+    # eager.
+    if (prefill_backend, decode_backend) != ("fa3", "flashmla"):
+        return overrides
 
     mtp_wo_decode_sam = (
         view.speculative_algorithm is not None
@@ -201,7 +233,7 @@ def _sail_fa3_flashmla_qv_fallback(view: Any) -> dict:
     )
     chunked_prefix_disabled = view.disable_chunked_prefix_cache
     if not (mtp_wo_decode_sam or prefill_cg_enabled or chunked_prefix_disabled):
-        return {}
+        return overrides
 
     reasons = []
     if mtp_wo_decode_sam:
@@ -217,7 +249,8 @@ def _sail_fa3_flashmla_qv_fallback(view: Any) -> dict:
         "the prefill CUDA graph, and do not set --disable-chunked-prefix-cache.",
         "; ".join(reasons),
     )
-    return {"prefill_attention_backend": "flashmla"}
+    overrides["prefill_attention_backend"] = "flashmla"
+    return overrides
 
 
 @register_post_process
@@ -252,7 +285,7 @@ def handle_sail_attention_backend_compatibility(server_args: Any):
     if not get_platform().is_sail:
         return
 
-    run_post_process_pass(server_args, _sail_fa3_flashmla_qv_fallback)
+    run_post_process_pass(server_args, _sail_fa3_qv_fallbacks)
     run_post_process_pass(server_args, _sail_flashmla_fp8_kv_cache_fallback)
     cfg = resolved_view(server_args)
     if "fa3" in (
