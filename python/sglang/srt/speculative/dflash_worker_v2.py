@@ -128,9 +128,9 @@ def _get_fused_kv_materialize_helper():
 
 
 class _DflashDraftSampler:
-    """Capture-safe greedy argmax over the target LM head, run inside the draft
-    cuda graph so the draft sampling is captured and counted in fwd_occupancy.
-    DFLASH's draft has no head of its own; it borrows the target `lm_head`.
+    """Capture-safe greedy argmax over a dense LM head, run inside the draft
+    cuda graph so draft sampling is captured and counted in fwd_occupancy.
+    Drafts borrow the target head unless they declare their own.
 
     tp=1: plain argmax over the local (full) vocab shard.
     tp>1: per-rank shard (max, global id) -> all-gather -> first-max select.
@@ -442,6 +442,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
+        if draft_config.has_own_lm_head:
+            self._sampling_lm_head = self.draft_model.own_lm_head
+        else:
+            self._sampling_lm_head = unwrap_lora_layer(
+                getattr(target_worker.model_runner.model, "lm_head", None)
+            )
         self._is_domino = draft_config.is_domino
         self.domino_candidate_pool_size = int(
             get_spec().speculative_domino_candidate_pool_size
@@ -858,9 +864,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.block_size <= 1:
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
-        lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+        lm_head = self._sampling_lm_head
         if lm_head is None:
-            return _eager("no target lm_head")
+            return _eager("no sampling lm_head")
 
         # A gate-admitted quantized head is capture-safe: the target's own
         # logits path already runs the same kernel under CUDA graphs.
@@ -2476,13 +2482,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         embed_module = unwrap_lora_layer(
             _resolve_dflash_embedding_module(self.draft_model, target_model)
         )
-        lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+        lm_head = self._sampling_lm_head
         if lm_head is None or not (
             hasattr(lm_head, "weight")
             or callable(getattr(getattr(lm_head, "quant_method", None), "apply", None))
         ):
             raise RuntimeError(
-                "DFLASH requires the target model to expose `lm_head` with either "
+                "DFLASH requires the selected sampling head to expose either "
                 "`weight` or a `quant_method` that can produce logits."
             )
 

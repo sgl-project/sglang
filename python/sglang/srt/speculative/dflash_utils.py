@@ -408,6 +408,20 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     )
     if sliding_window is None and is_nemotron_35_draft_config(config):
         sliding_window = _get_dflash_config(config).get("swa_window_size")
+    elif sliding_window is None:
+        dflash_config = _get_dflash_config(config)
+        architectures = _cfg_get(config, "architectures", None) or []
+        if "DFlashDraftModel" in architectures and dflash_config.get("use_swa") is True:
+            # Qwen3Config can clear the window despite explicit sliding layers.
+            sliding_window = dflash_config.get("swa_window_size")
+            if (
+                isinstance(sliding_window, bool)
+                or not isinstance(sliding_window, Integral)
+                or sliding_window <= 0
+            ):
+                raise ValueError(
+                    "DFLASH dflash_config.swa_window_size must be a positive integer."
+                )
     if sliding_window is None:
         raise ValueError(
             "DFLASH sliding_attention layers require config.sliding_window."
@@ -535,6 +549,7 @@ class DFlashDraftConfig:
     pure_draft_prefix_len: Optional[int]
     gru_hidden_dim: Optional[int]
     emb_dim: Optional[int]
+    has_own_lm_head: bool = False
     attention_sink_bias: bool = False
     attention_value_scale: Optional[float] = None
 
@@ -701,6 +716,12 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"got {mask_token_id}."
             )
 
+    has_own_lm_head = _cfg_get(draft_hf_config, "has_own_lm_head", False)
+    if not isinstance(has_own_lm_head, bool):
+        raise ValueError(
+            f"DFLASH has_own_lm_head must be a bool, got {has_own_lm_head!r}."
+        )
+
     # MiMo DFlash draft extras: per-head attention sink bias and V value scale.
     raw_attention_sink_bias = dflash_cfg.get("attention_sink_bias", False)
     if not isinstance(raw_attention_sink_bias, bool):
@@ -808,6 +829,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         pure_draft_prefix_len=pure_draft_prefix_len,
         gru_hidden_dim=gru_hidden_dim,
         emb_dim=emb_dim,
+        has_own_lm_head=has_own_lm_head,
         attention_sink_bias=attention_sink_bias,
         attention_value_scale=attention_value_scale,
     )

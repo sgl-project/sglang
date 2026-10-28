@@ -41,6 +41,7 @@ def _projector_model(projector_type="domino"):
     model = DFlashDraftModel.__new__(DFlashDraftModel)
     nn.Module.__init__(model)
     model.projector_type = projector_type
+    model.own_lm_head = None
     model.config = SimpleNamespace(hidden_size=8)
     if projector_type == "domino":
         model.prefix_gru = nn.GRU(8, 4, batch_first=True, bias=False)
