@@ -475,8 +475,6 @@ class KimiK3MoE(nn.Module):
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
         self._front_is_ep_pair = False
-        # Set by _prepare_mono() once the weights are in their final layout.
-        self._mono = None
         self.moe_hidden_size = (
             config.routed_expert_hidden_size if self.use_latent_moe else hidden_size
         )
@@ -758,20 +756,6 @@ class KimiK3MoE(nn.Module):
             "_ep_front_eligible",
         ):
             self.__dict__.pop(prop, None)
-
-    def _prepare_mono(self) -> None:
-        """Bind the ROCm mono decode launch to this layer, if it applies.
-
-        Called from precompile_kernels_after_loading. That hook runs after
-        every quant method's process_weights_after_loading, so the experts are
-        in their final preshuffled layout here. They are not yet in
-        post_load_weights. The hook is still before the KV cache is sized and
-        before any graph capture.
-        """
-        from sglang.srt.layers.moe.k3_mono_decode import maybe_build_mono
-
-        if self._mono is None:
-            self._mono = maybe_build_mono(self)
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -1499,7 +1483,6 @@ class KimiK3MoE(nn.Module):
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor] = None,
-        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         """A latent MoE, which writes the next stream itself, takes the pending
         prefix_sum: folded into the 3-way JIT tail add when covered, plain adds
@@ -1507,17 +1490,7 @@ class KimiK3MoE(nn.Module):
         residual add to its stage boundary and takes none."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if (
-            self._mono is not None
-            and forward_batch is not None
-            and self._mono.covered(hidden_states, forward_batch)
-        ):
-            # The fused launch returns the all-reduced routed + shared sum.
-            # The caller still adds the residual. K2 absorbs that add.
-            out = self._mono.forward(hidden_states)
-            if prefix_sum is not None:
-                out = out + prefix_sum
-        elif hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
             out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
@@ -1920,14 +1893,7 @@ class KimiK3DeltaAttention(nn.Module):
         that a raw row-cat would silently drop."""
         if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
             return False
-        # Deliberately not do_fuse_qkvbfg. That flag also means "quant_config
-        # is unset", which is stricter than this merge needs. The K3
-        # checkpoint carries a quantization_config for the MoE experts. Its
-        # attention linears still resolve to UnquantizedLinearMethod. The real
-        # question is whether these three weights are mergeable, and
-        # _is_unquantized_mergeable below asks that directly. The part of
-        # do_fuse_qkvbfg still needed here is its attention-TP condition.
-        if not (self.use_full_rank_gate and self.attn_tp_size == self.tp_size):
+        if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
             return False
         # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
@@ -1952,23 +1918,15 @@ class KimiK3DeltaAttention(nn.Module):
         unfused chain. Called once from load_weights (after all weights are
         loaded, before cuda graph capture)."""
         if _is_hip:
-            from sglang.kernels.ops.attention import (
-                kda_fused_decode_aiter_hip,
-                kda_fused_decode_gfx950,
-            )
+            from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
             layer = self.attn
             w = layer.conv_weights
             f_b_weight = self.f_b_proj.weight
-            backend = os.environ.get(
-                "SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "gfx950"
-            ).lower()
-            fused_ops = {
-                "aiter": kda_fused_decode_aiter_hip,
-                "gfx950": kda_fused_decode_gfx950,
-            }.get(backend)
-            backend_available = fused_ops is not None and fused_ops.available(
-                f_b_weight.device
+            backend = os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower()
+            backend_available = (
+                backend == "aiter"
+                and kda_fused_decode_aiter_hip.available(f_b_weight.device)
             )
             if (
                 backend_available
@@ -1994,7 +1952,7 @@ class KimiK3DeltaAttention(nn.Module):
                     float(self.o_norm.eps),
                     a_log,
                 )
-                fused_ops.warmup(
+                kda_fused_decode_aiter_hip.warmup(
                     f_b_weight=f_b_weight,
                     conv_weight=w,
                     A_log=a_log,
@@ -2004,7 +1962,6 @@ class KimiK3DeltaAttention(nn.Module):
                     norm_eps=float(self.o_norm.eps),
                 )
                 layer._k3_hip_fused_decode_backend = backend
-                layer._k3_hip_fused_decode_ops = fused_ops
                 self._kda_hip_fused_decode_ready = True
             return
         layer = self.attn
@@ -2126,23 +2083,13 @@ class KimiK3DeltaAttention(nn.Module):
             )
         return qkv, beta, forget_gate, g_proj_states
 
-    def forward_gated_core(
+    def forward(
         self,
-        *,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        **kwargs,
     ) -> torch.Tensor:
-        """The TP-local attention output after the output gate, before o_proj.
-
-        Shape is ``[num_tokens, num_local_heads * head_dim]``. o_proj is left
-        to the caller, which also owns the attention-TP reduction that o_proj
-        would do: ``o_proj(forward_gated_core(x)) == forward(x)``. The fused
-        decode path folds o_proj into a larger kernel, so it needs the
-        attention to stop here.
-        """
         defer_f_b = (
             self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
         )
@@ -2190,21 +2137,7 @@ class KimiK3DeltaAttention(nn.Module):
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
-        return core_attn_out.squeeze(0).flatten(-2)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-    ) -> torch.Tensor:
-        core_attn_out = self.forward_gated_core(
-            hidden_states=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-        )
+        core_attn_out = core_attn_out.squeeze(0).flatten(-2)
         if self.all_reduce_fusion:
             out = _k3_symm_o_proj_out(self.o_proj, core_attn_out)
             partial, _ = self.o_proj(core_attn_out, output_tensor=out)
@@ -2214,10 +2147,6 @@ class KimiK3DeltaAttention(nn.Module):
 
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     """MLA with output gate for K3. Gate is applied in TP-local space before o_proj."""
-
-    # Set by forward_gated_core() for the length of one forward; the gated
-    # o_proj wrapper below writes the pre-o_proj tensor into it.
-    _core_sink: Optional[List[torch.Tensor]] = None
 
     def __init__(
         self,
@@ -2374,14 +2303,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     # Even a skipped gate must close its capture branch.
                     torch.cuda.current_stream().wait_stream(self._gate_pending_stream)
                     self._gate_pending_stream = None
-                sink = self._core_sink
-                if sink is not None and not isinstance(x, tuple):
-                    # forward_gated_core(): hand the gated TP-local output back
-                    # and skip o_proj, whose GEMM and attention-TP reduction
-                    # belong to the caller. The MLA cores reach o_proj from
-                    # several places and only unpack a 2-tuple from it.
-                    sink.append(x)
-                    return x, None
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
@@ -2444,40 +2365,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         return super().forward(
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )
-
-    def forward_gated_core(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-        **kwargs,
-    ) -> torch.Tensor:
-        """The TP-local attention output after the output gate, before o_proj.
-
-        Shape is ``[num_tokens, num_local_heads * v_head_dim]``. o_proj is left
-        to the caller, which also owns the attention-TP reduction that o_proj
-        would do: ``o_proj(forward_gated_core(x)) == forward(x)``. The fused
-        decode path folds o_proj into a larger kernel, so it needs the
-        attention to stop here.
-
-        o_proj is called from inside the DeepseekV2AttentionMLA cores, so the
-        split point is the same instance-level wrapper that applies the gate.
-        """
-        assert self.use_output_gate, "forward_gated_core needs the gated o_proj wrapper"
-        sink: List[torch.Tensor] = []
-        self._core_sink = sink
-        try:
-            self.forward(
-                positions, hidden_states, forward_batch, zero_allocator, **kwargs
-            )
-        finally:
-            self._core_sink = None
-        if not sink:
-            # Empty batch, or a gate skipped because o_proj got a tuple input.
-            raise RuntimeError("MLA forward returned without reaching o_proj")
-        return sink[0]
 
 
 def _is_moe_layer(config: KimiLinearConfig, layer_idx: int) -> bool:
@@ -2627,10 +2514,6 @@ class KimiK3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
-        # Set by _prepare_mono_k2() / _prepare_mono_k1() once the weights are
-        # in their final layout.
-        self._mono_k2 = None
-        self._mono_k1 = None
         self._is_moe_layer = _is_moe_layer(config, layer_idx)
         # SP-MoE: with an EP a2a backend and attention TP, a MoE layer runs on
         # this rank's attention-TP shard of the rows.
@@ -2767,7 +2650,6 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        core: bool = False,
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
@@ -2787,12 +2669,7 @@ class KimiK3DecoderLayer(nn.Module):
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
             get_attn_tp_context().set_attn_inputs(attn_inputs)
 
-        # core=True stops before o_proj, for a caller that runs o_proj itself
-        # (the mono layer launch folds it into the kernel).
-        attn_forward = (
-            self.self_attn.forward_gated_core if core else self.self_attn.__call__
-        )
-        result = attn_forward(
+        result = self.self_attn(
             hidden_states=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
@@ -2803,24 +2680,6 @@ class KimiK3DecoderLayer(nn.Module):
             get_attn_tp_context().clear_attn_inputs()
 
         return result
-
-    def _prepare_mono_k2(self) -> None:
-        """Bind the ROCm whole-layer mono launch to this layer, if it applies.
-
-        Called from precompile_kernels_after_loading, right after the MoE
-        binding this one builds on. The experts are in their final preshuffled
-        layout by then. That point is still before the KV cache is sized and
-        before any graph capture.
-        """
-        from sglang.srt.layers.moe.k3_mono_decode import maybe_build_k2
-
-        if self._mono_k2 is None:
-            self._mono_k2 = maybe_build_k2(self)
-        if self._mono_k2 is not None and self._mono_k1 is None:
-            # K1 only helps where K2 already runs: it feeds K2 its core.
-            from sglang.srt.layers.moe.k3_mono_decode import maybe_build_k1
-
-            self._mono_k1 = maybe_build_k1(self)
 
     def forward(
         self,
@@ -2838,15 +2697,13 @@ class KimiK3DecoderLayer(nn.Module):
         )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        moe_kwargs = {"forward_batch": forward_batch} if self._is_moe_layer else {}
         if self._ffn_writes_stream:
             hidden_states = self.mlp(
                 hidden_states,
                 prefix_sum=residual_batch.written_residual(forward_batch),
-                **moe_kwargs,
             )
         else:
-            hidden_states = self.mlp(hidden_states, **moe_kwargs)
+            hidden_states = self.mlp(hidden_states)
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
@@ -2863,9 +2720,6 @@ class KimiK3LinearModel(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
-        # Set by precompile_kernels_after_loading once a layer binds the ROCm
-        # mono decode launch; gates the per-forward mailbox epoch bump.
-        self._mono_decode = False
         self._dp_attention = is_dp_attention_enabled()
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
@@ -2963,12 +2817,6 @@ class KimiK3LinearModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self._mono_decode:
-            # Advance the mono kernels' mailbox epoch once a forward. A device
-            # op, so a captured graph replays it.
-            from sglang.srt.layers.moe.k3_mono_decode import step_begin
-
-            step_begin()
         if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -3582,21 +3430,6 @@ class KimiK3LinearForCausalLM(nn.Module):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
 
-    def precompile_kernels_after_loading(self) -> None:
-        # Runs after every quant method's process_weights_after_loading, so
-        # the expert weights are in their final preshuffled layout here. They
-        # are not in post_load_weights. This point is still before the KV
-        # cache is sized and before any graph capture.
-        armed = False
-        for layer in self.model.layers:
-            if isinstance(layer, PPMissingLayer):
-                continue
-            if isinstance(layer.mlp, KimiK3MoE):
-                layer.mlp._prepare_mono()
-                layer._prepare_mono_k2()
-                armed = armed or layer.mlp._mono is not None
-        self.model._mono_decode = armed
-
 
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
@@ -3691,10 +3524,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
             self.language_model.post_load_weights()
 
     def precompile_kernels_after_loading(self) -> None:
-        # The LM tower's share runs either way; only the vision kernels are
-        # skipped in language-only mode.
-        if self.language_model is not None:
-            self.language_model.precompile_kernels_after_loading()
         if self.config.language_only:
             return
         if self.vision_tower.precompile_fused_rope():

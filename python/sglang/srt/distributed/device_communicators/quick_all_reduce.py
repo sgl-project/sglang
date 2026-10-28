@@ -323,6 +323,55 @@ class QuickAllReduce:
             and inp.data_ptr() % 16 == 0
         )
 
+    def uses_flydsl_int4(self, inp: torch.Tensor) -> bool:
+        """Whether ``quick_all_reduce`` runs ``inp`` through FlyDSL."""
+        return self.should_quick_allreduce(inp) and self._use_flydsl_int4(inp)
+
+    def should_fused_allreduce_rmsnorm(
+        self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
+    ) -> bool:
+        """Whether FlyDSL INT4 can fuse this all-reduce with add + RMSNorm.
+
+        ``weight`` is applied as given. Gemma callers already pass ``1 + w``,
+        so this does not set the kernel's Gemma flag.
+        """
+        if not self.uses_flydsl_int4(inp):
+            return False
+        supports = getattr(self._flydsl_int4, "supports_rmsnorm", None)
+        if supports is None:
+            return False
+        hidden = inp.shape[-1]
+        return (
+            bool(supports(hidden, inp.numel() * inp.element_size()))
+            and residual.shape == inp.shape
+            and residual.dtype == inp.dtype
+            and residual.is_contiguous()
+            and residual.data_ptr() % 16 == 0
+            and weight.dtype == inp.dtype
+            and weight.shape == (hidden,)
+            and weight.is_contiguous()
+            and weight.data_ptr() % 16 == 0
+        )
+
+    def fused_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """FlyDSL INT4 all-reduce of ``inp`` fused with add + RMSNorm.
+
+        Returns ``(rmsnorm(allreduce(inp) + residual), allreduce(inp) + residual)``.
+        """
+        assert self._flydsl_int4 is not None
+        out = torch.empty_like(inp)
+        residual_out = torch.empty_like(residual)
+        self._flydsl_int4.allreduce_rmsnorm(
+            inp, residual, weight, epsilon, out, residual_out, gemma_norm=False
+        )
+        return out, residual_out
+
     def close(self):
         flydsl = getattr(self, "_flydsl_int4", None)
         if flydsl is not None:
@@ -363,6 +412,31 @@ class _QuickAllReduceAdapter:
         if out is None:
             return reduce(inp)
         return reduce(inp, out=out)
+
+    def uses_flydsl_int4(self, inp: torch.Tensor) -> bool:
+        uses = getattr(self._communicator, "uses_flydsl_int4", None)
+        if uses is None:
+            return False
+        return bool(uses(inp))
+
+    def should_fused_allreduce_rmsnorm(
+        self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
+    ) -> bool:
+        should = getattr(self._communicator, "should_fused_allreduce_rmsnorm", None)
+        if should is None:
+            return False
+        return bool(should(inp, residual, weight))
+
+    def fused_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._communicator.fused_allreduce_rmsnorm(
+            inp, residual, weight, epsilon
+        )
 
     def close(self) -> None:
         close = getattr(self._communicator, "close", None)

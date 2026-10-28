@@ -27,6 +27,7 @@ MB = 1024 * 1024
 class _FakeFlyDSLInt4:
     instances = []
     fail_compile = False
+    supports = True
 
     def __init__(self, group=None, device=None, rank=0, world_size=4):
         self.group = group
@@ -35,6 +36,7 @@ class _FakeFlyDSLInt4:
         self.world_size = world_size
         self.allreduce_calls = 0
         self.compile_calls = 0
+        self.rmsnorm_calls = []
         self.closed = False
         self.instances.append(self)
 
@@ -45,6 +47,17 @@ class _FakeFlyDSLInt4:
 
     def allreduce(self, inp, out):
         self.allreduce_calls += 1
+
+    def supports_rmsnorm(self, hidden, nbytes):
+        self.support_args = (hidden, nbytes)
+        return type(self).supports
+
+    def allreduce_rmsnorm(
+        self, inp, residual, weight, epsilon, out, residual_out, gemma_norm=False
+    ):
+        self.rmsnorm_calls.append(
+            (inp, residual, weight, epsilon, out, residual_out, gemma_norm)
+        )
 
     def close(self):
         self.closed = True
@@ -213,6 +226,81 @@ def test_other_codecs_do_not_open_flydsl(monkeypatch):
     assert len(hip_inits) == 1
     assert hip_calls[0][3] == QuickReduceRegime.INT8.value
     _release(quick_reduce)
+
+
+def _eligible_operands(hidden: int = 8192):
+    """A bf16 payload at the world-size-2 INT4 floor, plus matching operands."""
+    rows = (8 * MB) // (hidden * 2)
+    payload = torch.empty(rows, hidden, dtype=torch.bfloat16)
+    residual = torch.empty_like(payload)
+    weight = torch.empty(hidden, dtype=torch.bfloat16)
+    assert payload.data_ptr() % 16 == 0
+    return payload, residual, weight
+
+
+def test_fused_rmsnorm_accepts_an_eligible_payload():
+    quick_reduce = _make()
+    quick_reduce.world_size = 2
+    quick_reduce.use_fp16_kernels = 0
+    quick_reduce.disabled = False
+    fake = _FakeFlyDSLInt4()
+    _FakeFlyDSLInt4.supports = True
+    quick_reduce._flydsl_int4 = fake
+    payload, residual, weight = _eligible_operands()
+
+    assert quick_reduce.should_fused_allreduce_rmsnorm(payload, residual, weight)
+    out, residual_out = quick_reduce.fused_allreduce_rmsnorm(
+        payload, residual, weight, 1e-6
+    )
+
+    assert fake.support_args == (8192, payload.numel() * payload.element_size())
+    assert len(fake.rmsnorm_calls) == 1
+    assert fake.rmsnorm_calls[0][6] is False
+    assert out.shape == payload.shape and residual_out.shape == residual.shape
+    _release(quick_reduce)
+
+
+def test_fused_rmsnorm_declines_outside_the_kernel(monkeypatch):
+    quick_reduce = _make()
+    quick_reduce.world_size = 2
+    quick_reduce.use_fp16_kernels = 0
+    quick_reduce.disabled = False
+    fake = _FakeFlyDSLInt4()
+    quick_reduce._flydsl_int4 = fake
+    payload, residual, weight = _eligible_operands()
+
+    try:
+        _FakeFlyDSLInt4.supports = False
+        assert not quick_reduce.should_fused_allreduce_rmsnorm(payload, residual, weight)
+        assert quick_reduce.uses_flydsl_int4(payload)
+
+        _FakeFlyDSLInt4.supports = True
+        short = torch.empty(16, 8192, dtype=torch.bfloat16)
+        assert not quick_reduce.should_fused_allreduce_rmsnorm(short, short, weight)
+        assert not quick_reduce.uses_flydsl_int4(short)
+
+        fp32_weight = torch.empty(8192, dtype=torch.float32)
+        assert not quick_reduce.should_fused_allreduce_rmsnorm(
+            payload, residual, fp32_weight
+        )
+
+        strided = torch.empty(
+            payload.shape[0], payload.shape[1] * 2, dtype=torch.bfloat16
+        )[:, ::2]
+        assert strided.shape == payload.shape
+        assert not strided.is_contiguous()
+        assert not quick_reduce.should_fused_allreduce_rmsnorm(payload, strided, weight)
+
+        monkeypatch.setattr(weight, "data_ptr", lambda: 8)
+        assert not quick_reduce.should_fused_allreduce_rmsnorm(payload, residual, weight)
+
+        # An AITER build without the epilogue still owns the all-reduce.
+        quick_reduce._flydsl_int4 = object()
+        assert not quick_reduce.should_fused_allreduce_rmsnorm(payload, residual, weight)
+        assert quick_reduce.uses_flydsl_int4(payload)
+    finally:
+        _FakeFlyDSLInt4.supports = True
+        _release(quick_reduce)
 
 
 def test_flydsl_compile_failure_propagates(monkeypatch):
