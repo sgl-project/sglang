@@ -115,6 +115,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
+    is_in_breakable_cuda_graph,
 )
 
 logger = init_logger(__name__)
@@ -952,7 +953,14 @@ def _minimax_h3_attention_core_impl(
     return out
 
 
-_minimax_h3_attention_core_bcg = eager_on_graph(True)(_minimax_h3_attention_core_impl)
+@eager_on_graph
+def _minimax_h3_attention_core_bcg(*args, out: torch.Tensor, **kwargs) -> None:
+    result = _minimax_h3_attention_core_impl(*args, **kwargs)
+    # copy_ would broadcast a mispredicted shape or cast a dtype silently.
+    assert out.shape == result.shape and out.dtype == result.dtype, (
+        "MiniMax-H3 attention output mispredicted"
+    )
+    out.copy_(result)
 
 
 class MiniMaxH3Attention(nn.Module):
@@ -1404,16 +1412,7 @@ class MiniMaxH3Attention(nn.Module):
             gate_flat, _ = self.to_gate_compress(x)
             gate_compress = gate_flat.view(total, self.num_heads, self.head_dim)
 
-        attention_core = (
-            _minimax_h3_attention_core_bcg
-            if self.bcg_breakpoint
-            else _minimax_h3_attention_core_impl
-        )
-        out = attention_core(
-            self,
-            q,
-            k,
-            v,
+        core_kwargs = dict(
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
@@ -1422,6 +1421,11 @@ class MiniMaxH3Attention(nn.Module):
             ring_active=ring_active,
             gate_compress=gate_compress,
         )
+        if self.bcg_breakpoint and is_in_breakable_cuda_graph():
+            out = q.new_empty(q.shape)
+            _minimax_h3_attention_core_bcg(self, q, k, v, out=out, **core_kwargs)
+        else:
+            out = _minimax_h3_attention_core_impl(self, q, k, v, **core_kwargs)
         return out.reshape(total, self.num_heads * self.head_dim)
 
     _attend_eager = torch.compiler.disable(_attend)
@@ -1818,6 +1822,8 @@ class MiniMaxH3FinalLayer(nn.Module):
         # Parallel Decoding Distillation heads, one per denoise step, loaded by
         # `load_pdd_fused_heads`. None on every ordinary run.
         self._pdd_heads: dict[str, torch.Tensor] | None = None
+        # (name, device, dtype) -> that head's stacked (weight, bias), uploaded once
+        self._pdd_device_heads: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def load_pdd_fused_heads(self, path: str) -> None:
         """Swap the two output heads for a per-step stack (PDD).
@@ -1845,6 +1851,7 @@ class MiniMaxH3FinalLayer(nn.Module):
                 width = projection.output_size_per_partition
                 heads[key] = heads[key].narrow(1, projection.tp_rank * width, width)
         self._pdd_heads = heads
+        self._pdd_device_heads = {}
         logger.info("MiniMax-H3 PDD: %d fused output heads loaded from %s", steps, path)
 
     def _pdd_project(self, h: torch.Tensor, name: str) -> torch.Tensor:
@@ -1857,9 +1864,14 @@ class MiniMaxH3FinalLayer(nn.Module):
                 f"step {step}; run with --num-inference-steps {stack.shape[0]} "
                 "(num_inference_steps counts denoise transitions)."
             )
-        weight = stack[step].to(device=h.device, dtype=h.dtype)
-        bias = heads[f"{name}.bias"][step].to(device=h.device, dtype=h.dtype)
-        return torch.nn.functional.linear(h, weight, bias)
+        key = (name, h.device, h.dtype)
+        if key not in self._pdd_device_heads:
+            self._pdd_device_heads[key] = (
+                stack.to(device=h.device, dtype=h.dtype),
+                heads[f"{name}.bias"].to(device=h.device, dtype=h.dtype),
+            )
+        weight, bias = self._pdd_device_heads[key]
+        return torch.nn.functional.linear(h, weight[step], bias[step])
 
     def _project(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self._pdd_heads is not None:
@@ -2648,10 +2660,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         device: torch.device,
         refined_prompt_embeds_length: int | torch.Tensor | None = None,
         local_embedding_layout: dict[str, torch.Tensor | int] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        embeddings: torch.Tensor,
+        t_emb: torch.Tensor,
+    ) -> None:
         """Build embeddings for one contiguous block-stack row shard.
 
-        Returns (decoder_input [S_local, H] bf16, t_emb [M, t_dim] fp32).
+        Writes embeddings [S_local, H] bf16 and t_emb [M, t_dim] fp32.
         """
         # BCG pads the prompt tensor only to stabilize its input signature.
         # Raw-input callers recover the live length from refiner metadata;
@@ -2695,18 +2709,13 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         if trusted_layout:
             used_len = text_len + int(img_pos.numel()) + int(audio_pos.numel())
             local_live_rows = min(max(used_len - row_start, 0), local_seq_len)
-            embeddings = torch.empty(
-                (local_seq_len, self.hidden_size), device=device, dtype=_BF16_DTYPE
-            )
             if local_live_rows < local_seq_len:
                 embeddings[local_live_rows:].zero_()
         else:
             # Direct model callers do not provide the serving-time partition
             # contract. Preserve their historical zero-fill/add semantics for
             # sparse or overlapping row maps.
-            embeddings = torch.zeros(
-                (local_seq_len, self.hidden_size), device=device, dtype=_BF16_DTYPE
-            )
+            embeddings.zero_()
 
         if local_embedding_layout is None:
             text_source_ids = torch.nonzero(
@@ -2778,8 +2787,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 audio_embed.to(_BF16_DTYPE),
             )
 
-        t_emb = self._time_embedding(unique_timesteps)
-        return embeddings, t_emb
+        time_embedding = self._time_embedding(unique_timesteps)
+        # copy_ would broadcast a mispredicted shape or cast a dtype silently.
+        assert (
+            t_emb.shape == time_embedding.shape and t_emb.dtype == time_embedding.dtype
+        ), "MiniMax-H3 t_emb mispredicted"
+        t_emb.copy_(time_embedding)
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed inference forward.
@@ -2927,7 +2940,15 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         audio_pos = audio_pos.to(device)
         text_pos = text_pos.to(device)
 
-        decoder_input, t_emb = self._embed(
+        decoder_input = torch.empty(
+            (local_seq_len, self.hidden_size), device=device, dtype=_BF16_DTYPE
+        )
+        t_emb = torch.empty(
+            (unique_timesteps.numel(), self.arch.time_embed_dim),
+            device=device,
+            dtype=_FP32_DTYPE,
+        )
+        self._embed(
             x=x,
             audio_x=audio_x,
             text_embeddings_selected=text_selected,
@@ -2942,6 +2963,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             device=device,
             refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
             local_embedding_layout=kwargs.get("local_embedding_layout"),
+            embeddings=decoder_input,
+            t_emb=t_emb,
         )
         self.release_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
         # request-step AdaLN input shared by all blocks

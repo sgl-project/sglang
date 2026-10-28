@@ -24,7 +24,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative import spec_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class NoHostRead(torch.Tensor):
@@ -241,6 +241,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                     rid="one",
                     lora_id=None,
                     token_type_ids=None,
+                    kv=SimpleNamespace(kv_committed_len=64),
                     extend_end=65,
                     full_untruncated_fill_ids=[3] * 65,
                 )
@@ -412,6 +413,116 @@ class TestDpDecodeRelabel(unittest.TestCase):
                 batch = make_forward_batch([1], [0], [1], mode)
                 batch._original_forward_mode = ForwardMode.IDLE
                 self.assertEqual(batch.logical_forward_mode, mode)
+
+
+def track_mapping(batch):
+    return batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+
+
+def make_verify_batch():
+    mapping = torch.tensor([[10, 11], [20, 21], [30, 31]])
+    return SimpleNamespace(
+        reqs=[
+            SimpleNamespace(kv=SimpleNamespace(mamba_next_track_idx=p))
+            for p in (0, None, 1)
+        ],
+        req_pool_indices=torch.tensor([2, 0, 1]),
+        req_to_token_pool=SimpleNamespace(
+            req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
+        ),
+        mamba_lazy_spec_track_positions_cpu=[1, 0, 0],
+    )
+
+
+class TestVerifyTrackIndexReuse(unittest.TestCase):
+    """Verify track indices reused from the last round must equal freshly built ones
+    after any change to what they are built from."""
+
+    def setUp(self):
+        self.builds = 0
+        build, tensor = spec_utils.set_mamba_track_indices_from_reqs, torch.tensor
+
+        def build_unpinned(batch, track_positions=None):
+            self.builds += 1
+            # no pinned host memory on CPU-only machines
+            with patch.object(
+                torch, "tensor", lambda *a, pin_memory=False, **k: tensor(*a, **k)
+            ):
+                build(batch, track_positions)
+
+        patcher = patch.object(
+            spec_utils, "set_mamba_track_indices_from_reqs", build_unpinned
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _prepare(self, batch, reuse, lazy=False):
+        settings = SimpleNamespace(
+            mamba=SimpleNamespace(
+                enable_mamba_extra_buffer=True, enable_mamba_extra_buffer_lazy=lazy
+            )
+        )
+        # reuse: the process's indices under SGLANG_Q35MF_MKH_N3B, None without it
+        with (
+            patch.object(spec_utils, "get_exec", return_value=settings),
+            patch.object(spec_utils, "_VERIFY_TRACK_INDICES", reuse),
+        ):
+            spec_utils.prepare_mamba_track_for_verify(batch)
+        return batch.mamba_track_indices.tolist(), batch.mamba_track_buffer_indices
+
+    def test_reuse_matches_a_fresh_build(self):
+        changes = {
+            "nothing": lambda b: None,
+            "slots replaced": lambda b: setattr(
+                b, "req_pool_indices", torch.tensor([0, 2, 1])
+            ),
+            "slots written": lambda b: b.req_pool_indices.copy_(
+                torch.tensor([1, 2, 0])
+            ),
+            "mapping replaced": lambda b: setattr(
+                b.req_to_token_pool,
+                "req_index_to_mamba_ping_pong_track_buffer_mapping",
+                torch.tensor([[40, 41], [50, 51], [60, 61]]),
+            ),
+            "mapping written": lambda b: track_mapping(b)[0, 1].fill_(19),
+            "position moved": lambda b: setattr(
+                b.reqs[2].kv, "mamba_next_track_idx", 0
+            ),
+            "request freed": lambda b: setattr(
+                b.reqs[0].kv, "mamba_next_track_idx", None
+            ),
+            "indices written": lambda b: b.mamba_track_indices.fill_(0),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                batch, reuse = make_verify_batch(), spec_utils.VerifyTrackIndices()
+                self._prepare(batch, reuse)
+                last_indices, builds = batch.mamba_track_indices, self.builds
+                change(batch)
+                got = self._prepare(batch, reuse)
+                # reused, the very same tensor, exactly when nothing changed
+                self.assertEqual(self.builds == builds, name == "nothing")
+                self.assertEqual(
+                    batch.mamba_track_indices is last_indices, name == "nothing"
+                )
+                self.assertEqual(got, self._prepare(batch, None))
+
+    def test_inference_tensors_are_rebuilt_every_round(self):
+        # SGLANG_ENABLE_TORCH_INFERENCE_MODE: inference tensors keep no version
+        with torch.inference_mode():
+            batch, reuse = make_verify_batch(), spec_utils.VerifyTrackIndices()
+            want = self._prepare(batch, None)
+            for _ in range(2):
+                builds = self.builds
+                self.assertEqual(self._prepare(batch, reuse), want)
+                self.assertEqual(self.builds, builds + 1)
+
+    def test_lazy_plan_is_never_reused_over(self):
+        batch, reuse = make_verify_batch(), spec_utils.VerifyTrackIndices()
+        self._prepare(batch, reuse)
+        self.assertEqual(
+            self._prepare(batch, reuse, lazy=True), ([31, -1, 20], [1, 0, 0])
+        )
 
 
 if __name__ == "__main__":
