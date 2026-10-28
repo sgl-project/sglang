@@ -579,7 +579,7 @@ class AnthropicServing:
 
         if anthropic_request.thinking is not None:
             # The protocol layer already enforces SDK shape:
-            #   enabled  -> budget_tokens required (>=1024), display optional
+            #   enabled  -> budget_tokens optional (>=1024), display optional
             #   disabled -> neither budget_tokens nor display allowed
             #   adaptive -> budget_tokens forbidden, display optional
             # So by the time we get here ``budget_tokens`` can only be
