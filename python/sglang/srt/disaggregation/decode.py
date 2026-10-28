@@ -3281,6 +3281,7 @@ class DisaggDecode:
         self.scheduler_stage_metrics = scheduler_stage_metrics
         self.decode_offload_manager = decode_offload_manager
         self.request_retirer = request_retirer
+        self.pool_stats_observer = pool_stats_observer
         self.flags = flags
         # KV received into host memory is copied into its row before the
         # request is admitted, on the stream forwards run on with the kernel
@@ -3526,6 +3527,16 @@ class DisaggDecode:
         )
         stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
             host_reqs, priority_enabled
+        )
+        full_tokens, swa_tokens = self.prealloc_queue.pre_allocated_token_counts()
+        pool_stats = self.pool_stats_observer.get_pool_stats()
+        stats.prealloc_full_token_usage = (
+            full_tokens / pool_stats.full_capacity if pool_stats.full_capacity else 0.0
+        )
+        stats.prealloc_swa_token_usage = (
+            swa_tokens / pool_stats.swa_capacity
+            if pool_stats.is_hybrid_swa and pool_stats.swa_capacity
+            else 0.0
         )
 
     def queue_log_msg(self, stats: SchedulerStats, max_total_num_tokens: int) -> str:

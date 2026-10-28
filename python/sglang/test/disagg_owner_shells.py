@@ -40,9 +40,16 @@ def decode_owner_shell(**attrs) -> DisaggDecode:
         kv_manager=SimpleNamespace(
             should_verify_kv_checksum=lambda bootstrap_addr: True
         ),
+        pre_allocated_token_counts=lambda: (0, 0),
     )
     owner.transfer_queue = SimpleNamespace(queue=[])
     owner.attn_tp_cpu_group = None
+    # Empty pools: the prealloc usage gauges read 0.
+    owner.pool_stats_observer = SimpleNamespace(
+        get_pool_stats=lambda: SimpleNamespace(
+            full_capacity=0, swa_capacity=0, is_hybrid_swa=False
+        )
+    )
     owner.ready = []
     owner.releasing = []
     owner.decode_offload_manager = None
