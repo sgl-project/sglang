@@ -2,7 +2,6 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib
 import logging
 import os
 
@@ -21,7 +20,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.aiter import (
     USE_AITER_GFX95,
-    USE_AITER_GFX942,
     USE_AITER_GFX1250,
 )
 
@@ -405,14 +403,7 @@ class AITerImpl(AttentionImpl):
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         del cu_seqlens_host
-        if USE_AITER_GFX942:
-            # The grouped-varlen ASM kernel hangs on H3's ~64K packed
-            # sequences on gfx942; AITER's Triton path handles this shape.
-            attention_func = importlib.import_module(
-                "aiter.ops.triton.attention.mha"
-            ).flash_attn_varlen_func
-        else:
-            attention_func = aiter.flash_attn_varlen_func
+        attention_func = aiter.flash_attn_varlen_func
 
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
         output = attention_func(
