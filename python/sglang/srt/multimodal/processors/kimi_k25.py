@@ -266,10 +266,32 @@ def _resize_images_by_source_shape(
 _GPU_PREPROCESS_CHUNK_BYTES = 512 * 1024 * 1024
 
 
-def _byte_bounded_chunks(group: list, pixels_per_item: int) -> list[list]:
-    """Split a size group so each chunk's fp32 RGBA pixels fit the budget."""
-    step = max(1, _GPU_PREPROCESS_CHUNK_BYTES // max(1, 4 * 4 * pixels_per_item))
-    return [group[i : i + step] for i in range(0, len(group), step)]
+def _gpu_preprocess_bytes(
+    image: Union[torch.Tensor, Image.Image], padded_pixels: int
+) -> int:
+    """Transient GPU bytes for one image in a batched chunk: the uint8 source,
+    its copy in the joined source batch and its fp32 resize input, plus the
+    fp32 RGBA output."""
+    if isinstance(image, Image.Image):
+        source = 3 * image.width * image.height
+    else:
+        source = image.numel()
+    return source * (1 + 1 + 4) + 4 * 4 * padded_pixels
+
+
+def _byte_bounded_chunks(group: list, padded_pixels: int) -> list[list]:
+    """Split a size group of ``(idx, image, config)`` so each chunk fits the budget."""
+    chunks, chunk, used = [], [], 0
+    for item in group:
+        size = _gpu_preprocess_bytes(item[1], padded_pixels)
+        if chunk and used + size > _GPU_PREPROCESS_CHUNK_BYTES:
+            chunks.append(chunk)
+            chunk, used = [], 0
+        chunk.append(item)
+        used += size
+    if chunk:
+        chunks.append(chunk)
+    return chunks
 
 
 def _gpu_preprocess_images(

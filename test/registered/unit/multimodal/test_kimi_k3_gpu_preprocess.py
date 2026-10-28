@@ -151,11 +151,24 @@ def test_gpu_preprocess_chunks_match_single_batch(monkeypatch):
     whole, whole_grids = kimi_k25._gpu_preprocess_images(*args, to_chw=_cpu_chw)
 
     monkeypatch.setattr(kimi_k25, "_GPU_PREPROCESS_CHUNK_BYTES", 1)
-    assert len(kimi_k25._byte_bounded_chunks(list(range(5)), 56 * 84)) == 5
+    group = [(i, image, config) for i, (image, config) in enumerate(zip(*args[:2]))]
+    assert len(kimi_k25._byte_bounded_chunks(group, 56 * 84)) == 5
     chunked, chunked_grids = kimi_k25._gpu_preprocess_images(*args, to_chw=_cpu_chw)
 
     torch.testing.assert_close(chunked, whole)
     assert torch.equal(chunked_grids, whole_grids)
+
+
+def test_gpu_preprocess_chunks_count_source_bytes(monkeypatch):
+    """Large sources with a small target are split by their own size, since
+    each source is moved to the GPU and joined before it is resized."""
+    image = Image.new("RGB", (2000, 1500))
+    group = [(i, image, None) for i in range(4)]
+    per_image = kimi_k25._gpu_preprocess_bytes(image, 56 * 84)
+    assert per_image > 6 * 2000 * 1500
+    monkeypatch.setattr(kimi_k25, "_GPU_PREPROCESS_CHUNK_BYTES", 2 * per_image)
+    chunks = kimi_k25._byte_bounded_chunks(group, 56 * 84)
+    assert [len(chunk) for chunk in chunks] == [2, 2]
 
 
 def test_prepare_image_features_falls_back_to_cpu_on_gpu_oom(monkeypatch):
