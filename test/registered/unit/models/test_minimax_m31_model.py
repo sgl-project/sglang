@@ -418,6 +418,11 @@ class TestMiniMaxM31Rocm(CustomTestCase):
                     os.environ[level] = preset
                 _minimax_m3_overrides(rocm_server_args(), NVFP4)
                 self.assertEqual(os.environ.get(level), resolved)
+        # only TP4 was measured: at TP2 the image's level stays
+        with gfx950(), patch.dict("os.environ"), int4.override(True):
+            os.environ[level] = "INT8"
+            _minimax_m3_overrides(rocm_server_args(tp_size=2), NVFP4)
+            self.assertEqual(os.environ[level], "INT8")
 
     def test_gfx950_jit_quick_reduce_takes_mid_sizes_only_under_int4(self):
         """The JIT quick-reduce replaces only the INT4 one the override turns on at TP4, and
