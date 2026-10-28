@@ -956,6 +956,74 @@ class TestEagleConfigurator(CustomTestCase):
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
 
+    def test_eagle_dcp_replicated_draft_does_not_exceed_budget(self):
+        """The replicated EAGLE draft pool spans every DCP virtual location."""
+        available = 10_000_000
+        num_layers = 32
+        eagle_draft_num_layers = 1
+
+        mr = _make_model_runner(self, num_layers=num_layers)
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_num_layers
+
+        for dcp_size in (1, 4):
+            with self.subTest(dcp_size=dcp_size):
+                # TP=8 makes both topologies valid. The mock deliberately keeps
+                # target geometry fixed so this isolates the draft term.
+                with (
+                    mock_cpu_env(tp_size=8),
+                    get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        create_memory_pool_configurator,
+                    )
+
+                    cfg = create_memory_pool_configurator(mr)
+                    config = cfg.calculate_pool_sizes(available, 1)
+
+                full_pt = _full_per_token(mr)
+                total_layers = num_layers + eagle_draft_num_layers * dcp_size
+                used = config.max_total_num_tokens * full_pt * total_layers
+                self.assertLessEqual(used, available)
+                self.assertGreater(used, available * 0.99)
+
+    def test_eagle_draft_priced_at_its_pool_loc_space_scale(self):
+        """The draft term follows the draft pool's loc space, not raw dcp_size."""
+        available = 10_000_000
+        num_layers = 32
+        eagle_draft_num_layers = 1
+
+        mr = _make_model_runner(self, num_layers=num_layers)
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_num_layers
+
+        # A draft that shards like the target spans one allocator id per token.
+        with (
+            mock_cpu_env(tp_size=8),
+            get_parallel().override(attn_dcp_size=4),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.draft_dcp_loc_space_scale",
+                return_value=1,
+            ) as draft_scale,
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, 1)
+
+        draft_scale.assert_called_with(mr.model_config.hf_config, 4)
+        full_pt = _full_per_token(mr)
+        total_layers = num_layers + eagle_draft_num_layers
+        used = config.max_total_num_tokens * full_pt * total_layers
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
