@@ -423,6 +423,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.rdna_splitk_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.rdna_small_m_gemv:rdna_splitk_gemv",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.sm12x_bf16_gemv",
         backend=KernelBackend.FLASHINFER,
         target="sglang.kernels.ops.gemm.sm12x_bf16_gemv:b12x_bf16_gemv",
