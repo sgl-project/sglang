@@ -5,8 +5,8 @@ Independent prompts exceed P's logical GPU capacity while fitting in L2.
 The final repeat must report a host hit, advance the H2D counter and match
 the device-hit answer.
 
-The eight-B300 accuracy variants use P TP4/CP4 + D TP4, matching layer-split's
-full GSM8K and Mixed-MoE settings, and require H2D reload during evaluation.
+The accuracy variants also use P TP2/CP2 + D TP2 on four GB300s. They retain
+layer-split's GSM8K scoring settings and require H2D reload during evaluation.
 """
 
 import re
@@ -29,8 +29,7 @@ from sglang.test.simple_eval_mixed_prefix_gsm8k import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-register_cuda_ci(est_time=600, stage="base-c", runner_config="4-gpu-gb300")
-register_cuda_ci(est_time=1500, stage="extra-b", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=1700, stage="base-c", runner_config="4-gpu-gb300")
 
 PAGE_SIZE = 64
 PREFILL_POOL_TOKENS = 4096  # Per rank: CP2 has 8192 logical GPU slots.
@@ -116,8 +115,7 @@ class ShardedHiCacheTestMixin:
         self.assertGreaterEqual(value, minimum, f"{name} did not reach {minimum}")
 
 
-# Select the fixture for this CI runner; both sizes are registered in this file.
-@unittest.skipUnless(torch.cuda.device_count() == 4, "requires the 4-GPU fixture")
+@unittest.skipUnless(torch.cuda.device_count() >= 4, "requires 4 CUDA GPUs")
 class TestGLM52PDShardedHiCache(PDDisaggregationServerBase, ShardedHiCacheTestMixin):
     model = "nvidia/GLM-5.2-NVFP4"
     prefill_tp_size = decode_tp_size = 2
@@ -221,15 +219,17 @@ class TestGLM52PDShardedHiCache(PDDisaggregationServerBase, ShardedHiCacheTestMi
         self.assertEqual(restored["text"], warm["text"])
 
 
-ACCURACY_CP_SIZE = 4
-ACCURACY_PREFILL_POOL_TOKENS = 8192  # Per rank: CP4 has 32768 logical GPU slots.
-ACCURACY_PRESSURE_TOKENS = 24576
+ACCURACY_CP_SIZE = 2
+ACCURACY_PREFILL_POOL_TOKENS = 8192  # Per rank: CP2 has 16384 logical GPU slots.
+ACCURACY_PRESSURE_TOKENS = 12288
 ACCURACY_HICACHE_RATIO = 4
 ACCURACY_COMMON_ARGS = [
     "--page-size",
     str(PAGE_SIZE),
     "--context-length",
-    "32768",
+    "16384",
+    "--max-running-requests",
+    "48",
     "--mem-fraction-static",
     "0.85",
     "--kv-cache-dtype",
@@ -251,13 +251,13 @@ ACCURACY_COMMON_ARGS = [
 ]
 
 
-@unittest.skipUnless(torch.cuda.device_count() >= 8, "requires 8 CUDA GPUs")
+@unittest.skipUnless(torch.cuda.device_count() >= 4, "requires 4 CUDA GPUs")
 class TestGLM52PDShardedHiCacheAccuracy(
     PDDisaggregationServerBase, ShardedHiCacheTestMixin, GSM8KMixin
 ):
     model = "nvidia/GLM-5.2-NVFP4"
-    prefill_tp_size = decode_tp_size = 4
-    decode_base_gpu_id = 4
+    prefill_tp_size = decode_tp_size = 2
+    decode_base_gpu_id = 2
 
     # Match the layer-split accuracy gate. The evaluator excludes the 20
     # few-shot examples from scoring, leaving 1299 held-out questions.
@@ -266,9 +266,13 @@ class TestGLM52PDShardedHiCacheAccuracy(
     gsm8k_num_threads = 48
     gsm8k_num_shots = 20
 
-    # Use the B300 fixture's Mooncake/RDMA transport, as layer-split does.
-    # The four-GB300 fixture above has its own fabric NVLink configuration.
-    extra_prefill_env = {"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": "python"}
+    # Use the same exportable KV allocator and fabric transport as the reload
+    # regression on this four-GB300 runner.
+    extra_prefill_env = {
+        **MOONCAKE_ENV,
+        "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": "python",
+    }
+    extra_decode_env = dict(MOONCAKE_ENV)
     extra_prefill_args = ACCURACY_COMMON_ARGS + [
         "--enable-kv-cache-sharding",
         "--enable-prefill-cp",
@@ -295,7 +299,9 @@ class TestGLM52PDShardedHiCacheAccuracy(
     ]
     extra_decode_args = ACCURACY_COMMON_ARGS + [
         "--max-total-tokens",
-        "131072",
+        "65536",
+        "--cuda-graph-max-bs-decode",
+        "48",
         # Every scored question must use P/D transfer, including repeated shots.
         "--disable-radix-cache",
     ]
@@ -376,17 +382,17 @@ class TestGLM52PDShardedHiCacheAccuracy(
 
 
 class TestGLM52PDShardedHiCacheAccuracyMixedMoE(TestGLM52PDShardedHiCacheAccuracy):
-    """Match layer-split's target DeepEP + TP-only EAGLE draft smoke coverage."""
+    """Cover target DeepEP DP2/EP2 with a TP-only EAGLE draft on two D GPUs."""
 
     gsm8k_accuracy_thres = 0.8
     gsm8k_num_questions = 32
     gsm8k_num_threads = 32
     extra_decode_args = TestGLM52PDShardedHiCacheAccuracy.extra_decode_args + [
         "--attn-dp-size",
-        "4",
+        "2",
         "--enable-dp-lm-head",
         "--ep-size",
-        "4",
+        "2",
         "--moe-dense-tp-size",
         "1",
         "--moe-a2a-backend",
