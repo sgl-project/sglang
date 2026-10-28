@@ -21,7 +21,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -32,12 +32,65 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.utils import is_gfx95_supported
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.vocab_gather import VocabGather
 
 logger = logging.getLogger(__name__)
+
+# fp8 target lm_head GEMM for the DSPARK verify logits, opt-in via
+# SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD. The bf16 head matmul
+# [num_verify_tokens, hidden] x [hidden, vocab_slice] is a per-decode-step cost
+# that grows with the verify batch; running it in fp8 (per-token activation
+# scale + per-output-channel weight scale) roughly halves that GEMM. The weight
+# is fp8-quantized once and cached on the module. Evaluated once at import to
+# keep the per-token decode path free of env lookups.
+#
+# Platform guard: the fp8 _scaled_mm path is validated on gfx95x (MI355X). On
+# gfx942 (MI300X) it produces an accuracy regression, so gate the flag on the
+# arch -- a user who sets the env on gfx942 keeps the safe bf16 head matmul
+# (the flag stays inert) rather than silently hitting the accuracy issue.
+_DSPARK_FP8_LM_HEAD = (
+    envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and is_gfx95_supported()
+)
+if envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and not _DSPARK_FP8_LM_HEAD:
+    logger.warning(
+        "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD is set but the fp8 lm_head path is only "
+        "supported on gfx95x; keeping the bf16 head matmul on this device."
+    )
+_FP8_DTYPE = torch.float8_e4m3fn
+_FP8_MAX = 448.0
+
+
+def _fp8_quant_per_row(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-row (dim=-1) symmetric fp8 quant. Returns (fp8 tensor, float32 scale [rows,1])."""
+    amax = x.abs().amax(dim=-1, keepdim=True).to(torch.float32).clamp_(min=1e-6)
+    scale = amax / _FP8_MAX
+    x_fp8 = (x.to(torch.float32) / scale).clamp_(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
+    return x_fp8, scale
+
+
+def _fp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+    """logits = hidden @ weight.T computed in fp8 via torch._scaled_mm."""
+    weight = lm_head.weight  # [N(vocab_slice), K(hidden)]
+    w_fp8 = getattr(lm_head, "_fp8_weight_cache", None)
+    w_scale = getattr(lm_head, "_fp8_wscale_cache", None)
+    if w_fp8 is None or w_fp8.shape != weight.shape:
+        w_fp8, w_scale = _fp8_quant_per_row(weight)  # [N,K], [N,1]
+        lm_head._fp8_weight_cache = w_fp8
+        lm_head._fp8_wscale_cache = w_scale
+    h_fp8, h_scale = _fp8_quant_per_row(hidden)  # [M,K], [M,1]
+    # a=[M,K] fp8, b=[K,N] fp8 (col-major via .t()); scale_a per-row [M,1],
+    # scale_b per-col [1,N]. Output cast back to hidden dtype.
+    return torch._scaled_mm(
+        h_fp8,
+        w_fp8.t(),
+        scale_a=h_scale,
+        scale_b=w_scale.t(),
+        out_dtype=hidden.dtype,
+    )
 
 
 def _is_pow2(n: int) -> bool:
@@ -79,6 +132,13 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     if should_apply_lm_head_quant_method(lm_head, quant_method):
         return quant_method.apply(lm_head, hidden, None)
     weight = lm_head.weight
+    if (
+        _DSPARK_FP8_LM_HEAD
+        and weight.is_floating_point()
+        and hidden.shape[0] > 0
+        and weight.shape[-1] % 16 == 0
+    ):
+        return _fp8_lm_head_matmul(hidden, lm_head)
     return torch.matmul(hidden.to(weight.dtype), weight.T)
 
 
@@ -450,6 +510,11 @@ def build_confidence_head(config) -> Optional[nn.Module]:
 _DSPARK_SKIPPED_WEIGHT_PREFIXES = ("lm_head.", "rotary_emb.")
 
 
+def _has_mla_layers(layers) -> bool:
+    # MLA layers have no qkv_proj to slice; they write their own latent rows.
+    return any(isinstance(layer.self_attn, DFlashMLAAttention) for layer in layers)
+
+
 class DSparkDraftMixin:
     supports_pre_gather_target_hidden_projection = True
     # Drafts whose base logits leave the vocab-parallel lm_head via a TP-sharded
@@ -645,7 +710,7 @@ class DSparkDraftMixin:
 
     def _build_fused_kv_write_bundle(self, pool) -> Optional[FusedKvWriteBundle]:
         layers = list(self.layers)
-        if not layers:
+        if not layers or _has_mla_layers(layers):
             return None
         weights = []
         for layer in layers:
@@ -743,7 +808,7 @@ class DSparkDraftMixin:
         Cached; None (per-layer fallback) when a QKV weight cannot be sliced
         (quantized) or layers disagree on norm epsilon / bias presence.
         """
-        if not envs.SGLANG_DSPARK_STACKED_CTX_KV.get():
+        if not envs.SGLANG_DSPARK_STACKED_CTX_KV.get() or _has_mla_layers(self.layers):
             return None
         cached = getattr(self, "_stacked_ctx_kv_cache", False)
         if cached is not False:
@@ -831,6 +896,16 @@ class DSparkDraftMixin:
             )
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
+            if isinstance(attn, DFlashMLAAttention):
+                attn.write_context_kv(
+                    pool=pool,
+                    positions=positions,
+                    hidden_states=ctx_hidden,
+                    cache_loc=cache_loc,
+                    cache_loc_2d=cache_loc_2d,
+                    commit_lens=commit_lens,
+                )
+                continue
             if stacked is not None:
                 k = k_all[i]
                 v = v_all[i]

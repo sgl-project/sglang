@@ -356,6 +356,7 @@ mod tests {
                 server_args,
                 chat_formatter: None,
                 generate_hook: None,
+                openai_chat: None,
             }),
             intake_rx,
             abort_rx,
@@ -377,7 +378,9 @@ mod tests {
         let (state, _, _) = test_state(ServerArgs {
             model_path: "/model".into(),
             served_model_name: "served".into(),
-            tokenizer_path: "/tokenizer".into(),
+            // The server loads a local copy; clients get the launched path.
+            tokenizer_path: "/local-tokenizer-copy".into(),
+            public_tokenizer_path: "/tokenizer".into(),
             weight_version: Some("weights-v1".into()),
             load_format: Some("safetensors".into()),
             reasoning_parser: Some("reasoner".into()),
@@ -433,7 +436,8 @@ mod tests {
         let (state, intake_rx, abort_rx) = test_state(ServerArgs {
             model_path: "/model".into(),
             served_model_name: "served".into(),
-            tokenizer_path: "/tokenizer".into(),
+            tokenizer_path: "/local-tokenizer-copy".into(),
+            public_tokenizer_path: "/tokenizer".into(),
             model_config: ModelConfig {
                 context_len: 4096,
                 ..Default::default()

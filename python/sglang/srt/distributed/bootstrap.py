@@ -408,8 +408,8 @@ def _prewarm_tp_lm_head_all_to_all() -> None:
     """Materialize PyNCCL P2P resources before model-memory accounting."""
     warmup_start = time.perf_counter()
     tp_group = get_tp_group()
-    pynccl_comm = tp_group.pynccl_comm
-    if pynccl_comm is None or not pynccl_comm.available:
+    pynccl_comm = tp_group.get_available_pynccl_comm()
+    if pynccl_comm is None:
         raise RuntimeError(
             "--enable-tp-lm-head-all-to-all requires an available PyNCCL "
             "communicator for CUDA graph capture."
