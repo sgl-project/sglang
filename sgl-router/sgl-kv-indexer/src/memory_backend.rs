@@ -154,6 +154,19 @@ impl InMemoryKvIndexerBackend {
 
         let previous_fast_path = state.workers.get(&worker_id).and_then(fast_path_kind);
 
+        let mut actions = req.actions;
+        if !pool_id.is_empty() {
+            // Private tiers stop receiving updates in pool mode. Drop their old
+            // snapshots so detaching later cannot resurrect stale residency.
+            for tier in [TierType::TierDram, TierType::TierSsd] {
+                actions.push(ExternalKvAction {
+                    r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
+                    tier: tier as i32,
+                    ..Default::default()
+                });
+            }
+        }
+
         // Address and spec are snapshots carried on every batch. Empty address
         // makes the worker unroutable; absent spec returns it to legacy mode.
         {
@@ -168,7 +181,7 @@ impl InMemoryKvIndexerBackend {
         // Only a fast-path worker identity change requires a full recompute.
         // REPORT, REVOKE, and CLEAR enqueue their affected hashes directly.
         let mut recompute_from_graph_roots = false;
-        for action in req.actions {
+        for action in actions {
             match ExternalKvActionType::try_from(action.r#type) {
                 Ok(ExternalKvActionType::ActionReport) => {
                     let has_masks = !action.component_masks.is_empty();
