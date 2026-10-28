@@ -96,6 +96,7 @@ mod tests {
             server_args,
             chat_formatter: None,
             generate_hook: None,
+            openai_chat: None,
         });
         routes().with_state(state)
     }

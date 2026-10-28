@@ -20,6 +20,7 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import random
@@ -52,6 +53,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -100,11 +102,13 @@ from sglang.srt.mem_cache.common import (
     RetractionBackup,
     discard_kv_cache_backup,
     dsv4_needs_rebootstrap,
+    finish_restore_kv_cache,
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
     release_kv_cache,
     restore_kv_cache,
+    start_restore_kv_cache,
     suffix_page_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -469,15 +473,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         enable_kv_checksum = get_disagg().disaggregation_enable_kv_checksum
-        if enable_kv_checksum and get_disagg().disaggregation_decode_enable_radix_cache:
-            # The digest covers the whole prompt; with a decode-side prefix
-            # hit the prefill sends only the suffix, so every hit would look
-            # like corruption. No digest is the safe direction.
-            logger.warning(
-                "KV checksum disabled: not supported together with "
-                "--disaggregation-decode-enable-radix-cache."
-            )
-            enable_kv_checksum = False
         self.kv_checksum_signature = 0
         # Test-only mismatch injector. Its own generator, seeded per rank: the
         # global `random` is seeded identically on every TP rank, so drawing
@@ -1700,6 +1695,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 device_page_size = self.token_to_kv_pool.page_size
                 return kv_to_page_indices(kv_indices_full, device_page_size)
 
+            def _minimax_payload():
+                return minimax_index_transfer_pages(
+                    self.req_to_token_pool.req_to_token[
+                        decode_req.req.kv.req_pool_idx, :seq_len
+                    ],
+                    page_size=self.token_to_kv_pool.page_size,
+                    prefix_len=total_prefix_len,
+                )
+
             def _dsa_pages_payload():
                 # Mirror of prefill _dsa_pages_payload: the cached prefix keeps
                 # its own indexer rows, and rows still being restored by
@@ -1757,7 +1761,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
-                StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
+                StateType.MINIMAX_INDEX_K: _minimax_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
@@ -2751,6 +2755,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     : decode_req.req.logprob.top_logprobs_num
                 ].tolist()
             )
+            if decode_req.req.logprob.token_ids_logprob is not None:
+                # Prefill omits these scores; reserve a row for the streaming offset.
+                decode_req.req.logprob.output_token_ids_logprobs_val.append([])
+                decode_req.req.logprob.output_token_ids_logprobs_idx.append([])
         if decode_req.req.return_sampling_mask and not replayed_boundary:
             assert output_token_sampling_mask_idx is not None, (
                 "sampling mask buffer disabled on decode side"
@@ -3304,8 +3312,16 @@ class SchedulerDisaggregationDecodeMixin:
             # no longer describes it.
             req.expected_kv_checksum = 0
             seq_len = len(req.origin_input_ids)
-            page_indices_gpu = page_indices_for_request(self, req, seq_len)
-            state_indices = state_indices_for_request(self, req, seq_len)
+            # The tree cache owns [0, cache_protected_len): the prefix this
+            # decode promised at bootstrap, so prefill sent and digested only
+            # what follows it.
+            start_idx = req.kv.cache_protected_len
+            page_indices_gpu = page_indices_for_request(
+                self, req, seq_len, start_idx=start_idx
+            )
+            state_indices = state_indices_for_request(
+                self, req, seq_len, start_idx=start_idx
+            )
             actual = computer.compute(page_indices_gpu, state_indices)
             if (
                 mismatch_prob > 0
@@ -3374,6 +3390,12 @@ class SchedulerDisaggregationDecodeMixin:
         if self.enable_priority_scheduling:
             self.policy.calc_priority(self.waiting_queue, running_batch)
 
+        host_restore = get_disagg().disaggregation_decode_host_receive_threshold < 1
+        restores_ready = set()
+        if host_restore:
+            self._start_host_restores()
+            restores_ready = self._host_restores_ready()
+
         curr_batch_size = running_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
@@ -3384,11 +3406,17 @@ class SchedulerDisaggregationDecodeMixin:
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
-        for i in range(len(self.waiting_queue)):
-            req = self.waiting_queue[i]
-            # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+        for req in self.waiting_queue:
+            # we can only add at least `num_not_used_batch` new batch to the running queue;
+            # a request restored from host memory waits until its copy has finished
+            if len(can_run_list) < num_not_used_batch and (
+                not host_restore
+                or req.kv.restore_done_event is None
+                or id(req) in restores_ready
+            ):
                 can_run_list.append(req)
+                if req.kv.restore_done_event is not None:
+                    finish_restore_kv_cache(req, self.tree_cache)
                 # `pop_preallocated` matched and locked new requests; a retracted or
                 # rebootstrapped one owns its row, and a re-match here takes no lock.
                 if get_disagg().disaggregation_decode_enable_radix_cache:
@@ -3429,17 +3457,78 @@ class SchedulerDisaggregationDecodeMixin:
             # A finished request can still have one redundant forward in flight.
             # Drain it before a prebuilt request seeds a potentially reused row.
             self.schedule_stream.wait_stream(self.forward_stream)
-        if get_disagg().disaggregation_decode_host_receive_threshold < 1:
-            for req in new_batch.reqs:
-                if req.kv.retraction_backup is not None:
-                    restore_kv_cache(
-                        req,
-                        self.tree_cache,
-                        self.req_to_token_pool,
-                        self.token_to_kv_pool_allocator,
-                        "host_pool",
-                    )
         return new_batch
+
+    def _start_host_restores(self: Scheduler) -> None:
+        """Start the host-to-device copy of every waiting request received into
+        host memory. A request joins a batch only once its copy has finished on
+        every rank that shares it (`_host_restores_ready`), so the scheduler does
+        not wait for a copy on the host; under PP, admission waits for it there."""
+        reqs = [
+            req for req in self.waiting_queue if req.kv.retraction_backup is not None
+        ]
+        if not reqs:
+            return
+        engine = self.tree_cache.cache_controller.l2_transfer_engine
+        # With the kernel backend, the copies and their index kernels run on the
+        # stream the forwards run on: after the in-flight forward (a copy may
+        # write a reused row) and before this iteration's forward, never beside
+        # one. The direct backend reads the device indices on the host while
+        # preparing a copy, which there would wait for the in-flight forward, so
+        # its copies stay on the transfer engine's streams.
+        on_forward = get_memory().hicache_io_backend == "kernel"
+        # As in run_batch: without overlap or PP, forwards run on the schedule
+        # stream.
+        forward_stream = (
+            self.forward_stream
+            if self.enable_overlap or get_parallel().pp_size > 1
+            else self.schedule_stream
+        )
+        if on_forward:
+            # They read rows allocated on the schedule stream.
+            forward_stream.wait_stream(self.schedule_stream)
+        elif self.enable_overlap:
+            # A finished request can still have one redundant forward in flight,
+            # and a copy may write a reused row: order the copies after it. Fence
+            # only the copy stream, as HiCache loads do: index preparation must
+            # not wait for the forward (the direct backend reads it on the host).
+            engine.host_to_device_stream.wait_stream(self.forward_stream)
+        with contextlib.ExitStack() as placement:
+            if on_forward:
+                placement.enter_context(torch.cuda.stream(forward_stream))
+                placement.enter_context(engine.on_current_stream())
+            for req in reqs:
+                start_restore_kv_cache(req, self.tree_cache)
+
+    def _host_restores_ready(self: Scheduler) -> set[int]:
+        """Ids of the waiting requests whose restore copy has finished on every
+        rank that shares them. Each rank admits requests on its own and all must
+        admit the same ones, so a copy that has finished on only some ranks keeps
+        the request waiting on all of them: the attention-TP ranks, then the
+        attention-CP ranks, agree through a MIN all-reduce.
+
+        PP stages cannot agree here: a stage selects a microbatch's batch before
+        the next stage starts that microbatch, so a collective would deadlock.
+        Under PP every pending restore counts as ready, and admission
+        (`finish_restore_kv_cache`) waits for the copy on the host, as the
+        synchronous restore did, so every stage admits the same requests."""
+        pending = [
+            req for req in self.waiting_queue if req.kv.restore_done_event is not None
+        ]
+        if not pending:
+            return set()
+        if get_parallel().pp_size > 1:
+            return {id(req) for req in pending}
+        ready = torch.tensor(
+            [int(req.kv.restore_done_event.query()) for req in pending],
+            dtype=torch.int32,
+        )
+        for group in (self.attn_tp_cpu_group, self.attn_cp_cpu_group):
+            if group is not None and torch.distributed.get_world_size(group) > 1:
+                torch.distributed.all_reduce(
+                    ready, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+        return {id(req) for req, done in zip(pending, ready.tolist()) if done}
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
