@@ -838,7 +838,8 @@ class FlashInferAttnBackend(AttentionBackend):
             in_capture
             and forward_mode.is_target_verify()
             and spec_info is not None
-            and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+            and spec_info.spec_input_type
+            in (SpecInputType.DFLASH_VERIFY, SpecInputType.CLOVER_VERIFY)
             and getattr(spec_info, "custom_mask", None) is None
             and self.prefill_backend == "fa2"
             # Host-rebuilt layout only matches full attention (single wrapper);

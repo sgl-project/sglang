@@ -45,6 +45,7 @@ class SpeculativeAlgorithm(Enum):
     STANDALONE = auto()
     NGRAM = auto()
     NONE = auto()
+    CLOVER = auto()
 
     @classmethod
     def from_string(
@@ -114,6 +115,9 @@ class SpeculativeAlgorithm(Enum):
     def is_frozen_kv_mtp(self) -> bool:
         return self == SpeculativeAlgorithm.FROZEN_KV_MTP
 
+    def is_clover(self) -> bool:
+        return self == SpeculativeAlgorithm.CLOVER
+
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
@@ -171,10 +175,12 @@ class SpeculativeAlgorithm(Enum):
         return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
 
     def has_draft_kv(self) -> bool:
-        """Whether the draft phase writes KV chains. NGRAM does not (its tree
-        lives only in the verify mask), so per-decode KV sizing needs no
-        per-topk page rounding; see get_alloc_len_per_decode."""
-        return not self.is_ngram()
+        """Whether drafts need separate KV chains and per-topk page rounding.
+
+        NGRAM has no draft KV; CLOVER previews reuse the target verify window.
+        See get_alloc_len_per_decode.
+        """
+        return not (self.is_ngram() or self.is_clover())
 
     def carries_draft_hidden_states(self) -> bool:
         """Whether the disagg prefill->decode transfer carries draft hidden
@@ -251,7 +257,11 @@ class SpeculativeAlgorithm(Enum):
 
         read_ragged_verify_mode()
 
-        if self.is_dflash():
+        if self.is_clover():
+            from sglang.srt.speculative.clover_config import configure_clover
+
+            configure_clover(server_args)
+        elif self.is_dflash():
             _handle_dflash(server_args)
         elif self.is_uno():
             _handle_uno(server_args)
@@ -307,6 +317,11 @@ class SpeculativeAlgorithm(Enum):
         assert not self.is_none(), (
             "Cannot create worker for NONE speculative algorithm."
         )
+
+        if self.is_clover():
+            from sglang.srt.speculative.clover_worker import CloverWorker
+
+            return CloverWorker
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -379,6 +394,8 @@ class SpecInputType(IntEnum):
     # every stage rebuilds its verify input from. Neither a draft nor a verify
     # input -- no forward ever runs on it.
     PP_SPEC_RELAY = auto()
+    CLOVER_DRAFT = auto()
+    CLOVER_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -420,6 +437,7 @@ class SpecInput(ABC):
     # their own draft / verify SpecInput subclasses).
     def is_draft_input(self) -> bool:
         return self.spec_input_type in {
+            SpecInputType.CLOVER_DRAFT,
             SpecInputType.EAGLE_DRAFT,
             SpecInputType.EAGLE_DRAFT_EXTEND,
             SpecInputType.FROZEN_KV_MTP_DRAFT,
@@ -429,6 +447,7 @@ class SpecInput(ABC):
 
     def is_verify_input(self) -> bool:
         return self.spec_input_type in {
+            SpecInputType.CLOVER_VERIFY,
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.FROZEN_KV_MTP_VERIFY,
             SpecInputType.DFLASH_VERIFY,
@@ -478,7 +497,13 @@ def create_dummy_verify_input(
     spec = get_spec_config()
 
     spec_info = None
-    if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
+    if spec_algorithm.is_clover():
+        from sglang.srt.speculative.clover_info import CloverVerifyInput
+
+        spec_info = CloverVerifyInput(
+            draft_token=None, positions=None, draft_token_num=num_tokens_per_req
+        )
+    elif spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
         if is_draft_worker:

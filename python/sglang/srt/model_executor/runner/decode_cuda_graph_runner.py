@@ -489,17 +489,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Captures the per-replay attention-metadata prep into a small CUDA
         # graph; see metadata_glue_graph.py for the correctness contract.
-        # Force-off for DFlash-family spec: verify installs host-fed fast
-        # plans (sync-free begin_forward that recomputes plan inputs on the
+        # Force-off for DFlash-family and Clover spec: verify installs host-fed
+        # fast plans (sync-free begin_forward that recomputes plan inputs on the
         # host every replay), and capturing one freezes the capture-time
         # plan — drafts go stale and accept length collapses to ~1.
         enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
-        if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
+        if enable_metadata_glue and (
+            model_runner.spec_algorithm.is_dflash_family()
+            or model_runner.spec_algorithm.is_clover()
+        ):
             logger.warning(
                 "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
-                "DFlash-family speculative decoding (host-fed fast verify "
-                "plans must re-run on the host every replay); disabling the "
-                "metadata glue graph."
+                "DFlash-family and Clover speculative decoding (host-fed fast "
+                "verify plans must re-run on the host every replay); disabling "
+                "the metadata glue graph."
             )
             enable_metadata_glue = False
         self._metadata_glue = (
@@ -1741,6 +1744,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     else CaptureHiddenMode.FULL
                 ),
                 ragged_verify_layout=self._capture_ragged_verify_layout(num_tokens),
+            )
+
+        elif self.model_runner.spec_algorithm.is_clover():
+            from sglang.srt.speculative.clover_info import CloverVerifyInput
+
+            spec_info = CloverVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=self.captured_req_width,
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():

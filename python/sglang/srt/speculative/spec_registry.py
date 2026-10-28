@@ -78,6 +78,9 @@ class CustomSpecAlgo:
     def is_frozen_kv_mtp(self) -> bool:
         return False
 
+    def is_clover(self) -> bool:
+        return False
+
     def is_dflash(self) -> bool:
         return False
 

@@ -30,8 +30,19 @@ class Spec(msgspec.Struct):
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO, CLOVER. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
+    speculative_clover_accept_rule: A[
+        Literal["threshold", "exact"],
+        "Clover draft acceptance: probability threshold or exact verify argmax match. "
+        "Neither rule provides distribution-preserving stochastic acceptance.",
+    ] = "threshold"
+    speculative_clover_accept_ratio: A[
+        float, "Clover acceptance probability ceiling. (Optional)"
+    ] = 1.0
+    speculative_clover_accept_delta: A[
+        float, "Clover entropy-scaled acceptance factor."
+    ] = 0.6
     uno_lora_path: A[Optional[str], "Path to the UNO draft LoRA checkpoint."] = None
     speculative_draft_model_path: A[
         Optional[str],
