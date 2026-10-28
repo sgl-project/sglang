@@ -840,8 +840,11 @@ class DisaggPrefill:
         if self.enable_staging:
             # Decode allocates its staging while this forward runs.
             self.maybe_prefetch_staging_for_batch(batch)
+        # A load-back submitted in this build may still be writing pages that a
+        # later request matched as device prefix; don't early-send them.
+        load_pending = batch.hicache_consumer_index >= 0
         for req in batch.reqs:
-            self.maybe_send_cached_prefix_chunk(req)
+            self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
 
     def on_launch(self, reqs: List[Req]) -> None:
         """The launched requests prefill until their commit hands the KV over."""
@@ -1271,7 +1274,7 @@ class DisaggPrefill:
             self.send_kv_chunk(req)
         return chunked_req, waiting
 
-    def maybe_send_cached_prefix_chunk(self, req: Req) -> None:
+    def maybe_send_cached_prefix_chunk(self, req: Req, allow_send: bool) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 
@@ -1283,7 +1286,9 @@ class DisaggPrefill:
                 0, req.prefix_len - req.host_hit_length
             )
 
-        if req.disagg.pending_bootstrap:
+        # allow_send=False: a HiCache load-back from this build may still be writing
+        # pages matched as device prefix; the post-forward send covers them.
+        if req.disagg.pending_bootstrap or not allow_send:
             return
 
         # Device-resident prefix only; page-aligned so start_send_idx stays exact.
