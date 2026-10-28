@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import torch
 
-from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
+from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import (
     fused_kda_conv_gating_verify,
 )
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
