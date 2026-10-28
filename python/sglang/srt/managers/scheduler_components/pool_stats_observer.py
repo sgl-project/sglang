@@ -239,7 +239,7 @@ class SchedulerPoolStatsObserver:
             full_token_usage=token_usage,
             full_available_size=available_size,
             full_evictable_size=evictable_size,
-            full_capacity=self.max_total_num_tokens,
+            full_capacity=self.capacity.widened_max_total_num_tokens,
         )
 
     def _get_hisparse_token_info(self, pool_stats: PoolStats) -> PoolStats:
