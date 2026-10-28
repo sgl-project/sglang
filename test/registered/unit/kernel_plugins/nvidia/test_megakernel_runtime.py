@@ -17,9 +17,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fakes import ANY_TP, ARCH, ISA, SPEC, Lm, batch, server_args  # noqa: E402
+from _fakes import ANY_TP, ARCH, DRAFT, ISA, SPEC, Lm, batch, server_args  # noqa: E402
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+
+
+class OtherBinding:
+    def __init__(self, *, model):
+        self.model = model
 
 
 def install(
@@ -107,6 +112,88 @@ class TestMegakernelRuntime(CustomTestCase):
         lm = install(archs=["Draft"], is_draft=True)
         self.assertNotIn("forward", lm.__dict__)
         self.assertIs(binding.megakernel_draft_sampler(lm), print)
+
+    def test_each_architecture_gets_its_registered_binding(self):
+        with patch.dict(binding._BINDINGS, {ARCH: OtherBinding}):
+            lm = install(tokens=1)
+        self.assertIsInstance(lm.context.binding, OtherBinding)
+        self.assertIs(lm.context.binding.model, lm)
+
+    def test_offered_entries_reach_sglang_only_when_every_rank_offers_them(self):
+        registry.register(architecture="EagleDraft", path="_fakes:EAGLE_DRAFT")
+        lm = install(archs=["EagleDraft"], is_draft=True)
+        self.assertIs(binding.megakernel_entry(lm, "draft_loop"), print)
+        self.assertIsNone(binding.megakernel_entry(lm, "draft_extend"))
+        self.assertIsNone(binding.megakernel_entry(Lm(), "draft_loop"))
+
+        def fewer_entries_on_rank_1(value, group=None):
+            entries = value == ("draft_loop", "begin_draft_round")
+            return [value, value[:1]] if entries else [value]
+
+        with self.assertRaisesRegex(RuntimeError, "entries fake offers differ"):
+            install(
+                archs=["EagleDraft"], is_draft=True, gathered=fewer_entries_on_rank_1
+            )
+
+    def test_graph_variants_reach_a_runner_only_when_every_rank_offers_the_same(self):
+        """A runner captures one graph per label of the variants offered it, so ranks
+        offering other runners or labels would wait in different collectives."""
+        labels = SimpleNamespace(capture_labels=("short", "long"))
+
+        def offering(graph_variants):
+            return replace(
+                DRAFT,
+                build=lambda model, hf, ctx: SimpleNamespace(
+                    widths=(),
+                    draft_sampler=None,
+                    draft_loop=None,
+                    draft_extend=None,
+                    begin_draft_round=None,
+                    graph_variants=graph_variants,
+                ),
+            )
+
+        lm = self._install_spec(offering({"draft_loop": labels}))
+        served = binding.megakernel_graph_variants(lm, "draft_loop", batch_sizes={1})
+        self.assertIs(served, labels)
+        # one graph per batch size: another runner, no batch size the megakernel
+        # serves, a built object offering none, no megakernel
+        for model, runner, sizes in (
+            (lm, "draft_extend", {1}),
+            (lm, "draft_loop", frozenset()),
+            (self._install_spec(offering(None)), "draft_loop", {1}),
+            (Lm(), "target_verify", {1}),
+        ):
+            with self.subTest(runner=runner, sizes=sizes):
+                self.assertIsNone(
+                    binding.megakernel_graph_variants(model, runner, batch_sizes=sizes)
+                )
+
+        def fewer_labels_on_rank_1(value, group=None):
+            offered = value == [("draft_loop", ("short", "long"))]
+            return [value, [("draft_loop", ("short",))]] if offered else [value]
+
+        with self.assertRaisesRegex(RuntimeError, "graph variants fake offers differ"):
+            self._install_spec(
+                offering({"draft_loop": labels}), gathered=fewer_labels_on_rank_1
+            )
+        with self.assertRaisesRegex(ValueError, "graph_variants names 'verify'"):
+            self._install_spec(offering({"verify": labels}))
+
+    def test_the_verify_graphs_capture_the_variants_where_the_megakernel_runs(self):
+        """A target's verify step runs the megakernel only at the rows it built, so
+        the batch sizes that capture its variants are those rows over the width."""
+        labels = SimpleNamespace(capture_labels=("short", "long"))
+        lm = Lm()
+        lm.__dict__["_megakernel"] = SimpleNamespace(
+            widths=(7, 14), graph_variants={"target_verify": labels}
+        )
+        self.assertEqual(
+            binding.megakernel_verify_variants(
+                lm, capture_bs=[1, 2, 4, 8], tokens_per_request=7
+            ),
+            (labels, frozenset({1, 2})),
+        )
 
     def test_ranks_that_disagree_are_refused_on_every_rank(self):
         """A rank that differs would wait in a different collective."""

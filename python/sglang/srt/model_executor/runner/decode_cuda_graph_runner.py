@@ -42,6 +42,7 @@ from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_co
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import megakernel_verify_variants
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
@@ -217,8 +218,8 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
-        kv_loc_plan=forward_batch.kv_loc_plan,
-        kv_loc_cols=forward_batch.kv_loc_cols,
+        iteration_ids=forward_batch.iteration_ids,
+        iteration_cols=forward_batch.iteration_cols,
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         max_seq_len_override=forward_batch.max_seq_len_override,
@@ -256,10 +257,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    _restage_skip = False
+    _staged_inputs = None
     _draft_glue_logged = 0
 
     dllm_input_preparation = None
     dllm_attention = None
+    # The attention variants, captured at attention_variant_sizes (None: every batch
+    # size); class defaults, since runners built without __init__ set neither
+    attention_graph_variants: Optional[AttentionGraphVariants] = None
+    attention_variant_sizes: Optional[frozenset[int]] = None
     # Set in __init__: which DSpark runner's prep the glue graph serves past the guard.
     _draft_metadata_glue = False
     _target_metadata_glue = False
@@ -393,6 +400,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
+        # a target megakernel's verify variants, unless SGLang captures its own
+        if (
+            self.attention_graph_variants is None
+            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and not model_runner.is_draft_worker
+        ):
+            self.attention_graph_variants, self.attention_variant_sizes = (
+                megakernel_verify_variants(
+                    model_runner.model,
+                    capture_bs=self.capture_bs,
+                    tokens_per_request=self.captured_req_width,
+                )
+            )
 
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
@@ -557,6 +577,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._metadata_glue = (
             MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
+        # SGLANG_Q35MF_MKH_N3B: a pre-planned replay skips copying input_ids and
+        # positions again when the full load_batch copied them (_restage_is_redundant)
+        self._restage_skip = envs.SGLANG_Q35MF_MKH_N3B.get()
+        self._staged_inputs: Optional[tuple] = None
         # The DSpark draft runner's prep has no host-fed plan, so the guard above does
         # not apply where its backend says so.
         self._draft_metadata_glue = (
@@ -571,7 +595,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._draft_glue_logged = 0
         self._skips_prefilled_inputs = self._resolve_skips_prefilled_inputs()
         if self._draft_metadata_glue or self._target_metadata_glue:
-            self._metadata_glue = MetadataGlueGraph(self.device)
+            # The backend declared its prep capturable: in CI a failed capture fails.
+            self._metadata_glue = MetadataGlueGraph(
+                self.device, strict=envs.SGLANG_IS_IN_CI.get()
+            )
         self._skip_glued_replay_view = envs.SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW.get()
         # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: the verify's inputs and metadata glue
         # graph run on a side stream beside the draft graph (stage_verify_metadata_early).
@@ -747,10 +774,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _resolve_attention_variant(
         self, forward_batch: ForwardBatch, capture_batch_size: int
     ) -> Optional[str]:
-        variants = self.attention_graph_variants
-        if variants is None:
+        if not self._attention_varies_at(capture_batch_size):
             return None
-        return variants.select(forward_batch)
+        return self.attention_graph_variants.select(forward_batch)
+
+    def _attention_varies_at(self, bs: int) -> bool:
+        sizes = self.attention_variant_sizes
+        return self.attention_graph_variants is not None and (
+            sizes is None or bs in sizes
+        )
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not self.record_nolora_graph:
@@ -1233,7 +1265,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
-        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
+        self.model_runner.runner_ids.bind_runner_slots(forward_batch)
 
         # Trip the coordinator so the hisparse code path is captured into the
         # graph; backends read it from self.model_runner.hisparse_coordinator.
@@ -1328,10 +1360,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else reversed(self.capture_bs)
         )
         lora_variants = ("lora", "nolora") if self.record_nolora_graph else (None,)
-        variants = self.attention_graph_variants
         for bs in capture_range:
             attention_variants = (
-                variants.capture_labels if variants is not None else (None,)
+                self.attention_graph_variants.capture_labels
+                if self._attention_varies_at(bs)
+                else (None,)
             )
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1647,6 +1680,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_tensors=pp_proxy_tensors,
             skip_slots=STAGED_SLOTS if early_staged else frozenset(),
         )
+        if self._restage_skip and not early_staged:
+            self._staged_inputs = self._staged_signature(forward_batch)
         if self._skips_prefilled_inputs:
             self._prefilled_inputs = (forward_batch.input_ids, forward_batch.positions)
 
@@ -1708,6 +1743,34 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, attention_variant
+        )
+
+    def _staged_signature(self, forward_batch: ForwardBatch) -> Optional[tuple]:
+        input_ids, positions = forward_batch.input_ids, forward_batch.positions
+        # inference tensors (SGLANG_ENABLE_TORCH_INFERENCE_MODE) keep no version
+        if (
+            input_ids is None
+            or positions is None
+            or input_ids.is_inference()
+            or positions.is_inference()
+        ):
+            return None
+        # PyTorch bumps a tensor's version on every in-place write it makes
+        versions = (input_ids._version, positions._version)
+        return input_ids, positions, versions, self.device_module.current_stream()
+
+    def _restage_is_redundant(
+        self, staged: Optional[tuple], forward_batch: ForwardBatch
+    ) -> bool:
+        # a load on another stream, such as the plan stream, is never trusted
+        if staged is None:
+            return False
+        now = self._staged_signature(forward_batch)
+        return (
+            now is not None
+            and staged[0] is now[0]
+            and staged[1] is now[1]
+            and staged[2:] == now[2:]
         )
 
     def _glues_draft_metadata(self) -> bool:
@@ -1908,6 +1971,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _copy_replay_inputs(self, forward_batch: ForwardBatch) -> None:
         prefilled = self._prefilled_inputs
         self._prefilled_inputs = None
+        staged = None
+        if self._restage_skip:
+            staged, self._staged_inputs = self._staged_inputs, None
+        if self._restage_is_redundant(staged, forward_batch):
+            return
         # The plan-time load (or the early stage it took) filled these from the very
         # same tensors.
         if prefilled is None or forward_batch.input_ids is not prefilled[0]:
@@ -1993,12 +2061,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
-                    "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
+                    "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d "
+                    "attention=%s%s",
                     "draft" if self.model_runner.is_draft_worker else "target",
                     self._replay_graph_key.size,
                     "num_tokens" if self.ragged_verify_mode else "bs",
                     forward_batch.forward_mode.name,
                     forward_batch.batch_size,
+                    self._replay_graph_key.attention_variant,
                     (
                         f" slots={self._ragged_capture_slots(self._replay_graph_key.size)}"
                         if self.ragged_verify_mode
@@ -2042,6 +2112,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
+                    else None
+                ),
+                last_hidden_states=(
+                    output.last_hidden_states[: self.raw_num_token]
+                    if output.last_hidden_states is not None
                     else None
                 ),
             )
