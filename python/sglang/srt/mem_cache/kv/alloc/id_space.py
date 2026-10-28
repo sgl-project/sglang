@@ -190,9 +190,7 @@ class UnitIds:
         out: Optional[torch.Tensor] = None,
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
-        """One launch for the read and write conversions alike; see
-        `translate_token_ids`, which owns the `out=` dtype and shape contract
-        for both."""
+        """Share ``translate_token_ids``'s output dtype and shape contract."""
         return translate_token_ids(
             loc=loc,
             v2p=self.virtual_to_physical,

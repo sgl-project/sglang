@@ -88,8 +88,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        # The state sub-pool's storage and each state layer's index in it, as
-        # the KV pool's router binds them.
+        # State views and local layer indices come from the same router binding.
         router = self.token_to_kv_pool.layer_router
         self.state_pool = router.part_view(STATE_PART)
         self.state_layer_indices = router.part_indices(STATE_PART)

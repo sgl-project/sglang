@@ -27,11 +27,10 @@ logger = logging.getLogger(__name__)
 
 
 class UnifiedMambaSlotAllocator:
-    """Mamba slot allocator (PHYSICAL view) for the unified memory pool.
+    """Expose unified state slots through the ``MambaSlotAllocator`` interface.
 
-    Owns slot alloc/free, sizing, and the v<->p mapping (``translate``), presenting the
-    upstream ``MambaSlotAllocator`` interface. ``alloc()`` returns VIRTUAL ids and does
-    NOT clear state — clearing is deferred to ``StateView.clear_slots``.
+    ``alloc()`` returns virtual ids; ``translate()`` maps them to physical slots.
+    ``StateView.clear_slots`` owns clearing, not allocation.
     """
 
     def __init__(

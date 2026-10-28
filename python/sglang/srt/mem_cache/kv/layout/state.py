@@ -43,7 +43,7 @@ class MambaSubPoolSpec(SubPoolSpec):
 
         [ conv[0] x L | ... | temporal x L | draft conv[0] x Ld | ... | pad ]
 
-    Unfused, the entry keeps its raw (unaligned) size, byte-identical to before.
+    Unfused entries keep their raw, unaligned size.
     """
 
     conv_state_shapes: Tuple[Tuple[int, ...], ...]  # one shape per conv tensor

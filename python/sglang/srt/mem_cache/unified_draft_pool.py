@@ -147,17 +147,13 @@ def bind_fused_draft(
 
 
 def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBinding:
-    """This runner's attention layers, in layer order, over its lanes in the
-    dense hosts. The placement sized the lanes from the draft config; the
-    model's real layer ids fill them, so a count mismatch is a loud boot
-    failure, never a silent alias. Window layers follow the placement: they
-    bind the host that serves window layers when it holds lanes for this
-    runner, else the full one, where a full lifetime covers any window.
+    """Bind draft model layer ids to the lanes sized from its configuration.
 
-    A runner whose layers all live in the owner sub-pool reads that sub-pool's
-    view directly; any other runner routes each layer to its host's view, as
-    the target's pool does, so the attention backends read a window layer
-    through the window sub-pool's ids."""
+    Reject count mismatches to prevent aliasing. Window layers use their host's
+    lanes when present, otherwise full storage whose lifetime covers the window.
+    Owner-only drafts use that view directly; other drafts route each layer to
+    its host view and id space.
+    """
     hosts = ctx.hosts_of("dense")
     kv_layer_ids = draft_kv_layer_ids(ctx.model)
     if len(hosts) == 1:

@@ -58,8 +58,7 @@ class UnifiedBuildContext(msgspec.Struct, frozen=True, kw_only=True):
     forward_stream: Optional[Any] = None  # torch.cuda.Stream
     post_capture_active: bool = False
     is_draft_worker: bool = False
-    # The model's per-rank KV head count and head dim, recorded on the
-    # full+state facade even when its full side is an MLA latent.
+    # Per-rank model KV geometry, including when the owner stores MLA latents.
     head_num: Optional[int] = None
     head_dim: Optional[int] = None
     # The request table (every plan) and the state storage (a plan with state).
@@ -181,10 +180,7 @@ def build_kv_storage(
     sizing: KVSizingInputs,
     ctx: UnifiedBuildContext,
 ) -> KVStorage:
-    """The plan's KV storage: one arena for its sub-pools, a view per token
-    sub-pool, the routed KV cache over them, the chain allocator handing out
-    their ids and the request table holding them. A plan with state also gets
-    its state storage."""
+    """Construct the arena, views, allocator and request storage for ``plan``."""
     assert not ctx.is_draft_worker, (
         "a draft worker binds views over the target's buffer instead of "
         "building one of its own"
@@ -215,9 +211,8 @@ def build_kv_storage(
     )
     token_sub_pools = [s for s in plan.owner_first() if s is not state]
     views = {s.name: _build_token_view(s, arena, plan, ctx) for s in token_sub_pools}
-    # Today's token capacity of the pool: the owner's configured cap where
-    # the owner is the only token sub-pool, else its slots (until sizing
-    # follows one rule for every chain).
+    # Without a window, capacity uses the configured cap;
+    # window chains use the owner's current arena slots.
     kv_size = (
         sizing.full_tokens if window is None else arena.num_entries(owner.name) - 1
     )

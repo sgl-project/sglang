@@ -1,11 +1,8 @@
-"""Today's capacity policy of each unified chain shape, kept as data.
+"""Capacity policies selected from unified chain geometry.
 
-`ChainAllocator` owns the bands and every lifecycle fan-out; what still
-differs between the chains it serves (joint pricing, admission hooks, reclaim
-and the per-side capacity views) lives here, one policy per chain shape, chosen
-from the band geometry alone. Each policy reproduces the decisions of the
-allocator that served that shape before, so a replaced chain keeps its
-admission, reclaim and compaction outcomes.
+`ChainAllocator` owns the bands and lifecycle operations. Each policy supplies
+joint pricing, admission hooks, reclaim and per-side capacity views for one
+chain shape.
 """
 
 from __future__ import annotations

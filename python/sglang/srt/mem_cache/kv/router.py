@@ -31,9 +31,8 @@ class PartRoute(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
-    """One layer's storage: its route, its view, and the reads and writes an
-    attention backend makes on it. Reads come from `KVLayerRouter.read`, which
-    waits for a layer-wise load-back; writes from `KVLayerRouter.layer`."""
+    """Reads use ``KVLayerRouter.read`` to wait for layer-wise load-back;
+    writes use ``KVLayerRouter.layer`` without waiting."""
 
     route: PartRoute
     view: Any  # a type from kv.memory.views for the layouts that have one
@@ -301,9 +300,8 @@ class KVLayerRouter:
 
 
 class PlainPoolRouter(KVLayerRouter):
-    """A plain pool's router: one sub-pool whose view is the pool itself, which
-    takes model layer ids and does its own ``start_layer`` arithmetic. Routes
-    are built on first use, so the router needs no layer count."""
+    """Lazily route model layer ids without requiring a layer count;
+    the pool applies its own ``start_layer`` offset."""
 
     def __init__(self, pool, name: str):
         super().__init__(pool, sub_pools=(), views={name: pool}, layers={})

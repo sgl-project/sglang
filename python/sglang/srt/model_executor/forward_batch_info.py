@@ -970,13 +970,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         iteration_ids: Optional[IterationIds] = None,
         write_cols: Optional[Cols] = None,
     ):
-        # init_new must not mutate the input ScheduleBatch; per-forward
-        # overrides go through explicit keyword arguments.
-        #
-        # `iteration_ids`: the iteration's plan when this forward is one of
-        # several over the same slots (a speculative iteration), `write_cols`
-        # the columns of its window this forward writes. Without one, this
-        # forward is its own iteration and builds the plan itself.
+        # init_new must not mutate ScheduleBatch; use explicit forward overrides.
+        # Speculative forwards share iteration_ids and select their write_cols;
+        # a standalone forward builds its own iteration plan.
 
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
