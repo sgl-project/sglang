@@ -38,19 +38,6 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             {"strategy_class": strategy_class},
         )
 
-    def __new__(cls, hf_config, processor, *, processor_config=None, **kwargs):
-        # mm_process_config["processor_class_attributes"] overrides the loader's class
-        # attributes (e.g. video_preprocessing_device) over the strategy's own.
-        overrides = _processor_class_attribute_overrides(processor_config)
-        if overrides:
-            cls = cls._with_class_attributes(tuple(sorted(overrides.items())))
-        return super().__new__(cls)
-
-    @classmethod
-    @functools.cache
-    def _with_class_attributes(cls, attributes):
-        return type(cls.__name__, (cls,), dict(attributes))
-
     def __init__(
         self,
         hf_config,
@@ -281,36 +268,3 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                 output["mrope_positions"] = mrope_positions
                 output["mrope_position_delta"] = mrope_position_delta
         return output if package_output is None else package_output(output)
-
-
-PROCESSOR_CLASS_ATTRIBUTES_KEY = "processor_class_attributes"
-# Loader attributes read from the class; __init__ sets the others per instance.
-OVERRIDABLE_PROCESSOR_CLASS_ATTRIBUTES = frozenset(
-    {
-        "auto_mm_io_worker_num",
-        "gpu_image_decode",
-        "smart_rgb_conversion",
-        "video_preprocessing_device",
-    }
-)
-
-
-def _processor_class_attribute_overrides(processor_config) -> dict:
-    """mm_process_config["processor_class_attributes"], checked against the allowed names."""
-    if processor_config is None:
-        return {}
-    overrides = processor_config.mm_process_config.get(
-        PROCESSOR_CLASS_ATTRIBUTES_KEY, {}
-    )
-    if not isinstance(overrides, dict):
-        raise TypeError(
-            f"mm_process_config['{PROCESSOR_CLASS_ATTRIBUTES_KEY}'] must be a dict, "
-            f"but got {type(overrides)}"
-        )
-    unknown = sorted(set(overrides) - OVERRIDABLE_PROCESSOR_CLASS_ATTRIBUTES)
-    if unknown:
-        raise ValueError(
-            f"mm_process_config['{PROCESSOR_CLASS_ATTRIBUTES_KEY}'] cannot set "
-            f"{unknown}; allowed: {sorted(OVERRIDABLE_PROCESSOR_CLASS_ATTRIBUTES)}"
-        )
-    return overrides
