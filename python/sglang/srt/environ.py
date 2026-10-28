@@ -1848,7 +1848,7 @@ class Envs:
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
-    SGLANG_OPT_DSV41_MHC_POST_COMBINE_DECODE = EnvBool(False)
+    SGLANG_OPT_DSV41_MHC_POST_COMBINE_DECODE = EnvBool(True)
     # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
