@@ -1344,9 +1344,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             storage_dir=storage_dir,
             prefetch_threshold=threshold,
         )
-        decode = SimpleNamespace(
-            scheduler=SimpleNamespace(enable_decode_hicache=True), tree_cache=cons
-        )
+        decode = SimpleNamespace(enable_decode_hicache=True, tree_cache=cons)
         for stored, promised in ((short_hit, 0), (long_hit, len(long_hit))):
             req = self._make_req(cons_rtp)
             req.origin_input_ids = array("q", stored + list(range(5000, 5016)))

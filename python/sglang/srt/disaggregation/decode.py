@@ -1650,7 +1650,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
-            if self.scheduler.enable_decode_hicache:
+            if self.enable_decode_hicache:
                 # Prefill is promised only the L3 span the prefetch took.
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
                 if prefix_match is not None:
@@ -1662,8 +1662,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len,
             )
             decode_req.prefix_match = prefix_match
-            if self.enable_decode_hicache:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
