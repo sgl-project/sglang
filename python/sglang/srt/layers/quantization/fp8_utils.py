@@ -764,12 +764,6 @@ def xpu_w8a16_block_fp8_linear_with_fallback(
 ) -> torch.Tensor:
     """Keep activations in bf16 on XPU: decode is weight-bandwidth bound and Xe2 GEMMs
     gain nothing from fp8 activations."""
-    # prepare_xpu_block_scale_for_scaled_mm keys its transpose-contiguous scale
-    # reorder on `linear_fn is torch_w8a8_block_fp8_linear`, so scales reaching
-    # this wrapper keep the standard k-contiguous layout the W8A16 kernels
-    # require. Fallbacks below pay a per-forward contiguous/copy in scaled_mm —
-    # acceptable for these rare configs; do NOT "fix" it by teaching the prep
-    # about this wrapper, the fused op asserts k-contiguous scales instead.
     if (
         input_scale is not None
         or input.dtype != torch.bfloat16
