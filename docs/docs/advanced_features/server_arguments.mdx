@@ -2451,6 +2451,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`cpu`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--engram-config`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Where the DeepSeek-V4.1 Engram tables live, as a JSON object; omitted keys keep their defaults. `placement`: `gpu` (default) or `cpu` (pinned host memory, leaving the HBM to the KV cache). `replication`: `none` (default; one table split across the TP group) or `per_node` (each node holds the whole table; needs `cpu` and one node). `lookup`, with `replication` `none`: `collective` (default) or `peer_read` (read rows from the owning GPU's shard; needs `gpu` and CUDA). Replaces the deprecated `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE`, `SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT` and `SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS`. See [Engram tables](./engram).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON object</td>
+    </tr>
   </tbody>
 </table>
 
