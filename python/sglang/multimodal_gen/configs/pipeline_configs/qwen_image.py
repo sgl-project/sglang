@@ -801,12 +801,17 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
             [noisy_img_complex, img_complex[noisy_img_seq_len:, :]], dim=0
         ).to(device=device)
 
+        # one tensor for both CFG branches, so the DiT's modulation cache hits
+        additional_t_cond = batch.extra.get("qwen_layered_t_cond")
+        if additional_t_cond is None:
+            additional_t_cond = torch.zeros(1, device=device, dtype=torch.long)
+            batch.extra["qwen_layered_t_cond"] = additional_t_cond
         cond_kwargs = {
             "txt_seq_lens": txt_seq_lens,
             "img_shapes": img_shapes,
             "freqs_cis": (img_cache, txt_cache),
             "freqs_complex": (img_complex, txt_complex),
-            "additional_t_cond": torch.tensor([0], device=device, dtype=torch.long),
+            "additional_t_cond": additional_t_cond,
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
         return cond_kwargs

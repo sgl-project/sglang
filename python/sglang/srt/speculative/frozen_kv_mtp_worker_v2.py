@@ -373,7 +373,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def _capture_cuda_graphs(self) -> None:
-        if cuda_graph_fully_disabled() or self.speculative_num_steps <= 1:
+        # Even a one-step frozen draft runs the assistant seed forward.
+        if cuda_graph_fully_disabled() or self.speculative_num_steps <= 0:
             return
         if self.target_worker.device != "cuda":
             logger.info(

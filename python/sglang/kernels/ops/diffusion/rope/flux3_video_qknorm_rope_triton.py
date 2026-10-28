@@ -13,7 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.diffusion.common.numerics import cuda_rsqrtf, round_bf16_to_fp32
+from sglang.kernels.numerics import cuda_rsqrtf, round_bf16_to_fp32
 from sglang.srt.utils.custom_op import register_custom_op
 
 

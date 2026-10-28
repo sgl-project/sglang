@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -22,6 +22,7 @@ use crate::message::request::{GenerateRequest, Request, RequestKind};
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::TokenIds;
+use crate::multi_modality::worker::{MediaError, MmProcessor};
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
 use crate::utils::error::Error;
@@ -108,6 +109,9 @@ struct CoreInner {
     startup_ready: AtomicBool,
     is_disaggregation: bool,
     mm_limits: Vec<(String, usize)>,
+    /// The MM pool's processor, whose media hooks admission runs; set once
+    /// when the pool starts (after the listeners are up).
+    mm_processor: OnceLock<Arc<dyn MmProcessor>>,
     metadata: CoreMetadata,
     generations: Generations,
 }
@@ -127,10 +131,17 @@ impl CoreHandle {
                 startup_ready: AtomicBool::new(config.startup_ready),
                 is_disaggregation: config.is_disaggregation,
                 mm_limits: config.mm_limits,
+                mm_processor: OnceLock::new(),
                 metadata: config.metadata,
                 generations: Generations::default(),
             }),
         }
+    }
+
+    /// Run `processor`'s media hooks during admission. The first processor
+    /// installed wins; `false` if one already was.
+    pub(crate) fn set_mm_processor(&self, processor: Arc<dyn MmProcessor>) -> bool {
+        self.inner.mm_processor.set(processor).is_ok()
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -242,9 +253,16 @@ impl CoreHandle {
     }
 
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
-        prefetch::prefetch_all(requests, &self.inner.mm_limits)
-            .await
-            .map_err(CoreError::InvalidArgument)
+        prefetch::prefetch_all(
+            requests,
+            &self.inner.mm_limits,
+            self.inner.mm_processor.get(),
+        )
+        .await
+        .map_err(|error| match error {
+            MediaError::Client(message) => CoreError::InvalidArgument(message),
+            MediaError::Server(message) => CoreError::Internal(message),
+        })
     }
 
     /// Return static model metadata without exposing the full launch config.
@@ -1347,6 +1365,56 @@ mod tests {
         ));
         assert!(intake_rx.try_recv().is_err());
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    /// A processor's media failures reach adapters as Python's loader classes:
+    /// a client fault is a 400, a server fault a 500. Neither is admitted.
+    #[tokio::test]
+    async fn processor_media_failures_keep_their_status_class() {
+        struct FailingFetch;
+
+        impl MmProcessor for FailingFetch {
+            fn process(
+                &self,
+                _input_ids: TokenIds,
+                _mm: MmData,
+            ) -> Result<crate::multi_modality::worker::MmProcessOutput, String> {
+                unreachable!("rejected during admission")
+            }
+
+            fn fetch_media(
+                &self,
+                source: &str,
+                _modality: crate::multi_modality::encoded::MmModality,
+                _budget: &crate::MediaByteBudget,
+            ) -> Result<Option<Bytes>, MediaError> {
+                Err(match source {
+                    "custom://client" => MediaError::Client("bad media".into()),
+                    _ => MediaError::Server("backend down".into()),
+                })
+            }
+        }
+
+        let harness = Harness::unbounded(8);
+        assert!(harness.handle.set_mm_processor(Arc::new(FailingFetch)));
+        assert!(!harness.handle.set_mm_processor(Arc::new(FailingFetch)));
+        for (source, status, message) in [
+            ("custom://client", 400, "bad media"),
+            ("custom://server", 500, "backend down"),
+        ] {
+            let request = GenerateRequest {
+                mm: Some(Box::new(MmData {
+                    image_data: vec![MmItem::Source(source.into())],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let error = harness.handle.generate(request).await.err().unwrap();
+            assert_eq!(error.http_status().as_u16(), status, "{source}");
+            assert_eq!(error.to_string(), message);
+        }
+        assert!(harness.intake_rx.try_recv().is_err());
+        assert!(harness.abort_rx.try_recv().is_err());
     }
 
     /// A busy scheduler skips the probe and acknowledges it after its next step.

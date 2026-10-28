@@ -677,3 +677,25 @@ def test_timing_tolerance_override_leaves_memory_guards_alone():
     with patch.object(current_platform, "is_hip", return_value=False):
         with pytest.raises(AssertionError, match="Runtime Peak VRAM"):
             validator.validate_peak_vram(regression, 10_000.0, 10_000.0)
+
+
+def test_request_metrics_compare_by_identity():
+    """Distinct RequestMetrics instances must not compare equal."""
+    assert perf_logger_module.RequestMetrics("a") != perf_logger_module.RequestMetrics(
+        "b"
+    )
+
+
+def test_log_request_summary_records_requested_tag(monkeypatch, tmp_path):
+    """log_request_summary must record the tag it is given."""
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    monkeypatch.setattr(perf_logger_module, "get_is_main_process", lambda: True)
+    monkeypatch.setattr(
+        perf_logger_module, "get_diffusion_perf_log_dir", lambda: str(tmp_path)
+    )
+
+    perf_logger_module.PerformanceLogger.log_request_summary(
+        perf_logger_module.RequestMetrics("r1"), tag="custom_tag"
+    )
+
+    assert "custom_tag" in (tmp_path / "performance.log").read_text()

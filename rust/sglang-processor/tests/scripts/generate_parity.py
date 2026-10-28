@@ -37,7 +37,6 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/parity"
-DSV4_PROFILE = chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
 
 
 class RecordingTokenizer:
@@ -87,18 +86,6 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
         tokenizer=tokenizer,
         tool_call_parser=tool_call_parser,
     )
-    server._dsv4_reasoning_effort_profile = (
-        chat_encoding.resolve_dsv4_reasoning_effort_profile(
-            model_path=path, revision=revision, override=config.get(DSV4_PROFILE)
-        )
-        if server.chat_encoding_spec == "dsv4"
-        else None
-    )
-    server._dsv41_default_reasoning_effort = (
-        chat_encoding.default_dsv41_reasoning_effort_from_env(None)
-        if server.chat_encoding_spec == "dsv41"
-        else None
-    )
     server._tokenizer_auto_adds_specials = len(tokenizer.encode("")) > 0
     server._prompt_text_round_trip_is_lossy = server._probe_prompt_text_round_trip()
     server._chat_template_cache = OrderedDict()
@@ -130,13 +117,10 @@ def generate(fixture_path):
         tok,
         fixture.get("tool_call_parser"),
     )
-    # What the processor reads from config.json; the resolved profile stands in
-    # for the checkpoint's encoder file so the Rust test runs offline.
+    # What the processor reads from config.json.
     fixture["config"] = {
         key: config[key] for key in ("model_type", "architectures") if key in config
     }
-    if server._dsv4_reasoning_effort_profile:
-        fixture["config"][DSV4_PROFILE] = server._dsv4_reasoning_effort_profile
     fixture["bos_token_id"] = tok.bos_token_id
     # Jinja checkpoints render with their template; keep it so the test runs offline.
     if server.chat_encoding_spec is None:

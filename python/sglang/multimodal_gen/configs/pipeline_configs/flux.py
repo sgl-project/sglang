@@ -125,6 +125,12 @@ class FluxPipelineConfig(ImagePipelineConfig):
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
 
+    def get_classifier_free_guidance_scale(self, batch, guidance_scale: float) -> float:
+        # true_cfg_scale is the CFG weight when given, as in diffusers FluxPipeline.
+        if batch.true_cfg_scale is not None:
+            return batch.true_cfg_scale
+        return guidance_scale
+
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = 2 * (
             batch.height // (self.vae_config.arch_config.vae_scale_factor * 2)

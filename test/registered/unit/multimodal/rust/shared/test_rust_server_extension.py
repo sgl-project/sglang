@@ -120,6 +120,36 @@ class TestRustServerExtension(CustomTestCase):
         self.assertEqual(startup_time["load_weight"], 1.0)
         self.assertEqual(startup_time["cuda_graph"]["decode"], 2.0)
 
+    def test_scheduler_aborts_reach_the_rust_egress(self):
+        """An abort the scheduler sends outside the output stream becomes a
+        one-request terminal batch in Rust mode, keeping the request's counts;
+        without the Rust server it still goes to the tokenizer socket."""
+        import msgspec
+
+        from sglang.srt.managers.io_struct import AbortReq
+        from sglang.srt.managers.scheduler import Scheduler
+
+        req = SimpleNamespace(
+            origin_input_ids=[1, 2, 3], cached_tokens=2, reasoning_tokens=1
+        )
+        abort = AbortReq(rid="r#1", abort_message="gone")
+        server = RustServer(Mock(), http_port=30000)
+        scheduler = SimpleNamespace(rust_server=server, ipc_channels=Mock())
+        Scheduler.send_abort_output(scheduler, abort, req)
+        header, cols = server.server.push_decode_result_batch.call_args.args
+        self.assertEqual(
+            msgspec.msgpack.decode(header),
+            [["r#1"], [{"type": "abort", "message": "gone"}], [3], [0], [2], [1]],
+        )
+        self.assertEqual(cols, [b""])
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+
+        scheduler.rust_server = None
+        Scheduler.send_abort_output(scheduler, abort, req)
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once_with(
+            abort, req
+        )
+
     def test_launch_resolves_the_mm_pipeline_before_the_server_starts(self):
         """The listener answers once the server is constructed, so a model
         without a Rust MM pipeline must be refused before that; a supported

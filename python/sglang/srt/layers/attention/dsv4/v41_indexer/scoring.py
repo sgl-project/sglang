@@ -12,6 +12,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
+    flat_selection_slots,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
@@ -83,10 +84,11 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
         """The pool slots of the request-local ``inputs.out_raw_indices`` rows."""
         if inputs.out_page_indices is None:
             return
-        raw = inputs.out_raw_indices[: self.num_rows]
-        columns = (raw + self.request_starts[:, None]).clamp_min(0)
-        inputs.out_page_indices[: self.num_rows, : raw.shape[1]] = torch.where(
-            raw >= 0, self.k_slots[columns], -1
+        flat_selection_slots(
+            inputs.out_raw_indices[: self.num_rows],
+            self.request_starts,
+            self.k_slots,
+            inputs.out_page_indices,
         )
 
     def write_selection(self, selected: torch.Tensor, inputs: PrefillInputs) -> None:

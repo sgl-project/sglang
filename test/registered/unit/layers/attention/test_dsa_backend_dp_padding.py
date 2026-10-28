@@ -65,6 +65,12 @@ class TestDSABackendDPPadding(unittest.TestCase):
             )
 
     def test_trtllm_decode_runs_real_rows_then_restores_physical_batch(self):
+        self._check_trtllm_padding(is_prefill=False)
+
+    def test_trtllm_prefill_narrows_metadata_to_live_cp_queries(self):
+        self._check_trtllm_padding(is_prefill=True)
+
+    def _check_trtllm_padding(self, *, is_prefill):
         metadata = SimpleNamespace(
             cache_seqlens_int32=torch.tensor([8, 12], dtype=torch.int32),
             page_table_1=torch.zeros((2, 12), dtype=torch.int32),
@@ -110,6 +116,16 @@ class TestDSABackendDPPadding(unittest.TestCase):
         forward_batch = SimpleNamespace()
         q = torch.arange(4 * 2 * 3, dtype=torch.float32).view(4, 2, 3)
         topk_indices = torch.arange(4 * 2, dtype=torch.int32).view(4, 2)
+        if is_prefill:
+            # The CP graph bridge has removed padded Q rows; metadata was
+            # planned for the physical shard before entering the eager break.
+            q = q[:2]
+            topk_indices = topk_indices[:2]
+            metadata.cache_seqlens_int32 = torch.tensor(
+                [8, 12, 0, 0], dtype=torch.int32
+            )
+            backend.use_fused_topk = True
+            backend._get_fused_topk_page_table = lambda indices: indices
 
         flashinfer = ModuleType("flashinfer")
         flashinfer_decode = ModuleType("flashinfer.decode")
@@ -159,10 +175,12 @@ class TestDSABackendDPPadding(unittest.TestCase):
                 seq_lens=metadata.cache_seqlens_int32,
                 save_kv_cache=False,
                 topk_indices=topk_indices,
+                is_prefill=is_prefill,
             )
 
         self.assertEqual(captured["query"].shape, (2, 1, 2, 3))
-        self.assertEqual(output.shape, (4, 1, 2, 2))
+        self.assertEqual(captured["seq_lens"].tolist(), [8, 12])
+        self.assertEqual(output.shape, (2 if is_prefill else 4, 1, 2, 2))
         self.assertTrue(torch.all(output[:2] == 1))
         self.assertTrue(torch.all(output[2:] == 0))
 

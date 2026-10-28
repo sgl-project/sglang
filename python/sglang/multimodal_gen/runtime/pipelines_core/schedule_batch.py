@@ -441,7 +441,7 @@ class Req:
      embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
                     n_tokens: {self.n_tokens}
                   flow_shift: {effective_flow_shift}
-                  image_path: {self.image_path}
+                  image_path: {_sanitize_for_logging(self.image_path)}
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
@@ -484,6 +484,8 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
+    # encoded image per output when the request sets return_image_bytes
+    output_image_bytes: list[bytes | None] | None = None
     # Decoded LiDAR of a joint camera/LiDAR request: file paths and metadata,
     # plus range_m/intensity/validity arrays when the client asked for frames.
     lidar: dict[str, Any] | None = None
@@ -505,6 +507,7 @@ class OutputBatch:
         self.rollout_trajectory_data = None
         self.trajectory_decoded = None
         self.output_file_paths = None
+        self.output_image_bytes = None
         self.lidar = None
         self.raw_frame_batches = None
         self.noise_pred = None

@@ -107,7 +107,11 @@ def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
         getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
         or (
             isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
-            and (runner_backend is None or not runner_backend.is_marlin())
+            # Marlin, or the LoRA MoE runner on its Marlin NVFP4 vendor.
+            and (
+                runner_backend is None
+                or not (runner_backend.is_marlin() or runner_backend.is_lora_marlin())
+            )
         )
         or (
             runner_backend is not None
@@ -426,7 +430,11 @@ class FusedMoE(torch.nn.Module):
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
-        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+        # Unquantized BF16 LoRA uses DeepGEMM's resident weight layout.
+        self.use_deep_gemm = (
+            get_moe_runner_backend().is_deep_gemm()
+            or get_moe_runner_backend().is_lora()
+        )
 
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -596,7 +604,10 @@ class FusedMoE(torch.nn.Module):
             _fuses_routed_scaling_factor_in_topk(self.quant_method, self.runner_backend)
         )
 
-        self.routing_method_type = routing_method_type
+        self.routing_method_type = self.quant_method.get_moe_routing_method_type(
+            self, routing_method_type
+        )
+        self.moe_runner_config.routing_method_type = self.routing_method_type
 
         # overlap args
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
@@ -1556,11 +1567,11 @@ class FusedMoE(torch.nn.Module):
 
             return forward_fuseep(self, hidden_states, topk_output)
         if is_in_tc_piecewise_cuda_graph():
-            if (
-                TopKOutputChecker.format_is_bypassed(topk_output)
-                and topk_output.expert_location_dispatch_info is not None
+            if TopKOutputChecker.format_is_bypassed(topk_output) and (
+                topk_output.expert_location_dispatch_info is not None
+                or topk_output.num_token_non_padded is not None
             ):
-                # The opaque logits-only op cannot carry placement metadata.
+                # The opaque logits-only op cannot carry padding or placement metadata.
                 return self.forward_impl(
                     hidden_states, topk_output, pre_quant_input=pre_quant_input
                 )

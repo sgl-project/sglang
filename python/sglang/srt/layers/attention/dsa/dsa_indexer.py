@@ -152,6 +152,7 @@ if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -238,6 +239,14 @@ def _make_eager_idle_topk_result(
         dtype=torch.int32,
         device=x.device,
     )
+
+
+def _index_k_write_targets(pool, layer_id: int, loc: torch.Tensor):
+    """(index-K buffer, token slots, selected token rows or None) to write."""
+    shard_pool = get_kv_shard_pool(pool)
+    if shard_pool is None:
+        return ((pool.get_index_k_with_scale_buffer(layer_id=layer_id), loc, None),)
+    return shard_pool.index_key_cache.write_targets(layer_id, loc)
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -1026,17 +1035,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
-            fused_k_indexer_norm_rope_store(
-                key_raw,
-                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
-                out_cache_loc,
-                self.k_norm.weight,
-                self.k_norm.bias,
-                self.k_norm.variance_epsilon,
-                self._indexer_cos_sin_cache,
-                positions,
-                page_size,
-            )
+            for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
+                fused_k_indexer_norm_rope_store(
+                    key_raw if rows is None else key_raw.index_select(0, rows),
+                    buf,
+                    loc,
+                    self.k_norm.weight,
+                    self.k_norm.bias,
+                    self.k_norm.variance_epsilon,
+                    self._indexer_cos_sin_cache,
+                    positions if rows is None else positions.index_select(0, rows),
+                    page_size,
+                )
             return
 
         # Fallback: separate K kernel + store kernel.
@@ -1510,7 +1520,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
-            block_tables = metadata.get_page_table_64()
+            block_tables = metadata.get_logical_page_table()
 
         assert (
             forward_batch.seq_lens_cpu is not None
@@ -1830,13 +1840,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            fused_store_index_k_cache(
-                key,
-                buf,
-                out_cache_loc,
-                pool.index_page_size,
-            )
+            for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
+                fused_store_index_k_cache(
+                    key if rows is None else key.index_select(0, rows),
+                    buf,
+                    loc,
+                    pool.index_page_size,
+                )
             return
 
         # Fast path: AITER fused quant + cache store

@@ -31,6 +31,10 @@ Disaggregation is controlled by a single flag: `--disagg-role`. Each component i
       <td>All stages with the default <code>RoleType.ENCODER</code> affinity: <code>InputValidationStage</code>, <code>TextEncodingStage</code> (plus <code>ImageEncodingStage</code> / <code>ImageVAEEncodingStage</code> for image-conditioned pipelines), <code>LatentPreparationStage</code>, <code>TimestepPreparationStage</code>, and any model-specific "before denoising" stage (e.g. <code>QwenImageLayeredBeforeDenoisingStage</code>, <code>GlmImageBeforeDenoisingStage</code>).</td>
     </tr>
     <tr>
+      <td><code>prompt_encoder</code> / <code>image_encoder</code></td>
+      <td>Separate text and reference-image encoding stages (currently FLUX.3 Image).</td>
+    </tr>
+    <tr>
       <td><code>denoiser</code></td>
       <td><code>DenoisingStage</code> (and its subclasses: <code>CausalDMDDenoisingStage</code>, <code>DmdDenoisingStage</code>, <code>LTX2AVDenoisingStage</code>, <code>LTX2RefinementStage</code>, <code>Hunyuan3DShapeDenoisingStage</code>, ...) — the DiT forward loop plus the scheduler stepping it drives.</td>
     </tr>
@@ -45,7 +49,7 @@ Disaggregation is controlled by a single flag: `--disagg-role`. Each component i
   </tbody>
 </table>
 
-> Each stage declares its role via the `role_affinity` property on `PipelineStage` (default `ENCODER`). When `--disagg-role` is not `monolithic`, the pipeline only instantiates stages whose affinity matches, so the above table is the source of truth for what actually runs in each process.
+> Each stage declares its role via the `role_affinity` property on `PipelineStage` (default `ENCODER`). Non-monolithic pipelines only instantiate matching stages. The combined `encoder` role also includes stages with `PROMPT_ENCODER` or `IMAGE_ENCODER` affinity.
 
 ### Single-Machine Example (Verified)
 
@@ -140,6 +144,105 @@ sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers \
 ```
 
 > ZMQ handles startup order gracefully — instances and head can start in any order.
+
+## FLUX.3 split encoding {#flux3-split-encoding}
+
+FLUX.3 Image supports both the three-role topology above and four independently
+deployable worker pools:
+
+```text
+T2I: HTTP head -> prompt_encoder -> denoiser -> decoder -> HTTP head
+i2i: HTTP head -> prompt_encoder -> image_encoder -> denoiser -> decoder -> HTTP head
+```
+
+The prompt encoder loads only the text encoder. The image encoder loads only
+the VAE for reference-image encoding; the decoder has its own VAE instance.
+The denoiser loads only the DiT and creates noise from the request seed locally.
+T2I bypasses the image encoder and goes directly from prompt encoder to denoiser.
+Stages within one request run sequentially; different requests can occupy
+different worker pools concurrently. This is not a latency optimization for a
+single request: separation adds transfers and allows independent placement and
+scaling. The head still serves complete image-generation requests; this is not
+a standalone API for returning training embeddings or VAE latents.
+
+Use the same FLUX.3 package, variant, and numerical settings on every process.
+Each host currently needs a complete package on disk, even though a worker
+loads only its own components into memory. Follow the
+[FLUX.3 cookbook](/cookbook/diffusion/FLUX/FLUX.3) for model access and licensing.
+For gated checkpoints, authenticate on each host with an authorized account
+using `hf auth login`, or provide an accessible local package path.
+Install the transfer dependencies described below on every worker.
+For long prompts, increase `--disagg-transfer-pool-size` on the encoding and
+denoising workers to cover their largest incoming/outgoing tensors, as well as
+reserved receive slots; for example, `1073741824` reserves a 1 GiB pool.
+
+For a Linux NVIDIA deployment with four GPUs, start the workers in one shell:
+
+```bash
+MODEL_PATH=black-forest-labs/flux-3-image-klein
+for spec in 'prompt_encoder 0 19000' 'image_encoder 1 19010' \
+            'denoiser 2 19020' 'decoder 3 19030'; do
+  read -r ROLE GPU WORK_PORT <<< "$spec"
+  CUDA_VISIBLE_DEVICES="$GPU" sglang serve --model-path "$MODEL_PATH" \
+    --num-gpus 1 --disagg-role "$ROLE" \
+    --disagg-server-addr tcp://127.0.0.1:18000 \
+    --disagg-p2p-hostname 127.0.0.1 \
+    --scheduler-port "$WORK_PORT" --master-port "$((WORK_PORT + 50))" &
+done
+```
+
+Then start the GPU-less head in another shell:
+
+```bash
+sglang serve --model-path black-forest-labs/flux-3-image-klein \
+  --disagg-role server --host 127.0.0.1 --port 30000 --scheduler-port 18000 \
+  --prompt-encoder-urls tcp://127.0.0.1:19000 \
+  --image-encoder-urls tcp://127.0.0.1:19010 \
+  --denoiser-urls tcp://127.0.0.1:19020 \
+  --decoder-urls tcp://127.0.0.1:19030
+```
+
+The existing image API is unchanged: use `/v1/images/generations` for T2I and
+multipart `/v1/images/edits` for references:
+
+```bash
+curl --fail-with-body -sS http://127.0.0.1:30000/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"A sunset over mountains","size":"1024x1024","seed":42,"response_format":"b64_json"}' \
+  -o flux3-t2i.json
+
+curl --fail-with-body -sS http://127.0.0.1:30000/v1/images/edits \
+  -F 'image=@reference.png' \
+  -F 'prompt=Turn the scene into a watercolor painting' \
+  -F 'seed=42' -F 'response_format=b64_json' \
+  -o flux3-i2i.json
+```
+
+Replace `reference.png` with your input image. Omit `size` on edits to keep the
+reference dimensions, including the model's padding/crop behavior. The head
+inlines locally uploaded reference files before dispatch, so GPU workers do
+not need access to the head's upload directory. URL inputs must remain
+reachable from the image encoder.
+
+Specify both `--prompt-encoder-urls` and `--image-encoder-urls`, instead of
+`--encoder-urls`. Each accepts semicolon-separated worker endpoints, with the
+same dispatch policy as the existing pools. Alternatively, use the existing
+`encoder` role and `--encoder-urls` to colocate both encoders in one worker.
+Image encoder and decoder processes can also share a GPU if their combined
+weights, transfer pools, and concurrent activations fit.
+
+Across machines, replace loopback addresses with routable IPs. Advertise each
+worker's IP with `--disagg-p2p-hostname`, and use that exact work endpoint in
+the head's URL list. The head also listens on scheduler port +4 for prompt
+encoder results and +5 for image encoder results; +1/+2/+3 retain their
+existing meanings. Keep worker work/control ports (+1), internal scheduler
+ports, and distributed master ports distinct. Run the internal transport on a
+trusted private network, not a public interface.
+
+The BF16 flow-map package has been validated on H200 with same-node,
+multi-process Mooncake RDMA: concurrent T2I, reference-size-preserving i2i,
+and both three-role and four-role topologies matched the monolithic API's
+output pixels with `quality=exact`. Cross-node execution has not been validated.
 
 ## Multiple Instances per Role
 
@@ -297,6 +400,14 @@ Result endpoints are derived deterministically from the head node's `--scheduler
       <td>Decoder result (PULL)</td>
       <td><code>scheduler_port + 3</code></td>
     </tr>
+    <tr>
+      <td>Prompt encoder result (PULL, split encoding)</td>
+      <td><code>scheduler_port + 4</code></td>
+    </tr>
+    <tr>
+      <td>Image encoder result (PULL, split encoding)</td>
+      <td><code>scheduler_port + 5</code></td>
+    </tr>
   </tbody>
 </table>
 
@@ -304,7 +415,7 @@ Role instances derive their result endpoint automatically from `--disagg-server-
 
 ## Transfer Mechanism
 
-Tensor data between roles (encoder→denoiser, denoiser→decoder) is transferred via a P2P transfer engine. The DiffusionServer only routes lightweight control messages (alloc/push/ready); actual tensor data flows directly between instances.
+Tensor data between adjacent roles is transferred via a P2P transfer engine. The DiffusionServer routes control messages and request metadata; tensors flow directly between workers. Uploaded reference files are forwarded inline as request metadata.
 
 **mooncake-transfer-engine** is required for disaggregated diffusion. It provides RDMA for direct GPU-to-GPU data movement.
 
@@ -317,12 +428,12 @@ pip install mooncake-transfer-engine
 
 ### Transfer Flow
 
-1. **Sender** (encoder/denoiser) stages tensors: async copy to transfer buffer (GPU or CPU pinned, depending on GPUDirect support), overlapped with metadata JSON serialization.
-2. **Sender** sends `transfer_staged` control message to DiffusionServer (metadata only, no tensor data).
-3. **DiffusionServer** sends `transfer_alloc` to receiver → receiver allocates buffer slot → replies `transfer_allocated`.
-4. **DiffusionServer** sends `transfer_push` to receiver with sender's address info.
-5. **Receiver** pulls data via transfer engine (Mooncake RDMA or mock), sends `transfer_ready`.
-6. **Receiver** loads tensors async on a dedicated transfer stream, overlapped with the previous request's compute.
+1. **Sender** stages output tensors in its transfer buffer, then notifies DiffusionServer.
+2. **DiffusionServer** selects a downstream worker and reserves one of its preallocated receive slots. If none fits, it sends `transfer_alloc` and waits for `transfer_allocated`.
+3. **DiffusionServer** sends `transfer_push` to the sender with the receiver's session and destination address.
+4. **Sender** pushes the tensors through Mooncake and reports `transfer_pushed` after completion.
+5. **DiffusionServer** sends `transfer_ready` to the receiver and releases the sender's scheduling slot.
+6. **Receiver** loads the tensors on its transfer stream and executes its stages. Receive prefetch can overlap the previous request's compute.
 
 Decoder results (final output) flow back through DiffusionServer as raw ZMQ frames to the HTTP client.
 
