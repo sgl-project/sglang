@@ -87,8 +87,8 @@ def _mode_flags(mode):
 
 def _strided_bmm_cases(groups):
     cases = [("is_target_verify", rows) for rows in (9, 64, 100, 128, 384)]
-    cases += [("is_prefill", rows) for rows in (4096, 8192, 16384)]
-    if groups == 8:
+    cases += [("is_prefill", rows) for rows in (4096, 8192, 16384, 65536)]
+    if groups != 2:
         # 2 groups run 1-8 rows through the gemv and small-batch kernels instead
         cases += [("is_decode", 1)]
         cases += [("is_target_verify", rows) for rows in range(1, 9)]
@@ -98,7 +98,7 @@ def _strided_bmm_cases(groups):
             yield mode, rows, padded_heads
 
 
-@pytest.mark.parametrize("groups", [2, 8])
+@pytest.mark.parametrize("groups", [2, 4, 8])
 def test_wo_a_strided_bmm_matches_einsum(groups):
     """The strided bmm returns the einsum's values in the token-major layout wo_b reads."""
     from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
@@ -115,7 +115,7 @@ def test_wo_a_strided_bmm_matches_einsum(groups):
         assert torch.equal(out, torch.einsum("tgd,grd->tgr", x, wo_a)), case
 
 
-@pytest.mark.parametrize("groups", [2, 8])
+@pytest.mark.parametrize("groups", [2, 4, 8])
 def test_wo_a_strided_bmm_graph_replay_matches_einsum(groups):
     """Replays of a captured call stay token-major and equal to the einsum on new inputs."""
     from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
@@ -139,7 +139,7 @@ def test_wo_a_strided_bmm_graph_replay_matches_einsum(groups):
             assert torch.equal(out, torch.einsum("tgd,grd->tgr", x, wo_a)), case
 
 
-@pytest.mark.parametrize("groups, rows", [(8, 4095), (4, 4096)])
+@pytest.mark.parametrize("groups, rows", [(8, 4095), (4, 4095)])
 def test_wo_a_strided_bmm_gate_rejects_unmeasured_prefill(groups, rows):
     """Prefill shapes outside the measured gate keep the einsum's group-major layout."""
     from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
