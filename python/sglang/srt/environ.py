@@ -873,6 +873,11 @@ class Envs:
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
     SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S = EnvFloat(300.0)
     SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S = EnvFloat(600.0)
+    # Consecutive send failures before a Mooncake session is blacklisted.
+    # Default 1 preserves the historical behavior. Raise it when transient
+    # timeouts (e.g. transfer-queue head-of-line blocking) can falsely mark
+    # a healthy session as dead.
+    SGLANG_MOONCAKE_SESSION_FAILURE_THRESHOLD = EnvInt(1)
 
     # ===================================================================
     # Mooncake store
