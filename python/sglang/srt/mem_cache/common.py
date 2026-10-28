@@ -42,6 +42,8 @@ class RetractionBackup(NamedTuple):
     pool_transfers: Optional[list[PoolTransfer]] = None
     # Set when the KV pool leaves the recurrent state to the caller.
     mamba_cpu: Any = None
+    # Request-owned snapshots: the existing CPU discard path drops these too.
+    draft_cpu_tensors: tuple[Any, ...] = ()
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:

@@ -367,6 +367,17 @@ class BaseSpecWorker(ABC):
             )
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        spec_algorithm = self.target_worker.model_runner.spec_algorithm
+        if (
+            spec_algorithm.is_eagle()
+            and not spec_algorithm.is_frozen_kv_mtp()
+            and not get_memory().enable_unified_memory
+        ):
+            # Independent of the HiCache plan: CPU retraction is also used
+            # with HiCache off, and multi-layer EAGLE needs every runner.
+            token_to_kv_pool_allocator.register_cpu_retraction_draft_pools(
+                tuple(runner.token_to_kv_pool for runner in self._draft_model_runners())
+            )
 
     def init_attention_backends(self):
         if self.draft_worker is not None:

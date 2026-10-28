@@ -2132,6 +2132,16 @@ class Req(ReqDllmMixin):
                 if mamba_pool is not None and self.kv.holds_mamba
                 else None
             ),
+            draft_cpu_tensors=tuple(
+                pool.get_cpu_copy(
+                    token_indices,
+                    mamba_indices=self.kv.mamba_pool_idx,
+                    req_pool_index=self.kv.req_pool_idx,
+                )
+                for pool in getattr(
+                    token_to_kv_pool_allocator, "cpu_retraction_draft_pools", ()
+                )
+            ),
         )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
@@ -2151,6 +2161,17 @@ class Req(ReqDllmMixin):
             mamba_indices=self.kv.mamba_pool_idx,
             req_pool_index=self.kv.req_pool_idx,
         )
+        for pool, cpu_tensors in zip(
+            getattr(token_to_kv_pool_allocator, "cpu_retraction_draft_pools", ()),
+            self.kv.retraction_backup.draft_cpu_tensors,
+            strict=True,
+        ):
+            pool.load_cpu_copy(
+                cpu_tensors,
+                token_indices,
+                mamba_indices=self.kv.mamba_pool_idx,
+                req_pool_index=self.kv.req_pool_idx,
+            )
         self.kv.retraction_backup = None
 
     def build_rebootstrap_payload(self) -> dict:
