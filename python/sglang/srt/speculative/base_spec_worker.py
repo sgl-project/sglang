@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
@@ -150,6 +151,7 @@ class EagleDraftWorkerBase(ABC):
 
 class BaseSpecWorker(ABC):
     _hicache_draft_plan = HiCacheDraftPlan()
+    draft_parallel_layout: DraftParallelLayout | None = None
 
     def __init__(self) -> None:
         self._additional_graph_memory_usage: dict[str, float] = {}

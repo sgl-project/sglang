@@ -49,7 +49,7 @@ from sglang.srt.speculative.base_spec_worker import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestDecodeRetractionBackup(CustomTestCase):
@@ -274,6 +274,11 @@ class TestDecodeRetractionBackup(CustomTestCase):
         env.allocator.free(source_indices)
         env.req_to_token_pool.free(req)
 
+    @staticmethod
+    def _finish_restores(cache):
+        # A restore returns its host slots once its host-to-device copy has finished.
+        cache._discard_restore_backups()
+
     def test_restores_target_and_draft_kv(self):
         env = self._build_cache(hicache_ratio=1.0)
         req_to_token_pool = env.req_to_token_pool
@@ -325,6 +330,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         )
 
         cache.restore_kv_cache(req, backup)
+        self._finish_restores(cache)
 
         self._assert_pool_equal(
             target_pool, destination_physical_indices, target_expected
@@ -472,6 +478,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         self.assertTrue(queue.allocate_host_staged(decode_req))
         req.output_ids.append(99)
         env.cache.restore_kv_cache(req, backup)
+        self._finish_restores(env.cache)
         full_indices = env.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :23
         ].long()
@@ -667,6 +674,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 for buffer in device_buffers:
                     buffer[source_indices] = -1
                 cache.restore_kv_cache(retracted, retraction)
+                self._finish_restores(cache)
                 for index, buffer in enumerate(device_buffers):
                     self.assertTrue(torch.all(buffer[source_indices] == index + 100))
                 group.free(blockers)
@@ -686,6 +694,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 ].to(torch.int64)
                 req.output_ids.append(99)
                 cache.restore_kv_cache(req, backup)
+                self._finish_restores(cache)
                 for buffer, values in zip(device_buffers, expected, strict=True):
                     self.assertTrue(
                         torch.equal(buffer[received_indices[:num_tokens]].cpu(), values)
@@ -819,6 +828,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         req.init_next_round_input(None)
         req.extend_end = 8
         restore_kv_cache(req, cache, env.req_to_token_pool, env.allocator, "host_pool")
+        self._finish_restores(cache)
         self.assertEqual(cache.host_pool_group.available_size(), host_free_before)
         free_before_insert = env.allocator.available_size()
         cache.checkpoint(req, up_to=req.extend_end)
