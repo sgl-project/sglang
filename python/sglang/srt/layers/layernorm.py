@@ -23,6 +23,7 @@ import torch.nn.functional as F
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.batch_invariant_ops import (
+    fused_add_rms_norm_batch_invariant,
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
 )
@@ -509,6 +510,32 @@ class RMSNorm(BaseFusedOp):
         if force_native:
             self._forward_method = self.forward_native
 
+    def _batch_invariant_add_rms_norm(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_residual_addition: Optional[torch.Tensor],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """The residual path of batch-invariant mode as one kernel, with the same
+        float32 math as forward_native. None where forward_native must be used."""
+        if (
+            self.cast_x_before_out_mul
+            or self.variance_size_override is not None
+            or getattr(self, "x_pad_to_multiple", 0) > 0
+            or get_exec().deterministic.rl_on_policy_target == "fsdp"
+        ):
+            return None
+        orig_dtype = self.override_orig_dtype or x.dtype
+        return fused_add_rms_norm_batch_invariant(
+            x,
+            residual,
+            self.weight.data,
+            self.variance_epsilon,
+            addend=post_residual_addition,
+            out_dtype=orig_dtype,
+            residual_dtype=torch.float32 if self.fp32_residual else orig_dtype,
+        )
+
     def fuse_input_quant(self, linear: nn.Module) -> None:
         """Fuse the static per-tensor FP8 input quantization of ``linear``, the
         projection that consumes this norm's output, whenever forward_cuda can.
@@ -533,6 +560,12 @@ class RMSNorm(BaseFusedOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
+            if residual is not None:
+                fused = self._batch_invariant_add_rms_norm(
+                    x, residual, post_residual_addition
+                )
+                if fused is not None:
+                    return fused
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
@@ -677,6 +710,12 @@ class RMSNorm(BaseFusedOp):
             # FP32 weight + BF16 activation yields finite-but-corrupted output on gfx950.
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
+            if residual is not None:
+                fused = self._batch_invariant_add_rms_norm(
+                    x, residual, post_residual_addition
+                )
+                if fused is not None:
+                    return fused
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
@@ -773,6 +812,12 @@ class RMSNorm(BaseFusedOp):
             return self.forward_native(x, residual, post_residual_addition)
 
         if is_batch_invariant_mode_enabled():
+            if residual is not None:
+                fused = self._batch_invariant_add_rms_norm(
+                    x, residual, post_residual_addition
+                )
+                if fused is not None:
+                    return fused
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
@@ -907,6 +952,12 @@ class RMSNorm(BaseFusedOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
+            if residual is not None:
+                fused = self._batch_invariant_add_rms_norm(
+                    x, residual, post_residual_addition
+                )
+                if fused is not None:
+                    return fused
             if (
                 residual is not None
                 or get_exec().deterministic.rl_on_policy_target == "fsdp"
