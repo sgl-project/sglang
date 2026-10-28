@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import logging
+import re
 from functools import partial
-from typing import Iterable, Optional, Tuple
+from typing import Collection, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -89,6 +90,49 @@ def _logical_linear_weight_shape(
     if logical_numel % output_features == 0:
         return (output_features, logical_numel // output_features)
     return (logical_numel,)
+
+
+# A checkpoint for another model can share the draft's hidden size, so the
+# shapes often line up and the wrong weights land in the draft without any
+# error. These patterns catch the names that provably cannot belong to it.
+_LAYER_INDEX_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+# Head weights the draft never owns: it predicts hidden states, not tokens.
+# Only a draft that carries its own embedding (the Nemotron 3.5 variant) has
+# an "embed_tokens.weight".
+_FOREIGN_HEAD_WEIGHTS = ("embed_tokens.weight", "lm_head.weight")
+
+
+def find_foreign_weight_reason(
+    name: str,
+    *,
+    num_draft_layers: int,
+    draft_param_names: Collection[str],
+) -> Optional[str]:
+    """Explain why a checkpoint weight cannot belong to this draft.
+
+    Returns ``None`` when the name is plausible for the draft. The check is
+    deliberately narrow: only names that cannot come from the draft are
+    reported, so genuine draft checkpoints (and harmless extras such as the
+    HF rotary caches) keep loading unchanged.
+    """
+    unprefixed_name = name.removeprefix("model.")
+    if unprefixed_name in draft_param_names:
+        return None
+    for head_weight in _FOREIGN_HEAD_WEIGHTS:
+        if unprefixed_name == head_weight and head_weight not in draft_param_names:
+            return (
+                f"it is a head weight ({head_weight!r}) that the DFLASH draft "
+                "does not own"
+            )
+    match = _LAYER_INDEX_PATTERN.search(unprefixed_name)
+    if match is not None and num_draft_layers > 0:
+        layer_index = int(match.group(1))
+        if layer_index >= num_draft_layers:
+            return (
+                f"it names layer {layer_index}, but the DFLASH draft only has "
+                f"{num_draft_layers} layers (0..{num_draft_layers - 1})"
+            )
+    return None
 
 
 def _project_candidate_logits(
@@ -1064,6 +1108,7 @@ class DFlashDraftModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params = set()
+        num_draft_layers = len(self.layers)
 
         # Alias the native export's "encoder." names.
         _VENDOR_ENCODER_ALIASES = {
@@ -1087,7 +1132,53 @@ class DFlashDraftModel(nn.Module):
                 return aliased_name
             return None
 
+        def resolve_stacked_name(name: str) -> Optional[Tuple[str, object]]:
+            """Map a fused checkpoint name onto a parameter and its shard id."""
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if f".{weight_name}." not in name:
+                    continue
+                mapped_name = name.replace(weight_name, param_name)
+                resolved_name = resolve_param_name(mapped_name)
+                if resolved_name is None:
+                    continue
+                return resolved_name, shard_id
+            return None
+
+        def foreign_weight_reason(name: str) -> Optional[str]:
+            """Why this checkpoint name cannot belong to this draft, if it cannot."""
+            if resolve_stacked_name(name) is not None:
+                return None
+            if resolve_param_name(name) is not None:
+                return None
+            return find_foreign_weight_reason(
+                name,
+                num_draft_layers=num_draft_layers,
+                draft_param_names=params_dict.keys(),
+            )
+
+        def reject_foreign_weight(name: str) -> None:
+            reason = foreign_weight_reason(name)
+            if reason is None:
+                return
+            raise ValueError(
+                f"DFLASH checkpoint does not match the draft model: {name!r} "
+                f"{reason}. Refusing to load another model's weights into the "
+                "draft, which would silently break speculation."
+            )
+
+        # A materialized weight list can be checked before anything is
+        # written, so a foreign checkpoint never lands in the draft. A lazy
+        # iterator (the disk loader's) is checked as it streams instead: it
+        # must not be materialized, because that pulls whole checkpoints into
+        # host memory.
+        if isinstance(weights, (list, tuple)):
+            for name, _ in weights:
+                reject_foreign_weight(name)
+
+        unresolved_names = []
+        total_names = 0
         for name, loaded_weight in weights:
+            total_names += 1
             unprefixed_name = name.removeprefix("model.")
             if self.projector_type != "domino" and unprefixed_name.startswith(
                 ("prefix_gru.", "embed_proj.")
@@ -1096,62 +1187,70 @@ class DFlashDraftModel(nn.Module):
                     "DFLASH checkpoint contains Domino projector weights but "
                     f"projector_type={self.projector_type!r}."
                 )
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if f".{weight_name}." not in name:
-                    continue
-                mapped_name = name.replace(weight_name, param_name)
-                resolved_name = resolve_param_name(mapped_name)
-                if resolved_name is None:
-                    continue
+            stacked_name = resolve_stacked_name(name)
+            if stacked_name is not None:
+                resolved_name, shard_id = stacked_name
                 param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(resolved_name)
-                break
-            else:
-                resolved_name = resolve_param_name(name)
-                if resolved_name is None:
-                    # Ignore unexpected weights (e.g., HF rotary caches).
-                    continue
-                param = params_dict[resolved_name]
-                if resolved_name.endswith("fc.weight"):
-                    if self.is_nemotron_35_draft:
-                        expected_shape = (
-                            int(self.config.hidden_size),
-                            int(self.num_context_features * self.config.hidden_size),
-                        )
-                        loaded_shape = _logical_linear_weight_shape(
-                            param,
-                            loaded_weight,
-                            output_features=expected_shape[0],
-                        )
-                        shape_matches = loaded_shape == expected_shape or (
-                            getattr(param, "pack_factor", None) is None
-                            and tuple(loaded_weight.shape) == tuple(param.shape)
-                        )
-                    else:
-                        expected_shape = tuple(param.shape)
-                        loaded_shape = tuple(loaded_weight.shape)
-                        shape_matches = loaded_shape == expected_shape
-                    if not shape_matches:
-                        raise ValueError(
-                            "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
-                            "number of context features (K) does not match this config. "
-                            f"Expected fc.weight.shape={expected_shape} "
-                            f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
-                            f"but got {loaded_shape} for weight '{name}'."
-                        )
-                if resolved_name.startswith(("prefix_gru.", "embed_proj.")) and tuple(
-                    loaded_weight.shape
-                ) != tuple(param.shape):
-                    raise ValueError(
-                        "DFLASH Domino projector weight shape mismatch: "
-                        f"expected {resolved_name}{tuple(param.shape)}, got "
-                        f"{tuple(loaded_weight.shape)} from {name!r}."
+                continue
+            resolved_name = resolve_param_name(name)
+            if resolved_name is None:
+                # Ignore unexpected weights (e.g., HF rotary caches), but
+                # refuse a checkpoint that clearly belongs to another model.
+                reject_foreign_weight(name)
+                unresolved_names.append(name)
+                continue
+            param = params_dict[resolved_name]
+            if resolved_name.endswith("fc.weight"):
+                if self.is_nemotron_35_draft:
+                    expected_shape = (
+                        int(self.config.hidden_size),
+                        int(self.num_context_features * self.config.hidden_size),
                     )
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(resolved_name)
+                    loaded_shape = _logical_linear_weight_shape(
+                        param,
+                        loaded_weight,
+                        output_features=expected_shape[0],
+                    )
+                    shape_matches = loaded_shape == expected_shape or (
+                        getattr(param, "pack_factor", None) is None
+                        and tuple(loaded_weight.shape) == tuple(param.shape)
+                    )
+                else:
+                    expected_shape = tuple(param.shape)
+                    loaded_shape = tuple(loaded_weight.shape)
+                    shape_matches = loaded_shape == expected_shape
+                if not shape_matches:
+                    raise ValueError(
+                        "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
+                        "number of context features (K) does not match this config. "
+                        f"Expected fc.weight.shape={expected_shape} "
+                        f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
+                        f"but got {loaded_shape} for weight '{name}'."
+                    )
+            if resolved_name.startswith(("prefix_gru.", "embed_proj.")) and tuple(
+                loaded_weight.shape
+            ) != tuple(param.shape):
+                raise ValueError(
+                    "DFLASH Domino projector weight shape mismatch: "
+                    f"expected {resolved_name}{tuple(param.shape)}, got "
+                    f"{tuple(loaded_weight.shape)} from {name!r}."
+                )
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(resolved_name)
+
+        if unresolved_names and 2 * len(unresolved_names) >= max(total_names, 1):
+            logger.warning(
+                "DFLASH checkpoint looks like it belongs to another model: %d of %d "
+                "weights did not match the draft (for example %s). The draft may "
+                "keep stale weights.",
+                len(unresolved_names),
+                total_names,
+                ", ".join(sorted(unresolved_names)[:3]),
+            )
 
         if self.projector_type == "domino":
             required = {

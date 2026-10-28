@@ -190,6 +190,10 @@ class WeightUpdater:
         )
 
         target_device = torch.device(self.device)
+        # The checkpoint this model currently serves. A failed update has to
+        # roll back to this one, and the model must keep pointing at it, so
+        # remember it before the new path replaces it.
+        original_model_path = self.model_config.model_path
         self.model_config.model_path = model_path
         # PP stages handle disk updates sequentially, unlike cold startup.
         load_config = LoadConfig(
@@ -233,8 +237,18 @@ class WeightUpdater:
                 )
                 del iter
                 gc.collect()
-                iter = get_weight_iter(self.model_config)
-                model_load_weights(self.get_model(), iter)
+                # Roll back to the checkpoint the model was serving, not to the
+                # checkpoint that just failed.
+                self.model_config.model_path = original_model_path
+                try:
+                    iter = get_weight_iter(self.model_config)
+                    model_load_weights(self.get_model(), iter)
+                except Exception as rollback_error:
+                    logger.error(
+                        "Failed to roll back to the original weights from %s: %s",
+                        original_model_path,
+                        rollback_error,
+                    )
                 return False, message
 
         self.update_model_fields(
