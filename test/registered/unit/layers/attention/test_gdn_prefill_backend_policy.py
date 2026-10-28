@@ -1,9 +1,11 @@
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
@@ -27,7 +29,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _publish(testcase, **fields):
@@ -78,6 +80,61 @@ def make_runner(
             )
         ),
     )
+
+
+class TestGDNPrefillGraphExtend(CustomTestCase):
+    @contextmanager
+    def _setup(self, *, cuda=True, enable_mis=False, draft=False):
+        """A target's GDN backend on a setup the graph-safe chain supports, unless
+        cuda, enable_mis or draft say otherwise."""
+        backend = GDNAttnBackend.__new__(GDNAttnBackend)
+        backend.is_draft_worker = draft
+        backend.enable_mis = enable_mis
+        backend._mamba_chunk_size = 64
+        backend.kernel_dispatcher = SimpleNamespace(
+            extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel)
+        )
+        cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba_pool=SimpleNamespace(mamba_cache=cache)
+        )
+        graph = SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[512]))
+        )
+        with (
+            patch.object(gdn_backend, "is_cuda", return_value=cuda),
+            patch.object(gdn_backend, "FLA_CHUNK_SIZE", 64, create=True),
+            patch.object(
+                gdn_backend, "buckets_keep_chunk_o_block_size", return_value=True
+            ),
+            patch.object(
+                gdn_backend, "get_exec", return_value=SimpleNamespace(graph=graph)
+            ),
+            patch(
+                "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
+                "get_prefill_num_tokens_to_capture",
+                return_value=[512],
+            ),
+        ):
+            yield backend
+
+    def test_the_switch_captures_the_extend_only_where_the_setup_supports_it(self):
+        """Off, the default, breakable prefill graphs keep breaking at every GDN
+        layer; on, they capture the target's extend only where this setup supports
+        the graph-safe chain, and a draft's prefill graphs keep their eager path."""
+        for switch, setup, captured in (
+            (False, {}, False),
+            (True, {}, True),
+            (True, dict(cuda=False), False),
+            (True, dict(enable_mis=True), False),
+            (True, dict(draft=True), False),
+        ):
+            with (
+                self.subTest(switch=switch, **setup),
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(switch),
+                self._setup(**setup) as backend,
+            ):
+                self.assertEqual(backend.supports_prefill_graph_extend(), captured)
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):

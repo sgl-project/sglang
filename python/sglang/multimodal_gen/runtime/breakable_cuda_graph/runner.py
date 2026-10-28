@@ -556,9 +556,13 @@ class BaseBreakableCudaGraphRunner:
 
         # Warm up on the capture stream so cuBLAS/cuDNN/Triton workspaces and
         # any lazy JIT are materialized before capture (mirrors the LLM runner
-        # and torch.cuda.make_graphed_callables).
+        # and torch.cuda.make_graphed_callables). The BCG flag makes the warmup
+        # take the branches the capture records.
         self.device_module.synchronize()
-        with self.device_module.stream(self._capture_stream):
+        with (
+            self.device_module.stream(self._capture_stream),
+            enable_breakable_cuda_graph(),
+        ):
             for _ in range(2):
                 self.transformer(**static_kwargs)
         self._capture_stream.synchronize()

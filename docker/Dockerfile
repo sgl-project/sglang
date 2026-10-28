@@ -631,7 +631,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # SM103, compiled at runtime); disable with --build-arg ENABLE_SGL_NVIDIA_MEGA=0.
 ARG ENABLE_SGL_NVIDIA_MEGA=1
 ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
-ARG SGL_NVIDIA_MEGA_COMMIT="d47deb3390e14741c9420ac702954e7611a14da1"
+ARG SGL_NVIDIA_MEGA_COMMIT="6fd7ac30371a45ef246bb9db2e3559c398156feb"
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ "${ENABLE_SGL_NVIDIA_MEGA}" != "1" ]; then \
         echo "[sgl-nvidia-mega] skip (ENABLE_SGL_NVIDIA_MEGA=${ENABLE_SGL_NVIDIA_MEGA})"; \

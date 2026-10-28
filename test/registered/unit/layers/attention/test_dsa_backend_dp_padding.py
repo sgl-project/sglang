@@ -4,6 +4,8 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention import graph_utils
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     _restore_trtllm_decode_dp_padding,
@@ -11,12 +13,14 @@ from sglang.srt.layers.attention.dsa_backend import (
 )
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class TestDSABackendDPPadding(unittest.TestCase):
+class TestDSABackendDPPadding(CustomTestCase):
     def test_occupied_uneven_decode_with_idle_rank_selects_max_len(self):
         with (
             patch(
@@ -54,6 +58,101 @@ class TestDSABackendDPPadding(unittest.TestCase):
         self.assertTrue(torch.equal(output[:6], real_output))
         self.assertTrue(torch.all(output[6:] == 0))
 
+    def test_sparse_prefill_restores_tp_padding(self):
+        """Sparse prefill must preserve real rows and zero-pad to the TP extent."""
+        for implementation in ("tilelang", "triton"):
+            for real_rows in (1, 34):
+                with self.subTest(implementation=implementation, real_rows=real_rows):
+                    self._check_sparse_prefill_padding(implementation, real_rows)
+
+    def _check_sparse_prefill_padding(self, implementation, real_rows):
+        rows = (real_rows + 3) // 4 * 4
+        q = torch.arange(rows * 2 * 3, dtype=torch.float32).view(rows, 2, 3)
+        layer = SimpleNamespace(
+            layer_id=0,
+            head_dim=3,
+            qk_head_dim=3,
+            v_head_dim=2,
+            tp_q_head_num=2,
+            is_cross_attention=False,
+            scaling=1.0,
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            out_cache_loc=torch.arange(rows),
+            positions=torch.arange(rows),
+            mha_return_lse=False,
+            _attn_output=None,
+        )
+        values = torch.arange(real_rows * 2 * 2, dtype=torch.float32).view(
+            1, real_rows, 2, 2
+        )
+        kernel = ModuleType(
+            "sglang.kernels.ops.attention.dsa."
+            + (
+                "tilelang_kernel"
+                if implementation == "tilelang"
+                else "triton_sparse_mla"
+            )
+        )
+
+        def fake_sparse_fwd(**kwargs):
+            query = kwargs.get("q", kwargs.get("q_nope"))
+            self.assertEqual(query.shape[0], real_rows)
+            return values
+
+        setattr(
+            kernel,
+            "tilelang_sparse_fwd"
+            if implementation == "tilelang"
+            else "triton_sparse_mla_fwd",
+            fake_sparse_fwd,
+        )
+        backend = SimpleNamespace(
+            dsa_prefill_impl=implementation,
+            use_mha=False,
+            use_fused_topk=True,
+            hisparse_coordinator=None,
+            dsa_index_kpool=1,
+            forward_metadata=SimpleNamespace(max_seq_len_k=64),
+            token_to_kv_pool=SimpleNamespace(
+                get_key_buffer=lambda _: torch.zeros(64, 1, 3),
+                set_mla_kv_buffer=lambda *args: None,
+            ),
+            _resolve_kpool_tail_backend=lambda indices, impl: impl,
+            _check_kpool_tail_backend=lambda *args: None,
+            get_topk_transform_method=lambda _: TopkTransformMethod.PAGED,
+            _pad_topk_indices=lambda indices, n: indices[:n],
+            _get_fused_topk_page_table=lambda indices: indices,
+        )
+        backend._forward_tilelang = MethodType(
+            DeepseekSparseAttnBackend._forward_tilelang, backend
+        )
+        backend.forward = MethodType(DeepseekSparseAttnBackend.forward_extend, backend)
+        with (
+            patch.dict("sys.modules", {kernel.__name__: kernel}),
+            patch.object(graph_utils, "get_attn_backend", return_value=backend),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.concat_mla_absorb_q_general",
+                side_effect=lambda q, rope: torch.cat((q, rope), dim=-1),
+            ),
+        ):
+            output = graph_utils._attention_on_real_rows(
+                layer,
+                real_rows,
+                q,
+                torch.zeros(rows, 1, 3),
+                torch.zeros(rows, 1, 2),
+                batch,
+                True,
+                topk_indices=torch.zeros(rows, 64, dtype=torch.int32),
+            )
+
+        self.assertEqual(output.shape, (rows, 2, 2))
+        torch.testing.assert_close(output[:real_rows], values[0])
+        self.assertTrue(torch.all(output[real_rows:] == 0))
+        self.assertEqual(batch.out_cache_loc.shape[0], rows)
+
     def test_rejects_metadata_larger_than_physical_batch(self):
         with self.assertRaisesRegex(
             AssertionError, "metadata batch size \\(3\\) exceeds q batch size \\(2\\)"
@@ -65,6 +164,12 @@ class TestDSABackendDPPadding(unittest.TestCase):
             )
 
     def test_trtllm_decode_runs_real_rows_then_restores_physical_batch(self):
+        self._check_trtllm_padding(is_prefill=False)
+
+    def test_trtllm_prefill_narrows_metadata_to_live_cp_queries(self):
+        self._check_trtllm_padding(is_prefill=True)
+
+    def _check_trtllm_padding(self, *, is_prefill):
         metadata = SimpleNamespace(
             cache_seqlens_int32=torch.tensor([8, 12], dtype=torch.int32),
             page_table_1=torch.zeros((2, 12), dtype=torch.int32),
@@ -110,6 +215,16 @@ class TestDSABackendDPPadding(unittest.TestCase):
         forward_batch = SimpleNamespace()
         q = torch.arange(4 * 2 * 3, dtype=torch.float32).view(4, 2, 3)
         topk_indices = torch.arange(4 * 2, dtype=torch.int32).view(4, 2)
+        if is_prefill:
+            # The CP graph bridge has removed padded Q rows; metadata was
+            # planned for the physical shard before entering the eager break.
+            q = q[:2]
+            topk_indices = topk_indices[:2]
+            metadata.cache_seqlens_int32 = torch.tensor(
+                [8, 12, 0, 0], dtype=torch.int32
+            )
+            backend.use_fused_topk = True
+            backend._get_fused_topk_page_table = lambda indices: indices
 
         flashinfer = ModuleType("flashinfer")
         flashinfer_decode = ModuleType("flashinfer.decode")
@@ -159,10 +274,12 @@ class TestDSABackendDPPadding(unittest.TestCase):
                 seq_lens=metadata.cache_seqlens_int32,
                 save_kv_cache=False,
                 topk_indices=topk_indices,
+                is_prefill=is_prefill,
             )
 
         self.assertEqual(captured["query"].shape, (2, 1, 2, 3))
-        self.assertEqual(output.shape, (4, 1, 2, 2))
+        self.assertEqual(captured["seq_lens"].tolist(), [8, 12])
+        self.assertEqual(output.shape, (2 if is_prefill else 4, 1, 2, 2))
         self.assertTrue(torch.all(output[:2] == 1))
         self.assertTrue(torch.all(output[2:] == 0))
 
