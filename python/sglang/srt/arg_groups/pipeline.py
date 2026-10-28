@@ -286,6 +286,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
         handle_moe_kernel_config,
+        resolve_ascend_ops_speculative_draft,
         validate_deepep_v2_dispatch_token_budget,
         validate_deepep_v2_speculative_draft,
         validate_flashinfer_a2a_token_budget,
@@ -304,6 +305,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
     run_hook(handle_speculative_decoding, server_args)
+    run_post_process_pass(server_args, resolve_ascend_ops_speculative_draft)
 
     from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 
