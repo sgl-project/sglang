@@ -133,6 +133,12 @@ _ATTENTION_BY_MODEL = {
 }
 
 
+# Model types whose BF16 ComfyUI file has been validated with online quantization.
+_SINGLE_FILE_ONLINE_QUANT = frozenset({"qwen_image21"})
+# Online FP8 drifts on Qwen-Image 2.1 (SSIM ~0.85 vs BF16), so only INT8 is allowed.
+_SINGLE_FILE_ONLINE_METHODS = frozenset({"convrot_int8"})
+
+
 def _unsupported(feature: str, model_type: str) -> ValueError:
     return ValueError(
         f"{feature} is not supported for {model_type} in ComfyUI integrated mode yet"
@@ -199,14 +205,25 @@ def _check_cache(model_type: str, opts: dict) -> None:
 
 
 def _check_weights(model_type: str, opts: dict, *, native_dir: bool) -> None:
-    if opts.get("quantization") and not native_dir:
-        raise ValueError(
-            "quantization (online, at load) applies to native model directories; "
-            "ComfyUI files carry their own format, so load a pre-quantized file "
-            "(e.g. *_int8_convrot) instead"
-        )
+    quantization = opts.get("quantization")
+    if quantization and not native_dir:
+        if model_type not in _SINGLE_FILE_ONLINE_QUANT:
+            raise ValueError(
+                f"quantization (online, at load) of a ComfyUI file is supported for "
+                f"{sorted(_SINGLE_FILE_ONLINE_QUANT)}; for {model_type} use a native "
+                "model directory or a pre-quantized file (e.g. *_int8_convrot)"
+            )
+        if quantization not in _SINGLE_FILE_ONLINE_METHODS:
+            raise ValueError(
+                f"quantization={quantization} needs a pre-quantized checkpoint; a "
+                f"BF16 ComfyUI file takes one of {sorted(_SINGLE_FILE_ONLINE_METHODS)}"
+            )
     kernel = opts.get("int8_kernel", "auto")
-    if kernel != "auto" and model_type not in H3_MODELS:
+    if (
+        kernel != "auto"
+        and model_type not in H3_MODELS
+        and model_type not in {"qwen_image21"}
+    ):
         raise ValueError(
             f"int8_gemm={kernel} has no effect on {model_type}: only MiniMax H3 "
             "runs ConvRot INT8 weights; leave it at auto"

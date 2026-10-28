@@ -34,10 +34,10 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
+from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
     update_trtllm_mha_graph_metadata,
 )
-from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
+from sglang.kernels.ops.attention.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -671,7 +671,7 @@ class HPCOpsAttnBackend(AttentionBackend):
         """Graph-splitting wrapper for the fused QKNorm+RoPE+FP8-quant+StoreKV op.
 
         Like ``RadixAttention._eager_attention``, this runs eagerly between captured
-        prefill-graph segments (at capture and at every replay), so the Python
+        prefill-graph segments (at every replay), so the Python
         hand-off of the dynamic Q scales to the following attention op stays
         alive. ``out_q`` is preallocated by the captured segment and mutated in
         place, which is what stitches the surrounding graph segments together.
