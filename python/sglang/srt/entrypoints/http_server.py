@@ -82,6 +82,7 @@ from sglang.srt.entrypoints.api_contract import generate_contract_error
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
+    node_hosts_rust_server,
     run_detokenizer_process,
     run_scheduler_process,
 )
@@ -121,6 +122,7 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
@@ -3167,9 +3169,12 @@ def launch_server(
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
         # 503 until it succeeds, so the main process does not warm up here.
-        if launch_callback is not None:
-            launch_callback()
-        scheduler_init_result.block_until_scheduler_exits()
+        # Every listener is bound before its scheduler reports ready, so the
+        # sidecar can connect at once.
+        with rust_server_sidecar(node_hosts_rust_server()):
+            if launch_callback is not None:
+                launch_callback()
+            scheduler_init_result.block_until_scheduler_exits()
     else:
         _setup_and_run_http_server(
             server_args,

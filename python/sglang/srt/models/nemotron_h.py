@@ -205,7 +205,7 @@ def _capture_prefill_shared_expert(module, hidden_states, call) -> None:
     # replay here: that graph has only been captured, not launched yet.
 
 
-@eager_on_graph(True, capture_stub=_capture_prefill_shared_expert)
+@eager_on_graph(True, on_capture=_capture_prefill_shared_expert)
 def _launch_prefill_shared_expert(module, hidden_states, call) -> None:
     # BCG retains this call, its graph, events and output until graph cleanup.
     # A replay launches on the same explicit stream for every layer.
