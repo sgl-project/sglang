@@ -55,7 +55,8 @@ class Qwen2DecoderLayer(Qwen2DecoderLayer):
         if layer_id == 0:
             del self.input_layernorm
 
-    def _attn_readout(self, layer_id: int):
+    @classmethod
+    def _attn_readout(cls, layer_id: int):
         if layer_id == 0:
             return PLAIN_READOUT
         return super()._attn_readout(layer_id)

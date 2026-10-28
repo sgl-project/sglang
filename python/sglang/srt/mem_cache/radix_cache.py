@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.events import KVCacheEventRecorder, LoRANameTable
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
@@ -71,7 +71,7 @@ class RadixKey:
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
-        # Namespaces the tree and storage; omitted from KV events.
+        # Namespaces the tree and storage; KV events see only its LoRA name.
         self.extra_key = extra_key
         # Namespaces the tree, storage and KV events.
         self.cache_salt = cache_salt or None
@@ -292,6 +292,8 @@ class RadixCache(BasePrefixCache):
         self.kv_events = KVCacheEventRecorder(
             enabled=params.enable_kv_cache_events and not self.disable,
             page_size=self.page_size,
+            dynamo_format=params.dynamo_kv_event_format,
+            lora_names=params.kv_event_lora_names,
         )
 
         if params.enable_metrics:
@@ -321,6 +323,8 @@ class RadixCache(BasePrefixCache):
         mock_allocator: Optional[Any] = None,
         page_size: int = 1,
         enable_kv_cache_events: bool = False,
+        dynamo_kv_event_format: bool = False,
+        kv_event_lora_names: Optional[LoRANameTable] = None,
     ) -> RadixCache:
         """Init a radix cache without memory pools for simulation purpose."""
         params = CacheInitParams(
@@ -329,6 +333,8 @@ class RadixCache(BasePrefixCache):
             token_to_kv_pool_allocator=mock_allocator,
             page_size=page_size,
             enable_kv_cache_events=enable_kv_cache_events,
+            dynamo_kv_event_format=dynamo_kv_event_format,
+            kv_event_lora_names=kv_event_lora_names,
         )
         return RadixCache(params)
 
@@ -491,7 +497,7 @@ class RadixCache(BasePrefixCache):
                         key=prompt_key,
                         value=values[: len(prompt_key)],
                         inserted_len=len(prompt_key),
-                        priority=priority + 1,
+                        priority=min(priority + 1, torch.iinfo(torch.int64).max),
                     )
                 )
 

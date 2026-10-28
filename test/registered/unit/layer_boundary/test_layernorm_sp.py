@@ -42,7 +42,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _initialize(*, enable=True, arch="Qwen3ForCausalLM"):
@@ -121,6 +121,10 @@ class TestLayerNormSPValidation(CustomTestCase):
     def test_rejects_speculative(self):
         with self.assertRaisesRegex(ValueError, "speculative"):
             validate_layernorm_sp(**{**self.VALID, "speculative_algorithm": "EAGLE3"})
+
+    def test_rejects_pipeline_parallelism(self):
+        with self.assertRaisesRegex(ValueError, "pipeline"):
+            validate_layernorm_sp(**{**self.VALID, "pp_size": 2})
 
 
 class _Norm:

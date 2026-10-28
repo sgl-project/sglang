@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=45, suite="base-a-test-cpu")
+register_cpu_ci(est_time=196, suite="base-a-test-cpu")
 
 import dataclasses
 import json
@@ -485,7 +485,7 @@ class TestStampedRanks(_IsolatedOverrides):
 
         self.addCleanup(restore)
         publish(
-            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=8),
+            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=4),
             role="test",
             ranks=SpawnRanks(world_rank=3),
         )
@@ -493,13 +493,14 @@ class TestStampedRanks(_IsolatedOverrides):
         dp_flags.use_world_group_for_gather = False
         self.assertEqual(dp_gather_slot(), parallel.attn_dp_rank)
 
-        # After a scale-up the gather spans the expanded WORLD, and the joining
-        # cohort is numbered from its offset.
+        # After scale-up the gather spans expanded WORLD, but its slots remain
+        # logical DP replicas. Physical ranks 8 and 9 therefore share DP slot 4.
         dp_flags.use_world_group_for_gather = True
         dp_flags.joiner_skip_all_gather = False
         parallel.override_permanently(ep_join_rank_offset=8)
-        self.assertEqual(dp_gather_slot(), 8 + parallel.tp_rank)
-        self.assertEqual(parallel.attn_dp_size, 8)
+        self.assertEqual(dp_gather_slot(), (8 + parallel.tp_rank) // 2)
+        self.assertEqual(parallel.attn_dp_size, 4)
+        self.assertEqual(parallel.attn_tp_size, 2)
         self.assertEqual(parallel.tp_size, 8)
 
     def test_a_scale_up_writes_no_width(self):
@@ -806,6 +807,40 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         reset_context()
         with self.assertRaises(ValueError):
             get_server_args()
+
+
+class TestEmbeddedRuntimeContext(unittest.TestCase):
+    def test_embedded_context_is_scoped_and_keeps_its_overrides(self):
+        """An embedded engine context must neither replace nor leak into the process one."""
+        from sglang.srt import runtime_context as rc
+
+        self.addCleanup(rc.restore_context, rc.snapshot_context())
+        rc.reset_context()
+        outer_args = ServerArgs(model_path="dummy", tp_size=1)
+        outer = publish(
+            outer_args, role="diffusion_gpu_worker", ranks=SpawnRanks(world_rank=0)
+        )
+        inner = rc.create_context(
+            ServerArgs(model_path="dummy", tp_size=2),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=1),
+        )
+        self.assertIs(get_context(), outer)
+
+        with self.assertRaisesRegex(RuntimeError, "inner failure"):
+            with rc.use_context(inner):
+                self.assertIs(get_parallel(), inner.parallel)
+                self.assertEqual(get_parallel().tp_rank, 1)
+                inner.override("encoder.setup", page_size=16)
+                raise RuntimeError("inner failure")
+        self.assertIs(get_context(), outer)
+        self.assertIs(get_server_args(), outer_args)
+        self.assertEqual(get_parallel().tp_rank, 0)
+        self.assertEqual(publish_role(), "diffusion_gpu_worker")
+        self.assertNotEqual(rc.get_schedule().page_size, 16)
+
+        with rc.use_context(inner):
+            self.assertEqual(rc.get_schedule().page_size, 16)
 
 
 class TestAssertPublished(_IsolatedServerArgs):
@@ -1126,6 +1161,26 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertTrue(get_moe_a2a_backend().is_deepep())
         self.assertFalse(get_flags().moe.disable_fp4_allgather)
         self.assertFalse(get_flags().moe.speculative_context)
+
+    def test_flashinfer_megamoe_speculative_defaults(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "flashinfer_trtllm")
+        self.assertTrue(moe.speculative_a2a_backend.is_none())
+
+    def test_flashinfer_megamoe_speculative_explicit_wins(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+            speculative_moe_runner_backend="triton",
+            speculative_moe_a2a_backend="deepep",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "triton")
+        self.assertTrue(moe.speculative_a2a_backend.is_deepep())
 
     def test_swap_restores_on_exception(self):
         from sglang.srt.layers.moe.utils import (

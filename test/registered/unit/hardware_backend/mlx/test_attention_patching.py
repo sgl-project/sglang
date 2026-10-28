@@ -1247,7 +1247,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             mamba_track_mask_next_cpu=None,
             mamba_decode_batch_idx_cpu=None,
         )
-        result = SimpleNamespace()
+        result = GenerationBatchResult()
         i = 0
         logits_output = SimpleNamespace(customized_info=None)
         original_release = batch_result_processor_module.release_kv_cache
