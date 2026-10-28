@@ -457,12 +457,16 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             audio_feature_lengths = output["feature_attention_mask"].sum(-1)
 
         mrope_result = None
+        # The scheduler fallback has no mm_spans and, like legacy's, takes get_rope_index.
         if (
             video_grid_thw is None
             and second_per_grid_ts is None
             and audio_feature_lengths is None
+            and "mm_spans" in output
         ):
-            mrope_result = self._image_only_mrope_positions(input_ids, image_grid_thw)
+            mrope_result = self._image_only_mrope_positions(
+                input_ids, image_grid_thw, output["mm_spans"]
+            )
         if mrope_result is None:
             mrope_result = get_rope_index(
                 spatial_merge_size=self.mm_token_expansion_params["spatial_merge_size"],
@@ -489,9 +493,9 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         return mrope_positions, mrope_position_delta
 
     # Adapted from sglang.srt.multimodal.processors.qwen_vl.QwenVLImageProcessor._compute_image_only_mrope_positions_from_offsets;
-    # spans come from image-token runs in input_ids, not mm_items offsets.
-    def _image_only_mrope_positions(self, input_ids, image_grid_thw):
-        """get_rope_index for image-only prompts, from each image's token span.
+    # spans come from the core's mm_spans, not mm_items offsets.
+    def _image_only_mrope_positions(self, input_ids, image_grid_thw, mm_spans):
+        """get_rope_index for image-only prompts, from each image's [start, end) span.
 
         Returns None when the model or the prompt layout is outside this fast path.
         """
@@ -503,9 +507,7 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             "qwen4_exp",
         ):
             return None
-        spans = _token_spans(
-            input_ids, self.mm_token_expansion_params["image_token_id"]
-        )
+        spans = [span for media_spans in mm_spans for span in media_spans]
         if len(spans) != image_grid_thw.shape[0]:
             return None
 
@@ -527,7 +529,7 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
                 next_pos += text_len
             llm_grid_t, h, w = [int(x) for x in grid.tolist()]
             llm_grid_h, llm_grid_w = h // merge_size, w // merge_size
-            if llm_grid_t * llm_grid_h * llm_grid_w != end - start + 1:
+            if llm_grid_t * llm_grid_h * llm_grid_w != end - start:
                 return None
             t_index = (
                 torch.arange(llm_grid_t, dtype=dtype, device=device)
@@ -551,7 +553,7 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
                 torch.stack([t_index, h_index, w_index]) + next_pos
             )
             next_pos += max(llm_grid_t, llm_grid_h, llm_grid_w)
-            st = end + 1
+            st = end
         if st < input_len:
             position_segments.append(
                 torch.arange(input_len - st, dtype=dtype, device=device)
@@ -562,14 +564,6 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         mrope_positions = torch.cat(position_segments, dim=1).unsqueeze(1)
         mrope_position_delta = (mrope_positions.max() + 1 - input_len).reshape(1, 1)
         return mrope_positions, mrope_position_delta
-
-
-def _token_spans(input_ids, token_id):
-    """Inclusive (start, end) of each contiguous run of token_id."""
-    mask = input_ids == token_id
-    starts = (mask & ~torch.roll(mask, 1)).nonzero(as_tuple=True)[0]
-    ends = (mask & ~torch.roll(mask, -1)).nonzero(as_tuple=True)[0]
-    return list(zip(starts.tolist(), ends.tolist()))
 
 
 # Adapted from sglang.srt.disaggregation.encoder.preprocessor.EncoderPreprocessor._calculate_timestamps;
