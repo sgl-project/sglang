@@ -124,7 +124,7 @@ jobs:
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
-    if: false
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -139,7 +139,7 @@ jobs:
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
-    if: false
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -155,7 +155,7 @@ jobs:
   # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
   nightly-4-npu-a3:
     name: nightly-4-npu-a3
-    if: false
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -171,7 +171,7 @@ jobs:
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
-    if: false
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -186,7 +186,7 @@ jobs:
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
-    if: false
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -201,7 +201,7 @@ jobs:
 
   nightly-perf-2-npu-a3:
     name: nightly-perf-2-npu-a3
-    if: false
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -217,7 +217,7 @@ jobs:
 
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
-    if: false
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -233,7 +233,7 @@ jobs:
 
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
-    if: false
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -251,7 +251,7 @@ jobs:
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
-    if: false
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -268,7 +268,7 @@ jobs:
 
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
-    if: false
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -276,31 +276,6 @@ jobs:
       test_type: 'accuracy'
       test_suite: nightly-acc-16-npu-a3
       is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
-  # Single-point validation for the 4 CPU-mock NPU unit tests that used to be
-  # registered to `base-a-test-cpu`, a suite the PR pipeline no longer runs:
-  # test_npu_dcp, test_npu_cudagraph_backend, test_npu_graph_runner and
-  # test_npu_gemma_rmsnorm. Those registrations are nightly=False, so this job
-  # must keep is_nightly_pipeline_job: false -- with --nightly, filter_tests
-  # (t.nightly == nightly) would drop every case in the suite.
-  stage-a-unit-test-npu:
-    name: stage-a-unit-test-npu
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-2-
-      test_type: 'unit'
-      test_suite: stage-a-unit-test-npu
-      is_nightly_pipeline_job: false
-      # These files register nightly=False, so --nightly is not an option; keep
-      # going after a failing file so one run reports every stale case at once.
-      continue_on_error: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
@@ -326,7 +301,7 @@ jobs:
 #       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: false
+    if: ${{ !cancelled() }}
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
@@ -374,7 +349,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: false
+    if: ${{ !cancelled() }}
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
@@ -405,7 +380,7 @@ jobs:
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   check-all-jobs:
-    if: false
+    if: ${{ !cancelled() }}
     needs:
       - nightly-1-npu-a3
       - nightly-2-npu-a3
@@ -417,7 +392,6 @@ jobs:
       - nightly-perf-16-npu-a3
       - nightly-acc-2-npu-a3
       - nightly-acc-16-npu-a3
-      - stage-a-unit-test-npu
 #       - nightly-acc-4-npu-a5 # TEMP: disabled with job above (A5 power maintenance)
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
@@ -440,8 +414,7 @@ jobs:
             "${{ needs.nightly-perf-4-npu-a3.result }}" \
             "${{ needs.nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "${{ needs.nightly-acc-16-npu-a3.result }}" \
-            "${{ needs.stage-a-unit-test-npu.result }}"; do
+            "${{ needs.nightly-acc-16-npu-a3.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
             # "${{ needs.nightly-acc-4-npu-a5.result }}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
@@ -473,8 +446,7 @@ jobs:
             "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
             "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
             "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}" \
-            "stage-a-unit-test-npu:${{ needs.stage-a-unit-test-npu.result }}"; do
+            "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
             # "nightly-acc-4-npu-a5:${{ needs.nightly-acc-4-npu-a5.result }}"; do
             suite="${entry%%:*}"

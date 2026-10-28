@@ -10,7 +10,7 @@ from sglang.srt.hardware_backend.npu.graph_runner import npu_graph_runner as mod
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=12, suite="stage-a-unit-test-npu")
+register_npu_ci(est_time=12, suite="base-a-test-npu")
 
 
 def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():

@@ -9,7 +9,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=2, suite="stage-a-unit-test-npu")
+register_npu_ci(est_time=2, suite="base-a-test-npu")
 
 
 @pytest.mark.parametrize(
