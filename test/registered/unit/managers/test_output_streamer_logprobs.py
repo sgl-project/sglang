@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
@@ -36,7 +37,10 @@ class _FakeReq:
         self.reasoning_tokens = 0
         self.cached_tokens = 0
         self.retraction_count = 0
-        self.time_stats = None
+        self.time_stats = SimpleNamespace(
+            prefill_finished_time=0.0, enable_metrics=False
+        )
+        self.weight_version_events = []
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
         self.mm_video_tokens = 0
@@ -106,6 +110,52 @@ class TestOutputStreamerLogprobs(unittest.TestCase):
 
         self.assertEqual(accumulator.rids, ["req"])
         self.assertEqual(accumulator.cached_tokens, [7])
+
+
+class TestOutputStreamerReasoningUsage(unittest.TestCase):
+    def test_reasoning_usage_matches_retained_prefix(self):
+        # 99 closes reasoning; tokens after it are ordinary content.
+        cases = (
+            ([10, 11, 12, 13], 2, 2),  # Stop inside reasoning.
+            ([10, 99, 20, 21], 1, 1),  # Stop before the reasoning end tag.
+            ([10, 99, 20, 21], 2, 2),  # Stop at the end tag.
+            ([10, 99, 20, 21], 3, 2),  # Stop inside content.
+            ([10, 99, 20, 21], 4, 2),  # No discarded tokens.
+        )
+        for tokens, retained, expected in cases:
+            for stream in (False, True):
+                for rust in (False, True):
+                    with self.subTest(
+                        tokens=tokens, retained=retained, stream=stream, rust=rust
+                    ):
+                        req = _FakeReq(is_retracted=False, max_new_tokens=16)
+                        req.output_ids = tokens
+                        req._is_reasoning_over = False
+                        req._think_end_matcher = None
+                        req._think_end_match_len = 0
+                        Req.update_reasoning_tokens(req, tokens, [99])
+                        original_count = req.reasoning_tokens
+                        req.finished_len = retained
+                        req.output_ids_through_stop = Req.output_ids_through_stop.fget(
+                            req
+                        )
+                        req.finished = lambda: True
+                        req.finished_reason = SimpleNamespace(
+                            to_json=lambda: {"type": "stop"}
+                        )
+                        req.stream = stream
+                        # Streaming usage is cumulative, even after a prior emission.
+                        req.send_token_offset = 1 if stream else 0
+                        accumulator = _make_accumulator(rust_server_mode=rust)
+                        accumulator.accept(req=req)
+                        self.assertEqual(accumulator.reasoning_tokens, [expected])
+                        self.assertEqual(req.reasoning_tokens, original_count)
+                        self.assertEqual(
+                            accumulator.output_ids,
+                            [tokens[1 if stream else 0 : retained]],
+                        )
+                        if not rust:
+                            self.assertEqual(accumulator.completion_tokens, [retained])
 
 
 if __name__ == "__main__":
