@@ -590,7 +590,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_int4_weight_packed_with_c
   return std::make_tuple(std::move(blocked_weight), std::move(blocked_scales), std::move(blocked_qzeros));
 }
 
-std::tuple<at::Tensor, at::Tensor> unpack_4bit_to_32bit_signed(const at::Tensor& qweight, const at::Tensor& qzeros) {
+std::tuple<at::Tensor, at::Tensor>
+unpack_4bit_to_32bit_signed(const at::Tensor& qweight, const at::Tensor& qzeros, bool gptq_is_symmetric) {
   TORCH_CHECK(qweight.scalar_type() == at::kInt, "qweight must be int32");
   TORCH_CHECK(qzeros.scalar_type() == at::kInt, "qzeros must be int32");
   const auto W0 = qweight.size(0);
@@ -626,15 +627,17 @@ std::tuple<at::Tensor, at::Tensor> unpack_4bit_to_32bit_signed(const at::Tensor&
 
     for (int64_t row = 0; row < Z0; ++row) {
       int32_t v = qz_ptr[row * Z1 + src_col];
-      uz_ptr[row * (Z1 * 8) + col] = static_cast<int8_t>((v >> shift) & 0xF);
+      // Symmetric uint4 uses zero point 2^(4-1)=8.
+      uz_ptr[row * (Z1 * 8) + col] =
+          gptq_is_symmetric ? static_cast<int8_t>(1 << (4 - 1)) : static_cast<int8_t>(((v >> shift) & 0xF) + 1);
     }
   }
 
-  return std::make_tuple(unpacked_weights, unpacked_zeros + 1);
+  return std::make_tuple(unpacked_weights, unpacked_zeros);
 }
 
 std::tuple<at::Tensor, at::Tensor>
-autogptq_to_int4pack(const at::Tensor& qweight_tensor, const at::Tensor& qzeros_tensor) {
+autogptq_to_int4pack(const at::Tensor& qweight_tensor, const at::Tensor& qzeros_tensor, bool gptq_is_symmetric) {
   TORCH_CHECK(qweight_tensor.scalar_type() == at::kInt, "qweight_tensor must be int32");
   TORCH_CHECK(qzeros_tensor.scalar_type() == at::kInt, "qzeros_tensor must be int32");
   TORCH_CHECK(qweight_tensor.is_cpu(), "CPU only implementation");
@@ -645,7 +648,7 @@ autogptq_to_int4pack(const at::Tensor& qweight_tensor, const at::Tensor& qzeros_
     qweight_list.reserve(B);
     qzeros_list.reserve(B);
     for (int64_t i = 0; i < B; ++i) {
-      auto outputs = unpack_4bit_to_32bit_signed(qweight_tensor[i], qzeros_tensor[i]);
+      auto outputs = unpack_4bit_to_32bit_signed(qweight_tensor[i], qzeros_tensor[i], gptq_is_symmetric);
       at::Tensor unpacked_qweight = std::get<0>(outputs);
       at::Tensor unpacked_qzeros = std::get<1>(outputs);
       qweight_list.push_back(unpacked_qweight.transpose(0, 1).contiguous().to(at::kByte));
@@ -653,7 +656,7 @@ autogptq_to_int4pack(const at::Tensor& qweight_tensor, const at::Tensor& qzeros_
     }
     return std::make_tuple(at::stack(qweight_list).detach(), at::stack(qzeros_list).detach());
   }
-  auto outputs = unpack_4bit_to_32bit_signed(qweight_tensor, qzeros_tensor);
+  auto outputs = unpack_4bit_to_32bit_signed(qweight_tensor, qzeros_tensor, gptq_is_symmetric);
   at::Tensor unpacked_qweight = std::get<0>(outputs);
   at::Tensor unpacked_qzeros = std::get<1>(outputs);
   at::Tensor return_qweight = unpacked_qweight.transpose(0, 1).contiguous().to(at::kByte);
@@ -661,7 +664,8 @@ autogptq_to_int4pack(const at::Tensor& qweight_tensor, const at::Tensor& qzeros_
   return std::make_tuple(return_qweight, return_qzeros);
 }
 
-std::tuple<at::Tensor, at::Tensor> int4pack(at::Tensor qweight, at::Tensor qzeros, int64_t quant_method_4bit) {
+std::tuple<at::Tensor, at::Tensor>
+int4pack(at::Tensor qweight, at::Tensor qzeros, int64_t quant_method_4bit, bool gptq_is_symmetric) {
   if (quant_method_4bit == CPUQuantAlgo::AWQ) {
     // autoawq unpacking
     qweight = qweight.contiguous();
@@ -677,7 +681,7 @@ std::tuple<at::Tensor, at::Tensor> int4pack(at::Tensor qweight, at::Tensor qzero
     return std::make_tuple(qweight_final, qzeros_final);
   } else if (quant_method_4bit == CPUQuantAlgo::GPTQ) {
     // autogptq unpacking
-    auto outputs = autogptq_to_int4pack(qweight, qzeros);
+    auto outputs = autogptq_to_int4pack(qweight, qzeros, gptq_is_symmetric);
     at::Tensor unpacked_qweight = std::get<0>(outputs);
     at::Tensor unpacked_qzeros = std::get<1>(outputs);
     return std::make_tuple(unpacked_qweight, unpacked_qzeros);
@@ -690,11 +694,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
     at::Tensor qweight,  // awq: (*, K, N / 8)  ||  gptq: (*, K / 8, N) , int32
     at::Tensor qzeros,   // awq: (*, K / group_size, N / 8) ||  gptq: (*, K / group_size, N / 8) , int32
     at::Tensor scales,   // awq: (*, K / group_size, N) ||  gptq: (*, K / group_size, N) , bfloat16
-    int64_t quant_method_4bit) {
+    int64_t quant_method_4bit,
+    bool gptq_is_symmetric) {
   at::Tensor _qweight;
   at::Tensor _qzeros;
 
-  auto res = int4pack(qweight, qzeros, quant_method_4bit);
+  auto res = int4pack(qweight, qzeros, quant_method_4bit, gptq_is_symmetric);
   _qweight = std::get<0>(res);
   _qzeros = std::get<1>(res);
 

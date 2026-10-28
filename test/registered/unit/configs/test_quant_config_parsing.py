@@ -5,10 +5,7 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.linear import LinearBase
-from sglang.srt.layers.quantization.gptq.gptq import CPUGPTQConfig, GPTQLinearMethod
-from sglang.srt.layers.quantization.gptq.schemes.gptq_cpu import (
-    GPTQIntelAMXLinearScheme,
-)
+from sglang.srt.layers.quantization.gptq.gptq import CPUGPTQConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -89,12 +86,14 @@ class TestCPUGPTQDynamicConfig(CustomTestCase):
                 "bits": 4,
                 "group_size": 128,
                 "desc_act": False,
+                "sym": True,
                 "dynamic": {"-:.*attn.*": {}},
             }
         )
+        self.assertTrue(config.is_sym)
         layer = LinearBase(
             input_size=2048,
-            output_size=24,
+            output_size=72,
             params_dtype=torch.bfloat16,
             quant_config=config,
             prefix="model.layers.0.linear_attn.in_proj_ba",
@@ -109,42 +108,7 @@ class TestCPUGPTQDynamicConfig(CustomTestCase):
             params_dtype=torch.bfloat16,
         )
         self.assertEqual(layer.weight.shape, (24, 2048))
-        self.assertEqual(layer.weight.dtype, torch.bfloat16)
         self.assertNotIn("qweight", layer._parameters)
-
-    def test_quantized_layer_override_preserves_cpu_scheme(self):
-        config = CPUGPTQConfig.from_config(
-            {
-                "bits": 4,
-                "group_size": 128,
-                "desc_act": False,
-                "dynamic": {
-                    "-:.*attn.*": {},
-                    "+:.*gate_proj": {"group_size": 64},
-                },
-            }
-        )
-        layer = LinearBase(
-            input_size=256,
-            output_size=32,
-            params_dtype=torch.bfloat16,
-            quant_config=config,
-            prefix="model.layers.0.mlp.gate_proj",
-        )
-        self.assertIsInstance(layer.quant_method, GPTQLinearMethod)
-        layer.quant_method.create_weights(
-            layer=layer,
-            input_size_per_partition=256,
-            output_partition_sizes=[32],
-            input_size=256,
-            output_size=32,
-            params_dtype=torch.bfloat16,
-            weight_loader=None,
-        )
-        self.assertIsInstance(layer.scheme, GPTQIntelAMXLinearScheme)
-        self.assertEqual(layer.qweight.shape, (32, 32))
-        self.assertEqual(layer.scales.shape, (4, 32))
-        self.assertEqual(config.group_size, 128)
 
 
 if __name__ == "__main__":

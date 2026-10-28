@@ -387,7 +387,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
     at::Tensor qweight,  // awq: (*, K, N / 8)  ||  gptq: (*, K / 8, N) , int32
     at::Tensor qzeros,   // awq: (*, K / group_size, N / 8) ||  gptq: (*, K / group_size, N / 8) , int32
     at::Tensor scales,   // awq: (*, K / group_size, N) ||  gptq: (*, K / group_size, N) , bfloat16
-    int64_t quant_method_4bit);
+    int64_t quant_method_4bit,
+    bool gptq_is_symmetric);
 #endif
 
 // gemm
@@ -894,7 +895,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // weight prepack for int4 weights
   m.def(
-      "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales, int quant_method_4bit) -> (Tensor, "
+      "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales, int quant_method_4bit, "
+      "bool gptq_is_symmetric=False) -> (Tensor, "
       "Tensor, Tensor)");
   m.impl("convert_weight_packed_scale_zp", torch::kCPU, &convert_weight_packed_scale_zp);
 #endif
