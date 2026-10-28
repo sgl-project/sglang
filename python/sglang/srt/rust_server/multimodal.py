@@ -425,6 +425,7 @@ class RustMmProcessor:
             modality=_MODALITIES[item["modality"]],
             feature=feature,
             hash=item["hash"],
+            identity=bytes(item["identity"]),
             offsets=[tuple(span) for span in item["offsets"]],
             model_specific_data={
                 "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)

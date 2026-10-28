@@ -66,6 +66,7 @@ class TestWrapEncoded(CustomTestCase):
                         {
                             "modality": "image",
                             "hash": item_hash,
+                            "identity": [item_hash] * 32,
                             "offsets": [list(offset)],
                             "model_specific_data": {"image_grid_thw": list(grid)},
                         }
@@ -113,14 +114,14 @@ class TestWrapEncoded(CustomTestCase):
         with (
             patch.dict(os.environ, {"SGLANG_MM_PRECOMPUTE_HASH": "1"}),
             patch(
-                "sglang.srt.managers.mm_utils.hash_feature",
+                "sglang.srt.managers.mm_utils.hash_feature_digest",
                 side_effect=AssertionError("scheduler loop must not hash features"),
             ),
         ):
             output, _ = self.build()
         for item, item_hash in zip(output.mm_items, self.HASHES):
-            expected = MultimodalDataItem(modality=Modality.IMAGE, hash=item_hash)
-            expected.set_pad_value()
+            expected = MultimodalDataItem(modality=Modality.IMAGE)
+            expected.set_identity(bytes([item_hash] * 32))
             self.assertEqual(item.padding_values(), expected.padding_values())
             self.assertEqual(len(item.padding_values()), 4)
 
