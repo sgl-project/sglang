@@ -23,7 +23,8 @@ defaults:
 | `replication` | How many copies are there? | `none` (default): one table, its rows split across the TP group. `per_node`: each node holds the whole table, mapped by all of its ranks. |
 | `lookup` | How does a rank get rows another rank holds? Only with `replication` `none`. | `auto` (default): a collective SGLang picks for each step. `all_reduce`, `reduce_scatter`, `all_to_all`: that collective (see below). `peer_read`: each rank reads its tokens' rows straight from the owning GPU's shard over NVLink, with no collective. |
 
-The resolved configuration is logged at startup as `DeepSeek-V4.1 Engram tables: ...`.
+The configuration is logged at startup as `DeepSeek-V4.1 Engram tables: ...`, and the lookup
+`auto` resolves to, once the model is built, as `Engram lookup auto -> ...`.
 
 ```bash
 # Default: rows split across the TP group in GPU memory.
@@ -60,17 +61,22 @@ TP group. The lookup gathers every rank's hash ids, looks up rows, and exchanges
   rank its part. It moves `1 / tp_size` of the bytes the other two move, and needs the 24 hash
   columns to divide over the TP group (DP 2, 3, 4, 6, 8 and 12).
 
-On CUDA, with one DP rank per TP rank and no context parallelism, `auto` uses `all_to_all` for
-eager prefill batches whenever the columns divide, and elsewhere keeps the collective it used
-before (a reduce-scatter for decode batches, an all-reduce otherwise). Measured on GB300, B300 and
-H200 at DP 2-8 with host tables, from 512 to 65,536 tokens per rank, `all_to_all` was the fastest
-of the three in 134 of 144 shapes, and in all 96 from 8,192 tokens per rank up, where it was 8-62%
-faster than the all-reduce. Below that, another choice was ahead by at most 85 us. Every
-choice returns the same rows.
+On CUDA, with one DP rank per TP rank and no context parallelism, `auto` uses `all_to_all`
+whenever the columns divide, for prefill and decode batches alike, in CUDA graphs too; only a
+prefill batch of uneven per-rank counts captured in a CUDA graph keeps the earlier collective.
+Measured on GB300, B300 and H200 at DP 2-8 with host tables:
 
-An explicit `all_reduce`, `reduce_scatter` or `all_to_all` applies to the same eager prefill
-lookups; decode batches and CUDA-graph replays keep their collective, and without DP attention the
-lookup is always an all-reduce.
+- Prefill, 512 to 65,536 tokens per rank, uniform or skewed: `all_to_all` was the fastest of the
+  three in 134 of 144 shapes, and in all 96 from 8,192 tokens per rank up, where it was 8-62%
+  faster than the all-reduce. Below that, another choice was ahead by at most 85 us.
+- Decode under CUDA graphs, 16 to 1,280 tokens per rank: from DP 4, `all_to_all` was up to 48%
+  faster than the reduce-scatter decode used before, and at most 12 us behind at 64 tokens per rank
+  or fewer; at DP 2 it was at most 20 us behind and up to 53 us ahead.
+
+Every choice returns the same rows. `all_reduce` keeps the collectives used before `auto` (an
+all-reduce for prefill, a reduce-scatter for decode), and an explicit `reduce_scatter` or
+`all_to_all` applies to prefill and decode alike. Without DP attention the lookup is always an
+all-reduce.
 
 ## Requirements and limits
 
