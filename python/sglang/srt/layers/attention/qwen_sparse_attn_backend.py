@@ -1633,7 +1633,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             # gathered new K/V was just written), so read it in place instead of
             # packing each request's whole context per layer.
             pool = self.token_to_kv_pool
-            metadata = self._resolve_metadata(forward_batch)
             output = sparse_gqa_paged_prefill_triton(
                 q,
                 pool.get_key_buffer(layer.layer_id),
@@ -1645,6 +1644,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 layer.scaling,
                 max_q=meta.max_seqlen_q_combined,
             )
+            if pending is not None:
+                # Keep the prefetched K/V alive through the cache write above.
+                get_stream("qsa_cp_kv").wait_stream(torch.cuda.current_stream())
             return self._pad_extend_output(output, num_output_rows)
         if any(prefix_lens):
             # The all-gather contains only new tokens. Prefix K/V is already
