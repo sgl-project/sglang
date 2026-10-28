@@ -76,7 +76,7 @@ jobs:
         run: |
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sgl-eval==0.1.3" "antlr4-python3-runtime==4.9.3"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
           # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
@@ -184,7 +184,7 @@ jobs:
         run: |
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sgl-eval==0.1.3" "antlr4-python3-runtime==4.9.3"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
           # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
@@ -281,7 +281,7 @@ jobs:
         run: |
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sgl-eval==0.1.3" "antlr4-python3-runtime==4.9.3"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
           # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
@@ -378,7 +378,7 @@ jobs:
         run: |
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sgl-eval==0.1.3" "antlr4-python3-runtime==4.9.3"
           docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
           # Diffusion extras
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
