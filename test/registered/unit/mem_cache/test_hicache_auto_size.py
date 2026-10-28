@@ -121,12 +121,36 @@ class TestHiCacheAutoSize(CustomTestCase):
             ratio = get_memory().hicache_ratio
             self.assertLess(ratio, 2.0)
             host = MHATokenToKVPoolHost(
-                pool, ratio, 0, 2, "layer_first", pin_memory=False, device="cpu"
+                pool.get_device_pool_infos()[0].buffer_info,
+                ratio,
+                0,
+                2,
+                "layer_first",
+                pin_memory=False,
+                device="cpu",
+                device_capacity_tokens=pool.size
+                if pool.host_capacity_tokens is None
+                else pool.host_capacity_tokens,
+                start_layer=pool.start_layer,
+                end_layer=pool.end_layer,
+                write_back_staging=pool.hicache_write_back_staging,
             )
             self.assertLessEqual(host.size * host.size_per_token, 0.8 * rank_budget)
             with self.assertRaisesRegex(ValueError, "Not enough host memory"):
                 MHATokenToKVPoolHost(
-                    pool, ratio, 0, 2, "layer_first", pin_memory=False, device="cpu"
+                    pool.get_device_pool_infos()[0].buffer_info,
+                    ratio,
+                    0,
+                    2,
+                    "layer_first",
+                    pin_memory=False,
+                    device="cpu",
+                    device_capacity_tokens=pool.size
+                    if pool.host_capacity_tokens is None
+                    else pool.host_capacity_tokens,
+                    start_layer=pool.start_layer,
+                    end_layer=pool.end_layer,
+                    write_back_staging=pool.hicache_write_back_staging,
                 )
         self.assertIsNone(base._host_memory_budget.get())
 

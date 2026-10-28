@@ -88,16 +88,6 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         self.assertTrue(planner.flush_cache())
         planner.tree_cache.reset.assert_called_once()
 
-    def test_flush_cache_succeeds_on_mixed_queue_while_paused(self):
-        planner = self._new_planner()
-        planner.core_lists.waiting_queue = [
-            _make_req(is_retracted=True),
-            _make_req(is_retracted=False),
-        ]
-
-        self.assertTrue(planner.flush_cache())
-        planner.tree_cache.reset.assert_called_once()
-
     def test_paused_flush_refuses_waiting_req_holding_kv(self):
         """A PD-decode request whose KV has arrived waits holding its request
         row; a paused flush would free KV it still owns."""

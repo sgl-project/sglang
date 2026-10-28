@@ -39,7 +39,13 @@ class TestLMHeadFP32(CustomTestCase):
         ):
             raise unittest.SkipTest("needs CUDA GPU or XPU")
 
-    def _make_logprocessor(self, vocab_size, enable_fp32, config_enable_fp32=False):
+    def _make_logprocessor(
+        self,
+        vocab_size,
+        enable_fp32,
+        config_enable_fp32=False,
+        processor_cls=LogitsProcessor,
+    ):
         # LogitsProcessor reads get_exec().features.enable_fp32_lm_head
         # from the published config.
         override = get_context().override_server_args(enable_fp32_lm_head=enable_fp32)
@@ -50,8 +56,9 @@ class TestLMHeadFP32(CustomTestCase):
             final_logit_softcapping=None,
             enable_lm_head_fp32=config_enable_fp32,
         )
-        return LogitsProcessor(cfg, skip_all_gather=True, logit_scale=None)
+        return processor_cls(cfg, skip_all_gather=True, logit_scale=None)
 
+    @torch.inference_mode()
     def _run_case(
         self,
         hidden_state_dtype,
@@ -123,10 +130,15 @@ class TestLMHeadFP32(CustomTestCase):
         self.assertEqual(state["operation"], expected_operation)
         self.assertEqual(state["a"], expected_a_dtype)
         self.assertEqual(state["b"], expected_b_dtype)
-        self.assertEqual(
-            state["out_dtype"],
-            torch.float32 if expected_operation == "mm" else None,
+        expected_out_dtype = torch.float32 if expected_operation == "mm" else None
+        self.assertEqual(state["out_dtype"], expected_out_dtype)
+        reference = F.linear(
+            hidden_state.to(expected_a_dtype).double(),
+            head.weight.to(expected_b_dtype).double(),
         )
+        if expected_out_dtype is None:
+            reference = reference.to(expected_a_dtype)
+        torch.testing.assert_close(logits, reference.float(), rtol=1e-5, atol=1e-5)
 
     def test_flag_true_fp16_activations(self):
         expected_operation = "mm" if torch.cuda.is_available() else "matmul"
@@ -168,7 +180,12 @@ class TestLMHeadFP32(CustomTestCase):
 
     def test_flag_false_fp16_path(self):
         self._run_case(
-            torch.float16, False, torch.float16, torch.float16, torch.float16, "matmul"
+            torch.float16,
+            False,
+            torch.float16,
+            torch.float16,
+            torch.float16,
+            "matmul",
         )
 
     def test_flag_false_bf16_path(self):
@@ -180,6 +197,93 @@ class TestLMHeadFP32(CustomTestCase):
             torch.bfloat16,
             "matmul",
         )
+
+    @torch.inference_mode()
+    def test_logits_buffer_shapes_and_transforms(self):
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA fp32 GEMM output")
+        from sglang.srt.models.muse_spark import MuseSpark1xLogitsProcessor
+
+        cases = [
+            (128, 2, True, None, None),
+            (129, 2, True, None, None),
+            (128, 3, True, None, None),
+            (128, 2, False, None, None),
+            (128, 2, True, 0.5, None),
+            (128, 2, True, None, 3.0),
+            (129, 2, True, 0.5, 3.0),
+        ]
+        for processor_cls in (LogitsProcessor, MuseSpark1xLogitsProcessor):
+            for dtype in (torch.bfloat16, torch.float16):
+                for vocab, rows, use_buffer, scale, softcap in cases:
+                    with self.subTest(
+                        processor=processor_cls.__name__,
+                        dtype=dtype,
+                        case=(vocab, rows, use_buffer, scale, softcap),
+                    ):
+                        processor = self._make_logprocessor(
+                            vocab, False, processor_cls=processor_cls
+                        )
+                        processor.logit_scale = scale
+                        processor.final_logit_softcapping = softcap
+                        padded_vocab = ((vocab + 127) // 128) * 128
+                        head = LMHeadStub(padded_vocab, 64, dtype)
+                        hidden = torch.randn(2, 64, device=get_device(), dtype=dtype)
+                        buffer = torch.full(
+                            (rows, vocab), float("nan"), device=get_device()
+                        )
+                        meta = DummyMeta()
+                        meta.next_token_logits_buffer = buffer
+                        logits = processor._get_logits(
+                            hidden, head, meta, use_logits_buffer=use_buffer
+                        )
+                        reference = F.linear(hidden.double(), head.weight.double())[
+                            :, :vocab
+                        ]
+                        direct = use_buffer and rows == 2 and padded_vocab == vocab
+                        reference = reference.to(
+                            torch.float32
+                            if direct or processor_cls is MuseSpark1xLogitsProcessor
+                            else dtype
+                        )
+                        if scale is not None:
+                            reference *= scale
+                        reference = reference.float()
+                        if softcap is not None:
+                            reference = softcap * torch.tanh(reference / softcap)
+                        torch.testing.assert_close(
+                            logits, reference, rtol=1e-5, atol=1e-5
+                        )
+                        self.assertEqual(buffer.shape, (rows, vocab))
+                        if use_buffer and rows == 2:
+                            self.assertIs(logits, buffer)
+                        else:
+                            self.assertTrue(torch.isnan(buffer).all())
+
+    @torch.inference_mode()
+    def test_logits_buffer_cuda_graph_replay(self):
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA graphs")
+        processor = self._make_logprocessor(128, False)
+        hidden = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
+        head = LMHeadStub(128, 64, torch.bfloat16)
+        meta = DummyMeta()
+        meta.next_token_logits_buffer = torch.empty(2, 128, device="cuda")
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                processor._get_logits(hidden, head, meta)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            logits = processor._get_logits(hidden, head, meta)
+        for _ in range(3):
+            hidden.normal_()
+            graph.replay()
+            reference = F.linear(hidden.double(), head.weight.double()).float()
+            torch.testing.assert_close(logits, reference, rtol=1e-5, atol=1e-5)
+            self.assertIs(logits, meta.next_token_logits_buffer)
 
     def test_model_config_enables_fp32_without_server_flag(self):
         expected_operation = "mm" if torch.cuda.is_available() else "matmul"

@@ -1124,6 +1124,7 @@ def _make_modelopt_ci_case(
     extras: list[str],
     env_vars: dict[str, str] | None = None,
     run_consistency_check: bool = False,
+    run_perf_check: bool = False,
 ) -> DiffusionTestCase:
     return DiffusionTestCase(
         case_id,
@@ -1134,7 +1135,7 @@ def _make_modelopt_ci_case(
             env_vars=env_vars or {},
         ),
         sampling_params,
-        run_perf_check=False,
+        run_perf_check=run_perf_check,
         run_consistency_check=run_consistency_check,
         run_component_accuracy_check=False,
     )

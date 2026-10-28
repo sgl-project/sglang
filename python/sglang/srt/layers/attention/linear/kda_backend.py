@@ -224,7 +224,7 @@ class KDAKernelDispatcher:
                 # SM100 chunk prefill pipeline.
                 self.extend_kernel = cutedsl_kernel
             else:
-                # CuTe DSL prefill kernels need SM100 (Blackwell); on older GPUs
+                # CuTe DSL prefill kernels need SM10x (tcgen05); elsewhere
                 # fall back to the Triton chunk kernel.
                 self.extend_kernel = triton_kernel
                 rank0_log(
@@ -402,10 +402,16 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
-    def effective_extend_kernel(self, lower_bound: Optional[float], num_tokens: int):
-        """The packed FlashInfer prefill kernel requires more than one token."""
+    def effective_extend_kernel(
+        self, lower_bound: Optional[float], num_tokens: int, num_seqs: int = 1
+    ):
+        """The packed FlashInfer prefill kernel requires more than one token per
+        sequence. A batch where every sequence extends exactly one token (e.g.
+        retracted requests re-entering with a fully cached prefix) would fall to
+        FlashInfer's grouped recurrent kernel, which only accepts a bf16 state
+        pool; the KDA pool is fp32, so route those batches to Triton."""
         kernel = self.extend_kernel
-        if self.prefill_backend.is_flashinfer() and num_tokens <= 1:
+        if self.prefill_backend.is_flashinfer() and num_tokens <= max(num_seqs, 1):
             return self.triton_kernel
         if lower_bound is not None and not getattr(kernel, "supports_safe_gate", True):
             kernel = self.triton_kernel
@@ -424,7 +430,9 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        kernel = self.effective_extend_kernel(kwargs.get("lower_bound"), q.shape[1])
+        kernel = self.effective_extend_kernel(
+            kwargs.get("lower_bound"), q.shape[1], query_start_loc.numel() - 1
+        )
         return kernel.extend(
             q,
             k,
@@ -523,7 +531,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             and verify_backend.is_triton()
             and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
         ):
-            from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
+            from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import (
                 fused_kda_conv_gating_verify,
             )
 
@@ -616,8 +624,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def supports_prefill_graph_extend(self) -> bool:
         return (
             not envs.SGLANG_DISABLE_KDA_PREFILL_GRAPH_EXTEND.get()
-            # Only the Triton chain guards padded rows (-1 state slots, chunks past T).
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonKDAKernel)
+            and (
+                isinstance(self.kernel_dispatcher.extend_kernel, TritonKDAKernel)
+                or getattr(
+                    self.kernel_dispatcher.extend_kernel,
+                    "prefill_graph_wrapper_cls",
+                    None,
+                )
+                is not None
+            )
             # Fused-accept staging (flashinfer verify) writes per extend.
             and self.accept_lens_pool is None
         )
@@ -630,13 +645,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
     ) -> KDAPrefillGraphMetadata:
         cache_indices = self._prefill_graph_cache_indices(forward_batch)
         meta = KDAPrefillGraphMetadata.allocate(
-            num_tokens=forward_batch.positions.shape[0],
+            # KDA sees global sequence order, even when CP positions are local.
+            num_tokens=forward_batch.extend_num_tokens,
             max_seqs_cap=self.prefill_graph_max_seqs,
             # Any replay of this bucket may carry prefix-cache snapshots (the
             # extra buffer is only on with the radix cache).
             track=get_exec().mamba.enable_mamba_extra_buffer,
             cache_index_dtype=cache_indices.dtype,
             device=self.device,
+            flashinfer_wrapper_cls=getattr(
+                self.kernel_dispatcher.extend_kernel, "prefill_graph_wrapper_cls", None
+            ),
         )
         self._fill_prefill_graph_metadata(
             meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
@@ -1110,7 +1129,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # Check the kernel the dispatcher will actually run (safe-gate
             # reroute included), not just the configured one.
             extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
-                layer.lower_bound, q.shape[1]
+                layer.lower_bound, q.shape[1], query_start_loc.numel() - 1
             )
             assert extend_kernel.supports_track_state_snapshot, (
                 f"{type(extend_kernel).__name__} cannot write the fp32 track "

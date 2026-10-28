@@ -75,6 +75,14 @@ def _should_fuse_kpool_topk(metadata: BaseIndexerMetadata) -> bool:
     )
 
 
+def _topk_v2_plan_for(
+    *, owned_plan: Optional[torch.Tensor], pool_lens: torch.Tensor
+) -> Optional[torch.Tensor]:
+    if owned_plan is not None and owned_plan.shape[0] == pool_lens.shape[0] + 1:
+        return owned_plan
+    return None
+
+
 def _slice_rows(
     *, tensor: Optional[torch.Tensor], rows: slice
 ) -> Optional[torch.Tensor]:
@@ -763,6 +771,7 @@ class IndexerKPool(MultiPlatformOp):
         row_starts: Optional[torch.Tensor] = None,
         out_rows: Optional[int] = None,
         page_table_row_index: Optional[torch.Tensor] = None,
+        topk_v2_plan: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             topk_from_pooled_history_logits,
@@ -791,6 +800,7 @@ class IndexerKPool(MultiPlatformOp):
             row_starts=row_starts,
             out_rows=out_rows,
             page_table_row_index=page_table_row_index,
+            topk_v2_plan=topk_v2_plan,
         )
 
     def _get_kpool_decode_metadata(
@@ -800,7 +810,13 @@ class IndexerKPool(MultiPlatformOp):
         seqlens_32: torch.Tensor,
         blocksize: int,
         build_schedule_metadata: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             build_pooled_page_table_64,
         )
@@ -828,9 +844,13 @@ class IndexerKPool(MultiPlatformOp):
                 pool_context_lens,
                 pool_block_tables,
                 pool_schedule_metadata,
+                _topk_v2_plan_for(
+                    owned_plan=plan.pool_topk_v2_plan, pool_lens=pool_seqlens
+                ),
             )
 
         pool_seqlens = attn_metadata.pooled_cache_seqlens_int32
+        topk_v2_plan = attn_metadata.pooled_topk_v2_plan
         pool_block_tables = attn_metadata.pooled_real_page_table
         pool_schedule_metadata = attn_metadata.pooled_paged_mqa_schedule_metadata
 
@@ -846,6 +866,7 @@ class IndexerKPool(MultiPlatformOp):
                 block_tables, self.index_kpool
             ).contiguous()
             pool_schedule_metadata = None
+            topk_v2_plan = None
         else:
             pool_seqlens = pool_seqlens[: seqlens_32.shape[0]]
             pool_block_tables = pool_block_tables[
@@ -864,6 +885,7 @@ class IndexerKPool(MultiPlatformOp):
             pool_context_lens,
             pool_block_tables,
             pool_schedule_metadata,
+            _topk_v2_plan_for(owned_plan=topk_v2_plan, pool_lens=pool_seqlens),
         )
 
     @staticmethod
@@ -1003,16 +1025,18 @@ class IndexerKPool(MultiPlatformOp):
             and self._should_use_tilelang_paged_mqa_logits(q_fp8)
         )
 
-        pool_seqlens, pool_context_lens, pool_block_tables, pool_schedule_metadata = (
-            self._get_kpool_decode_metadata(
-                metadata,
-                block_tables,
-                seqlens_32,
-                blocksize,
-                build_schedule_metadata=not (
-                    use_aiter_paged_mqa or use_tilelang_paged_mqa
-                ),
-            )
+        (
+            pool_seqlens,
+            pool_context_lens,
+            pool_block_tables,
+            pool_schedule_metadata,
+            topk_v2_plan,
+        ) = self._get_kpool_decode_metadata(
+            metadata=metadata,
+            block_tables=block_tables,
+            seqlens_32=seqlens_32,
+            blocksize=blocksize,
+            build_schedule_metadata=not (use_aiter_paged_mqa or use_tilelang_paged_mqa),
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
         if use_aiter_paged_mqa:
@@ -1065,8 +1089,9 @@ class IndexerKPool(MultiPlatformOp):
 
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
         topk_result = self._topk_from_kpool_logits(
-            logits,
-            pool_seqlens,
+            logits=logits,
+            pool_lens=pool_seqlens,
+            topk_v2_plan=topk_v2_plan,
             seq_lens=seqlens_32,
             page_table=page_table_1,
             topk_offsets=topk_offsets,
@@ -1682,9 +1707,9 @@ class IndexerKPool(MultiPlatformOp):
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         if is_hip():
-            from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
+            from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
         elif not is_npu():
-            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+            from sglang.kernels.ops.quantization.act_quant_triton import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)

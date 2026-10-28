@@ -65,6 +65,7 @@ def handle_hicache(server_args: Any):
 
     # Step 2: Storage-layout normalization without changing io backend.
     resolve_storage_layout_compatibility(server_args)
+    resolve_unified_memory_layout_io(server_args)
     if (
         cfg.disaggregation_decode_host_receive_threshold < 1
         and cfg.hicache_mem_layout != "layer_first"
@@ -200,6 +201,25 @@ def resolve_storage_layout_compatibility(server_args: Any):
     logger.warning(
         f"Mooncake/Ascend MemCache storage backend does not support layer_first layout, "
         f"switching to {new_layout} layout for {cfg.hicache_io_backend} io backend"
+    )
+
+
+def resolve_unified_memory_layout_io(server_args: Any):
+    # The unified pool's token-major entries make each layer's device rows
+    # strided; the direct page_first_direct copies assume packed rows.
+    cfg = resolving_view(server_args)
+    if not cfg.enable_unified_memory or cfg.hicache_mem_layout != "page_first_direct":
+        return
+    declare_resolution(
+        server_args,
+        "_resolve_unified_memory_layout_io",
+        hicache_mem_layout="page_first",
+        hicache_io_backend="kernel",
+    )
+    logger.warning(
+        "--enable-unified-memory: the direct io backend cannot copy the unified "
+        "pool's strided KV rows, switching to the page_first layout with the "
+        "kernel io backend"
     )
 
 

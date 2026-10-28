@@ -70,9 +70,18 @@ class SchedulerLoadInquirer:
         num_tokens = 0
         for req in queued:
             if waiting_queue_prefix_matched:
-                num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
+                matched = req.num_matched_prefix_tokens
+                uncached = max(0, req.seqlen - matched)
+                span = self.kv.tree_cache.waiting_storage_span(req.cache_request_handle)
+                if span is not None:
+                    storage_tokens = max(
+                        0, min(span[1], req.seqlen) - max(span[0], matched)
+                    )
+                    uncached -= storage_tokens
             else:
-                num_tokens += int(req.seqlen * cache_miss_rate)
+                # The historical hit rate already includes admitted storage hits.
+                uncached = int(req.seqlen * cache_miss_rate)
+            num_tokens += uncached
         # The other waiting requests that own no KV yet (PD prefill
         # bootstrap) were never prefix-matched.
         for req in registry.reqs(

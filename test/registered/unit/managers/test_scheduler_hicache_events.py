@@ -79,40 +79,6 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
             "test", enable_hierarchical_cache=True, disable_overlap_schedule=True
         )
 
-    def test_feature_gates(self):
-        for hierarchical, flexkv, linker, storage in (
-            (False, False, False, False),
-            (True, False, False, False),
-            (False, True, False, False),
-            (False, False, True, False),
-            (True, False, False, True),
-        ):
-            with (
-                self.subTest(
-                    hierarchical=hierarchical,
-                    flexkv=flexkv,
-                    linker=linker,
-                    storage=storage,
-                ),
-                patch(
-                    "sglang.srt.managers.scheduler.get_memory",
-                    return_value=SimpleNamespace(
-                        enable_flexkv=flexkv,
-                        enable_hierarchical_cache=hierarchical,
-                        enable_unified_cache_external_linker=linker,
-                        enable_lmcache=False,
-                    ),
-                ),
-            ):
-                self.calls.reset_mock()
-                s = self.scheduler
-                self.storage_enabled.return_value = storage
-                s._process_hicache_events()
-                expected = [call.drain()] if hierarchical or flexkv or linker else []
-                if storage:
-                    expected.append(call.retry())
-                self.assertEqual(self.calls.mock_calls, expected)
-
     def test_pd_prefill_drains_before_admission_even_with_empty_queue(self):
         s = self.scheduler
         s.hub.step_planner.get_new_batch_prefill = self.calls.admit
@@ -161,7 +127,12 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.assertIsNone(step)
         s.hub.step_planner.get_new_batch_prefill.assert_not_called()
         self.assertEqual(
-            self.calls.mock_calls, [call.drain(), call.retry(), call.defer()]
+            self.calls.mock_calls,
+            [
+                call.drain(),
+                call.retry(),
+                call.defer(self.running_batch),
+            ],
         )
 
     def test_pp_prefill_drains_before_admission(self):

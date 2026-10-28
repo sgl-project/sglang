@@ -305,49 +305,6 @@ def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
     return hc_split_sinkhorn_kernel_
 
 
-def _hc_split_sinkhorn_torch(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int = 4,
-    sinkhorn_iters: int = 20,
-    eps: float = 1e-6,
-):
-    """Pure-torch equivalent of hc_split_sinkhorn_kernel.
-
-    TileLang's CK-backed buffer addressing does not compile on gfx1250, so the
-    sinkhorn kernel is reimplemented here. Layout mirrors the kernel exactly:
-    the flattened ``mixes`` row holds ``pre`` (hc), ``post`` (hc) and the
-    ``comb`` matrix (hc * hc) consecutively.
-    """
-    b, s, _ = mixes.size()
-    hc = hc_mult
-    flat = mixes.reshape(-1, (2 + hc) * hc).float()
-    scale = hc_scale.float()
-    base = hc_base.float()
-
-    pre = torch.sigmoid(flat[:, :hc] * scale[0] + base[:hc]) + eps
-    post = 2 * torch.sigmoid(flat[:, hc : 2 * hc] * scale[1] + base[hc : 2 * hc])
-
-    comb = flat[:, 2 * hc :] * scale[2] + base[2 * hc :]
-    comb = comb.reshape(-1, hc, hc)
-
-    # Initial row softmax (numerically stabilized) then column normalize.
-    row_max = comb.amax(dim=2, keepdim=True)
-    comb = torch.exp(comb - row_max)
-    comb = comb / comb.sum(dim=2, keepdim=True) + eps
-    comb = comb / (comb.sum(dim=1, keepdim=True) + eps)
-
-    for _ in range(sinkhorn_iters - 1):
-        comb = comb / (comb.sum(dim=2, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=1, keepdim=True) + eps)
-
-    pre = pre.reshape(b, s, hc).to(mixes.dtype)
-    post = post.reshape(b, s, hc).to(mixes.dtype)
-    comb = comb.reshape(b, s, hc, hc).to(mixes.dtype)
-    return pre, post, comb
-
-
 @triton.jit
 def _hc_split_sinkhorn_triton_kernel(
     mixes_ptr,
@@ -486,7 +443,7 @@ def hc_split_sinkhorn(
         )
     if is_gfx1250_supported():
         # TileLang's CK-backed addressing doesn't compile on gfx1250; use the
-        # Triton port. _hc_split_sinkhorn_torch is kept as a reference fallback.
+        # Triton port.
         return _hc_split_sinkhorn_triton(
             mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
         )
@@ -901,7 +858,11 @@ def prewarm_mhc_pre(
     from sglang.srt.runtime_context import get_schedule
 
     hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
-    max_num_tokens = get_schedule().chunked_prefill_size
+    schedule = get_schedule()
+    max_num_tokens = schedule.chunked_prefill_size
+    if max_num_tokens is None or max_num_tokens <= 0:
+        # Chunked prefill disabled: bound by the prefill token budget.
+        max_num_tokens = schedule.max_prefill_tokens
     buckets = get_mhc_pre_token_count_representatives(
         max_num_tokens, hc_mult * hidden_size
     )
@@ -1309,7 +1270,16 @@ def mhc_pre(
     },
 )
 def mhc_post_tilelang(
-    a, b, c, d, x, hc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024
+    a,
+    b,
+    c,
+    d,
+    x,
+    hc: int,
+    hidden: int,
+    n_thr: int = 128,
+    h_blk: int = 1024,
+    num_h_blocks: int = 1,
 ):
     n = T.dynamic("num_tokens")
     h = hidden
@@ -1322,7 +1292,7 @@ def mhc_post_tilelang(
     x: T.Tensor((n, hc, h), T.bfloat16)
 
     ENABLE_PDL = is_arch_support_pdl()
-    with T.Kernel(n, threads=n_thr) as i_n:
+    with T.Kernel(n, num_h_blocks, threads=n_thr) as (i_n, i_h_block):
         if ENABLE_PDL:
             T.pdl_sync()
 
@@ -1339,7 +1309,8 @@ def mhc_post_tilelang(
         T.copy(a[i_n, 0, 0], a_local)
         T.copy(c[i_n, 0], c_local)
 
-        for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=2):
+        for i_h_iter in T.Pipelined(T.ceildiv(h, h_blk * num_h_blocks), num_stages=2):
+            i0_h = i_h_iter * num_h_blocks + i_h_block
             T.copy(b[i_n, 0, i0_h * h_blk], b_shared)
             T.copy(d[i_n, i0_h * h_blk], d_shared)
 
@@ -1369,6 +1340,11 @@ def mhc_post(
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
     out = torch.empty_like(residual)
+    hidden_size = residual.shape[-1]
+    # Small batches need more parallelism than one CTA per token.
+    num_h_blocks = (
+        hidden_size // math.gcd(hidden_size, 1024) if x.shape[0] <= 256 else 1
+    )
     mhc_post_tilelang(
         comb_res_mix,
         residual,
@@ -1376,7 +1352,8 @@ def mhc_post(
         x,
         out,
         residual.shape[-2],
-        residual.shape[-1],
+        hidden_size,
+        num_h_blocks=num_h_blocks,
     )
     return out
 
@@ -2182,7 +2159,7 @@ def npu_hc_pre(
 
 
 @triton.jit
-def _hc_combine_kernel(
+def _mhc_combine_kernel(
     x_ptr,
     pre_ptr,
     y_ptr,
@@ -2737,7 +2714,7 @@ def hc_mix_stats_sinkhorn_deepgemm(
     return pre, post, comb
 
 
-def hc_combine(
+def mhc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
     """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
@@ -2745,7 +2722,7 @@ def hc_combine(
     h = x_flat.shape[1] // hc
     y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
     block_h = 1024
-    _hc_combine_kernel[(m, triton.cdiv(h, block_h))](
+    _mhc_combine_kernel[(m, triton.cdiv(h, block_h))](
         x_flat,
         pre,
         y,

@@ -40,8 +40,14 @@ REPO_NAME = "sglang"
 PRODUCT_PREFIX = "python/sglang/"
 
 
-# Directory prefix of test case folders under coverage data dir.
-TEST_CASE_DIR_PREFIX = "____w__sglang__sglang__test__"
+# Encoded workspace marker in test case folder names under the coverage
+# data dir. run_tests_with_coverage.sh encodes the absolute test path, so
+# folder names embed the runner's checkout root: ____w__sglang__sglang__...
+# (k8s pool, /__w/sglang/sglang) or __home__runner__work__sglang__sglang__...
+# (hosted runners, /home/runner/work/sglang/sglang). Everything through the
+# first __sglang__sglang__ anchor is the workspace root; what follows is the
+# test/ layout (registered CI tests).
+WORKSPACE_MARKER = "__sglang__sglang__"
 
 # Coverage density threshold: proportion of changed lines covered
 # Range: 0.0 ~ 1.0, higher value = stricter filtering
@@ -173,10 +179,10 @@ class CoverageSelector:
             if not item.is_dir():
                 continue
             name = item.name
-            # sglang naming: ____w__sglang__sglang__test__... (GitHub Actions encoded path)
-            is_sglang_layout = TEST_CASE_DIR_PREFIX and name.startswith(
-                TEST_CASE_DIR_PREFIX
-            )
+            # sglang naming: encoded absolute test path under the runner's
+            # checkout root — ____w__sglang__sglang__test__... (k8s pool) or
+            # __home__runner__work__sglang__sglang__test__... (hosted runners)
+            is_sglang_layout = name.startswith("__") and WORKSPACE_MARKER in name
             if not is_sglang_layout:
                 continue
             # coverage.* files directly under test case dir (sglang)
@@ -189,18 +195,21 @@ class CoverageSelector:
     def normalize_test_name(test_name: str) -> str:
         """
         Convert test case directory name to standard script name format.
-        sglang (GitHub Actions encoded dir name: /__w/sglang/sglang/test/... -> ____w__sglang__sglang__test__...):
-        - ____w__sglang__sglang__test__registered__npu__xxx__test_foo.py
+        sglang (encoded dir name: <encoded workspace root><test path>):
+        - k8s pool: /__w/sglang/sglang/... -> ____w__sglang__sglang__...
+        - hosted runners: /home/runner/work/sglang/sglang/... -> __home__runner__work__sglang__sglang__...
+        - ...test__registered__npu__xxx__test_foo
           -> test/registered/npu/xxx/test_foo.py (file-level)
         - ...--test_foo -> test/registered/npu/xxx/test_foo.py::test_foo (function-level)
         """
-        # sglang layout: strip ____w__sglang__sglang__test__ prefix (encoded /__w/sglang/sglang/test/)
-        if not TEST_CASE_DIR_PREFIX or not test_name.startswith(TEST_CASE_DIR_PREFIX):
+        # sglang layout: the encoded workspace root ends with the
+        # __sglang__sglang__ anchor (k8s and hosted runners alike).
+        if not test_name.startswith("__") or WORKSPACE_MARKER not in test_name:
             return test_name
-        # rest: encoded path after /test/ (e.g. registered__npu__xxx__test_foo.py)
-        rest = test_name[len(TEST_CASE_DIR_PREFIX) :]
-        # Restore test/ prefix (TEST_CASE_DIR_PREFIX ends with test__, __ encodes /)
-        result = "test/" + rest.replace("__", "/")
+        # rest: encoded workspace-relative path (test__registered__...),
+        # split at the FIRST anchor in case a nested path repeats the marker.
+        _, _, rest = test_name.partition(WORKSPACE_MARKER)
+        result = rest.replace("__", "/")
         # Handle function-level marker: .../test_foo.py--test_bar -> .../test_foo.py::test_bar
         result = result.replace("--", "::")
         # File-level tests need .py suffix; avoid double .py when name already ends with .py

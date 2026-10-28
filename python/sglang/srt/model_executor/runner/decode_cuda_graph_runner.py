@@ -334,14 +334,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.captured_req_width,
             gathered_buffer_required=self.require_gathered_buffer,
         )
-        if self.dllm_uses_input_embeds:
-            max_requests = min(
-                self.dllm_config.max_running_requests, max(self.capture_bs)
-            )
-            self.capture_bs = sorted(
-                {bs for bs in self.capture_bs if bs <= max_requests} | {max_requests}
-            )
-            self.compile_bs = [bs for bs in self.compile_bs if bs <= max_requests]
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -1115,6 +1107,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        with self.model_context():
+            self._capture()
+
+    def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
@@ -1257,7 +1253,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
-        with forward_context(ForwardContext(attn_backend=attn_backend)):
+        with forward_context(
+            ForwardContext(attn_backend=attn_backend), forward_batch=forward_batch
+        ):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
             if forward_batch.lora_ids is not None:
@@ -1266,65 +1264,67 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
-                # Graph-recordable metadata-prep hook. The unified memory pool
-                # records ZERO translate nodes here: all its read/write translates
-                # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
-                # the captured graph reads already-physical locs. Base no-op for triton.
-                attn_backend.init_forward_metadata_in_graph(forward_batch)
-                self._record_in_graph_metadata_prep_done()
-
-                # No invalidate_loc_cache() here: the unified pool translates its
-                # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
-
-                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
-                    None
-                )
-                set_dp_buffer_len(
-                    forward_batch.global_dp_buffer_len,
-                    num_tokens,
-                    forward_batch.dp_padding_mode.is_max_len(),
-                    forward_batch.global_num_tokens_cpu,
-                )
-                set_is_extend_in_batch(False)
-
-                kwargs = {}
-                if (
-                    self.pp_size > 1
-                    and "pp_proxy_tensors" in inspect.signature(forward).parameters
+                # Debug replay retains this callback beyond the capture scope.
+                with forward_context(
+                    ForwardContext(attn_backend=attn_backend),
+                    forward_batch=forward_batch,
                 ):
-                    kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                        {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-                    )
-                if (
-                    (
-                        self.dllm_uses_input_embeds
-                        or (
-                            self.model_runner.spec_algorithm.is_dflash_family()
-                            and self.model_runner.is_draft_worker
-                        )
-                    )
-                    and "input_embeds" in inspect.signature(forward).parameters
-                    and not hasattr(self.model_runner.model, "forward_embed")
-                ):
-                    if self.dllm_input_preparation is None:
-                        kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
-                    else:
-                        state = self.buffer_registry.get_slot(
-                            "dllm_input_preparation_state"
-                        ).buffer[:num_tokens]
-                        kwargs["input_embeds"] = self.dllm_input_preparation(
-                            self.model_runner.model, forward_batch.input_ids, state
-                        )
+                    # Backends may gather live pool mappings into their static
+                    # metadata here; these nodes run before any model KV reads.
+                    attn_backend.init_forward_metadata_in_graph(forward_batch)
+                    self._record_in_graph_metadata_prep_done()
 
-                out = forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    **kwargs,
-                )
-                for capture_hook in self.model_runner.capture_tail_hooks:
-                    capture_hook(self, out, forward_batch, num_tokens)
-                return out
+                    forward_batch.dp_local_start_pos = (
+                        forward_batch.dp_local_num_tokens
+                    ) = None
+                    set_dp_buffer_len(
+                        forward_batch.global_dp_buffer_len,
+                        num_tokens,
+                        forward_batch.dp_padding_mode.is_max_len(),
+                        forward_batch.global_num_tokens_cpu,
+                    )
+                    set_is_extend_in_batch(False)
+
+                    kwargs = {}
+                    if (
+                        self.pp_size > 1
+                        and "pp_proxy_tensors" in inspect.signature(forward).parameters
+                    ):
+                        kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                            {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                        )
+                    if (
+                        (
+                            self.dllm_uses_input_embeds
+                            or (
+                                self.model_runner.spec_algorithm.is_dflash_family()
+                                and self.model_runner.is_draft_worker
+                            )
+                        )
+                        and "input_embeds" in inspect.signature(forward).parameters
+                        and not hasattr(self.model_runner.model, "forward_embed")
+                    ):
+                        if self.dllm_input_preparation is None:
+                            kwargs["input_embeds"] = self.buffers.input_embeds[
+                                :num_tokens
+                            ]
+                        else:
+                            state = self.buffer_registry.get_slot(
+                                "dllm_input_preparation_state"
+                            ).buffer[:num_tokens]
+                            kwargs["input_embeds"] = self.dllm_input_preparation(
+                                self.model_runner.model, forward_batch.input_ids, state
+                            )
+
+                    out = forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
+                    for capture_hook in self.model_runner.capture_tail_hooks:
+                        capture_hook(self, out, forward_batch, num_tokens)
+                    return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
             canary_ctx = (
@@ -1606,7 +1606,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         shared_read_ends = self._resolve_shared_read_ends(
             self._replay_attn_backend(), forward_batch.forward_mode
         )
-        with timer_ctx, self.backend.replay_session():
+        with self.model_context(), timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(

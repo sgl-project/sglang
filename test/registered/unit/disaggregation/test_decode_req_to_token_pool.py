@@ -4,10 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.disaggregation.decode import (
-    DecodeReqToTokenPool,
-    HybridMambaDecodeReqToTokenPool,
-)
+from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.common import free_req_slot
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -15,7 +12,7 @@ from sglang.srt.sampling.penalties import PenaltyStore
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _init_decode_pool(pool):
@@ -30,12 +27,6 @@ def _init_decode_pool(pool):
     return pool
 
 
-def test_decode_pool_reports_physical_capacity():
-    pool = _init_decode_pool(DecodeReqToTokenPool.__new__(DecodeReqToTokenPool))
-
-    assert pool.schedulable_token_capacity(17) == 17
-
-
 def test_decode_pool_supports_noop_aux_cache_contract():
     pool = _init_decode_pool(DecodeReqToTokenPool.__new__(DecodeReqToTokenPool))
     req_to_token = pool.req_to_token.clone()
@@ -47,14 +38,6 @@ def test_decode_pool_supports_noop_aux_cache_contract():
     pool.reset_aux_cache_allocator()
 
     assert torch.equal(pool.req_to_token, req_to_token)
-
-
-def test_hybrid_decode_pool_initializes_aux_cache_contract():
-    pool = _init_decode_pool(
-        HybridMambaDecodeReqToTokenPool.__new__(HybridMambaDecodeReqToTokenPool)
-    )
-
-    assert pool.schedulable_token_capacity(17) == 17
 
 
 @pytest.mark.parametrize(

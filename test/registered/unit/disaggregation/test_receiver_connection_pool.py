@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 import threading
@@ -64,46 +64,6 @@ def _fetching_receiver(connection_pool):
 
 
 class TestReceiverConnectionPool(CustomTestCase):
-    def test_invalidate_removes_matching_generation(self):
-        stale = [
-            {"rank_ip": "10.0.0.1", "rank_port": 1001},
-            {"rank_ip": "10.0.0.1", "rank_port": 1002},
-        ]
-        retained = [{"rank_ip": "10.0.0.2", "rank_port": 2001}]
-        receiver = _receiver(
-            {"stale": stale, "retained": retained},
-            {"stale": stale},
-        )
-
-        receiver.invalidate_cached_bootstrap_infos()
-
-        self.assertEqual(receiver.kv_mgr.connection_pool, {"retained": retained})
-        self.assertEqual(receiver._connection_pool_entries, {})
-
-    def test_invalidate_preserves_concurrent_replacement_generation(self):
-        stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
-        replacement = [{"rank_ip": "10.0.0.1", "rank_port": 2001}]
-        receiver = _receiver(
-            {"key": replacement},
-            {"key": stale},
-        )
-
-        receiver.invalidate_cached_bootstrap_infos()
-
-        self.assertEqual(receiver.kv_mgr.connection_pool, {"key": replacement})
-
-    def test_invalidate_removes_all_matching_cp_entries(self):
-        stale_cp0 = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
-        stale_cp1 = [{"rank_ip": "10.0.0.1", "rank_port": 1002}]
-        receiver = _receiver(
-            {"cp0": stale_cp0, "cp1": stale_cp1},
-            {"cp0": stale_cp0, "cp1": stale_cp1},
-        )
-
-        receiver.invalidate_cached_bootstrap_infos()
-
-        self.assertEqual(receiver.kv_mgr.connection_pool, {})
-
     def test_next_receiver_refetches_after_invalidation(self):
         stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
         connection_pool = {"prefill:8998_0_0_0": stale}

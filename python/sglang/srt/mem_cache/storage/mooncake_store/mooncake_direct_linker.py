@@ -55,7 +55,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         *,
         components,
         storage=None,
+        forward_stream=None,
     ):
+        self.forward_stream = forward_stream
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
@@ -384,9 +386,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        ready_event = device_module.Event()
-        ready_event.record()
-        self.offload_queue.put((expanded, tokens, ready_event))
+        ready_events = self.record_offload_ready()
+        self.offload_queue.put((expanded, tokens, ready_events))
         return True
 
     def offload_thread_func(self) -> None:
@@ -395,8 +396,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                expanded, tokens, ready_event = task
-                ready_event.synchronize()
+                expanded, tokens, ready_events = task
+                for event in ready_events:
+                    event.synchronize()
                 results = self.storage.batch_set_v2(expanded)
                 success = all(all(pool_results) for pool_results in results.values())
                 if success:

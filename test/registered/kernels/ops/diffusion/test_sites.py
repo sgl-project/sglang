@@ -31,20 +31,14 @@ import sglang.kernels.ops.diffusion.sites.lingbot_video_rmsnorm_site as lingbot_
 import sglang.kernels.ops.diffusion.sites.qwen_image_added_qkv_site as qwen_image_added_qkv
 import sglang.kernels.ops.diffusion.sites.sana_video_linear_attention_site as sana_video_linear_attention
 from sglang.kernels.ops.diffusion import (
+    FLUX2_NVFP4_SWIGLU_QUANT,
+    FUSED_LN_MODULATE,
     BitExactFusionGate,
     QualityGatedFusion,
     can_use_ln_modulate,
     flashinfer_rmsnorm_diagnostic_hint,
-    flux2_nvfp4_swiglu_quant_active,
     fused_ln_modulate,
-    fused_ln_modulate_active,
-    mark_flux2_nvfp4_swiglu_quant_site,
-    mark_fused_ln_modulate_site,
-    mount_flux2_nvfp4_swiglu_quant,
-    mount_fused_ln_modulate,
     tensors_equal,
-    unmount_flux2_nvfp4_swiglu_quant,
-    unmount_fused_ln_modulate,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -84,14 +78,13 @@ def test_quality_gate_rejection_is_all_or_nothing():
         name="test fusion",
         marker_attr="_test_fusion_site",
         enabled_attr="_test_fusion_enabled",
+        reject_reason=lambda site: "rejected" if fusion.metadata(site) else None,
     )
     root = nn.ModuleList([nn.Module(), nn.Module()])
     for index, site in enumerate(root):
         fusion.mark(site, index)
 
-    assert not fusion.mount(
-        root, reject_reason=lambda site: "rejected" if fusion.metadata(site) else None
-    )
+    assert not fusion.mount(root)
     assert not any(fusion.is_enabled(site) for site in root)
     assert not fusion.mount(nn.Module())
 
@@ -99,13 +92,13 @@ def test_quality_gate_rejection_is_all_or_nothing():
 def test_flux2_nvfp4_swiglu_quant_is_disabled_until_quality_gate_mounts():
     site = nn.Module()
     root = nn.ModuleList([site])
-    mark_flux2_nvfp4_swiglu_quant_site(site)
+    FLUX2_NVFP4_SWIGLU_QUANT.mark(site)
 
-    assert not flux2_nvfp4_swiglu_quant_active(site)
-    assert mount_flux2_nvfp4_swiglu_quant(root)
-    assert flux2_nvfp4_swiglu_quant_active(site)
-    unmount_flux2_nvfp4_swiglu_quant(root)
-    assert not flux2_nvfp4_swiglu_quant_active(site)
+    assert not FLUX2_NVFP4_SWIGLU_QUANT.is_enabled(site)
+    assert FLUX2_NVFP4_SWIGLU_QUANT.mount(root)
+    assert FLUX2_NVFP4_SWIGLU_QUANT.is_enabled(site)
+    FLUX2_NVFP4_SWIGLU_QUANT.unmount(root)
+    assert not FLUX2_NVFP4_SWIGLU_QUANT.is_enabled(site)
 
 
 def test_qwen_image_added_qkv_site_is_request_scoped():
@@ -113,13 +106,13 @@ def test_qwen_image_added_qkv_site_is_request_scoped():
     site.to_added_qkv = nn.Module()
     site.to_added_qkv.quant_config = None
     site.to_added_qkv.output_partition_sizes = [8, 8, 8]
-    qwen_image_added_qkv.mark_qwen_image_added_qkv_site(site)
+    qwen_image_added_qkv.QWEN_IMAGE_ADDED_QKV.mark(site)
 
-    assert not qwen_image_added_qkv.qwen_image_added_qkv_active(site)
-    assert qwen_image_added_qkv.mount_qwen_image_added_qkv(site)
-    assert qwen_image_added_qkv.qwen_image_added_qkv_active(site)
-    qwen_image_added_qkv.unmount_qwen_image_added_qkv(site)
-    assert not qwen_image_added_qkv.qwen_image_added_qkv_active(site)
+    assert not qwen_image_added_qkv.QWEN_IMAGE_ADDED_QKV.is_enabled(site)
+    assert qwen_image_added_qkv.QWEN_IMAGE_ADDED_QKV.mount(site)
+    assert qwen_image_added_qkv.QWEN_IMAGE_ADDED_QKV.is_enabled(site)
+    qwen_image_added_qkv.QWEN_IMAGE_ADDED_QKV.unmount(site)
+    assert not qwen_image_added_qkv.QWEN_IMAGE_ADDED_QKV.is_enabled(site)
 
 
 # -------------------------------------------------------------------------
@@ -151,7 +144,6 @@ def test_bitexact_gate_mismatch_disables_permanently():
     out = gate.accept_or_fallback(
         torch.tensor([1.0]),
         torch.tensor([2.0]),
-        mismatch_msg="mismatch",
     )
     assert torch.equal(out, torch.tensor([2.0]))
     assert gate.disabled and not gate.verified
@@ -178,6 +170,45 @@ def test_bitexact_gate_skips_first_sight_during_graph_capture(monkeypatch):
     # A verified gate replays the fused kernel alone, which is capture-safe.
     gate.mark_verified()
     assert gate.can_attempt_once()
+
+
+def test_bitexact_gate_run_verifies_each_signature_outside_capture(monkeypatch):
+    # A new signature must not verify (eager reference + host sync) inside
+    # capture, while a verified one replays the fused kernel alone there.
+    gate = BitExactFusionGate("run", per_signature=True)
+    calls = []
+
+    def fused():
+        calls.append("fused")
+        return torch.tensor([1.0])
+
+    def ref():
+        calls.append("ref")
+        return torch.tensor([1.0])
+
+    def capturing(active):
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: active)
+        calls.clear()
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    capturing(True)
+    gate.run(fused, ref, sig="a")
+    assert calls == ["ref"] and not gate.is_verified("a")
+    capturing(False)
+    gate.run(fused, ref, sig="a")
+    assert calls == ["fused", "ref"] and gate.is_verified("a")
+    capturing(True)
+    gate.run(fused, ref, sig="a")
+    assert calls == ["fused"]
+    gate.run(fused, ref, sig="b")
+    assert calls == ["fused", "ref"] and not gate.is_verified("b")
+
+    def invalid():
+        raise ValueError("bad operands")
+
+    with pytest.raises(ValueError):
+        gate.run(invalid, ref, sig="a", reraise=(ValueError,))
+    assert not gate.disabled
 
 
 def test_tensors_equal_supports_sequences():
@@ -299,13 +330,13 @@ def test_fused_ln_modulate_guards_and_mount_protocol():
 
     root = nn.Module()
     root.child = nn.Module()
-    mark_fused_ln_modulate_site(root.child)
-    assert not fused_ln_modulate_active(root.child)
-    assert mount_fused_ln_modulate(root)
-    assert fused_ln_modulate_active(root.child)
-    unmount_fused_ln_modulate(root)
-    assert not fused_ln_modulate_active(root.child)
-    assert not mount_fused_ln_modulate(nn.Module())  # no marked sites
+    FUSED_LN_MODULATE.mark(root.child)
+    assert not FUSED_LN_MODULATE.is_enabled(root.child)
+    assert FUSED_LN_MODULATE.mount(root)
+    assert FUSED_LN_MODULATE.is_enabled(root.child)
+    FUSED_LN_MODULATE.unmount(root)
+    assert not FUSED_LN_MODULATE.is_enabled(root.child)
+    assert not FUSED_LN_MODULATE.mount(nn.Module())  # no marked sites
 
 
 @requires_cuda
@@ -314,10 +345,12 @@ def test_mounted_ln_modulate_site_compiles_fullgraph():
     class Site(nn.Module):
         def __init__(self):
             super().__init__()
-            mark_fused_ln_modulate_site(self)
+            FUSED_LN_MODULATE.mark(self)
 
         def forward(self, x, scale, shift):
-            if fused_ln_modulate_active(self) and can_use_ln_modulate(x, scale, shift):
+            if FUSED_LN_MODULATE.is_enabled(self) and can_use_ln_modulate(
+                x, scale, shift
+            ):
                 return fused_ln_modulate(x, scale, shift, eps=1e-6)
             return (
                 F.layer_norm(x, (x.shape[-1],), eps=1e-6) * (1 + scale[:, None])
@@ -325,7 +358,7 @@ def test_mounted_ln_modulate_site_compiles_fullgraph():
             )
 
     site = Site()
-    assert mount_fused_ln_modulate(site)
+    assert FUSED_LN_MODULATE.mount(site)
     x = torch.randn(1, 64, 128, device="cuda", dtype=torch.bfloat16)
     scale = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
     shift = torch.randn_like(scale)
@@ -347,7 +380,7 @@ class _GateRMSNormSite(nn.Module):
         self.norm = nn.RMSNorm(
             GATE_RMSNORM_DIM, eps=GATE_RMSNORM_EPS, device="cuda", dtype=dtype
         )
-        gate_rmsnorm.mark_fused_gate_rmsnorm_site(self, ("norm",))
+        gate_rmsnorm.FUSED_GATE_RMSNORM.mark(self, ("norm",))
 
 
 @requires_cuda
@@ -362,7 +395,7 @@ def test_fused_gate_rmsnorm_matches_ideogram_reference():
     mods = torch.randn(1, 1, 2 * dim, device="cuda", dtype=torch.bfloat16)
     scale, gate = mods.chunk(2, dim=-1)
 
-    assert gate_rmsnorm.mount_fused_gate_rmsnorm(site)
+    assert gate_rmsnorm.FUSED_GATE_RMSNORM.mount(site)
     got_scale = gate_rmsnorm.fused_rmsnorm_scale(x, w, 1.0 + scale, GATE_RMSNORM_EPS)
     got_gate = gate_rmsnorm.fused_rmsnorm_tanh_residual(
         x, gate, residual, w, GATE_RMSNORM_EPS
@@ -379,23 +412,23 @@ def test_fused_gate_rmsnorm_matches_ideogram_reference():
 def test_fused_gate_rmsnorm_mount_is_all_or_nothing():
     good, bad = _GateRMSNormSite(), _GateRMSNormSite(torch.float32)
     # One fp32 norm anywhere in the tree keeps *every* site on the reference.
-    assert not gate_rmsnorm.mount_fused_gate_rmsnorm(nn.ModuleList([good, bad]))
-    assert not gate_rmsnorm.fused_gate_rmsnorm_active(good)
-    assert gate_rmsnorm.mount_fused_gate_rmsnorm(good)
-    gate_rmsnorm.unmount_fused_gate_rmsnorm(good)
-    assert not gate_rmsnorm.fused_gate_rmsnorm_active(good)
+    assert not gate_rmsnorm.FUSED_GATE_RMSNORM.mount(nn.ModuleList([good, bad]))
+    assert not gate_rmsnorm.FUSED_GATE_RMSNORM.is_enabled(good)
+    assert gate_rmsnorm.FUSED_GATE_RMSNORM.mount(good)
+    gate_rmsnorm.FUSED_GATE_RMSNORM.unmount(good)
+    assert not gate_rmsnorm.FUSED_GATE_RMSNORM.is_enabled(good)
 
 
 class _GeluSite(nn.Module):
     def __init__(self, dtype=torch.bfloat16, bias=True):
         super().__init__()
         self.proj = nn.Linear(64, 256, bias=bias, device="cuda", dtype=dtype)
-        linear_gelu.mark_fused_gelu_site(self, "proj")
+        linear_gelu.FUSED_LINEAR_GELU.mark(self, "proj")
 
     def forward(self, x):
-        if linear_gelu.fused_gelu_active(self) and linear_gelu.can_use_linear_gelu(
-            self.proj, x
-        ):
+        if linear_gelu.FUSED_LINEAR_GELU.is_enabled(
+            self
+        ) and linear_gelu.can_use_linear_gelu(self.proj, x):
             return linear_gelu.fused_linear_gelu_tanh(
                 x, self.proj.weight, self.proj.bias
             )
@@ -409,7 +442,7 @@ def test_fused_linear_gelu_matches_reference(dtype):
     site = _GeluSite(dtype)
     x = torch.randn(512, 64, device="cuda", dtype=dtype)
     ref = site(x)  # unmounted: the reference chain
-    assert linear_gelu.mount_fused_linear_gelu(site)
+    assert linear_gelu.FUSED_LINEAR_GELU.mount(site)
     atol = 2e-2 if dtype == torch.bfloat16 else 4e-3
     torch.testing.assert_close(site(x), ref, atol=atol, rtol=2e-2)
 
@@ -418,13 +451,13 @@ def test_fused_linear_gelu_matches_reference(dtype):
 def test_fused_linear_gelu_guards_and_lossless_path():
     torch.manual_seed(0)
     good, bad = _GeluSite(), _GeluSite(torch.float32)
-    assert not linear_gelu.mount_fused_linear_gelu(nn.ModuleList([good, bad]))
-    assert not linear_gelu.fused_gelu_active(good)
+    assert not linear_gelu.FUSED_LINEAR_GELU.mount(nn.ModuleList([good, bad]))
+    assert not linear_gelu.FUSED_LINEAR_GELU.is_enabled(good)
 
     x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
     ref = good(x)
-    assert linear_gelu.mount_fused_linear_gelu(good)
-    linear_gelu.unmount_fused_linear_gelu(good)
+    assert linear_gelu.FUSED_LINEAR_GELU.mount(good)
+    linear_gelu.FUSED_LINEAR_GELU.unmount(good)
     # Unmounting must restore the reference path bit-for-bit.
     assert torch.equal(good(x), ref)
 
@@ -434,11 +467,36 @@ def test_fused_linear_gelu_guards_and_lossless_path():
 
 
 @requires_cuda
+def test_linear_gelu_verdict_is_reused_until_remount(monkeypatch):
+    if torch.cuda.get_device_capability() >= (12, 0):
+        pytest.skip(
+            "SM120 keeps these sites on the eager path before reading the linear"
+        )
+    site = _GeluSite()
+    x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
+    assert linear_gelu.FUSED_LINEAR_GELU.mount(site)
+    reads = []
+    static = linear_gelu.can_use_linear_gelu_static
+    monkeypatch.setattr(
+        linear_gelu,
+        "can_use_linear_gelu_static",
+        lambda linear: reads.append(linear) or static(linear),
+    )
+    for _ in range(3):
+        assert linear_gelu.can_use_linear_gelu(site.proj, x)
+    assert reads == [site.proj]
+    linear_gelu.FUSED_LINEAR_GELU.unmount(site)
+    assert linear_gelu.FUSED_LINEAR_GELU.mount(site)
+    assert linear_gelu.can_use_linear_gelu(site.proj, x)
+    assert reads == [site.proj, site.proj]
+
+
+@requires_cuda
 @torch.no_grad()
 def test_mounted_gelu_site_compiles_fullgraph():
     site = _GeluSite()
     x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
-    assert linear_gelu.mount_fused_linear_gelu(site)
+    assert linear_gelu.FUSED_LINEAR_GELU.mount(site)
     expected = site(x)
     torch.testing.assert_close(
         torch.compile(site, fullgraph=True)(x), expected, atol=2e-2, rtol=2e-2
@@ -450,7 +508,7 @@ def test_mounted_gelu_site_compiles_fullgraph():
 def test_sana_video_linear_attention_quality_path_and_guards():
     torch.manual_seed(0)
     site = nn.Module()
-    sana_video_linear_attention.mark_sana_video_linear_attention_site(site)
+    sana_video_linear_attention.SANA_VIDEO_LINEAR_ATTENTION.mark(site)
     shape = (1, 4, 16, 128)
     query = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     key = torch.randn_like(query)
@@ -465,7 +523,7 @@ def test_sana_video_linear_attention_quality_path_and_guards():
         )
         is None
     )
-    assert sana_video_linear_attention.mount_sana_video_linear_attention(site)
+    assert sana_video_linear_attention.SANA_VIDEO_LINEAR_ATTENTION.mount(site)
     output = sana_video_linear_attention.try_sana_video_linear_attention(
         site, query, key, value, normalizer
     )
@@ -484,8 +542,8 @@ def test_sana_video_linear_attention_quality_path_and_guards():
         )
         is None
     )
-    sana_video_linear_attention.unmount_sana_video_linear_attention(site)
-    assert not sana_video_linear_attention.sana_video_linear_attention_active(site)
+    sana_video_linear_attention.SANA_VIDEO_LINEAR_ATTENTION.unmount(site)
+    assert not sana_video_linear_attention.SANA_VIDEO_LINEAR_ATTENTION.is_enabled(site)
 
 
 @requires_cuda
@@ -494,7 +552,7 @@ def test_lingbot_video_rmsnorm_quality_path_and_guards():
     torch.manual_seed(1)
     site = nn.Module()
     site.weight = nn.Parameter(torch.randn(2048, device="cuda", dtype=torch.float32))
-    lingbot_video_rmsnorm.mark_lingbot_video_rmsnorm_site(site)
+    lingbot_video_rmsnorm.LINGBOT_VIDEO_RMSNORM.mark(site)
     hidden_states = torch.randn(1, 128, 2048, device="cuda", dtype=torch.bfloat16)
 
     assert (
@@ -503,7 +561,7 @@ def test_lingbot_video_rmsnorm_quality_path_and_guards():
         )
         is None
     )
-    assert lingbot_video_rmsnorm.mount_lingbot_video_rmsnorm(site)
+    assert lingbot_video_rmsnorm.LINGBOT_VIDEO_RMSNORM.mount(site)
     output = lingbot_video_rmsnorm.try_lingbot_video_rmsnorm(
         site, hidden_states, site.weight, 1e-6
     )
@@ -517,8 +575,8 @@ def test_lingbot_video_rmsnorm_quality_path_and_guards():
     bf16_site.weight = nn.Parameter(
         torch.randn(2048, device="cuda", dtype=torch.bfloat16)
     )
-    lingbot_video_rmsnorm.mark_lingbot_video_rmsnorm_site(bf16_site)
-    assert lingbot_video_rmsnorm.mount_lingbot_video_rmsnorm(bf16_site)
+    lingbot_video_rmsnorm.LINGBOT_VIDEO_RMSNORM.mark(bf16_site)
+    assert lingbot_video_rmsnorm.LINGBOT_VIDEO_RMSNORM.mount(bf16_site)
     bf16_output = lingbot_video_rmsnorm.try_lingbot_video_rmsnorm(
         bf16_site, hidden_states, bf16_site.weight, 1e-6
     )
@@ -531,8 +589,8 @@ def test_lingbot_video_rmsnorm_quality_path_and_guards():
         )
         is None
     )
-    lingbot_video_rmsnorm.unmount_lingbot_video_rmsnorm(site)
-    assert not lingbot_video_rmsnorm.lingbot_video_rmsnorm_active(site)
+    lingbot_video_rmsnorm.LINGBOT_VIDEO_RMSNORM.unmount(site)
+    assert not lingbot_video_rmsnorm.LINGBOT_VIDEO_RMSNORM.is_enabled(site)
 
 
 if __name__ == "__main__":

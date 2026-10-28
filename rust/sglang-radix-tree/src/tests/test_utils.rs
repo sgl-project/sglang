@@ -43,7 +43,7 @@ pub(crate) fn action_kinds(actions: &[CacheAction]) -> Vec<&'static str> {
             CacheAction::FreeDeviceKV(_) => "FreeDeviceKV",
             CacheAction::FreeDeviceKVFullOnly(_) => "FreeDeviceKVFullOnly",
             CacheAction::BackupKV(_) => "BackupKV",
-            CacheAction::ReplaceWriteThroughOnNodeSplit { .. } => "ReplaceWriteThroughOnNodeSplit",
+            CacheAction::UpdatePendingBackupOnNodeSplit { .. } => "UpdatePendingBackupOnNodeSplit",
             CacheAction::MambaEvictExcessPathStates { .. } => "MambaEvictExcessPathStates",
             CacheAction::FreeComponentDeviceSlot { .. } => "FreeComponentDeviceSlot",
             CacheAction::FreeComponentHostSlot { .. } => "FreeComponentHostSlot",

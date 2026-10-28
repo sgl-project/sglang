@@ -1,9 +1,10 @@
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_policy import (
-    CacheAgnosticPolicy,
     CacheAwarePolicy,
     SchedulePolicy,
 )
@@ -27,13 +28,6 @@ class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
             supports_fast_match_prefix=lambda: supports_fast_match_prefix
         )
         return schedule_policy
-
-    def test_cache_agnostic_policy_requires_fast_matching(self):
-        policy = self.make_policy(CacheAgnosticPolicy.FCFS, False)
-        self.assertFalse(policy.waiting_queue_prefix_matched([]))
-
-        policy.tree_cache = SimpleNamespace(supports_fast_match_prefix=lambda: True)
-        self.assertTrue(policy.waiting_queue_prefix_matched([]))
 
     def test_lpm_queue_limit_respects_fast_matching_capability(self):
         policy = self.make_policy(CacheAwarePolicy.LPM, False)

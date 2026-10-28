@@ -20,10 +20,8 @@ import pytest
 import sgl_kernel  # noqa: F401  the ROCm path dispatches to torch.ops.sgl_kernel
 import torch
 
-from sglang.kernels.ops.attention.dsv4 import (
-    fused_q_indexer_rope_first_quant,
-    fused_q_indexer_rope_hadamard_quant,
-)
+from sglang.kernels.ops.attention.dsa.indexer_q import fused_q_indexer_rope_first_quant
+from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_hadamard_quant
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 

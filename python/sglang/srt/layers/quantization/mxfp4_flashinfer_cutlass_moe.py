@@ -124,6 +124,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
         self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return self.runner.runner_backend
+
     def process_weights_after_loading(self, layer: Module) -> None:
         # Preserve the base FP4 post-load handling.
         self._fp8.process_weights_after_loading(layer)

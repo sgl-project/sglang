@@ -8,16 +8,23 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.disagg_owner_shells import decode_owner_shell, prefill_owner_shell
 from sglang.test.scheduler_request_lists import make_request_registry
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 import math
+import queue
 import types
 import unittest
+from collections import deque
+from contextlib import nullcontext
 from functools import partial
-from unittest.mock import patch
+from itertools import count
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import prometheus_client
+import torch
 
+from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.request_lists import CoreLists
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -35,7 +42,192 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval, device_timer_ctx
 from sglang.test.test_utils import CustomTestCase, enter_scope
+
+
+class FakeInterval(_TimingInterval):
+    def __init__(self, milliseconds, ready=False, start=0, stream=0):
+        super().__init__(
+            start_event=SimpleNamespace(
+                elapsed_time=lambda end: end.timestamp - start, query=lambda: True
+            ),
+            end_event=self,
+            stream=stream,
+        )
+        self.timestamp = start + milliseconds
+        self.ready = ready
+
+    def end(self, metadata):
+        self.metadata = metadata
+
+    def query(self):
+        return self.ready
+
+    def elapsed_time(self):
+        return self.start_event.elapsed_time(self)
+
+
+def capture_timing(timer, *intervals):
+    timing = FpmTiming()
+    with patch.object(_TimingInterval, "create", side_effect=intervals):
+        with timer.capture(timing):
+            for _ in intervals:
+                with device_timer_ctx(timer, "test"):
+                    pass
+    timing.seal()
+    return timing
+
+
+class TestDeviceTimerCapture(unittest.TestCase):
+    def test_intervals_use_selected_device(self):
+        for track_stream in (False, True):
+            with (
+                self.subTest(track_stream=track_stream),
+                patch(
+                    "sglang.srt.utils.device_timer.torch.get_device_module"
+                ) as module,
+            ):
+                device = module.return_value
+                interval = _TimingInterval.create(track_stream=track_stream)
+                interval.end({})
+            self.assertEqual(device.Event.call_count, 2)
+            device.Event.assert_called_with(enable_timing=True)
+            self.assertEqual(device.Event.return_value.record.call_count, 2)
+            self.assertEqual(device.current_stream.call_count, int(track_stream))
+            self.assertIs(
+                interval.stream,
+                device.current_stream.return_value if track_stream else None,
+            )
+
+    def test_wrapper_cleans_up_after_exception(self):
+        timer = DeviceTimer()
+        forward = Mock(side_effect=ValueError("forward failed"))
+        wrapped = wrap_forward_with_fpm(forward, timer)
+        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        with self.assertRaisesRegex(ValueError, "forward failed"):
+            wrapped(batch)
+        self.assertIsNone(timer._observer)
+
+    def test_overlapping_groups_keep_their_own_spans(self):
+        reporter = Mock()
+        timer = DeviceTimer(reporter)
+        pending = [FakeInterval(5, start=4), FakeInterval(3, start=12)]
+        first = capture_timing(timer, FakeInterval(2, ready=True), pending[0])
+        second = capture_timing(timer, pending[1])
+        # A later unobserved interval must not extend either captured span.
+        with patch.object(
+            _TimingInterval, "create", return_value=FakeInterval(99, True)
+        ):
+            with timer.wrap({}):
+                pass
+        callbacks = [Mock(), Mock()]
+        first.when_ready(callbacks[0])
+        second.when_ready(callbacks[1])
+        timer._report()
+        callbacks[0].assert_not_called()
+        callbacks[1].assert_not_called()
+        pending[0].ready = True
+        self.assertTrue(timer.is_active())
+        callbacks[0].assert_not_called()
+        timer._report()
+        callbacks[0].assert_called_once_with(0.009)  # Includes the 2 ms gap.
+        callbacks[1].assert_not_called()
+        pending[1].ready = True
+        self.assertFalse(timer.is_active())
+        callbacks[1].assert_not_called()
+        timer._report()
+        callbacks[1].assert_called_once_with(0.003)
+        self.assertTrue(all(interval.observer is None for interval in pending))
+        self.assertEqual(reporter.call_count, 4)
+        timer._report()
+        callbacks[0].assert_called_once()
+        callbacks[1].assert_called_once()
+
+    def test_empty_zero_and_cross_stream_spans(self):
+        for intervals, expected in (
+            ([], 0.0),
+            ([FakeInterval(0, True)], 0.0),
+            ([FakeInterval(7, True)], 0.007),
+            ([FakeInterval(2, True, stream=1), FakeInterval(5, True, stream=2)], None),
+        ):
+            with self.subTest(expected=expected, intervals=len(intervals)):
+                for interval in intervals:
+                    interval.elapsed_time = Mock(side_effect=AssertionError)
+                timing = capture_timing(DeviceTimer(), *intervals)
+                self.assertEqual(timing.num_intervals, len(intervals))
+                callback = Mock()
+                timing.when_ready(callback)
+                callback.assert_called_once_with(expected)
+
+
+class TestSpecDecodeLengthSnapshot(CustomTestCase):
+    def test_snapshot_precedes_settlement_and_survives_retraction(self):
+        for algorithm in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DSPARK,
+        ):
+            with self.subTest(algorithm=algorithm):
+                reporter = _make_reporter(self, types.SimpleNamespace())
+                reporter.scheduler.enable_fpm = True
+                reqs = [
+                    types.SimpleNamespace(
+                        seqlen=length + 1,
+                        is_retracted=length == 200,
+                        finished=lambda length=length: length == 300,
+                        grammar=None,
+                        spec_verify_ct=0,
+                        spec_num_correct_drafts=0,
+                        update_spec_correct_drafts_histogram=Mock(),
+                        kv=types.SimpleNamespace(kv_committed_len=0),
+                    )
+                    for length in (100, 200, 300)
+                ]
+                batch = types.SimpleNamespace(
+                    reqs=reqs,
+                    spec_algorithm=algorithm,
+                    forward_mode=ForwardMode.DECODE,
+                    seq_lens_cpu=None,
+                )
+                result = GenerationBatchResult(
+                    next_token_ids=torch.arange(24),
+                    accept_lens=torch.tensor([1, 8, 3]),
+                    speculative_output_stride=8,
+                )
+
+                def settle_grammar(result, batch):
+                    # Mutating request state must not affect the earlier snapshot.
+                    for req in batch.reqs:
+                        req.seqlen += 20
+
+                processor = types.SimpleNamespace(
+                    metrics_reporter=reporter,
+                    model_worker=types.SimpleNamespace(on_verify_complete_cpu=Mock()),
+                    advance_grammar_fsm=settle_grammar,
+                )
+                tokens = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
+                    processor, result, batch
+                )
+                self.assertEqual([len(ids) for ids in tokens], [1, 8, 3])
+                self.assertEqual([req.kv.kv_committed_len for req in reqs], [1, 0, 0])
+                metrics = reporter._build_scheduled_request_metrics(batch, result)
+                self.assertEqual(metrics.num_decode_requests, 3)
+                self.assertEqual(metrics.sum_decode_kv_tokens, 600)
+                self.assertAlmostEqual(metrics.var_decode_kv_tokens, 20000 / 3)
+
+    def test_disabled_and_unsupported_do_not_read_requests(self):
+        reporter = _make_reporter(self, types.SimpleNamespace())
+        result = GenerationBatchResult()
+        reporter.snapshot_spec_decode_metrics(None, result)
+        self.assertIsNone(result.fpm_scheduled_requests)
+        reporter.scheduler.enable_fpm = True
+        for algorithm in (SpeculativeAlgorithm.UNO, SpeculativeAlgorithm.FROZEN_KV_MTP):
+            reporter.snapshot_spec_decode_metrics(
+                types.SimpleNamespace(spec_algorithm=algorithm), result
+            )
+            self.assertIsNone(result.fpm_scheduled_requests)
 
 
 class _FakeReq:
@@ -70,6 +262,9 @@ class _CollectingPublisher:
 
     def publish(self, metrics):
         self.metrics.append(metrics)
+
+    def set_idle(self, idle):
+        self.idle = idle
 
 
 class _DummyPublisherThread:
@@ -106,6 +301,8 @@ def _publish_server_args(test, **fields):
 
 
 def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
+    if not hasattr(scheduler, "run_batch"):
+        scheduler.run_batch = lambda *args, **kwargs: types.SimpleNamespace()
     if not hasattr(scheduler, "server_args"):
         scheduler.server_args = _publish_server_args(
             test,
@@ -197,12 +394,17 @@ class TestForwardPassMetrics(unittest.TestCase):
             prefix_lens=[],
             prefill_stats=None,
             seq_lens_cpu=[],
-            fpm_start_time=100.0,
         )
         defaults.update(overrides)
         batch = types.SimpleNamespace(**defaults)
         batch.prefill_reqs = partial(ScheduleBatch.prefill_reqs, batch)
         return batch
+
+    def _emit_ready(self, batch, milliseconds=1):
+        timing = capture_timing(DeviceTimer(), FakeInterval(milliseconds, ready=True))
+        self.reporter._emit_forward_pass_metrics(
+            batch, GenerationBatchResult(fpm_timing=timing)
+        )
 
     def test_emit_mixed_batch_separates_prefill_and_decode(self):
         self.reporter.metrics_sink._fpm_dp_rank = 3
@@ -226,11 +428,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             seq_lens_cpu=[decode_req.seqlen],
         )
 
-        with patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
-            return_value=104.5,
-        ):
-            self.reporter._emit_forward_pass_metrics(batch)
+        self._emit_ready(batch, milliseconds=4500)
 
         self.assertEqual(len(self.reporter.metrics_sink._fpm_publisher.metrics), 1)
         metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
@@ -255,7 +453,13 @@ class TestForwardPassMetrics(unittest.TestCase):
         )
         batch = self._make_batch()
 
-        self.reporter._emit_forward_pass_metrics(batch)
+    def test_scheduler_state_controls_heartbeat_with_metrics_disabled(self):
+        self.reporter.record_scheduler_active(event_ns=0)
+        self.assertFalse(self.scheduler._fpm_publisher.idle)
+        self.reporter.record_scheduler_idle()
+        self.assertTrue(self.scheduler._fpm_publisher.idle)
+        self.reporter.record_scheduler_active(event_ns=1)
+        self.assertFalse(self.scheduler._fpm_publisher.idle)
 
         self.assertEqual(len(self.reporter.metrics_sink._fpm_publisher.metrics), 1)
         self.assertAlmostEqual(
@@ -280,9 +484,13 @@ class TestForwardPassMetrics(unittest.TestCase):
     def test_emit_uses_monotonic_without_device_timer(self):
         batch = self._make_batch()
 
+        # Later iterations may mutate both sources before timing becomes ready.
+        batch.seq_lens_cpu = [900]
+        self.scheduler.waiting_queue.clear()
+        interval.ready = True
         with patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
-            return_value=100.035,
+            "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+            False,
         ):
             self.reporter._emit_forward_pass_metrics(batch, result=None)
 
@@ -300,11 +508,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.scheduler.lists.waiting_queue = [_FakeReq(200), _FakeReq(50)]
         batch = self._make_batch()
 
-        with patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
-            return_value=101.0,
-        ):
-            self.reporter._emit_forward_pass_metrics(batch)
+        self._emit_ready(batch)
 
         metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 3)
@@ -323,11 +527,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         ]
         batch = self._make_batch()
 
-        with patch(
-            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
-            return_value=101.0,
-        ):
-            self.reporter._emit_forward_pass_metrics(batch)
+        self._emit_ready(batch)
 
         metrics = self.reporter.metrics_sink._fpm_publisher.metrics[0]
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 0)
@@ -358,6 +558,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_metrics_uses_server_worker_id(self):
         scheduler = types.SimpleNamespace()
+        original_forward = scheduler.run_batch = lambda batch: types.SimpleNamespace()
         scheduler.server_args = _publish_server_args(
             self,
             enable_metrics=False,
@@ -397,6 +598,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_init_fpm_disabled_on_non_last_pp_rank(self):
         scheduler = types.SimpleNamespace()
+        original_forward = scheduler.run_batch = lambda: types.SimpleNamespace()
         scheduler.server_args = _publish_server_args(
             self,
             enable_metrics=False,

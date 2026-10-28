@@ -55,6 +55,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
+    get_pd_kv_layout,
     get_qsa_pending_state_indices,
     is_aborted,
     is_mla_backend,
@@ -164,6 +165,15 @@ def _transfer_start_layer(*, pool, hf_text_config) -> int:
     )
 
 
+def max_bootstrap_input_len(*, capacity: int, page_size: int, shard_size: int) -> int:
+    """Bootstrap prompt limit; sharded admission never fits a longer prompt."""
+    if shard_size == 1:
+        return capacity
+    # Strictest path, add_one_req_ignore_eos: page-rounded prompt, one page per
+    # shard, 1 new token and 1 spare token must stay below capacity.
+    return (capacity - shard_size * page_size - 3) // page_size * page_size
+
+
 def maybe_release_metadata_buffer(
     req: Req, allocator: ReqToMetadataIdxAllocator
 ) -> None:
@@ -195,6 +205,7 @@ class PrefillBootstrapQueue:
         gpu_id: int,
         bootstrap_port: int,
         max_total_num_tokens: int,
+        kv_shard_widening: int,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
         transfer_backend: TransferBackend,
         *,
@@ -230,6 +241,11 @@ class PrefillBootstrapQueue:
         self.kv_senders: Dict[str, BaseKVSender] = {}
         self.scheduler_stage_metrics = scheduler_stage_metrics
         self.max_total_num_tokens = max_total_num_tokens
+        self.max_input_len = max_bootstrap_input_len(
+            capacity=max_total_num_tokens,
+            page_size=page_size,
+            shard_size=kv_shard_widening,
+        )
         self.transfer_backend = transfer_backend
         self.model_config = model_config
         self.server_args = server_args
@@ -291,6 +307,7 @@ class PrefillBootstrapQueue:
         kv_args.system_dp_rank = get_parallel().dp_rank
         kv_args.rust_http_port = self.rust_http_port
         kv_args.kv_cache_dtype_str = self.kv_cache_dtype_str
+        kv_args.kv_layout = get_pd_kv_layout(self.token_to_kv_pool)
         layer_shard_enabled = getattr(
             self.token_to_kv_pool, "layer_shard_enabled", False
         )
@@ -487,8 +504,8 @@ class PrefillBootstrapQueue:
             self.add(req, num_kv_heads)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
-        if len(req.origin_input_ids) > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
+        if len(req.origin_input_ids) > self.max_input_len:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_input_len}"
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
@@ -628,7 +645,10 @@ class DisaggPrefill:
         req_to_token_pool = kv.req_to_token_pool
         tree_cache = kv.tree_cache
         max_running_requests = capacity.max_running_requests
-        max_total_num_tokens = capacity.effective_max_total_num_tokens
+        # Each rank owns a subset of logical KV pages, so capacity widens by N.
+        max_total_num_tokens = (
+            capacity.effective_max_total_num_tokens * capacity.kv_shard_widening
+        )
         forward_stream = streams.forward_stream
         scheduler_stage_metrics = services.scheduler_stage_metrics
         output_streamer = services.output_streamer
@@ -677,6 +697,7 @@ class DisaggPrefill:
             gpu_id=get_device().gpu_id,
             bootstrap_port=get_disagg().disaggregation_bootstrap_port,
             max_total_num_tokens=max_total_num_tokens,
+            kv_shard_widening=capacity.kv_shard_widening,
             scheduler_stage_metrics=scheduler_stage_metrics,
             transfer_backend=transfer_backend,
             model_config=model_config,
@@ -1365,9 +1386,21 @@ class DisaggPrefill:
                 ]
 
             def _swa_payload():
-                window_size = self.sliding_window_size
+                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                request_window = kvcache.request_window
+                # Under encoder replay the scheduler is not hybrid SWA and keeps no
+                # window size; the pool holds it.
+                window_size = (
+                    self.sliding_window_size
+                    if request_window is None
+                    else kvcache.sliding_window
+                )
                 window_start = max(req.disagg.decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
+                if request_window is not None:
+                    return request_window.page_indices(
+                        int(req.kv.req_pool_idx), window_start, seq_len
+                    )
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, window_start:seq_len
                 ]
@@ -1428,6 +1461,9 @@ class DisaggPrefill:
                     int(req.kv.req_pool_idx), c128_seq_len
                 )
 
+            def _request_row_payload():
+                return np.array([req.kv.req_pool_idx], dtype=np.int32)
+
             state_types = self.bootstrap_queue.kv_manager.kv_args.state_types
             payloads = {
                 StateType.MAMBA: _mamba_payload,
@@ -1440,6 +1476,7 @@ class DisaggPrefill:
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
+                StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
@@ -1495,18 +1532,43 @@ class DisaggPrefill:
                     raw_kv_indices
                 )
             )
-            page_indices = kv_to_page_indices(kv_indices, page_size)
-            segment_is_last = last_chunk and is_final_segment
-            if not self.kv_senders[req.rid].should_send_kv_chunk(
-                len(page_indices), segment_is_last
+            sender = self.kv_senders[req.rid]
+            indices_event = None
+            if getattr(sender, "supports_host_tensor_indices", False) and not (
+                sender.kv_mgr.enable_all_cp_ranks_for_transfer
+                and not get_parallel().enable_dsa_cache_layer_split
             ):
+                # The schedule stream waits on the in-flight forward; move the
+                # D2H wait to the transfer worker so scheduling can continue.
+                page_indices_dev = kv_indices[::page_size] // page_size
+                page_indices = torch.empty(
+                    page_indices_dev.shape,
+                    dtype=page_indices_dev.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                page_indices.copy_(page_indices_dev, non_blocking=True)
+                indices_event = torch.cuda.Event()
+                indices_event.record(torch.cuda.current_stream())
+            else:
+                page_indices = kv_to_page_indices(kv_indices, page_size)
+            segment_is_last = last_chunk and is_final_segment
+            if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
             send_state_indices = state_indices if segment_is_last else None
-            self.kv_senders[req.rid].send(
-                page_indices,
-                send_state_indices,
-                num_kv_tokens=seg_end - seg_start,
-            )
+            if indices_event is not None:
+                sender.send(
+                    page_indices,
+                    send_state_indices,
+                    num_kv_tokens=seg_end - seg_start,
+                    indices_event=indices_event,
+                )
+            else:
+                sender.send(
+                    page_indices,
+                    send_state_indices,
+                    num_kv_tokens=seg_end - seg_start,
+                )
         req.disagg.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on the transfer list.

@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -270,6 +271,9 @@ void flashmla_sched_meta(
 
   const std::size_t smem = sizeof(int) * static_cast<std::size_t>(b * 5 + 1 + num_sm_parts * kMetaInts);
   RuntimeCheck(smem <= 48 * 1024, "schedule does not fit in shared memory: ", smem, " bytes");
+  // The kernel also has static shared memory. Opt in so schedules near
+  // 48 KiB do not exceed the default combined static + dynamic limit.
+  runtime::set_max_dynamic_smem_per_device<flashmla_sched_meta_kernel>(device_.unwrap(), 48 * 1024);
   LaunchKernel(1, kBlockSize, device_.unwrap(), smem)(flashmla_sched_meta_kernel, p);
 }
 

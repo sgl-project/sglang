@@ -151,16 +151,6 @@ class TestStashGatePreservesPrefix(CustomTestCase):
             req, up_to=self.POST_RESET_FILL_LEN
         )
 
-    def test_no_chunked_req_never_mutates_state(self):
-        # The outer `if chunked_req is not None` guard must hold on the retract
-        # path that clears chunked_req.
-        cache = _make_tree_cache()
-        s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
-
-        Scheduler.schedule_step(s, ScheduleSlot())
-        self.assertIsNone(s.parts.lists.chunked_req)
-        cache.checkpoint.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()

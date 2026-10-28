@@ -6,6 +6,7 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -501,7 +502,11 @@ class QSAIndexer(MultiPlatformOp):
     ) -> torch.Tensor:
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
-        use_fast_topk = q.is_cuda and self.block_topk == 512
+        use_fast_topk = (
+            q.is_cuda
+            and self.block_topk == 512
+            and not is_batch_invariant_mode_enabled()
+        )
         logits = qsa_mqa_decode(
             q,
             compressed_cache,

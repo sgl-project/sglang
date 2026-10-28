@@ -29,7 +29,7 @@
 // The reader requires the rows of a page to be contiguous and the page stride
 // to be a multiple of kPageAlign (its TMA row stride), which is what
 // kv_page_bytes pads to. The pure-torch reference of the V41 (fp8) quantizer is
-// `sglang.kernels.ops.attention.dsv4.torch_quant`.
+// `sglang.test.kernels.deepseek_v4.k_cache_reference`.
 
 namespace sglang {
 

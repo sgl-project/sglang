@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Optional
 
 import torch
 import triton
@@ -24,7 +25,10 @@ _is_musa = is_musa()
 _is_xpu = is_xpu()
 
 if _is_cpu:
-    from sgl_kernel import assign_extend_cache_locs_cpu
+    from sgl_kernel import (
+        assign_draft_cache_locs_contiguous_cpu,
+        assign_extend_cache_locs_cpu,
+    )
 
 
 def _get_oot_speculative_cache_locs_fn() -> Callable[..., torch.Tensor] | None:
@@ -76,6 +80,47 @@ def assign_draft_cache_locs_contiguous(
                     kv_start,
                     topk_offset < topk,
                 )
+
+
+def assign_draft_cache_locs_contiguous_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,  # mutable
+    topk: int,
+    num_cols: int,
+    positions: Optional[torch.Tensor] = None,  # mutable
+    mrope: Optional[torch.Tensor] = None,  # mutable
+):
+    """Copy each request's ``topk * num_cols`` slots from ``seq_lens`` on, and
+    write the draft positions when ``positions`` is given."""
+    if _is_cpu:
+        assert positions is None and mrope is None, "CPU writes no positions"
+        assign_draft_cache_locs_contiguous_cpu(
+            req_pool_indices,
+            req_to_token,
+            seq_lens,
+            out_cache_loc,
+            req_to_token.shape[1],
+            topk,
+            num_cols,
+        )
+        return
+    bs = seq_lens.shape[0]
+    assign_draft_cache_locs_contiguous[(bs,)](
+        req_pool_indices,
+        req_to_token,
+        seq_lens,
+        out_cache_loc,
+        req_to_token.shape[1],
+        topk,
+        num_cols,
+        positions=positions,
+        mrope=mrope,
+        BS=bs,
+        WRITE_POSITIONS=positions is not None,
+        WRITE_MROPE=mrope is not None,
+    )
 
 
 @triton.jit
@@ -266,128 +311,121 @@ def generate_draft_decode_kv_indices(
 
 
 @triton.jit
-def align_evict_mask_to_page_size(
-    seq_lens,
-    evict_mask,
+def generate_draft_decode_window_kv_indices(
+    req_pool_indices,
+    req_to_token,
+    paged_kernel_lens,
+    window_kv_indices,
+    window_kv_indptr,
+    positions,
+    # Runtime, as in generate_draft_decode_kv_indices.
+    row_stride,
+    kv_indices_stride: tl.constexpr,
+    kv_indptr_stride: tl.constexpr,
+    bs_upper: tl.constexpr,
+    iter_upper: tl.constexpr,
+    num_tokens_upper: tl.constexpr,
     page_size: tl.constexpr,
-    num_draft_tokens: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    window: tl.constexpr,
+    ENTRY_PAGE_SIZE: tl.constexpr = 1,
+    # The source's sliding-window page table (`KVIndexTable.v2p`).
+    v2p=None,
+    TRANSLATE: tl.constexpr = False,
 ):
-    t_range = tl.arange(0, BLOCK_SIZE)
+    """Per-step sliding-window read rail of the multi-step draft.
 
-    bid = tl.program_id(axis=0)
-    seq_len = tl.load(seq_lens + bid)
-    io_mask = t_range < num_draft_tokens
-    mask_row = tl.load(
-        evict_mask + bid * num_draft_tokens + t_range, mask=io_mask, other=0
+    Step ``iters`` of branch ``(bid, topk_id)`` attends ``seq_len + iters``
+    tokens: the committed prefix plus the draft's own chain in the slots
+    `generate_draft_decode_kv_indices` emits. A window layer reads the last
+    ``min(seq_len + iters, window)`` of them, so this emits that tail only,
+    prefix ids first and chain ids after, from the sliding-window read source.
+    """
+    BLOCK_SIZE: tl.constexpr = 128
+    iters = tl.program_id(axis=0)
+    bid = tl.program_id(axis=1)
+    topk_id = tl.program_id(axis=2)
+
+    num_steps = tl.num_programs(axis=0)
+    num_seqs = tl.num_programs(axis=1)
+    topk = tl.num_programs(axis=2)
+
+    window_kv_indices += kv_indices_stride * iters
+    window_kv_indptr += kv_indptr_stride * iters
+    iters += 1
+
+    seq_len = tl.load(paged_kernel_lens + bid)
+    total = seq_len + iters
+    window_len = tl.minimum(total, window)
+    # Chain position of the first token in the window; the prefix part covers
+    # [start, seq_len), the chain part [max(start - seq_len, 0), iters).
+    start = total - window_len
+
+    # This branch's output offset: the window lengths of the branches before
+    # it, each clipped like this one.
+    zid = bid * topk + topk_id
+    bs_offset = tl.arange(0, num_tokens_upper)
+    in_front = bs_offset < zid
+    prev_lens = tl.load(positions + bs_offset, mask=in_front, other=0)
+    prev_window = tl.where(in_front, tl.minimum(prev_lens + iters, window), 0)
+    base = tl.sum(prev_window)
+    out_ptr = window_kv_indices + base
+    token_pool_ptr = req_to_token + tl.load(req_pool_indices + bid) * row_stride
+
+    prefix_start = tl.minimum(start, seq_len)
+    prefix_len = seq_len - prefix_start
+    kv_offset = tl.arange(0, BLOCK_SIZE)
+    num_loop = tl.cdiv(prefix_len, BLOCK_SIZE)
+    for _ in range(num_loop):
+        mask = kv_offset < prefix_len
+        data = _load_token_ids(
+            token_pool_ptr,
+            prefix_start + kv_offset,
+            mask,
+            v2p,
+            page_size,
+            ENTRY_PAGE_SIZE,
+            TRANSLATE,
+        )
+        tl.store(out_ptr + kv_offset, data, mask=mask)
+        kv_offset += BLOCK_SIZE
+
+    chain_start = tl.maximum(start - seq_len, 0)
+    extend_offset = tl.arange(0, iter_upper)
+    chain_step = chain_start + extend_offset
+    chain_mask = chain_step < iters
+    # The same chain slots `generate_draft_decode_kv_indices` emits.
+    if page_size == 1 or topk == 1:
+        chain_pos = seq_len + topk_id * num_steps + chain_step
+    else:
+        last_page_len = seq_len % page_size
+        num_new_pages_per_topk = (
+            last_page_len + num_steps + page_size - 1
+        ) // page_size
+        prefix_base = seq_len // page_size * page_size
+        chain_base = (
+            prefix_base + topk_id * num_new_pages_per_topk * page_size + last_page_len
+        )
+        chain_pos = chain_base + chain_step
+    extend_data = _load_token_ids(
+        token_pool_ptr,
+        chain_pos,
+        chain_mask,
+        v2p,
+        page_size,
+        ENTRY_PAGE_SIZE,
+        TRANSLATE,
     )
+    tl.store(out_ptr + prefix_len + extend_offset, extend_data, mask=chain_mask)
 
-    num_trues = tl.sum(mask_row)
-    num_false = num_draft_tokens - num_trues
-
-    start = (seq_len + num_false - 1) // page_size * page_size - seq_len
-    for i in range(max(start, 0), min(start + page_size, num_draft_tokens)):
-        tl.store(evict_mask + bid * num_draft_tokens + i, False)
-
-
-@torch.compile(dynamic=True, disable=_is_npu)
-def get_src_tgt_cache_loc(
-    seq_lens: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    accept_index: torch.Tensor,
-    num_correct_drafts: torch.Tensor,
-    draft_token_num: int,
-    page_size: int,
-):
-    src_cache_loc = out_cache_loc[accept_index]
-    # zeros_like, not empty_like: any uncovered tail stays at slot 0 (padding)
-    # instead of caching-allocator garbage.
-    tgt_cache_loc = torch.zeros_like(src_cache_loc)
-    extended_len = seq_lens + draft_token_num
-    keep_len = torch.minimum(
-        (seq_lens + num_correct_drafts + 1 + page_size - 1) // page_size * page_size,
-        extended_len,
-    )
-    to_free_num_slots = extended_len - keep_len
-    return src_cache_loc, tgt_cache_loc, to_free_num_slots
-
-
-@triton.jit
-def get_target_cache_loc(
-    tgt_cache_loc,
-    to_free_slots,
-    num_correct_drafts,
-    to_free_num_slots,
-    out_cache_loc,
-    num_verify_tokens: tl.constexpr,
-    num_verify_tokens_upper: tl.constexpr,
-    bs_upper: tl.constexpr,
-):
-    bid = tl.program_id(axis=0)
-    offset = tl.arange(0, num_verify_tokens_upper)
-    bs_offset = tl.arange(0, bs_upper)
-
-    # write the first part to tgt_cache_loc
-    accept_len_all = tl.load(num_correct_drafts + bs_offset, mask=bs_offset < bid)
-    tgt_cache_loc_start = tl.sum(accept_len_all) + bid
-    copy_len = tl.load(num_correct_drafts + bid) + 1
-    out_cache_loc_row = tl.load(
-        out_cache_loc + bid * num_verify_tokens + offset, mask=offset < copy_len
-    )
-    tl.store(
-        tgt_cache_loc + tgt_cache_loc_start + offset,
-        out_cache_loc_row,
-        mask=offset < copy_len,
-    )
-
-    # write the second part to to_free_num_pages
-    to_free_num_slots_all = tl.load(to_free_num_slots + bs_offset, mask=bs_offset < bid)
-    to_free_num_slots_cur = tl.load(to_free_num_slots + bid)
-    out_cache_loc_start = num_verify_tokens - to_free_num_slots_cur
-    to_free_slots_start = tl.sum(to_free_num_slots_all)
-
-    copy_len = to_free_num_slots_cur
-    out_cache_loc_row = tl.load(
-        out_cache_loc + bid * num_verify_tokens + out_cache_loc_start + offset,
-        mask=offset < copy_len,
-    )
-    tl.store(
-        to_free_slots + to_free_slots_start + offset,
-        out_cache_loc_row,
-        mask=offset < copy_len,
-    )
-
-
-@triton.jit
-def filter_finished_cache_loc_kernel(
-    out_cache_loc,
-    tgt_cache_loc,
-    num_correct_drafts,
-    num_accept_tokens_filter,
-    bs_upper: tl.constexpr,
-    num_verify_tokens_upper: tl.constexpr,
-):
-    bid = tl.program_id(0)
-    bs_offset = tl.arange(0, bs_upper)
-
-    num_correct_drafts_all = tl.load(
-        num_correct_drafts + bs_offset, mask=bs_offset < bid
-    )
-    old_start = tl.sum(num_correct_drafts_all) + bid
-
-    num_accept_tokens_filter_all = tl.load(
-        num_accept_tokens_filter + bs_offset, mask=bs_offset < bid
-    )
-    new_start = tl.sum(num_accept_tokens_filter_all)
-
-    copy_len = tl.load(num_accept_tokens_filter + bid)
-    copy_offset = tl.arange(0, num_verify_tokens_upper)
-    value = tl.load(
-        tgt_cache_loc + old_start + copy_offset, mask=copy_offset < copy_len
-    )
-    tl.store(
-        out_cache_loc + new_start + copy_offset, value, mask=copy_offset < copy_len
-    )
+    # Update window_kv_indptr: program 0 writes the total at [num_seqs * topk],
+    # every other program its own start; [0] stays the buffer's zero.
+    if zid == 0:
+        zid = num_seqs * topk
+        in_front = bs_offset < zid
+        prev_lens = tl.load(positions + bs_offset, mask=in_front, other=0)
+        prev_window = tl.where(in_front, tl.minimum(prev_lens + iters, window), 0)
+        base = tl.sum(prev_window)
+    tl.store(window_kv_indptr + zid, base)
 
 
 @triton.jit
@@ -501,6 +539,13 @@ def assign_extend_cache_locs_uniform(
     out_cache_loc,
     pool_len: tl.constexpr,
     draft_token_num: tl.constexpr,
+    full_v2p=None,
+    swa_v2p=None,
+    full_out=None,
+    swa_out=None,
+    PAGE_SIZE: tl.constexpr = 1,
+    num_v_pages=0,
+    num_swa_pages=0,
 ):
     """Uniform-length variant of assign_extend_cache_locs: every row extends
     exactly draft_token_num tokens, so the end offset is start +
@@ -519,6 +564,21 @@ def assign_extend_cache_locs_uniform(
         mask = o < draft_token_num
         data = tl.load(token_pool + kv_start + o, mask=mask)
         tl.store(out_cache_ptr + o, data, mask=mask)
+        if full_v2p is not None:
+            page = data // PAGE_SIZE
+            valid = mask & (data >= 0) & (page < num_v_pages)
+            physical = tl.load(
+                full_v2p + tl.where(valid, page, 0), mask=valid, other=-1
+            )
+            full_loc = tl.maximum(physical * PAGE_SIZE + data % PAGE_SIZE, 0)
+            tl.store(full_out + pid * draft_token_num + o, full_loc, mask=mask)
+            if swa_v2p is not None:
+                swa_valid = mask & (data >= 0) & (page < num_swa_pages)
+                physical = tl.load(
+                    swa_v2p + tl.where(swa_valid, page, 0), mask=swa_valid, other=-1
+                )
+                swa_loc = tl.maximum(physical * PAGE_SIZE + data % PAGE_SIZE, 0)
+                tl.store(swa_out + pid * draft_token_num + o, swa_loc, mask=mask)
 
 
 def assign_extend_cache_locs_uniform_func(
@@ -528,11 +588,30 @@ def assign_extend_cache_locs_uniform_func(
     batch_size: int,
     draft_token_num: int,
     device,
+    *,
+    full_v2p: Optional[torch.Tensor] = None,
+    swa_v2p: Optional[torch.Tensor] = None,
+    full_out: Optional[torch.Tensor] = None,
+    swa_out: Optional[torch.Tensor] = None,
+    page_size: int = 1,
 ) -> torch.Tensor:
     """assign_extend_cache_locs for the uniform case (all rows extend exactly
     draft_token_num tokens, e.g. spec target-verify prep). Computes end
     offsets inside the kernel, removing the eager `seq_lens + draft_token_num`
-    add from the host critical path."""
+    add from the host critical path. Optional v2p tables fill physical FULL
+    and SWA write windows in the same launch; the returned ids stay virtual.
+    Mapping tables and output buffers must be contiguous, with one output
+    per gathered token. Translation is rank-local (no DCP widening).
+    """
+    if full_v2p is not None:
+        assert full_out is not None and full_out.numel() == batch_size * draft_token_num
+        assert full_v2p.is_contiguous() and full_out.is_contiguous()
+        assert swa_v2p is None or (
+            swa_out is not None
+            and swa_out.numel() == full_out.numel()
+            and swa_out.is_contiguous()
+            and swa_v2p.is_contiguous()
+        )
     if _is_cuda or _is_hip or _is_musa or _is_xpu:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
@@ -546,10 +625,18 @@ def assign_extend_cache_locs_uniform_func(
             out_cache_loc,
             req_to_token.shape[1],
             draft_token_num,
+            full_v2p=full_v2p,
+            swa_v2p=swa_v2p,
+            full_out=full_out,
+            swa_out=swa_out,
+            PAGE_SIZE=page_size,
+            num_v_pages=0 if full_v2p is None else full_v2p.numel(),
+            num_swa_pages=0 if swa_v2p is None else swa_v2p.numel(),
         )
         return out_cache_loc
 
     # NPU / CPU platforms: fall back to the end_offset-tensor path.
+    assert full_v2p is None, "fused write translation requires a Triton device"
     return assign_extend_cache_locs_func(
         req_pool_indices=req_pool_indices,
         req_to_token=req_to_token,
@@ -632,3 +719,34 @@ def assign_extend_cache_locs_func(
         )
 
         return out_cache_loc
+
+
+def fill_front_out_cache_loc_func(
+    num_front: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    front_out_cache_loc: torch.Tensor,  # mutable
+):
+    """Pack the first ``num_front[i]`` slots of request i's window in ``out_cache_loc``."""
+    bs = num_front.numel()
+    window = out_cache_loc.view(bs, -1)
+    rows = torch.arange(bs, device=window.device)
+    starts = torch.zeros_like(num_front)
+    if _is_cpu:
+        assign_extend_cache_locs_cpu(
+            rows,
+            window.int(),
+            starts,
+            num_front,
+            front_out_cache_loc,
+            window.shape[1],
+        )
+        return
+    assign_extend_cache_locs[(bs,)](
+        rows,
+        window,
+        starts,
+        num_front,
+        front_out_cache_loc,
+        window.shape[1],
+        next_power_of_2(bs),
+    )

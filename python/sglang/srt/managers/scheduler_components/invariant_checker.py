@@ -536,14 +536,24 @@ class SchedulerWatchdog:
         )
 
     def _dump_info(self) -> str:
-        if self.flags.is_initializing:
-            return ""
-        checker = self.invariant_checker
-        _, messages = checker._check_all_pools(
-            checker.pool_stats_observer.get_pool_stats(),
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            describe_registration_in_progress,
         )
-        batch = self.counters.cur_batch_for_debug
-        return (
-            f"scheduler.cur_batch_for_debug.batch_size()={batch.batch_size()!r}\n"
-            f"scheduler.cur_batch_for_debug.reqs={batch.reqs!r}\n" + "\n".join(messages)
-        )
+
+        parts = []
+        # Checked before is_initializing: CUDA graph capture registers too, and
+        # only the soft watchdog runs that early.
+        if (registration := describe_registration_in_progress()) is not None:
+            parts.append(f"symmetric-memory registration in progress: {registration}")
+        if not self.flags.is_initializing:
+            checker = self.invariant_checker
+            _, messages = checker._check_all_pools(
+                checker.pool_stats_observer.get_pool_stats(),
+            )
+            batch = self.counters.cur_batch_for_debug
+            parts += [
+                f"scheduler.cur_batch_for_debug.batch_size()={batch.batch_size()!r}",
+                f"scheduler.cur_batch_for_debug.reqs={batch.reqs!r}",
+                *messages,
+            ]
+        return "\n".join(parts)

@@ -566,7 +566,10 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         with (
             self._target_kv_pool_view(forward_batch),
-            forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+            forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend),
+                forward_batch=forward_batch,
+            ),
         ):
             seed_output = self.draft_model_runner.forward(forward_batch).logits_output
 
@@ -609,7 +612,10 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
             with (
                 self._target_kv_pool_view(forward_batch),
-                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+                forward_context(
+                    ForwardContext(attn_backend=self.draft_attn_backend),
+                    forward_batch=forward_batch,
+                ),
             ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch

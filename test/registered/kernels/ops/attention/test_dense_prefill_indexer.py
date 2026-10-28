@@ -3,7 +3,9 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
+from sglang.kernels.ops.quantization.fp4_indexer_quant import (
+    quantize_fp4_indexer_tensor,
+)
 from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks, scoring
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase

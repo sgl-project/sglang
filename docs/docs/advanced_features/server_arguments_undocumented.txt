@@ -30,7 +30,6 @@
 --enable-dsa-fused-indexer
 --enable-encoder-swa-bounded-replay
 --enable-flexkv
---enable-layernorm-sp
 --enable-lean-attention
 --enable-linear-replayssm
 --enable-linear-replayssm-spec
@@ -64,7 +63,6 @@
 --mm-preprocess-cache-size-mb
 --mm-processor-worker-num
 --otlp-service-name
---prefill-decode-interval
 --prefill-kv-cache-dequant-dtype
 --qsa-indexer-dtype
 --radix-eviction-policy-config

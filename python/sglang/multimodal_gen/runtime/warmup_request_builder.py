@@ -629,7 +629,14 @@ def build_warmup_reqs(
             num_inference_steps=sampling_defaults.num_inference_steps,
             num_frames=num_frames,
         )
-        if include_warmup_image:
+        if (
+            server_args.enable_breakable_cuda_graph is True
+            and sampling_defaults.image_path
+        ):
+            # Optional image conditioning changes the captured signature. Use
+            # the configured references rather than capturing text-only inputs.
+            req_kwargs["image_path"] = sampling_defaults.image_path
+        elif include_warmup_image:
             if warmup_input_path is None:
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"

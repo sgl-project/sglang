@@ -402,3 +402,42 @@ def test_cached_merge_restores_untouched_base_view():
     layer.merge_lora_weights(strength=0.5)
     layer.unmerge_lora_weights()
     torch.testing.assert_close(base.weight, original, rtol=0, atol=0)
+
+
+def test_switching_adapters_unmerges_layers_the_new_adapter_skips():
+    layer_x, layer_y = _make_layer(), _make_layer()
+    base_x = layer_x.base_layer.weight.detach().clone()
+    pipeline = _make_pipeline(layer_x)
+    pipeline.lora_layers = {"x": layer_x, "y": layer_y}
+    pipeline.lora_adapters["a"]["x.lora_A"] = torch.ones(1, 2)
+    pipeline.lora_adapters["a"]["x.lora_B"] = torch.ones(2, 1)
+    pipeline.lora_adapters["b"]["y.lora_A"] = torch.ones(1, 2)
+    pipeline.lora_adapters["b"]["y.lora_B"] = torch.ones(2, 1)
+
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline._apply_lora_to_layers(
+            pipeline.lora_layers, ["a"], ["/a"], 0, [1.0], clear_existing=True
+        )
+        assert not torch.equal(layer_x.base_layer.weight, base_x)
+        pipeline._apply_lora_to_layers(
+            pipeline.lora_layers, ["b"], ["/b"], 0, [1.0], clear_existing=True
+        )
+
+    assert not layer_x.merged
+    assert layer_x.disable_lora
+    assert layer_x.lora_weights_list == []
+    torch.testing.assert_close(layer_x.base_layer.weight, base_x)
+    x = torch.randn(3, 2)
+    torch.testing.assert_close(layer_x(x), x @ base_x.T)
+
+
+def test_unmerge_restores_base_even_when_lora_disabled():
+    layer = _make_layer()
+    base = layer.base_layer.weight.detach().clone()
+    layer.set_lora_weights(torch.ones(1, 2), torch.ones(2, 1), merge_weights=True)
+    layer.disable_lora = True
+
+    layer.unmerge_lora_weights()
+
+    assert not layer.merged
+    torch.testing.assert_close(layer.base_layer.weight, base)

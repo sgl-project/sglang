@@ -2,7 +2,8 @@ import dataclasses
 import types
 import unittest
 from array import array
-from unittest.mock import MagicMock
+from itertools import product
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -11,11 +12,22 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers import schedule_batch  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    Req,
     ScheduleBatch,
     split_cached_prefix_by_tier,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.managers.scheduler_components.batch_result_processor import (  # noqa: E402
+    SchedulerBatchResultProcessor,
+)
+from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.runtime_context import get_context  # noqa: E402
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")

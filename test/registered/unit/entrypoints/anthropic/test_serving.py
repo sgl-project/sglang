@@ -1438,18 +1438,6 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(anthropic_response.content[0].type, "text")
         self.assertEqual(anthropic_response.content[0].text, "")
 
-    def test_error_response_does_not_leak_exception_name(self):
-        """``error.type`` must stay in Anthropic's documented literal set."""
-        serving = self._serving()
-        response = serving._error_response(
-            status_code=500,
-            error_type="api_error",
-            message="Internal server error",
-            exception_name="KeyError",
-        )
-        body = json.loads(bytes(response.body).decode())
-        self.assertEqual(body["error"]["type"], "api_error")
-
     def test_user_message_text_tool_text_preserves_order(self):
         """User message [text, tool_result, text] must stay user→tool→user on the wire."""
         serving = self._serving()

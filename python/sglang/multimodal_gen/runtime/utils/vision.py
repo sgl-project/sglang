@@ -132,6 +132,7 @@ def load_video(
     convert_method: (
         Callable[[list[PIL.Image.Image]], list[PIL.Image.Image]] | None
     ) = None,
+    max_frames: int | None = None,
 ) -> list[PIL.Image.Image]:
     """
     Loads `video` to a list of PIL Image.
@@ -141,10 +142,15 @@ def load_video(
         convert_method (Callable[[List[PIL.Image.Image]], List[PIL.Image.Image]], *optional*):
             A conversion method to apply to the video after loading it. When set to `None` the images will be converted
             to "RGB".
+        max_frames (`int`, *optional*):
+            Stop decoding after this many frames. Decoding is sequential, so a caller that only needs a prefix of a
+            long clip should pass it here instead of slicing the result; the frames returned are the same either way.
     Returns:
         `List[PIL.Image.Image]`:
             The video as a list of PIL images.
     """
+    if max_frames is not None and max_frames <= 0:
+        raise ValueError(f"max_frames must be positive, got {max_frames}.")
     is_url = video.startswith("http://") or video.startswith("https://")
     is_file = os.path.isfile(video)
     was_tempfile_created = False
@@ -177,7 +183,7 @@ def load_video(
     if video.endswith(".gif"):
         gif = PIL.Image.open(video)
         try:
-            while True:
+            while max_frames is None or len(pil_images) < max_frames:
                 pil_images.append(gif.copy())
                 gif.seek(gif.tell() + 1)
         except EOFError:
@@ -192,9 +198,12 @@ def load_video(
             ) from None
 
         with imageio.get_reader(video) as reader:
-            # Read all frames
+            # Closing the reader early stops the ffmpeg subprocess, so a prefix
+            # costs only the frames it needs.
             for frame in reader:
                 pil_images.append(PIL.Image.fromarray(frame))
+                if max_frames is not None and len(pil_images) >= max_frames:
+                    break
 
     if was_tempfile_created:
         os.remove(video_path)

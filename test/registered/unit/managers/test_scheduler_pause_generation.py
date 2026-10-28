@@ -326,26 +326,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIs(scheduler.parts.counters.cur_batch_for_debug, original_cur_batch)
         self.assertIs(scheduler.parts.lists.chunked_req, original_chunked_req)
 
-    def test_paused_engine_accounting_uses_current_scheduler_state(self):
-        scheduler = partial_scheduler()
-        scheduler.parts.mode_owners = ModeOwners()
-        scheduler.parts.metrics_sink = MagicMock()
-        scheduler.hub.request_registry = MagicMock()
-
-        for is_idle in (True, False):
-            with self.subTest(is_idle=is_idle):
-                scheduler.hub.request_registry.is_fully_idle.return_value = is_idle
-                scheduler.parts.metrics_sink.reset_mock()
-
-                scheduler._record_scheduler_state_for_paused_engine()
-
-                if is_idle:
-                    scheduler.parts.metrics_sink.record_scheduler_idle.assert_called_once_with()
-                    scheduler.parts.metrics_sink.record_scheduler_active.assert_not_called()
-                else:
-                    scheduler.parts.metrics_sink.record_scheduler_active.assert_called_once()
-                    scheduler.parts.metrics_sink.record_scheduler_idle.assert_not_called()
-
     def test_inplace_does_not_commit_pending_steps(self):
         """in_place should leave the pending steps to the event loop."""
         scheduler = self._new_scheduler()

@@ -81,6 +81,9 @@ mod tests {
                     metadata: Default::default(),
                 },
             ),
+            generation_policy: crate::message::request::GenerationPolicy::from(
+                server_args.as_ref(),
+            ),
             server_args,
             chat_formatter: None,
         });

@@ -1,0 +1,46 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "warn"
+# Unmaintained advisories are checked for direct dependencies only. The
+# transitive ones we cannot fix from here (`paste` via tokenizers ->
+# dynamo-tokenizers, `number_prefix` via indicatif -> hf-hub, `backoff` and
+# `instant` via kube-runtime, `rustls-pemfile` via kube-client) pose no
+# security risk; revisit when the upstream crates drop them.
+unmaintained = "workspace"
+# Keep `ignore` minimal — we want to be notified of new CVEs.
+ignore = [
+    # webpki-roots 0.26.11 (via ureq 2 <- fastokens <- dynamo-tokenizers) is a
+    # shim that re-exports webpki-roots 1.x, locked at the fixed 1.0.10; it
+    # bundles no roots of its own. Drop once ureq 2 leaves the tree.
+    { id = "RUSTSEC-2026-0381", reason = "0.26.11 re-exports the patched webpki-roots 1.0.10" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    # Added per the initial license review:
+    "CDLA-Permissive-2.0",  # webpki-roots — Linux Foundation permissive license.
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path dependencies have no semver requirement.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

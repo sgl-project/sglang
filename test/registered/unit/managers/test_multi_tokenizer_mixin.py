@@ -1,6 +1,7 @@
 import pickle
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import DEFAULT, MagicMock, patch
 
 import numpy as np
@@ -14,6 +15,8 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.beam_search.types import BeamSearchSequence
+from sglang.srt.entrypoints import http_server
+from sglang.srt.environ import envs
 from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -28,38 +31,14 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
     MultiHttpWorkerDetokenizerMixin,
-    TokenizerWorker,
     _cached_output_fields,
     _handle_output_by_index,
     _handle_output_by_indices,
     _send_output_to_tokenizer_workers,
-    get_tokenizer_worker_class,
 )
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-
-
-class CustomTokenizerWorker(TokenizerWorker):
-    pass
-
-
-class NotAWorker:
-    pass
-
-
-class DefaultServerArgs:
-    def get_tokenizer_worker_class(self):
-        return TokenizerWorker
-
-
-class CustomServerArgs:
-    def get_tokenizer_worker_class(self):
-        return CustomTokenizerWorker
-
-
-class InvalidServerArgs:
-    def get_tokenizer_worker_class(self):
-        return NotAWorker
 
 
 def _make_batch_str_output() -> BatchStrOutput:
@@ -200,6 +179,44 @@ def _make_router() -> MultiDetokenizerRouter:
 
 
 class TestMultiTokenizerMixin(CustomTestCase):
+    def test_each_tokenizer_worker_freezes_locally(self):
+        threshold = [700, 10, 1000]
+        server_args = mock.Mock(gc_threshold=threshold)
+        timeline = mock.Mock()
+        execution = mock.Mock(moe=mock.Mock(is_ep_scale_joiner=False))
+        with (
+            get_context().override_server_args(
+                checkpoint_engine_wait_weights_before_ready=False,
+                delete_ckpt_after_loading=False,
+                skip_server_warmup=False,
+                debug_tensor_dump_input_file=None,
+            ),
+            mock.patch.object(http_server, "get_exec", return_value=execution),
+            mock.patch.object(http_server, "freeze_gc", side_effect=timeline.worker),
+            mock.patch.object(
+                http_server,
+                "_freeze_gc_after_server_warmup",
+                side_effect=timeline.routed,
+            ),
+        ):
+            for worker_id in range(4):
+                timeline.reset_mock()
+                kwargs = http_server._multi_tokenizer_warmup_kwargs(
+                    server_args, worker_id
+                )
+                http_server._wait_and_warmup(
+                    **kwargs,
+                    execute_warmup_func=lambda _: timeline.warmup() or True,
+                )
+                self.assertEqual(
+                    timeline.mock_calls,
+                    [
+                        mock.call.warmup(),
+                        mock.call.worker(f"Tokenizer worker {worker_id}", threshold),
+                        mock.call.routed(server_args),
+                    ],
+                )
+
     def test_router_cpu_metric_started_only_when_enabled(self):
         for enabled in (False, True):
             with self.subTest(enable_metrics=enabled):
@@ -460,7 +477,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
             ],
         )
 
-    def test_return_path_groups_noncontiguous_owners(self):
+    def test_return_path_batching_preserves_owner_order(self):
         output = _handle_output_by_indices(_make_batch_str_output(), [0, 1, 0])
         output.rids = ["rid-0", "rid-1", "rid-2"]
         output.output_strs = ["first", "second", "third"]
@@ -474,22 +491,32 @@ class TestMultiTokenizerMixin(CustomTestCase):
             )
         )
 
-        _send_output_to_tokenizer_workers(output, ipcs, mapping)
-
-        self.assertEqual(
-            sent,
-            [
-                (
-                    "worker-b",
-                    ["rid-0", "rid-2"],
-                    ["first", "third"],
-                    ["worker-b", "worker-b"],
-                    True,
-                ),
-                ("worker-a", ["rid-1"], ["second"], ["worker-a"], True),
-            ],
-        )
-        self.assertEqual(pickle.dumps(output), original)
+        expected_grouped = [
+            (
+                "worker-b",
+                ["rid-0", "rid-2"],
+                ["first", "third"],
+                ["worker-b", "worker-b"],
+                True,
+            ),
+            ("worker-a", ["rid-1"], ["second"], ["worker-a"], True),
+        ]
+        expected_individual = [
+            ("worker-b", ["rid-0"], ["first"], None, True),
+            ("worker-a", ["rid-1"], ["second"], None, True),
+            ("worker-b", ["rid-2"], ["third"], None, True),
+        ]
+        for batching in (True, False):
+            sent.clear()
+            with (
+                self.subTest(batching=batching),
+                envs.SGLANG_BATCH_TOKENIZER_OUTPUTS.override(batching),
+            ):
+                _send_output_to_tokenizer_workers(output, ipcs, mapping)
+            self.assertEqual(
+                sent, expected_grouped if batching else expected_individual
+            )
+            self.assertEqual(pickle.dumps(output), original)
 
     def test_return_path_falls_back_before_sending_any_group(self):
         output = _make_batch_embedding_output()
@@ -544,19 +571,6 @@ class TestMultiTokenizerMixin(CustomTestCase):
             worker.multi_http_worker_event_loop()
 
         self.assertEqual(sent, [("worker-a", ["rid-0", "rid-1"])])
-
-    def test_get_tokenizer_worker_class_uses_default(self):
-        self.assertIs(get_tokenizer_worker_class(DefaultServerArgs()), TokenizerWorker)
-
-    def test_get_tokenizer_worker_class_resolves_custom_class(self):
-        self.assertIs(
-            get_tokenizer_worker_class(CustomServerArgs()),
-            CustomTokenizerWorker,
-        )
-
-    def test_get_tokenizer_worker_class_rejects_non_worker(self):
-        with self.assertRaisesRegex(TypeError, "TokenizerWorker"):
-            get_tokenizer_worker_class(InvalidServerArgs())
 
 
 if __name__ == "__main__":

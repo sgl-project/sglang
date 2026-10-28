@@ -4,18 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.numerics import round_bf16_to_fp32
+
 _QWEN4_HC_COUNT = 4
 _QWEN4_HIDDEN_SIZE = 2560
-
-
-@triton.jit
-def _round_bf16_to_fp32(value):
-    """RNE-round fp32 to BF16 precision while retaining an fp32 register."""
-
-    bits = value.to(tl.int32, bitcast=True)
-    rounding_bias = 0x7FFF + ((bits >> 16) & 1)
-    rounded_bits = (bits + rounding_bias) & -65536
-    return rounded_bits.to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -37,10 +29,10 @@ def _qwen4_gate_value_kernel(
     # every remaining eager bf16 rounding boundary is reproduced below.
     gate = tl.load(gate_ptr + token_group).to(tl.float32)
     magnitude = tl.maximum(tl.abs(gate), 1.0e-6)
-    root = _round_bf16_to_fp32(tl.sqrt(magnitude))
+    root = round_bf16_to_fp32(tl.sqrt(magnitude))
     sign = tl.where(gate > 0.0, 1.0, tl.where(gate < 0.0, -1.0, 0.0))
-    transformed = _round_bf16_to_fp32(root * sign)
-    activated = _round_bf16_to_fp32(tl.sigmoid(transformed))
+    transformed = round_bf16_to_fp32(root * sign)
+    activated = round_bf16_to_fp32(tl.sigmoid(transformed))
 
     value = tl.load(value_ptr + token * HIDDEN_SIZE + hidden, mask=mask, other=0.0).to(
         tl.float32
@@ -106,13 +98,13 @@ def _qwen4_gate_reduce_kernel(
     query = tl.load(query_ptr + group * HIDDEN_SIZE + hidden, mask, other=0).to(
         tl.float32
     )
-    product = _round_bf16_to_fp32(key * query)
-    gate = _round_bf16_to_fp32(tl.sum(product, 0))
-    gate = _round_bf16_to_fp32(gate * (HIDDEN_SIZE**-0.5))
-    magnitude = _round_bf16_to_fp32(tl.maximum(tl.abs(gate), 1.0e-6))
-    root = _round_bf16_to_fp32(tl.sqrt(magnitude))
+    product = round_bf16_to_fp32(key * query)
+    gate = round_bf16_to_fp32(tl.sum(product, 0))
+    gate = round_bf16_to_fp32(gate * (HIDDEN_SIZE**-0.5))
+    magnitude = round_bf16_to_fp32(tl.maximum(tl.abs(gate), 1.0e-6))
+    root = round_bf16_to_fp32(tl.sqrt(magnitude))
     sign = tl.where(gate > 0, 1.0, tl.where(gate < 0, -1.0, 0.0))
-    activated = _round_bf16_to_fp32(tl.sigmoid(_round_bf16_to_fp32(root * sign)))
+    activated = round_bf16_to_fp32(tl.sigmoid(round_bf16_to_fp32(root * sign)))
     value = tl.load(
         value_ptr + (group // HC_COUNT) * HIDDEN_SIZE + hidden, mask, other=0
     ).to(tl.float32)

@@ -86,7 +86,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.layer_boundary.stage import check_stage_producers
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
-    install_shared_experts_fusion_decision,
+    resolve_shared_experts_config,
 )
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -137,7 +137,6 @@ from sglang.srt.utils import (
     rank0_log,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import temp_set_env
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -286,11 +285,7 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
-    # Decide the shared-experts-fusion question here, once per runner, before any
-    # layer exists: this is the only place a model class is instantiated, and it
-    # is the last point that still knows both the checkpoint's quantization and
-    # (through the build scope) whether this runner is a draft.
-    install_shared_experts_fusion_decision(
+    shared_experts = resolve_shared_experts_config(
         model_class, model_config.hf_config, quant_config
     )
     kwargs = {
@@ -306,8 +301,10 @@ def _initialize_model(
     if load_config.draft_model_idx is not None:
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
-    model = model_class(**kwargs)
-    check_stage_producers(model)
+    with get_model().override(shared_experts=shared_experts):
+        model = model_class(**kwargs)
+        check_stage_producers(model)
+    model.shared_experts_config = shared_experts
     return model
 
 
@@ -1059,22 +1056,10 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         weights = monokernel_weights_iterator(model=model, weights=weights)
-        if is_nvfp4_online or is_modelopt_fp4_online:
-            # Scope exact FP4 quantization math to load-time conversion only;
-            # restore the original environment before serving starts.
-            with temp_set_env(
-                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
-                FLASHINFER_NVFP4_4OVER6="1",
-                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
-                FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
-                FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
-            ):
-                model.load_weights(weights)
-            if target_device.type == "cuda":
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-        else:
-            model.load_weights(weights)
+        model.load_weights(weights)
+        if (is_nvfp4_online or is_modelopt_fp4_online) and target_device.type == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
@@ -1508,7 +1493,7 @@ class DummyModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
 
-        if get_bool_env_var("SGL_CPU_QUANTIZATION"):
+        if envs.SGLANG_CPU_QUANTIZATION.get():
             return load_model_with_cpu_quantization(
                 self, model_config=model_config, device_config=device_config
             )

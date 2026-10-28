@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, call, patch
 
 import torch
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -16,10 +17,17 @@ maybe_stub_sgl_kernel()
 from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend, mega_moe
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_module
-from sglang.srt.layers.moe.topk import TopKConfig
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_flags,
+    get_model,
+    get_parallel,
+)
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -211,6 +219,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             mega_l2_weights=object(),
             should_fuse_routed_scaling_factor_in_topk=True,
             moe_runner_config=SimpleNamespace(swiglu_limit=None),
+            uses_expert_location=False,
             _mega_moe_weights_built=True,
             _mega_moe_nvfp4=False,
         )
@@ -234,6 +243,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             num_fused_shared_experts=0,
             layer_id=0,
             routed_scaling_factor=1.0,
+            routed_scaling_factor_fused_in_topk=True,
             mega_shared_l1_weights=None,
             mega_shared_l2_weights=None,
         )
@@ -254,11 +264,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             ),
             # Toy shapes.
             patch.object(mega_moe, "check_mega_moe_shapes"),
-            patch.object(
-                mega_moe.ExpertLocationDispatchInfo,
-                "init_new",
-                return_value=object(),
-            ),
             get_parallel().override(
                 moe_ep_group=SimpleNamespace(device_group=object())
             ),
@@ -353,6 +358,14 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         expert boundary exposes accidentally routing image rows as text, and
         padded rows must contribute nothing.
         """
+        config = get_context().override_server_args(
+            model_path="dummy",
+            enable_waterfill=False,
+            ep_dispatch_algorithm=None,
+            enable_eplb=False,
+        )
+        config.install()
+        self.addCleanup(config.restore)
         for fused_shared in (0, 1):
             for scale_in_topk in (False, True):
                 with self.subTest(
@@ -380,12 +393,17 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
                     with (
                         get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
-                        get_parallel().override(moe_ep_size=2, moe_ep_rank=1),
-                        patch.object(
-                            mega_moe.ExpertLocationDispatchInfo,
-                            "init_new",
-                            return_value=None,
+                        get_parallel().override(
+                            tp_size=2,
+                            tp_rank=1,
+                            attn_tp_size=2,
+                            attn_tp_rank=1,
+                            moe_ep_size=2,
+                            moe_ep_rank=1,
+                            moe_tp_size=1,
+                            moe_tp_rank=0,
                         ),
+                        forward_context(ForwardContext(None), forward_batch=batch),
                         patch.object(mega_moe, "run_mega_routed_experts", run_experts),
                         # The fused padded-row fill requires Triton/GPU.
                         patch(
@@ -434,38 +452,46 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
     @staticmethod
     def _v41_moe(fused_shared, scale_in_topk):
-        return SimpleNamespace(
-            config=SimpleNamespace(
-                hidden_size=4,
-                num_experts_per_tok=2,
-                moe_intermediate_size=8,
-                image_token_id=99,
+        with (
+            get_context().override_server_args(),
+            get_model().override(
+                shared_experts=SharedExpertsConfig(
+                    num_fused_shared_experts=fused_shared
+                )
             ),
-            experts=SimpleNamespace(
-                should_fuse_routed_scaling_factor_in_topk=scale_in_topk,
-                moe_runner_config=SimpleNamespace(swiglu_limit=None),
-            ),
-            gate=MagicMock(
-                return_value=torch.zeros((3, 4)),
-                e_score_correction_bias=torch.tensor([4.0, 3.0, 0.0, 0.0]),
-                e_score_correction_bias_vl=torch.tensor([0.0, 0.0, 3.0, 4.0]),
-            ),
-            topk=SimpleNamespace(
-                topk_config=TopKConfig(
-                    top_k=2 + fused_shared,
-                    num_fused_shared_experts=fused_shared,
+        ):
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    hidden_size=4,
+                    num_experts_per_tok=2,
+                    moe_intermediate_size=8,
+                    image_token_id=99,
+                ),
+                experts=SimpleNamespace(
+                    should_fuse_routed_scaling_factor_in_topk=scale_in_topk,
+                    moe_runner_config=SimpleNamespace(swiglu_limit=None),
+                ),
+                gate=MagicMock(
+                    return_value=torch.zeros((3, 4)),
+                    e_score_correction_bias=torch.tensor([4.0, 3.0, 0.0, 0.0]),
+                    e_score_correction_bias_vl=torch.tensor([0.0, 0.0, 3.0, 4.0]),
+                ),
+                topk=TopK(
+                    top_k=2,
+                    layer_id=0,
+                    scoring_func="sqrtsoftplus",
                     renormalize=True,
                     routed_scaling_factor=2.0,
                     apply_routed_scaling_factor_on_output=scale_in_topk,
-                )
-            ),
-            is_hash=False,
-            num_fused_shared_experts=fused_shared,
-            layer_id=0,
-            routed_scaling_factor=2.0,
-            mega_shared_l1_weights=None,
-            mega_shared_l2_weights=None,
-        )
+                ),
+                is_hash=False,
+                num_fused_shared_experts=fused_shared,
+                layer_id=0,
+                routed_scaling_factor=2.0,
+                routed_scaling_factor_fused_in_topk=scale_in_topk,
+                mega_shared_l1_weights=None,
+                mega_shared_l2_weights=None,
+            )
 
     def test_shape_check_uses_pinned_fp8_fp4_alignment(self):
         # Packed SF groups need 128 elements, not a 16-byte token SF row.

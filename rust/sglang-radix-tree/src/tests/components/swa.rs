@@ -76,7 +76,7 @@ fn swa_window_attach_splits_both_edges_preserving_full_and_pending_actions() {
     assert_eq!(actions.len(), 2);
     for action in &actions {
         assert!(
-            matches!(action, CacheAction::ReplaceWriteThroughOnNodeSplit { ack_id: 91, old_node_id, new_child_node_id, .. } if *old_node_id == leaf_id && *new_child_node_id == leaf_id)
+            matches!(action, CacheAction::UpdatePendingBackupOnNodeSplit { ack_id: Some(91), old_node_id, new_child_node_id, .. } if *old_node_id == leaf_id && *new_child_node_id == leaf_id)
         );
     }
     let head = child_of(&tc, tc.arena.root(), &[1, 2]);
@@ -1119,6 +1119,55 @@ fn insert_overlap_recovers_a_locked_swa_tombstone() {
 }
 
 #[test]
+fn insert_overlap_can_preserve_unlocked_full_ids() {
+    for window_start in [0, 2] {
+        let mut tc = swa_core(/* window = */ 8, /* page_size = */ 1);
+        let key = vec![1, 2, 3, 4];
+        tc.insert(&insert_params_swa(&key, &[10, 11, 12, 13], 0, 0));
+        let root = tc.arena.root();
+        let leaf = child_of(&tc, root, &[1]);
+        let original_id = tc.arena.node(leaf).id;
+        let params = insert_params_swa(&key, &[20, 21, 22, 23], 0, window_start);
+        let mut result = InsertResult {
+            adopted_ranges: Some(HashMap::new()),
+            ..Default::default()
+        };
+        let mut actions = Vec::new();
+        let consumed_from = swa_component(8).update_component_on_insert_overlap(
+            &mut tc,
+            leaf,
+            4,
+            0,
+            params.value.shallow_clone(),
+            &params,
+            true,
+            &mut result,
+            &mut actions,
+        );
+        assert_eq!(consumed_from, window_start);
+        assert_eq!(tc.arena.node(leaf).id, original_id);
+        assert_eq!(tc.arena.node(leaf).device_lock_ref(FULL), 0);
+        let [
+            CacheAction::RecoverSwaWithLockedFull {
+                node_id,
+                kept_full,
+                incoming_full,
+            },
+        ] = actions.as_slice()
+        else {
+            panic!("expected recovery with canonical FULL IDs");
+        };
+        assert_eq!(*node_id, original_id);
+        assert!(kept_full.equal(&Tensor::from_slice(&[10i64, 11, 12, 13][window_start..])));
+        assert!(incoming_full.equal(&Tensor::from_slice(&[20i64, 21, 22, 23][window_start..])));
+        assert!(tc.arena.device_value(leaf, FULL).equal(kept_full));
+        let adopted = result.adopted_ranges.unwrap();
+        assert_eq!(adopted[&SWA], [(window_start, 4)]);
+        assert!(!adopted.contains_key(&FULL));
+    }
+}
+
+#[test]
 fn insert_overlap_with_a_locked_full_emits_the_recover_action() {
     let mut tc = swa_core(/* window = */ 8, /* page_size = */ 1);
     tc.insert(&insert_params_swa(&vec![1, 2, 3], &[10, 11, 12], 0, 0));
@@ -2060,6 +2109,7 @@ fn unanchored_receipts_are_rejected_before_any_release() {
     let before = lock_state(&tc);
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
+    let mut cache_actions = Vec::new();
 
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
@@ -2080,6 +2130,7 @@ fn unanchored_receipts_are_rejected_before_any_release() {
                 &unanchored(&device_lock),
                 &mut device_frees,
                 &mut host_frees,
+                &mut cache_actions,
             )
         }))
         .is_err()
@@ -2092,12 +2143,14 @@ fn unanchored_receipts_are_rejected_before_any_release() {
                 &unanchored(&device_lock),
                 &mut device_frees,
                 &mut host_frees,
+                &mut cache_actions,
             )
         }))
         .is_err()
     );
     assert_eq!(lock_state(&tc), before);
     assert!(device_frees.is_empty() && host_frees.is_empty());
+    assert!(cache_actions.is_empty());
 
     // The anchored receipts still release exactly what was acquired.
     tc.dec_lock_ref(
@@ -2376,6 +2429,7 @@ fn evict_component_device_frees_the_full_indices_and_tombstones_swa() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!((freed, host_freed), (2, 0));
@@ -2411,6 +2465,7 @@ fn evict_component_device_parks_a_remaining_host_value() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert!(tc.arena.has_host_value(node, SWA));
@@ -2433,6 +2488,7 @@ fn evict_component_host_frees_and_delists_the_host_value() {
         node,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!((freed, host_freed), (0, 2));
@@ -2651,8 +2707,15 @@ fn dec_window_lock_only_preserves_full_and_mamba_locks() {
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     assert_eq!(tc.component_protected_size(SWA), 2);
-    tc.dec_window_lock_only(leaf, SWA, &params, &mut device_frees, &mut host_frees)
-        .unwrap();
+    tc.dec_window_lock_only(
+        leaf,
+        SWA,
+        &params,
+        &mut device_frees,
+        &mut host_frees,
+        &mut Vec::new(),
+    )
+    .unwrap();
     assert_eq!(tc.arena.device_lock_ref(idx, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(idx, FULL), 1);
     assert_eq!(tc.arena.device_lock_ref(idx, MAMBA), 1);
@@ -2685,13 +2748,21 @@ fn dec_window_lock_only_ignores_root_and_skipped_window() {
         },
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     )
     .unwrap();
     let receipt = tc.inc_lock_ref(leaf, ComponentSet::of(SWA)).unwrap();
     let params = receipt.to_dec_params();
     assert!(!params.component_lock_uuids.contains_key(&(SWA.idx() as u8)));
-    tc.dec_window_lock_only(leaf, SWA, &params, &mut device_frees, &mut host_frees)
-        .unwrap();
+    tc.dec_window_lock_only(
+        leaf,
+        SWA,
+        &params,
+        &mut device_frees,
+        &mut host_frees,
+        &mut Vec::new(),
+    )
+    .unwrap();
     assert_eq!(tc.component_protected_size(FULL), 3);
     assert_eq!(tc.component_protected_size(MAMBA), 1);
     assert_eq!(tc.component_protected_size(SWA), 0);
@@ -2712,6 +2783,7 @@ fn dec_window_lock_only_checks_receipt_anchor_before_skipping() {
         &receipt.to_dec_params(),
         &mut HashMap::new(),
         &mut HashMap::new(),
+        &mut Vec::new(),
     )
     .unwrap();
 }
@@ -2738,6 +2810,7 @@ fn dec_swa_lock_only_releases_swa_while_full_stays_locked() {
         &result.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     )
     .expect("live test node");
     // SWA is early-released; the FULL locks on the path stay.
@@ -2779,6 +2852,7 @@ fn dec_swa_lock_only_evicts_a_fully_unlocked_device_leaf() {
         &result.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     )
     .expect("live test node");
     // The fully unlocked leaf c is device-evicted on release; b keeps its
@@ -2806,6 +2880,7 @@ fn dec_swa_lock_only_is_a_noop_without_the_swa_component() {
         },
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     )
     .expect("live test node");
     assert!(device_frees.is_empty());
@@ -2838,6 +2913,7 @@ fn release_window_lock_breaks_on_a_tombstone_carrying_the_uuid() {
         },
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(a, SWA), 1);
@@ -2858,6 +2934,7 @@ fn release_window_lock_panics_on_a_non_swa_component() {
         &DecLockRefParams::default(),
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
 }
 
@@ -2947,6 +3024,7 @@ fn dec_swa_lock_only_releases_the_window_exactly_once() {
         &first.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     )
     .expect("live test node");
     // The second window still holds the lock: refs drop to 1, sizes stay.
@@ -2959,6 +3037,7 @@ fn dec_swa_lock_only_releases_the_window_exactly_once() {
         &first.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     )
     .expect("live test node");
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
@@ -2999,6 +3078,7 @@ fn dec_swa_lock_only_leaves_out_of_window_swa_locks_alone() {
         &result.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     )
     .expect("live test node");
     // Only the SWA window is released; a's out-of-window lock survives.
@@ -3036,6 +3116,7 @@ fn release_window_lock_without_the_uuid_dies_past_the_boundary() {
         },
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
 }
 
@@ -3062,6 +3143,7 @@ fn release_window_lock_passes_over_a_mid_chain_tombstone_without_a_uuid() {
         &receipt.to_dec_params(),
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
     assert_eq!(tc.arena.device_lock_ref(c, SWA), 0);
     assert_eq!(tc.arena.device_lock_ref(b, SWA), 0);
@@ -3899,46 +3981,94 @@ fn new_leaf_after_a_cached_prefix_splits_at_the_leaf_relative_boundary() {
 
 #[test]
 fn new_leaf_boundary_split_and_window_cap_compose_in_one_commit() {
-    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
-    tc.insert(&insert_params_swa(&vec![1, 2], &[10, 11], 0, 0));
-    let root = tc.arena.root();
-    let a = child_of(&tc, root, &[1]);
-    let result = tc.insert(&insert_params_swa(
-        &vec![1, 2, 3, 4, 5, 6, 7],
-        &[20, 21, 22, 23, 24, 25, 26],
-        /* prev_prefix_len = */ 2,
-        /* swa_evicted_seqlen = */ 3,
-    ));
-    // Boundary split first ([3] tombstone), then the window cap splits the
-    // in-window run into [4, 5] + [6, 7], rebuilt older-prefix-first.
-    let p = child_of(&tc, a, &[3]);
-    let capped = child_of(&tc, p, &[4]);
-    let leaf = child_of(&tc, capped, &[6]);
-    assert_eq!(tc.arena.node(p).key, vec![3]);
-    assert_eq!(tc.arena.node(capped).key, vec![4, 5]);
-    assert_eq!(tc.arena.node(leaf).key, vec![6, 7]);
-    let rebuilds: Vec<NodeId> = result
-        .cache_actions
-        .iter()
-        .filter_map(|action| match action {
-            CacheAction::SwaRebuild { node_id, .. } => Some(*node_id),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        rebuilds,
-        vec![tc.arena.node(capped).id, tc.arena.node(leaf).id]
-    );
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(capped).id && source_value.equal(&Tensor::from_slice(&[23i64, 24]))
-    )));
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[25i64, 26]))
-    )));
+    for buffer_only in [false, true] {
+        let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+        if buffer_only {
+            tc.set_host_memory_buffer_only();
+        }
+        tc.insert(&insert_params_swa(&vec![1, 2], &[10, 11], 0, 0));
+        let root = tc.arena.root();
+        let a = child_of(&tc, root, &[1]);
+        let result = tc.insert(&insert_params_swa(
+            &vec![1, 2, 3, 4, 5, 6, 7],
+            &[20, 21, 22, 23, 24, 25, 26],
+            /* prev_prefix_len = */ 2,
+            /* swa_evicted_seqlen = */ 3,
+        ));
+        // Boundary split first ([3] tombstone), then the window cap splits the
+        // in-window run into [4, 5] + [6, 7], rebuilt older-prefix-first.
+        let p = child_of(&tc, a, &[3]);
+        let capped = child_of(&tc, p, &[4]);
+        let leaf = child_of(&tc, capped, &[6]);
+        assert_eq!(tc.arena.node(p).key, vec![3]);
+        assert_eq!(tc.arena.node(capped).key, vec![4, 5]);
+        assert_eq!(tc.arena.node(leaf).key, vec![6, 7]);
+        let rebuilds: Vec<NodeId> = result
+            .cache_actions
+            .iter()
+            .filter_map(|action| match action {
+                CacheAction::SwaRebuild { node_id, .. } => Some(*node_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rebuilds,
+            vec![tc.arena.node(capped).id, tc.arena.node(leaf).id]
+        );
+        assert!(result.cache_actions.iter().any(|action| matches!(
+            action,
+            CacheAction::SwaRebuild { node_id, source_value }
+                if *node_id == tc.arena.node(capped).id && source_value.equal(&Tensor::from_slice(&[23i64, 24]))
+        )));
+        assert!(result.cache_actions.iter().any(|action| matches!(
+            action,
+            CacheAction::SwaRebuild { node_id, source_value }
+                if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[25i64, 26]))
+        )));
+        let split_ids: Vec<NodeId> = result
+            .cache_actions
+            .iter()
+            .filter_map(|action| match action {
+                CacheAction::UpdatePendingBackupOnNodeSplit {
+                    ack_id,
+                    old_node_id,
+                    new_node_id,
+                    new_child_node_id,
+                } => {
+                    assert_eq!(*ack_id, None);
+                    assert_eq!(*old_node_id, tc.arena.node(leaf).id);
+                    assert_eq!(*new_child_node_id, tc.arena.node(leaf).id);
+                    Some(*new_node_id)
+                }
+                _ => None,
+            })
+            .collect();
+        if buffer_only {
+            assert_eq!(
+                split_ids,
+                vec![tc.arena.node(p).id, tc.arena.node(capped).id]
+            );
+            let first_rebuild = result
+                .cache_actions
+                .iter()
+                .position(|action| matches!(action, CacheAction::SwaRebuild { .. }))
+                .unwrap();
+            assert_eq!(
+                result.cache_actions[..first_rebuild]
+                    .iter()
+                    .filter(|action| {
+                        matches!(action, CacheAction::UpdatePendingBackupOnNodeSplit { .. })
+                    })
+                    .count(),
+                2,
+            );
+        } else {
+            assert!(split_ids.is_empty());
+        }
+        for node in [p, capped, leaf] {
+            assert_eq!(tc.arena.node(node).write_through_pending_id, None);
+        }
+    }
 }
 
 #[test]
@@ -4030,10 +4160,26 @@ fn window_cap_skips_a_page_misaligned_leaf() {
         )
         .unwrap();
     // split_at = 5 - 2 = 3 is not page-aligned: the cap is skipped.
-    let capped = swa_component(2).maybe_split_leaf_for_swa_lock_(&mut tc, leaf);
+    let mut actions = Vec::new();
+    let capped = swa_component(2).maybe_split_leaf_for_swa_lock_(&mut tc, leaf, &mut actions);
+    assert!(actions.is_empty());
     assert_eq!(capped, None);
     assert_eq!(tc.arena.node(leaf).key, vec![1, 2, 3, 4, 5]);
     assert_eq!(tc.arena.node(leaf).parent(), root);
+}
+
+#[test]
+#[should_panic(expected = "fresh SWA leaf cannot be write-through-pending")]
+fn window_cap_rejects_a_write_through_ack() {
+    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+    tc.set_host_memory_buffer_only();
+    let root = tc.arena.root();
+    let leaf = tc
+        .arena
+        .alloc_child(root, vec![1, 2, 3, 4], 0, None)
+        .unwrap();
+    tc.arena.node_mut(leaf).write_through_pending_id = Some(91);
+    swa_component(2).maybe_split_leaf_for_swa_lock_(&mut tc, leaf, &mut Vec::new());
 }
 
 #[test]
@@ -6443,7 +6589,7 @@ fn buffer_mode_backup_window_is_the_target_alone_at_both_call_sites() {
 }
 
 #[test]
-fn write_back_reinsert_still_backs_up_an_unbacked_swa_window() {
+fn write_back_reinsert_defers_swa_backup_while_write_through_publishes() {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
             is_write_back: true,
@@ -6462,6 +6608,15 @@ fn write_back_reinsert_still_backs_up_an_unbacked_swa_window() {
     tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new())
         .expect("live test node");
 
+    let result = tc.insert(&insert_params_swa(&key, &[20, 21], 0, 0));
+    assert!(
+        !result
+            .cache_actions
+            .iter()
+            .any(|action| matches!(action, CacheAction::BackupKV(_)))
+    );
+
+    tc.is_write_back = false;
     let result = tc.insert(&insert_params_swa(&key, &[20, 21], 0, 0));
     let backups: Vec<_> = result
         .cache_actions

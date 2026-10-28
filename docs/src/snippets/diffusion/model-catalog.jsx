@@ -299,6 +299,30 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Cosmos/Cosmos3",
     },
     {
+      name: "Cosmos-Dreams (Cosmos3-Interactive)",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Bimanual"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
+    },
+    {
+      name: "Cosmos-Dreams-Transfer",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Transfer"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
+    },
+    {
+      name: "Cosmos3 Multiview-AV",
+      modelIds: ["nvidia/Cosmos3-Nano-Transfer-Auto"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
+    },
+    {
+      name: "Cosmos3 Sim-Auto",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Auto"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
+    },
+    {
       name: "FLUX 3 Action",
       modelIds: ["black-forest-labs/flux-3-action-droid"],
       cookbook: "/cookbook/vla/FLUX/FLUX-3-Action",

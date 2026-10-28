@@ -35,9 +35,6 @@ try:
 except ImportError:
     _has_otel = False
 
-# Access the private module-level function (avoid name mangling inside classes).
-_get_host_id = getattr(mod, "_get_host_id")
-
 
 class TestTraceFunctions(unittest.TestCase):
     def test_extract_trace_headers(self):
@@ -92,45 +89,6 @@ class TestSpanAttributes(unittest.TestCase):
         self.assertIsInstance(SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS, str)
 
 
-# __get_host_id
-class TestGetHostId(unittest.TestCase):
-    def test_from_machine_id_file(self):
-        with (
-            patch("os.path.exists", return_value=True),
-            patch(
-                "builtins.open",
-                unittest.mock.mock_open(read_data="abc123\n"),
-            ),
-        ):
-            self.assertEqual(_get_host_id(), "abc123")
-
-    def test_from_machine_id_file_error(self):
-        """Falls back to MAC address when file read fails."""
-        with (
-            patch("os.path.exists", return_value=True),
-            patch("builtins.open", side_effect=IOError("read error")),
-        ):
-            result = _get_host_id()
-            self.assertIsInstance(result, str)
-            self.assertGreater(len(result), 0)
-
-    def test_from_mac_address(self):
-        with (
-            patch("os.path.exists", return_value=False),
-            patch("uuid.getnode", return_value=0x112233445566),
-        ):
-            result = _get_host_id()
-            self.assertIsInstance(result, str)
-            self.assertGreater(len(result), 0)
-
-    def test_unknown_fallback(self):
-        with (
-            patch("os.path.exists", return_value=False),
-            patch("uuid.getnode", return_value=0),
-        ):
-            self.assertEqual(_get_host_id(), "unknown")
-
-
 @unittest.skipUnless(_has_otel, "opentelemetry not installed")
 class TestGetOtlpSpanExporter(unittest.TestCase):
     def test_grpc_default(self):
@@ -156,6 +114,13 @@ class TestGetOtlpSpanExporter(unittest.TestCase):
 
 
 class TestProcessTracingInit(unittest.TestCase):
+    def setUp(self):
+        self.orig_initialized = mod.opentelemetry_initialized
+        mod.opentelemetry_initialized = False
+
+    def tearDown(self):
+        mod.opentelemetry_initialized = self.orig_initialized
+
     def test_raises_without_otel(self):
 
         orig = mod.opentelemetry_imported

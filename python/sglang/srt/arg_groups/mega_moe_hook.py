@@ -14,7 +14,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.utils.common import ceil_align, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ def mega_moe_needs_token_budget(
 def validate_mega_moe_token_budget_for_model(server_args: ServerArgs) -> None:
     # Runs after speculative resolution so the decode / verify bound is final.
     cfg = resolving_view(server_args)
-    if cfg.moe_a2a_backend != "megamoe":
+    if cfg.moe_a2a_backend != "megamoe" or cfg.encoder_only:
         return
     validate_flydsl_decode_capacity(server_args)
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
@@ -93,6 +93,12 @@ def validate_mega_moe_token_budget_for_model(server_args: ServerArgs) -> None:
 def mega_moe_decode_tokens_per_rank(cfg) -> int:
     cg_config = cfg.cuda_graph_config
     decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
+    if cfg.max_running_requests is not None:
+        per_rank_requests = ceil_align(
+            cfg.max_running_requests // cfg.attn_dp_size,
+            cfg.tp_size // cfg.attn_dp_size,
+        )
+        decode_max_bs = min(decode_max_bs, per_rank_requests)
     num_tokens_per_req = (
         (cfg.speculative_num_draft_tokens or 1) if cfg.speculative_algorithm else 1
     )
@@ -168,11 +174,11 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
                 f"{model_label} with MegaMoE requires "
                 "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to cover the "
                 "largest decode / verify forward on one rank. Current values: "
-                f"decode cuda graph max bs x tokens per request = {decode_tokens}, "
+                f"largest decode graph bucket x tokens per request = {decode_tokens}, "
                 f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
                 f"{max_tokens_per_rank}. Raise the env var to at least "
                 f"{decode_tokens} or lower --cuda-graph-max-bs / "
-                "--speculative-num-draft-tokens."
+                "--max-running-requests / --speculative-num-draft-tokens."
             )
     if cfg.disaggregation_mode == "decode":
         # decode node will skip the check because decode bs is not relevant with --chunk-prefill-size

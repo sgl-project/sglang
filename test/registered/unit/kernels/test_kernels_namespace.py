@@ -1,7 +1,7 @@
 """GPU-free import / registry / selector tests for ``sglang.kernels`` (RFC #29630)."""
 
 import ast
-import importlib
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -68,10 +68,10 @@ def test_multi_backend_requires_explicit_backend(monkeypatch):
     # the current device means selection must name one.
     monkeypatch.setattr(sel, "_platform", lambda: _SM90)
     with pytest.raises(ValueError):
-        K.select_kernel("layernorm.rmsnorm")
-    spec = K.select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT)
+        K.select_kernel("activation.silu_and_mul")
+    spec = K.select_kernel("activation.silu_and_mul", backend=KernelBackend.JIT)
     assert spec.backend is KernelBackend.JIT
-    assert spec.target == "sglang.kernels.ops.layernorm:_RMSNORM.forward_jit"
+    assert spec.target == "sglang.kernels.ops.activation:_SILU_AND_MUL.forward_jit"
 
 
 @pytest.mark.parametrize("device, expect", [("cuda", "jit"), ("hip", "aot")])
@@ -81,25 +81,6 @@ def test_activation_default_backend(monkeypatch, device, expect):
 
     monkeypatch.setattr(fo, "_platform", lambda: PlatformInfo(device_type=device))
     assert _SILU_AND_MUL.auto_selected_backend().value == expect
-
-
-@pytest.mark.parametrize(
-    "op_attr, device, expect",
-    [
-        ("_RMSNORM", "cuda", "aot"),
-        ("_RMSNORM", "hip", "aiter"),
-        ("_RMSNORM", "npu", "torch_npu"),
-        ("_GEMMA_RMSNORM", "cuda", "aot"),
-        ("_GEMMA_RMSNORM", "hip", "jit"),  # rocm-triton JIT pinned to HIP
-        ("_GEMMA_RMSNORM", "npu", "torch_npu"),
-    ],
-)
-def test_layernorm_default_backend(monkeypatch, op_attr, device, expect):
-    # Same AOT provenance, different device coverage per op: rmsnorm's AOT is
-    # CUDA-only, so HIP falls to aiter and NPU to torch_npu.
-    ln = importlib.import_module("sglang.kernels.ops.layernorm")
-    monkeypatch.setattr(fo, "_platform", lambda: PlatformInfo(device_type=device))
-    assert getattr(ln, op_attr).auto_selected_backend().value == expect
 
 
 @pytest.mark.parametrize(
@@ -193,9 +174,8 @@ def test_import_stays_metadata_only():
         ("moe.situ_and_mul_masked_post_quant", KernelBackend.JIT, "cuda"),
         ("attention.attn_res_fused_tma", KernelBackend.JIT, "cuda"),
         ("attention.attn_res_hip", KernelBackend.TRITON, "hip"),
-        ("attention.kimi_k3_mla_output_gate", KernelBackend.JIT, "cuda"),
+        ("elementwise.kimi_k3_mla_output_gate", KernelBackend.JIT, "cuda"),
         ("attention.fused_kda_decode_mtp_dspark", KernelBackend.CUTE_DSL, "cuda"),
-        ("attention.flydsl_kimi_k3_kda_decode", KernelBackend.FLYDSL, "hip"),
         ("attention.flydsl_kimi_k3_kda_decode_with_f_b", KernelBackend.FLYDSL, "hip"),
         ("communication.all_reduce_push_res", KernelBackend.JIT, "cuda"),
         ("communication.gemm_ag_up_proj", KernelBackend.JIT, "cuda"),
@@ -210,6 +190,27 @@ def test_kimi_k3_kernels_are_inventoried_by_operator(op, backend, device):
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
 
 
+def _readme() -> str:
+    return (Path(K.__file__).resolve().parent / "README.md").read_text()
+
+
+def test_readme_operator_groups_match_registry():
+    """The README group list is the documented contract for ``ops._GROUPS``."""
+    paragraph = _readme().split("Operator groups", 1)[1].split("\n\n", 1)[0]
+    documented = re.findall(r"`([a-z_0-9]+)`", paragraph)
+    assert len(documented) == len(set(documented)), documented
+    assert set(documented) == set(K.ops.__all__) == set(K.ops._GROUPS)
+
+
+def test_readme_layout_lists_every_top_level_directory():
+    """A new directory directly under ``kernels/`` must be documented first."""
+    layout = _readme().split("## Layout", 1)[1].split("```", 2)[1]
+    documented = set(re.findall(r"^  ([a-z_0-9]+)/", layout, re.MULTILINE))
+    root = Path(K.__file__).resolve().parent
+    actual = {p.name for p in root.iterdir() if p.is_dir() and p.name != "__pycache__"}
+    assert documented == actual
+
+
 def test_operator_and_test_groups_agree():
     """A new root-level model bundle must not bypass logical op grouping."""
     root = Path(K.__file__).resolve().parents[3]
@@ -221,6 +222,20 @@ def test_operator_and_test_groups_agree():
         tests = root / "test/registered/kernels" / kind
         actual = {p.relative_to(tests).parts[0] for p in tests.rglob("*.py")}
         assert actual <= groups, actual - groups
+
+
+def test_agent_kernels_register_their_backend():
+    """Agent-generated kernels are listed by backend, so directory and backend must agree."""
+    agent_backends = {
+        "sglang.kernels.kda_kernels.": KernelBackend.KDA,
+        "sglang.kernels.cake_kernels.": KernelBackend.CAKE,
+    }
+    for spec in K.registry.all_specs():
+        expected = next(
+            (b for p, b in agent_backends.items() if spec.target.startswith(p)), None
+        )
+        if expected is not None or spec.backend in agent_backends.values():
+            assert spec.backend is expected, spec
 
 
 def test_inventory_targets_survive_module_moves():
@@ -248,12 +263,20 @@ def test_reclassified_public_entry_points_are_inventoried():
         "attention.dsa.kpool_topk_transform",
         "attention.dsa.indexer_k",
         "attention.dsv4.wo_a",
+        "attention.helion.kda_replayssm",
+        "attention.helion.kda_verify",
+        "attention.minimax_sparse.common.index",
+        "attention.minimax_sparse.decode.indexer_cp",
+        "attention.minimax_sparse.decode.topk_sparse",
+        "attention.minimax_sparse.prefill.gluon_prefill",
+        "attention.minimax_sparse.prefill.topk_sparse",
         "embeddings.qwen4_ngram",
         "elementwise.qwen4_gate",
         "elementwise.row_scale",
         "elementwise.hc_combine_decode",
         "mamba.qwen4_short_conv",
         "mamba.lfm_short_conv",
+        "mamba.kda_prefill_track",
         "gemm.dsv4_wo_a",
         "gemm.inkling_rel_proj",
         "gemm.hopper_bf16_gemv",
@@ -264,10 +287,15 @@ def test_reclassified_public_entry_points_are_inventoried():
         "layernorm.rmsnorm_fanout",
         "layernorm.grouped_gemma_rmsnorm",
         "moe.dsv4",
+        "activation.silu_and_mul_clamp",
         "moe.gemma4_routing",
         "moe.shared_expert_gate",
         "memory.adler32",
         "memory.row_compact",
+        "kv_canary.plan.api",
+        "kv_canary.write",
+        "kv_canary.verify",
+        "kv_canary.scatter_req_token_ids",
         "mm.process.image",
         "speculative.row_argmax",
     )
@@ -284,6 +312,65 @@ def test_reclassified_public_entry_points_are_inventoried():
             ):
                 continue
             assert f"sglang.kernels.ops.{module}:{node.name}" in targets
+
+
+def _module_defines(module: str, attr: str) -> bool:
+    """AST check that ``module`` defines ``attr`` (``name`` or ``name.method``).
+
+    For ``instance.method`` the instance's class must define ``method``.
+    """
+    root = Path(K.__file__).resolve().parents[2]
+    tree = ast.parse(root.joinpath(*module.split(".")).with_suffix(".py").read_text())
+    top = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            top[node.name] = node
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    top[target.id] = node.value
+    name, _, method = attr.partition(".")
+    node = top.get(name)
+    if node is None or not method:
+        return node is not None
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        node = top.get(node.func.id)
+    return isinstance(node, ast.ClassDef) and any(
+        isinstance(item, ast.FunctionDef) and item.name == method for item in node.body
+    )
+
+
+@pytest.mark.parametrize(
+    "op, backends",
+    [
+        ("attention.muse_spark_qk_norm_rope_store", {"torch", "triton", "helion"}),
+        ("communication.muse_spark_all_gather", {"jit"}),
+        ("communication.muse_spark_all_gather_norm_residual", {"jit"}),
+        (
+            "communication.muse_spark_moe_finalize_all_reduce",
+            {"torch", "cute_dsl", "helion"},
+        ),
+        ("communication.all_gather_matmul", {"cute_dsl"}),
+        ("communication.matmul_reduce_scatter", {"cute_dsl"}),
+        ("elementwise.row_sum", {"jit"}),
+        ("gemm.muse_spark_router_gemm", {"jit"}),
+        ("layernorm.muse_spark_norm_gate", {"torch", "jit", "helion", "triton"}),
+        ("layernorm.muse_spark_norm_residual", {"torch", "jit", "triton"}),
+        ("layernorm.muse_spark_rmsnorm_nvfp4_quant", {"torch", "jit", "helion"}),
+        ("moe.muse_spark_routing", {"torch", "jit", "triton"}),
+        ("moe.muse_spark_post_expert_finalize", {"triton"}),
+    ],
+)
+def test_muse_spark_kernels_are_inventoried_by_operator(op, backends):
+    specs = [s for s in K.registry.all_specs() if s.op == op]
+    assert {s.backend.value for s in specs} == backends
+    group = op.split(".")[0]
+    for spec in specs:
+        module, attr = spec.target.split(":", 1)
+        assert module.startswith(f"sglang.kernels.ops.{group}."), spec
+        assert _module_defines(module, attr), spec
+        if spec.backend is not KernelBackend.TORCH:
+            assert not K.capabilities_satisfied(spec.capabilities, _CPU), spec
 
 
 @pytest.mark.parametrize(
@@ -308,6 +395,13 @@ def test_reclassified_public_entry_points_are_inventoried():
         ("attention.deep_select_topk", (10, 1), False),
         ("attention.deep_select_topk", (10, 3), True),
         ("attention.deep_select_topk", (12, 0), False),
+        ("attention.chunk_kda_fwd", (9, 0), False),
+        ("attention.chunk_kda_fwd", (10, 0), True),
+        ("attention.chunk_kda_fwd", (10, 1), False),
+        ("attention.chunk_kda_fwd", (10, 3), True),
+        ("attention.chunk_kda_fwd", (12, 0), False),
+        ("attention.absorbed_bmm_concat_cast_q_fp8", (9, 0), True),
+        ("attention.absorbed_bmm_concat_cast_q_fp8", (10, 0), False),
         ("gemm.convrot_int8_fused_linear", (8, 9), False),
         ("gemm.convrot_int8_fused_linear", (9, 0), True),
         ("gemm.convrot_int8_fused_linear", (10, 0), True),

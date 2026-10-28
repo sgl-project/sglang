@@ -2385,6 +2385,9 @@ def enter_scope(test_case, scope):
 
 
 class CustomTestCase(unittest.TestCase):
+    # Fault-injection tests must inspect the failure after their server exits.
+    expect_server_exit = False
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
@@ -2417,13 +2420,29 @@ class CustomTestCase(unittest.TestCase):
         cls.setUpClass = classmethod(safe_setUpClass)
 
     def _callTestMethod(self, method):
+        if self.expect_server_exit:
+            # Retrying would reuse the server that the test intentionally stopped.
+            return super()._callTestMethod(method)
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
         if max_retry is None:
             max_retry = 1 if is_in_ci() else 0
-        retry(
-            lambda: super(CustomTestCase, self)._callTestMethod(method),
-            max_retry=max_retry,
+        # A server that dies mid-method fails every later request; abort the
+        # run rather than let clients back off and the method retry against it.
+        # Teardown kills the server only after this window closes.
+        process = getattr(self, "process", None)
+        stop = (
+            start_subprocess_fail_fast_watcher([("server", process)])
+            if isinstance(process, subprocess.Popen)
+            else None
         )
+        try:
+            retry(
+                lambda: super(CustomTestCase, self)._callTestMethod(method),
+                max_retry=max_retry,
+            )
+        finally:
+            if stop is not None:
+                stop.set()
 
     def setUp(self):
         print(

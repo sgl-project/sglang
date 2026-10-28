@@ -301,17 +301,6 @@ class TestNemotronHOmniModel(CustomTestCase):
         self.assertLess(max(moe_layer_ids), expert_config.num_layers)
         self.assertEqual(expert_config.num_logical_experts, 8)
 
-    def test_routed_expert_weights_come_from_language_model(self):
-        """The VL wrapper exposes the language model's expert weights for EPLB."""
-        model = object.__new__(NemotronH_Omni_Reasoning_V3)
-        nn.Module.__init__(model)
-        weights_of_layer = {1: [torch.ones(1)]}
-        model.language_model = SimpleNamespace(
-            routed_experts_weights_of_layer=weights_of_layer
-        )
-
-        self.assertIs(model.routed_experts_weights_of_layer, weights_of_layer)
-
 
 if __name__ == "__main__":
     unittest.main()

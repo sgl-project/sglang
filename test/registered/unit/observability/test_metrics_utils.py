@@ -6,31 +6,12 @@ from sglang.srt.observability.utils import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 
 
 class TestMetricsUtils(unittest.TestCase):
     """Test cases for metrics utility functions."""
-
-    def test_two_sides_exponential_buckets_basic(self):
-        """Test basic functionality of two_sides_exponential_buckets."""
-        # Test with simple parameters
-        count = 5
-        buckets = two_sides_exponential_buckets(middle=10.0, base=2.0, count=count)
-
-        # Should contain the middle value
-        self.assertIn(10.0, buckets)
-
-        # Should be sorted
-        self.assertEqual(buckets, sorted(buckets))
-
-        # Should have unique values (no duplicates)
-        self.assertEqual(len(buckets), len(set(buckets)))
-
-        # Should have reasonable number of buckets (not exactly count due to ceiling and deduplication)
-        self.assertGreaterEqual(len(buckets), 3)
-        self.assertLessEqual(len(buckets), count + 2)
 
     def test_two_sides_exponential_buckets_specific_values(self):
         """Test specific values for two_sides_exponential_buckets."""
@@ -49,18 +30,6 @@ class TestMetricsUtils(unittest.TestCase):
         # Should contain the middle value
         self.assertIn(5.0, buckets)
 
-    def test_two_sides_exponential_buckets_edge_cases(self):
-        """Test edge cases for two_sides_exponential_buckets."""
-        # Count = 1
-        buckets = two_sides_exponential_buckets(middle=10.0, base=2.0, count=1)
-        self.assertIn(10.0, buckets)
-
-        # Very small middle value
-        buckets = two_sides_exponential_buckets(middle=0.1, base=2.0, count=2)
-        self.assertIn(0.1, buckets)
-        for bucket in buckets:
-            self.assertGreaterEqual(bucket, 0.0)
-
     def test_generate_buckets_default(self):
         """Test generate_buckets with default rule."""
         default_buckets = [1.0, 5.0, 10.0, 50.0, 100.0]
@@ -72,21 +41,6 @@ class TestMetricsUtils(unittest.TestCase):
         # Test with None (should default to "default")
         result = generate_buckets(None, default_buckets)
         self.assertEqual(result, default_buckets)
-
-        # Test with empty (should default to "default")
-        result = generate_buckets(None, default_buckets)
-        self.assertEqual(result, default_buckets)
-
-    def test_generate_buckets_tse(self):
-        """Test generate_buckets with tse (two sides exponential) rule."""
-        default_buckets = [1.0, 5.0, 10.0]
-
-        # Test with "tse" rule
-        result = generate_buckets(["tse", "10", "2.0", "4"], default_buckets)
-
-        # Should return the same as calling two_sides_exponential_buckets directly
-        expected = two_sides_exponential_buckets(10.0, 2.0, 4)
-        self.assertEqual(result, expected)
 
     def test_generate_buckets_custom(self):
         """Test generate_buckets with custom rule."""

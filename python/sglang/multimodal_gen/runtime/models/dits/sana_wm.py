@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -13,7 +12,6 @@ from sglang.multimodal_gen.configs.models.fsdp import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
-from sglang.multimodal_gen.runtime.models.dits import sana_wm_parity as parity_probe
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 # Re-exported for back-compat: callers import these names from this module path.
@@ -838,34 +836,6 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         if not self.use_chunk_plucker_post_attn:
             plucker_emb = None
 
-        # parity harness (env-gated, no-op in prod): on the FIRST sink-path call
-        # (frame_index not None), checksum the pre-block tensors and x after every
-        # block to localize where the two execution paths first diverge.
-        _probe_path = os.environ.get(parity_probe.ENV_BLOCK_PROBE)
-        _probe = None
-        if (
-            _probe_path
-            and frame_index is not None
-            and not getattr(self, "_block_probe_done", False)
-        ):
-            _ck = parity_probe.checksum
-            _probe = {
-                "x_embed": _ck(x),
-                "t6": _ck(t6),
-                "y": _ck(y),
-                "freqs": (
-                    (
-                        tuple(freqs.shape),
-                        float(freqs.real.detach().double().sum().item()),
-                        float(freqs.imag.detach().double().sum().item()),
-                    )
-                    if freqs is not None
-                    else None
-                ),
-                "plucker_emb": _ck(plucker_emb),
-                "frame_index": frame_index.tolist(),
-            }
-
         HW = (T, H, W)
         new_cache = []
         for i, block in enumerate(self.blocks):
@@ -882,11 +852,6 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 save_kv_cache=save_kv_cache,
             )
             new_cache.append(block_cache)
-            if _probe is not None:
-                _probe[f"x_after_block_{i:02d}"] = parity_probe.checksum(x)
-        if _probe is not None:
-            torch.save(_probe, _probe_path)
-            self._block_probe_done = True
 
         x = self.final_layer(x, t_emb)
         x = x.reshape(B, T, H, W, p_t, p_h, p_w, self.out_channels)

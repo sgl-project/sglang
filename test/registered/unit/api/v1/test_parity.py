@@ -1,4 +1,4 @@
-"""Parity of the three `/generate` vocabularies: the hand-written Python
+"""Parity of the `/generate` and HiCache API vocabularies: the hand-written Python
 request structs (`io_struct.GenerateReqInput`, `SamplingParams`), the
 generated Python types (`sglang.api.v1.api_types`), and the generated Rust
 types (`rust/sglang-api-types`).
@@ -6,14 +6,17 @@ types (`rust/sglang-api-types`).
 The cross-language half runs through `rust/sglang-api-types/testdata/
 json_parity.json`: both generators must turn each fixture input into the same
 canonical bytes (`tests/json_parity.rs` checks the Rust side). The Python half
-pins the field sets against the hand-written structs and proves a schema
-request still normalizes through the dataclass the Python server runs.
+pins the field sets against the hand-written structs, checks HiCache request
+validation, and proves a generation request still normalizes through the
+dataclass the Python server runs.
 """
 
 import dataclasses
 import json
 import unittest
 from pathlib import Path
+
+from pydantic import TypeAdapter
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -27,7 +30,11 @@ from sglang.api.v1.api_types import (
     GenerateResponse,
     SamplingParams,
 )
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    AttachHiCacheStorageReqInput,
+    BaseReq,
+    GenerateReqInput,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams as PySamplingParams
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -43,7 +50,6 @@ FIXTURES = REPO_ROOT / "rust" / "sglang-api-types" / "testdata" / "json_parity.j
 PYTHON_ONLY_REQUEST_FIELDS = frozenset(
     {
         "background",
-        "cache_salt",
         "conversation_id",
         "custom_labels",
         "custom_logit_processor",
@@ -54,12 +60,9 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "image_max_dynamic_patch",
         "images_config",
         "input_embeds",
-        "kv_hints",
         "log_metrics",
         "lora_id",
-        "lora_path",
         "max_dynamic_patch",
-        "max_thinking_tokens",
         "min_dynamic_patch",
         "mm_content_hashes",
         "mm_processor_kwargs",
@@ -70,7 +73,6 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "num_items_assigned",
         "positional_embed_overrides",
         "received_time",
-        "require_reasoning",
         "return_bytes",
         "return_entropy",
         "return_flat_raw_output_top_logprobs",
@@ -81,10 +83,8 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "return_routed_experts",
         "return_sampling_mask",
         "routed_experts_start_len",
-        "routing_key",
         "sampling_logprobs_mode",
         "session_id",
-        "session_params",
         "token_indices_to_pool",
         "use_audio_in_video",
         "video_config",
@@ -116,6 +116,11 @@ def load_fixtures():
         return json.load(f)["cases"]
 
 
+# Schema-only sampling inputs the Rust server lowers before the scheduler
+# (choice -> regex); Python's SamplingParams never receives them.
+SCHEMA_ONLY_SAMPLING_FIELDS = frozenset({"choice"})
+
+
 class TestCrossLanguageFixtures(CustomTestCase):
     def test_fixtures_decode_to_their_canonical_bytes(self):
         """The Python emitter agrees with the Rust emitter on every fixture:
@@ -138,6 +143,31 @@ class TestCrossLanguageFixtures(CustomTestCase):
             self.assertTrue(hasattr(api_types, case["type"]), case["type"])
 
 
+class TestHiCacheRequestParity(CustomTestCase):
+    def test_attach_fields_match_python(self):
+        """Only scheduler transport fields are excluded from the public request."""
+        self.assertEqual(
+            set(api_types.AttachHiCacheStorageRequest.__struct_fields__),
+            set(AttachHiCacheStorageReqInput.__struct_fields__)
+            - set(BaseReq.__struct_fields__),
+        )
+
+    def test_attach_fixtures_match_python_validation_and_defaults(self):
+        """Decode using the same Pydantic adapter as the Python HTTP endpoint."""
+        adapter = TypeAdapter(AttachHiCacheStorageReqInput)
+        for case in load_fixtures():
+            if case["type"] != "AttachHiCacheStorageRequest":
+                continue
+            with self.subTest(case=case["name"]):
+                python = adapter.validate_python(case["input"])
+                generated = api_types.AttachHiCacheStorageRequest.from_json_value(
+                    case["input"]
+                )
+                self.assertIsNotNone(generated.hicache_storage_backend)
+                for name in generated.__struct_fields__:
+                    self.assertEqual(getattr(generated, name), getattr(python, name))
+
+
 class TestRequestFieldParity(CustomTestCase):
     def test_schema_request_fields_are_a_subset_of_the_dataclass(self):
         """Every schema field is a `GenerateReqInput` field, so a schema body
@@ -156,7 +186,10 @@ class TestRequestFieldParity(CustomTestCase):
             for name in PySamplingParams.__struct_fields__
             if name not in DERIVED_SAMPLING_FIELDS
         ]
-        self.assertEqual(set(python_api), set(SamplingParams.__struct_fields__))
+        self.assertEqual(
+            set(python_api),
+            set(SamplingParams.__struct_fields__) - SCHEMA_ONLY_SAMPLING_FIELDS,
+        )
         self.assertEqual(
             set(PySamplingParams.__struct_fields__) - set(python_api),
             DERIVED_SAMPLING_FIELDS,

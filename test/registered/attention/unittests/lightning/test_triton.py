@@ -200,7 +200,6 @@ class TestTritonLightningBackendCorrectness(CustomTestCase):
             track_state_indices=torch.tensor(
                 [track_slot], dtype=torch.int64, device=device
             ),
-            decouple=True,
         )
 
         expected = initial_state.float()

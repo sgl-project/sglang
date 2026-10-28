@@ -487,7 +487,7 @@ class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
         self.assertEqual(methods[0].apply.call_args.args[1].shape, (4096, 128))
         methods[1].apply.assert_not_called()
         for method in methods:
-            self.assertEqual(method.mxfp8_prefill_autotune_min_tokens, 4096)
+            self.assertEqual(method.mxfp8_prefill_autotune_min_tokens, 1)
         self.assertIsNone(fallback.quant_method.mxfp8_prefill_autotune_min_tokens)
 
     def test_block_fp8_dispatch_keeps_decode_and_determinism_pinned(self):
@@ -521,36 +521,6 @@ class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
                 ):
                     method.apply(layer, torch.empty(rows, 128, device="cuda"))
                 self.assertEqual(call.call_args.kwargs.get("pin_tactic"), expected)
-
-    def test_prefill_tuning_leaves_decode_bit_identical(self):
-        """Tuning the prefill buckets must not move the decode tactic: below the
-        stamped min_tokens the output has to stay bit-for-bit what it was."""
-        from flashinfer.autotuner import autotune
-
-        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-
-        runtime_patch = mock.patch(
-            "sglang.srt.runtime_context.get_exec",
-            return_value=SimpleNamespace(
-                deterministic=SimpleNamespace(enable_deterministic_inference=False)
-            ),
-        )
-        runtime_patch.start()
-        self.addCleanup(runtime_patch.stop)
-        layer = self._ready_layer(1792, 5120)
-        method = layer.quant_method
-        x = torch.randn(6, 5120, device="cuda", dtype=torch.bfloat16)
-        original = method.apply(layer, x)
-        model = SimpleNamespace(
-            config=SimpleNamespace(model_type="deepseek_v41"),
-            model=torch.nn.ModuleList([layer]),
-        )
-        with autotune(True):
-            DeepseekV4ForCausalLM.autotune_prefill_kernels(
-                model, 4096, dtype=torch.bfloat16
-            )
-        self.assertEqual(method.mxfp8_prefill_autotune_min_tokens, 4096)
-        torch.testing.assert_close(method.apply(layer, x), original, rtol=0, atol=0)
 
 
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")

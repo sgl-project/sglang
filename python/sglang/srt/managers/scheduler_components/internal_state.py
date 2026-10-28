@@ -157,6 +157,7 @@ class SchedulerInternalStateController:
     def _add_rust_server(self, state: Dict[str, Any]) -> None:
         if self.rust_server is not None:
             state["rust_mm_transport"] = self.rust_server.mm_transport_stats()
+            state["rust_server_startup_time"] = self.rust_server.startup_time
 
     def _add_env_vars(self, state: Dict[str, Any]) -> None:
         if envs.SGLANG_EXPOSE_OWN_ENV_VARS.get():

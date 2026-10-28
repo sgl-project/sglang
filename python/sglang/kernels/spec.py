@@ -44,7 +44,9 @@ class KernelBackend(str, Enum):
     AOT = "aot"  # sgl_kernel wheel (CUDA / ROCm builds)
     CUTE_DSL = "cute_dsl"
     FLYDSL = "flydsl"  # FlyDSL MLIR compiler (device=HIP, gfx950)
+    HELION = "helion"
     KDA = "KDA"  # Kernel Design Agents generated implementation
+    CAKE = "cake"  # Cake-generated implementation, distributed by FlashInfer
     FLASHINFER = "flashinfer"
     DEEPGEMM = "deepgemm"
     AITER = "aiter"  # AMD aiter library (device=HIP)
@@ -84,21 +86,14 @@ class PlatformInfo(msgspec.Struct, frozen=True):
     def is_cuda(self) -> bool:
         return self.device_type == "cuda"
 
-    @property
-    def is_hip(self) -> bool:
-        return self.device_type == "hip"
-
     @classmethod
     def detect(cls) -> PlatformInfo:
         """Build a :class:`PlatformInfo` from the current process.
 
-        Never raises: if ``torch`` is missing or no accelerator is visible the
-        default CPU platform is returned.
+        Never raises: if no accelerator is visible the default CPU platform is
+        returned.
         """
-        try:
-            import torch
-        except Exception:
-            return cls()
+        import torch
 
         try:
             if torch.version.hip is not None and torch.cuda.is_available():
@@ -171,6 +166,8 @@ CapabilityRequirement.CUDA = CapabilityRequirement(device=DeviceType.CUDA)
 CapabilityRequirement.HIP = CapabilityRequirement(device=DeviceType.HIP)
 CapabilityRequirement.NPU = CapabilityRequirement(device=DeviceType.NPU)
 
+CUDA_ONLY: FrozenSet[CapabilityRequirement] = frozenset({CapabilityRequirement.CUDA})
+
 
 def capabilities_satisfied(
     capabilities: Union[
@@ -190,18 +187,6 @@ def capabilities_satisfied(
     return (not capabilities) or any(c.is_satisfied_by(platform) for c in capabilities)
 
 
-class FormatSignature(msgspec.Struct, frozen=True):
-    """A light description of a kernel's data contract.
-
-    This is deliberately loose in the first version — enough to document intent
-    and support future inventory tooling, not a strict schema.
-    """
-
-    supported_dtypes: Tuple[str, ...] = ()
-    in_place: bool = False
-    description: str = ""
-
-
 class KernelSpec(msgspec.Struct, frozen=True):
     """A single callable kernel implementation and its metadata.
 
@@ -209,39 +194,25 @@ class KernelSpec(msgspec.Struct, frozen=True):
     ----------
     op:
         Fully-qualified operator id, ``"<group>.<name>"`` (e.g.
-        ``"layernorm.rmsnorm"``). This is the public lookup key.
+        ``"activation.silu_and_mul"``). This is the public lookup key.
     backend:
         Which :class:`KernelBackend` (provenance) provides this implementation.
     target:
         Import path of the callable in ``"module:attr"`` form, resolved lazily
-        by :meth:`load` (e.g. ``"sgl_kernel:rmsnorm"``). ``attr`` may be a
+        by :meth:`load` (e.g. ``"sgl_kernel:silu_and_mul"``). ``attr`` may be a
         dotted path into a module-level object, e.g.
-        ``"sglang.kernels.ops.layernorm:_RMSNORM.forward_aot"`` for a bound
+        ``"sglang.kernels.ops.activation:_SILU_AND_MUL.forward_aot"`` for a bound
         :class:`~sglang.kernels.fused_op.BaseFusedOp` backend method.
     capabilities:
         Set of :class:`CapabilityRequirement` (OR semantics; empty = runs on
         any device) used by the selector to skip backends unusable on the
         detected platform.
-    format_signature:
-        Optional data-contract description for inventory/documentation.
-    description:
-        Human-readable one-liner.
     """
 
     op: str
     backend: KernelBackend
     target: str
     capabilities: FrozenSet[CapabilityRequirement] = frozenset()
-    format_signature: FormatSignature = msgspec.field(default_factory=FormatSignature)
-    description: str = ""
-
-    @property
-    def group(self) -> str:
-        return self.op.split(".", 1)[0]
-
-    @property
-    def name(self) -> str:
-        return self.op.split(".", 1)[1] if "." in self.op else self.op
 
     def is_available(self, platform: PlatformInfo) -> bool:
         """Whether this backend can run on ``platform`` (metadata-only check)."""

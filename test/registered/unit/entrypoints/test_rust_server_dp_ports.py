@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,18 @@ def _launch_config():
     "overrides,kwarg,expected",
     [
         ({}, "grpc_port", 50051),
+        ({"hicache_storage_backend": "file"}, "hicache_storage_backend", "file"),
+        (
+            {"hicache_storage_backend_extra_config": "{}"},
+            "hicache_storage_backend_extra_config",
+            "{}",
+        ),
+        (
+            {"hicache_storage_prefetch_policy": "timeout"},
+            "hicache_storage_prefetch_policy",
+            "timeout",
+        ),
+        ({"hicache_write_policy": "write_back"}, "hicache_write_policy", "write_back"),
         ({"smg_grpc_mode": True}, "grpc_port", None),
         ({"grpc_mode": True}, "grpc_port", None),
         ({"default_priority_value": 5}, "default_priority_value", None),
@@ -41,13 +54,25 @@ def _launch_config():
             "default_priority_value",
             5,
         ),
+        ({}, "limit_mm_data_per_request", []),
+        (
+            {"limit_mm_data_per_request": {"video": 1, "image": 2}},
+            "limit_mm_data_per_request",
+            [("video", 1), ("image", 2)],
+        ),
     ],
     ids=[
         "native-grpc",
+        "hicache_storage_backend",
+        "hicache_storage_backend_extra_config",
+        "hicache_storage_prefetch_policy",
+        "hicache_write_policy",
         "legacy-smg",
         "deprecated-legacy-smg",
         "priority-off",
         "priority-on",
+        "mm-limits-unset",
+        "mm-limits-keep-order",
     ],
 )
 def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):
@@ -59,14 +84,59 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         DefaultSamplingParams=MagicMock(return_value="sampling-defaults"),
         ServerArgs=MagicMock(return_value="server-args"),
     )
+    scheduler = _scheduler_for_typed_config()
     with (
         get_context().override_server_args(grpc_port=50051, **overrides),
+        get_parallel().override(attn_dp_rank=0, dp_rank=None),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
     ):
         assert rust_config._build_server_args(**_launch_config()) == "server-args"
 
     assert extension.ServerArgs.call_args.kwargs[kwarg] == expected
+    assert extension.ServerArgs.call_args.kwargs["default_max_new_tokens"] is None
+    scheduler.get_init_info.assert_not_called()
+    scheduler.kv_events_publisher.local_kv_event_sources.assert_called_once_with(16)
+    deployment_info = json.loads(
+        extension.ServerArgs.call_args.kwargs["deployment_info"]
+    )
+    assert deployment_info["kv_event_sources"] == [{"endpoint": "tcp://127.0.0.1:5557"}]
+
+
+@pytest.mark.parametrize(
+    "server_args,ranks,expected",
+    [
+        ({"tp_size": 4, "attn_dp_size": 4}, {"attn_dp_rank": 2, "dp_rank": None}, 2),
+        ({"dp_size": 2}, {"attn_dp_rank": 0, "dp_rank": 1}, 1),
+        ({}, {"attn_dp_rank": 0, "dp_rank": None}, 0),
+    ],
+    ids=["attention-dp", "replica-dp", "no-dp"],
+)
+def test_deployment_info_reports_listener_dp_rank(server_args, ranks, expected):
+    """Each DP listener must advertise its own rank, matching its KV-event
+    source; a per-listener orchestrator cannot otherwise tell listeners apart."""
+    extension = SimpleNamespace(
+        DisaggregationMode=SimpleNamespace(
+            Null="null", Prefill="prefill", Decode="decode"
+        ),
+        ModelConfig=MagicMock(return_value="model-config"),
+        DefaultSamplingParams=MagicMock(return_value="sampling-defaults"),
+        ServerArgs=MagicMock(return_value="server-args"),
+    )
+    with (
+        get_context().override_server_args(**server_args),
+        get_parallel().override(**ranks),
+        patch.object(rust_extensions, "load_rust_extension", return_value=extension),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        rust_config._build_server_args(_scheduler_for_typed_config())
+
+    deployment_info = json.loads(
+        extension.ServerArgs.call_args.kwargs["deployment_info"]
+    )
+    assert deployment_info["dp_rank"] == expected
 
 
 @pytest.mark.parametrize("enable_metrics", [False, True])
@@ -74,9 +144,11 @@ def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
     extension = MagicMock()
     with (
         get_context().override_server_args(enable_metrics=enable_metrics),
+        get_parallel().override(attn_dp_rank=0, dp_rank=None),
         patch.dict("os.environ", {"PROMETHEUS_MULTIPROC_DIR": "/tmp/prom"}),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
     ):
         rust_config._build_server_args(**_launch_config())
 
@@ -86,6 +158,21 @@ def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
         assert metrics is extension.MetricsConfig.return_value
     else:
         assert metrics is None
+
+
+@pytest.mark.parametrize(
+    "tokenizer,expected",
+    [
+        (None, -1),
+        (SimpleNamespace(), -1),
+        (SimpleNamespace(model_max_length=4096), 4096),
+        # HF's unset sentinel, int(1e30), is not a 64-bit integer.
+        (SimpleNamespace(model_max_length=int(1e30)), 2048),
+    ],
+    ids=["no-tokenizer", "no-attribute", "configured", "unset-sentinel"],
+)
+def test_tokenizer_model_max_length_matches_python_tokenize(tokenizer, expected):
+    assert rust_config._tokenizer_model_max_length(tokenizer, 2048) == expected
 
 
 @pytest.mark.parametrize(

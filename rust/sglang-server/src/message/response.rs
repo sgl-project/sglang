@@ -57,6 +57,8 @@ pub enum ResponseItem {
     /// bytes for the core to decode (e.g. detokenized text), not a
     /// client-facing wire payload and not a generation frame.
     Data(Bytes),
+    /// Reply to `RequestKind::Tokenize`: the encoded token ids.
+    TokenIds(TokenIds),
     /// Terminal runtime failure; the core maps it to a semantic error.
     Error(Error),
 }
@@ -70,6 +72,9 @@ pub const DISPATCH_TAG_BATCH: u8 = 2;
 /// A per-request failure `[rid, message]`: the Python drain couldn't decode a
 /// header, so it routes a 400 back to that request instead of crashing the loop.
 pub const DISPATCH_TAG_ERROR: u8 = 3;
+/// A bodiless acknowledgement of the health probes a busy scheduler skipped,
+/// sent after its next step.
+pub const DISPATCH_TAG_HEALTH_ACK: u8 = 4;
 
 /// Read `n` little-endian f32s from `data` at `*off`, advancing `*off`. `None` when
 /// the range runs past the buffer (a malformed / positional-ABI-drifted frame): the
@@ -555,6 +560,11 @@ pub fn frame_error(rid: &str, message: &str) -> Bytes {
     buf.push(DISPATCH_TAG_ERROR);
     let _ = rmpv::encode::write_value(&mut buf, &arr);
     Bytes::from(buf)
+}
+
+/// Frame a health-probe acknowledgement: the tag alone.
+pub fn frame_health_ack() -> Bytes {
+    Bytes::from_static(&[DISPATCH_TAG_HEALTH_ACK])
 }
 
 /// One scheduler output increment — the common, always-present frame. `token_ids`
@@ -1231,12 +1241,12 @@ mod tests {
     }
 
     /// The common frame must stay small: logprob/hidden columns are boxed behind
-    /// `ChunkExtras`.
+    /// `ChunkExtras`. 152 since the matched stop token rides in the frame (#42637).
     #[test]
     fn chunk_event_frame_stays_small() {
         let sz = std::mem::size_of::<ChunkEvent>();
         assert!(
-            sz <= 144,
+            sz <= 152,
             "ChunkEvent grew to {sz} bytes; keep rare columns behind ChunkExtras"
         );
     }

@@ -1,7 +1,7 @@
 """No-sort B200 decode kernels for Inkling routed MoE LoRA.
 
 The contract is BF16 CUDA, M<=32, top-k 6, rank 32, up to four slots, TP-local
-intermediate 384 or 768, and non-EP expert IDs in ``[0, E)``.
+intermediate 384 or 768, and non-EP expert IDs in ``[0, E)`` or the inactive sentinel ``-1``.
 """
 
 from __future__ import annotations
@@ -47,7 +47,8 @@ def _direct_gate_expand_kernel(
     expert = tl.load(topk_ids_ptr + route).to(tl.int64)
     token = route // ROUTER_TOPK
     slot = tl.load(token_lora_mapping_ptr + token).to(tl.int64)
-    active = (slot >= 0) & (slot < NUM_SLOTS)
+    active = (slot >= 0) & (slot < NUM_SLOTS) & (expert >= 0)
+    expert = tl.maximum(expert, 0)
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_r = tl.arange(0, RANK)
@@ -110,7 +111,8 @@ def _direct_down_shrink_kernel(
     expert = tl.load(topk_ids_ptr + route).to(tl.int64)
     token = route // ROUTER_TOPK
     slot = tl.load(token_lora_mapping_ptr + token).to(tl.int64)
-    active = (slot >= 0) & (slot < NUM_SLOTS)
+    active = (slot >= 0) & (slot < NUM_SLOTS) & (expert >= 0)
+    expert = tl.maximum(expert, 0)
     offs_m = tl.arange(0, BLOCK_M)
     offs_r = tl.arange(0, RANK)
     offs_k = tl.arange(0, BLOCK_K)
@@ -121,7 +123,7 @@ def _direct_down_shrink_kernel(
         k_mask = k < INTERMEDIATE_SIZE
         x = tl.load(
             activation_ptr + route * stride_xq + k[None, :] * stride_xk,
-            mask=(offs_m[:, None] == 0) & k_mask[None, :],
+            mask=active & (offs_m[:, None] == 0) & k_mask[None, :],
             other=0.0,
         )
         a = tl.load(

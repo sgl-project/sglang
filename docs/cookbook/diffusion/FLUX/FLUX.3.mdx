@@ -34,6 +34,13 @@ below. Unverified hardware or resource shapes remain selectable but are not
 measured recommendations.
 </Note>
 
+The picker defaults to resident weights for its 1 MP, batch-1 workload. Its
+recommended execution uses BCG only where a matched E2E comparison showed a
+material gain: currently single-GB300 distilled NVFP4 T2I. Other combinations
+start eager; this graph recipe covers the 80-token text bucket. Changing
+precision never happens automatically. Recommendations are best among the
+tested settings, not an exhaustive optimum.
+
 <Warning>
 FLUX.3 Image Klein is released under the
 [FLUX Kommunity License v1.0](https://huggingface.co/black-forest-labs/flux-3-image-klein/blob/main/LICENSE.md):
@@ -172,6 +179,21 @@ comparison against BF16.
 These flags remain separately configurable; see the validation boundaries below
 before combining quantization with other optimizations.
 
+### Breakable CUDA graphs
+
+BCG reserves additional device memory and captures specific request shapes.
+The picker generates `--warmup-resolutions 1024x1024` and matching
+`--warmup-sampling-params` for the selected quality. For editing it also sets
+`flux3_mode="i2i"` and a server-local reference path: mount a 1024x1024 image
+there before starting the server. This path can differ from the client's upload
+path. Longer prompt token buckets, other reference dimensions/counts, batches
+or quality settings may run eager instead; check for a serving-signature miss
+in the server log.
+
+Changing the picker workload also changes its graph warmup command. Restart
+with that command to capture the new workload. Keep eager for variable-shape
+traffic, or explicitly validate every shape you intend to capture.
+
 ### LoRA adapters
 
 Use the standard LoRA API with native DiT keys, optionally prefixed by `dit.` or
@@ -180,7 +202,9 @@ check, including repeatability and exact restoration after unloading; this does
 not validate every community adapter. For quantized deployments requiring LoRA,
 pass `--lora-path` at startup to select the generic quantized layout. Attaching
 LoRA after PrimsTS weight preparation is rejected before replacing any layers.
-Quantized LoRA combinations still need separate end-to-end validation.
+FP8R and NVFP4 startup adapters also have synthetic rank-4 generation checks
+on GB300, including repeatability and exact restoration after unloading. These
+do not establish compatibility with arbitrary quantized community adapters.
 
 ## 4. Multi-GPU and memory
 
@@ -196,6 +220,11 @@ uses `--num-gpus 2 --tp-size 1 --ulysses-degree 2`. Base also permits CFG
 parallelism; distilled checkpoints have no CFG branch to parallelize.
 More GPUs do not guarantee lower latency, particularly over PCIe.
 
+Ulysses inherits all-to-all streaming through the shared attention layer.
+Leave its pipeline-group policy automatic; short sequences need not benefit.
+TP-only deployments do not use this path. Encoding-while-decoding overlaps
+video-frame decoding with video-file encoding, so it does not apply to this
+still-image pipeline.
 <Note>
 Under sequence parallelism every rank holds the full DiT, so combining it with
 layerwise offload streams the whole model to each GPU every step. TP also
@@ -318,6 +347,44 @@ jq -n --slurpfile p ${PUP_PATH}/system_prompts.json '{
 
 You can then pass the returned caption as the `--prompt` of a `t2i` request to the Flux3 pipeline.
 
+To have the image server call the upsampler itself, point it at this endpoint with the
+built-in `flux3-klein-pup` protocol. It reads `system_prompts.json` from the upsampler
+package (`protocol_source`, a local directory or the Hugging Face repo, which is the
+default) and follows BFL's reference code: the `t2i` prompt for generations, the `i2i`
+prompt with the references first (resized as the reference code does) for edits, greedy
+decoding with presence penalty 1.5 for `t2i` and 0 for `i2i`, and thinking disabled.
+
+```bash
+cat > flux3_pup.json <<'JSON'
+{
+  "base_url": "http://127.0.0.1:8001/v1",
+  "model": "flux-3-image-klein-pup",
+  "protocol": "flux3-klein-pup",
+  "protocol_source": "<local-path>"
+}
+JSON
+
+sglang serve --model-path black-forest-labs/flux-3-image-klein-base \
+  --prompt-enhancer-config flux3_pup.json --port 30010
+```
+
+A request opts in with `enhance_prompt`; it is off by default, so a full caption is sent
+as typed:
+
+```bash
+curl -sS -X POST http://localhost:30010/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "A man walking with his dog, afternoon sun", "enhance_prompt": true, "size": "1024x1024", "response_format": "b64_json"}'
+```
+
+Greedy decoding is not by itself reproducible here: the caption changes with the
+upsampler's prefix cache and batch. Start the upsampler with
+`--enable-deterministic-inference --disable-radix-cache` when the same request must give
+the same caption.
+
+The layout prompts (`t2i_bbox`, `i2i_bbox`) are not wired in yet; write the box table
+into the prompt yourself as described in [Model capabilities](#2-model-capabilities).
+
 ## 8. Dynamic batching
 
 Enable a small batching window to collect concurrent requests:
@@ -375,13 +442,42 @@ batching rather than assuming a batch-1 recipe fits on a 32 GB card at batch 2.
 ## 9. Validation boundaries
 
 The release BF16 and FP8R checkpoints have single-GB300/H200 generation checks;
-NVFP4 has GB300 checks. Base BF16 also has an RTX 5090 check. Each uses eager
+NVFP4 has GB300 and RTX 5090 checks. RTX 5090 also has Base BF16 and both
+checkpoints' FP8R and Cache-DiT checks. Single-GPU measurements use eager
 execution, all components resident, batch 1, 1024x1024 T2I and I2I, two
 prompts/seeds and repeated requests. Base uses 50 steps and distilled uses 16.
 Repeated requests matched pixel-for-pixel within each tested configuration.
 This does not establish official-reference parity or validate every combination
 of hardware, parallelism, batching and optional features in the picker.
 
+### Multi-GPU measurements
+
+Base BF16, 50 steps, CFG 3.5, batch 1 and `quality="exact"`. These are warmed
+localhost HTTP medians through PNG decoding, excluding loading and warmup;
+two prompts/seeds and two timed rounds per prompt. Software: PyTorch
+2.14.1+cu130, Transformers 5.19.0, FlashInfer 0.7.1. Both runs use checkpoint
+`d8acde427a698bdb98b5c1c941c60fa4c97e9f28`. The H200 run uses FA3 and
+NVLink; the RTX 4090 run uses Torch SDPA over PCIe without CUDA peer access.
+
+| GPUs | Topology | T2I 1024x1024 | I2I, 1 MP reference/output |
+| --- | --- | --- | --- |
+| 2x H200 | TP2 | 4.27 s | Not measured |
+| 2x H200 | Ulysses 2, streaming auto | 4.68 s | Not measured |
+| 4x RTX 4090 | TP4 | 16.97 s | 32.61 s |
+| 4x RTX 4090 | TP2 x Ulysses 2 | 16.28 s | 32.63 s |
+
+The picker keeps TP as its multi-GPU starting point, not a guarantee that TP
+always wins. A hybrid topology can help on PCIe; validate it on your own
+interconnect. H100, B200 and other unmeasured resource shapes are extrapolated
+starting points and are not labelled verified.
+
+On the same two H200s, Ulysses streaming reduced 2048x2048 T2I from 24.00 to
+22.87 s and editing a 2048x2048 reference into a 1024x1024 output from 31.01
+to 29.54 s. Streamed and non-streamed outputs matched pixel-for-pixel in these
+samples, with no quantization or caching. At 1024x1024, automatic dispatch
+selected no streaming groups and gave no speedup. TP and SP themselves are
+not bit-identical: sample SSIM was 0.9890-0.9985. None of these comparisons
+establishes which path is closer to an official reference.
 ### Single-GPU measurements
 
 Warmed local HTTP medians, including PNG encoding and response transfer, from
@@ -403,8 +499,50 @@ reference, and reports the lowest value across two samples, not a quality bound.
 For the distilled checkpoint, quantization's T2I benefit was small on GB300;
 do not assume Base's speedup transfers to a 16-step workload. Cache-DiT at
 threshold 0.12 reduced Base I2I from 6.31 to 3.08 s on GB300, with sample SSIM
-0.9786-0.9975. It remains opt-in and approximate. Breakable CUDA graphs did not
-provide a clear latency win in the tested GB300 workload; eager stays recommended.
+0.9786-0.9975. It remains opt-in and approximate.
+
+### Eager versus CUDA graphs
+
+Matched ABBA comparisons use `quality="lossless"`, resident weights, batch 1,
+1024x1024 output/reference, and the same software versions above with stable
+FlashInfer 0.7.1. Base uses 50 steps/CFG 3.5; distilled uses 16 steps/no CFG.
+Times are warmed localhost HTTP medians through JPEG decoding: two prompts/seeds
+and four timed samples per arm, excluding loading and graph capture. These
+JPEG timings are not directly comparable with the earlier PNG table.
+
+| GPU | Checkpoint | Workload | Eager | BCG | Recommended |
+| --- | --- | --- | --- | --- | --- |
+| GB300 | Distilled NVFP4, FA4 | T2I | 0.563 s | 0.436 s | BCG |
+| GB300 | Distilled NVFP4, FA4 | I2I | 0.882 s | 0.886 s | Eager |
+| GB300 | Base BF16, FA4 | T2I | 3.103 s | 3.130 s | Eager |
+| GB300 | Base BF16, FA4 | I2I | 6.236 s | 6.733 s | Eager |
+| H200 | Base BF16, FA3 | T2I | 6.845 s | 6.916 s | Eager |
+| H200 | Base BF16, FA3 | I2I | 14.183 s | 15.252 s | Eager |
+| 2x H200, TP2 | Base BF16, FA3 | T2I | 4.000 s | 4.199 s | Eager |
+| RTX 5090 | Distilled NVFP4, SDPA | T2I | 1.676 s | 1.678 s | Eager |
+| RTX 5090 | Distilled NVFP4, SDPA | I2I | 4.092 s | 4.104 s | Eager |
+| RTX 5090 | Base NVFP4, SDPA | T2I | 9.449 s | 9.583 s | Eager |
+
+GB300 distilled NVFP4 T2I improves by 22.5% with FA4 + BCG. Peak allocated
+memory increases from 16.63 to 17.46 GiB; peak reserved rises from 18.75 to
+19.96 GiB. These are per-process allocator maxima across warmup/runtime,
+not loading or total-device peaks. Other workloads also need headroom; memory
+capacity alone is not a reason to enable graphs when they do not improve latency.
+
+All 15 fixed-backend eager/BCG workload pairs passed repeated-request checks
+and pixel-identical PNG comparisons across the two prompts. This is not an
+official-reference accuracy guarantee or evidence that quantization preserves
+BF16 output. GB300 measurements use Base revision `17333191c36bae1b61b0a247e33ba284f1df07fa`
+and distilled `875076bf83d4364b68dccdbf8307f4f01475f68d`; H200/5090 use
+`d8acde427a698bdb98b5c1c941c60fa4c97e9f28` and
+`4d02a6a4dc4d5c7a0f3fa767187483b2b70f2384`. TP2 uses tensor-identical Base
+DiT weights with a different safetensors header.
+
+GB300 distilled NVFP4 T2I also ran at 0.424 s with SDPA + BCG (versus 0.589 s
+SDPA eager). It is selectable but not the default backend: SDPA versus FA4
+outputs had sample SSIM 0.978-0.987 and MAD 1.74-1.75/255. Neither path is
+established as closer to the official output. Keep the backend fixed when
+evaluating the graph speedup.
 
 The native DiT's packed CFG forward has focused comparison tests against the
 shared FLUX 3 transformer. Such component tests do not replace full-checkpoint
