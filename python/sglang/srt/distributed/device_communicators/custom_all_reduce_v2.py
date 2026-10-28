@@ -405,6 +405,9 @@ class CustomAllReduceV2:
         """Check if the input tensor is suitable for custom all-reduce."""
         if self.disabled:
             return False
+        # The kernels reduce only the dtypes `FloatTrait` covers in communicator.cuh.
+        if inp.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
