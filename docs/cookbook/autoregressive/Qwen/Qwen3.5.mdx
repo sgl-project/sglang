@@ -255,9 +255,9 @@ Agentic replay on MI355X serves `Qwen/Qwen3.5-397B-A17B-FP8` with MTP on four GP
 
 **Concurrency 16-80, HiCache:** a host-DRAM tier below the GPU KV cache keeps more prefix cached and reaches higher concurrency than the device pool alone. This is the **Host DRAM (HiCache)** selection in the command generator in section 3.1. From concurrency 32 up, the host tier is pinned with `--hicache-size` (GB per rank), which overrides `--hicache-ratio`, so make sure the node has that much free CPU DRAM per server on top of the model weights.
 
-The braced values in the command follow concurrency:
+The braced values in the command follow concurrency. **Max running** is `--max-running-requests`, **Graph max batch** is `--cuda-graph-max-bs-decode`, and **HiCache GB** is `--hicache-size`:
 
-| Concurrency | --max-running-requests | --cuda-graph-max-bs-decode | --hicache-size |
+| Concurrency | Max running | Graph max batch | HiCache GB |
 |---|---|---|---|
 | 1 | 2 | 2 | no HiCache |
 | 4 | 8 | 8 | no HiCache |
