@@ -70,24 +70,9 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
         if self.plain:
             self.view.set_kv_buffer(layer, loc_info, cache_k, cache_v, *args, **kwargs)
             return
-        # Imported here: memory_pool imports this module for its routers.
         from sglang.srt.mem_cache.kv.memory.views import MLAKVView
-        from sglang.srt.mem_cache.memory_pool import (
-            KVWriteLoc,
-            unwrap_write_loc,
-            write_loc_is_physical,
-        )
 
-        loc, window_loc, owner_loc = unwrap_write_loc(loc_info)
-        if self.owner:
-            ids = owner_loc if owner_loc is not None else loc
-        else:
-            assert window_loc is not None, (
-                f"layer {layer.layer_id} writes sub-pool {self.route.sub_pool!r}, "
-                "but the attention backend bundled no swa_loc for it"
-            )
-            ids = window_loc
-        write_loc = KVWriteLoc(ids, physical=write_loc_is_physical(loc_info))
+        write_loc = self._write_loc(layer, loc_info)
         if isinstance(self.view, MLAKVView):
             self.view.set_kv_buffer(
                 layer,
@@ -113,11 +98,30 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
             return
         self.view.set_mla_kv_buffer(
             layer,
-            loc_info,
+            self._write_loc(layer, loc_info),
             cache_k_nope,
             cache_k_rope,
             layer_id_override=self.view_layer_id,
         )
+
+    def _write_loc(self, layer, loc_info):
+        # Imported here: memory_pool imports this module for its routers.
+        from sglang.srt.mem_cache.memory_pool import (
+            KVWriteLoc,
+            unwrap_write_loc,
+            write_loc_is_physical,
+        )
+
+        loc, window_loc, owner_loc = unwrap_write_loc(loc_info)
+        if self.owner:
+            ids = owner_loc if owner_loc is not None else loc
+        else:
+            assert window_loc is not None, (
+                f"layer {layer.layer_id} writes sub-pool {self.route.sub_pool!r}, "
+                "but the attention backend bundled no swa_loc for it"
+            )
+            ids = window_loc
+        return KVWriteLoc(ids, physical=write_loc_is_physical(loc_info))
 
     def read_mla(self, layer, loc, dst_dtype=None):
         """Read ids arrive translated at their production site."""

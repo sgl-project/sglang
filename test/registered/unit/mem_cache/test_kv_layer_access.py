@@ -12,8 +12,10 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     KVWriteLoc,
     MHATokenToKVPool,
+    MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.frozen_kv_mtp_utils import target_kv_pool_view
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -113,6 +115,59 @@ class TestKVLayerAccess(CustomTestCase):
                         via_pool.get_kv_buffer(layer_id),
                     ):
                         self.assertTrue(torch.equal(got, want))
+
+    def test_mla_writes_use_each_sub_pools_locations(self):
+        """MLA writes must reach the window or owner slots selected for the layer,
+        even when generic, window and explicit owner locations all differ."""
+        kwargs = dict(
+            page_size=1,
+            device=_DEV,
+            enable_memory_saver=False,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+        )
+        with get_parallel().override(
+            dcp_enabled=False, attn_dcp_size=1, attn_dcp_rank=0
+        ):
+            pool = SWAKVPool(
+                size=32,
+                size_swa=16,
+                page_size=1,
+                dtype=torch.bfloat16,
+                head_num=1,
+                head_dim=6,
+                swa_attention_layer_ids=[0, 2],
+                full_attention_layer_ids=[1, 3],
+                device=_DEV,
+                full_kv_pool_class=MLATokenToKVPool,
+                swa_kv_pool_class=MLATokenToKVPool,
+                full_kv_pool_kwargs=kwargs,
+                swa_kv_pool_kwargs=kwargs,
+            )
+            loc = torch.tensor([11], device=_DEV)
+            window_loc = torch.tensor([2], device=_DEV)
+            owner_loc = torch.tensor([7], device=_DEV)
+            for full_loc in (None, owner_loc):
+                for layer_id in (0, 1, 2, 3):
+                    with self.subTest(
+                        layer_id=layer_id, explicit_owner=full_loc is not None
+                    ):
+                        kv = pool.layer_router.layer(layer_id)
+                        buffer = kv.key()
+                        buffer.zero_()
+                        nope = torch.full((1, 1, 4), 2.0, dtype=pool.dtype, device=_DEV)
+                        rope = torch.full((1, 1, 2), 3.0, dtype=pool.dtype, device=_DEV)
+                        layer = SimpleNamespace(layer_id=layer_id)
+                        kv.store_mla(
+                            layer, KVWriteLoc(loc, window_loc, full_loc), nope, rope
+                        )
+                        expected = torch.zeros_like(buffer)
+                        slot = (
+                            2 if layer_id in (0, 2) else (11 if full_loc is None else 7)
+                        )
+                        expected[slot] = torch.cat((nope, rope), dim=-1)[0]
+                        self.assertTrue(torch.equal(buffer, expected))
+                        self.assertEqual(layer.layer_id, layer_id)
 
     def test_a_composite_marks_its_owner_and_a_plain_pool_is_plain(self):
         swa = _swa_pool().layer_router
