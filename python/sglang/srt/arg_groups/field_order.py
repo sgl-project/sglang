@@ -555,5 +555,6 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_key_scheme",
     "hicache_storage_head_partition",
     "hicache_storage_layer_partition",
+    "engram_config",
 )
 # fmt: on
