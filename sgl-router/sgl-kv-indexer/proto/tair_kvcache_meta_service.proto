@@ -1,0 +1,530 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
+// SPDX-License-Identifier: Apache-2.0
+// Vendored from Alibaba Cloud Tair KVCache Manager (meta_service.proto); only
+// RegisterInstance, ReportEvent, and GetHostCacheState are used here.
+
+syntax = "proto3";
+
+package kv_cache_manager.proto.meta;
+
+option cc_generic_services = false;
+// HTTP handlers keep request/response messages on one request-scoped arena.
+// This is a C++ allocation policy only; it does not change the wire or JSON
+// representation of any MetaService message.
+option cc_enable_arenas = true;
+
+enum ErrorCode {
+    UNSPECIFIED = 0;
+    OK = 1;
+    UNSUPPORTED = 2;
+    INTERNAL_ERROR = 3;
+    SERVICE_NOT_READY = 4;
+    INVALID_ARGUMENT = 5;
+    DUPLICATE_ENTITY = 6; // Registration with different deployment fields.
+    REACH_MAX_ENTITY_CAPACITY = 7;
+    INSTANCE_NOT_EXIST = 8;
+    SERVER_NOT_LEADER = 9; // HA mode: the request must reach the leader node.
+    NODE_NOT_REGISTERED = 10;
+    SNAPSHOT_IN_PROGRESS = 11;
+    reserved 12; // DELTA_IN_PROGRESS was removed: admitted deltas wait behind the snapshot gate.
+    SNAPSHOT_RATE_LIMITED = 13;
+    SNAPSHOT_REQUIRED = 14;
+
+    IO_ERROR = 20;
+    UNKNOWN_ERROR = 100;
+    ERROR_MAX = 65535;
+}
+
+message Status {
+    ErrorCode code = 1;
+    string message = 2;
+}
+
+message CommonResponseHeader {
+    Status status = 1;
+    string request_id = 2;
+    string tracer_result = 3;
+}
+
+message CommonResponse { CommonResponseHeader header = 1; }
+
+enum StorageType {
+    ST_UNSPECIFIED = 0;
+    ST_3FS = 1;
+    ST_MOONCAKE = 2;
+    ST_TAIRMEMPOOL = 3;
+    ST_NFS = 4;
+    ST_VCNS_3FS = 5;
+    ST_DUMMY = 6;
+    ST_EVENT_REPORT_L1P5 = 7;
+    ST_EVENT_REPORT_L2 = 8;
+    ST_TAIRMEMPOOL_SSD = 9;
+}
+
+// ---- Cache event reporting ----
+// ReportEvent is the ingestion API for cache subscribers: engine signals are
+// normalized into block-level mutations. `medium` is the block's cache tier.
+
+enum ReportEventType {
+    EVENT_UNSPECIFIED = 0;
+    // Optional startup signal; the first valid event may also lazily create
+    // the reporter. REGISTER clears a same-process HOST_DOWN or liveness
+    // tombstone.
+    EVENT_NODE_REGISTER = 1;
+    EVENT_BLOCK_ADD = 2;     // Reporter stored a block in one location
+    EVENT_BLOCK_DELETE = 3;  // Reporter removed a block from one location
+    EVENT_HOST_DOWN = 4;     // Reporter node is going down (graceful or detected)
+    EVENT_HEARTBEAT = 5;     // Reporter periodic heartbeat
+    EVENT_BLOCK_SNAPSHOT = 6; // Reporter sends one complete all-medium host snapshot
+}
+
+message NodeRegisterEventParams {
+    repeated string mediums = 1; // mediums supported by the node, e.g. ["mem","disk"]
+}
+
+message BlockAddEventParams {
+    // Signed int64 decimal, or unsigned uint64 decimal mapped to the same
+    // internal 64-bit key (e.g. UINT64_MAX is equivalent to -1).
+    string block_key = 1;
+    string uri = 2;       // deprecated, use specs instead
+    string medium = 3;    // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    repeated LocationSpec specs = 4;
+}
+
+message BlockDeleteEventParams {
+    string block_key = 1;
+    string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    // Required component names to remove from this block location.
+    repeated string spec_names = 3;
+}
+
+message BlockSnapshotItem {
+    string block_key = 1;
+    string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    repeated LocationSpec specs = 3;
+}
+
+message BlockSnapshotEventParams {
+    // Legacy single-medium form. New callers should set medium on every block.
+    string medium = 1 [deprecated = true];
+    // Complete block set for (instance_id, reporter host_ip_port), across every
+    // medium owned by the reporter. Empty means the host owns no blocks.
+    // Do not paginate.
+    repeated BlockSnapshotItem blocks = 2;
+}
+
+message HostDownEventParams {
+}
+
+message HeartbeatEventParams {
+    // KVCM only refreshes last_heartbeat; system_status is opaque observability data
+    map<string, string> system_status = 1;
+}
+
+message EventItem {
+    ReportEventType event_type = 1;
+    oneof event_params {
+        NodeRegisterEventParams node_register = 2;
+        BlockAddEventParams block_add = 3;
+        BlockDeleteEventParams block_delete = 4;
+        HostDownEventParams host_down = 5;
+        HeartbeatEventParams heartbeat = 6;
+        BlockSnapshotEventParams block_snapshot = 7;
+    }
+}
+
+message ReportEventRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    string host_ip_port = 3;
+    repeated EventItem events = 4;
+    StorageType storage_type = 5; // required: declares the reporter's storage/event_report
+}
+
+message ReportEventResponse {
+    CommonResponseHeader header = 1;
+    // Non-empty only when partial failures happen.
+    repeated ErrorCode item_results = 2;
+    // Current process-local reconciliation generation for
+    // (instance_id, storage_type, reporter host_ip_port). After a successful
+    // full snapshot it doubles as the strict query-visibility generation.
+    string committed_snapshot_version = 3;
+    uint64 retry_after_ms = 4;
+    // Advisory: true until this process has a generation, then once more
+    // when the first generation is lazily created. Schedule a reconciliation
+    // snapshot; realtime mutations stay accepted meanwhile.
+    bool snapshot_required = 5;
+    string extra_info = 6; // opaque JSON passed through from InstanceGroup
+}
+
+// URIs uniformly address all storage kinds; clients/connectors parse them.
+// ThreeFS: 3fs://cluster/root/dir/file?offset=0&size=1024
+// NFS: file://nfs_01/data/dir/file?offset=1&size=1024
+message LocationSpec {
+    string name = 1; // Matches LocationSpecInfo.name.
+    string uri = 2;
+}
+
+message CacheLocation {
+    StorageType type = 1;
+    int32 spec_size = 2;
+    repeated LocationSpec location_specs = 3;
+}
+
+message LocationSpecInfo {
+    string name = 1; // Caller-defined sub-partition of a block (e.g. TP0/TP1 at tp=2).
+    int64 size = 2;
+}
+
+message ModelDeployment {
+    string model_name = 1;
+    string dtype = 2;             // Torch dtype string, e.g. FP8.
+    bool use_mla = 3;             // Latent attention (two stored matrices only).
+    int32 tp_size = 4;            // Tensor-parallel degree.
+    int32 dp_size = 5;            // Data-parallel degree.
+    string lora_name = 6;         // LoRA checkpoint hash, if any.
+    int32 pp_size = 7;            // Pipeline depth.
+    string extra = 8;             // Extra identity fields (part of uniqueness).
+    string user_data = 9;        // Opaque user payload (not part of identity).
+    bool use_eagle_pop = 10;    // EaglePop: full-attention prefix shortened by one.
+}
+
+message LocationSpecGroup {
+    string name = 1;
+    repeated string spec_names = 2;
+}
+
+message InstanceInfo {
+    string quota_group_name = 1;
+    string instance_group_name = 2;
+    string instance_id = 3;
+    int32 block_size = 4;                              // Tokens per block.
+    repeated LocationSpecInfo location_spec_infos = 5; // Specs StartWriteCache allocates on.
+    ModelDeployment model_deployment = 6;
+    repeated LocationSpecGroup location_spec_groups = 7; // Named spec bundles for StartWriteCache.
+    QueryType default_query_type = 8; // Used when a request omits query_type.
+}
+
+message LocalStorageSpec {}
+
+message DummyStorageSpec {
+    string root_path = 1;
+    int32 key_count_per_file = 2;
+}
+
+// 3fs
+message ThreeFSStorageSpec {
+    string cluster_name = 1;      // 3FS cluster name.
+    string mountpoint = 2;        // Mount point, e.g. /3fs/stage/3fs/.
+    string root_dir = 3;          // Full prefix is mountpoint/root_dir.
+    int32 key_count_per_file = 4; // Keys per file.
+    bool touch_file_when_create = 5;
+}
+
+// vcns_3fs
+message VcnsThreeFSStorageSpec {
+    string cluster_name = 1;      // 3FS cluster name.
+    string mountpoint = 2;        // Mount point, e.g. /3fs/stage/3fs/.
+    string root_dir = 3;          // Full prefix is mountpoint/root_dir.
+    int32 key_count_per_file = 4; // Keys per file.
+    bool touch_file_when_create = 5;
+    string remote_host = 6;
+    int32 remote_port = 7;
+    string meta_storage_uri = 8;
+}
+
+// moonCake mooncake-store/include/client.h
+message MooncakeStorageSpec {
+    string local_hostname = 1;       // Local host address (IP:Port)
+    string metadata_connstring = 2;  // Connection string for metadata service
+    string protocol = 3;             // Transfer protocol ("rdma" or "tcp")
+    string rdma_device = 4;          // Protocol-specific arguments
+    string master_service_entry = 5; // The entry of master server
+                                     // (IP:Port of master address for non-HA mode,
+                                     // etcd://IP:Port;IP:Port;...;IP:Port for HA mode)
+}
+
+message TairMemPoolStorageSpec {
+    string domain = 1; // MemPool meta service domain (used when discovery URL is empty).
+    int32 timeout = 2; // Request timeout.
+    reserved 3, 4; // Historic: enable_vipserver / vipserver_domain.
+    reserved "enable_vipserver", "vipserver_domain";
+    // Service-discovery URL; empty disables discovery (same field as
+    // TairMemPoolStorageSpec in admin_service.proto).
+    string service_discovery_url = 5;
+    int32 media_type = 6; // 0=any, 2=DRAM, 5=SSD.
+}
+
+message NfsStorageSpec {
+    string root_path = 1;
+    int32 key_count_per_file = 2;
+}
+
+// One MetaService may front several storage systems.
+message StorageConfig {
+    string global_unique_name = 1;
+    oneof storage_spec {
+        LocalStorageSpec local = 2;
+        ThreeFSStorageSpec threefs = 3;
+        MooncakeStorageSpec mooncake = 4;
+        TairMemPoolStorageSpec tair_mem_pool = 5;
+        NfsStorageSpec nfs = 6;
+        ThreeFSStorageSpec vcnsthreefs = 7;
+        DummyStorageSpec dummy = 9;
+    }
+    bool check_storage_available_when_open = 8;
+}
+
+message RegisterInstanceRequest {
+    string trace_id = 1;
+    string instance_group = 2;
+    string instance_id = 3;        // One model deployment.
+    int32 block_size = 4;          // Tokens per block.
+    repeated LocationSpecInfo location_spec_infos = 5; // Specs StartWriteCache allocates on.
+    ModelDeployment model_deployment = 6;
+    repeated LocationSpecGroup location_spec_groups = 7; // Named spec bundles for StartWriteCache.
+    QueryType default_query_type = 8; // Used when a request omits query_type.
+}
+
+message RegisterInstanceResponse {
+    CommonResponseHeader header = 1;
+    string storage_configs = 2;
+    string extra_info = 3; // opaque JSON passed through from InstanceGroup
+}
+
+message GetInstanceInfoRequest {
+    string trace_id = 1;
+    string instance_id = 2; // One model deployment.
+}
+
+message GetInstanceInfoResponse {
+    CommonResponseHeader header = 1;
+    string instance_group = 2;
+    InstanceInfo instance_info = 3;
+}
+
+message BoolMasksType { repeated bool values = 1; }
+message BlockMask {
+    oneof info {
+        int32 offset = 1;             // [0, offset) masked, [offset, +) visible.
+        BoolMasksType bool_masks = 2; // Must match block_keys length.
+    }
+}
+
+enum QueryType {
+    QT_UNSPECIFIED = 0;
+    QT_BATCH_GET = 1;
+    QT_PREFIX_MATCH = 2;
+    QT_REVERSE_ROLL_SW_MATCH = 3;
+    QT_PREFIX_MATCH_WITH_MAMBA = 4;
+}
+
+message GetCacheLocationRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    QueryType query_type = 3;
+    repeated int64 block_keys = 4;
+    repeated int64 token_ids = 5;
+    BlockMask block_mask = 6; // Prefix or per-block mask.
+    int32 sw_size = 7;        // slide window size, for QT_REVERSE_ROLL_SW_MATCH
+    repeated string location_spec_names = 8; // Subset filter; empty returns all.
+}
+
+message CacheLocationVector {
+    repeated CacheLocation locations = 1;
+}
+
+enum LocationSelectStrategy {
+    LSS_UNSPECIFIED = 0;
+    LSS_V6D_PREFIX = 1;
+    LSS_V6D_COVERAGE = 2;
+    LSS_WEIGHTED_RANDOM = 3;
+}
+
+message BackendLocationSelector {
+    StorageType backend_type = 1;
+    LocationSelectStrategy strategy = 2;
+}
+
+message GetCacheLocationsByBackendRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    QueryType query_type = 3;              // Currently QT_BATCH_GET only.
+    repeated int64 block_keys = 4;
+    repeated int64 token_ids = 5;
+    BlockMask block_mask = 6;
+    int32 sw_size = 7;
+    repeated string location_spec_names = 8;
+    repeated BackendLocationSelector backend_selectors = 9;
+}
+
+message GetCacheLocationsByBackendResponse {
+    CommonResponseHeader header = 1;
+    repeated CacheLocationVector key_locations = 2;
+}
+
+message GetCacheLocationLenRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    QueryType query_type = 3;
+    repeated int64 block_keys = 4;
+    repeated int64 token_ids = 5;
+    int32 sw_size = 6;        // slide window size, for QT_REVERSE_ROLL_SW_MATCH
+}
+
+message GetCacheLocationResponse {
+    CommonResponseHeader header = 1;
+    repeated CacheLocation locations = 2; // One entry per key.
+}
+
+message GetCacheLocationLenResponse {
+    CommonResponseHeader header = 1;
+    int64 cache_location_len = 2; // Number of hit keys.
+}
+
+message GetCacheMetaRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;
+    repeated int64 token_ids = 4;
+    BlockMask block_mask = 5; // Prefix or per-block mask.
+    int32 detail_level = 6;   // Higher values return more detail.
+}
+
+message GetCacheMetaResponse {
+    CommonResponseHeader header = 1;
+    repeated CacheLocation locations = 2; // One entry per key.
+    repeated string metas = 3;            // One entry per requested key.
+}
+
+// Call before each write to obtain the write locations.
+message StartWriteCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;
+    repeated int64 token_ids = 4;
+
+    // Hybrid-attention layouts: empty means every block serves every spec;
+    // otherwise one entry per block names the spec group it serves (e.g.
+    // [Full, Full, Full, LinearAndFull, ...]).
+    repeated string location_spec_group_names = 5;
+    int32 write_timeout_seconds = 6; // FinishWriteCache must arrive within this window.
+    int32 min_replica_count = 7; // Skip the write at this many live replicas (default 1).
+}
+
+message StartWriteCacheResponse {
+    CommonResponseHeader header = 1;
+    string write_session_id = 2;
+    BlockMask block_mask = 3;
+    repeated CacheLocation locations = 4;
+}
+
+// Atomic all-or-nothing end of a write session. If this never arrives (or the
+// write stalls), the server drops the session's metadata.
+message FinishWriteCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    string write_session_id = 3;
+    BlockMask success_blocks = 4;
+    repeated CacheLocation locations = 5;
+}
+
+// Remove specific keys (bad-block remediation).
+message RemoveCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;
+    repeated int64 token_ids = 4;
+    BlockMask block_mask = 5; // Mask over block_keys/token_ids.
+}
+
+// Leader endpoint: Meta connection only, no Admin port.
+message MetaNodeEndpoint {
+    string node_id = 1;
+    string host = 2;
+    int32 meta_rpc_port = 3;
+    int32 meta_http_port = 4;
+    string custom_info = 5;
+}
+
+message GetClusterInfoRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+}
+
+message GetClusterInfoResponse {
+    CommonResponseHeader header = 1;
+    string self_node_id = 2;
+    string leader_node_id = 3;
+    // May be missing if the leader lookup itself failed; retry accordingly.
+    MetaNodeEndpoint leader_endpoint = 4;
+}
+
+enum TrimStrategy {
+    TS_UNSPECIFIED = 0;
+    TS_REMOVE_ALL_CACHE = 1;
+    TS_REMOVE_ALL_META = 2;
+    TS_TIMESTAMP = 3;
+}
+
+// Time-range deletion for data invalidated by a release.
+message TrimCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    TrimStrategy strategy = 3;
+    int32 begin_timestamp = 4; // TS_TIMESTAMP lower bound.
+    int32 end_timestamp = 5;   // TS_TIMESTAMP upper bound.
+}
+
+service MetaService {
+    // Register a deployment (normally called by the PD node); instance_id is
+    // hashed from the model deployment, and identical re-registration succeeds.
+    rpc RegisterInstance(RegisterInstanceRequest) returns (RegisterInstanceResponse);
+    // Instance status, for reuse decisions and debugging.
+    rpc GetInstanceInfo(GetInstanceInfoRequest) returns (GetInstanceInfoResponse);
+    // Full meta dump for troubleshooting (TODO move to the debug service).
+    rpc GetCacheMeta(GetCacheMetaRequest) returns (GetCacheMetaResponse);
+    // Cache locations (called by the PD node).
+    rpc GetCacheLocation(GetCacheLocationRequest) returns (GetCacheLocationResponse);
+    // Number of hit keys.
+    rpc GetCacheLocationLen(GetCacheLocationLenRequest) returns (GetCacheLocationLenResponse);
+    // Reserve write locations; an empty answer means no write needed.
+    rpc StartWriteCache(StartWriteCacheRequest) returns (StartWriteCacheResponse);
+    // Always call this when the write session ends, success or not.
+    rpc FinishWriteCache(FinishWriteCacheRequest) returns (CommonResponse);
+    // Remove specific keys (single-query remediation).
+    rpc RemoveCache(RemoveCacheRequest) returns (CommonResponse);
+    // Delete all cache or metadata, optionally by time range.
+    rpc TrimCache(TrimCacheRequest) returns (CommonResponse);
+    // Cluster info / leader discovery; any node can serve it.
+    rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
+    // Reporter event stream (register, block add/remove, host down, heartbeat).
+    rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
+    // Per-host prefix-match answers for an instance.
+    rpc GetHostCacheState(GetHostCacheStateRequest) returns (GetHostCacheStateResponse);
+    // Each key's locations; each backend picks one address.
+    rpc GetCacheLocationsByBackend(GetCacheLocationsByBackendRequest) returns (GetCacheLocationsByBackendResponse);
+}
+
+// ---- GetHostCacheState ----
+
+message GetHostCacheStateRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    QueryType query_type = 3;
+    repeated int64 block_cache_keys = 4;   // Ordered prompt block keys.
+    repeated string medium = 5;            // Media to match; empty means all.
+    int32 p2p_host_count = 6;              // Expand P2P for the top-N local hosts; 0 = local only.
+}
+
+message HostCacheMatch {
+    string host_ip_port = 1;   // host:port, same format the worker status uses.
+    int64 local = 2;           // Locally held prefix blocks.
+    int64 p2p_1_fetch = 3;     // Deduplicated blocks to fetch from the peer.
+    int64 p2p_1_total_match = 4;   // Prefix blocks after the P2P merge.
+}
+
+message GetHostCacheStateResponse {
+    CommonResponseHeader header = 1;
+    repeated HostCacheMatch hosts = 2;
+}

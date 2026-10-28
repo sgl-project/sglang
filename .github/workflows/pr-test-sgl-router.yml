@@ -271,6 +271,106 @@ jobs:
           echo "## Tier-2 results" >> "$GITHUB_STEP_SUMMARY"
           echo "- Build duration: \`${tier_2_build_duration_seconds:-(not recorded)}\` s" >> "$GITHUB_STEP_SUMMARY"
 
+  # tier-kv-indexer — the Tair KVCache backend's live suite. The memory backend's
+  # tests run inside tier-2 through `cargo test --workspace`; this suite is
+  # `#[ignore]`d because it needs a real Tair KVCache Manager, so this job
+  # builds one from a pinned commit and runs the ignored tests against it.
+  # The manager is built inside the project's own dev image (the host's newer
+  # GCC turns boringssl warnings into errors), and the build cache is keyed on
+  # the pinned SHA. The job sits behind the same gate as the other tiers.
+  sgl-router-kv-indexer:
+    name: tier-kv-indexer
+    needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test]
+    if: needs.sgl-router-changes.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # python3-requests is imported by the setup script; protoc/libssl are
+      # needed by the Rust crate's build script.
+      - name: Install OS deps (libssl, pkg-config, python requests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config python3-requests
+
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
+      # The backend's live suite runs against the exact manager revision it was
+      # verified with; bump this SHA together with the live tests. A blobless
+      # clone keeps the checkout out of the workspace (actions/checkout only
+      # allows paths under it) and still lands on an arbitrary commit.
+      - name: Checkout Tair KVCache Manager (pinned)
+        run: |
+          set -euo pipefail
+          MANAGER="$RUNNER_TEMP/tair-kvcache"
+          git clone -q --filter=blob:none --no-checkout \
+            https://github.com/alibaba/tair-kvcache.git "$MANAGER"
+          git -C "$MANAGER" checkout -q 534df33b
+          echo "manager=$(git -C "$MANAGER" rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Build in the manager's own dev image: the host's GCC 13+ promotes a
+      # boringssl warning to an error, and the image pins the toolchain the
+      # manager is tested with upstream.
+      - name: Cache bazel state
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/bazel-cache
+          key: tair-kvcache-bazel-534df33b
+
+      - name: Build the manager
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kvcm-bin" "$RUNNER_TEMP/bazel-cache"
+          docker run --rm \
+            -v "$RUNNER_TEMP/tair-kvcache:/src" \
+            -v "$RUNNER_TEMP/bazel-cache:/root/.cache/bazel" \
+            -v "$RUNNER_TEMP/kvcm-bin:/out" \
+            -w /src \
+            ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1 \
+            bash -lc 'bazelisk build //kv_cache_manager:kv_cache_manager_bin &&
+                      cp -L bazel-bin/kv_cache_manager/kv_cache_manager_bin /out/'
+
+      # The binary is what tier-3 e2e needs to run a real model against this
+      # backend; building it here keeps the H100 runner free of the build.
+      - name: Upload the manager binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvcm-bin
+          path: ${{ runner.temp }}/kvcm-bin/kv_cache_manager_bin
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sgl-router
+          shared-key: "sgl-router-cache"
+          cache-all-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run the live suite against the manager
+        working-directory: sgl-router
+        run: |
+          set -euo pipefail
+          python3 sgl-kv-indexer/tests/test_tair_kvcache_live/setup_tair_kvcache_manager.py start \
+            --binary "$RUNNER_TEMP/kvcm-bin/kv_cache_manager_bin"
+          set -a
+          source /tmp/tair_kvcache-live/tair_kvcache_live.env
+          set +a
+          cargo test --locked --release -p sgl-kv-indexer \
+            --test test_tair_kvcache_live -- --ignored
+
+      - name: Stop the manager
+        if: always()
+        working-directory: sgl-router
+        run: |
+          if [ -f /tmp/tair_kvcache-live/tair_kvcache_live.json ]; then
+            python3 sgl-kv-indexer/tests/test_tair_kvcache_live/setup_tair_kvcache_manager.py \
+              stop --workdir /tmp/tair_kvcache-live || true
+          fi
+
   sgl-router-docker-build-test:
     name: tier-3 — docker (placeholder)
     needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test]
@@ -338,7 +438,9 @@ jobs:
 
   sgl-router-e2e:
     name: tier-3 — e2e
-    needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test]
+    # Waits on tier-kv-indexer for its manager binary: the GPU runner runs the
+    # Tair KVCache stack, it does not build it.
+    needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test, sgl-router-kv-indexer]
     if: needs.sgl-router-changes.outputs.should_run == 'true'
     runs-on: 2-gpu-h100
     timeout-minutes: 45
@@ -372,6 +474,23 @@ jobs:
         run: |
           python3 -m pip install -r sgl-router/tests/e2e/requirements.txt
 
+      # Built by tier-kv-indexer (which this job waits on), so the GPU runner
+      # runs the Tair KVCache stack instead of building it. The test itself
+      # fails in CI when the binary is missing, so a wiring bug stays visible.
+      - name: Download the Tair KVCache manager binary
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: kvcm-bin
+          path: ${{ runner.temp }}/kvcm-bin
+
+      # Artifacts do not carry the executable bit.
+      - name: Make the manager binary executable
+        run: |
+          if [ -f "$RUNNER_TEMP/kvcm-bin/kv_cache_manager_bin" ]; then
+            chmod +x "$RUNNER_TEMP/kvcm-bin/kv_cache_manager_bin"
+          fi
+
       # IMPORTANT: --ignore=tests/e2e/k8s_integration. The k8s integration
       # suite is owned by the `sgl-router-k8s-integration` job which has
       # kind + kubectl installed and a real cluster running. The e2e GPU
@@ -384,6 +503,7 @@ jobs:
         working-directory: sgl-router
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TAIR_KVCACHE_MANAGER_BINARY: ${{ runner.temp }}/kvcm-bin/kv_cache_manager_bin
         run: |
           python3 -m pytest tests/e2e/ -v -s --tb=short \
             --ignore=tests/e2e/k8s_integration
@@ -403,6 +523,7 @@ jobs:
       - sgl-router-gate
       - sgl-router-lint
       - sgl-router-build-and-test
+      - sgl-router-kv-indexer
       - sgl-router-docker-build-test
       - sgl-router-k8s-integration
       - sgl-router-e2e
@@ -422,6 +543,7 @@ jobs:
           GATE_RESULT: ${{ needs.sgl-router-gate.result }}
           LINT_RESULT: ${{ needs.sgl-router-lint.result }}
           BUILD_RESULT: ${{ needs.sgl-router-build-and-test.result }}
+          KV_INDEXER_RESULT: ${{ needs.sgl-router-kv-indexer.result }}
           DOCKER_RESULT: ${{ needs.sgl-router-docker-build-test.result }}
           K8S_RESULT: ${{ needs.sgl-router-k8s-integration.result }}
           E2E_RESULT: ${{ needs.sgl-router-e2e.result }}
@@ -430,12 +552,12 @@ jobs:
             echo "::error::sgl-router path detection did not succeed ($CHANGES_RESULT)."
             exit 1
           fi
-          tiers="$GATE_RESULT $LINT_RESULT $BUILD_RESULT $DOCKER_RESULT $K8S_RESULT $E2E_RESULT"
-          if [[ "$SHOULD_RUN" == "true" && "$tiers" == "success success success success success success" ]]; then
+          tiers="$GATE_RESULT $LINT_RESULT $BUILD_RESULT $KV_INDEXER_RESULT $DOCKER_RESULT $K8S_RESULT $E2E_RESULT"
+          if [[ "$SHOULD_RUN" == "true" && "$tiers" == "success success success success success success success" ]]; then
             echo "All sgl-router checks passed."
-          elif [[ "$SHOULD_RUN" == "false" && "$tiers" == "skipped skipped skipped skipped skipped skipped" ]]; then
+          elif [[ "$SHOULD_RUN" == "false" && "$tiers" == "skipped skipped skipped skipped skipped skipped skipped" ]]; then
             echo "No sgl-router-related changes; tiers skipped."
           else
-            echo "::error::Unexpected sgl-router results: should_run=$SHOULD_RUN, gate=$GATE_RESULT, lint=$LINT_RESULT, build=$BUILD_RESULT, docker=$DOCKER_RESULT, k8s=$K8S_RESULT, e2e=$E2E_RESULT."
+            echo "::error::Unexpected sgl-router results: should_run=$SHOULD_RUN, gate=$GATE_RESULT, lint=$LINT_RESULT, build=$BUILD_RESULT, kv_indexer=$KV_INDEXER_RESULT, docker=$DOCKER_RESULT, k8s=$K8S_RESULT, e2e=$E2E_RESULT."
             exit 1
           fi

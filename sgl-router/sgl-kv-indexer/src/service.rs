@@ -378,15 +378,15 @@ pub fn component_bit(name: &str) -> Option<u32> {
 }
 
 /// Servable tiers as a `1 << TierType` bitmask. V1: HBM + DRAM, SSD excluded.
-const SERVABLE_TIER_MASK: u32 =
+pub(crate) const SERVABLE_TIER_MASK: u32 =
     (1 << (TierType::TierHbm as u32)) | (1 << (TierType::TierDram as u32));
 
 /// Highest `WorkerCacheSpec.version` this build interprets; a higher (future)
 /// version fails closed. Version 0 (proto default) is accepted as current.
-const SUPPORTED_SPEC_VERSION: u32 = 1;
+pub(crate) const SUPPORTED_SPEC_VERSION: u32 = 1;
 
 /// Whether `tier` is set in a `1 << TierType` bitmask.
-fn tier_in_mask(mask: u32, tier: i32) -> bool {
+pub(crate) fn tier_in_mask(mask: u32, tier: i32) -> bool {
     tier >= 0 && mask & (1u32 << tier) != 0
 }
 
