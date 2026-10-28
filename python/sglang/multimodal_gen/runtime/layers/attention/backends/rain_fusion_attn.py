@@ -5,6 +5,7 @@ from itertools import pairwise
 from typing import Any, Optional
 
 import torch
+
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
