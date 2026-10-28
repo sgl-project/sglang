@@ -27,7 +27,6 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.layers.attention.base_attn_backend import (
-    STATIC_SPEC_COMBINATIONS,
     AttentionBackend,
     resolve_window_id_space,
     resolve_window_kv_pool,
@@ -384,10 +383,6 @@ class AiterAttnBackend(AttentionBackend):
 
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
-
-    # Static storage only: it reads dense pages by the request table's ids
-    # (`_require_untranslated_storage`).
-    implemented_spec_combinations = STATIC_SPEC_COMBINATIONS
 
     def __init__(
         self,

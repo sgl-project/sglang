@@ -31,12 +31,9 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
-    STATIC_SPEC_COMBINATIONS,
     AttentionBackend,
-    SpecMode,
     resolve_window_id_space,
     resolve_window_kv_pool,
-    spec_combinations,
 )
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
@@ -333,12 +330,6 @@ def fast_prefill_plan(
 
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
-
-    # On translated storage: a multi-step draft step reads its window layers
-    # through its own window rail; every other mode through its window read.
-    implemented_spec_combinations = STATIC_SPEC_COMBINATIONS | spec_combinations(
-        *SpecMode, translated=(True,)
-    )
 
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.

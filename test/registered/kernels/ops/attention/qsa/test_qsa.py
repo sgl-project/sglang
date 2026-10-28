@@ -394,9 +394,6 @@ def test_qsa_draft_extend_backend_decision_follows_profile():
         runner = SimpleNamespace(
             model_config=SimpleNamespace(hf_config=config),
             draft_attention_backend=None,
-            # What the factory's speculative-mode check reads off the runner.
-            sliding_window_size=None,
-            kv_index_translator=SimpleNamespace(is_translating=False),
         )
         return DraftBackendFactory(
             draft_model_runner=runner,
@@ -405,17 +402,8 @@ def test_qsa_draft_extend_backend_decision_follows_profile():
             qsa_profile=parse_qsa_profile(config),
         )
 
-    from sglang.srt.runtime_context import get_context
-
     compressed = factory(_compressed_config_namespace())
-    # The factory checks the draft extend it builds against the published
-    # CUDA graph setting.
-    override = get_context().override_server_args(disable_cuda_graph=False)
-    override.install()
-    try:
-        backend = compressed.create_draft_extend_backend()
-    finally:
-        override.restore()
+    backend = compressed.create_draft_extend_backend()
     assert isinstance(backend, QwenSparseAttnBackend)
     assert backend.runner is compressed.draft_model_runner
     assert backend.decode_attention_backend_str == "qsa"

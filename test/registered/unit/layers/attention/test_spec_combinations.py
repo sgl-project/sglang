@@ -1,12 +1,17 @@
-"""Each attention backend declares the speculative combinations it implements,
-and the runner that builds it for a speculative forward refuses any other.
+"""The draft factory and the runner build an attention backend for every
+speculative forward without a per-backend list of the combinations it serves.
 
 A combination is the forward (multi-step draft decode, draft extend, target
 verify), whether the model has sliding-window layers, whether the runner
 captures CUDA graphs, and whether its KV storage is translated (the unified
-pool, or a draft fused into it). The backends are built through the runner's
-and the draft factory's own paths; their constructors are stood in for, as the
-check reads only the class and the runner.
+pool, or a draft fused into it). Every backend that can face translated storage
+reads its window and its ids through the same window reads and id spaces, so
+the combinations once refused there build: a FlashInfer target verify and
+graph draft extend with window layers, a trtllm_mha draft extend with window
+layers, an MLA target verify. A backend that cannot read translated storage at
+all refuses it at its own init, by the storage's views (AITER; its tests are in
+`test_fused_draft_window_metadata.py`). Constructors are stood in for: what is
+checked is that neither the factory nor the runner refuses.
 """
 
 import unittest
@@ -14,20 +19,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config  # noqa: E402
-from sglang.srt.arg_groups.overrides import resolution_result  # noqa: E402
-from sglang.srt.layers.attention import base_attn_backend  # noqa: E402
 from sglang.srt.layers.attention import hybrid_attn_backend  # noqa: E402
-from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend  # noqa: E402
-from sglang.srt.layers.attention.base_attn_backend import (  # noqa: E402
-    SpecCombination,
-    SpecMode,
-    spec_combinations,
-)
 from sglang.srt.layers.attention.cutedsl_mla_backend import (  # noqa: E402
     CuteDslMLABackend,
 )
@@ -40,9 +36,6 @@ from sglang.srt.layers.attention.flashinfer_backend import (  # noqa: E402
 from sglang.srt.layers.attention.flashinfer_mla_backend import (  # noqa: E402
     FlashInferMLAAttnBackend,
 )
-from sglang.srt.layers.attention.intel_amx_backend import (  # noqa: E402
-    IntelAMXAttnBackend,
-)
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend  # noqa: E402
 from sglang.srt.layers.attention.trtllm_mha_backend import (  # noqa: E402
     TRTLLMHAAttnBackend,
@@ -50,54 +43,33 @@ from sglang.srt.layers.attention.trtllm_mha_backend import (  # noqa: E402
 from sglang.srt.layers.attention.trtllm_mla_backend import (  # noqa: E402
     TRTLLMMLABackend,
 )
-from sglang.srt.model_executor.cuda_graph_config import (  # noqa: E402
-    Backend,
-    CudaGraphConfig,
-    PhaseConfig,
-)
 from sglang.srt.model_executor.model_runner_components import (  # noqa: E402
     attention_backend_setup as setup,
 )
-from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.srt.speculative import draft_utils  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_TRANSLATED = spec_combinations(*SpecMode, translated=(True,))
-
-# What each backend implements on translated storage.
-_DECLARED = {
-    TritonAttnBackend: _TRANSLATED,
-    FlashAttentionBackend: _TRANSLATED,
-    FlashInferAttnBackend: _TRANSLATED,
-    TRTLLMHAAttnBackend: spec_combinations(
-        SpecMode.TARGET_VERIFY, SpecMode.DRAFT_DECODE, translated=(True,)
-    )
-    | spec_combinations(SpecMode.DRAFT_EXTEND, window=(False,), translated=(True,)),
-}
-_MLA_VERIFY = spec_combinations(
-    SpecMode.TARGET_VERIFY, window=(False,), translated=(True,)
+_MHA = (
+    (TritonAttnBackend, "triton"),
+    (FlashInferAttnBackend, "flashinfer"),
+    (TRTLLMHAAttnBackend, "trtllm_mha"),
+    (FlashAttentionBackend, "fa3"),
 )
-# The MLA family (flashmla derives from it too): a fused draft is MHA, so only
-# the target reads translated storage here.
-for _cls in (FlashInferMLAAttnBackend, TRTLLMMLABackend, CuteDslMLABackend):
-    _DECLARED[_cls] = _MLA_VERIFY
-# Static storage only.
-for _cls in (AiterAttnBackend, IntelAMXAttnBackend):
-    _DECLARED[_cls] = frozenset()
+_MLA = (FlashInferMLAAttnBackend, TRTLLMMLABackend, CuteDslMLABackend)
 
 
 def _runner(
-    combination: SpecCombination,
     *,
     draft: bool = False,
     algorithm: SpeculativeAlgorithm = SpeculativeAlgorithm.EAGLE,
     **extra,
 ):
+    """A runner with sliding-window layers on translated storage."""
     return SimpleNamespace(
-        sliding_window_size=128 if combination.window else None,
-        kv_index_translator=SimpleNamespace(is_translating=combination.translated),
+        sliding_window_size=128,
+        kv_index_translator=SimpleNamespace(is_translating=True),
         is_draft_worker=draft,
         spec_algorithm=algorithm,
         draft_attention_backend=None,
@@ -105,121 +77,9 @@ def _runner(
     )
 
 
-def _graphs(combination: SpecCombination):
-    return patch.object(
-        base_attn_backend,
-        "get_exec",
-        return_value=SimpleNamespace(
-            graph=SimpleNamespace(
-                cuda_graph_config=CudaGraphConfig(
-                    decode=PhaseConfig(
-                        backend=(
-                            Backend.FULL if combination.cuda_graph else Backend.DISABLED
-                        )
-                    ),
-                    prefill=PhaseConfig(backend=Backend.DISABLED),
-                )
-            )
-        ),
-    )
-
-
 def _built(cls):
     """An instance of ``cls`` as its constructor would leave its class."""
     return object.__new__(cls)
-
-
-def _combination(mode, *, window=True, cuda_graph=True, translated=True):
-    return SpecCombination(
-        mode=mode, window=window, cuda_graph=cuda_graph, translated=translated
-    )
-
-
-class TestResolvedGraphConfig(CustomTestCase):
-    def test_speculative_modes_follow_the_resolved_decode_backend(self):
-        cases = (
-            ({"cuda_graph_backend_decode": Backend.DISABLED}, False),
-            (
-                {
-                    "cuda_graph_config": {
-                        "decode": {"backend": Backend.DISABLED},
-                        "prefill": {"backend": Backend.FULL},
-                    }
-                },
-                False,
-            ),
-            (
-                {
-                    "disable_cuda_graph": True,
-                    "cuda_graph_backend_decode": Backend.BREAKABLE,
-                },
-                True,
-            ),
-            (
-                {
-                    "disable_cuda_graph": True,
-                    "cuda_graph_config": {"decode": {"backend": Backend.FULL}},
-                },
-                True,
-            ),
-            (
-                {
-                    "disable_decode_cuda_graph": True,
-                    "cuda_graph_config": {"decode": {"backend": Backend.FULL}},
-                },
-                True,
-            ),
-            ({"disable_decode_cuda_graph": True}, False),
-            ({"disable_cuda_graph": True}, False),
-            ({"cuda_graph_config": {"prefill": {"backend": Backend.DISABLED}}}, True),
-        )
-        for inputs, captures_decode in cases:
-            args = ServerArgs(model_path="dummy", **inputs)
-            parse_cuda_graph_config(args)
-            graph = SimpleNamespace(
-                disable_cuda_graph=args.disable_cuda_graph,
-                cuda_graph_config=resolution_result(args, "cuda_graph_config"),
-            )
-            with patch.object(
-                base_attn_backend, "get_exec", return_value=SimpleNamespace(graph=graph)
-            ):
-                for mode in SpecMode:
-                    with self.subTest(inputs=inputs, mode=mode):
-                        runner = _runner(_combination(mode))
-                        self.assertEqual(
-                            SpecCombination.of_runner(runner, mode).cuda_graph,
-                            captures_decode,
-                        )
-                # Draft extend shares the decode capture phase with draft decode
-                # and target verify, even when prefill has another backend.
-                runner = _runner(_combination(SpecMode.DRAFT_EXTEND), draft=True)
-                backend = _built(FlashInferAttnBackend)
-                with self.subTest(inputs=inputs, gate="window draft extend"):
-                    if captures_decode:
-                        with self.assertRaisesRegex(ValueError, "with CUDA graphs"):
-                            backend.require_spec_mode(runner, SpecMode.DRAFT_EXTEND)
-                    else:
-                        backend.require_spec_mode(runner, SpecMode.DRAFT_EXTEND)
-
-
-class TestDeclarations(unittest.TestCase):
-    def test_each_backend_accepts_what_it_declares_and_refuses_the_rest(self):
-        """Every combination on static storage, as before; on translated
-        storage only what the backend declares, refused with a message that
-        names the backend and the combination."""
-        for cls, declared in _DECLARED.items():
-            for combination in spec_combinations(*SpecMode):
-                with self.subTest(backend=cls.__name__, combo=combination.describe()):
-                    runner = _runner(combination)
-                    with _graphs(combination):
-                        if not combination.translated or combination in declared:
-                            _built(cls).require_spec_mode(runner, combination.mode)
-                            continue
-                        with self.assertRaises(ValueError) as refused:
-                            _built(cls).require_spec_mode(runner, combination.mode)
-                    message = str(refused.exception)
-                    self.assertIn(cls.__name__, message)
-                    self.assertIn(combination.describe(), message)
 
 
 class _Container:
@@ -233,14 +93,13 @@ class TestDraftFactory(unittest.TestCase):
     """The draft factory checks what it builds: every step of a multi-step
     draft decode, and the draft-extend backend."""
 
-    def _decode(self, cls, name, combination):
-        runner = _runner(combination, draft=True)
+    def _decode(self, cls, name):
+        runner = _runner(draft=True)
         container = _Container(cls)
         factory = draft_utils.DraftBackendFactory(
             runner, topk=1, speculative_num_steps=3
         )
         with (
-            _graphs(combination),
             patch.object(draft_utils, "attention_backends", return_value=(name, name)),
             patch.object(
                 draft_utils.DraftBackendFactory,
@@ -258,13 +117,12 @@ class TestDraftFactory(unittest.TestCase):
         ):
             return factory.create_decode_backend()
 
-    def _extend(self, cls, name, combination):
-        runner = _runner(combination, draft=True)
+    def _extend(self, cls, name):
+        runner = _runner(draft=True)
         factory = draft_utils.DraftBackendFactory(
             runner, topk=1, speculative_num_steps=3
         )
         with (
-            _graphs(combination),
             patch.object(draft_utils, "attention_backends", return_value=(name, name)),
             patch.object(
                 draft_utils,
@@ -284,64 +142,31 @@ class TestDraftFactory(unittest.TestCase):
         ):
             return factory.create_draft_extend_backend()
 
-    def test_aiter_refuses_a_fused_window_draft(self):
-        """BUG REGRESSION (from the window-only and mixed fused drafts on
-        aiter). With the draft backend lists gone, aiter steps were built for a
-        draft fused into the target's pool, whose window ids aiter cannot
-        read. The factory now refuses it, naming the combination."""
-        combination = _combination(SpecMode.DRAFT_DECODE)
-        with self.assertRaisesRegex(
-            ValueError, "AiterAttnBackend.*multi-step draft decode with sliding"
-        ):
-            self._decode(AiterAttnBackend, "aiter", combination)
-        static = _combination(SpecMode.DRAFT_DECODE, translated=False)
-        self.assertIsNotNone(self._decode(AiterAttnBackend, "aiter", static))
-
-    def test_window_drafts_build_on_the_backends_that_read_their_rails(self):
-        for cls, name in (
-            (TritonAttnBackend, "triton"),
-            (FlashInferAttnBackend, "flashinfer"),
-            (TRTLLMHAAttnBackend, "trtllm_mha"),
-            (FlashAttentionBackend, "fa3"),
-        ):
-            with self.subTest(backend=name):
-                built = self._decode(cls, name, _combination(SpecMode.DRAFT_DECODE))
+    def test_window_drafts_build_on_every_backend(self):
+        """Multi-step draft decode and draft extend, which the lists once
+        refused on translated storage for some backends, now build."""
+        for cls, name in _MHA:
+            with self.subTest(backend=name, mode="draft decode"):
+                built = self._decode(cls, name)
                 self.assertEqual(len(built.attn_backends), 2)
-
-    def test_flashinfer_window_draft_extend_builds_with_graphs(self):
-        """BUG REGRESSION. A graph replay of a FlashInfer draft extend planned
-        its window wrapper without the window, so the combination was refused;
-        it now plans with the window as the eager extend does, and builds."""
-        for cuda_graph in (False, True):
-            combination = _combination(SpecMode.DRAFT_EXTEND, cuda_graph=cuda_graph)
-            built = self._extend(FlashInferAttnBackend, "flashinfer", combination)
-            self.assertIsInstance(built, FlashInferAttnBackend)
-
-    def test_trtllm_mha_refuses_a_fused_window_draft_extend(self):
-        combination = _combination(SpecMode.DRAFT_EXTEND)
-        with self.assertRaisesRegex(ValueError, "TRTLLMHAAttnBackend.*draft extend"):
-            self._extend(TRTLLMHAAttnBackend, "trtllm_mha", combination)
-        no_window = _combination(SpecMode.DRAFT_EXTEND, window=False)
-        self._extend(TRTLLMHAAttnBackend, "trtllm_mha", no_window)
+            with self.subTest(backend=name, mode="draft extend"):
+                self.assertIsInstance(self._extend(cls, name), cls)
 
 
-class TestRunnerBackend(CustomTestCase):
-    """A speculative runner checks its own backend: target verify on the
-    target or a verify-style draft, draft extend on other drafts; a split
-    pair answers with the child that runs the forward."""
+class TestRunnerBackend(unittest.TestCase):
+    """A speculative runner builds its own backend for target verify (the
+    target) or draft extend (a draft) without consulting a combination list."""
 
     def _build(
         self,
         prefill_cls,
         decode_cls,
-        combination,
         *,
         draft=False,
         mode="prefill",
         algorithm=SpeculativeAlgorithm.EAGLE,
     ):
         runner = _runner(
-            combination,
             draft=draft,
             algorithm=algorithm,
             model_config=SimpleNamespace(context_len=2048),
@@ -359,7 +184,6 @@ class TestRunnerBackend(CustomTestCase):
             decode="decode-test" if decode_cls is not prefill_cls else "prefill-test",
         )
         with (
-            _graphs(combination),
             patch.dict(setup.ATTENTION_BACKENDS, constructors),
             patch.object(setup, "attn_backend_wrapper", side_effect=lambda r, b: b),
             patch.object(
@@ -377,109 +201,24 @@ class TestRunnerBackend(CustomTestCase):
                 model_runner=runner, resolved=resolved, init_new_workspace=False
             )
 
-    def test_flashinfer_builds_a_translated_window_target_verify(self):
-        """BUG REGRESSION. A FlashInfer EAGLE verify read its window wrapper
-        from column 0, so a translated window target verify was refused; it
-        now reads from the window's start and builds."""
-        combination = _combination(SpecMode.TARGET_VERIFY)
-        self._build(FlashInferAttnBackend, FlashInferAttnBackend, combination)
+    def test_window_target_verify_builds_on_every_backend(self):
+        """A translated target verify with window layers: once refused on
+        FlashInfer and the MLA family, it now builds, alone or as the verifying
+        child of a split pair."""
+        for cls, _ in _MHA:
+            with self.subTest(backend=cls.__name__):
+                self.assertIsInstance(self._build(cls, cls), cls)
+        for cls in _MLA:
+            with self.subTest(backend=cls.__name__):
+                self.assertIsInstance(self._build(cls, cls), cls)
+        for mode in ("prefill", "decode"):
+            with self.subTest(split_pair_verifies_on=mode):
+                self._build(TritonAttnBackend, FlashInferMLAAttnBackend, mode=mode)
 
-    def test_a_split_pair_checks_the_child_that_verifies(self):
-        combination = _combination(SpecMode.TARGET_VERIFY)
-        # Verify on the prefill side (triton) builds; on the decode side
-        # (flashinfer_mla) it is refused.
-        self._build(TritonAttnBackend, FlashInferMLAAttnBackend, combination)
-        with self.assertRaisesRegex(ValueError, "FlashInferMLAAttnBackend"):
-            self._build(
-                TritonAttnBackend, FlashInferMLAAttnBackend, combination, mode="decode"
-            )
-
-    def test_a_draft_runner_checks_draft_extend(self):
-        combination = _combination(SpecMode.DRAFT_EXTEND)
-        with self.assertRaisesRegex(ValueError, "AiterAttnBackend.*draft extend"):
-            self._build(AiterAttnBackend, AiterAttnBackend, combination, draft=True)
-        self._build(TritonAttnBackend, TritonAttnBackend, combination, draft=True)
-
-    def test_verify_draft_runners_check_target_verify_capabilities(self):
-        """A verify-style draft builds on window backends that support verification."""
-        for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
-            for cuda_graph in (False, True):
-                with self.subTest(algorithm=algorithm, cuda_graph=cuda_graph):
-                    combination = _combination(
-                        SpecMode.TARGET_VERIFY, cuda_graph=cuda_graph
-                    )
-                    self._build(
-                        TRTLLMHAAttnBackend,
-                        TRTLLMHAAttnBackend,
-                        combination,
-                        draft=True,
-                        algorithm=algorithm,
-                    )
-                    window = _combination(SpecMode.TARGET_VERIFY, cuda_graph=cuda_graph)
-                    with self.assertRaisesRegex(
-                        ValueError, "FlashInferAttnBackend.*target verify with sliding"
-                    ):
-                        self._build(
-                            FlashInferAttnBackend,
-                            FlashInferAttnBackend,
-                            window,
-                            draft=True,
-                            algorithm=algorithm,
-                        )
-
-    def test_verify_drafts_check_the_selected_verify_child(self):
-        """A split draft checks the child selected for verification."""
-        for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
-            for cuda_graph in (False, True):
-                with self.subTest(algorithm=algorithm, cuda_graph=cuda_graph):
-                    combination = _combination(
-                        SpecMode.TARGET_VERIFY, cuda_graph=cuda_graph
-                    )
-                    self._build(
-                        TritonAttnBackend,
-                        FlashInferAttnBackend,
-                        combination,
-                        draft=True,
-                        algorithm=algorithm,
-                    )
-                    with self.assertRaisesRegex(
-                        ValueError, "FlashInferAttnBackend.*target verify with sliding"
-                    ):
-                        self._build(
-                            TritonAttnBackend,
-                            FlashInferAttnBackend,
-                            combination,
-                            draft=True,
-                            mode="decode",
-                            algorithm=algorithm,
-                        )
-
-    def test_eagle_draft_runner_keeps_draft_extend_capabilities(self):
-        """An EAGLE draft still requires support for draft extend."""
-        for cuda_graph in (False, True):
-            with self.subTest(cuda_graph=cuda_graph):
-                combination = _combination(SpecMode.DRAFT_EXTEND, cuda_graph=cuda_graph)
-                with self.assertRaisesRegex(
-                    ValueError, "TRTLLMHAAttnBackend.*draft extend"
-                ):
-                    self._build(
-                        TRTLLMHAAttnBackend,
-                        TRTLLMHAAttnBackend,
-                        combination,
-                        draft=True,
-                    )
-                self._build(
-                    TritonAttnBackend, TritonAttnBackend, combination, draft=True
-                )
-
-    def test_a_runner_without_speculation_is_not_checked(self):
-        combination = _combination(SpecMode.TARGET_VERIFY)
-        self._build(
-            AiterAttnBackend,
-            AiterAttnBackend,
-            combination,
-            algorithm=SpeculativeAlgorithm.NONE,
-        )
+    def test_a_draft_runner_builds_its_draft_extend_backend(self):
+        for cls, _ in _MHA:
+            with self.subTest(backend=cls.__name__):
+                self.assertIsInstance(self._build(cls, cls, draft=True), cls)
 
 
 if __name__ == "__main__":

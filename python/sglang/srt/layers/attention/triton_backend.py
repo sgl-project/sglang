@@ -23,8 +23,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
-    SpecMode,
-    spec_combinations,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp import (
@@ -149,11 +147,6 @@ class ForwardMetadata:
 
 
 class TritonAttnBackend(AttentionBackend):
-    # Every speculative forward, on static or translated storage: its index
-    # builders read through the translator, and window layers take their own
-    # read rails in every captured mode.
-    implemented_spec_combinations = spec_combinations(*SpecMode)
-
     # CUDA-graph replay rebuilds metadata from preallocated kv_indptr/kv_indices
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False

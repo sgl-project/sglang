@@ -23,8 +23,6 @@ from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
-    SpecMode,
-    spec_combinations,
 )
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -148,10 +146,6 @@ class FlashAttentionBackend(AttentionBackend):
 
     needs_cpu_seq_lens: bool = False
     supports_ragged_verify_graph: bool = True
-    # Every speculative forward, fa3 and fa4 alike, on static or translated
-    # storage: page tables are copied from the translator, and window layers
-    # read their window side's table.
-    implemented_spec_combinations = spec_combinations(*SpecMode)
 
     # Set from the pool type in __init__; the class default keeps the extend
     # metadata guard readable on instances built with __new__ (test stubs).

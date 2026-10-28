@@ -29,11 +29,8 @@ from sglang.kernels.ops.attention.trtllm_mha_page_table import (
 from sglang.kernels.ops.attention.utils import canonicalize_stride
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
-    STATIC_SPEC_COMBINATIONS,
     SharedReadEnds,
-    SpecMode,
     resolve_window_kv_pool,
-    spec_combinations,
 )
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
@@ -182,18 +179,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     needs_cpu_seq_lens: bool = False
 
     supports_ragged_verify_graph: bool = True
-
-    # On translated storage: target verify, and a multi-step draft whose steps
-    # take their own window rails and write columns (checked on CPU, not run
-    # on Blackwell hardware). A draft extend is declared there without window
-    # layers only: its window page table is not checked.
-    implemented_spec_combinations = (
-        STATIC_SPEC_COMBINATIONS
-        | spec_combinations(
-            SpecMode.TARGET_VERIFY, SpecMode.DRAFT_DECODE, translated=(True,)
-        )
-        | spec_combinations(SpecMode.DRAFT_EXTEND, window=(False,), translated=(True,))
-    )
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
