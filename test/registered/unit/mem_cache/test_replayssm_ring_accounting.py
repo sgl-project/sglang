@@ -21,8 +21,6 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.mem_cache.kv_cache_configurator import (  # noqa: F401
     _pp_local_per_request_bytes,
-)
-from sglang.srt.mem_cache.kv_cache_configurator import (
     replayssm_ring_memory_charge,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
