@@ -316,9 +316,8 @@ class MambaFinishedOvershootCheckpointFixtures:
         req.output_ids = array("q")
         req.extra_key = None
         req.swa_uuid_for_lock = None
-        req.kv.kv_committed_len = len(tokens)
-        req.kv.kv_allocated_len = len(tokens)
-        req.kv.cache_protected_len = 0
+        req.kv.allocate_extend(len(tokens))
+        req.kv.protect_prefix(0)
         req.kv.mamba_last_track_seqlen = len(tokens)
         req.kv.mamba_prev_track_seqlen = previous_track_seqlen
         req.kv.mamba_last_track_idx = 0
@@ -339,9 +338,8 @@ class UnifiedRadixCacheInt8MambaCheckpointFixtures:
         )
         req_to_token_pool.alloc([req])
         req.output_ids = array("q")
-        req.kv.kv_committed_len = len(tokens)
-        req.kv.kv_allocated_len = len(tokens)
-        req.kv.cache_protected_len = 0
+        req.kv.allocate_extend(len(tokens))
+        req.kv.protect_prefix(0)
         req.lock = None
         req.extra_key = None
         req.kv.mamba_last_track_seqlen = len(tokens)
@@ -372,8 +370,8 @@ class SWADraftHistoryFixtures:
         req.output_ids = []
         req.full_untruncated_fill_ids = tokens
         req.extend_end = len(tokens)
-        req.kv.kv_committed_len = req.kv.kv_allocated_len = len(tokens)
-        req.kv.cache_protected_len = 0
+        req.kv.allocate_extend(len(tokens))
+        req.kv.protect_prefix(0)
         req.kv.mamba_last_track_seqlen = len(tokens)
         req.kv.mamba_last_track_idx = 0
         req.kv.mamba_next_track_idx = pool.get_mamba_ping_pong_other_idx(0)

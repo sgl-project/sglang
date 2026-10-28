@@ -265,8 +265,7 @@ class StreamingSessionLockLifecycleFixtures:
             (req.kv.req_pool_idx, slice(0, len(tokens))),
             allocator.alloc(len(tokens)),
         )
-        req.kv.kv_committed_len = len(tokens)
-        req.kv.kv_allocated_len = len(tokens)
+        req.kv.allocate_extend(len(tokens))
         req.last_node = cache.root_node_handle()
         req.lock = cache.lock(req.last_node)
         return req
@@ -287,7 +286,6 @@ class StreamingSessionLockLifecycleFixtures:
         )
         req.last_node = match.last_device_node
         pool.write((req.kv.req_pool_idx, slice(8, 12)), allocator.alloc(4))
-        req.kv.kv_committed_len = 12
-        req.kv.kv_allocated_len = 12
+        req.kv.allocate_extend(12)
         cache.maybe_hand_to_session(req)
         return cache.session.slots["s"], req
