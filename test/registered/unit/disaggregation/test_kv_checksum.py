@@ -198,6 +198,20 @@ class TestKvChecksumComputer(unittest.TestCase):
         self.assertEqual([v.tolist() for v in ids], [[5], [5], [2], [2], [3, 1]])
         suffix_ids = state_indices_for_request(scheduler, req, 8, start_idx=4)
         self.assertEqual([v.tolist() for v in suffix_ids], [[5], [5], [2], [2], [1]])
+        from sglang.srt.disaggregation.base.conn import StateType
+
+        transfer_args = SimpleNamespace(
+            state_types=[
+                StateType.MAMBA,
+                StateType.QSA_PENDING,
+                StateType.QSA_COMPRESSED,
+            ],
+            state_data_ptrs=[[1, 2], [3, 4, 6, 7], [5, 8]],
+        )
+        ids = state_indices_for_request(scheduler, req, 8, kv_args=transfer_args)
+        self.assertEqual(
+            [v.tolist() for v in ids], [[5], [5], [2], [2], [2], [2], [3, 1], [3, 1]]
+        )
         tensors = [torch.randn(8, 16, device=self.device) for _ in ids]
         widths = [t[0].nbytes for t in tensors]
         computer = _make_computer([], 0, tensors, widths)
@@ -304,7 +318,7 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.attn_tp_cpu_group = None
         self.disagg_decode_prealloc_queue = SimpleNamespace(
             kv_manager=SimpleNamespace(
-                should_verify_kv_checksum=lambda bootstrap_addr: True
+                kv_args=None, should_verify_kv_checksum=lambda bootstrap_addr: True
             ),
             kv_checksum_mismatch_injector=random.Random(0),
         )
@@ -318,7 +332,7 @@ class _FakePrefillScheduler(SchedulerDisaggregationPrefillMixin):
         self.kv_checksum_computer = computer or object()
         self.disagg_metadata_buffers = SimpleNamespace(set_kv_checksum=Mock())
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            kv_checksum_signature=0x1234
+            kv_checksum_signature=0x1234, kv_manager=SimpleNamespace(kv_args=None)
         )
 
 

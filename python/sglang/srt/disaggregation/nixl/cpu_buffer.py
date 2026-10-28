@@ -188,13 +188,18 @@ class CpuBufferMixin:
             elif state_type == StateType.QSA_PENDING:
                 tensors = [
                     tensor
+                    for state_pool in pools
                     for tensor in (
-                        *pool.qsa_key_state_buffer_pool,
-                        pool.qsa_rope_position_buffer,
+                        *state_pool.qsa_key_state_buffer_pool,
+                        state_pool.qsa_rope_position_buffer,
                     )
                 ]
             elif state_type == StateType.QSA_COMPRESSED:
-                tensors = list(pool.qsa_compressed_k_buffer_pool)
+                tensors = [
+                    t
+                    for state_pool in pools
+                    for t in state_pool.qsa_compressed_k_buffer_pool
+                ]
             else:
                 raise ValueError(f"Unsupported CPU-buffer state type: {state_type}")
             self._cpu_state_views.append(page_views(tensors, pointers, widths))

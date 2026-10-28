@@ -274,6 +274,7 @@ class TestCpuBufferConfiguration(CustomTestCase):
                     for architecture in (
                         "Qwen3_5ForConditionalGeneration",
                         "Qwen3_5MoeForConditionalGeneration",
+                        "Qwen4ExpForConditionalGeneration",
                     ):
                         model.hf_config.architectures = [architecture]
                         handle_pd_disaggregation(ServerArgs(**values))
@@ -922,6 +923,61 @@ class TestCpuBufferQsaState(CustomTestCase):
 
 
 class TestCpuBufferMtp(CustomTestCase):
+    @staticmethod
+    def make_pool(seed):
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
+        pool.qsa_compress_ratio = 2
+        pool.kv_buffer = [torch.full((16, 4), seed, dtype=torch.uint8)]
+        pool.qsa_key_state_buffer_pool = [
+            torch.full((16, 2), seed + 1, dtype=torch.uint8)
+        ]
+        pool.qsa_rope_position_buffer = torch.full((16, 3), seed + 2, dtype=torch.int64)
+        pool.qsa_compressed_k_buffer_pool = [
+            torch.full((8, 4), seed + 3, dtype=torch.uint8)
+        ]
+        return pool
+
+    def test_target_and_draft_match_registered_pointer_order(self):
+        target, draft = self.make_pool(10), self.make_pool(20)
+        mgr = manager()
+        mgr.kv_args.kv_data_ptrs = [
+            t.data_ptr() for p in (target, draft) for t in p.kv_buffer
+        ]
+        mgr.kv_args.kv_item_lens = [4, 4]
+        mgr.kv_args.state_types = [StateType.QSA_PENDING, StateType.QSA_COMPRESSED]
+        pending = [
+            t
+            for p in (target, draft)
+            for t in (*p.qsa_key_state_buffer_pool, p.qsa_rope_position_buffer)
+        ]
+        compressed = [
+            t for p in (target, draft) for t in p.qsa_compressed_k_buffer_pool
+        ]
+        # Descriptors, not tensor discovery order, define the wire layout.
+        mgr.kv_args.state_data_ptrs = [
+            [t.data_ptr() for t in reversed(pending)],
+            [t.data_ptr() for t in compressed],
+        ]
+        mgr.kv_args.state_item_lens = [[48, 4, 48, 4], [4, 4]]
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            mgr.set_cpu_kv_buffers(target)
+        mgr.set_cpu_kv_buffers(target, draft)
+        self.assertEqual(
+            [v.data_ptr() for v in mgr._cpu_views], mgr.kv_args.kv_data_ptrs
+        )
+        for views, pointers in zip(mgr._cpu_state_views, mgr.kv_args.state_data_ptrs):
+            self.assertEqual([v.data_ptr() for v in views], pointers)
+        packed = torch.empty(16, dtype=torch.uint8)
+        pack_pages(mgr._cpu_views, np.array([1, 3]), packed)
+        self.assertEqual(packed.tolist(), [10] * 8 + [20] * 8)
+        for view in mgr._cpu_views:
+            view.zero_()
+        scatter_pages(mgr._cpu_views, np.array([5, 7]), packed)
+        self.assertEqual(mgr._cpu_views[1][5].tolist(), [20] * 4)
+        self.assertEqual(mgr._cpu_views[1][1].count_nonzero(), 0)
+
     def test_cpu_sender_keeps_unpublished_pages_until_transfer_finishes(self):
         from sglang.srt.disaggregation.prefill import (
             SchedulerDisaggregationPrefillMixin,
@@ -1042,6 +1098,38 @@ class TestCpuBufferMtp(CustomTestCase):
         target.mamba_pool.load_cpu_copy.assert_called_once_with("target-state", 17)
         target.cpu_copy_draft_pool = None
         self.assertEqual(len(target.get_cpu_copy([1, 2])), 2)
+
+    def test_retraction_restores_draft_qsa_to_new_slots(self):
+
+        target, draft = self.make_pool(10), self.make_pool(20)
+        target.cpu_copy_draft_pool = draft
+        src, dst = torch.tensor([4, 5, 6, 7]), torch.tensor([8, 9, 10, 11])
+        for pool in (target, draft):
+            pool.full_kv_pool = Mock()
+            pool.full_kv_pool.get_cpu_copy.return_value = "kv"
+            pool.mamba_pool = Mock()
+            pool.mamba_pool.get_cpu_copy.return_value = "mamba"
+            pool._mamba_translate = lambda x: x
+        backup = target.get_cpu_copy(src, mamba_indices=1, req_pool_index=2)
+        for pool in (target, draft):
+            for tensor in (
+                *pool.qsa_key_state_buffer_pool,
+                pool.qsa_rope_position_buffer,
+                *pool.qsa_compressed_k_buffer_pool,
+            ):
+                tensor.zero_()
+        target.load_cpu_copy(backup, dst, mamba_indices=3, req_pool_index=4)
+        for pool in (target, draft):
+            pool.full_kv_pool.load_cpu_copy.assert_called_once()
+            pool.mamba_pool.load_cpu_copy.assert_called_once_with("mamba", 3)
+        self.assertEqual(
+            draft.qsa_key_state_buffer_pool[0][8:10].tolist(), [[21, 21]] * 2
+        )
+        self.assertEqual(draft.qsa_rope_position_buffer[8:10].tolist(), [[22] * 3] * 2)
+        self.assertEqual(
+            draft.qsa_compressed_k_buffer_pool[0][4:6].tolist(), [[23] * 4] * 2
+        )
+        self.assertEqual(draft.qsa_compressed_k_buffer_pool[0][:4].count_nonzero(), 0)
 
 
 if __name__ == "__main__":

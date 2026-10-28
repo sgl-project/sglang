@@ -66,8 +66,11 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             if model.hf_config.architectures not in (
                 ["Qwen3_5ForConditionalGeneration"],
                 ["Qwen3_5MoeForConditionalGeneration"],
+                ["Qwen4ExpForConditionalGeneration"],
             ):
-                raise ValueError("CPU-buffer PD MTP currently supports only Qwen3.5")
+                raise ValueError(
+                    "CPU-buffer PD MTP currently supports only Qwen3.5 and Qwen3.8-Flash-Next"
+                )
             if cfg.enable_multi_layer_eagle:
                 raise ValueError(
                     "CPU-buffer PD MTP currently supports only a single draft layer"

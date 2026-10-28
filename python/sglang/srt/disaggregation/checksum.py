@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MiniMaxSparseKVPool
@@ -49,7 +50,12 @@ def page_indices_for_request(
 
 
 def state_indices_for_request(
-    scheduler, req: Req, seq_len: int, start_idx: int = 0
+    scheduler,
+    req: Req,
+    seq_len: int,
+    start_idx: int = 0,
+    *,
+    kv_args: Optional[KVArgs] = None,
 ) -> Optional[torch.Tensor | list[torch.Tensor]]:
     pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
     router = pool.layer_router
@@ -68,6 +74,19 @@ def state_indices_for_request(
                 [req.kv.req_pool_idx], dtype=torch.int64, device=mamba.device
             )
             compressed = page_indices_for_request(scheduler, req, seq_len, start_idx)
+            if kv_args is not None:
+                indices = {
+                    StateType.MAMBA: mamba,
+                    StateType.QSA_PENDING: pending,
+                    StateType.QSA_COMPRESSED: compressed,
+                }
+                return [
+                    indices[state_type]
+                    for state_type, pointers in zip(
+                        kv_args.state_types, kv_args.state_data_ptrs, strict=True
+                    )
+                    for _ in pointers
+                ]
             # Match the registered MAMBA, QSA_PENDING, QSA_COMPRESSED order.
             # Each component uses a different physical address space.
             return (

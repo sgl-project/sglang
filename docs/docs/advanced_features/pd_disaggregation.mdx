@@ -68,7 +68,7 @@ generation. Both sides must have identical state layouts and attention TP sizes.
 With `--disaggregation-enable-kv-checksum`, verification includes all three state
 components using their respective physical indices.
 
-For Qwen3.5 MTP, enable the built-in draft on **both** workers:
+For Qwen3.5 and Qwen3.8-Flash-Next MTP, enable the built-in draft on **both** workers:
 
 ```bash
 --speculative-algorithm NEXTN \
@@ -80,8 +80,9 @@ For Qwen3.5 MTP, enable the built-in draft on **both** workers:
 `NEXTN` resolves to the EAGLE execution path. Use the same target checkpoint
 and MTP configuration on both roles; decode-only MTP, multi-layer EAGLE, and
 external draft checkpoints are not supported by CPU-buffer transport. Draft KV
-uses the same host transport as target KV. Checksum verification and
-`cpu_tensor` retraction include draft state.
+uses the same host transport as target KV. For Qwen3.8-Flash-Next, this also
+includes draft QSA pending state, RoPE positions, and compressed keys. Checksum
+verification and `cpu_tensor` retraction include draft state.
 On H20, use `--mamba-ssm-dtype float32` with FlashInfer GDN MTP. Keep CUDA graphs
 and overlap scheduling enabled. Allocate CPU pool capacity for both target and
 draft buffers. Prefill publishes newly computed prefixes to the radix cache

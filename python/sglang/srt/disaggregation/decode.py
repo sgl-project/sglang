@@ -3793,6 +3793,7 @@ class SchedulerDisaggregationDecodeMixin:
                 req,
                 seq_len,
                 start_idx=start_idx,
+                kv_args=prealloc_queue.kv_manager.kv_args,
             )
             actual = computer.compute(page_indices_gpu, state_indices)
             if (

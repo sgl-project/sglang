@@ -1624,6 +1624,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req,
                     end_idx,
                     start_idx=start_idx,
+                    kv_args=self.disagg_prefill_bootstrap_queue.kv_manager.kv_args,
                 )
                 digest = computer.compute(page_indices_gpu, state_indices)
                 signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
