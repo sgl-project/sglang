@@ -1403,6 +1403,7 @@ class DeepseekV4AttnBackend(
         # feed only asserts) except in these cases.
         for bad, why in (
             (not self.is_dspark_draft, "not the DSpark draft runner"),
+            (self.needs_cpu_seq_lens, "host sequence lengths"),
             (self.trtllm_attn, "trtllm-gen attention"),
             (self.online_c128_mtp.enabled(), "online c128 MTP"),
             (self.token_to_kv_pool.request_window is not None, "a request window"),
@@ -2677,14 +2678,12 @@ class DeepseekV4AttnBackend(
             else:
                 out_cache_loc = None
             actual_forward_mode = forward_batch.forward_mode
-            seq_lens_sum = int(seq_lens.sum().item())
             seq_lens_cpu = seq_lens.cpu() if self.needs_cpu_seq_lens else None
         else:
             out_cache_loc = forward_batch.out_cache_loc
             actual_forward_mode = getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
             )
-            seq_lens_sum = forward_batch.seq_lens_sum
             seq_lens_cpu = (
                 forward_batch.seq_lens_cpu if self.needs_cpu_seq_lens else None
             )
@@ -2699,7 +2698,6 @@ class DeepseekV4AttnBackend(
             seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
             if self.needs_cpu_seq_lens:
                 seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
-            seq_lens_sum = bs
             req_pool_indices = torch.zeros(
                 bs, dtype=req_pool_indices.dtype, device=device
             )
