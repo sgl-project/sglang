@@ -14,7 +14,7 @@
 """Common utilities."""
 
 import hashlib
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.kernels.ops.kvcache.mla_buffer import (
     get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
@@ -84,22 +84,37 @@ def get_eviction_strategy(
     return factory(**config) if config else factory()
 
 
-def _uses_mori_pd() -> bool:
+_MemPoolResult = Tuple[bool, Optional[Any], Optional[str]]
+
+
+def _mori_custom_mem_pool(device: str) -> _MemPoolResult:
+    from sglang.srt.disaggregation.mori.custom_mem_pool import (
+        init_mori_custom_mem_pool,
+    )
+
+    return init_mori_custom_mem_pool(device)
+
+
+# PD transfer backends that may choose the KV pool allocator themselves. A
+# resolver returning (False, None, None) falls back to the env-driven pool below.
+_PD_BACKEND_MEM_POOLS: Dict[str, Callable[[str], _MemPoolResult]] = {
+    "mori": _mori_custom_mem_pool,
+}
+
+
+def _pd_transfer_backend() -> Optional[str]:
     from sglang.srt.runtime_context import get_disagg
 
     try:
         config = get_disagg()
     except ValueError:
-        return False
-    return (
-        config.disaggregation_mode in ("prefill", "decode")
-        and config.disaggregation_transfer_backend == "mori"
-    )
+        return None
+    if config.disaggregation_mode not in ("prefill", "decode"):
+        return None
+    return config.disaggregation_transfer_backend
 
 
-def maybe_init_custom_mem_pool(
-    device: str,
-) -> Tuple[bool, Optional[Any], Optional[str]]:
+def maybe_init_custom_mem_pool(device: str) -> _MemPoolResult:
     """
     Initialize custom memory pool based on environment variable.
 
@@ -111,12 +126,9 @@ def maybe_init_custom_mem_pool(
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
-    if _uses_mori_pd():
-        from sglang.srt.disaggregation.mori.custom_mem_pool import (
-            init_mori_custom_mem_pool,
-        )
-
-        result = init_mori_custom_mem_pool(device)
+    resolve = _PD_BACKEND_MEM_POOLS.get(_pd_transfer_backend())
+    if resolve is not None:
+        result = resolve(device)
         if result[0]:
             return result
 
