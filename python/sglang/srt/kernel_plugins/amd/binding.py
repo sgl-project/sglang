@@ -346,6 +346,12 @@ def unread_capture_sizes(
     )
 
 
+def gathers_logits(model: torch.nn.Module, key: ShapeKey) -> bool:
+    """Whether the monokernel forward that runs steps of this key returns logits
+    gathered over the TP group, bitwise equal on every rank."""
+    return key in model.__dict__.get("_monokernel_gathered_logits", ())
+
+
 def install_monokernel_forward(
     *,
     model: torch.nn.Module,
@@ -608,6 +614,7 @@ def _install_forward(
     model.forward = forward
     # attention backends ask is_metadata_unread before building per-step metadata
     model._monokernel_unread_metadata = (served, spec.unread_metadata)
+    model._monokernel_gathered_logits = served if spec.gathered_logits else ()
 
 
 def _format_steps(keys: Iterable[ShapeKey]) -> str:

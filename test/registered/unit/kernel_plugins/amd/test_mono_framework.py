@@ -382,6 +382,18 @@ class TestMonokernelFramework(CustomTestCase):
         kept = runner(switched(spec=unread)[0], sizes=frozenset({8}))
         self.assertEqual(kept.attention_variant_sizes, frozenset({8}))
 
+    def test_only_routed_steps_of_a_gathering_spec_gather_their_logits(self):
+        from sglang.kernels.plugin_kernels.amd.spec import ShapeKey
+
+        gathering, _ = switched(spec=replace(SPEC, gathered_logits=True))
+        routed, unrouted = ShapeKey("decode", 2, 1), ShapeKey("decode", 3, 1)
+        self.assertTrue(binding.gathers_logits(gathering, routed))
+        # a width not built runs the standard forward
+        self.assertFalse(binding.gathers_logits(gathering, unrouted))
+        not_declared, _ = switched()
+        for model in (not_declared, Lm()):
+            self.assertFalse(binding.gathers_logits(model, routed))
+
     def test_the_weights_iterator_passes_weights_through_and_keeps_copies(self):
         iterator = binding.monokernel_weights_iterator
         model, other = torch.nn.Module(), torch.nn.Module()

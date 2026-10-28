@@ -2051,6 +2051,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
+    def _logits_rank_identical(self, batch: ScheduleBatch) -> bool:
+        """Whether the verify logits and the draft logits behind its candidates are
+        gathered over the TP group (monokernel forwards that declare it), so every
+        rank's greedy verify reaches the same result on its own. Only HIP broadcasts
+        a greedy verify, so only HIP asks."""
+        from sglang.kernels.plugin_kernels.amd.spec import ShapeKey
+        from sglang.srt.kernel_plugins.amd.binding import gathers_logits
+
+        if not _is_hip or self.topk != 1 or self._draft_worker is None:
+            return False
+        bs = len(batch.seq_lens)
+        n = self.speculative_num_draft_tokens
+        target = self.target_worker.model_runner.model
+        draft = self._draft_worker.draft_runner.model
+        return (
+            gathers_logits(target, ShapeKey("target_verify", bs, n))
+            and gathers_logits(draft, ShapeKey("draft_extend", bs, n))
+            and gathers_logits(draft, ShapeKey("decode", bs, 1))
+        )
+
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
         # SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING: the compact top-k branch, when
         # every request allows it, in the post-verify graphs and the eager verify
@@ -2073,4 +2093,5 @@ class EAGLEWorkerV2(BaseSpecWorker):
             post_verify_graphs=self._post_verify_graphs,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             sparse_bonus_argmax=max_top_k is not None,
+            results_rank_identical=self._logits_rank_identical(batch),
         )

@@ -179,6 +179,9 @@ class MonoSpec(msgspec.Struct, frozen=True):
     # per-step metadata the forward never reads; backends skip it on routed steps,
     # so a served step must run the monokernels whenever it is graph-replayed
     unread_metadata: frozenset[StepMetadata] = frozenset()
+    # the forward's logits are gathered over the TP group (each vocabulary shard
+    # copied from the rank that computed it), so they are bitwise equal on every rank
+    gathered_logits: bool = False
     # (model) -> the (forward_mode, tokens_per_request) steps a draft spec serves in
     # place of the target's verify step, e.g. an EAGLE draft's draft decode
     # ("decode", 1) and draft extend ("draft_extend", N)

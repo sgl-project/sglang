@@ -542,6 +542,7 @@ def eagle_sample(
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
     *,
+    results_rank_identical: bool = False,
     watermark_state: Optional[WatermarkState] = None,
     watermark_full_mask: bool = True,
     simulated_acc_len: Optional[torch.Tensor] = None,
@@ -555,7 +556,8 @@ def eagle_sample(
     graph can replay the injection. simulated_acc_len_rng: the generator to draw
     it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
     injected acceptance's bonus is the target argmax on the compact top-k branch
-    too, as on the dense one.
+    too, as on the dense one. results_rank_identical: the verify and draft logits are
+    bitwise equal on every TP rank, so a greedy verify needs no broadcast to agree.
     """
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
@@ -687,11 +689,12 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
 
-        if _is_hip:
+        if _is_hip and not (results_rank_identical and not use_rejection_sampling):
             # On ROCm, the per-rank draft tokens can differ, so ranks accept a
             # different number of drafts, desynchronize the committed seq_lens, and
             # deadlock the next TP collective. Broadcast from rank 0 to ensure
-            # consistency, the same way the sampling branch below does.
+            # consistency, the same way the sampling branch below does. Logits equal
+            # on every rank with greedy drafts (no rejection sampling) need none.
             tp_group = (
                 get_parallel().attn_tp_group
                 if is_dp_attention_enabled()
