@@ -311,7 +311,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_kv_size = int(
                         self._cell_size * draft_num_layers / int(num_layers)
                     )
-                    self._cell_size += draft_kv_size * draft_loc_space_scale
+                    # A non-DSA draft pool is replicated under DCP: it spans the
+                    # allocator's widened ids (KVCacheConfigurator.loc_space_scale).
+                    self._cell_size += draft_kv_size * draft_loc_space_scale * dcp_size
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
