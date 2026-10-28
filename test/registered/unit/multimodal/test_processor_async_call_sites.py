@@ -108,7 +108,7 @@ def test_sglang_entry_forwards_the_request_to_its_core(media_source):
 
     wrapper = object.__new__(TokenSpaceSGLangProcessor)
     wrapper._core = SimpleNamespace(process=AsyncMock(return_value=object()))
-    wrapper._serving_image_processor_device = lambda: "image device"
+    wrapper._image_device = "image device"
     request_obj = SimpleNamespace(video_data=["request video"], audio_data=["audio"])
     media = (
         {"video_data": ["video"], "audio_data": ["audio"]}
