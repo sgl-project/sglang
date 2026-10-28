@@ -10,6 +10,7 @@ import torch
 
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
+from sglang.kernels.ops.speculative.chain_verify import greedy_chain_verify
 from sglang.kernels.ops.speculative.spec_tree import (
     TreeMaskMode,
     build_tree_kernel_efficient_func,
@@ -687,38 +688,60 @@ def eagle_sample(
             )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    predict_shape = list(next_token_logits.shape)[:-1]
-    predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
-        rows=math.prod(predict_shape),
-        bs=bs,
-        depth=verify_input.max_tree_depth,
-        device=device,
-        packed=_PACKED_VERIFY_BCAST,
-    )
-
-    # Sample tokens
-    target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if _verify_uses_greedy(
+    greedy = _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
-    ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
-        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
-            retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            target_predict=target_predict,
-            topk=verify_input.tree_topk,
+    )
+    # A greedy top-1 chain on GPU f32 logits: argmax and verify in one launch, the
+    # results packed for one broadcast
+    chain = (
+        greedy
+        and verify_input.tree_topk == 1
+        and next_token_logits.is_cuda
+        and next_token_logits.dtype == torch.float32
+        and next_token_logits.stride(-1) == 1
+    )
+    target_predict = None
+    if chain:
+        predict, accept_index, num_correct_drafts, target_predict, verify_out = (
+            greedy_chain_verify(
+                next_token_logits,
+                candidates,
+                verify_input.retrieve_index,
+                verify_input.retrieve_next_token,
+                verify_input.max_tree_depth,
+            )
         )
+    else:
+        predict_shape = list(next_token_logits.shape)[:-1]
+        predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
+            rows=math.prod(predict_shape),
+            bs=bs,
+            depth=verify_input.max_tree_depth,
+            device=device,
+            packed=_PACKED_VERIFY_BCAST,
+        )
+
+    # Sample tokens
+    if greedy:
+        if not chain:
+            target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+                topk=verify_input.tree_topk,
+            )
 
         if _is_hip:
             # On ROCm, the per-rank draft tokens can differ, so ranks accept a
@@ -731,9 +754,12 @@ def eagle_sample(
                 else get_parallel().tp_group
             )
             if tp_group.world_size > 1:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
+                if verify_out is not None:
+                    tp_group.broadcast(verify_out, src=0)
+                else:
+                    tp_group.broadcast(predict, src=0)
+                    tp_group.broadcast(accept_index, src=0)
+                    tp_group.broadcast(num_correct_drafts, src=0)
     elif _can_use_sparse_uno_tree_target_sampling(
         uno_target_max_top_k,
         sampling_info,
