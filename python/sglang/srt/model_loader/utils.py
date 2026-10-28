@@ -279,8 +279,9 @@ def should_deepgemm_weight_requant_ue8m0(
         and weight_block_size is not None
     ):
         return False
-    # SM120 routes dense block-FP8 GEMMs to CUTLASS/Triton (fp32 scales);
-    # only the grouped MoE GEMM consumes DeepGEMM layouts there.
+    # SM120 keeps dense [128, 128] block-FP8 on CUTLASS/Triton with fp32 scales.
+    # DeepGEMM layouts there are consumed by the grouped MoE GEMM and, for
+    # [32, 32] on request, by pack_block32_scale_ue8m0_for_deepgemm.
     if get_device_sm() == 120 and not grouped_moe:
         return False
     if output_dtype is not None and output_dtype != torch.bfloat16:

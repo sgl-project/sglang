@@ -23,6 +23,7 @@ def _sm120_deep_gemm_apis_available() -> bool:
         callable(getattr(deep_gemm, name, None))
         for name in (
             "fp8_einsum",
+            "fp8_fp4_gemm_nt",
             "m_grouped_fp8_fp4_gemm_nt_contiguous",
             "transform_sf_into_required_layout",
         )
@@ -55,6 +56,9 @@ def _compute_enable_deep_gemm():
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and get_platform().is_sm100
+DEEPGEMM_PACKED_BLOCK32 = (
+    ENABLE_JIT_DEEPGEMM and _is_cuda and get_device_sm() in (120, 121)
+)
 DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
     get_platform().is_sm100 or get_device_sm() in (120, 121)
 )

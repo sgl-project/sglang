@@ -1626,11 +1626,14 @@ class ShardedStateLoader(BaseModelLoader):
     ) -> nn.Module:
         from safetensors.torch import safe_open
 
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
         local_model_path = self._prepare_weights(
             model_config.model_path, model_config.revision
         )
 
         quant_config = _get_quantization_config(model_config, self.load_config)
+        deferred_block32_modules = []
 
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
@@ -1638,7 +1641,14 @@ class ShardedStateLoader(BaseModelLoader):
                 for _, module in model.named_modules():
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
-                        quant_method.process_weights_after_loading(module)
+                        if (
+                            isinstance(quant_method, Fp8LinearMethod)
+                            and quant_method.uses_sm120_block32_deepgemm
+                        ):
+                            # Canonical block32 tensors need loaded scales before packing.
+                            deferred_block32_modules.append(module)
+                        else:
+                            quant_method.process_weights_after_loading(module)
             rank = get_parallel().tp_rank
             pattern = os.path.join(
                 local_model_path,
@@ -1677,6 +1687,8 @@ class ShardedStateLoader(BaseModelLoader):
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
+            for module in deferred_block32_modules:
+                module.quant_method.process_weights_after_loading(module)
             post_load_weights(model)
 
         return model.eval()

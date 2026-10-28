@@ -28,7 +28,8 @@ from sglang.test.layer_ut_utils import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=139, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
+# SM120 now runs the block32 DeepGEMM cases here, including their JIT builds.
+register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
 register_cuda_ci(est_time=141, stage="base-b", runner_config="1-gpu-large")
 
 FP8_MAX = 448.0
@@ -64,8 +65,8 @@ def _fp8_block_backends():
     if 100 <= sm < 110:
         return ["triton", "deep_gemm", "flashinfer_trtllm", "flashinfer_cutlass"]
     if sm >= 120:
-        # cutlass is the SM120-only explicit backend; the trtllm / deepgemm
-        # kernels do not support consumer Blackwell.
+        # The generic [128, 128] route uses Triton/CUTLASS on consumer Blackwell;
+        # block32 DeepGEMM has its own explicit-backend coverage below.
         return ["triton", "cutlass"]
     if sm == 90:
         # flashinfer_deepgemm (swapAB) is SM90-only.
@@ -477,6 +478,476 @@ class TestSm90Block32Linear(_LinearBackendCheck):
             plain = layer.quant_method.apply(layer, x, bias)
             quantized = layer.quant_method.apply(layer, (q, scales), bias)
             torch.testing.assert_close(plain, quantized, rtol=0, atol=0)
+
+
+@unittest.skipUnless(
+    get_device_sm() in (120, 121), "Native block32 DeepGEMM requires SM120/SM121"
+)
+class TestSm120Block32Linear(_LinearBackendCheck):
+    """Native DeepGEMM for [32, 32] UE8M0 weights on SM120."""
+
+    _build_layer = staticmethod(_build_block32_layer)
+    _shapes = [(1, 96, 288), (6, 5120, 288), (512, 512, 512)]
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import deep_gemm
+        except (ImportError, OSError, RuntimeError) as exc:
+            raise unittest.SkipTest(f"DeepGEMM is unavailable: {exc}") from exc
+        if not all(
+            callable(getattr(deep_gemm, name, None))
+            for name in (
+                "fp8_einsum",
+                "fp8_fp4_gemm_nt",
+                "m_grouped_fp8_fp4_gemm_nt_contiguous",
+                "transform_sf_into_required_layout",
+            )
+        ):
+            raise unittest.SkipTest("DeepGEMM build lacks the required SM120 APIs")
+        if not (
+            fp8_utils.deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and fp8_utils.deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ):
+            raise AssertionError("SM120 DeepGEMM flags disabled with supported APIs")
+        super().setUpClass()
+
+    def test_deep_gemm_serves_the_blocks(self):
+        with mock.patch.object(
+            fp8_utils,
+            "triton_w8a8_block_fp8_linear",
+            side_effect=AssertionError("block32 unexpectedly fell back to Triton"),
+        ):
+            self._check_backend(
+                "deep_gemm", ["deep_gemm"], self._shapes, self._build_layer
+            )
+
+    def test_checkpoint_without_ue8m0_keeps_triton(self):
+        torch.manual_seed(7)
+        n, k = 96, 288
+        for scale_fmt in (None, "fp32"):
+            with (
+                self.subTest(scale_fmt=scale_fmt),
+                mock.patch.object(
+                    fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+                ),
+            ):
+                layer = _make_linear(
+                    Fp8Config(
+                        is_checkpoint_fp8_serialized=True,
+                        activation_scheme="dynamic",
+                        weight_block_size=[32, 32],
+                        scale_fmt=scale_fmt,
+                    ),
+                    n,
+                    k,
+                )
+                self.assertIs(
+                    getattr(layer.quant_method.w8a8_block_fp8_linear, "func", None),
+                    fp8_utils.triton_w8a8_block_fp8_linear,
+                )
+                weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / 10
+                qweight, scales, reference_weight = _quantize_fp8_blockwise(weight, 32)
+                load_linear_weights(layer, weight=qweight, weight_scale_inv=scales)
+                canonical = layer.weight_scale_inv.detach().clone()
+                scale_ptr = layer.weight_scale_inv.data_ptr()
+                layer.quant_method.process_weights_after_loading(layer)
+                self.assertEqual(layer.weight_scale_inv.data_ptr(), scale_ptr)
+                self.assertEqual(layer.weight_scale_inv.dtype, torch.float32)
+                torch.testing.assert_close(
+                    layer.weight_scale_inv, canonical, rtol=0, atol=0
+                )
+                self.assertIsNone(
+                    getattr(layer, "_deepgemm_block32_weight_scale", None)
+                )
+                x = torch.randn(6, k, device="cuda", dtype=torch.bfloat16) / 10
+                with mock.patch.object(
+                    fp8_utils,
+                    "w8a8_block_fp8_matmul_deepgemm",
+                    side_effect=AssertionError("non-UE8M0 checkpoint reached DeepGEMM"),
+                ):
+                    output = layer.quant_method.apply(layer, x)
+                assert_output_close(
+                    self, output, x.float() @ reference_weight.T, rtol=5e-2, atol=1e-1
+                )
+
+    def test_weight_recipe_layout_is_equivalent(self):
+        from deep_gemm import transform_sf_into_required_layout
+
+        torch.manual_seed(7)
+        for n, k in ((8, 32), (40, 288), (96, 288)):
+            with self.subTest(n=n, k=k):
+                scales = torch.exp2(
+                    torch.randint(
+                        -12, 13, ((n + 31) // 32, k // 32), device="cuda"
+                    ).float()
+                )
+                packed = transform_sf_into_required_layout(
+                    scales, mn=n, k=k, recipe=(1, 32, 32), is_sfa=False
+                )
+                legacy = transform_sf_into_required_layout(
+                    scales, mn=n, k=k, recipe=(32, 32, 32), is_sfa=False
+                )
+                self.assertEqual(tuple(packed.shape), (n, (k + 127) // 128))
+                self.assertEqual(packed.dtype, torch.int32)
+                self.assertEqual(legacy.dtype, packed.dtype)
+                self.assertEqual(legacy.shape, packed.shape)
+                self.assertEqual(legacy.stride(), packed.stride())
+                torch.testing.assert_close(
+                    legacy.contiguous().reshape(-1).view(torch.uint8),
+                    packed.contiguous().reshape(-1).view(torch.uint8),
+                    rtol=0,
+                    atol=0,
+                )
+                unpacked = fp8_utils._unpack_ue8m0_scale_for_triton(
+                    packed, (n, k), [32, 32]
+                )
+                torch.testing.assert_close(unpacked, scales, rtol=0, atol=0)
+
+        with (
+            mock.patch.object(
+                fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+            ),
+            mock.patch.object(
+                fp8_utils,
+                "triton_w8a8_block_fp8_linear",
+                side_effect=AssertionError("recipe comparison fell back to Triton"),
+            ),
+        ):
+            layer, reference_weight = self._build_layer(96, 288)
+            layer.quant_method.process_weights_after_loading(layer)
+            x = torch.randn(6, 288, device="cuda", dtype=torch.bfloat16) / 10
+            output = layer.quant_method.apply(layer, x)
+            legacy = transform_sf_into_required_layout(
+                layer.weight_scale_inv, mn=96, k=288, recipe=(32, 32, 32), is_sfa=False
+            )
+            layer._deepgemm_block32_weight_scale.copy_(legacy)
+            legacy_output = layer.quant_method.apply(layer, x)
+            torch.testing.assert_close(legacy_output, output, rtol=0, atol=0)
+            assert_output_close(
+                self, output, x.float() @ reference_weight.T, rtol=5e-2, atol=1e-1
+            )
+
+    def test_sharded_load_rebuilds_packed_scales_for_native_output(self):
+        import tempfile
+
+        from sglang.srt.model_loader import loader as model_loader
+
+        torch.manual_seed(7)
+        config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[32, 32],
+            scale_fmt="ue8m0",
+        )
+        with (
+            mock.patch.object(
+                fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+            ),
+            mock.patch.object(
+                fp8_utils,
+                "triton_w8a8_block_fp8_linear",
+                side_effect=AssertionError("sharded load fell back to Triton"),
+            ),
+            tempfile.TemporaryDirectory() as directory,
+        ):
+            source, reference_weight = self._build_layer(96, 288)
+            source.quant_method.process_weights_after_loading(source)
+            self.assertNotIn("_deepgemm_block32_weight_scale", source.state_dict())
+            target = _make_linear(config, 96, 288)
+            load_config = SimpleNamespace(model_loader_extra_config=None)
+            with (
+                mock.patch.object(
+                    model_loader, "_get_quantization_config", return_value=config
+                ),
+                mock.patch.object(
+                    model_loader, "_initialize_model", return_value=target
+                ),
+            ):
+                model_loader.ShardedStateLoader.save_model(source, directory)
+                restored = model_loader.ShardedStateLoader(load_config).load_model(
+                    model_config=SimpleNamespace(
+                        model_path=directory, revision=None, dtype=torch.bfloat16
+                    ),
+                    device_config=SimpleNamespace(device="cuda"),
+                )
+            self.assertTrue(restored.weight_scale_inv.power_of_two)
+            self.assertNotIn("_deepgemm_block32_weight_scale", restored.state_dict())
+            torch.testing.assert_close(
+                restored.weight_scale_inv, source.weight_scale_inv, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                restored._deepgemm_block32_weight_scale,
+                source._deepgemm_block32_weight_scale,
+                rtol=0,
+                atol=0,
+            )
+            x = torch.randn(6, 288, device="cuda", dtype=torch.bfloat16) / 10
+            output = restored.quant_method.apply(restored, x)
+            assert_output_close(
+                self, output, x.float() @ reference_weight.T, rtol=5e-2, atol=1e-1
+            )
+
+    def test_cuda_graph_replay_uses_refreshed_packed_scales(self):
+        torch.manual_seed(7)
+        with (
+            mock.patch.object(
+                fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+            ),
+            mock.patch.object(
+                fp8_utils,
+                "triton_w8a8_block_fp8_linear",
+                side_effect=AssertionError(
+                    "CUDA graph unexpectedly fell back to Triton"
+                ),
+            ),
+        ):
+            layer, w_dequant = self._build_layer(96, 288)
+            layer.quant_method.process_weights_after_loading(layer)
+            x = torch.randn((6, 288), device="cuda", dtype=torch.bfloat16) / 10
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    layer.quant_method.apply(layer, x)
+            torch.cuda.current_stream().wait_stream(stream)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = layer.quant_method.apply(layer, x)
+            graph.replay()
+            torch.cuda.synchronize()
+            ref = x.float() @ w_dequant.T
+            assert_output_close(self, out, ref, rtol=5e-2, atol=1e-1)
+            before = out.clone()
+            packed_ptr = layer._deepgemm_block32_weight_scale.data_ptr()
+
+            layer.weight_scale_inv.mul_(2)
+            layer.quant_method.process_weights_after_loading(layer)
+            self.assertEqual(
+                layer._deepgemm_block32_weight_scale.data_ptr(), packed_ptr
+            )
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(out, before * 2, rtol=1e-2, atol=1e-3)
+            assert_output_close(self, out, ref * 2, rtol=5e-2, atol=1e-1)
+
+            x.neg_()
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(out, before * -2, rtol=1e-2, atol=1e-3)
+
+    def test_prepack_preserves_checkpoint_and_refreshes_cache(self):
+        torch.manual_seed(7)
+        n, k = 96, 288
+        with mock.patch.object(
+            fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+        ):
+            layer, _ = self._build_layer(n, k)
+            checkpoint_scale = layer.weight_scale_inv.detach().clone()
+            checkpoint_weight = layer.weight.detach().float().clone()
+            layer.quant_method.process_weights_after_loading(layer)
+
+            self.assertEqual(layer.weight_scale_inv.dtype, torch.float32)
+            self.assertEqual(tuple(layer.weight_scale_inv.shape), (3, 9))
+            torch.testing.assert_close(
+                layer.weight_scale_inv, checkpoint_scale, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                layer.weight.float(), checkpoint_weight, rtol=0, atol=0
+            )
+
+            packed = layer._deepgemm_block32_weight_scale
+            self.assertEqual(packed.dtype, torch.int32)
+            self.assertEqual(tuple(packed.shape), (n, (k // 32 + 3) // 4))
+            self.assertNotIn("_deepgemm_block32_weight_scale", layer.state_dict())
+            unpacked = fp8_utils._unpack_ue8m0_scale_for_triton(
+                packed, (n, k), [32, 32]
+            )
+            torch.testing.assert_close(unpacked, checkpoint_scale, rtol=0, atol=0)
+
+            packed_ptr = packed.data_ptr()
+            packed_before_reload = packed.clone()
+            reloaded_scale = checkpoint_scale * 2
+            layer.weight_scale_inv.copy_(reloaded_scale)
+            layer.quant_method.process_weights_after_loading(layer)
+
+            self.assertEqual(
+                layer._deepgemm_block32_weight_scale.data_ptr(), packed_ptr
+            )
+            self.assertFalse(
+                torch.equal(layer._deepgemm_block32_weight_scale, packed_before_reload)
+            )
+            torch.testing.assert_close(
+                layer.weight_scale_inv, reloaded_scale, rtol=0, atol=0
+            )
+            unpacked = fp8_utils._unpack_ue8m0_scale_for_triton(
+                layer._deepgemm_block32_weight_scale, (n, k), [32, 32]
+            )
+            torch.testing.assert_close(unpacked, reloaded_scale, rtol=0, atol=0)
+
+            packed_before_rejected_reload = packed.clone()
+            layer.weight_scale_inv.copy_(checkpoint_scale * 1.5)
+            with self.assertRaisesRegex(RuntimeError, "eligibility changed"):
+                layer.quant_method.process_weights_after_loading(layer)
+            torch.testing.assert_close(
+                layer._deepgemm_block32_weight_scale,
+                packed_before_rejected_reload,
+                rtol=0,
+                atol=0,
+            )
+
+    def test_online_update_rejects_before_writing_weights(self):
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            WeightUpdater,
+        )
+
+        torch.manual_seed(7)
+        with mock.patch.object(
+            fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+        ):
+            layer, _ = self._build_layer(96, 288)
+            layer.quant_method.process_weights_after_loading(layer)
+        original = layer.weight.detach().float().clone()
+        packed = layer._deepgemm_block32_weight_scale.clone()
+        updater = WeightUpdater(
+            tp_rank=0,
+            device="cuda",
+            gpu_id=0,
+            model_config=None,
+            custom_weight_loaders={},
+            get_model=lambda: layer,
+            update_model_fields=mock.Mock(),
+            recapture_cuda_graph=mock.Mock(),
+            get_model_runner=mock.Mock(),
+        )
+        with mock.patch(
+            "sglang.srt.model_executor.model_runner_components.weight_updater.get_model",
+            return_value=SimpleNamespace(weight_cache_mode="off"),
+        ):
+            success, message = updater.update_weights_from_tensor(
+                [("weight", torch.zeros_like(layer.weight))], load_format="direct"
+            )
+        self.assertFalse(success)
+        self.assertIn("SM120 block32", message)
+        torch.testing.assert_close(layer.weight.float(), original, rtol=0, atol=0)
+        torch.testing.assert_close(
+            layer._deepgemm_block32_weight_scale, packed, rtol=0, atol=0
+        )
+
+    def test_prequantized_input_falls_back_with_packed_weights(self):
+        torch.manual_seed(7)
+        with mock.patch.object(
+            fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+        ):
+            layer, w_dequant = self._build_layer(96, 288)
+            layer.quant_method.process_weights_after_loading(layer)
+        x = torch.randn(5, 288, device="cuda", dtype=torch.bfloat16) / 10
+        q, scales = fp8_utils.sglang_per_token_group_quant_fp8(x, 32, scale_ue8m0=True)
+        bias = torch.randn(96, device="cuda", dtype=torch.bfloat16)
+        triton_linear = fp8_utils.triton_w8a8_block_fp8_linear
+        with (
+            mock.patch.object(
+                fp8_utils,
+                "w8a8_block_fp8_matmul_deepgemm",
+                side_effect=AssertionError("prequantized block32 reached DeepGEMM"),
+            ),
+            mock.patch.object(
+                fp8_utils, "triton_w8a8_block_fp8_linear", wraps=triton_linear
+            ) as triton_matmul,
+        ):
+            out = layer.quant_method.apply(layer, (q, scales), bias)
+        triton_matmul.assert_called_once()
+        ref = fp8_utils.dequant_group_fp8_to_bf16(q, scales).float() @ w_dequant.T
+        assert_output_close(self, out, ref + bias.float(), rtol=5e-2, atol=1e-1)
+
+    def test_non_deepgemm_reader_uses_checkpoint_scale(self):
+        torch.manual_seed(7)
+        with mock.patch.object(
+            fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+        ):
+            layer, _ = self._build_layer(96, 288)
+            layer.quant_method.process_weights_after_loading(layer)
+
+        calls = []
+
+        def linear(**kwargs):
+            calls.append(kwargs)
+            return kwargs["input"].new_empty((kwargs["input"].shape[0], 96))
+
+        layer.quant_method.w8a8_block_fp8_linear = linear
+        layer.quant_method.apply(
+            layer, torch.empty((2, 288), device="cuda", dtype=torch.bfloat16)
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["weight_scale"], layer.weight_scale_inv)
+
+    def test_auto_request_keeps_fp32_scales(self):
+        torch.manual_seed(7)
+        with mock.patch.object(
+            fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.AUTO
+        ):
+            layer, _ = self._build_layer(96, 288)
+            layer.quant_method.process_weights_after_loading(layer)
+            self.assertEqual(layer.weight_scale_inv.dtype, torch.float32)
+            self.assertEqual(tuple(layer.weight_scale_inv.shape), (3, 9))
+            self.assertIsNone(getattr(layer, "_deepgemm_block32_weight_scale", None))
+
+    def test_scales_that_are_not_powers_of_two_fall_back_to_triton(self):
+        torch.manual_seed(7)
+        n, k = 96, 288
+        quant_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[32, 32],
+            scale_fmt="ue8m0",
+        )
+        with mock.patch.object(
+            fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+        ):
+            layer = _make_linear(quant_config, n, k)
+            self.assertIs(
+                getattr(layer.quant_method.w8a8_block_fp8_linear, "func", None),
+                fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback,
+            )
+            w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
+            w_fp8, scale_inv, w_dequant = _quantize_fp8_blockwise(w, block=32)
+            load_linear_weights(layer, weight=w_fp8, weight_scale_inv=scale_inv)
+            layer.quant_method.process_weights_after_loading(layer)
+
+            self.assertFalse(getattr(layer.weight_scale_inv, "power_of_two", False))
+            self.assertEqual(layer.weight_scale_inv.dtype, torch.float32)
+            self.assertIsNone(getattr(layer, "_deepgemm_block32_weight_scale", None))
+            self.assertIn("SM120 block32", layer._derived_weight_cache_error)
+
+            triton_linear = fp8_utils.triton_w8a8_block_fp8_linear
+            with (
+                mock.patch.object(
+                    fp8_utils,
+                    "w8a8_block_fp8_matmul_deepgemm",
+                    side_effect=AssertionError(
+                        "non-power-of-two scales reached DeepGEMM"
+                    ),
+                ) as deepgemm_matmul,
+                mock.patch.object(
+                    fp8_utils,
+                    "triton_w8a8_block_fp8_linear",
+                    wraps=triton_linear,
+                ) as triton_matmul,
+            ):
+                x = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) / 10
+                out, _ = layer(x)
+
+            deepgemm_matmul.assert_not_called()
+            triton_matmul.assert_called_once()
+            assert_output_close(
+                self, out, x.float() @ w_dequant.T, rtol=5e-2, atol=1e-1
+            )
+
+            layer.weight_scale_inv.copy_(torch.full_like(layer.weight_scale_inv, 0.25))
+            with self.assertRaisesRegex(RuntimeError, "eligibility changed"):
+                layer.quant_method.process_weights_after_loading(layer)
 
 
 @unittest.skipUnless(
