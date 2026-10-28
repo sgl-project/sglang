@@ -46,7 +46,11 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVCacheScheme):
         if offset.modelslim_loaded and torch.count_nonzero(offset):
             raise ValueError(f"{self.prefix}.fa_k.offset must be zero for FP8")
 
+        # Checkpoint fa_k.scale: dequantize as C_fp8 * k_scale.
+        # Used by cache dequantization, FIA v2, and BF16 q_pe rescaling.
         self.k_scale = scale.detach()
+        # Reciprocal scale: quantize as FP8(C * k_inv_scale).
+        # Used by pool writes, npu_kv_rmsnorm_rope_cache, and MLAProlog.
         self.k_inv_scale = self.k_scale.reciprocal()
 
     def get_cache_layout(self, *, use_mla_backend):
