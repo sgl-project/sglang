@@ -34,23 +34,23 @@ class _NpuAccumulatorMixin:
         return get_eplb_device_group()
 
 
-class _NpuStatAccumulator(_NpuAccumulatorMixin, distribution._StatAccumulator):
-    pass
-
-
 class _NpuDetailAccumulator(_NpuAccumulatorMixin, distribution._DetailAccumulator):
     pass
 
 
-class NpuExpertDistributionAccumulator(_NpuStatAccumulator):
+class NpuExpertDistributionAccumulator(
+    _NpuAccumulatorMixin, distribution._StatAccumulator
+):
     """Reduce window totals for EPLB policies that only consume summed loads."""
 
     def _get_physical_count_for_dump(self, output_mode):
         counts = super()._get_physical_count_for_dump(output_mode)
-        if output_mode == "object" and distribution.get_exec().moe.eplb_algorithm in (
-            "auto",
-            "deepseek",
-            "deepseek_hierarchical",
+        moe = distribution.get_exec().moe
+        if (
+            moe.enable_eplb
+            and not moe.elastic_ep_backend
+            and output_mode == "object"
+            and moe.eplb_algorithm in ("auto", "deepseek", "deepseek_hierarchical")
         ):
             # These policies sum the time dimension before planning. Aggregate
             # before mapping/all_reduce; keep int64 to avoid window-sum overflow.
@@ -65,14 +65,12 @@ class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal
     def _create_accumulator(self, expert_location_metadata, rank):
         moe = distribution.get_exec().moe
         accumulator_class = {
-            distribution._StatAccumulator: _NpuStatAccumulator,
+            distribution._StatAccumulator: NpuExpertDistributionAccumulator,
             distribution._DetailAccumulator: _NpuDetailAccumulator,
         }[distribution._Accumulator.get_class()]
         if moe.enable_eplb and not moe.elastic_ep_backend:
             # Join/scale paths need their own collective initialization order.
             warmup_eplb_communication()
-            if accumulator_class is _NpuStatAccumulator:
-                accumulator_class = NpuExpertDistributionAccumulator
         return accumulator_class(expert_location_metadata, rank)
 
     def _create_gatherer(self, expert_location_metadata, rank):
@@ -81,10 +79,7 @@ class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal
         if (
             moe.moe_a2a_backend == "deepep"
             and moe.expert_distribution_recorder_mode
-            not in (
-                "per_token",
-                "stat_approx",
-            )
+            not in ("per_token", "stat_approx")
         ):
             # Ascend receiver counts include graph padding; count valid routes.
             return distribution._SelectExpertsSinglePassGatherer(

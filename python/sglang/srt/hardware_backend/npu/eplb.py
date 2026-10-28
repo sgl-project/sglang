@@ -44,10 +44,10 @@ def get_eplb_device_group() -> dist.ProcessGroup:
         import torch_npu
 
         options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-        # Keep migration off the forward communicator with a small HOST buffer.
+        # Bound EPLB buffers without changing inference communicators.
         options.hccl_config = {
             "hccl_buffer_size": 64,
-            "hccl_op_expansion_mode": 1,
+            "hccl_op_expansion_mode": 1,  # HOST expansion
         }
         _device_group = dist.new_group(backend="hccl", pg_options=options)
         _group_world = world
@@ -94,7 +94,7 @@ def prepare_expert_weight_update(
     layer_ids: list[int],
     old_map: torch.Tensor,
     new_map: torch.Tensor,
-) -> tuple[list[int], list[torch.Tensor] | None, Callable[..., object] | None]:
+) -> tuple[list[int], list[torch.Tensor] | None, Callable[..., None] | None]:
     """Return selected layers, receive buffers, and a single-layer update callable.
 
     Validate the entire chunk before allocating workspaces or moving weights.
@@ -120,13 +120,13 @@ def prepare_expert_weight_update(
         return layer_ids, None, None
 
     rank = dist.get_rank()
-    _validate_migration_weights(weights_by_layer, layer_ids, rank)
+    needs_staging = _validate_migration_weights(weights_by_layer, layer_ids, rank)
     sample = weights_by_layer[layer_ids[0]]
-    staging = ExpertWeightStaging(sample)
+    staging = ExpertWeightStaging(needs_staging)
     temp_buffers = staging.create_temp_buffers(sample)
     group = get_eplb_device_group()
 
-    def update_layer(*, routed_experts_weights: list[torch.Tensor], **kwargs) -> object:
+    def update_layer(*, routed_experts_weights: list[torch.Tensor], **kwargs) -> None:
         start = kwargs["rank"] * kwargs["num_local_physical_experts"]
         end = start + kwargs["num_local_physical_experts"]
         old_placement = kwargs["old_physical_to_logical_map"]
@@ -142,7 +142,7 @@ def prepare_expert_weight_update(
             ):
                 return
         migration_weights = staging.load(routed_experts_weights)
-        result = update_expert_weights_single_layer(
+        update_expert_weights_single_layer(
             routed_experts_weights=migration_weights,
             group=group,
             **kwargs,
@@ -150,17 +150,25 @@ def prepare_expert_weight_update(
         # Unchanged local slots may still send; only their writeback is redundant.
         if local_changed:
             staging.store(routed_experts_weights, migration_weights)
-        return result
 
     return layer_ids, temp_buffers, update_layer
 
 
 def _validate_migration_weights(
     weights_by_layer: dict[int, list[torch.Tensor]], layer_ids: list[int], rank: int
-) -> None:
+) -> list[bool]:
+    """Validate chunk compatibility and return its ND staging requirements."""
+    import torch_npu
+
     def specification(weights):
         return [
-            (tuple(t.shape), t.dtype, t.device, needs_nd_staging(t)) for t in weights
+            (
+                tuple(t.shape),
+                t.dtype,
+                t.device,
+                torch_npu.get_npu_format(t) not in (0, 2),
+            )
+            for t in weights
         ]
 
     sample_layer = layer_ids[0]
@@ -176,15 +184,7 @@ def _validate_migration_weights(
                 f"layer {sample_layer} in tensor count, shape, dtype, device, "
                 "and ND staging requirements"
             )
-
-
-def needs_nd_staging(tensor: torch.Tensor) -> bool:
-    """Internal NPU formats need ordinary buffers for expert-slot copies."""
-    if tensor.device.type != "npu":
-        return False
-    import torch_npu
-
-    return torch_npu.get_npu_format(tensor) not in (0, 2)
+    return [needs_staging for _, _, _, needs_staging in expected]
 
 
 class ExpertWeightStaging:
@@ -194,9 +194,9 @@ class ExpertWeightStaging:
     result into model storage without changing addresses held by captured graphs.
     """
 
-    def __init__(self, sample_tensors: list[torch.Tensor]):
-        # Per-expert NZ conversion can copy the whole backing tensor.
-        self._needs_staging = [needs_nd_staging(tensor) for tensor in sample_tensors]
+    def __init__(self, needs_staging: list[bool]):
+        # Convert whole weights once per layer, then migrate expert slices in ND.
+        self._needs_staging = needs_staging
 
     def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         return [
