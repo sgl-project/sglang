@@ -683,10 +683,13 @@ class TestTritonAttention(CustomTestCase):
             self.assertTrue(torch.allclose(o[start:end], o_torch, atol=1e-2))
 
     def test_extend_attention_int32_kv_indices_above_2g(self):
-        # int32 kv_indices (aiter CUDA-graph buffer, spec-decode kv_indices)
-        # with slot * stride >= 2**31. Slots sit just below 2**32 / stride so
-        # an int32 offset wraps onto the zero rows in front of the buffer and
-        # shows up as a mismatch instead of a memory fault. Needs ~8.6 GB.
+        """Regression for int32 KV offset overflow in the extend kernels.
+
+        With int32 kv_indices, slot * stride wraps once slot >= 2**31 / stride.
+        Slots sit just below 2**32 / stride so a wrapped offset lands on the
+        zero rows in front of the buffer and shows up as a mismatch, not a
+        fault. Needs ~8.6 GB.
+        """
         device = get_device()
         dtype = torch.bfloat16
         B, P, E, H_Q, D = 2, 64, 16, 8, 128
