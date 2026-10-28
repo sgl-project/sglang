@@ -780,14 +780,24 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
                     self.assertEqual(result, 4096)
                     budget.assert_called_once_with(device_index=0, allow_sync=True)
 
-    def _build(self, *, num_rows: int, budget, use_topk_v2: bool, mx: bool = False):
+    def _build(
+        self,
+        *,
+        num_rows: int,
+        budget,
+        use_topk_v2: bool,
+        mx: bool = False,
+        first_len: int = 1,
+    ):
         deep_gemm = SimpleNamespace(
             get_num_sms=MagicMock(return_value=1),
             get_paged_mqa_logits_metadata=MagicMock(
-                side_effect=lambda c4, *_: torch.zeros((2, 2), dtype=torch.int32)
+                side_effect=lambda c4, *_: torch.tensor(
+                    [[int(c4.sum()), c4.shape[0]]] * 2, dtype=torch.int32
+                )
             ),
         )
-        c4_seq_lens = torch.arange(1, num_rows + 1, dtype=torch.int32)
+        c4_seq_lens = torch.arange(first_len, first_len + num_rows, dtype=torch.int32)
         page_table = torch.zeros(
             (num_rows, _ISSUE_ALIGNED_COLS // 64), dtype=torch.int32
         )
@@ -804,8 +814,8 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
             ),
             patch(
                 "sglang.kernels.ops.attention.dsv4.plan_topk_v2",
-                side_effect=lambda seq_lens: seq_lens.new_zeros(
-                    (seq_lens.shape[0] + 1, 2)
+                side_effect=lambda seq_lens: seq_lens.new_full(
+                    (seq_lens.shape[0] + 1, 2), int(seq_lens.sum())
                 ),
             ) as plan_topk_v2,
         ):
@@ -884,6 +894,29 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
             for call in deep_gemm.get_paged_mqa_logits_metadata.call_args_list
         ]
         self.assertEqual(schedule_rows, [_SM100_INDEXER_M_CHUNK, 1])
+
+    def test_graph_replay_copies_chunk_plans_in_place(self):
+        num_rows = _SM100_INDEXER_M_CHUNK + 1
+        captured, _, _ = self._build(
+            num_rows=num_rows, budget=None, use_topk_v2=True, mx=True
+        )
+        replay, _, _ = self._build(
+            num_rows=num_rows, budget=None, use_topk_v2=True, mx=True, first_len=7
+        )
+        schedules = list(captured.deep_gemm_metadata)
+        topk_plans = list(captured.topk_metadata_chunks)
+        with patch(f"{_METADATA}.is_hip", return_value=False):
+            captured.copy_(replay)
+        for kept, fresh, now in zip(
+            schedules, replay.deep_gemm_metadata, captured.deep_gemm_metadata
+        ):
+            self.assertIs(now, kept)
+            torch.testing.assert_close(kept, fresh)
+        for kept, fresh, now in zip(
+            topk_plans, replay.topk_metadata_chunks, captured.topk_metadata_chunks
+        ):
+            self.assertIs(now, kept)
+            torch.testing.assert_close(kept, fresh)
 
 
 class TestChunkedTopKMatchesUnchunked(CustomTestCase):

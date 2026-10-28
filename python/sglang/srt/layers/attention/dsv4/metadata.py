@@ -143,7 +143,11 @@ def copy_metadata(
         if src_val is None and dst_val is None:
             continue
         assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
-        if hasattr(dst_val, "copy_"):
+        if isinstance(dst_val, list):
+            assert len(dst_val) == len(src_val), f"{field_name=} chunk count differs"
+            for dst_item, src_item in zip(dst_val, src_val):
+                dst_item.copy_(src_item)
+        elif hasattr(dst_val, "copy_"):
             dst_val.copy_(src_val)
         else:
             warnings.warn(
@@ -365,22 +369,29 @@ class PagedIndexerMetadata:
         return chunks
 
     def copy_(self, other: PagedIndexerMetadata):
-        # A chunked schedule list has no in-place copy; rebind it instead.
+        # Captured graphs read each chunk's schedule and top-k plan by address, so
+        # equally chunked metadata copies them in place; differently chunked rebinds.
         chunked = isinstance(self.deep_gemm_metadata, list) or isinstance(
             other.deep_gemm_metadata, list
         )
-        if is_hip() or chunked:
+        same_chunks = chunked and self.rows_per_chunk == other.rows_per_chunk
+        if is_hip() or (chunked and not same_chunks):
             copy_fields = ["page_table", "compressed_seq_lens"]
-            assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
+            assign_fields = [
+                "deep_gemm_metadata",
+                "nonpaged_plan",
+                "topk_metadata_chunks",
+            ]
         else:
-            copy_fields = ["page_table", "compressed_seq_lens", "deep_gemm_metadata"]
+            copy_fields = [
+                "page_table",
+                "compressed_seq_lens",
+                "deep_gemm_metadata",
+                "topk_metadata_chunks",
+            ]
             assign_fields = ["nonpaged_plan"]
         copy_fields += ["topk_metadata"]
-        assign_fields += [
-            "rows_per_chunk",
-            "mqa_logits_budget_bytes",
-            "topk_metadata_chunks",
-        ]
+        assign_fields += ["rows_per_chunk", "mqa_logits_budget_bytes"]
         copy_metadata(
             src=other,
             dst=self,
