@@ -8,7 +8,10 @@ import logging
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
-from sglang.srt.mem_cache.unified_cache.linker_config import UnifiedCacheLinkerConfig
+from sglang.srt.mem_cache.unified_cache.linker_config import (
+    UnifiedCacheLinkerConfig,
+    parse_linker_load_options,
+)
 from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
@@ -65,12 +68,12 @@ def create_unified_cache_linker(
     components: set[ComponentType],
     forward_stream: torch.cuda.Stream | None = None,
 ) -> UnifiedCacheLinker:
-    if config is not None and not isinstance(config, dict):
-        raise ValueError(
-            "--unified-cache-external-linker-config must be a JSON object."
-        )
+    load_mode, prefetch_policy, backend_config = parse_linker_load_options(config)
+    extra_config = backend_config
     if backend == "dynamic":
-        config = UnifiedCacheLinkerConfig.from_dict(config)
+        config = UnifiedCacheLinkerConfig.from_dict(
+            backend_config if config is not None else None
+        )
         # Do not mask ImportError from the plugin's own dependencies.
         module = importlib.import_module(config.linker_module_path)
         linker_cls = getattr(module, config.linker, None)
@@ -90,15 +93,8 @@ def create_unified_cache_linker(
                 f"{config.linker_module_path}.{config.linker} must implement "
                 f"all UnifiedCacheLinker methods: {sorted(linker_cls.__abstractmethods__)}"
             )
-        return linker_cls(
-            server_args,
-            params,
-            components=components,
-            extra_config=deepcopy(config.linker_extra_config),
-            forward_stream=forward_stream,
-        )
-
-    if backend == "mooncake":
+        extra_config = config.linker_extra_config
+    elif backend == "mooncake":
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
             MooncakeDirectLinker,
         )
@@ -112,10 +108,16 @@ def create_unified_cache_linker(
         linker_cls = UMBPDirectLinker
     else:
         raise ValueError(f"Unknown unified cache external linker backend: {backend!r}")
-    return linker_cls(
+    if backend != "dynamic" and load_mode == "prefetch":
+        # Built-ins may need the mode while constructing their load workers.
+        extra_config["load_mode"] = load_mode
+    linker = linker_cls(
         server_args,
         params,
         components=components,
-        extra_config=deepcopy(config or {}),
+        extra_config=deepcopy(extra_config),
         forward_stream=forward_stream,
     )
+    linker.load_mode = load_mode
+    linker.prefetch_policy = prefetch_policy
+    return linker

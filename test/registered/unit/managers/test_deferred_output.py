@@ -208,6 +208,7 @@ def test_held_responses_do_not_change_idle_state():
     scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
     scheduler.enable_hierarchical_cache = False
     scheduler.enable_lmcache = False
+    scheduler.enable_unified_cache_external_linker = False
     scheduler.enable_hisparse = False
     scheduler.defer_response(_req("held"), Future())
 
