@@ -1144,10 +1144,6 @@ The panel keeps its c16 / c48 / c256 strategy presets. Apply the following overr
 
 For c1, use `lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261028` for the serving roles and add `--enable-amd-monokernel` to the **decode** command.
 
-<Warning>
-The 1028 nightly tag is provisional: the early build does not contain the `sgl-amd-mono` upgrade in [SGLang #46951](https://github.com/sgl-project/sglang/pull/46951), which adds MoRI PD decode support. Use a rebuilt image containing that upgrade before enabling the mono kernel, and rerun performance and accuracy validation for this TP4 → TP8 c1 recipe.
-</Warning>
-
 **c32:** start from Low-Latency, keep TP4 → TP8 and block size 6, set both admission limits to 64, and capture decode graph sizes 1–64. Both roles use FP8 KV and mxscale, as at c16 and c48.
 
 **c192 / c384 / c512:** start from High-Throughput. Keep TP8+DP8+EP8 prefill → TP8+DP8 decode, DSpark block size 3 (4 draft tokens), and decode dispatch budget 256. Set both admission limits to 384 / 768 / 1024 and capture decode graph sizes 1–48 / 1–96 / 1–128, respectively. Keep FP8 KV on both roles, mxscale on decode only, and the power-of-two router settings above. At c384 and c512, add `--request-timeout-secs 14400` to the router.
