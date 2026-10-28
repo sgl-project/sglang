@@ -1446,6 +1446,7 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_S: tl.constexpr,
     HAS_PADDING: tl.constexpr,
+    ZERO_PAD_WEIGHTS: tl.constexpr,
 ):
     """Append shared experts AND apply the DeepEP interleaved remap in one pass.
 
@@ -1458,6 +1459,16 @@ def _fused_append_remap_shared_experts_deepep_kernel(
                   the shared slots that precede this id's rank)
     Shared IDs:   shared_id_base + arange(S)        (one id per shared slot)
     Shared wgt:   scale_factor                     (1.0 on aiter; 1/rsf otherwise)
+
+    Padding (HAS_PADDING): rows >= num_token_non_padded get pad_fill_id in every
+    routed id slot so aiter never sees an out-of-range id. Such a row still
+    carries live routed and shared ids; it is routed nowhere only once its
+    weights are zeroed. ZERO_PAD_WEIGHTS gates that weight zeroing -- when set it
+    zeroes both the routed and the shared weights on padded rows, folding the
+    caller's separate _zero_topk_weights_padded_region pass. It is kept separate
+    from the id fill because SGLANG_MORI_NO_PAD_MASK keeps the fill (aiter needs
+    in-range ids) but deliberately leaves the padded weights live, so that path
+    passes HAS_PADDING with ZERO_PAD_WEIGHTS off.
     """
     pid = tl.program_id(0)
 
@@ -1486,17 +1497,18 @@ def _fused_append_remap_shared_experts_deepep_kernel(
         # launch): rows >= num_token_non_padded get pad_fill_id in every routed
         # slot. Matches the old fill(topk_ids=0) -> remap(0)=0 when pad_fill_id==0.
         # ids is a BLOCK_K-wide register tile (K need not be pow2), so fill the
-        # whole tile and let the masked store below drop the tail.
-        #
-        # The weights are zeroed here too, on both the routed and the shared
-        # slots, so a padded row leaves this kernel fully inert. The caller
-        # otherwise has to follow up with a separate pass to zero them, because
-        # the gate's routed weights survive the id fill and the shared slots are
-        # written unconditionally at scale_factor.
+        # whole tile and let the masked store below drop the tail. A padded row
+        # still carries live routed/shared ids after this; it is routed nowhere
+        # only once ZERO_PAD_WEIGHTS zeroes its weights.
         n_valid = tl.load(num_token_non_padded_ptr)
         keep = pid < n_valid
         ids = tl.where(keep, ids, tl.full((BLOCK_K,), pad_fill_id, dtype=ids.dtype))
-        ws = tl.where(keep, ws, tl.zeros((BLOCK_K,), dtype=ws.dtype))
+        if ZERO_PAD_WEIGHTS:
+            # Fold the trailing _zero_topk_weights_padded_region pass: zero the
+            # routed weights here and the shared weights below so the caller can
+            # drop that separate per-layer launch. Gated off (while the id fill
+            # stays on) for SGLANG_MORI_NO_PAD_MASK, which keeps weights live.
+            ws = tl.where(keep, ws, tl.zeros((BLOCK_K,), dtype=ws.dtype))
 
     tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
     tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws, mask=mask_k)
@@ -1505,7 +1517,9 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     mask_s = offs_s < S
     shared_ids = tl.cast(shared_id_base + offs_s, ids.dtype)
     shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
-    if HAS_PADDING:
+    if ZERO_PAD_WEIGHTS:
+        # keep is defined whenever ZERO_PAD_WEIGHTS is set: the wrapper only
+        # enables it alongside HAS_PADDING (num_token_non_padded is not None).
         shared_ws = tl.where(keep, shared_ws, tl.zeros([BLOCK_S], dtype=ws.dtype))
 
     tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
@@ -1521,12 +1535,20 @@ def fused_append_remap_shared_experts_deepep(
     num_local_routed,
     num_token_non_padded=None,
     pad_fill_id=0,
+    zero_pad_weights=True,
 ):
     """Fused append + DeepEP remap (see kernel docstring).
 
     Fused form of topk.remap_topk_for_per_rank_shared_slots() for
     the aiter/DeepEP-class path. Host computes the scalar remap params so the
     kernel stays branch-free.
+
+    When ``num_token_non_padded`` is given the kernel fills padded rows'
+    routed ids with ``pad_fill_id`` (aiter rejects out-of-range ids). It also
+    zeroes those rows' routed and shared weights when ``zero_pad_weights`` is
+    True, folding the caller's separate _zero_topk_weights_padded_region pass;
+    pass ``zero_pad_weights=False`` (e.g. SGLANG_MORI_NO_PAD_MASK) to keep the
+    id fill but leave the padded weights live.
     """
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
@@ -1539,6 +1561,8 @@ def fused_append_remap_shared_experts_deepep(
     )
 
     has_padding = num_token_non_padded is not None
+    # Weight zeroing rides on the id fill, so it is only meaningful with padding.
+    zero_pad_weights = has_padding and zero_pad_weights
     # Placeholder pointer when no padding (never dereferenced: HAS_PADDING False).
     ntnp_ptr = num_token_non_padded if has_padding else topk_ids
     _fused_append_remap_shared_experts_deepep_kernel[(m,)](
@@ -1556,6 +1580,7 @@ def fused_append_remap_shared_experts_deepep(
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_S=triton.next_power_of_2(s),
         HAS_PADDING=has_padding,
+        ZERO_PAD_WEIGHTS=zero_pad_weights,
         num_warps=1,
     )
     return out_ids, out_weights
