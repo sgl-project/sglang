@@ -10,6 +10,7 @@ from sglang.kernels.ops.attention.npu_lim import (
     fused_lightning_indexer_manage,
     load_fused_lim_operator,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
     prepare_prefill_gather_rows,
 )
@@ -27,6 +28,8 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     mtp_topk_mask,
     mtp_topk_rows,
     prepare_mtp_rows,
+    use_native_mtp_verify,
+    validate_mtp_chain,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -36,6 +39,58 @@ register_cpu_ci(est_time=3, stage="base-a")
 
 
 class TestLIMState(CustomTestCase):
+    def test_native_mtp_verify_dispatch_only_for_long_q4_chain(self):
+        backend = SimpleNamespace(graph_mode=False)
+        manager = SimpleNamespace(
+            lim_adapter=SimpleNamespace(mtp_full_visible=True), cache_capacity=12288
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=SimpleNamespace(num_tokens_per_req=4),
+            seq_lens_cpu=torch.tensor([12288, 0]),
+        )
+        self.assertTrue(use_native_mtp_verify(backend, batch, manager))
+        batch.seq_lens_cpu = torch.tensor([12287, 12288])
+        self.assertFalse(use_native_mtp_verify(backend, batch, manager))
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        backend.graph_mode = True
+        self.assertFalse(use_native_mtp_verify(backend, batch, manager))
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        self.assertTrue(use_native_mtp_verify(backend, batch, manager))
+        batch.spec_info.num_tokens_per_req = 3
+        self.assertFalse(use_native_mtp_verify(backend, batch, manager))
+
+    def test_mtp_chain_validation_rejects_partial_and_out_of_bounds_rows(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            req_pool_indices=torch.tensor([1, 0]),
+            seq_lens=torch.tensor([20, 0]),
+            positions=torch.tensor([20, 21, 22, 23, 0, 0, 0, 0]),
+            out_cache_loc=torch.tensor([1, 2, 3, 4, -1, -1, -1, -1]),
+            spec_info=SimpleNamespace(num_tokens_per_req=4),
+        )
+        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
+            _, positions, live = prepare_mtp_rows(batch, 8, 3, 24)
+            validate_mtp_chain(batch, positions, live, 3)
+            batch.out_cache_loc[2] = -1
+            _, positions, live = prepare_mtp_rows(batch, 8, 3, 24)
+            with self.assertRaisesRegex(RuntimeError, "complete contiguous"):
+                validate_mtp_chain(batch, positions, live, 3)
+            batch.out_cache_loc[2] = 3
+            batch.positions[3] = 24  # context bound
+            _, positions, live = prepare_mtp_rows(batch, 8, 3, 24)
+            with self.assertRaisesRegex(RuntimeError, "complete contiguous"):
+                validate_mtp_chain(batch, positions, live, 3)
+            batch.positions[3] = 22  # in range but non-contiguous
+            _, positions, live = prepare_mtp_rows(batch, 8, 3, 24)
+            with self.assertRaisesRegex(RuntimeError, "complete contiguous"):
+                validate_mtp_chain(batch, positions, live, 3)
+            batch.positions[3] = 23
+            batch.req_pool_indices[0] = 0  # active row cannot use padding slot
+            _, positions, live = prepare_mtp_rows(batch, 8, 3, 24)
+            with self.assertRaisesRegex(RuntimeError, "complete contiguous"):
+                validate_mtp_chain(batch, positions, live, 3)
+
     def test_mtp_tp_padding_does_not_extend_request_windows_or_shrink_k(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -169,6 +224,7 @@ class TestLIMState(CustomTestCase):
         )
         adapter = LIMDecodeAdapter.__new__(LIMDecodeAdapter)
         adapter.top_k, adapter.capacity = top_k, capacity
+        adapter.fused_copy_metadata = False
         sources = torch.arange(batch * 32768, dtype=torch.int32).view(batch, 32768)
         plan = SimpleNamespace(
             source_ids=torch.arange(top_k, dtype=torch.int32).expand(batch, -1).clone(),
@@ -327,6 +383,41 @@ class TestLIMState(CustomTestCase):
                 hbm_budget_bytes=small.managed_hbm_bytes,
             )
 
+    def test_mtp_full_visible_budget_reserves_q4_workspace(self):
+        options = dict(
+            request_rows=4,
+            graph_batch_capacity=8,
+            context_len=32768,
+            cache_tokens=12288,
+            num_layers=2,
+            top_k=2048,
+            kv_bytes_per_token=1152,
+            indexer_impl="lim",
+            copy_sfa=True,
+            copy_sfa_query_heads=32,
+        )
+        baseline = resolve_sparse_kv_budget(**options)
+        mtp = resolve_sparse_kv_budget(**options, mtp_full_visible=True)
+        self.assertEqual(
+            mtp.adapter_bytes - baseline.adapter_bytes,
+            8 * 4 * (2 * 2048 * 4 + 4 + 64 * 4) + 8 * 4,
+        )
+        self.assertEqual(
+            mtp.copy_sfa_bytes - baseline.copy_sfa_bytes, 8 * 4 * 32 * 512 * 2
+        )
+        fused = resolve_sparse_kv_budget(
+            **options, mtp_full_visible=True, fused_copy_sfa_metadata=True
+        )
+        self.assertEqual(fused.adapter_bytes - mtp.adapter_bytes, (4 + 1 + 8) * 4)
+        with self.assertRaisesRegex(ValueError, "capacity"):
+            resolve_sparse_kv_budget(
+                **{**options, "cache_tokens": 4096}, mtp_full_visible=True
+            )
+        with self.assertRaisesRegex(ValueError, "native LIM"):
+            resolve_sparse_kv_budget(
+                **{**options, "copy_sfa": False}, mtp_full_visible=True
+            )
+
     def test_full_visible_q1_transition_padding_and_reuse(self):
         previous = torch.tensor([-1, -1, 2048, 3000, -1], dtype=torch.int32)
         result = prepare_lim_rows(
@@ -382,7 +473,7 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(budget.cache_tokens, 2048)
         self.assertEqual(budget.host_kv_bytes, 3 * 4 * 4224 * 1152)
         self.assertGreater(budget.copy_sfa_bytes, 4 * 4 * 2048 * 4)
-        with self.assertRaisesRegex(ValueError, "K=2048 and C"):
+        with self.assertRaisesRegex(ValueError, "requires the native LIM indexer"):
             resolve_sparse_kv_budget(
                 request_rows=3,
                 context_len=4097,

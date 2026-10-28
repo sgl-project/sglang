@@ -1065,6 +1065,8 @@ class Envs:
     SGLANG_NPU_SPARSE_KV_INDEXER = EnvStr("legacy")
     SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA = EnvBool(False)
     SGLANG_NPU_FUSED_LIM_PRE_METADATA = EnvBool(False)
+    # Experimental MTP path; requires a matching full-visible LIM kernel.
+    SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE = EnvBool(False)
     # Optional operator-enabled library; loaded once before graph capture.
     SGLANG_NPU_ENABLE_COPY_SFA = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph

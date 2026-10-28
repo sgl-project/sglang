@@ -45,6 +45,9 @@ def resolve_sparse_kv_budget(
     indexer_impl: str = "legacy",
     copy_sfa: bool = False,
     copy_sfa_query_heads: int = 128,
+    mtp_full_visible: bool = False,
+    fused_copy_sfa_metadata: bool = False,
+    fused_pre_metadata: bool = False,
     graph_batch_capacity: int = 0,
 ) -> SparseKVBudget:
     """Size persistent manager allocations, including padding and one workspace.
@@ -86,6 +89,10 @@ def resolve_sparse_kv_budget(
             raise ValueError("Copy-SFA padded query heads must be in [1,128].")
         context_len = (context_len + 127) // 128 * 128
         cache_tokens = cache_tokens or top_k
+    if mtp_full_visible and (not copy_sfa or indexer_impl != "lim"):
+        raise ValueError("Experimental MTP requires native LIM and Copy-SFA.")
+    if mtp_full_visible and cache_tokens < 4 * top_k:
+        raise ValueError("Experimental Q4 MTP requires capacity >= 4 * TopK.")
     experimental = indexer_impl != "legacy"
     native = indexer_impl == "lim"
     batch_rows = sparse_batch_capacity(request_rows, graph_batch_capacity)
@@ -114,6 +121,19 @@ def resolve_sparse_kv_budget(
             + num_layers * (request_rows + 1) * 4
             + 128 * 4
         )
+    if native and copy_sfa:
+        if fused_copy_sfa_metadata:
+            adapter_bytes += (request_rows + 1 + batch_rows) * 4
+        if fused_pre_metadata:
+            adapter_bytes += batch_rows * (6 * 4 + 2)
+    mtp_output_bytes = 0
+    if mtp_full_visible:
+        # Q4 source/slot rows, route counts, query scales and Q endpoints.
+        adapter_bytes += batch_rows * 4 * (2 * top_k * 4 + 4 + 64 * 4)
+        adapter_bytes += batch_rows * 4
+        mtp_output_bytes = (
+            batch_rows * 4 * copy_sfa_query_heads * 512 * (kv_bytes_per_token // 576)
+        )
     auto_capacity = cache_tokens == 0
     if auto_capacity and hbm_budget_bytes:
         # Conservative LRU accounting: slot owners (int32), slot order (int64),
@@ -131,6 +151,7 @@ def resolve_sparse_kv_budget(
                     - selected_kv_bytes
                     - slot_ids_bytes
                     - adapter_bytes
+                    - mtp_output_bytes
                 )
                 // per_slot,
             ),
@@ -157,7 +178,7 @@ def resolve_sparse_kv_budget(
     ) + slot_ids_bytes
     copy_sfa_bytes = 0
     if copy_sfa:
-        copy_sfa_bytes = (
+        copy_sfa_bytes = mtp_output_bytes + (
             num_layers * (request_rows + 1) * cache_tokens * 4
             + batch_rows * (2 * top_k + 2 * cache_tokens + 5) * 4
             + (batch_rows + 1) * ((cache_tokens + context_len) // 128) * 4

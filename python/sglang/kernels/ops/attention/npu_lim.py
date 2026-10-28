@@ -1,7 +1,8 @@
 """Adapter for the optional Ascend FusedLightningIndexerManage native extension.
 
-The 19-tensor in-place ABI is implemented by sgl-kernel-npu. Its native
-source and direct AscendC launch live in that repository; importing this
+The in-place ABI is implemented by sgl-kernel-npu. Its optional full-visible
+mode extends the default 19-tensor call with a scalar flag. Native source and
+direct AscendC launch live in that repository; importing this
 module neither imports torch_npu nor loads/compiles a native library.
 """
 
@@ -50,8 +51,12 @@ def fused_lightning_indexer_manage(
     miss_slots: torch.Tensor,
     miss_counts: torch.Tensor,
     operator=None,
+    full_visible=False,
 ) -> None:
-    """Launch the BF16/FP16, page-128, TopK-2048 native LIM ABI."""
+    """Launch BF16/FP16, page-128, TopK-2048 native LIM.
+
+    The experimental full-visible mode requires a matching kernel wheel.
+    """
     if query.ndim != 3 or query.shape[1] not in (32, 64) or query.shape[2] != 128:
         raise ValueError("LIM requires query [T, 32|64, 128].")
     if query.dtype not in (torch.float16, torch.bfloat16):
@@ -91,4 +96,7 @@ def fused_lightning_indexer_manage(
         raise ValueError("LIM inputs and outputs must be on one device.")
     if operator is None:
         operator = load_fused_lim_operator()
-    operator(*inputs)
+    if full_visible:
+        operator(*inputs, full_visible=True)
+    else:
+        operator(*inputs)

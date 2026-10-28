@@ -134,6 +134,21 @@ class LIMDecodeAdapter:
             self._metadata_next_scratch = torch.full(
                 (self.batch_capacity,), -1, dtype=torch.int32, device=device
             )
+        self.mtp_full_visible = envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
+        if self.mtp_full_visible:
+            # The diagnostic integration supports the target-verify Q4 shape.
+            rows = self.batch_capacity * 4
+            self.mtp_source_ids = torch.empty(
+                (rows, 1, self.top_k), dtype=torch.int32, device=device
+            )
+            self.mtp_device_slots = torch.empty_like(self.mtp_source_ids)
+            self.mtp_topk_misses = torch.empty(rows, dtype=torch.int32, device=device)
+            self.mtp_query_scale = torch.empty(
+                (rows, 64), dtype=torch.float32, device=device
+            )
+            self.mtp_query_ends = torch.arange(
+                4, rows + 1, 4, dtype=torch.int32, device=device
+            )
         self.tail_offsets = torch.arange(128, dtype=torch.int32, device=device)
         self.combined_kv = self.combined_ids = None
         if not self.full_visible:
@@ -309,6 +324,97 @@ class LIMDecodeAdapter:
             self.miss_slots[:batch],
             self.miss_counts[:batch],
             prefix,
+            sparse,
+            valid,
+            slots,
+            lengths,
+        )
+
+    def select_mtp(
+        self, manager, *, query, weights, key, block_table, forward_batch, layer_id
+    ):
+        """Build one Q4 union plan, retained through all IndexShare layers."""
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
+            prepare_mtp_rows,
+            validate_mtp_chain,
+        )
+
+        batch = forward_batch.batch_size
+        rows = batch * 4
+        if not self.mtp_full_visible or not self.is_native or query.shape[0] < rows:
+            raise ValueError("Experimental native MTP requires Q4 native LIM.")
+        if forward_batch.out_cache_loc is None:
+            raise ValueError("Native MTP verify requires per-token KV locations.")
+        _, positions, live = prepare_mtp_rows(
+            forward_batch, query.shape[0], manager.size, manager.logical_max_context_len
+        )
+        if positions.shape[1] != 4 or batch > self.batch_capacity:
+            raise ValueError(
+                "Experimental native MTP requires Q4 within graph capacity."
+            )
+        validate_mtp_chain(forward_batch, positions, live, self.rows)
+        valid = live.all(dim=1)
+        lengths = torch.where(valid, positions[:, -1] + 1, 0).to(torch.int32)
+        sparse = valid & (lengths >= self.capacity)
+        slots = torch.where(valid, forward_batch.req_pool_indices, self.rows).to(
+            torch.int32
+        )
+        layer_index = layer_id - manager.start_layer
+        previous = self.last_prefix[layer_index][slots.long()]
+        warm = sparse & (previous >= 0) & (lengths >= previous)
+        states = torch.where(sparse, torch.where(warm, -1, -2), -3).to(torch.int32)
+        if block_table.shape[0] != batch:
+            raise ValueError("MTP LIM block-table batch must match the request batch.")
+        # Graph metadata may reserve extra speculative pages beyond the logical
+        # host context. prepare_mtp_rows rejects positions outside that context.
+        table = self.block_table[:batch]
+        table.zero_()
+        columns = min(block_table.shape[1], table.shape[1])
+        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            from sglang.srt.utils.async_probe import maybe_assert_async
+
+            maybe_assert_async(
+                ((~valid) | (lengths <= columns * 128)).all(),
+                "Native MTP index block table does not cover the live context.",
+            )
+        table[:, :columns].copy_(block_table[:, :columns])
+        sources = self.mtp_source_ids[:rows]
+        fused_lightning_indexer_manage(
+            weights=weights[:rows].contiguous(),
+            query_scale=self.mtp_query_scale.view(-1)[: rows * query.shape[1]].view(
+                rows, query.shape[1]
+            ),
+            query=query[:rows].contiguous(),
+            key_scale=self.key_scale,
+            key=key,
+            block_table=table,
+            query_ends=self.mtp_query_ends[:batch],
+            seq_lens=lengths,
+            prefix_lens=lengths,
+            cache_sizes=torch.where(sparse, self.capacity, 0).to(torch.int32),
+            request_state=states,
+            request_slots=slots,
+            slot_pool=manager.device_slot_map[layer_index],
+            source_ids=sources,
+            device_slots=self.mtp_device_slots[:rows],
+            topk_misses=self.mtp_topk_misses[:rows],
+            miss_sources=self.miss_sources[:batch],
+            miss_slots=self.miss_slots[:batch],
+            miss_counts=self.miss_counts[:batch],
+            operator=self.operator,
+            full_visible=True,
+        )
+        sources.masked_fill_(~valid[:, None].expand(batch, 4).reshape(rows, 1, 1), -1)
+        next_prefix = torch.where(sparse, lengths, -1)
+        self.last_prefix[layer_index].index_copy_(0, slots.long(), next_prefix)
+        return LIMSelection(
+            sources[:, 0],
+            self.mtp_device_slots[:rows, 0],
+            self.mtp_topk_misses[:rows],
+            self.miss_sources[:batch],
+            self.miss_slots[:batch],
+            self.miss_counts[:batch],
+            lengths,
             sparse,
             valid,
             slots,

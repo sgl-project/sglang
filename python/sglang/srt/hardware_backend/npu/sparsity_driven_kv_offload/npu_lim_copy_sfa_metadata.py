@@ -23,6 +23,7 @@ def _lim_copy_sfa_metadata_kernel(
     dram_block_table_ptr,
     B: tl.constexpr,
     K: tl.constexpr,
+    Q: tl.constexpr,
     C: tl.constexpr,
     H: tl.constexpr,
     R: tl.constexpr,
@@ -44,12 +45,13 @@ def _lim_copy_sfa_metadata_kernel(
 
     col = tile_id * BLOCK + tl.arange(0, BLOCK).to(tl.int32)
     if tile_id * BLOCK < K:
-        source_base = row_id.to(tl.int64) * K
-        tl.store(
-            source_ids_ptr + source_base + col.to(tl.int64),
-            -1,
-            mask=(col < K) & ~is_valid,
-        )
+        for route in range(Q):
+            source_base = (row_id.to(tl.int64) * Q + route) * K
+            tl.store(
+                source_ids_ptr + source_base + col.to(tl.int64),
+                -1,
+                mask=(col < K) & ~is_valid,
+            )
 
     if tile_id * BLOCK < HBM_PAGES:
         hbm_base = row_id.to(tl.int64) * HBM_PAGES
@@ -70,10 +72,14 @@ def _lim_copy_sfa_metadata_kernel(
         )
 
     if tile_id == 0:
-        tl.store(topk_misses_ptr + row_id, 0, mask=~active)
+        for route in range(Q):
+            tl.store(topk_misses_ptr + row_id * Q + route, 0, mask=~active)
         tl.store(miss_counts_ptr + row_id, 0, mask=~active)
         cache_length = tl.where(active, C, 0).to(tl.int32)
-        tl.store(actual_seq_lengths_kv_ptr + row_id, cache_length)
+        tl.store(
+            actual_seq_lengths_kv_ptr + row_id,
+            tl.where(active, C + Q - 1, 0).to(tl.int32),
+        )
         tl.store(num_cache_tokens_ptr + row_id, cache_length)
         tl.store(
             last_prefix_ptr + request_slot.to(tl.int64),
@@ -127,13 +133,17 @@ def fused_lim_copy_sfa_metadata(
     capacity: int,
     host_context_len: int,
     request_rows: int,
+    query_width: int = 1,
 ) -> None:
     """Update preallocated LIM / Copy-SFA metadata in one NPU kernel launch.
 
-    ``source_ids`` keeps its full contiguous ``[B, 2048]`` LIM stride. Valid
-    short rows retain their selected IDs; only invalid rows are reset to -1.
+    ``source_ids`` keeps its full contiguous ``[B * query_width, 2048]``
+    LIM stride. Valid short rows retain their selected IDs; only invalid
+    request rows are reset to -1 across all their query rows.
     The miss source/slot buffers and all KV payloads are deliberately untouched.
     """
+    if query_width not in (1, 4):
+        raise ValueError("query_width must be 1 or 4.")
     if not isinstance(capacity, int) or not 2048 <= capacity <= 32640:
         raise ValueError("capacity must be an integer in [2048, 32640].")
     if capacity % 128:
@@ -166,12 +176,15 @@ def fused_lim_copy_sfa_metadata(
     if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
         raise TypeError("all metadata inputs and outputs must be torch.Tensor values.")
     if source_ids.ndim != 2 or source_ids.shape[1] != 2048:
-        raise ValueError("source_ids must have shape [B, 2048].")
-    batch = source_ids.shape[0]
+        raise ValueError("source_ids must have shape [B * query_width, 2048].")
+    if source_ids.shape[0] % query_width:
+        raise ValueError("source_ids rows must be divisible by query_width.")
+    batch = source_ids.shape[0] // query_width
     if batch <= 0:
         raise ValueError("batch must be positive.")
+    if topk_misses.ndim != 1 or topk_misses.shape[0] != batch * query_width:
+        raise ValueError("topk_misses must have shape [B * query_width].")
     row_tensors = (
-        topk_misses,
         miss_counts,
         valid_rows,
         sparse_rows,
@@ -243,6 +256,7 @@ def fused_lim_copy_sfa_metadata(
         dram_block_table,
         batch,
         2048,
+        query_width,
         capacity,
         host_context_len,
         request_rows,

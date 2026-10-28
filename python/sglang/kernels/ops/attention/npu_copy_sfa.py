@@ -38,23 +38,27 @@ def fused_scatter_copy_sparse_flash_attention(
     scale_value,
     *,
     operator=None,
+    full_visible=False,
 ) -> None:
-    """Fill Q1 resident KV and attend to K=2048 selected combined-cache tokens.
+    """Copy resident KV and attend to selected combined-cache tokens.
 
-    Resident capacity C is 2048, 4096 or 8192; request miss rows have width C.
-
-    Native host validation checks the remaining metadata/layout/device contract
-    without device scalar reads. Buffer ownership stays with the runtime manager.
+    Query tensors use contiguous TND ``[T, H, 512|64]`` and request-level
+    cumulative query lengths. The default mode retains the native sparse-plus-
+    tail contract. ``full_visible=True`` selects exactly K=2048 resident slots
+    without appending a tail; Q4 supports C=12288 and a request union miss list
+    with up to 32768 entries. Native host validation checks the remaining
+    metadata, layout and device contract without reading device scalar values.
+    Buffer ownership stays with the runtime manager.
     """
     if query.ndim != 3 or query.shape[2] != 512:
-        raise ValueError("Copy-SFA query must be [B,H,512].")
+        raise ValueError("Copy-SFA query must be [T,H,512].")
     if query_rope.shape != (*query.shape[:2], 64):
-        raise ValueError("Copy-SFA query rope must be [B,H,64].")
+        raise ValueError("Copy-SFA query rope must be [T,H,64].")
     if query.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("Copy-SFA requires FP16/BF16 query and KV storage.")
     if operator is None:
         operator = load_copy_sfa_operator()
-    operator(
+    inputs = (
         query,
         query_rope,
         combined_hbm_cache,
@@ -73,3 +77,7 @@ def fused_scatter_copy_sparse_flash_attention(
         attention_out,
         scale_value,
     )
+    if full_visible:
+        operator(*inputs, full_visible=True)
+    else:
+        operator(*inputs)

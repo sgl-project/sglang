@@ -19,10 +19,12 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import numpy as np
 import torch
+
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     is_copy_sfa_decode_graph_eligible,
 )
@@ -140,7 +142,10 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs[shape_key] = out
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode() or (
+            envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
+            and forward_batch.forward_mode.is_target_verify()
+        ):
             # Copy-SFA v1 uses a fixed 2048-token cache window. Decide from
             # scheduler-owned CPU metadata before graph replay, so short or
             # mixed-context batches take the eager materialization path. The

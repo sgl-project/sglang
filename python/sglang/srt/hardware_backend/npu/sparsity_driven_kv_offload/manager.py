@@ -122,6 +122,22 @@ class SparseKVCacheManager:
         self.last_decode_path = "unselected"
         self.logical_max_context_len = int(req_to_token_pool.max_context_len)
         self.copy_sfa_enabled = envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
+        if envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get():
+            from sglang.srt.runtime_context import get_spec
+
+            spec = get_spec()
+            if (
+                spec.speculative_eagle_topk != 1
+                or spec.speculative_num_draft_tokens != 4
+            ):
+                raise ValueError(
+                    "Experimental native MTP requires a Q4 chain with topk=1."
+                )
+        if (
+            envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
+            and envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.get()
+        ):
+            raise ValueError("Experimental Q4 LIM does not support fused pre-metadata.")
         self.max_context_len = copy_sfa_host_row_stride(
             self.logical_max_context_len, self.copy_sfa_enabled
         )
@@ -349,6 +365,16 @@ class SparseKVCacheManager:
                         dtype=torch.int32,
                         device=self.device,
                     )
+                    if envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get():
+                        self.mtp_attn_out = torch.empty(
+                            (
+                                self.batch_capacity * 4,
+                                copy_sfa_padded_query_heads,
+                                self.kv_lora_rank,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
                     self.planner_attn_out = torch.empty(
                         (
                             self.batch_capacity,
@@ -537,6 +563,93 @@ class SparseKVCacheManager:
             self.planner_hbm_block_table[:batch_size],
             self.planner_dram_block_table[:batch_size],
         )
+
+    def copy_sfa_mtp_verify(
+        self, layer, query_nope, query_rope, query_heads, scale_value, plan
+    ):
+        """Consume a Q4 union plan and refresh rewritten resident KV for this layer."""
+        batch = plan.request_slots.shape[0]
+        rows = batch * 4
+        valid = plan.valid_rows & plan.sparse_rows
+        route_valid = valid[:, None].expand(batch, 4).reshape(rows)
+        adapter = self.lim_adapter
+        if adapter.fused_copy_metadata:
+            adapter._fused_copy_sfa_metadata(
+                source_ids=plan.source_ids,
+                topk_misses=plan.topk_misses,
+                miss_counts=plan.miss_counts,
+                valid_rows=plan.valid_rows,
+                sparse_rows=plan.sparse_rows,
+                request_slots=plan.request_slots,
+                next_prefix=plan.prefix_lens,
+                last_prefix=adapter._metadata_prefix_scratch,
+                actual_seq_lengths_kv=self.planner_actual_seq_lengths_kv[:batch],
+                num_cache_tokens=self.planner_num_cache_tokens[:batch],
+                hbm_block_table=self.planner_hbm_block_table[:batch],
+                dram_block_table=self.planner_dram_block_table[:batch],
+                capacity=self.cache_capacity,
+                host_context_len=self.max_context_len,
+                request_rows=self.size,
+                query_width=4,
+            )
+        else:
+            plan.topk_misses.masked_fill_(~route_valid, 0)
+            plan.miss_counts.masked_fill_(~valid, 0)
+            # These lengths suppress padding; full-visible attention appends no tail.
+            self.planner_actual_seq_lengths_kv[:batch].copy_(
+                valid.to(torch.int32) * (self.cache_capacity + 3)
+            )
+            self.planner_num_cache_tokens[:batch].copy_(
+                valid.to(torch.int32) * self.cache_capacity
+            )
+            for pages, offsets, output in (
+                (
+                    self.cache_capacity // 128,
+                    self.hbm_page_offsets,
+                    self.planner_hbm_block_table,
+                ),
+                (
+                    self.max_context_len // 128,
+                    self.dram_page_offsets,
+                    self.planner_dram_block_table,
+                ),
+            ):
+                fill_request_block_table(
+                    plan.request_slots, valid, offsets, pages, output[:batch]
+                )
+        padded_heads = self.mtp_attn_out.shape[1]
+        if query_nope.shape[1] < padded_heads:
+            padding = padded_heads - query_nope.shape[1]
+            query_nope = torch.nn.functional.pad(query_nope, (0, 0, 0, padding))
+            query_rope = torch.nn.functional.pad(query_rope, (0, 0, 0, padding))
+        output = self.mtp_attn_out[:rows]
+        layer_idx = layer.layer_id - self.start_layer
+        combined = self.device_kv_buffer[layer_idx].view(
+            self.size * (self.cache_capacity // 128), 128, self.head_num, self.head_dim
+        )
+        fused_scatter_copy_sparse_flash_attention(
+            query_nope.contiguous(),
+            query_rope.contiguous(),
+            combined,
+            self.lim_adapter.mtp_query_ends[:batch],
+            self.planner_actual_seq_lengths_kv[:batch],
+            self.planner_num_cache_tokens[:batch],
+            plan.source_ids.unsqueeze(1),
+            plan.device_slots.unsqueeze(1),
+            plan.topk_misses,
+            plan.miss_sources,
+            plan.miss_slots,
+            plan.miss_counts,
+            self.planner_hbm_block_table[:batch],
+            self.planner_dram_block_table[:batch],
+            self.dev_ptr_list[layer_idx],
+            output,
+            scale_value,
+            operator=self._copy_sfa_operator,
+            full_visible=True,
+        )
+        result = output[:, :query_heads].reshape(rows, -1)
+        return result.masked_fill(~route_valid[:, None], 0)
 
     def copy_sfa_decode(
         self,

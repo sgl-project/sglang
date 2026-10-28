@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 
 import numpy as np
 import torch
+
 from sglang.srt.configs.model_config import (
     AttentionArch,
     is_deepseek_dsa,
@@ -104,8 +105,11 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # the fixed-window requirement before either padded or exact replay.
         if (
             forward_batch.forward_mode.is_decode()
-            and not is_copy_sfa_decode_graph_eligible(forward_batch.seq_lens_cpu)
-        ):
+            or (
+                envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get()
+                and forward_batch.forward_mode.is_target_verify()
+            )
+        ) and not is_copy_sfa_decode_graph_eligible(forward_batch.seq_lens_cpu):
             return False
         return super().can_run_graph(forward_batch)
 

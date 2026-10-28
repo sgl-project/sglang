@@ -201,6 +201,9 @@ def get_sparse_kv_budget(
         indexer_impl=get_sparse_kv_indexer_impl(),
         copy_sfa=envs.SGLANG_NPU_ENABLE_COPY_SFA.get(),
         copy_sfa_query_heads=copy_sfa_query_heads,
+        mtp_full_visible=envs.SGLANG_ENABLE_NPU_LIM_MTP_FULL_VISIBLE.get(),
+        fused_copy_sfa_metadata=envs.SGLANG_NPU_FUSED_LIM_COPY_SFA_METADATA.get(),
+        fused_pre_metadata=envs.SGLANG_NPU_FUSED_LIM_PRE_METADATA.get(),
         graph_batch_capacity=sparse_batch_capacity(
             request_rows,
             max(graph_batch_capacity, get_eager_max_batch_size(request_rows - 1)),
