@@ -1327,7 +1327,13 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
     ) -> None:
         if forward_mode.is_decode_or_idle():
-            decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
+            # A batch size captured more than once (attention graph variants, LoRA /
+            # no-LoRA) must share one set of wrappers: replay plans only
+            # decode_cuda_graph_metadata[bs], so a fresh set per capture leaves the
+            # earlier graphs reading plans nobody refreshes.
+            decode_wrappers = self.decode_cuda_graph_metadata.get(
+                bs
+            ) or self._create_decode_wrappers(bs, num_tokens)
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
@@ -1336,7 +1342,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
             )
-            prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
+            prefill_wrappers = self.prefill_cuda_graph_metadata.get(
+                bs
+            ) or self._create_prefill_wrappers(bs, use_custom_mask)
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
