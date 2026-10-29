@@ -872,6 +872,11 @@ install_msa() {
         exit 1
     fi
     msa_dir="${HOME}/.cache/sglang-ci/minimax-msa/${msa_commit}"
+    # Runner containers share ${HOME}/.cache: without the lock, one job's rm -rf
+    # deletes the tree another job is still cloning.
+    mkdir -p "${HOME}/.cache/sglang-ci"
+    exec 8>"${HOME}/.cache/sglang-ci/minimax-msa.lock"
+    flock --exclusive 8
     if [ ! -f "${msa_dir}/.complete" ]; then
         rm -rf "$msa_dir"
         git init -q "$msa_dir"
@@ -885,6 +890,8 @@ install_msa() {
     if [ -f "${msa_dir}/integrations/sglang/pyproject.toml" ]; then
         $PIP_CMD install --no-deps -e "${msa_dir}/integrations/sglang" $PIP_INSTALL_SUFFIX
     fi
+    flock --unlock 8
+    exec 8>&-
     python3 -c "import inference, msa_v1; print(f'MSA {inference.__file__}')"
 
     mark_step_done "${FUNCNAME[0]}"
