@@ -1026,6 +1026,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         cache_indices: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return Q/K/V, using contiguous planes for equal-width FlashInfer prefill."""
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width matches the decode path and saves two kernel launches.
         split_size = (
@@ -1034,7 +1035,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             and layer.q_dim == layer.k_dim == layer.v_dim
             else 0
         )
-        qkv = causal_conv1d_fn(
+        conv_output = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
             layer.bias,
@@ -1047,8 +1048,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             output_split_size=split_size,
         )
         if split_size:
-            return qkv.unbind(0)
-        return qkv.transpose(0, 1).split(
+            return conv_output.unbind(0)
+        return conv_output.transpose(0, 1).split(
             [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
         )
 
