@@ -631,7 +631,11 @@ class DeepseekMHAForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        if _is_cuda or _use_aiter_gfx95:
+        if (
+            _is_cuda
+            or _use_aiter_gfx95
+            or getattr(get_token_to_kv_pool(), "mla_seg_page_layout", False)
+        ):
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )

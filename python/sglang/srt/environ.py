@@ -1031,6 +1031,15 @@ class Envs:
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
+    # gfx1250: run fp8 MLA decode on aiter's non-persistent page-64 asm kernel.
+    # The kernel reads seg-packed KV pages, so this also switches the MLA pool
+    # to that layout; every pool reader and writer must go through the pool.
+    SGLANG_AITER_MLA_GFX1250_ASM = EnvBool(False)
+    # KV splits per sequence for that kernel; 0 sizes it from the batch size.
+    SGLANG_AITER_MLA_GFX1250_ASM_SPLITS = EnvInt(0)
+    # Its fp8 Q scale: 1 casts Q unscaled (as the gfx950 asm path does),
+    # 0 takes a dynamic per-tensor scale at the cost of a reduction per layer.
+    SGLANG_AITER_MLA_GFX1250_ASM_STATIC_Q = EnvBool(True)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
     SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(False)
 

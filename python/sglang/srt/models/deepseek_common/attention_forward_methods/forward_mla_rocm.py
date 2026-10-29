@@ -1159,6 +1159,9 @@ class DeepseekMLARocmForwardMixin:
         # The layer-static half of _fuse_rope_for_gfx1250_mla.
         self._gfx1250_fused_rope_layer = (
             _use_gfx1250_fused_mla_rope
+            # The fused kernel writes token-major KV rows; the asm decode
+            # pool is seg-packed, so its writes go through the pool.
+            and not envs.SGLANG_AITER_MLA_GFX1250_ASM.get()
             and self.kv_cache_dtype in _GFX1250_FUSED_ROPE_KV_CACHE_DTYPES
             and not self.use_dsa
             and self.dcp_size == 1
