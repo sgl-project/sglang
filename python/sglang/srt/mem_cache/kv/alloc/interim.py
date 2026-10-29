@@ -411,6 +411,7 @@ class _TokenEndsPolicy(_WindowPolicy):
         *,
         full_evictable_tokens: int = 0,
         swa_evictable_tokens: int = 0,
+        auxiliary_swa_evictable_tokens: int = 0,
         empty_pool: bool = False,
         prefer_swa: bool = False,
     ) -> Optional[Tuple[int, int]]:
@@ -434,6 +435,7 @@ class _TokenEndsPolicy(_WindowPolicy):
         *,
         full_evictable_tokens: int = 0,
         swa_evictable_tokens: int = 0,
+        auxiliary_swa_evictable_tokens: int = 0,
         empty_pool: bool = False,
         require_token_slack: bool = False,
     ) -> bool:
@@ -622,6 +624,7 @@ class _FloatChainPolicy(_WindowPolicy):
         *,
         full_evictable_tokens: int = 0,
         swa_evictable_tokens: int = 0,
+        auxiliary_swa_evictable_tokens: int = 0,
         empty_pool: bool = False,
         require_token_slack: bool = False,
     ) -> bool:
@@ -919,8 +922,8 @@ class _FloatChainPolicy(_WindowPolicy):
 class _MultiWindowPolicy(_WindowPolicy):
     """Conservative admission for independently retained window bands.
 
-    Queries credit only the physical takes that can succeed now. Relief and
-    eviction happen before reservation, never while part of a take is live.
+    Admission can credit evictable pages while reservation checks only current
+    geometry. Relief and eviction finish before any physical take is published.
     """
 
     keeps_leak_census = False
@@ -939,16 +942,50 @@ class _MultiWindowPolicy(_WindowPolicy):
             for b in (c.full_attn_allocator, *c._windows)
         )
 
-    def can_reserve(self, c, full_tokens, swa_tokens, **kwargs):
-        from sglang.srt.mem_cache.kv.alloc.pricing import sequential_fit
+    def can_reserve(
+        self,
+        c,
+        full_tokens,
+        swa_tokens,
+        *,
+        full_evictable_tokens=0,
+        swa_evictable_tokens=0,
+        auxiliary_swa_evictable_tokens=0,
+        empty_pool=False,
+        require_token_slack=False,
+    ):
+        from sglang.srt.mem_cache.kv.alloc.pricing import (
+            reclaimed_snapshot,
+            sequential_fit,
+        )
 
         if full_tokens < 0 or swa_tokens < 0:
             return False
-        if -(-int(full_tokens) // c.page_size) > len(
-            c.full_attn_allocator.free_virtual_ids
+        if require_token_slack and (
+            full_tokens >= self._size_full or swa_tokens >= self._size_swa
         ):
             return False
-        return sequential_fit(_snapshot(c), self._demands(c, full_tokens, swa_tokens))
+        snapshot = _snapshot(c)
+        credits = {
+            c.roles.owner: int(full_evictable_tokens) // c.page_size,
+            **{
+                b.sub_pool_name: int(
+                    swa_evictable_tokens
+                    if b is c.swa_attn_allocator
+                    else auxiliary_swa_evictable_tokens
+                )
+                // c.page_size
+                for b in c._windows
+            },
+        }
+        if empty_pool or any(credits.values()):
+            snapshot = reclaimed_snapshot(snapshot, credits, empty_pool=empty_pool)
+        if (
+            -(-int(full_tokens) // c.page_size)
+            > snapshot.band(c.roles.owner).free_virtual_pages
+        ):
+            return False
+        return sequential_fit(snapshot, self._demands(c, full_tokens, swa_tokens))
 
     def _compute_available_size(self, c):
         pages = min(

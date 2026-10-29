@@ -458,6 +458,9 @@ class ChainPrefillBudget(SWAPrefillBudget):
             swa_evictable_tokens=0
             if empty_pool
             else self.tree_cache.swa_evictable_size(),
+            auxiliary_swa_evictable_tokens=0
+            if empty_pool
+            else self.tree_cache.auxiliary_swa_evictable_size(),
             empty_pool=empty_pool,
             require_token_slack=empty_pool,
         )

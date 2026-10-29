@@ -591,6 +591,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_evictable_size(self):
         return 0
 
+    def auxiliary_swa_evictable_size(self):
+        return 0
+
     def protected_size(self):
         return 0
 

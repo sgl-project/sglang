@@ -926,6 +926,10 @@ class TestTriJointReclaim(CustomTestCase):
 
 
 class TestTriGeometry(CustomTestCase):
+    def setUp(self):
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+
     def check_saved(self, a, saved):
         for member, buf, ids, values in saved:
             self.assertTrue(
