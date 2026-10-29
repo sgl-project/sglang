@@ -4825,9 +4825,15 @@ class AiterAttnBackend(AttentionBackend):
                 self.asm_mla_kv_indices,
                 self.asm_mla_last_page_len,
             )
-        q_fp8, q_scale = self._asm_mla_quant_pad_q(
-            q.view(bs, num_heads, layer.qk_head_dim), fp8_dtype, self.asm_mla_q_scale
-        )
+        if q.dtype == fp8_dtype:
+            # Already rotated, cast and padded by the fused rope kernel.
+            q_fp8, q_scale = q, self.asm_mla_q_scale
+        else:
+            q_fp8, q_scale = self._asm_mla_quant_pad_q(
+                q.view(bs, num_heads, layer.qk_head_dim),
+                fp8_dtype,
+                self.asm_mla_q_scale,
+            )
         # K is divided by k_scale before it is written to the cache.
         if layer.k_scale is not None and layer.k_scale_float != 1.0:
             kv_scale = layer.k_scale.reshape(1).float()
@@ -5007,7 +5013,10 @@ class AiterAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
-        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        # fp8 Q here is the fused rope kernel's padded asm-decode input; a
+        # reshape would copy it out of its padded rows.
+        if not (self.gfx1250_mla_asm_decode and q.dtype == fp8_dtype):
+            q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         k_descale = None
         v_descale = None

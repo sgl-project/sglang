@@ -159,6 +159,7 @@ if _use_gfx1250_fused_mla_rope:
 # FP4, mxfp8 and e5m2 caches keep set_kv_buffer.
 _GFX1250_FUSED_ROPE_KV_CACHE_DTYPES = ("auto", "bf16", "bfloat16", "fp8_e4m3")
 _GFX1250_FUSED_ROPE_BACKENDS = ("aiter", "triton")
+_GFX1250_ASM_MLA_Q_PAD = 768
 
 
 _ABSORB_BMM_DECODE_MAX_M = 256
@@ -449,6 +450,19 @@ def _fused_rope_cat_and_cache(
         out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
     # AITER reads slot_mapping with stride 1, including on the resident path.
     out_cache_loc = out_cache_loc.contiguous()
+    seg_kwargs = {}
+    if getattr(kv_pool, "mla_seg_page_layout", False):
+        # gfx1250 asm MLA decode: seg-packed KV pages and fp8 Q rows padded to
+        # 768, written here so the backend consumes them without a copy.
+        b, qh, d_nope = q_nope_out.shape
+        q_pad = torch.empty(
+            (b, qh, _GFX1250_ASM_MLA_Q_PAD), dtype=fp8_dtype, device=q_nope_out.device
+        )
+        seg_kwargs = dict(
+            q_out=q_pad[..., : d_nope + q_pe.shape[-1]],
+            seg_page_size=kv_pool.page_size,
+        )
+        q_out_dtype = fp8_dtype
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
@@ -461,6 +475,7 @@ def _fused_rope_cat_and_cache(
         attn.attn_mqa.k_scale,
         attn.rotary_emb.is_neox_style,
         q_out_dtype=q_out_dtype,
+        **seg_kwargs,
     )
 
 
@@ -1159,9 +1174,12 @@ class DeepseekMLARocmForwardMixin:
         # The layer-static half of _fuse_rope_for_gfx1250_mla.
         self._gfx1250_fused_rope_layer = (
             _use_gfx1250_fused_mla_rope
-            # The fused kernel writes token-major KV rows; the asm decode
-            # pool is seg-packed, so its writes go through the pool.
-            and not envs.SGLANG_AITER_MLA_GFX1250_ASM.get()
+            # The asm decode takes the fused kernel's fp8 Q unscaled, so a
+            # dynamic Q scale keeps rope and the KV write on the pool path.
+            and (
+                not envs.SGLANG_AITER_MLA_GFX1250_ASM.get()
+                or envs.SGLANG_AITER_MLA_GFX1250_ASM_STATIC_Q.get()
+            )
             and self.kv_cache_dtype in _GFX1250_FUSED_ROPE_KV_CACHE_DTYPES
             and not self.use_dsa
             and self.dcp_size == 1
