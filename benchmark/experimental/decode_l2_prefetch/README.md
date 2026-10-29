@@ -52,8 +52,17 @@ stable after installation. Invalid custom budgets are not validated by this
 research patch; use the defaults below. Large arbitrary budgets can exceed the
 fixed sink capacity. Install only once in a fresh worker process.
 
-Full model serving on current upstream main has not been validated. Adding this
-directory to main does not extend the historical 0.5.22 results to current main.
+End-to-end serving smoke validation also passed on upstream main commit
+5007cbd6a57515bf5e008ff2fd2bdb834356b53c with the configuration above, FlashInfer
+0.7.2, and sglang-kernel 0.4.10. Native and original-patch runs each completed
+8 requests at concurrency 1, 4, and 8, generating exactly 128 tokens per request
+(48/48 successful requests total). All 24 paired output-token sequences matched,
+and all 6,144 returned output-token log probabilities were finite. Both target
+workers armed 128 AllReduce sites and recorded 3,200 prefetch calls with zero
+skips during graph capture; decode logs confirmed CUDA Graph execution.
+This is a serving compatibility check with eight short prompts, not a repeated
+performance or broad answer-quality evaluation. Historical throughput results
+below remain specific to the 0.5.22 experiments.
 
 ## Reproduce
 
