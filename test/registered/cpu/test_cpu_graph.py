@@ -73,7 +73,7 @@ def _make_cpu_graph_runner():
 
 
 def _make_cpu_prefill_forward_batch(num_tokens=6, batch_size=2):
-    return SimpleNamespace(
+    return ForwardBatch(
         forward_mode=ForwardMode.EXTEND,
         global_forward_mode=ForwardMode.EXTEND,
         batch_size=batch_size,
@@ -83,14 +83,23 @@ def _make_cpu_prefill_forward_batch(num_tokens=6, batch_size=2):
         mrope_positions=torch.arange(3 * num_tokens, dtype=torch.int64).reshape(
             3, num_tokens
         ),
+        seq_lens=torch.full((batch_size,), num_tokens // batch_size, dtype=torch.int64),
+        seq_lens_cpu=torch.full(
+            (batch_size,), num_tokens // batch_size, dtype=torch.int64
+        ),
+        req_pool_indices=torch.arange(batch_size, dtype=torch.int64),
+        extend_seq_lens=torch.full(
+            (batch_size,), num_tokens // batch_size, dtype=torch.int64
+        ),
+        extend_prefix_lens=torch.zeros(batch_size, dtype=torch.int64),
+        extend_start_loc=torch.zeros(batch_size, dtype=torch.int64),
         seq_lens_sum=num_tokens,
-        mm_inputs=None,
+        extend_num_tokens=num_tokens,
+        extend_seq_lens_cpu=[num_tokens // batch_size] * batch_size,
+        extend_prefix_lens_cpu=[0] * batch_size,
         return_logprob=False,
-        input_embeds=None,
-        replace_embeds=None,
         capture_hidden_mode=CaptureHiddenMode.NULL,
         return_hidden_states_before_norm=False,
-        contains_mm_inputs=lambda: False,
     )
 
 
@@ -770,6 +779,7 @@ class TestCPUGraph(CustomTestCase):
         batch = runner._build_prefill_dummy_forward_batch(num_tokens=7, bs=3)
 
         self.assertEqual(batch.batch_size, 3)
+        self.assertEqual(batch.extend_num_tokens, 7)
         self.assertEqual(batch.input_ids.shape, (7,))
         self.assertEqual(batch.extend_seq_lens.tolist(), [2, 2, 3])
         self.assertEqual(batch.extend_start_loc.tolist(), [0, 2, 4])
@@ -861,10 +871,13 @@ class TestCPUGraph(CustomTestCase):
         runner.max_bs = 2
         runner.enable_dynamic_graph = True
         runner.decode_dynamic_graphs = {True: object()}
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
 
         forward_batch = SimpleNamespace(
             batch_size=3,
             forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            return_hidden_states_before_norm=False,
         )
 
         self.assertTrue(runner.can_run_graph(forward_batch))
@@ -877,7 +890,7 @@ class TestCPUGraph(CustomTestCase):
         runner.is_encoder_decoder = True
         runner.capture_num_tokens = []
         runner.decode_dynamic_graphs = {}
-        runner.model_runner = SimpleNamespace(req_to_token_pool=SimpleNamespace())
+        runner.model_runner = SimpleNamespace(token_to_kv_pool=None)
 
         with (
             patch.object(
@@ -1054,6 +1067,48 @@ class TestCPUGraph(CustomTestCase):
         forward_batch2 = _make_cpu_prefill_forward_batch(num_tokens=128, batch_size=2)
         forward_batch2.return_hidden_states_before_norm = True
         self.assertFalse(runner._can_run_prefill_graph(forward_batch2))
+
+    def test_mamba_cache_install_and_reset_uses_layer_router_state_part(self):
+        from sglang.srt.mem_cache.kv.router import STATE_PART
+        from sglang.srt.model_executor.cpu_graph_runner import (
+            _get_mamba_pool,
+            _install_cpu_compile_layer_caches,
+        )
+
+        layer0_cache = object()
+        conv_tensor = torch.ones(2, 4)
+        temporal_tensor = torch.ones(2, 4)
+        mamba_cache = SimpleNamespace(
+            conv=[conv_tensor],
+            temporal=[temporal_tensor],
+            at_layer_idx=lambda idx: layer0_cache if idx == 0 else None,
+        )
+        mamba_pool = SimpleNamespace(
+            num_mamba_layers=1,
+            mamba_cache=mamba_cache,
+        )
+
+        class DummyLayerRouter:
+            def part_view(self, part):
+                if part == STATE_PART:
+                    return mamba_pool
+                raise KeyError(part)
+
+        model_runner = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(
+                layer_router=DummyLayerRouter(),
+            ),
+        )
+
+        self.assertIs(_get_mamba_pool(model_runner), mamba_pool)
+        _install_cpu_compile_layer_caches(model_runner)
+        self.assertIs(mamba_pool.mamba2_layer_cache(0), layer0_cache)
+
+        runner = _make_cpu_graph_runner()
+        runner.model_runner = model_runner
+        runner._reset_mamba_cache_if_needed()
+        self.assertTrue(torch.all(conv_tensor == 0))
+        self.assertTrue(torch.all(temporal_tensor == 0))
 
     @intel_amx_benchmark(
         extra_args=[

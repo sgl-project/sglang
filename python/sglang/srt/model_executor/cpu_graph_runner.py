@@ -478,13 +478,17 @@ def patch_model(
             tp_group.ca_comm = backup_ca_comm
 
 
+def _get_mamba_pool(model_runner: ModelRunner):
+    if model_runner is None or model_runner.token_to_kv_pool is None:
+        return None
+    return model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
+
+
 def _install_cpu_compile_layer_caches(model_runner: ModelRunner):
-    if model_runner is None:
+    mamba_pool = _get_mamba_pool(model_runner)
+    if mamba_pool is None or mamba_pool.mamba_cache is None:
         return
-    mamba_pool = getattr(model_runner.req_to_token_pool, "mamba_pool", None)
-    mamba_cache = getattr(mamba_pool, "mamba_cache", None)
-    if mamba_pool is None or mamba_cache is None:
-        return
+    mamba_cache = mamba_pool.mamba_cache
 
     layer_caches = [
         mamba_cache.at_layer_idx(layer_idx)
@@ -1074,11 +1078,7 @@ class CPUGraphRunner:
         self.enable_dynamic_graph = envs.SGLANG_TORCH_DYNAMIC_SHAPE.get()
         self.disable_padding = get_exec().graph.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.model_is_mrope = (
-            getattr(model_runner.model_config, "model_is_mrope", False)
-            if hasattr(model_runner, "model_config")
-            else False
-        )
+        self.model_is_mrope = model_runner.model_config.model_is_mrope
         self.require_gathered_buffer = require_gathered_buffer()
         self.require_mlp_tp_gather = require_mlp_tp_gather()
         self.require_mlp_sync = require_mlp_sync()
@@ -1258,8 +1258,7 @@ class CPUGraphRunner:
         self.prefill_dynamic_graph: Optional[Callable] = None
         self.prefill_dynamic_graph_bs1: Optional[Callable] = None
         self.prefill_dynamic_batch_template: Optional[ForwardBatch] = None
-        schedule = get_schedule()
-        configured_prefill_max_tokens = getattr(schedule, "max_prefill_tokens", None)
+        configured_prefill_max_tokens = get_schedule().max_prefill_tokens
         self.dynamic_prefill_max_tokens = max(
             int(configured_prefill_max_tokens or 0),
             self.capture_num_tokens[-1] if self.capture_num_tokens else 0,
@@ -1314,11 +1313,9 @@ class CPUGraphRunner:
         if forward_batch.forward_mode.is_extend():
             return self._can_run_prefill_graph(forward_batch)
 
-        if getattr(forward_batch, "return_hidden_states_before_norm", False):
+        if forward_batch.return_hidden_states_before_norm:
             return False
-        if self.capture_hidden_mode < getattr(
-            forward_batch, "capture_hidden_mode", CaptureHiddenMode.NULL
-        ):
+        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
             return False
 
         skip_cross_attention = self._get_skip_cross_attention(forward_batch)
@@ -1381,15 +1378,10 @@ class CPUGraphRunner:
             self._compile_decode_dynamic_graphs()
 
     def _reset_mamba_cache_if_needed(self) -> None:
-        token_to_kv_pool = getattr(self.model_runner, "token_to_kv_pool", None)
-        if token_to_kv_pool is None or not hasattr(token_to_kv_pool, "layer_router"):
+        mamba_pool = _get_mamba_pool(self.model_runner)
+        if mamba_pool is None or mamba_pool.mamba_cache is None:
             return
-        mamba_pool = token_to_kv_pool.layer_router.part_view(STATE_PART)
-        if mamba_pool is None:
-            return
-        mamba_cache = getattr(mamba_pool, "mamba_cache", None)
-        if mamba_cache is None:
-            return
+        mamba_cache = mamba_pool.mamba_cache
 
         def _zero_nested(obj):
             if isinstance(obj, torch.Tensor):
@@ -1482,11 +1474,7 @@ class CPUGraphRunner:
             ),
             global_forward_mode=self.capture_forward_mode,
         )
-        if (
-            hasattr(self.model_runner, "runner_ids")
-            and self.model_runner.runner_ids is not None
-        ):
-            self.model_runner.runner_ids.bind_runner_slots(forward_batch)
+        self.model_runner.runner_ids.bind_runner_slots(forward_batch)
         # Wrap all forward calls with capture_with_skip_cross_attention so that
         # mllama (and any other encoder-decoder model) sees the correct compile-
         # time constant for skip_cross_attention during tracing.
@@ -1563,41 +1551,37 @@ class CPUGraphRunner:
         include_extend_metadata: bool,
     ) -> None:
         dynamic_forward_batch.encoder_lens_cpu = copy.copy(
-            getattr(forward_batch, "encoder_lens_cpu", None)
+            forward_batch.encoder_lens_cpu
         )
-        dynamic_forward_batch.encoder_cached = copy.copy(
-            getattr(forward_batch, "encoder_cached", None)
-        )
+        dynamic_forward_batch.encoder_cached = copy.copy(forward_batch.encoder_cached)
         if include_extend_metadata:
-            dynamic_forward_batch.extend_num_tokens = getattr(
-                forward_batch, "extend_num_tokens", None
-            )
+            dynamic_forward_batch.extend_num_tokens = forward_batch.extend_num_tokens
             dynamic_forward_batch.extend_seq_lens_cpu = copy.copy(
-                getattr(forward_batch, "extend_seq_lens_cpu", None)
+                forward_batch.extend_seq_lens_cpu
             )
             dynamic_forward_batch.extend_prefix_lens_cpu = copy.copy(
-                getattr(forward_batch, "extend_prefix_lens_cpu", None)
+                forward_batch.extend_prefix_lens_cpu
             )
             dynamic_forward_batch.extend_logprob_start_lens_cpu = copy.copy(
-                getattr(forward_batch, "extend_logprob_start_lens_cpu", None)
+                forward_batch.extend_logprob_start_lens_cpu
             )
             dynamic_forward_batch.top_logprobs_nums = copy.copy(
-                getattr(forward_batch, "top_logprobs_nums", None)
+                forward_batch.top_logprobs_nums
             )
             dynamic_forward_batch.token_ids_logprobs = copy.copy(
-                getattr(forward_batch, "token_ids_logprobs", None)
+                forward_batch.token_ids_logprobs
             )
             dynamic_forward_batch.multi_item_delimiter_indices = copy.copy(
-                getattr(forward_batch, "multi_item_delimiter_indices", None)
+                forward_batch.multi_item_delimiter_indices
             )
             dynamic_forward_batch.token_indices_to_pool = copy.copy(
-                getattr(forward_batch, "token_indices_to_pool", None)
+                forward_batch.token_indices_to_pool
             )
             dynamic_forward_batch.mamba_prefill_track_mask_cpu = copy.copy(
-                getattr(forward_batch, "mamba_prefill_track_mask_cpu", None)
+                forward_batch.mamba_prefill_track_mask_cpu
             )
             dynamic_forward_batch.mamba_track_seqlens_cpu = copy.copy(
-                getattr(forward_batch, "mamba_track_seqlens_cpu", None)
+                forward_batch.mamba_track_seqlens_cpu
             )
 
     def _compile_decode_dynamic_graph(self, skip_cross_attention: bool) -> Callable:
@@ -1651,8 +1635,8 @@ class CPUGraphRunner:
         dynamic_forward_batch.batch_size = forward_batch.batch_size
         dynamic_forward_batch.seq_lens_sum = forward_batch.seq_lens_sum
         dynamic_forward_batch.capture_hidden_mode = forward_batch.capture_hidden_mode
-        dynamic_forward_batch.return_hidden_states_before_norm = getattr(
-            forward_batch, "return_hidden_states_before_norm", False
+        dynamic_forward_batch.return_hidden_states_before_norm = (
+            forward_batch.return_hidden_states_before_norm
         )
         if (
             forward_batch.mm_inputs is not None
@@ -1871,7 +1855,7 @@ class CPUGraphRunner:
                 ),
                 last_hidden_states=(
                     output.last_hidden_states[: self.raw_num_token]
-                    if getattr(output, "last_hidden_states", None) is not None
+                    if output.last_hidden_states is not None
                     else None
                 ),
             )
@@ -1955,6 +1939,7 @@ class CPUGraphRunner:
             seq_lens_cpu=torch.tensor(lens_cpu, dtype=torch.int64),
             out_cache_loc=out_cache_loc,
             seq_lens_sum=num_tokens,
+            extend_num_tokens=num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_start_loc=extend_start_loc,
@@ -2174,8 +2159,8 @@ class CPUGraphRunner:
         dynamic_forward_batch.batch_size = forward_batch.batch_size
         dynamic_forward_batch.seq_lens_sum = forward_batch.seq_lens_sum
         dynamic_forward_batch.capture_hidden_mode = forward_batch.capture_hidden_mode
-        dynamic_forward_batch.return_hidden_states_before_norm = getattr(
-            forward_batch, "return_hidden_states_before_norm", False
+        dynamic_forward_batch.return_hidden_states_before_norm = (
+            forward_batch.return_hidden_states_before_norm
         )
         dynamic_forward_batch.mm_inputs = None
         self._refresh_dynamic_forward_batch_metadata(
@@ -2321,11 +2306,9 @@ class CPUGraphRunner:
             return False
         if forward_batch.replace_embeds is not None:
             return False
-        if getattr(forward_batch, "return_hidden_states_before_norm", False):
+        if forward_batch.return_hidden_states_before_norm:
             return False
-        if self.capture_hidden_mode < getattr(
-            forward_batch, "capture_hidden_mode", CaptureHiddenMode.NULL
-        ):
+        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
             return False
         if forward_batch.batch_size > self.prefill_max_bs:
             return False
@@ -2436,7 +2419,7 @@ class CPUGraphRunner:
         if isinstance(output, LogitsProcessorOutput):
             if output.hidden_states is not None:
                 output.hidden_states = output.hidden_states[:raw_num_tokens]
-            if getattr(output, "last_hidden_states", None) is not None:
+            if output.last_hidden_states is not None:
                 output.last_hidden_states = output.last_hidden_states[:raw_num_tokens]
         return output
 

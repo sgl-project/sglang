@@ -501,10 +501,7 @@ def capture_prefill_graph(
             return result(None)
         if model_runner.is_draft_worker and not force_for_draft_worker:
             return result(None)
-        if (
-            not hasattr(model_runner, "_uses_cpu_graph_attention_backend")
-            or not model_runner._uses_cpu_graph_attention_backend()
-        ):
+        if not model_runner._uses_cpu_graph_attention_backend():
             return result(None)
         if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
             return result(None)
@@ -762,12 +759,9 @@ def capture_decode_graph(
             return no_capture
     except (ValueError, AttributeError):
         pass
-    device = getattr(model_runner, "device", None)
-    if device != "cpu" and check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+    if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
         return no_capture
-    if device == "cpu":
-        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
-            return no_capture
+    if model_runner.device == "cpu":
         try:
             decode_backend = get_exec().graph.cuda_graph_config.decode.backend
         except (ValueError, AttributeError):
@@ -780,7 +774,7 @@ def capture_decode_graph(
                 "only 'full' is supported on CPU."
             )
         if prefill_runner is None:
-            prefill_runner = getattr(model_runner, "prefill_cuda_graph_runner", None)
+            prefill_runner = model_runner.prefill_cuda_graph_runner
         if isinstance(prefill_runner, CPUGraphRunner):
             return GraphCapture(
                 runner=prefill_runner,
@@ -790,10 +784,7 @@ def capture_decode_graph(
             )
         if not get_flags().capture.enable_torch_compile:
             return no_capture
-        if (
-            not hasattr(model_runner, "_uses_cpu_graph_attention_backend")
-            or not model_runner._uses_cpu_graph_attention_backend()
-        ):
+        if not model_runner._uses_cpu_graph_attention_backend():
             return no_capture
         return GraphCapture(
             runner=CPUGraphRunner(model_runner),
