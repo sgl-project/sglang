@@ -13,11 +13,17 @@
 
 namespace sglang {
 
-/// \brief xIELU coefficients after the softplus, constant at inference time.
 struct XIELUParams {
   const void* __restrict__ input;
   void* __restrict__ out;
+  /// fp32 [softplus(alpha_p), beta + softplus(alpha_n), beta, eps], read on device so that
+  /// captured CUDA graphs follow in-place weight updates.
+  const float* __restrict__ coeffs;
   uint32_t num_elems;
+};
+
+/// \brief The effective xIELU coefficients.
+struct XIELUCoeffs {
   float alpha_p;  ///< softplus(alpha_p)
   float alpha_n;  ///< beta + softplus(alpha_n)
   float beta;
@@ -35,7 +41,7 @@ struct XIELUParams {
  * bit-identical to it after the single rounding to the output dtype.
  * min(x, eps) is a select so that NaN propagates as in torch.clamp_max.
  */
-SGL_DEVICE float xielu_f32(float x, const XIELUParams& p) {
+SGL_DEVICE float xielu_f32(float x, const XIELUCoeffs& p) {
   const float beta_x = __fmul_rn(p.beta, x);
   if (x > 0.0f) {
     return __fadd_rn(__fmul_rn(__fmul_rn(p.alpha_p, x), x), beta_x);
@@ -53,20 +59,22 @@ __global__ void xielu_kernel(const __grid_constant__ XIELUParams params) {
   const uint32_t num_vecs = params.num_elems / kVecSize;
   const uint32_t vec_id = blockIdx.x * blockDim.x + threadIdx.x;
   if (vec_id > num_vecs) return;
+  // The coefficients are not written by the preceding kernel, so read them before the wait.
+  const XIELUCoeffs c{params.coeffs[0], params.coeffs[1], params.coeffs[2], params.coeffs[3]};
   PDLWaitPrimary<kUsePDL>();
   if (vec_id < num_vecs) {
     const auto in = load_as<vec_t>(params.input, vec_id);
     vec_t out;
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize; ++i) {
-      out[i] = cast<T>(xielu_f32(cast<fp32_t>(in[i]), params));
+      out[i] = cast<T>(xielu_f32(cast<fp32_t>(in[i]), c));
     }
     store_as<vec_t>(params.out, out, vec_id);
   } else {
     const auto* input = static_cast<const T*>(params.input);
     auto* out = static_cast<T*>(params.out);
     for (uint32_t i = num_vecs * kVecSize; i < params.num_elems; ++i) {
-      out[i] = cast<T>(xielu_f32(cast<fp32_t>(input[i]), params));
+      out[i] = cast<T>(xielu_f32(cast<fp32_t>(input[i]), c));
     }
   }
   PDLTriggerSecondary<kUsePDL>();
@@ -87,10 +95,7 @@ struct XIELUKernel {
   static XIELUParams make_params(
       const tvm::ffi::TensorView input,
       const tvm::ffi::TensorView out,
-      float alpha_p,
-      float alpha_n,
-      float beta,
-      float eps,
+      const tvm::ffi::TensorView coeffs,
       DLDevice* device) {
     using namespace host;
     auto N = SymbolicSize{"num_elems"};
@@ -101,17 +106,18 @@ struct XIELUKernel {
         .with_device(device_)
         .verify(out)
         .verify(input);
+    TensorMatcher({4})  //
+        .with_dtype<fp32_t>()
+        .with_device(device_)
+        .verify(coeffs);
     const auto num_elems = N.unwrap();
     CHECK_HOST(num_elems <= std::numeric_limits<uint32_t>::max()) << "xielu: too many elements: " << num_elems;
     *device = device_.unwrap();
     return XIELUParams{
         .input = input.data_ptr(),
         .out = out.data_ptr(),
+        .coeffs = static_cast<const float*>(coeffs.data_ptr()),
         .num_elems = static_cast<uint32_t>(num_elems),
-        .alpha_p = alpha_p,
-        .alpha_n = alpha_n,
-        .beta = beta,
-        .eps = eps,
     };
   }
 
@@ -120,18 +126,11 @@ struct XIELUKernel {
    *
    * \param input   Contiguous input, flattened
    * \param out     Contiguous output; same shape, dtype and device as `input`
-   * \param alpha_p softplus(alpha_p)
-   * \param alpha_n beta + softplus(alpha_n)
+   * \param coeffs  fp32 [softplus(alpha_p), beta + softplus(alpha_n), beta, eps] on the same device
    */
-  static void
-  run(const tvm::ffi::TensorView input,
-      const tvm::ffi::TensorView out,
-      float alpha_p,
-      float alpha_n,
-      float beta,
-      float eps) {
+  static void run(const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, const tvm::ffi::TensorView coeffs) {
     DLDevice device;
-    const auto params = make_params(input, out, alpha_p, alpha_n, beta, eps, &device);
+    const auto params = make_params(input, out, coeffs, &device);
     if (params.num_elems == 0) return;
     // Use the widest vector that both buffers are aligned to and that still leaves enough
     // threads to fill the GPU: at decode sizes a few elements per thread is latency-bound

@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.activation.xielu import xielu_coeffs, xielu_reference
 from sglang.srt.distributed import (
     divide,
 )
@@ -317,10 +318,11 @@ class XIELU(BaseFusedOp):
 
     ``alpha_p`` and ``alpha_n`` are stored in the checkpoint's pre-softplus
     form. The effective coefficients ``softplus(alpha_p)`` and
-    ``beta + softplus(alpha_n)`` are constant at inference time, so
-    :meth:`update_coefficients` derives them once in fp32 after the weights are
-    loaded, and the CUDA kernel takes them as plain floats. Both paths evaluate
-    the expression in fp32 and round once to the input dtype.
+    ``beta + softplus(alpha_n)`` are constant at inference time, so they are
+    derived once in fp32 into the non-persistent ``_coeffs`` buffer
+    (:meth:`update_coefficients`, after loading weights), which the CUDA kernel
+    reads on device. Both paths evaluate the expression in fp32 and round once
+    to the input dtype.
     """
 
     def __init__(
@@ -344,33 +346,26 @@ class XIELU(BaseFusedOp):
         )
         self.register_buffer("beta", torch.tensor(beta, dtype=dtype))
         self.register_buffer("eps", torch.tensor(eps, dtype=dtype))
+        self.register_buffer(
+            "_coeffs", torch.empty(4, dtype=torch.float32), persistent=False
+        )
         self.update_coefficients()
 
+    @torch.no_grad()
     def update_coefficients(self) -> None:
-        """Derive the effective coefficients; call after loading weights."""
-        beta = self.beta.float()
-        self._alpha_p = F.softplus(self.alpha_p.float()).item()
-        self._alpha_n = (beta + F.softplus(self.alpha_n.float())).item()
-        self._beta = beta.item()
-        self._eps = self.eps.float().item()
+        """Derive the effective coefficients in place; call after loading weights."""
+        self._coeffs.copy_(
+            xielu_coeffs(self.alpha_p, self.alpha_n, self.beta, self.eps)
+        )
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        beta = self.beta.float()
-        alpha_p = F.softplus(self.alpha_p.float())
-        alpha_n = beta + F.softplus(self.alpha_n.float())
-        xf = x.float()
-        out = torch.where(
-            xf > 0,
-            alpha_p * xf * xf + beta * xf,
-            (torch.expm1(torch.clamp_max(xf, self.eps.float())) - xf) * alpha_n
-            + beta * xf,
-        )
-        return out.to(x.dtype)
+        coeffs = xielu_coeffs(self.alpha_p, self.alpha_n, self.beta, self.eps)
+        return xielu_reference(x, coeffs)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.is_contiguous():
+        if x.dtype not in (torch.float16, torch.bfloat16) or not x.is_contiguous():
             return self.forward_native(x)
-        return xielu(x, self._alpha_p, self._alpha_n, self._beta, self._eps)
+        return xielu(x, self._coeffs)
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         # The JIT xielu kernel is CUDA-only and not imported on ROCm.
