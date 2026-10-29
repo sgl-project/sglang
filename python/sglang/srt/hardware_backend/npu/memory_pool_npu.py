@@ -6,6 +6,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SparseKVOffloadMode,
+    get_sparsity_driven_kv_offload_fixed_memory_size,
     resolve_sparse_kv_offload_mode,
 )
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
@@ -17,16 +18,50 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+    from sglang.srt.model_executor.pool_configurator import (
+        MemoryPoolConfig,
+        MemoryPoolConfigurator,
+    )
 
 if is_npu():
     import torch_npu
+
+
+def adjust_sparse_kv_config(
+    kvc: "KVCacheConfigurator",
+    configurator: "MemoryPoolConfigurator",
+    config: "MemoryPoolConfig",
+    budget_bytes: int,
+) -> "MemoryPoolConfig":
+    """Size the index pool alongside sparse device KV and PD staging buffers."""
+    max_running_requests = get_schedule().max_running_requests
+    sparse_buffer_bytes = get_sparsity_driven_kv_offload_fixed_memory_size(
+        model_config=kvc.model_config,
+        use_mla_backend=kvc.use_mla_backend,
+        num_layers=kvc.layer_info.num_effective_layers,
+        element_size=torch._utils._element_size(kvc.kv_cache_dtype),
+        max_running_requests_per_worker=(
+            0
+            if max_running_requests is None
+            else int(max_running_requests) // kvc.attn_dp_size
+        ),
+    )
+    if sparse_buffer_bytes is None:
+        return config
+
+    # Reuse the original byte budget so the configurator charges upstream
+    # scratch exactly once and applies page alignment after sparse buffers.
+    return configurator.calculate_pool_sizes(
+        budget_bytes - sparse_buffer_bytes, get_schedule().page_size
+    )
 
 
 def _mla_fia_nz_scatter_indices(

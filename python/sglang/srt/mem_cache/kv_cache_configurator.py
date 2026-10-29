@@ -3204,6 +3204,12 @@ class KVCacheConfigurator:
         config = configurator.calculate_pool_sizes(
             budget_bytes, get_schedule().page_size
         )
+        if _is_npu and envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                adjust_sparse_kv_config,
+            )
+
+            config = adjust_sparse_kv_config(self, configurator, config, budget_bytes)
         if get_memory().enable_unified_memory:
             # Floor-align to 4096 B: the factories `.view()` the whole uint8
             # buffer as the KV/state dtype, so the total must be a dtype-size

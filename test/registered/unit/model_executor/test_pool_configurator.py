@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.page_interleave import (
     compute_page_shard_scratch_bytes,
     make_page_shard_spec,
@@ -370,9 +371,10 @@ class TestDefaultConfigurator(CustomTestCase):
             with (
                 self.subTest(attn_dp_size=attn_dp_size),
                 mock_cpu_env(),
+                patch("sglang.srt.mem_cache.kv_cache_configurator._is_npu", True),
                 patch.dict(os.environ, {"SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": "1"}),
                 patch(
-                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparsity_driven_kv_offload_fixed_memory_size",
+                    "sglang.srt.hardware_backend.npu.memory_pool_npu.get_sparsity_driven_kv_offload_fixed_memory_size",
                     side_effect=lambda **kwargs: (
                         (kwargs["max_running_requests_per_worker"] + 1)
                         * memory_per_request
@@ -383,14 +385,10 @@ class TestDefaultConfigurator(CustomTestCase):
                     return_value=cell_size,
                 ),
             ):
-                from sglang.srt.model_executor.pool_configurator import (
-                    DefaultPoolConfigurator,
-                )
-
-                configurator = DefaultPoolConfigurator(mr)
-                config = configurator.calculate_pool_sizes(available, page_size)
+                mr._apply_token_constraints.side_effect = lambda tokens: tokens
+                config = KVCacheConfigurator.config_from_budget(mr, available)
                 with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
-                    configurator.calculate_pool_sizes(fixed_memory - 1, page_size)
+                    KVCacheConfigurator.config_from_budget(mr, fixed_memory - 1)
 
                 expected_tokens = ((available - fixed_memory) // cell_size) // page_size
                 self.assertEqual(
@@ -415,6 +413,7 @@ class TestDefaultConfigurator(CustomTestCase):
         index_bytes = 1024 * 128 * 2 * 78
         with (
             mock_cpu_env(),
+            patch("sglang.srt.mem_cache.kv_cache_configurator._is_npu", True),
             get_exec().kernel.override(attention_backend="ascend"),
             get_disagg().override(disaggregation_transfer_backend="ascend"),
             patch.dict(
@@ -430,18 +429,14 @@ class TestDefaultConfigurator(CustomTestCase):
                 return_value=True,
             ),
         ):
-            from sglang.srt.model_executor.pool_configurator import (
-                DefaultPoolConfigurator,
-            )
-
-            configurator = DefaultPoolConfigurator(mr)
-            result = configurator.calculate_pool_sizes(
-                device_kv_bytes + staging_bytes + index_bytes, 128
+            mr._apply_token_constraints.side_effect = lambda tokens: tokens
+            result = KVCacheConfigurator.config_from_budget(
+                mr, device_kv_bytes + staging_bytes + index_bytes
             )
             self.assertEqual(result.max_total_num_tokens, 1024)
             with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
-                configurator.calculate_pool_sizes(
-                    device_kv_bytes + staging_bytes - 1, 128
+                KVCacheConfigurator.config_from_budget(
+                    mr, device_kv_bytes + staging_bytes - 1
                 )
 
     @patch(
