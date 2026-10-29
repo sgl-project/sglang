@@ -216,15 +216,6 @@ def build_capture_verify_lens(
     return [base + 1] * rem + [base] * (num_slots - rem)
 
 
-def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
-    """Layout riding the batch's spec input, or None. Tolerates the runner's
-    ad-hoc replay batch views, which may not carry spec_info at all."""
-    spec_info = getattr(forward_batch, "spec_info", None)
-    if spec_info is None:
-        return None
-    return spec_info.ragged_verify_layout
-
-
 class RaggedTargetVerifyGeometry(msgspec.Struct):
     cache_seqlens_int32: torch.Tensor
     cu_seqlens_q: torch.Tensor
@@ -278,7 +269,7 @@ def compute_target_verify_graph_key(
 
 class VerifyExtendLengths(msgspec.Struct, frozen=True):
     seq_lens_extended: torch.Tensor
-    seq_lens_cpu_extended: List[int]
+    seq_lens_cpu_extended: Optional[List[int]]
     extend_seq_lens_cpu: List[int]
     num_tokens: int
     extend_start_loc: Optional[torch.Tensor]
@@ -287,12 +278,14 @@ class VerifyExtendLengths(msgspec.Struct, frozen=True):
 def compute_uniform_extend_lengths(
     *,
     seq_lens: torch.Tensor,
-    seq_lens_cpu: List[int],
+    seq_lens_cpu: Optional[List[int]],
     extend_len: int,
 ) -> VerifyExtendLengths:
-    batch_size = len(seq_lens_cpu)
+    batch_size = seq_lens.shape[0]
     seq_lens_extended = seq_lens + extend_len
-    seq_lens_cpu_extended = [x + extend_len for x in seq_lens_cpu]
+    seq_lens_cpu_extended = (
+        None if seq_lens_cpu is None else [x + extend_len for x in seq_lens_cpu]
+    )
     extend_seq_lens_cpu = [extend_len] * batch_size
     num_tokens = extend_len * batch_size
     return VerifyExtendLengths(

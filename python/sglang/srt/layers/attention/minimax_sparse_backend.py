@@ -310,6 +310,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._msa_owns_decode = self._use_msa_decode and not (
             self.use_dense_sparse_decode and self.kv_pool.main_pool.head_num == 1
         )
+        # Without NPU kernels or the MSA decode plan, a TARGET_VERIFY step runs the
+        # capture-safe decode kernels with one causal query per draft row.
+        self._linear_verify = not self.is_npu and not self._use_msa_decode
         self.dense_backend: Optional[AttentionBackend] = None
 
         self.index_topk_freq = (
@@ -430,7 +433,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # capture never allocates. num_kv_heads == 1 at TP>=4 for M3.
         if self.index_cache_enabled and (
             forward_batch.forward_mode.is_decode_or_idle()
-            or (self.is_hip and forward_batch.forward_mode.is_target_verify())
+            or (self._linear_verify and forward_batch.forward_mode.is_target_verify())
         ):
             bs = forward_batch.seq_lens.shape[0]
             if forward_batch.forward_mode.is_target_verify():
@@ -457,7 +460,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
             or (
-                (self.is_npu or self.is_hip)
+                (self.is_npu or self._linear_verify)
                 and forward_batch.forward_mode.is_target_verify()
             )
         ):
@@ -466,7 +469,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._max_seqlen_k = self.max_context_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
-            if self.is_hip and forward_batch.forward_mode.is_target_verify():
+            if self._linear_verify and forward_batch.forward_mode.is_target_verify():
                 self._max_seqlen_k += self.speculative_num_draft_tokens
 
         # Build plan + page table eager (outside capture) so captured forward_decode
@@ -555,7 +558,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self._msa_dec_meta = (kv_indices_buf, plan)
 
-    def _init_rocm_linear_verify_metadata(self, forward_batch: ForwardBatch):
+    def _init_linear_verify_metadata(self, forward_batch: ForwardBatch):
         ndt = self.speculative_num_draft_tokens
         # GPU seq_lens are the accepted prefix lengths. A linear EAGLE
         # chain exposes one more KV token to each successive query.
@@ -572,8 +575,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         if not self.is_npu:
-            if self.is_hip and forward_batch.forward_mode.is_target_verify():
-                self._init_rocm_linear_verify_metadata(forward_batch)
+            if self._linear_verify and forward_batch.forward_mode.is_target_verify():
+                self._init_linear_verify_metadata(forward_batch)
             return
         # Layer-invariant decode/verify metadata as captured ops (re-read at replay).
         fm = forward_batch.forward_mode
@@ -1460,7 +1463,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_v: Optional[torch.Tensor],
         out_quant: str = "",
     ):
-        if self.is_hip and forward_batch.forward_mode.is_target_verify():
+        if self._linear_verify and forward_batch.forward_mode.is_target_verify():
             meta = self._linear_verify_meta
             if meta is None or meta.seq_lens.numel() != q.shape[0]:
                 raise RuntimeError("Missing MiniMax-M3 linear verify metadata")
@@ -1499,7 +1502,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 layer.idx_k_scale_float,
                 layer.idx_v_scale_float,
             )
-        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_pool.layer_router.read(layer.layer_id).kv()
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
@@ -1751,7 +1754,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 layer.idx_k_scale_float,
                 layer.idx_v_scale_float,
             )
-        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_pool.layer_router.read(layer.layer_id).kv()
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
@@ -1895,7 +1898,7 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     ):
         self.dense = dense_backend
         self.sparse = sparse_backend
-        self.kv_index_translator = dense_backend.kv_index_translator
+        self.runner_ids = dense_backend.runner_ids
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
