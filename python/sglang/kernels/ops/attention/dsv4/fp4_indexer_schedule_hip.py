@@ -62,7 +62,34 @@ def _pad_page_table_tile(
     tl.store(dst_ptr + row * dst_stride + cols, vals, mask=inside)
 
 
-@triton.jit
+# Every runtime argument tracks the batch: the row count, the table width and strides,
+# and pointers into row-sliced tables and the shared scratch, whose 16-byte alignment
+# moves with the row offset. Specialized, each new combination of ints equal to 1 or
+# divisible by 16 and of pointer alignments would compile a variant (up to ~1.4 s)
+# mid-serving, so BLOCK_T is the only thing left to key on.
+@triton.jit(
+    do_not_specialize=[
+        "pt_src_stride",
+        "pt_dst_stride",
+        "T",
+        "P",
+        "s_max",
+        "w_src",
+        "w_dst",
+        "pt_tiles_per_row",
+    ],
+    do_not_specialize_on_alignment=[
+        "le_ptr",
+        "chunks_ptr",
+        "incl_ptr",
+        "excl_ptr",
+        "rb_ptr",
+        "ls_ptr",
+        "scalars_ptr",
+        "pt_src_ptr",
+        "pt_dst_ptr",
+    ],
+)
 def _prefill_schedule_prep_kernel(
     le_ptr,  # [T] int32  local_ends (== c4_seq_lens)
     chunks_ptr,  # [T] int32  out
@@ -147,7 +174,10 @@ def _prefill_schedule_prep_kernel(
         )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["src_stride", "dst_stride", "w_src", "w_dst"],
+    do_not_specialize_on_alignment=["src_ptr", "dst_ptr"],
+)
 def _pad_page_table_kernel(
     src_ptr,
     dst_ptr,
@@ -379,6 +409,34 @@ def build_prefill_schedule(
         BLOCK_P=BLOCK_P,
     )
     return guarded_out, buffers
+
+
+def warmup_prefill_schedule(device: torch.device) -> None:
+    """Compile the prefill schedule's kernels before the engine serves.
+
+    The prep kernel keys on BLOCK_T alone, a power of two from 16 to MAX_FUSED_ROWS, and
+    the standalone pad on nothing, so one build per bucket covers every batch; serving
+    would otherwise compile each the first time a batch lands in its bucket.
+    """
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        CTA_INFO_WIDTH,
+    )
+
+    page_table = torch.zeros((MAX_FUSED_ROWS, 1), dtype=torch.int32, device=device)
+    local_ends = torch.zeros(MAX_FUSED_ROWS, dtype=torch.int32, device=device)
+    pad_page_table(page_table[:1])
+    rows = 16
+    while rows <= MAX_FUSED_ROWS:
+        build_prefill_schedule(
+            page_table=page_table[:rows],
+            local_ends=local_ends[:rows],
+            cta_info_out=torch.empty(
+                (rows, CTA_INFO_WIDTH), dtype=torch.int32, device=device
+            ),
+            parallel_unit_num=rows,
+            max_seq_len=_KV_BLOCK_SIZE,
+        )
+        rows *= 2
 
 
 # Rows per block of the decode prep kernel's loops: its registers stay fixed as the
