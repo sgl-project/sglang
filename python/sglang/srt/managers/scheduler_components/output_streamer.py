@@ -518,10 +518,6 @@ class _GenerationStreamAccumulator:
             # Per-step header columns of `push_generation`.
             self.prompt_tokens.append(len(req.origin_input_ids))
             self.cached_tokens.append(req.cached_tokens)
-            # Multimodal prompt token counts. In disagg decode mode the prefill node
-            # already computed these and transferred them via the metadata buffer
-            # (req.mm_*), so prefer the pre-stored values; otherwise compute them
-            # from the request's multimodal items.
             image_t, audio_t, video_t = req.get_mm_token_counts()
             self.image_tokens.append(image_t)
             self.audio_tokens.append(audio_t)

@@ -621,8 +621,6 @@ class TestOutputStreamerRequestStats(unittest.TestCase):
         self.addCleanup(observability.stop)
 
     def test_request_stats_carry_time_stats_only_with_metrics_on(self):
-        """With metrics on a request's stats carry its time stats, None for
-        a request whose own metrics are off; with metrics off it carries none."""
         timed = SchedulerReqTimeStats(enable_metrics=True)
         timed.queue_duration_s = 0.25
 
@@ -674,8 +672,6 @@ class TestOutputStreamerRequestStats(unittest.TestCase):
         self.assertEqual(finished.time_stats.queue_time, 0.5)
 
     def test_take_request_stats_due(self):
-        """Request stats are due on the first call, the first call after each
-        retraction, and every call once the request finished."""
         req = _metered_req()
         self.assertTrue(req.take_request_stats_due())
         self.assertFalse(req.take_request_stats_due())

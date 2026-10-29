@@ -282,7 +282,7 @@ class ReqState:
     # For performance metrics
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
-    # The latest request stats the scheduler sent; it sends only changes.
+    # The latest stats the scheduler sent; see RequestOutputStats for when.
     request_stats: Optional[RequestOutputStats] = None
     ttft_observed: bool = False
 

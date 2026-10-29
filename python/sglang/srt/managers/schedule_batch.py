@@ -1675,10 +1675,9 @@ class Req(ReqDllmMixin):
         return self.finished_reason is not None
 
     def take_request_stats_due(self) -> bool:
-        """Whether this output row carries the request's stats; records the send
-        when it does. The tokenizer keeps each request's latest stats. They go
-        out with the first output, the first output after each retraction, and
-        the finished row, so the final output reports the final values."""
+        """Whether this output row carries the request's stats, recording the
+        send: due on the first output, the first after each retraction, and the
+        finished row."""
         if (
             self.request_stats_retraction_count != self.retraction_count
             or self.finished()
