@@ -20,6 +20,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import msgspec
+import orjson
 import psutil
 
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
@@ -43,6 +44,7 @@ from sglang.srt.utils.flatten import (
     NestedRowColumns,
     RaggedPairColumns,
 )
+from sglang.srt.utils.json_response import ORJSON_RESPONSE_OPTIONS
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 if TYPE_CHECKING:
@@ -100,6 +102,9 @@ class RustServer:
         # The engine-level startup timings `/server_info` reports, set once
         # the scheduler finishes initializing (see `set_startup_time`).
         self.startup_time: Optional[Dict[str, Any]] = None
+        # Batches whose customized_info could not be sent (see
+        # `_customized_info_json`).
+        self._dropped_customized_info = 0
 
     @classmethod
     def _health_generate_headers(cls, scheduler: Scheduler) -> Dict[str, str]:
@@ -514,9 +519,12 @@ class RustServer:
             the shape metadata for the optional families (``*_lens`` element counts
             for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
             and hidden ones), then the finished requests' weight-version
-            spans, a multimodal model's media token counts, and
+            spans, a multimodal model's media token counts,
             ``decode_latencies`` (by row: a finished non-streaming request's
-            decode latency in seconds).
+            decode latency in seconds), and the scheduler's
+            ``customized_info`` (per key, each request's values for its new
+            output tokens) as one JSON text, which the frontend accumulates
+            and reports in ``meta_info`` as Python's TokenizerManager does.
           - ``data``: the raw little-endian numeric buffer: the token ids
             first, as the 8-byte ``array("q")`` bytes the scheduler already
             holds, then every logprob / hidden column as 4-byte elements
@@ -664,10 +672,11 @@ class RustServer:
             )
 
         # After the extras: the finished requests' weight-version spans (None
-        # for the others), a multimodal model's media token counts and the
-        # finished requests' decode latencies, each empty when nothing in the
-        # batch carries it. Only the last is built here, for finished rows; the
-        # header stops at its last non-empty column.
+        # for the others), a multimodal model's media token counts, the
+        # finished requests' decode latencies and the customized_info columns,
+        # each empty when nothing in the batch carries it. Only the latencies
+        # are built here, for finished rows; the header stops at its last
+        # non-empty column.
         latencies = []
         if decode_latencies:
             latencies = [None] * len(rids)
@@ -680,6 +689,8 @@ class RustServer:
             (payload.audio_tokens or []) if media else [],
             (payload.video_tokens or []) if media else [],
             latencies,
+            [],  # abort_outputs, push_abort's column
+            self._customized_info_json(payload.customized_info),
         ]
         while trailing and not trailing[-1]:
             trailing.pop()
@@ -696,6 +707,30 @@ class RustServer:
                 "Rust egress closed; dropped batch of %d requests during shutdown",
                 len(rids),
             )
+
+    def _customized_info_json(self, customized_info: Optional[dict]) -> bytes:
+        """The batch's customized_info as the JSON text Python's responses
+        carry it in (orjson, with `dumps_json`'s options), a value orjson has
+        no form for as its `str`; empty when there is none. A batch even that
+        cannot encode (say, an int past 64 bits) goes without it, logged, so a
+        model's values never fail the scheduler step."""
+        if not customized_info:
+            return b""
+        try:
+            return orjson.dumps(
+                customized_info, option=ORJSON_RESPONSE_OPTIONS, default=str
+            )
+        except orjson.JSONEncodeError as error:
+            self._dropped_customized_info += 1
+            count = self._dropped_customized_info
+            if count & (count - 1) == 0:
+                logger.warning(
+                    "Dropped customized_info the Rust frontend cannot send "
+                    "(%d batches so far): %s",
+                    count,
+                    error,
+                )
+            return b""
 
     @classmethod
     def _build_mm_spec(cls, spec: RustMmSpec) -> MmSpec:
