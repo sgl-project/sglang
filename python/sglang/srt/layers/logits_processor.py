@@ -70,6 +70,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import (
     is_cpu,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
     is_pin_memory_available,
@@ -81,6 +82,19 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+# On gfx1250, torch.mm for a bf16 lm_head is slower than aiter's GEMM.
+_use_aiter_lm_head = is_hip() and envs.SGLANG_USE_AITER.get() and is_gfx1250_supported()
+if _use_aiter_lm_head:
+    from aiter.tuned_gemm import tgemm
+
+
+def _aiter_lm_head_ok(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (
+        _use_aiter_lm_head
+        and hidden_states.dim() == 2
+        and hidden_states.dtype == weight.dtype == torch.bfloat16
+    )
+
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
@@ -476,7 +490,6 @@ class LogitsProcessor(nn.Module):
         self.use_fp32_lm_head_output = getattr(
             config, "enable_lm_head_output_fp32", False
         )
-        self.use_aiter_lm_head = envs.SGLANG_OPT_AITER_LM_HEAD.get() and _is_hip
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
@@ -1198,10 +1211,8 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
-            elif self.use_aiter_lm_head and lm_head.weight.dtype == torch.bfloat16:
-                from aiter.tuned_gemm import tgemm
-
-                logits = tgemm.mm(hidden_states.to(torch.bfloat16), lm_head.weight, None)
+            elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
+                logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T

@@ -263,6 +263,9 @@ def test_non_lightning_minicpm_is_not_classified_as_linear_attention():
 def test_lightning_backend_reads_structural_linear_config(monkeypatch):
     def fake_base_init(self, model_runner):
         self.topk = 1
+        self.state_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(conv=[torch.empty(0)])
+        )
 
     monkeypatch.setattr(MambaAttnBackendBase, "__init__", fake_base_init)
     config = SimpleNamespace(
@@ -272,11 +275,6 @@ def test_lightning_backend_reads_structural_linear_config(monkeypatch):
         lightning_layerwise_decay=False,
     )
     model_runner = SimpleNamespace(
-        req_to_token_pool=SimpleNamespace(
-            mamba_pool=SimpleNamespace(
-                mamba_cache=SimpleNamespace(conv=[torch.empty(0)])
-            )
-        ),
         sliding_window_size=None,
         model_config=SimpleNamespace(
             hf_config=config,
