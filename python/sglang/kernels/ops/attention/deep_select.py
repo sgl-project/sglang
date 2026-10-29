@@ -80,15 +80,11 @@ _NORMAL_CONFIGS: Dict[Tuple[torch.dtype, int], Tuple[_Config, ...]] = {
 }
 SUPPORTED_CUDA_ARCHS = ((9, 0), (10, 0), (10, 3))
 
-# A third, denser tier for the paged-indexer path. One row is one CTA, so the kernel runs
-# ceil(rows / (SMs * occupancy)) rounds; raising occupancy to 3 moves that grid and can remove a
-# whole round. Paying for it means fitting the plan under (opt-in smem)/3, which caps
-# reconstruct_threshold at 2048 and so costs per-CTA throughput -- `TopkNormal` therefore takes
-# this tier only when it saves a round. A threshold that small leaves NUM_EXTRA_SLOTS too small for
-# the index-sort window delta table, so the tier is only offered when nothing sorts by index.
-_DENSE_CONFIGS: Dict[Tuple[torch.dtype, int], _Config] = {
-    (torch.bfloat16, 512): _Config(512, 256, 3, 4096, 2048, 2),
-}
+# A third tier at 3 CTAs/SM, taken only when that removes a round (see `TopkNormal`). Its
+# threshold is the largest that fits (opt-in smem)/3, and too small for the index-sort window
+# delta table, so it is offered only where nothing sorts by index.
+_DENSE_BUCKET = (torch.bfloat16, 512)
+_DENSE_CONFIG = _Config(512, 256, 3, 4096, 2048, 2)
 
 
 # (max rows, cluster size), widest first: the most rows each cluster size runs in one wave
@@ -140,10 +136,12 @@ def _jit_deep_select_module(
     if cluster_size == 1:
         configs = _NORMAL_CONFIGS[(value_dtype, max_topk)]
         host_dispatch = "TopkNormal"
-        offer_dense = page_transform and not sorted_index
-        dense = _DENSE_CONFIGS.get((value_dtype, max_topk)) if offer_dense else None
-        if dense is not None and len(configs) == 2:
-            configs = (*configs, dense)
+        if (
+            page_transform
+            and not sorted_index
+            and (value_dtype, max_topk) == _DENSE_BUCKET
+        ):
+            configs = (*configs, _DENSE_CONFIG)
     else:
         # Upstream tunes the cluster kernel for bf16 at max_topk 1024 alone, so
         # the 512 and 1024 buckets share this module.
