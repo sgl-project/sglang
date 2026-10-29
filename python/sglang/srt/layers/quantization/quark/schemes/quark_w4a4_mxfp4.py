@@ -1031,7 +1031,10 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
         assert w.dtype == torch.bfloat16 and n % 256 == 0 and k % 256 == 0, (
             f"online MXFP4 needs a BF16 weight with N, K % 256 == 0, got {w.dtype} {n}x{k}"
         )
-        w_q, w_s = _dynamic_mxfp4_quant_orig(_block_hadamard32(w) if hadamard else w)
+        method = cls(hadamard)
+        w_q, w_s = _dynamic_mxfp4_quant_orig(
+            _block_hadamard32(w) if method.hadamard else w
+        )
         layer.weight = torch.nn.Parameter(
             shuffle_weight(w_q.view(torch.uint8), layout=(16, 16)),
             requires_grad=False,
@@ -1042,7 +1045,7 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
         layer.mxfp4_preshuffle_tuned = _get_config(
             cls.PRESHUFFLE_MAX_M, n, k // 2, True
         )[1]
-        layer.quant_method = cls(hadamard)
+        layer.quant_method = method
 
     def create_weights(self, *args, **kwargs):
         raise NotImplementedError("use quantize_() on a loaded BF16 linear")
