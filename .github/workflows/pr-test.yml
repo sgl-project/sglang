@@ -403,20 +403,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {
-              runner_config: 4-gpu-h100,
-              run_timeout: '30',
-              timeout_per_file: '',
-              warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4',
-              warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4',
-            }
-          - {
-              runner_config: 8-gpu-h200,
-              run_timeout: '30',
-              timeout_per_file: '1800',
-              warmup_deep_gemm_models: 'deepseek-ai/DeepSeek-V3-0324:8 deepseek-ai/DeepSeek-V3.2:8 zai-org/GLM-5-FP8:8 XiaomiMiMo/MiMo-V2-Flash:4 XiaomiMiMo/MiMo-V2.5:8',
-              warmup_timeout: '60',
-            }
+          - { runner_config: 4-gpu-h100, run_timeout: '30', timeout_per_file: '' }
+          - { runner_config: 8-gpu-h200, run_timeout: '30', timeout_per_file: '1800' }
           - { runner_config: 8-gpu-h20, run_timeout: '30', timeout_per_file: '' }
           - { runner_config: 4-gpu-b200, run_timeout: '30', timeout_per_file: '1800' }
           - { runner_config: 8-gpu-b300, run_timeout: '60', timeout_per_file: '3600' }
@@ -429,10 +417,6 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: ${{ matrix.run_timeout }}
       timeout_per_file: ${{ matrix.timeout_per_file }}
-      warmup_deep_gemm_models: ${{ matrix.warmup_deep_gemm_models }}
-      warmup_server_models: ${{ matrix.warmup_server_models }}
-      # Rows that do not set it keep _pr-test-stage.yml's own default.
-      warmup_timeout_minutes: ${{ matrix.warmup_timeout || '25' }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
@@ -446,6 +430,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - { runner_config: 2-gpu-gb300, run_timeout: '30', timeout_per_file: '1800' }
           - { runner_config: 4-gpu-gb300, run_timeout: '30', timeout_per_file: '1800' }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
