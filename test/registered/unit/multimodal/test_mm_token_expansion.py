@@ -18,6 +18,7 @@ TokenSpaceProcessor.process(media, IDs)
   processor_output / precomputed_embedding source -> ValueError
   bare source instead of a list -> TypeError
   strategy loading options -> load kwargs
+  worker_thread_device d, no processor pool -> inline processing on device d
 """
 
 import asyncio
@@ -245,6 +246,25 @@ class TestTokenSpaceProcessor(unittest.TestCase):
                         [{"format": media_format}], input_ids=[1, IMAGE]
                     )
                 )
+
+    def test_inline_processing_runs_on_the_device_the_caller_passes(self):
+        """With one processor worker there is no pool, so the caller's thread decodes on cuda:0."""
+        with (
+            patch("torch.cuda.set_device"),  # bound into the IO threads' initializer
+            patch("torch.cuda.device") as device,
+        ):
+            processor = TokenSpaceProcessor.for_strategy(_ImageWidthStrategy)(
+                None,
+                _bare_tokenizer(),
+                processor_config=MultimodalProcessorConfig(mm_processor_worker_num=1),
+                worker_thread_device=3,
+            )
+            self.addCleanup(processor.shutdown)
+            asyncio.run(
+                processor.process([Image.new("RGB", (2, 1))], input_ids=[1, IMAGE])
+            )
+        self.assertEqual(device.call_count, 2)  # the item, then the output
+        device.assert_called_with(3)
 
     def test_media_sources_must_be_lists(self):
         # A bare source would otherwise be iterated item by item, e.g. a URL per character.
