@@ -47,6 +47,7 @@ def _build(
     gamma=None,
     replay=None,
     ple=False,
+    fused_draft=None,
     window_with_state=False,
 ):
     setup_allocator_context()
@@ -90,6 +91,7 @@ def _build(
         speculative_num_draft_tokens=gamma,
         request_parts=requests,
         derived_parts=derived,
+        fused_draft=fused_draft,
     )
     inputs = KVSizingInputs(
         full_tokens=256,
@@ -912,6 +914,148 @@ class TestDeclaredParts(CustomTestCase):
                 tensor.stride(0) * tensor.itemsize,
                 plan.sub_pool("mamba").spec.entry_bytes(),
             )
+
+    def test_retraction_carries_whole_entries_derived_pages_and_request_parts(self):
+        from unittest.mock import patch
+
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        class BoundedGather(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                result = func(*args, **(kwargs or {}))
+                if func == torch.ops.aten.index_select.default:
+                    assert result.numel() * result.element_size() <= 256
+                return result
+
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftStateGeometry,
+            DraftStateRegion,
+            FusedDraftPlacement,
+        )
+
+        for with_state in (False, True):
+            with self.subTest(state=with_state):
+                regions = {
+                    "full": DenseDraftRegion(
+                        lane_num=2,
+                        head_num=1,
+                        head_dim=3,
+                        v_head_dim=5,
+                        store_dtype=torch.bfloat16,
+                    )
+                }
+                if with_state:
+                    regions["mamba"] = DraftStateRegion(
+                        lane_num=1,
+                        state=DraftStateGeometry(
+                            conv_state_shapes=((1, 3),),
+                            conv_dtype=torch.bfloat16,
+                            temporal_state_shape=(3,),
+                            temporal_dtype=torch.float32,
+                        ),
+                    )
+                placement = FusedDraftPlacement.from_counts(
+                    counts={
+                        name: [region.lane_num] for name, region in regions.items()
+                    },
+                    regions=regions,
+                )
+                storage, _, _ = _build(
+                    state=with_state,
+                    fused_draft=placement,
+                    derived=(
+                        DerivedPartDecl(
+                            sub_pool="full",
+                            part=TensorPartDecl(
+                                name="index",
+                                shape=(528,),
+                                dtype=torch.uint8,
+                                layer_ids=(0,),
+                            ),
+                        ),
+                    ),
+                    requests=(
+                        RequestPartDecl(
+                            part=TensorPartDecl(
+                                name="pending", shape=(3,), dtype=torch.int32
+                            )
+                        ),
+                    ),
+                )
+                allocator = storage.allocator
+                source = allocator.alloc(16)
+                state_ids = allocator.alloc_state_slots(1) if with_state else None
+                (request_row,) = storage.take_rows(1)
+                storage.request_memory.tensors["pending"][request_row].fill_(97)
+                original = {}
+                for n, band in enumerate(allocator.members):
+                    ids = (
+                        state_ids
+                        if band.sub_pool_name == allocator.roles.state
+                        else source
+                    )
+                    physical = band.ids.translate(ids.to(torch.int64))
+                    value = n + 17
+                    allocator.arena.entries(band.sub_pool_name)[physical] = value
+                    original[band.sub_pool_name] = value
+                blob = allocator.arena.page_parts["full"].tensors["index"]
+                src_pages = allocator.full_attn_allocator.ids.virtual_to_physical[
+                    source[::4] // 4
+                ]
+                blob[:, src_pages] = 83
+                with (
+                    patch(
+                        "sglang.srt.mem_cache.kv.memory.snapshot._COPY_CHUNK_BYTES",
+                        256,
+                        create=True,
+                    ),
+                    BoundedGather(),
+                ):
+                    saved = allocator.get_cpu_copy(
+                        source, mamba_indices=state_ids, req_pool_index=request_row
+                    )
+                # A distinct allocation changes both virtual and physical rows.
+                destination = allocator.alloc(16)
+                new_state = allocator.alloc_state_slots(1) if with_state else None
+                (new_row,) = storage.take_rows(1)
+                if not with_state:
+                    allocator.free_swa_segment(destination[:4], start_pos=0)
+                with (
+                    patch(
+                        "sglang.srt.mem_cache.kv.memory.snapshot._COPY_CHUNK_BYTES",
+                        256,
+                        create=True,
+                    ),
+                    BoundedGather(),
+                ):
+                    allocator.load_cpu_copy(
+                        saved,
+                        destination,
+                        mamba_indices=new_state,
+                        req_pool_index=new_row,
+                    )
+                for band in allocator.members:
+                    ids = (
+                        new_state
+                        if band.sub_pool_name == allocator.roles.state
+                        else destination
+                    )
+                    physical = band.ids.translate(ids.to(torch.int64))
+                    physical = physical[physical > 0]
+                    self.assertTrue(
+                        torch.all(
+                            allocator.arena.entries(band.sub_pool_name)[physical]
+                            == original[band.sub_pool_name]
+                        )
+                    )
+                pages = allocator.full_attn_allocator.ids.virtual_to_physical[
+                    destination[::4] // 4
+                ]
+                self.assertTrue(torch.all(blob[:, pages] == 83))
+                self.assertTrue(
+                    torch.all(storage.request_memory.tensors["pending"][new_row] == 97)
+                )
 
     def test_sparse_page_regions_and_request_ring_reuse(self):
         # Packed DSA pages put all 128-byte keys before the 4-byte scales;
