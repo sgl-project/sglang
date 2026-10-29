@@ -34,7 +34,7 @@ _NEXTN_LOCAL_EXPERTS = {
     (4, 2): 64,
     (8, 1): 32,
 }
-_KERNEL_PACKAGE = "sglang.srt.layers.moe.gluon_kernels.glm_mxfp4"
+_KERNEL_PACKAGE = "sglang.kernels.ops.moe.gluon_moe_gfx950"
 _LOGGED_SHARED_MODES = set()
 logger = logging.getLogger(__name__)
 
