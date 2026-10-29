@@ -4,6 +4,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
+    FullXPUGraphBackend,
+)
 from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
@@ -95,6 +98,48 @@ class TestXPUGraphMetadata(CustomTestCase):
                 expected_swa_pages,
             )
         )
+        # During capture, swa_out_cache_loc is zeroed and max_seq_len_k is baked to max_context_len
+        self.assertEqual(
+            backend.full_cg_prefill_metadata.max_seq_len_k, max_context_len
+        )
+        self.assertTrue(
+            torch.equal(
+                backend.full_cg_prefill_metadata.swa_out_cache_loc,
+                torch.zeros(4, dtype=torch.int64),
+            )
+        )
+
+        # Replay (in_capture=False) with prefix hit (seq_lens != extend_seq_lens) and shorter out_cache_loc:
+        # verifies separate cu_seqlens_q/k buffers, dynamic max_seq_len_k update, and swa_out_cache_loc translation + tail zeroing
+        replay_batch = SimpleNamespace(
+            batch_size=2,
+            seq_lens=torch.tensor([32, 0], dtype=torch.int32),
+            extend_seq_lens=torch.tensor([16, 0], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([32, 0], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0, 0], dtype=torch.int64),
+            out_cache_loc=torch.tensor([10, 20], dtype=torch.int64),
+            positions=torch.arange(2, dtype=torch.int64),
+        )
+        backend._init_full_cg_prefill_metadata(replay_batch, in_capture=False)
+        m = backend.full_cg_prefill_metadata
+        self.assertEqual(m.max_seq_len_k, 32)
+        self.assertTrue(
+            torch.equal(m.cu_seqlens_k, torch.tensor([0, 32, 32], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(m.cu_seqlens_q, torch.tensor([0, 16, 16], dtype=torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(
+                m.swa_out_cache_loc, torch.tensor([1010, 1020], dtype=torch.int64)
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                backend.full_cg_prefill_swa_out_cache_loc[2:],
+                torch.zeros(2, dtype=torch.int64),
+            )
+        )
 
     def test_forward_extend_hybrid_swa_and_irope_rejection(self):
         backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
@@ -147,42 +192,6 @@ class TestXPUGraphMetadata(CustomTestCase):
     def test_prefill_cuda_graph_runner_rejects_attention_chunk_size_under_full_graph(
         self,
     ):
-        class _FakeModelRunner:
-            device = "cpu"
-            is_draft_worker = False
-            attention_chunk_size = 512
-            attn_backend = SimpleNamespace(
-                attention_chunk_size=512,
-                dllm_attention=None,
-                prefill_cuda_graph_default_max_seq_len=None,
-            )
-            req_to_token_pool = SimpleNamespace(
-                size=16,
-                req_to_token=torch.zeros((16, 64), dtype=torch.int32),
-            )
-            model_config = SimpleNamespace(
-                is_multimodal=False,
-                hidden_size=64,
-                hf_config=SimpleNamespace(model_type=None),
-            )
-            model = SimpleNamespace(quant_config=None)
-            lora_manager = None
-            is_generation = True
-            spec_algorithm = SimpleNamespace(
-                is_eagle=lambda: False,
-                is_dflash_family=lambda: False,
-            )
-            dtype = torch.float16
-            pp_group = SimpleNamespace(is_first_rank=True)
-            get_pp_proxy_topk_size = lambda self: 0
-            get_pp_proxy_residual_num_blocks = lambda self: 0
-            get_pp_proxy_dspark_hidden_size = lambda self: 0
-            attn_tp_sequence_sharded = lambda self: False
-            attention_layers = []
-            mha_companion_layers = []
-            moe_layers = []
-            moe_fusions = []
-
         override = get_context().override_server_args(
             cuda_graph_config=CudaGraphConfig(
                 prefill=PhaseConfig(
@@ -196,98 +205,62 @@ class TestXPUGraphMetadata(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-        with (
-            patch(
-                "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.resolve_prefill_backend",
-                return_value=SimpleNamespace(),
-            ),
-            patch(
-                "sglang.srt.model_executor.runner.prefill_cuda_graph_runner._is_full_graph_backend",
-                return_value=True,
-            ),
-            self.assertRaisesRegex(
-                ValueError,
-                "Full prefill CUDA/XPU graph does not support models with attention_chunk_size",
-            ),
-        ):
-            PrefillCudaGraphRunner(_FakeModelRunner())
+        for owner_name in ("model_runner", "model_config", "attn_backend"):
+            with self.subTest(owner=owner_name):
 
-    def test_prefill_cuda_graph_runner_rejects_irope_under_full_graph(self):
-        class _FakeLayer:
-            use_irope = True
+                class _FakeModelRunner:
+                    device = "cpu"
+                    is_draft_worker = False
+                    attention_chunk_size = 512 if owner_name == "model_runner" else None
+                    attn_backend = SimpleNamespace(
+                        attention_chunk_size=(
+                            512 if owner_name == "attn_backend" else None
+                        ),
+                        dllm_attention=None,
+                        prefill_cuda_graph_default_max_seq_len=None,
+                    )
+                    req_to_token_pool = SimpleNamespace(
+                        size=16,
+                        req_to_token=torch.zeros((16, 64), dtype=torch.int32),
+                    )
+                    model_config = SimpleNamespace(
+                        is_multimodal=False,
+                        hidden_size=64,
+                        attention_chunk_size=(
+                            512 if owner_name == "model_config" else None
+                        ),
+                        hf_config=SimpleNamespace(model_type=None),
+                    )
+                    model = SimpleNamespace(quant_config=None)
+                    lora_manager = None
+                    is_generation = True
+                    spec_algorithm = SimpleNamespace(
+                        is_eagle=lambda: False,
+                        is_dflash_family=lambda: False,
+                    )
+                    dtype = torch.float16
+                    pp_group = SimpleNamespace(is_first_rank=True)
+                    get_pp_proxy_topk_size = lambda self: 0
+                    get_pp_proxy_residual_num_blocks = lambda self: 0
+                    get_pp_proxy_dspark_hidden_size = lambda self: 0
+                    attn_tp_sequence_sharded = lambda self: False
+                    attention_layers = []
+                    mha_companion_layers = []
+                    moe_layers = []
+                    moe_fusions = []
 
-        class _FakeModel:
-            quant_config = None
-
-            def modules(self):
-                return [_FakeLayer()]
-
-        class _FakeModelRunner:
-            device = "cpu"
-            is_draft_worker = False
-            attention_chunk_size = 512
-            attn_backend = SimpleNamespace(
-                attention_chunk_size=512,
-                dllm_attention=None,
-                prefill_cuda_graph_default_max_seq_len=None,
-            )
-            req_to_token_pool = SimpleNamespace(
-                size=16,
-                req_to_token=torch.zeros((16, 64), dtype=torch.int32),
-            )
-            model_config = SimpleNamespace(
-                is_multimodal=False,
-                hidden_size=64,
-                attention_chunk_size=512,
-                hf_config=SimpleNamespace(model_type=None),
-            )
-            model = _FakeModel()
-            lora_manager = None
-            is_generation = True
-            spec_algorithm = SimpleNamespace(
-                is_eagle=lambda: False,
-                is_dflash_family=lambda: False,
-            )
-            dtype = torch.float16
-            pp_group = SimpleNamespace(is_first_rank=True)
-            get_pp_proxy_topk_size = lambda self: 0
-            get_pp_proxy_residual_num_blocks = lambda self: 0
-            get_pp_proxy_dspark_hidden_size = lambda self: 0
-            attn_tp_sequence_sharded = lambda self: False
-            attention_layers = []
-            mha_companion_layers = []
-            moe_layers = []
-            moe_fusions = []
-
-        override = get_context().override_server_args(
-            cuda_graph_config=CudaGraphConfig(
-                prefill=PhaseConfig(
-                    backend="full",
-                    bs=[1],
-                    max_context_size=64,
-                    full_prefill_max_req=1,
-                )
-            ),
-        )
-        override.install()
-        self.addCleanup(override.restore)
-
-        with (
-            patch(
-                "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.resolve_prefill_backend",
-                return_value=SimpleNamespace(),
-            ),
-            patch(
-                "sglang.srt.model_executor.runner.prefill_cuda_graph_runner._is_full_graph_backend",
-                return_value=True,
-            ),
-            self.assertRaisesRegex(
-                ValueError,
-                "Full prefill CUDA/XPU graph does not support models with "
-                "attention_chunk_size or use_irope",
-            ),
-        ):
-            PrefillCudaGraphRunner(_FakeModelRunner())
+                with (
+                    patch(
+                        "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.resolve_prefill_backend",
+                        return_value=FullXPUGraphBackend.__new__(FullXPUGraphBackend),
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "Full prefill CUDA/XPU graph does not support models with "
+                        "attention_chunk_size or use_irope",
+                    ),
+                ):
+                    PrefillCudaGraphRunner(_FakeModelRunner())
 
 
 if __name__ == "__main__":

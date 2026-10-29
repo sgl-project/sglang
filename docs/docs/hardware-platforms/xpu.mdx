@@ -287,7 +287,7 @@ python -m sglang.launch_server \
 
 | Argument | XPU allowed values | Default | Description |
 |---|---|---|---|
-| `--cuda-graph-backend-decode` | `full`, `breakable`, `disabled` | `disabled` | Backend for the decode phase. Set to `full` or `breakable` to enable. |
+| `--cuda-graph-backend-decode` | `full`, `disabled` | `disabled` | Backend for the decode phase. Set to `full` to enable. |
 | `--cuda-graph-backend-prefill` | `full`, `breakable`, `disabled` | `disabled`* | Backend for the prefill phase. Set to `full` or `breakable` explicitly to enable. |
 | `--cuda-graph-bs-prefill` | list of ints | auto | Explicit token-length buckets to capture for prefill. |
 | `--cuda-graph-bs-decode` | list of ints | auto | Explicit batch sizes to capture for decode. |
@@ -306,6 +306,7 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 |---|---|
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
 | Speculative decoding | Supported |
+| Decode breakable graph (`--cuda-graph-backend-decode breakable`) | Not yet supported |
 
 ## Decode Context Parallel (DCP) on Intel XPU [Experimental]
 

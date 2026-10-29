@@ -588,18 +588,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         # This flag controls whether the model dispatches through the distinct
         # chunked-prefix topology; backend capability is validated separately.
-        # Only enable chunked-prefix FullCG if the backend explicitly supports it
-        # (e.g., FlashAttentionBackend on CUDA). Other backends (e.g., XPUAttentionBackend)
-        # gracefully fall back to plain EXTEND full graph capture.
         self._capture_chunked_prefix = (
             self._is_full_backend
             and not get_schedule().disable_chunked_prefix_cache
             and self.dllm_attention is None
-            and getattr(
-                model_runner.attn_backend,
-                "supports_full_cuda_graph_chunked_prefix",
-                False,
-            )
         )
         self._prefix_chunk_len = 0
         self._prefix_chunk_capacity = 0
