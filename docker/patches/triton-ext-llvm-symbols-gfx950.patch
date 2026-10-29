@@ -18,5 +18,5 @@ index 3f066ea91..08f1bbfbe 100644
 +    target_link_options(triton PRIVATE
 +      "LINKER:--version-script,${TRITON_EXPORT_SYMBOLS_FILE}")
    endif()
- 
+
    install(TARGETS triton
