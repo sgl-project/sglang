@@ -29,8 +29,9 @@ from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface
     UnifiedTreeCoreInspectionInterface,
 )
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import FAMILY_OF, tree_slots_of
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _cache_init_params(**kwargs) -> CacheInitParams:
@@ -39,7 +40,7 @@ def _cache_init_params(**kwargs) -> CacheInitParams:
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
         page_size=2,
-        tree_components=(ComponentType.FULL,),
+        tree_slots=tree_slots_of((ComponentType.FULL,)),
         **kwargs,
     )
 
@@ -157,7 +158,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
     def _cache_params(
         self,
         tree_components=(ComponentType.FULL,),
-        component_registry_override={ComponentType.FULL: _StubFullComponent},
+        component_registry_override={FAMILY_OF[ComponentType.FULL]: _StubFullComponent},
         **kwargs,
     ) -> CacheInitParams:
         return CacheInitParams(
@@ -170,7 +171,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             ),
             token_to_kv_pool_allocator=None,
             page_size=1,
-            tree_components=tree_components,
+            tree_slots=tree_slots_of(tree_components, checkpoint_interval=64),
             component_registry_override=component_registry_override,
             **kwargs,
         )
@@ -180,8 +181,8 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             is_eagle=True,
             tree_components=(ComponentType.FULL, ComponentType.MAMBA),
             component_registry_override={
-                ComponentType.FULL: _StubFullComponent,
-                ComponentType.MAMBA: _StubMambaComponent,
+                FAMILY_OF[ComponentType.FULL]: _StubFullComponent,
+                FAMILY_OF[ComponentType.MAMBA]: _StubMambaComponent,
             },
         )
         cache = UnifiedRadixCache(params)
@@ -246,8 +247,8 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             self._cache_params(
                 tree_components=(ComponentType.FULL, ComponentType.AUXILIARY_SWA),
                 component_registry_override={
-                    ComponentType.FULL: _StubFullComponent,
-                    ComponentType.AUXILIARY_SWA: _StubAuxiliarySWAComponent,
+                    FAMILY_OF[ComponentType.FULL]: _StubFullComponent,
+                    FAMILY_OF[ComponentType.AUXILIARY_SWA]: _StubAuxiliarySWAComponent,
                 },
                 tree_core_backend="python",
             )
@@ -484,14 +485,18 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
     def test_session_and_custom_components_use_python(self):
         for overrides in (
             {"enable_session_radix_cache": True},
-            {"component_registry_override": {ComponentType.FULL: _StubFullComponent}},
+            {
+                "component_registry_override": {
+                    FAMILY_OF[ComponentType.FULL]: _StubFullComponent
+                }
+            },
         ):
             with self.subTest(overrides=overrides):
                 self.assertEqual(
                     select_tree_core_backend(_cache_init_params(**overrides)), "python"
                 )
         params = _cache_init_params()
-        params.tree_components = (ComponentType.FULL, ComponentType.C128)
+        params.tree_slots = tree_slots_of((ComponentType.FULL, ComponentType.C128))
         self.assertEqual(select_tree_core_backend(params), "python")
 
     def test_unsupported_platform_and_torch_use_python(self):

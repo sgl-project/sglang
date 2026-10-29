@@ -108,12 +108,12 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         super().__init__(model_runner)
         # Pool-wide, bound at pool construction: conv[stream] is
         # [n_layers, n_slots, conv_kernel - 1, conv_dim].
-        self._mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+        self._mamba_cache = self.state_pool.mamba_cache
         self.conv_state_len: int = self.conv_states_shape[2]
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
         # Both identity and unified v2p gathers are recordable. The allocator
         # updates the stable device table in place, including after compaction.
-        self._slot_gather_recordable = self.req_to_token_pool.mamba_translate_is_fusable
+        self._slot_gather_recordable = True
 
         self.sconv_metadata = InklingShortConvMetadata()
 
@@ -270,7 +270,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
                 out_state_indices=buf,
                 valid_bs=n,
                 total_bs=n,
-                v2p=pool.mamba_v2p_table,
+                v2p=self._state_ids.read_v2p,
             )
             self._cache_indices = buf[:n]
             self.forward_metadata = ForwardMetadata(
@@ -284,8 +284,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         # Every metadata view must explicitly provide virtual IDs or None.
         indices = forward_batch.mamba_track_indices
         if indices is None or (
-            self._slot_gather_recordable
-            and self.req_to_token_pool.mamba_v2p_table is None
+            self._slot_gather_recordable and self._state_ids.read_v2p is None
         ):
             self.sconv_metadata.track_cache_indices = indices
             return
@@ -571,7 +570,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         if mamba_track_indices is not None:
             mamba_track_indices = self._translate_mamba_indices(mamba_track_indices)
         scatter_mamba_states_after_mtp_verify(
-            pool.get_speculative_mamba2_params_all_layers(),
+            self.state_pool.get_speculative_mamba2_params_all_layers(),
             slot_ids,
             last_correct_step_indices,
             mamba_track_indices,
@@ -587,12 +586,12 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
     def sconv_state(self, *, layer_id: int, stream: int) -> torch.Tensor:
         """``layer_id``'s conv state for one ``SconvType`` stream."""
-        pool_layer = self.req_to_token_pool.mamba2_layer_index(layer_id)
+        pool_layer = self.state_layer(layer_id).view_layer_id
         return self._mamba_cache.conv[stream][pool_layer]
 
     def sconv_intermediate_window(self, *, layer_id: int, stream: int) -> torch.Tensor:
         """One stream's per-draft-token conv windows. TARGET_VERIFY only."""
-        pool_layer = self.req_to_token_pool.mamba2_layer_index(layer_id)
+        pool_layer = self.state_layer(layer_id).view_layer_id
         return self._mamba_cache.intermediate_conv_window[stream][pool_layer]
 
 

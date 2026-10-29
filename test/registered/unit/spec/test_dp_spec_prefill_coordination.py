@@ -17,7 +17,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 WORKER_MODULE = "sglang.srt.speculative.eagle_worker_v2"
 
@@ -281,7 +281,7 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                         hidden_states=object(), mm_input_embeds=None
                     ),
                     next_token_ids=object(),
-                    kv_loc_plan=None,
+                    iteration_ids=None,
                 )
                 verify_input = object()
 

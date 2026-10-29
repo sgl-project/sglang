@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     get_required_capture_hidden_mode,
@@ -727,7 +728,11 @@ class SchedulerBatchResultProcessor:
                 logger.error(
                     f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                 )
-                req.to_finish = FINISH_ABORT()
+                req.to_finish = FINISH_ABORT(
+                    f"Grammar accept_token failed: {e}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                )
         req.grammar.finished = req.finished()
 
     def _apply_chunked_prefill_logprobs(
@@ -869,7 +874,11 @@ class SchedulerBatchResultProcessor:
                 f"Grammar accept_token failed for req {req.rid} with token "
                 f"{tokens}: {e}"
             )
-            req.to_finish = FINISH_ABORT()
+            req.to_finish = FINISH_ABORT(
+                f"Grammar accept_token failed: {e}",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+            )
         return retained
 
     def advance_grammar_fsm(
@@ -1614,11 +1623,9 @@ class SchedulerBatchResultProcessor:
             return
         if planned_pos != req.kv.mamba_next_track_idx:
             # Promote pending -> keep: free the old checkpoint, repoint.
-            pool = batch.req_to_token_pool
-            keep_idx = req.kv.mamba_next_track_idx
-            keep_val = req.kv.mamba_ping_pong_track_buffer[keep_idx]
-            pool.mamba_allocator.free(keep_val.unsqueeze(0))
-            pool.set_mamba_ping_pong_slot(req, keep_idx, -1)
+            kv_storage_of(
+                batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+            ).release_tracking_slot(req, req.kv.mamba_next_track_idx)
             req.kv.mamba_next_track_idx = planned_pos
         # else: in-place fallback, or promoted by an earlier confirmation —
         # keep holds the track_seqlen state either way.
@@ -1682,9 +1689,7 @@ class SchedulerBatchResultProcessor:
         req.kv.mamba_last_track_idx = track_idx
         req.kv.mamba_next_track_idx = track_idx
         other_idx = 1 - track_idx
-        pool = batch.req_to_token_pool
         if not req.kv.mamba_ping_pong_empty[other_idx]:
-            pool.mamba_allocator.free(
-                req.kv.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
-            )
-            pool.set_mamba_ping_pong_slot(req, other_idx, -1)
+            kv_storage_of(
+                batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+            ).release_tracking_slot(req, other_idx)

@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use tch::Tensor;
 
 use super::*;
-use crate::components::{ComponentSet, FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, FULL, Family, MAMBA, SWA, native_family};
 use crate::node::{NodeAccessError, ValueSlotIdx};
 use crate::test_utils::{accumulate_step, action_kinds, expect_action, matched_device_indices};
 
@@ -21,33 +21,56 @@ fn add_leaf<K: ChildKeyType>(core: &mut UnifiedTreeCore<K>, parent: NodeIdx_, ke
 
 #[test]
 fn rotation_phase_counts_the_prefix_pages() {
-    let mut core = UnifiedTreeCore::new(
-        CacheInitParams {
-            page_size: 1,
-            ..CacheInitParams::default()
-        },
-        vec![FULL],
-    );
-    core.insert(&InsertParams {
-        rotation_base: Some(2),
-        ..insert_params(&vec![1, 2, 3], &[10, 11, 12])
-    });
-    let probe = vec![1, 2, 4, 5];
-    core.insert(&InsertParams {
-        rotation_base: Some(2),
-        ..insert_params(&probe, &[10, 11, 13, 14])
-    });
-
-    for (tokens, expected) in [(vec![1, 2], 2), (vec![1, 2, 3], 4), (probe.clone(), 4)] {
-        let node = core
-            .match_prefix(&match_params(&tokens))
-            .last_device_node_id;
-        assert_eq!(core.rotation_phase_of(node).unwrap(), Some(expected));
+    for page_size in [1, 4, 64] {
+        for rotation_base in [0, 2] {
+            let mut core = UnifiedTreeCore::new(
+                CacheInitParams {
+                    page_size,
+                    ..CacheInitParams::default()
+                },
+                vec![FULL],
+            );
+            let tokens: Vec<i64> = (0..4 * page_size as i64).collect();
+            let mut sibling = tokens[..3 * page_size].to_vec();
+            sibling.extend((1000..).take(page_size));
+            let mut short_branch = tokens[..page_size].to_vec();
+            short_branch.extend((2000..).take(page_size));
+            // Two splits leave multiple ancestors above the original leaf.
+            for key in [&tokens, &sibling, &short_branch] {
+                core.insert(&InsertParams {
+                    rotation_base: Some(rotation_base),
+                    ..insert_params(key, key)
+                });
+            }
+            for (key, prefix_pages) in [
+                (tokens[..page_size].to_vec(), 0),
+                (tokens[..3 * page_size].to_vec(), 1),
+                (tokens, 3),
+                (sibling, 3),
+                (short_branch, 1),
+            ] {
+                let node = core.match_prefix(&match_params(&key)).last_device_node_id;
+                assert_eq!(
+                    core.rotation_phase_of(node).unwrap(),
+                    Some(rotation_base + prefix_pages),
+                    "page_size={page_size}, rotation_base={rotation_base}"
+                );
+            }
+            assert_eq!(
+                core.rotation_phase_of(core.root_node_handle(None)).unwrap(),
+                None
+            );
+        }
     }
-    assert_eq!(
-        core.rotation_phase_of(core.root_node_handle(None)).unwrap(),
-        None
-    );
+}
+
+#[test]
+fn unsharded_node_has_no_rotation_phase() {
+    let mut core = core();
+    let key = vec![1, 2, 3];
+    core.insert(&insert_params(&key, &[10, 11, 12]));
+    let node = core.match_prefix(&match_params(&key)).last_device_node_id;
+    assert_eq!(core.rotation_phase_of(node).unwrap(), None);
 }
 
 #[test]
@@ -317,6 +340,10 @@ impl TreeComponent<Vec<i64>> for RecordingComponentForTest {
         SWA
     }
 
+    fn family(&self) -> Family {
+        native_family(self.component_type())
+    }
+
     fn refresh_lru(
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
@@ -439,6 +466,10 @@ impl TreeComponent<Vec<i64>> for CountingComponentForTest {
         SWA
     }
 
+    fn family(&self) -> Family {
+        native_family(self.component_type())
+    }
+
     fn refresh_lru(
         &self,
         _tree_core: &mut UnifiedTreeCore<Vec<i64>>,
@@ -530,6 +561,10 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
         MAMBA
     }
 
+    fn family(&self) -> Family {
+        native_family(self.component_type())
+    }
+
     fn eviction_priority(&self, _is_leaf: bool) -> i64 {
         0
     }
@@ -609,6 +644,10 @@ struct SwaComponentForTest;
 impl TreeComponent<Vec<i64>> for SwaComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
+    }
+
+    fn family(&self) -> Family {
+        native_family(self.component_type())
     }
 
     fn create_match_validator(
@@ -700,6 +739,10 @@ impl SwaEvictionComponentForTest {
 impl TreeComponent<Vec<i64>> for SwaEvictionComponentForTest {
     fn component_type(&self) -> ComponentType {
         SWA
+    }
+
+    fn family(&self) -> Family {
+        native_family(self.component_type())
     }
 
     fn eviction_priority(&self, is_leaf: bool) -> i64 {
@@ -7444,6 +7487,8 @@ fn size_accessors_mirror_the_full_component_state() {
 #[test]
 fn swa_size_accessors_mirror_the_swa_component_state() {
     let mut tc = core();
+    // The accessors read the tree's window slot, so the tree needs one.
+    tc.register_component_(Arc::new(SwaComponentForTest));
     tc.component_state_mut(SWA).evictable_size = 2;
     tc.component_state_mut(SWA).protected_size = 1;
     assert_eq!(tc.swa_evictable_size(), 2);

@@ -35,6 +35,11 @@ SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=rust
 SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
 ```
 
+KV-sharded prefill (`--enable-kv-cache-sharding`) defaults to Python when the
+backend is unset. Set `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=rust` to opt in to
+the Rust core's rotation-aware allocation and host-backup queries. The same
+platform/toolchain fallback policy above applies to this explicit selection.
+
 Standard SGLang wheels bundle the production extension; some platform
 distributions omit it. A source checkout falls back to
 the shared fingerprinted Rust-extension cache; it never writes a shared object
