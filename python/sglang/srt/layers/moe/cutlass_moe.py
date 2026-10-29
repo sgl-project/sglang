@@ -14,11 +14,13 @@ if _is_cuda:
         es_sm100_mxfp8_blockscaled_grouped_mm,
         es_sm100_mxfp8_blockscaled_grouped_quant,
         fp8_blockwise_scaled_grouped_mm,
-        prepare_moe_input,
         shuffle_rows,
     )
 
     from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.moe.cutlass_prepare_moe_input import (
+        cutlass_prepare_moe_input,
+    )
     from sglang.kernels.ops.moe.shuffle_rows_with_scales import (
         shuffle_rows_with_scales,
     )
@@ -142,10 +144,6 @@ def cutlass_fused_experts_fp8(
     topk = topk_ids.size(1)
     device = a.device
 
-    # prepare_moe_input writes only live routes; gathers still span the tail.
-    a_map = torch.zeros((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.full((topk_ids.numel(),), -1, dtype=torch.int32, device=device)
-
     if use_mxfp8:
         assert es_up and es_down, "MXFP8 requires expert-specialization for both GEMMs"
         assert get_platform().is_sm100, "MXFP8 requires SM100"
@@ -178,13 +176,23 @@ def cutlass_fused_experts_fp8(
             (max_total + mxfp8_blockscale_align - 1) // mxfp8_blockscale_align
         ) * mxfp8_blockscale_align
 
+    if m == 0 or topk == 0:
+        if output is None:
+            output = torch.empty((m, k), dtype=out_dtype, device=device)
+        if m != 0:
+            output.zero_()
+        return output
+
+    a_map = torch.empty((topk_ids.numel(),), dtype=torch.int32, device=device)
+    c_map = torch.empty((topk_ids.numel(),), dtype=torch.int32, device=device)
+
     blockscale_offsets = None
     if use_mxfp8 and (es_up or es_down):
         blockscale_offsets = torch.empty(
             (num_experts + 1,), dtype=torch.int32, device=device
         )
 
-    prepare_moe_input(
+    cutlass_prepare_moe_input(
         topk_ids,
         expert_offsets,
         problem_sizes1,
@@ -346,5 +354,7 @@ def cutlass_fused_experts_fp8(
     if output is None:
         output = torch.empty((m, k), device=device, dtype=out_dtype)
 
-    shuffle_weighted_sum(c2, output, c_map, topk_weights.to(out_dtype))
+    shuffle_weighted_sum(
+        c2, output, c_map, topk_weights, cast_weights_to_input_dtype=True
+    )
     return output

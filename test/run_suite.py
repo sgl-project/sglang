@@ -31,13 +31,14 @@ HW_MAPPING = {
 # Per-commit test suites (run on every PR).
 # Includes both base-a/b/c (always-on; pr-test.yml) and extra-a/b
 # (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
-# pr-test-extra.yml's `run-ci-extra` PR label decides whether extra-* dispatches.
+# pr-test-extra.yml's `run-ci-nv-extra` PR label decides whether extra-* dispatches.
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
         "stage-a-test-cpu-intel",
         "stage-a-tp-test-cpu-intel",
         "stage-b-test-cpu-intel",
+        "extra-test-cpu-intel",
         "base-b-test-cpu-arm64",
     ],
     HWBackend.AMD: [
@@ -56,7 +57,7 @@ PER_COMMIT_SUITES = {
         "stage-c-test-large-8-gpu-amd-mi35x",
         # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
         # (mirror of CUDA extra-a; tests stay tagged per-commit but only
-        # dispatch when the PR carries the `run-ci-extra` label). 1-gpu-small
+        # dispatch when the PR carries the `run-ci-amd-extra` label). 1-gpu-small
         # carries the mock-model / kv_canary unit + single-GPU canary e2e
         # tests; 1-gpu-large carries the subset of model e2e tests validated
         # to pass on mi325 (quant fp8kv-triton, sessions streaming-session
@@ -65,9 +66,14 @@ PER_COMMIT_SUITES = {
         # of CUDA extra-a tests fail on ROCm (missing flash_attn.cute/flash_ops
         # kernels, OOM, or accuracy regressions — e.g. gemma4-mtp-31b dips
         # below the gsm8k floor on the topk=3 leg) and stay CUDA-only for now.
+        # Tests that pass on ROCm but sit in CUDA's extra tier (basic_perf,
+        # torch.compile, LoRA/RL weight updates, ...) are registered here too
+        # rather than in the always-on stage-b/c suites.
         "extra-a-test-1-gpu-small-amd",
         "extra-a-test-1-gpu-large-amd",
         "extra-a-test-2-gpu-large-amd",
+        # extra-b: 4-GPU tests that CUDA runs in extra-b (4-gpu-h100/b200).
+        "extra-b-test-4-gpu-amd",
     ],
     HWBackend.MUSA: [],
     HWBackend.CUDA: [
@@ -106,6 +112,7 @@ PER_COMMIT_SUITES = {
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
         "extra-b-test-8-gpu-h200",
+        "extra-b-test-8-gpu-h20",
         "extra-b-test-8-gpu-b300",
     ],
     HWBackend.NPU: [

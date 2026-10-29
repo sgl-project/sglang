@@ -242,6 +242,19 @@ unchanged. GB300/H200 image SSIM was 0.9951-0.9992 against the exact path across
 four samples. This is allocated memory, not total device usage: a 32 GB card
 still needs offload or quantization headroom for that reference size.
 
+### Disaggregated serving
+
+You can deploy the prompt encoder, reference-image VAE encoder, DiT, and VAE
+decoder as separate worker pools behind the same image API. Both T2I and i2i
+are supported. Use the [split encoding deployment guide](/docs/sglang-diffusion/disaggregation#flux3-split-encoding)
+for the four-role commands, or keep the existing three-role topology with a
+combined encoder. This separates resources and scaling; it adds transfer hops
+and does not imply lower single-request latency.
+T2I skips the image encoder; editing keeps reference padding/crop semantics.
+Each pool can have a different number of workers. Keep the package variant and
+numerical settings consistent across workers; the guide includes the required
+transfer dependency, network ports, and same-node validation scope.
+
 ## 5. Cache-DiT
 
 [Cache-DiT](/docs/sglang-diffusion/cache_dit) skips the 28 single-stream blocks
