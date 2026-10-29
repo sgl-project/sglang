@@ -85,7 +85,7 @@ class TokenSpaceSGLangProcessor:
             },
         )
 
-    def __init__(self, hf_config, server_args, _processor, transport_mode, **kwargs):
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         strategy_class = self._strategy_class
         self._serving_spec = self._serving_spec_class(hf_config)
         self._server_args = server_args
