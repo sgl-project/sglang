@@ -66,7 +66,21 @@ _EXTERNAL: Dict[Type, SubPoolExternal] = {
 }
 
 # The order PD peers list state entries in: a window's before recurrent state.
-_WIRE_ORDER = ("swa", "mamba")
+_WIRE_ORDER = (
+    "minimax_index_k",
+    "minimax_dense_kv",
+    "swa",
+    "block_scale",
+    "block_scale_swa",
+    "swa_ring",
+    "c128_state",
+    "mamba",
+    "dsa",
+    "dsa_tail",
+    "qsa_pending",
+    "qsa_compressed",
+    "request_row",
+)
 
 # How a prefix tree keeps a sub-pool for a cached prefix: every token, the
 # trailing window of tokens, one state checkpoint per grid step, or fixed-size
@@ -209,6 +223,30 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
             for s in self.sub_pools
             if s.external.wire is not None
         ]
+        groups = {}
+        for declared in self.derived_parts:
+            if declared.wire is not None:
+                key = (declared.sub_pool, declared.wire)
+                groups.setdefault(
+                    key,
+                    WireEntry(
+                        sub_pool=declared.sub_pool,
+                        part=declared.wire,
+                        state_type=declared.wire,
+                    ),
+                )
+        for declared in self.request_parts:
+            if declared.wire is not None:
+                key = (self.owner().name, declared.wire)
+                groups.setdefault(
+                    key,
+                    WireEntry(
+                        sub_pool=self.owner().name,
+                        part=declared.wire,
+                        state_type=declared.wire,
+                    ),
+                )
+        entries.extend(groups.values())
         return tuple(sorted(entries, key=lambda e: _WIRE_ORDER.index(e.state_type)))
 
 
@@ -308,12 +346,8 @@ def plan_kv_storage(
     """The unified-buffer plan for these declarations."""
     assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
     groups = _group_parts(decls, page_size)
-    if len(groups) < 2:
-        raise ValueError(
-            "--enable-unified-memory shares one buffer between sub-pools of "
-            f"different lifetimes; this model declares {len(groups)} "
-            "(a plain or pure-window model)"
-        )
+    if not any(isinstance(lt, FullLifetime) for lt, _ in groups):
+        raise ValueError("unified storage needs a FULL virtual-id owner")
     windows = {lt for lt, _ in groups if isinstance(lt, WindowLifetime)}
     if len(windows) > 1:
         raise ValueError(
@@ -326,7 +360,7 @@ def plan_kv_storage(
         lifetime, unit = key
         layer_ids, geometry = groups[key]
         name = _SUB_POOL_NAMES[type(lifetime)]
-        grow_direction = "up" if i == 0 else "down" if i == len(chain) - 1 else "float"
+        grow_direction = "down" if i == len(chain) - 1 else "up" if i == 0 else "float"
         sub_pools.append(
             PlannedSubPool(
                 name=name,
@@ -400,6 +434,21 @@ def plan_kv_storage(
         if derived.sub_pool not in names:
             raise ValueError(
                 f"derived part {derived.part.name!r} has no owning sub-pool"
+            )
+    wire_owners = {}
+    for declared in (*derived_parts, *request_parts):
+        if declared.wire is None:
+            continue
+        if declared.wire not in _WIRE_ORDER:
+            raise ValueError(f"unknown transfer wire name {declared.wire!r}")
+        owner = (
+            ("page", declared.sub_pool)
+            if isinstance(declared, DerivedPartDecl)
+            else ("request",)
+        )
+        if wire_owners.setdefault(declared.wire, owner) != owner:
+            raise ValueError(
+                f"wire component {declared.wire!r} mixes allocation domains"
             )
     return KVStoragePlan(
         page_size=page_size,

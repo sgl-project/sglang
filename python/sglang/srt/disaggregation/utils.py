@@ -1491,7 +1491,7 @@ def setup_state_kv_args(
         else None
     )
     for entry in storage.wire_entries():
-        region = storage.regions(entry.sub_pool)
+        region = storage.regions(entry.sub_pool, part=entry.part)
         state_type = _wire_state_type(entry.state_type)
         append_state_component(
             kv_args,

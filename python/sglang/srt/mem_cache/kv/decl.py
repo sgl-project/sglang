@@ -220,6 +220,8 @@ class RequestPartDecl(msgspec.Struct, frozen=True, kw_only=True):
 
     part: TensorPartDecl
     lifetime: RequestLifetime = RequestLifetime()
+    # Parts with the same wire name form one transfer component, in declaration order.
+    wire: Optional[str] = None
 
 
 class DerivedPartDecl(msgspec.Struct, frozen=True, kw_only=True):
@@ -231,6 +233,7 @@ class DerivedPartDecl(msgspec.Struct, frozen=True, kw_only=True):
 
     sub_pool: str
     part: TensorPartDecl
+    wire: Optional[str] = None
 
 
 def with_state_replay(

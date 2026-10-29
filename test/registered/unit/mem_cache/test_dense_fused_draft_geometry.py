@@ -162,6 +162,42 @@ class TestFusedRegionConfinement(unittest.TestCase):
                     self.assertLessEqual(hi, (page + 1) * self.PS * entry)
 
 
+class TestDraftPartAlignment(unittest.TestCase):
+    def test_mixed_dtype_state_parts_are_aligned_and_move_with_the_entry(self):
+        region = DraftStateRegion(
+            lane_num=3,
+            state=DraftStateGeometry(
+                conv_state_shapes=((1, 3), (1, 1)),
+                conv_dtype=torch.bfloat16,
+                temporal_state_shape=(3,),
+                temporal_dtype=torch.float32,
+            ),
+        )
+        state = _mamba_spec(region)
+        full = _host_spec()
+        arena = arena_of(
+            total_bytes=16384,
+            sub_pool_specs=[state, full],
+            device="cpu",
+            enable_memory_saver=False,
+            page_size=1,
+            fused_draft=FusedDraftPlacement.from_counts(
+                counts={"mamba": [3]}, regions={"mamba": region}
+            ),
+        )
+        arena.raw.zero_()
+        conv, temporal = state.draft_views(arena)
+        for tensor in (*conv, temporal):
+            self.assertEqual(tensor.data_ptr() % tensor.element_size(), 0)
+            tensor[:, 4].fill_(7)
+        arena.move_units("mamba", torch.tensor([6]), torch.tensor([4]))
+        for tensor in (*conv, temporal):
+            self.assertTrue(torch.all(tensor[:, 6] == 7))
+        host_conv, host_temporal = state.views(arena)
+        for tensor in (*host_conv, host_temporal):
+            self.assertTrue(torch.all(tensor[:, 6] == 0))
+
+
 class TestDraftMHAView(unittest.TestCase):
     PS = 2
     PAGES = 8

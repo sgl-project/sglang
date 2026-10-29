@@ -1,5 +1,6 @@
 """Stable allocations outside the movable KV chain, owned by its plan."""
 
+import math
 from contextlib import nullcontext
 from typing import Sequence
 
@@ -67,3 +68,37 @@ class FixedMemory:
             tensor = self.tensors[part.name]
             values = tensor.index_select(part.row_axis, src.to(torch.int64))
             tensor.index_copy_(part.row_axis, dst.to(torch.int64), values)
+
+    def regions(self, parts: Sequence[TensorPartDecl]):
+        """Contiguous fixed rows in stable part-major, then layer order."""
+        from sglang.srt.mem_cache.kv.storage import Region
+
+        ptrs, lens, items, dims, outer, layers = [], [], [], [], [], []
+        for part in parts:
+            tensor = self.tensors[part.name]
+            views = tensor.unbind(0) if part.layer_ids else (tensor,)
+            layer_ids = part.layer_ids or (-1,)
+            for layer_id, view in zip(layer_ids, views):
+                if view.numel() == 0:
+                    continue
+                assert view.is_contiguous(), "fixed transfer rows must be contiguous"
+                ptrs.append(view.data_ptr())
+                lens.append(view.nbytes)
+                items.append(view[0].nbytes)
+                dims.append(
+                    0 if part.slice_axis is None else part.shape[part.slice_axis]
+                )
+                outer.append(
+                    1
+                    if part.slice_axis is None
+                    else math.prod(part.shape[: part.slice_axis])
+                )
+                layers.append(layer_id)
+        return Region(
+            ptrs=tuple(ptrs),
+            lens=tuple(lens),
+            item_lens=tuple(items),
+            dim_per_tensor=tuple(dims),
+            slice_outer_counts=tuple(outer),
+            layer_ids=tuple(layers),
+        )

@@ -1975,12 +1975,16 @@ class KVCacheConfigurator:
             **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
             **kv_layout_kwargs,
         )
-        if not self.is_draft_worker and token_to_kv_pool._unified_kv:
-            # The draft pool has no C4 layers and shares this req pool, so only
-            # the target registers the per-slot C4 reset.
-            req_to_token_pool.register_on_alloc_rows(
-                token_to_kv_pool.clear_c4_req_states
-            )
+        if not self.is_draft_worker:
+            # Fresh rows include beam slots and PD preallocation. Reused rows
+            # retain their current history; retraction has its own replay reset.
+            def reset_request_rows(rows):
+                if token_to_kv_pool._unified_kv:
+                    token_to_kv_pool.clear_c4_req_states(rows)
+                if token_to_kv_pool.request_window_memory is not None:
+                    token_to_kv_pool.request_window_memory.reset_rows(rows)
+
+            req_to_token_pool.register_on_alloc_rows(reset_request_rows)
         return token_to_kv_pool
 
     def _page_major_enabled(self) -> bool:

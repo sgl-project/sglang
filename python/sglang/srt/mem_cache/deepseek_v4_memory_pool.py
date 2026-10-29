@@ -38,10 +38,8 @@ from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backe
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
-from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
 logger = logging.getLogger(__name__)
 
@@ -1122,6 +1120,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         self.request_window = None
+        self.request_window_memory = None
         self.full_to_swa_index_mapping = None
         # Per req slot, the first position whose draft SWA rows this request
         # wrote: the ring restarts at the cached prefix, and a PD decode receives
@@ -1135,49 +1134,35 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             not uses_draft_swa_ring() and get_spec().speculative_algorithm is not None
         )
         if encoder_replay and not is_draft_worker:
-            from sglang.srt.mem_cache.dsv41_request_window import RequestWindow
-
-            def make_window_pool(size, layers):
-                return self._make_kv_pool(
-                    size=size,
-                    page_size=swa_page_size,
-                    dtype=dtype,
-                    layer_num=layers,
-                    device=device,
-                    enable_memory_saver=enable_memory_saver,
-                    global_page_size=swa_page_size,
-                    kv_layout=self.kv_layout,
-                )
+            from sglang.srt.mem_cache.dsv41_request_window import (
+                RequestWindowSpec,
+                request_window_workspace_rows,
+            )
+            from sglang.srt.mem_cache.kv.memory.request_window import (
+                RequestWindowMemory,
+            )
 
             self.swa_kv_pool = None
             self.unified_kv_pool = None
-            from sglang.srt.runtime_context import get_schedule
-
-            chunk = get_schedule().chunked_prefill_size or 0
-            # A prefill graph pads its layouts to the captured bucket, which can
-            # exceed this rank's chunk (DP attention divides the chunk budget).
-            graph_config = get_exec().graph.cuda_graph_config
-            prefill_graph = graph_config.prefill if graph_config is not None else None
-            graph_rows = (
-                get_cuda_graph_max_batch_size(max(prefill_graph.bs))
-                if prefill_graph is not None
-                and prefill_graph.backend == Backend.BREAKABLE
-                and prefill_graph.bs
-                else 0
-            )
-            self.request_window = RequestWindow(
-                make_window_pool,
+            window_spec = RequestWindowSpec.create(
                 num_slots=self.num_req_slots,
                 layers=stage_layer_num,
                 page_size=swa_page_size,
                 capacity=self.sliding_window + (online_mtp_max_draft_tokens or 0),
-                workspace_rows=(self.num_req_slots + 1) * self.sliding_window
-                + max(
-                    chunk,
-                    graph_rows,
-                    (self.num_req_slots + 1) * (1 + (online_mtp_max_draft_tokens or 0)),
+                workspace_rows=request_window_workspace_rows(
+                    self.num_req_slots,
+                    self.sliding_window,
+                    online_mtp_max_draft_tokens or 0,
                 ),
+                kv_layout=self.kv_layout,
             )
+            self.request_window_memory = RequestWindowMemory(
+                window_spec,
+                dtype=dtype,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+            )
+            self.request_window = self.request_window_memory.view
         elif uses_draft_swa_ring():
             # The DSpark draft writes SWA rows only from target hidden states, never
             # while attending, so it addresses its ring directly with no workspace.
