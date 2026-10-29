@@ -1077,7 +1077,8 @@ TOPK_KERNEL void topk_split_fused(const __grid_constant__ TopKPagedParams params
   if (threadIdx.x == 0) {
     __threadfence();  // release: this block's histogram adds land before its arrival
     atomicAdd(&ctr->barrier, 1u);
-    while (atomicAdd(&ctr->barrier, 0u) < ws.split) __builtin_amdgcn_s_sleep(1);
+    while (atomicAdd(&ctr->barrier, 0u) < ws.split)
+      __builtin_amdgcn_s_sleep(1);
     __threadfence();  // acquire the other blocks' adds
   }
   __syncthreads();
