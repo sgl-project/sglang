@@ -32,7 +32,7 @@ def _clamp_decode_ids(ids: List[int], vocab_size: Optional[int]) -> List[int]:
     return [t if (0 <= t and (hi is None or t < hi)) else 0 for t in ids]
 
 
-class DecodeStatus(msgspec.Struct):
+class DetokenizeState(msgspec.Struct):
     """Store the status of incremental decoding."""
 
     # ----- | --------- read_ids -------|
@@ -135,8 +135,8 @@ class LimitedCapacityDict(OrderedDict):
         super().__setitem__(key, value)
 
 
-class DecodeStates:
-    """The detokenizer's DecodeStatus by rid: started by a request's first row,
+class DetokenizeStateTable:
+    """The detokenizer's DetokenizeState by rid: started by a request's first row,
     released by its finished row; past capacity, the oldest is evicted."""
 
     def __init__(self, capacity: int):
@@ -149,9 +149,9 @@ class DecodeStates:
         decode_ids: List[int],
         read_offset: int,
         vocab_size: Optional[int],
-    ) -> DecodeStatus:
+    ) -> DetokenizeState:
         if rid not in self._states:
-            s = DecodeStatus(
+            s = DetokenizeState(
                 decode_ids=_clamp_decode_ids(decode_ids, vocab_size),
                 surr_offset=0,
                 read_offset=read_offset,
@@ -162,7 +162,7 @@ class DecodeStates:
             s.decode_ids.extend(_clamp_decode_ids(decode_ids, vocab_size))
         return s
 
-    def get(self, rid: str) -> Optional[DecodeStatus]:
+    def get(self, rid: str) -> Optional[DetokenizeState]:
         return self._states.get(rid)
 
     def release(self, rid: str) -> None:

@@ -32,7 +32,7 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.managers.incremental_detokenize import (
     DETOKENIZER_MAX_STATES,
-    DecodeStates,
+    DetokenizeStateTable,
 )
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
@@ -116,7 +116,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 self.vocab_size = getattr(self.tokenizer, "vocab_size", None)
 
     def init_running_status(self, server_args: ServerArgs):
-        self.decode_states = DecodeStates(capacity=DETOKENIZER_MAX_STATES)
+        self.detokenize_state_table = DetokenizeStateTable(
+            capacity=DETOKENIZER_MAX_STATES
+        )
         self.disable_tokenizer_batch_decode = (
             get_serving().disable_tokenizer_batch_decode
         )
@@ -264,7 +266,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Initialize decode status
         read_ids, surr_ids = [], []
         for i in range(bs):
-            s = self.decode_states.start_or_extend(
+            s = self.detokenize_state_table.start_or_extend(
                 rid=recv_obj.rids[i],
                 decode_ids=recv_obj.decode_ids[i],
                 read_offset=recv_obj.read_offsets[i],
@@ -317,7 +319,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         output_strs = []
         for i in range(bs):
             rid = recv_obj.rids[i]
-            s = self.decode_states.get(rid)
+            s = self.detokenize_state_table.get(rid)
             if s is None:
                 raise RuntimeError(
                     f"Decode status not found for request {rid}. "
@@ -329,7 +331,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 )
             finished_reason = recv_obj.finished_reasons[i]
             if finished_reason is not None:
-                self.decode_states.release(rid)
+                self.detokenize_state_table.release(rid)
             output_strs.append(
                 s.step(
                     read_text=read_texts[i],

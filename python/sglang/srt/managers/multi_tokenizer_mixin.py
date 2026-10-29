@@ -706,7 +706,7 @@ class MultiDetokenizerRouter:
 
     Each request is pinned to a worker by hashing its ``http_worker_ipc`` with
     ``zlib.crc32`` (deterministic across runs), so all outputs of the same rid
-    always land on the same detokenizer and ``decode_states`` stays consistent.
+    always land on the same detokenizer and ``detokenize_state_table`` stays consistent.
     With a single tokenizer worker no ``http_worker_ipc`` is stamped, and the
     ``rid`` is hashed instead.
     """
