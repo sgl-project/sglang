@@ -95,6 +95,7 @@ class KVArena:
         self.backed_after_capture = backed_after_capture
         self._sink = sink_bytes
         self._vmm_owner = None
+        self.page_parts = {}
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -222,6 +223,8 @@ class KVArena:
             self._extent[name] // band.unit_entries,
             band.unit_bytes,
         )
+        if name in self.page_parts:
+            self.page_parts[name].copy_rows(dst, src)
 
     def zero_units(self, name: str, units: torch.Tensor) -> None:
         """Zero whole units (physical unit ids) of one band."""
@@ -232,6 +235,8 @@ class KVArena:
             self._extent[name] // band.unit_entries,
             band.unit_bytes,
         )
+        if name in self.page_parts:
+            self.page_parts[name].reset_rows(units)
 
     # -- backing --
 

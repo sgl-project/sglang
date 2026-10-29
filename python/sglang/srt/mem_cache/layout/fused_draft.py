@@ -159,7 +159,32 @@ class DraftStateRegion(msgspec.Struct, frozen=True, kw_only=True):
 
     def entry_bytes(self) -> int:
         """Draft state bytes per slot, before the host entry's alignment."""
-        return self.lane_num * self.state.layer_bytes()
+        return self.entry_layout().entry_bytes
+
+    def entry_layout(self):
+        from sglang.srt.mem_cache.kv.decl import TensorPartDecl
+        from sglang.srt.mem_cache.kv.layout.state import state_entry_layout
+
+        layers = tuple(range(self.lane_num))
+        return state_entry_layout(
+            (
+                *(
+                    TensorPartDecl(
+                        name=f"conv.{i}",
+                        shape=shape,
+                        dtype=self.state.conv_dtype,
+                        layer_ids=layers,
+                    )
+                    for i, shape in enumerate(self.state.conv_state_shapes)
+                ),
+                TensorPartDecl(
+                    name="temporal",
+                    shape=self.state.temporal_state_shape,
+                    dtype=self.state.temporal_dtype,
+                    layer_ids=layers,
+                ),
+            )
+        )
 
 
 DraftRegion = Union[DenseDraftRegion, DraftStateRegion]
