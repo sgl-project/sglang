@@ -431,3 +431,15 @@ def get_processor(
     _fix_added_tokens_encoding(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
     return processor
+
+
+def get_text_tokenizer(tokenizer_name: str, *, model_architectures=(), **kwargs):
+    """Load a standalone tokenizer without changing a multimodal model's tokens.
+
+    Gemma4's processor and direct tokenizer loaders configure BOS differently.
+    Reuse the processor's tokenizer when omitting its encoders so the same text
+    still produces the same input IDs. Loading a processor builds no model tower.
+    """
+    if "Gemma4ForConditionalGeneration" in (model_architectures or ()):
+        return get_tokenizer_from_processor(get_processor(tokenizer_name, **kwargs))
+    return get_tokenizer(tokenizer_name, **kwargs)
