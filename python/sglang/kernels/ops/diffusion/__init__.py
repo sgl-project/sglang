@@ -46,6 +46,12 @@ _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     (
+        "diffusion.vsa_tile_to_bhsd",
+        KernelBackend.TRITON,
+        "layout.vsa_tile_layout_triton:vsa_tile_to_bhsd",
+        _CUDA,
+    ),
+    (
         "diffusion.fused_packed_swiglu_fp8_rowwise",
         KernelBackend.TRITON,
         "quantization.swiglu_fp8_rowwise_triton:fused_packed_swiglu_fp8_rowwise",
@@ -654,6 +660,7 @@ for _op, _backend, _target, _caps in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "vsa_tile_to_bhsd": "layout.vsa_tile_layout_triton",
     "fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
     "apply_matrix_rope": "rope.matrix_rope",
     "residual_gate_fp32": "modulate.residual_gate_fp32",
