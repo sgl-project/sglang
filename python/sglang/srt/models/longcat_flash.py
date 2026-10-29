@@ -112,11 +112,13 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -758,7 +760,7 @@ class LongcatFlashForCausalLM(nn.Module):
                             weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
                         if (
-                            _is_cuda
+                            (_is_cuda or _is_xpu)
                             and weight_block_size[0] == 128
                             and weight_block_size[1] == 128
                         ):
