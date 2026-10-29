@@ -32,6 +32,7 @@ __all__ = [
     "FullTopKIndexer",
     "PrefillCandidates",
     "PrefillInputs",
+    "configure_prefill_score_pool",
     "has_dense_fp4_indexer",
     "is_sm100_or_newer",
     "make_candidate_indexer",
@@ -121,3 +122,46 @@ def make_candidate_indexer(
     if not use_deep_gemm_prefill or get_parallel().attn_cp_size > 1:
         return dense_blocks, sparse_table
     return sparse_table, sparse_table
+
+
+def configure_prefill_score_pool(
+    *,
+    device: torch.device,
+    max_rows: int,
+    max_context_len: int,
+    index_heads: int,
+    index_topk: int,
+    candidate_topk_blocks: int,
+    candidate_block_size: int,
+) -> int:
+    """Hold device memory for the DeepGEMM prefill scorers' tiles: a whole forward
+    of ``max_rows`` rows at the widest score row (ratio 1 at ``max_context_len``)
+    with the largest declared scratch of any scorer, within the static budget.
+    Returns the capacity the tiles are then sized by."""
+    from sglang.kernels.ops.attention.dsv4.index_logits import (
+        FLAT_LOGITS_WIDTH_ALIGN,
+    )
+    from sglang.srt.layers.attention.mqa_logits_utils import mqa_logits_row_bytes
+    from sglang.srt.utils.common import ceil_align
+
+    from .dense_blocks import _consume_scratch_bytes, _publish_scratch_bytes
+    from .scoring import configure_prefill_score_pool as configure
+    from .sparse_table import _block_keys_row_bytes
+
+    width = ceil_align(max_context_len, FLAT_LOGITS_WIDTH_ALIGN)
+    rows = ceil_align(max_rows, 128 // index_heads)
+    scratch = [(0, 0), (_block_keys_row_bytes(width), 0)]
+    if candidate_topk_blocks > 0:
+        scratch += [
+            _publish_scratch_bytes(width, candidate_block_size, candidate_topk_blocks),
+            (
+                _consume_scratch_bytes(
+                    candidate_topk_blocks, candidate_block_size, index_topk
+                ),
+                0,
+            ),
+        ]
+    need = max(
+        rows * (mqa_logits_row_bytes(width) + row) + tile for row, tile in scratch
+    )
+    return configure(device=device, need_bytes=need)

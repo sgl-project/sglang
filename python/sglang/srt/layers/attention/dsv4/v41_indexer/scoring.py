@@ -5,7 +5,7 @@ a selection back into pool slots."""
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Generator, Iterator, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -22,6 +22,14 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    MqaLogitsPool,
+    mqa_logits_static_budget_bytes,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
@@ -31,9 +39,43 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-# TODO: use a per-forward mqa_logits_budget_bytes() budget that also
-# leaves room for candidate block ids and block-selection scratch.
 _DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
+
+
+# One pool per device index, shared by every low-ratio layer's prefill scorer.
+_PREFILL_SCORE_POOLS: dict[int, MqaLogitsPool] = {}
+
+
+def _device_index(device: torch.device) -> int:
+    return torch.cuda.current_device() if device.index is None else device.index
+
+
+def configure_prefill_score_pool(*, device: torch.device, need_bytes: int) -> int:
+    """Hold memory for the prefill score tiles on ``device``: what one forward's
+    widest tile needs, ``need_bytes``, within the static budget (the share of the
+    memory --mem-fraction-static leaves free) and the per-tile cap. Returns the
+    capacity the tiles are sized by."""
+    index = _device_index(device)
+    capacity = min(
+        need_bytes,
+        _DEEP_GEMM_SCORE_BUDGET_BYTES,
+        mqa_logits_static_budget_bytes(device_index=index),
+    )
+    pool = _PREFILL_SCORE_POOLS.get(index)
+    if pool is None or pool.capacity_bytes < capacity:
+        _PREFILL_SCORE_POOLS[index] = MqaLogitsPool(
+            capacity_bytes=capacity, device=torch.device(device.type, index)
+        )
+    return _PREFILL_SCORE_POOLS[index].capacity_bytes
+
+
+def _capturing() -> bool:
+    # Not get_is_capture_mode(): breakable-graph replay runs the scorers eagerly.
+    return (
+        capture_mode.is_capture_mode
+        or torch.cuda.is_current_stream_capturing()
+        or is_in_tc_piecewise_cuda_graph()
+    )
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -267,16 +309,32 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
     )
 
 
-def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):
-    yield from flat_index_logits_tiles(
+def score_tiles(
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    scratch_bytes: Callable[[int], Tuple[int, int]] = lambda width: (0, 0),
+) -> Generator[Tuple[slice, torch.Tensor], None, None]:
+    """``flat_index_logits_tiles`` over the prefill rows. With a configured pool
+    the tiles and everything the caller allocates while holding one come from it,
+    sized by its capacity; the caller must keep nothing allocated in that time."""
+    pool = _PREFILL_SCORE_POOLS.get(data.q_fp4.device.index)
+    budget = _DEEP_GEMM_SCORE_BUDGET_BYTES if pool is None else pool.capacity_bytes
+    tiles = flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,
         weights=data.weights,
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=budget,
+        scratch_bytes=scratch_bytes,
     )
+    if pool is None or _capturing():
+        yield from tiles
+        return
+    with pool.allocating():
+        yield from tiles
 
 
 def topk_ragged(
