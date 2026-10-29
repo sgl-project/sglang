@@ -215,7 +215,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             positions=None,
             forward_batch=batch,
         )
-        capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
+        capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
         x = torch.full((8, 2), 3, dtype=torch.int32)
         with (
             patch.object(
@@ -249,7 +249,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             global_num_token_non_padded_cpu=None,
         )
         context = SimpleNamespace(forward_batch=batch)
-        capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
+        capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
         pool = Mock(get_mamba_indices=lambda indices: indices)
         cases = [([8], [0] * 8), ([4, 4], [0] * 4 + [1] * 4)]
         with (

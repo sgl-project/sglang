@@ -699,9 +699,6 @@ def _tail_layers_in_prefill_graph(
     saved, forward_batch = _enter_eager_tail_in_prefill_graph(
         backend, get_tc_piecewise_forward_context().forward_batch, source_kv_layer_id
     )
-    # Runs between the outer graph's segments, also while it captures, so the
-    # inner breaks must run directly.
-    capture_token = bcg_module._current_capture_var.set(None)
     try:
         tail = backend.forward_metadata.late_layer_tail
         # The graph's rows are padded to its shape; the tail indexes live rows.
@@ -758,7 +755,6 @@ def _tail_layers_in_prefill_graph(
             bridge_key, block_rows, bridge, outputs=[residual, pre, *aux]
         )
     finally:
-        bcg_module._current_capture_var.reset(capture_token)
         backend.exit_late_layer_tail(saved, forward_batch)
         backend.prefill_graph_replay_batch = None
 
