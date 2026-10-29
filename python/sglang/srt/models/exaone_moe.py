@@ -26,7 +26,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -182,6 +181,10 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             apply_routed_scaling_factor_on_output=True,
             scoring_func="sigmoid",
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         if config.num_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.num_shared_experts
@@ -224,10 +227,6 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -464,7 +463,8 @@ class ExaoneMoEDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
 
-        if config.is_moe_layer[layer_id]:
+        attn, ffn = self.stage_facts(config, layer_id)
+        if ffn.sparse:
             self.mlp = ExaoneMoESparseMoEBlock(
                 layer_id=layer_id,
                 config=config,
@@ -485,17 +485,23 @@ class ExaoneMoEDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
         is_moe_layer = config.is_moe_layer
         num_layers = config.num_hidden_layers
-        self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=is_moe_layer[layer_id],
-                    next_layer_sparse=layer_id + 1 < num_layers
-                    and is_moe_layer[layer_id + 1],
-                ),
-                self.post_attention_layernorm,
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_moe_layer[layer_id],
+                next_layer_sparse=layer_id + 1 < num_layers
+                and is_moe_layer[layer_id + 1],
             ),
         )
 
@@ -559,6 +565,7 @@ class ExaoneMoEModel(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: ExaoneMoEDecoderLayer.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:

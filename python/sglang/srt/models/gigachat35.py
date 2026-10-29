@@ -410,9 +410,7 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
         if swiglu_limit > 0 and runner_config is not None:
             runner_config.gemm1_clamp_limit = swiglu_limit
 
-        layernorm_type = getattr(config, "layernorm_type", "pre")
-        self._use_pre = layernorm_type in ("pre", "pre_post")
-        self._use_post = layernorm_type in ("post", "pre_post")
+        self._use_pre, self._use_post = self._norm_placement(config)
 
         self.input_layernorm = build_norm(config, config.hidden_size)
         self.post_attention_layernorm = build_norm(config, config.hidden_size)
@@ -434,25 +432,55 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             input_layernorm=attn_prepare_layernorm,
             post_attention_layernorm=mlp_prepare_layernorm,
             qkv_latent_func=qkv_latent_func,
-            attn_output=(
-                OutputTransform(self.post_self_attn_layernorm)
-                if self.post_self_attn_layernorm is not None
-                else None
-            ),
-            output=(
-                OutputTransform(self.post_feedforward_layernorm)
-                if self.post_feedforward_layernorm is not None
-                else None
-            ),
+            post_self_attn_layernorm=self.post_self_attn_layernorm,
+            post_feedforward_layernorm=self.post_feedforward_layernorm,
         )
 
-    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
-        if is_nextn:
-            return bool(getattr(self.config, "nextn_is_sparse", False))
+    @staticmethod
+    def _norm_placement(config: GigaChat35Config):
+        """Whether the layer norms each sublayer's input, and its output."""
+        layernorm_type = getattr(config, "layernorm_type", "pre")
         return (
-            self.config.n_routed_experts is not None
-            and layer_id >= self.config.first_k_dense_replace
-            and layer_id % self.config.moe_layer_freq == 0
+            layernorm_type in ("pre", "pre_post"),
+            layernorm_type in ("post", "pre_post"),
+        )
+
+    @classmethod
+    def stage_facts(
+        cls,
+        config: GigaChat35Config,
+        layer_id: int,
+        *,
+        is_nextn: bool = False,
+        post_self_attn_layernorm=None,
+        post_feedforward_layernorm=None,
+    ):
+        """The stages a GigaChat 3.5 layer declares, from the config alone:
+        the model's shared declaration function, which the layer declares
+        with too (see make_layers). The output norms, which the layer has
+        only when it norms the sublayers' outputs, are the output
+        transforms."""
+        _, use_post = cls._norm_placement(config)
+        return super().stage_facts(
+            config,
+            layer_id,
+            is_nextn=is_nextn,
+            attn_output=(
+                OutputTransform(post_self_attn_layernorm) if use_post else None
+            ),
+            output=OutputTransform(post_feedforward_layernorm) if use_post else None,
+        )
+
+    @staticmethod
+    def _is_layer_sparse(
+        config: GigaChat35Config, layer_id: int, is_nextn: bool
+    ) -> bool:
+        if is_nextn:
+            return bool(getattr(config, "nextn_is_sparse", False))
+        return (
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
+            and layer_id % config.moe_layer_freq == 0
         )
 
     def forward(
@@ -527,6 +555,7 @@ class GigaChat35Model(nn.Module):
                 alt_stream=self.alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: GigaChat35DecoderLayer.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:

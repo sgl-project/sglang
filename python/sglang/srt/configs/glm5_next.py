@@ -104,7 +104,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
         n_routed_experts: Optional[int] = 288,
-        num_experts_per_tok: int = 7,
+        num_experts_per_tok: int = 8,
         n_shared_experts: int = 1,
         n_group: int = 1,
         topk_group: int = 1,
@@ -249,11 +249,6 @@ class Glm5NextTextConfig(PretrainedConfig):
     @property
     def linear_layer_ids(self):
         return [i for i in range(self.num_hidden_layers) if self.is_kda_layer(i)]
-
-    @property
-    def nextn_layer_ids(self):
-        num_nextn_layers = self.num_nextn_predict_layers or 0
-        return [self.num_hidden_layers + i for i in range(num_nextn_layers)]
 
     @property
     def full_attention_layer_ids(self):

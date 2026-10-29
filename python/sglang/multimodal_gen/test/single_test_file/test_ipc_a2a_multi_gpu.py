@@ -10,6 +10,8 @@ suite reaches them. Runs on 2 ranks, and on 4 when four GPUs are visible:
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import subprocess
 import sys
@@ -25,6 +27,53 @@ def _attend(q, k, v):
     # head-independent and exact under any head grouping; the flips and rolls
     # read across the whole gathered sequence, so a misplaced shard shows up
     return (q.float() * 2 + k.flip(0).float() - v.roll(1, 0).float()).to(q.dtype)
+
+
+def _attend_rows(q, k, v):
+    """`_attend` for [batch, rows, heads, head_dim] parts whose k/v may carry more
+    rows (a replicated KV prefix) and fewer heads (GQA) than q."""
+    rep = q.shape[2] // k.shape[2]
+    k = k.repeat_interleave(rep, dim=2).float()
+    v = v.repeat_interleave(rep, dim=2).float()
+    rows = q.shape[1]
+    # elementwise only (a reduction could round differently per head count):
+    # the leading and the trailing rows both read, so every row counts
+    return (
+        q.float() * 2
+        + k[:, :rows]
+        + k.flip(1)[:, :rows]
+        - v.roll(1, 1)[:, -rows:]
+        + v[:, :rows] * 0.5
+    ).to(q.dtype)
+
+
+def _deny_pidfd_getfd() -> None:
+    """Fail pidfd_getfd with EPERM in this process, as containers without ptrace
+    rights do; importing an expandable-segment IPC handle needs it."""
+
+    class Insn(ctypes.Structure):  # struct sock_filter
+        _fields_ = [
+            ("code", ctypes.c_uint16),
+            ("jt", ctypes.c_uint8),
+            ("jf", ctypes.c_uint8),
+            ("k", ctypes.c_uint32),
+        ]
+
+    class Prog(ctypes.Structure):  # struct sock_fprog
+        _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(Insn))]
+
+    insns = (Insn * 4)(
+        Insn(0x20, 0, 0, 0),  # load the syscall number
+        Insn(0x15, 0, 1, 438),  # pidfd_getfd, the same number on every arch
+        Insn(0x06, 0, 0, 0x00050000 | errno.EPERM),  # SECCOMP_RET_ERRNO
+        Insn(0x06, 0, 0, 0x7FFF0000),  # SECCOMP_RET_ALLOW
+    )
+    libc = ctypes.CDLL(None, use_errno=True)
+    # PR_SET_NO_NEW_PRIVS, then PR_SET_SECCOMP with SECCOMP_MODE_FILTER
+    if libc.prctl(38, 1, 0, 0, 0) or libc.prctl(
+        22, 2, ctypes.byref(Prog(len(insns), insns)), 0, 0
+    ):
+        raise OSError(ctypes.get_errno(), "could not install the seccomp filter")
 
 
 def _worker() -> int:
@@ -69,7 +118,7 @@ def _worker() -> int:
     if world == 2:
         cases.append((128, 16, 64, 8))
     for s_local, heads, head_dim, groups in cases:
-        # three calls in a row: the slots alternate and the counters advance
+        # three calls in a row: the slots are reused and the counters advance
         for call in range(3):
             torch.manual_seed(
                 1000 * call + s_local
@@ -132,22 +181,145 @@ def _worker() -> int:
                     f"filled pipeline {(s_local, heads, head_dim, groups)} call {call}"
                 )
 
-    # groups=-1 picks a count that divides the heads per rank (4 for 16 heads at
-    # 2 ranks, 2 at 4) and still matches
+    # groups=-1 picks the most groups that divide the heads per rank and whose
+    # calls still fill four waves of 128-row tiles, and still matches; a shape too
+    # small to fill them keeps the sequential exchange
+    sms = torch.cuda.get_device_properties(rank).multi_processor_count
+    s_auto = 4 * sms * 128 // world  # one head per group fills four waves
     torch.manual_seed(77)
     full = [
-        torch.randn(64 * world, 16, 64, dtype=torch.bfloat16, device="cuda")
+        torch.randn(s_auto * world, 16, 64, dtype=torch.bfloat16, device="cuda")
         for _ in range(3)
     ]
-    q, k, v = (t.narrow(0, rank * 64, 64).contiguous() for t in full)
+    q, k, v = (t.narrow(0, rank * s_auto, s_auto).contiguous() for t in full)
     got = ulysses_pipelined_attention(q, k, v, _attend, -1)
     if got is None or not torch.equal(sequential(q, k, v), got):
         failures.append("auto group count")
+    small = torch.randn(64, 16, 64, dtype=torch.bfloat16, device="cuda")
+    if ulysses_pipelined_attention(small, small, small, _attend, -1) is not None:
+        failures.append("auto pipelined a shape too small to fill the GPU")
+
+    # sequential=: the first call per shape and signature also runs the
+    # sequential exchange and keeps the pipeline only on a byte-for-byte match
+    torch.manual_seed(78)
+    full = [
+        torch.randn(80 * world, 16, 64, dtype=torch.bfloat16, device="cuda")
+        for _ in range(3)
+    ]
+    q, k, v = (t.narrow(0, rank * 80, 80).contiguous() for t in full)
+    ref = sequential(q, k, v)
+    for call in range(2):
+        got = ulysses_pipelined_attention(
+            q,
+            k,
+            v,
+            _attend,
+            2,
+            sequential=lambda: sequential(q, k, v),
+            signature="same",
+        )
+        if got is None or not torch.equal(ref, got):
+            failures.append(f"verified pipeline call {call}")
+    off = ref + 1  # a "sequential" result the pipeline cannot reproduce
+    got = ulysses_pipelined_attention(
+        q, k, v, _attend, 2, sequential=lambda: off, signature="other"
+    )
+    if got is None or not torch.equal(got, off):
+        failures.append("a mismatching first call did not return the sequential result")
+    if (
+        ulysses_pipelined_attention(
+            q, k, v, _attend, 2, sequential=lambda: off, signature="other"
+        )
+        is not None
+    ):
+        failures.append("a mismatched shape kept pipelining")
 
     # a head count the groups cannot split must decline, not mis-shard
     q = torch.randn(32, 12, 64, dtype=torch.bfloat16, device="cuda")
     if ulysses_pipelined_attention(q, q, q, _attend, 4) is not None:
         failures.append("pipelined accepted 12 heads in 4 groups")
+
+    # batch, replicated rows (prefix, suffix, KV-only prefix) and GQA: the output
+    # rows match attention over the global layout, computed with every head
+    def layout_case(batch, s_local, heads, kv_heads, rep, rep_kv, first, groups, seed):
+        torch.manual_seed(seed)
+        dims = 32
+        shard = lambda h: torch.randn(
+            batch, s_local * world, h, dims, device="cuda"
+        ).bfloat16()
+        full = [shard(heads), shard(kv_heads), shard(kv_heads)]
+        reps = [
+            torch.randn(batch, n, h, dims, device="cuda").bfloat16() if n else None
+            for n, h in ((rep, heads), (rep_kv, kv_heads), (rep_kv, kv_heads))
+        ]
+        mine = [t[:, rank * s_local : (rank + 1) * s_local].contiguous() for t in full]
+
+        def joined(t, r):
+            if r is None:
+                return t
+            return torch.cat([r, t] if first else [t, r], dim=1)
+
+        out_all = _attend_rows(*(joined(t, r) for t, r in zip(full, reps)))
+        lo = (rep if first else 0) + rank * s_local
+        own = out_all[:, lo : lo + s_local]
+        if rep:
+            rep_rows = out_all[:, :rep] if first else out_all[:, -rep:]
+            own = torch.cat([rep_rows, own] if first else [own, rep_rows], dim=1)
+        got = ulysses_pipelined_attention(
+            *mine,
+            _attend_rows,
+            groups,
+            replicated=tuple(reps),
+            replicated_first=first,
+        )
+        label = f"layout b{batch} h{heads}/{kv_heads} rep {rep}/{rep_kv} first={first} g{groups}"
+        if got is None:
+            failures.append(f"{label} returned None")
+        elif not torch.equal(got, own):
+            failures.append(label)
+
+    for call in range(2):  # every layout reuses the one pool
+        layout_case(2, 48, 16, 16, 0, 0, True, 2, 300 + call)
+        layout_case(1, 40, 16, 16, 9, 9, True, 2, 310 + call)
+        layout_case(2, 40, 16, 16, 7, 7, False, 2, 320 + call)
+        layout_case(1, 40, 16, 16, 0, 11, True, 2, 330 + call)
+        layout_case(2, 40, 16, 8, 5, 5, True, 2, 340 + call)
+
+    # one pool per dtype serves every plan above, sized for the largest of them
+    pools = IPC_A2A_MULTI.pools
+    if list(pools) != [torch.bfloat16]:
+        failures.append(f"pipeline pools per dtype: {list(pools)}")
+    else:
+        slots = list(IPC_A2A_MULTI.slots.values())
+        widest = (
+            max(s.in_total for s in slots),
+            max(s.out_total for s in slots),
+            max(s.plan.groups for s in slots),
+        )
+        if pools[torch.bfloat16].sizes != widest:
+            failures.append(f"pool sizes {pools[torch.bfloat16].sizes} != {widest}")
+
+    # one set of slots is enough: a peer cannot write a call's rows or output
+    # blocks before this rank has read the previous call's, however far ahead
+    # it runs. Rank 0 attends slowly; alternating plans share the pool.
+    def slow_attend(q, k, v):
+        if rank == 0:
+            torch.cuda._sleep(20_000_000)
+        return _attend(q, k, v)
+
+    issued = []
+    for call in range(6):  # queued back to back; compared only afterwards
+        s_local, heads, groups = ((96, 16, 2), (40, 32, 4))[call % 2]
+        torch.manual_seed(4000 + call)
+        full = [
+            torch.randn(s_local * world, heads, 64, dtype=torch.bfloat16, device="cuda")
+            for _ in range(3)
+        ]
+        parts = [t.narrow(0, rank * s_local, s_local).contiguous() for t in full]
+        issued.append((parts, ulysses_pipelined_attention(*parts, slow_attend, groups)))
+    for call, (parts, got) in enumerate(issued):
+        if got is None or not torch.equal(sequential(*parts), got):
+            failures.append(f"skewed back-to-back call {call}")
 
     # the plain N-rank exchange behind _usp_all_to_all_single
     for numel in (world * 1024, world * 4096 * 33):
@@ -185,7 +357,7 @@ def _worker() -> int:
 
 
 class TestIpcA2AMultiGpu(CustomTestCase):
-    def _run(self, world: int, port: int):
+    def _run(self, world: int, port: int, *worker_args: str, **env: str):
         if not current_platform.is_cuda():
             self.skipTest("CUDA-IPC transport is unavailable on this platform")
         if torch.cuda.device_count() < world:
@@ -199,10 +371,12 @@ class TestIpcA2AMultiGpu(CustomTestCase):
                 f"--master-port={port}",
                 __file__,
                 "--worker",
+                *worker_args,
             ],
             capture_output=True,
             text=True,
             timeout=1200,
+            env={**os.environ, **env},
         )
         print(proc.stdout[-4000:])
         if proc.returncode != 0:
@@ -217,8 +391,18 @@ class TestIpcA2AMultiGpu(CustomTestCase):
     def test_four_ranks_match_sequential_bitwise(self):
         self._run(4, 29537)
 
+    def test_two_ranks_engage_under_expandable_segments_without_pidfd_getfd(self):
+        self._run(
+            2,
+            29547,
+            "--deny-pidfd-getfd",
+            PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
+        )
+
 
 if __name__ == "__main__":
     if "--worker" in sys.argv:
+        if "--deny-pidfd-getfd" in sys.argv:
+            _deny_pidfd_getfd()
         raise SystemExit(_worker())
     unittest.main()
