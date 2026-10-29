@@ -66,9 +66,11 @@ def _load_k_block(
     MMA_DTYPE: gl.constexpr,
     K_FP4: gl.constexpr,
 ):
-    """The index-K block whose first slot is ``base``, dims x tokens: [HEAD_DIM,
-    BLOCK_N] in the MMA dtype, or NVFP4 as stored, u16 payload [HEAD_DIM // 4, BLOCK_N]
-    and E4M3 scales [HEAD_DIM // 16, BLOCK_N]."""
+    """The index-K block whose first slot is ``base``, dims x tokens.
+
+    That is [HEAD_DIM, BLOCK_N] in the MMA dtype, or NVFP4 as stored: u16 payload
+    [HEAD_DIM // 4, BLOCK_N] and E4M3 scales [HEAD_DIM // 16, BLOCK_N].
+    """
     stride_k_page, stride_k_s, stride_sc_page, stride_sc_s = strides
     # The slot offset rides in the 32-bit offsets so the buffer base stays uniform.
     k = buffer_load(
@@ -86,8 +88,7 @@ def _load_k_block(
 def _stage_k_block(
     smem_k, buf, k_block, GROUP_LAYOUT: gl.constexpr, K_FP4: gl.constexpr
 ):
-    """Write a loaded block to LDS buffer ``buf``; NVFP4 dequantizes into its even dims
-    followed by its odd dims."""
+    """Write a loaded block to LDS buffer ``buf``, NVFP4 dequantized to even then odd dims."""
     if K_FP4:
         payload, scales = k_block
         even, odd = nvfp4_even_odd(payload, scales, GROUP_LAYOUT)
@@ -448,7 +449,7 @@ def can_fuse_index_topk(
             k_cache.dtype in (q.dtype, torch.float8_e4m3fn)
             and page_size % block_size_k == 0
             and k_cache.stride(-1) == 1
-            # buffer_load takes 32-bit byte offsets
+            # buffer_load takes 32-bit byte offsets.
             and k_cache.numel() * k_cache.element_size() < 2**31
         )
     return (
@@ -556,8 +557,10 @@ def fused_index_topk(
     local_blocks: int,
     block_size_k: int,
 ) -> torch.Tensor:
-    """Top-k block ids per query and index head: [num_heads, total_q, topk] int32,
-    ascending with a -1 tail, like ``_topk_index_kernel`` with ``block_size_q == 1``."""
+    """Top-k block ids per query and index head, [num_heads, total_q, topk] int32.
+
+    The ids ascend with a -1 tail, like ``_topk_index_kernel`` with ``block_size_q == 1``.
+    """
     total_q, num_heads, head_dim = q.shape
     batch = cu_seqlens.shape[0] - 1
     k_fp4 = isinstance(k_cache, Nvfp4Cache)

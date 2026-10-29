@@ -1,5 +1,4 @@
-"""Prefill-side gather of the packed NVFP4 (MSA-v1) main K/V cache into the paged
-shuffle layout the Gluon sparse prefill reads, dequantized as it is gathered."""
+"""Dequantizing gather of the packed NVFP4 (MSA-v1) main K/V cache into Gluon shuffle pages."""
 
 import torch
 import triton
@@ -34,7 +33,7 @@ def _gather_nvfp4_to_shuffle_kernel(
     X: tl.constexpr,
     POOL_PAGE_SIZE: tl.constexpr,
 ):
-    """The NVFP4 twin of `_gather_nhd_to_shuffle_kernel`: dequantize while gathering."""
+    """The NVFP4 twin of ``_gather_nhd_to_shuffle_kernel``: dequantize while gathering."""
     pid = tl.program_id(0)
     req = tl.load(page_req_ptr + pid)
     ppos = tl.load(page_pos_ptr + pid)

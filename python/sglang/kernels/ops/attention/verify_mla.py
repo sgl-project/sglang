@@ -34,8 +34,8 @@ _BLOCK_CONFIG = {
 }
 
 
-# Draft rows per program of the windowed combine, measured on gfx950 for the
-# M3.1 draft (16 heads, 7 rows, window 4095) at 1-64 requests.
+# Draft rows per program of the windowed combine, measured on gfx950 for the M3.1 draft
+# (16 heads, 7 rows, window 4095) at 1-64 requests.
 def _window_combine_rows(bs: int) -> int:
     return 2 if bs <= 16 else 8
 
@@ -450,8 +450,10 @@ def _verify_window_combine_stage2(
     KV_GROUP_NUM: tl.constexpr,
     HAS_KV_HEADS: tl.constexpr,
 ):
-    """_verify_mla_combine_stage2 for a windowed, non-causal draft block, ROWS draft
-    rows per program: the splits merge in one pass instead of a loop over them."""
+    """_verify_mla_combine_stage2 for a windowed, non-causal draft block, ROWS rows per program.
+
+    The splits merge in one pass instead of a loop over them.
+    """
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     offs_r = tl.program_id(2) * ROWS + tl.arange(0, ROWS)

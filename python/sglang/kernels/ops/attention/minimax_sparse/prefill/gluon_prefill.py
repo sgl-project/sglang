@@ -168,9 +168,11 @@ def _gather_context_to_shuffle(
     total_pages: int,
     scratch_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather this batch's context tokens (NHD pool slots) into SHUFFLE 5D pages of
-    ``scratch_dtype``: the pool's, or the compute dtype an fp8 or NVFP4 pool widens to
-    exactly."""
+    """Gather this batch's context tokens (NHD pool slots) into SHUFFLE 5D pages.
+
+    The pages are ``scratch_dtype``: the pool's, or the compute dtype an fp8 or NVFP4
+    pool widens to exactly.
+    """
     x = 16 // scratch_dtype.itemsize  # 8 for bf16/fp16, 16 for fp8
     k_flat, v_flat = _get_scratch(k_cache.device, scratch_dtype, total_pages)
     if isinstance(k_cache, Nvfp4Cache):
@@ -403,7 +405,7 @@ def _scale_tensor(value: float, device: torch.device) -> torch.Tensor:
 
 
 def _kv_scale_tensor(scale: Optional[float], device: torch.device) -> torch.Tensor:
-    # the kernel takes per-tensor KV scales only as [1] fp32 tensors
+    # The kernel takes per-tensor KV scales only as [1] fp32 tensors.
     return _scale_tensor(1.0 if scale is None else float(scale), device)
 
 
@@ -490,8 +492,10 @@ def _gluon_sparse_prefill_group(
     v_scale: Optional[float] = None,
     out_quant: str = "",
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    """gluon_sparse_prefill over one request group, its whole context gathered into the
-    SHUFFLE scratch; raises GluonPrefillUnavailableError when the scratch cannot hold it."""
+    """``gluon_sparse_prefill`` over one request group, its whole context in the scratch.
+
+    Raises GluonPrefillUnavailableError when the scratch cannot hold the context.
+    """
     if sm_scale is None:
         sm_scale = q.shape[-1] ** -0.5
 
@@ -615,10 +619,13 @@ def gluon_sparse_prefill(
     out_quant: str = "",
     q_lens_cpu: Optional[list[int]] = None,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    """Run Gluon sparse prefill via the SHUFFLE scratch; raises GluonPrefillUnavailableError
-    when the scratch cannot hold the context. An NVFP4 cache past the cap runs consecutive
-    request groups of ``q_lens_cpu`` query rows instead, raising only for one oversized
-    request. ``out_quant`` may return O quantized for the o_proj, from a single group only."""
+    """Run Gluon sparse prefill via the SHUFFLE scratch.
+
+    Raises GluonPrefillUnavailableError when the scratch cannot hold the context; an
+    NVFP4 cache past the cap runs consecutive request groups of ``q_lens_cpu`` query rows
+    instead, raising only for one oversized request. ``out_quant`` may return O
+    quantized for the o_proj, from a single group only.
+    """
     run_group = functools.partial(
         _gluon_sparse_prefill_group,
         k_cache=k_cache,
