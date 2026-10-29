@@ -1,4 +1,5 @@
 import logging
+import weakref
 from typing import List, Optional
 
 import numpy as np
@@ -11,7 +12,7 @@ from sglang.kernels.ops.speculative.reconstruct_tree import (
     reconstruct_indices_from_tree_mask_func,
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -106,9 +107,9 @@ class NGRAMWorker(BaseSpecWorker):
         self.device = get_device().device
 
         self.adaptive_controller = None
-        # rids of the last decode batch; used to erase corpus match state for
-        # requests that left the batch (see forward_batch_generation).
-        self._prev_decode_rids: set = set()
+        # A completed request ID can belong to a new Req. Weak references keep
+        # an idle worker from holding finished requests in memory.
+        self._prev_decode_reqs: dict[str, weakref.ReferenceType[Req]] = {}
         self.grammar_tree_host: Optional[tuple] = None
 
         self.ngram_corpus = NgramCorpus(
@@ -151,7 +152,7 @@ class NGRAMWorker(BaseSpecWorker):
 
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
-        self._prev_decode_rids = set()
+        self._prev_decode_reqs.clear()
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
@@ -423,12 +424,27 @@ class NGRAMWorker(BaseSpecWorker):
             i += 1
         self.ngram_corpus.batch_put(batch_tokens)
 
+    def _clear_stale_request_state(self, batch: ScheduleBatch):
+        current_reqs = {req.rid: req for req in batch.reqs}
+        stale_rids = [
+            rid
+            for rid, req_ref in self._prev_decode_reqs.items()
+            if rid not in current_reqs or req_ref() is not current_reqs[rid]
+        ]
+        if stale_rids:
+            self.ngram_corpus.erase_match_state(stale_rids)
+        self._prev_decode_reqs = {
+            rid: weakref.ref(req) for rid, req in current_reqs.items()
+        }
+
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         fwd_stream = torch.get_device_module(self.device).current_stream()
         record_stream_for_v2_verify(batch, None, fwd_stream)
         bs = len(batch.reqs)
+        if batch.forward_mode.is_decode():
+            self._clear_stale_request_state(batch)
 
         set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
         self._prepare_for_speculative_decoding(batch)
@@ -529,15 +545,6 @@ class NGRAMWorker(BaseSpecWorker):
                 on_publish(new_seq_lens)
 
             self._update_ngram_corpus(batch)
-            # Erase match state of requests that left the decode batch.
-            # req.finished() is unusable here: under overlap it flips at result
-            # processing, one iteration after the request left the batch.
-            # The last batch's entries persist while idle (bounded, small).
-            cur_rids = {req.rid for req in batch.reqs}
-            departed_rids = self._prev_decode_rids - cur_rids
-            if departed_rids:
-                self.ngram_corpus.erase_match_state(list(departed_rids))
-            self._prev_decode_rids = cur_rids
             batch.forward_mode = ForwardMode.DECODE
 
         else:
