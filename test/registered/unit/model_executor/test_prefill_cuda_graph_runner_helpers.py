@@ -60,23 +60,33 @@ def _make_pp_buffers_and_registry():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
-    def test_attention_padding_respects_cuda_and_mixed_moe_layers(self):
+    def test_attention_padding_respects_cuda_moe_and_quantization(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = True
-        runner.model_runner = SimpleNamespace(attn_backend=object())
         runner.attention_layers = []
-        runner.quant_config = None
         runner.moe_fusions = []
         runner.dsa_indexers = None
         runner.mha_companion_layers = None
-        for cuda, moe_layers, zero_tail in (
-            (True, [], False),
-            (True, [None, None], False),
-            (True, [None, object()], True),
-            (False, [], True),
-            (False, [None, object()], True),
+        for cuda, moe_layers, quant_config, quantization, zero_tail in (
+            (True, [], None, None, False),
+            (True, [None, None], None, None, False),
+            (True, [None, object()], None, None, True),
+            (True, [], object(), None, True),
+            (True, [], None, "fp8", True),
+            (False, [], None, None, True),
+            (False, [None, object()], None, None, True),
         ):
-            with self.subTest(cuda=cuda, moe_layers=moe_layers):
+            with self.subTest(
+                cuda=cuda,
+                moe_layers=moe_layers,
+                quant_config=quant_config,
+                quantization=quantization,
+            ):
+                runner.model_runner = SimpleNamespace(
+                    attn_backend=object(),
+                    model_config=SimpleNamespace(quantization=quantization),
+                )
+                runner.quant_config = quant_config
                 runner.moe_layers = moe_layers
                 output = torch.ones(4, 2)
                 with (
