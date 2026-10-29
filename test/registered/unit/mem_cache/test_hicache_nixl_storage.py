@@ -288,8 +288,8 @@ class TestNixlUnified(CustomTestCase):
             extra_config={
                 "plugin": {"posix": {"active": True}},
                 "use_direct_io": False,
-                # Round-trip checks require files to survive between writes
-                # and reads, even on a busy CI disk. Cleanup has its own suite.
+                # Round trips require retained files regardless of runner disk
+                # pressure. Cleaner behavior has its own dedicated test suite.
                 "l3_cleaner_enabled": False,
             },
         )
@@ -520,7 +520,9 @@ class TestNixlUnified(CustomTestCase):
             },
         )
         try:
-            return HiCacheNixl(storage_config=obj_config, file_path="")
+            hicache = HiCacheNixl(storage_config=obj_config, file_path="")
+            self.addCleanup(hicache.close)
+            return hicache
         except Exception as e:
             self.skipTest(f"NIXL OBJ backend unavailable: {e}")
 
