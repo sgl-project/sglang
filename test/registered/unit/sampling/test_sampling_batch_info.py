@@ -46,6 +46,19 @@ def _make_info(batch_size=2, **overrides):
     return SamplingBatchInfo(**defaults)
 
 
+def _make_greedy_info(greedy_rows, track_rows=True):
+    """Create a SamplingBatchInfo whose rows are greedy (top_k=1) or sampling."""
+    return _make_info(
+        batch_size=len(greedy_rows),
+        top_ks=torch.tensor(
+            [1 if greedy else TOP_K_ALL for greedy in greedy_rows], dtype=torch.int32
+        ),
+        is_all_greedy=all(greedy_rows),
+        is_any_greedy=any(greedy_rows),
+        greedy_rows=list(greedy_rows) if track_rows else None,
+    )
+
+
 def _serial_batched_fill(entries, vocab_mask):
     for entry in entries:
         entry.grammar.fill_vocab_mask(vocab_mask, entry.row)
@@ -670,6 +683,93 @@ class TestMergeBatch(CustomTestCase):
         self.assertEqual(info1.sampling_seed[2].item(), 30)
 
 
+# is_all_greedy / is_any_greedy across merge_batch and filter_batch
+class TestGreedyFlags(CustomTestCase):
+    def test_filter_out_sampling_row_restores_all_greedy(self):
+        """A greedy row is all-greedy again once a merged sampling row leaves."""
+        info = _make_greedy_info([True])
+        info.merge_batch(_make_greedy_info([False]))
+        self.assertFalse(info.is_all_greedy)
+        self.assertTrue(info.is_any_greedy)
+
+        info.filter_batch([0], torch.tensor([0]))
+
+        self.assertEqual(info.greedy_rows, [True])
+        self.assertTrue(info.is_all_greedy)
+        self.assertTrue(info.is_any_greedy)
+
+    def test_all_greedy_batch_round_trip(self):
+        """All greedy -> a sampling row merges in -> it leaves -> all greedy."""
+        info = _make_greedy_info([True, True])
+        self.assertTrue(info.is_all_greedy)
+
+        info.merge_batch(_make_greedy_info([False]))
+        self.assertEqual(info.greedy_rows, [True, True, False])
+        self.assertFalse(info.is_all_greedy)
+
+        info.filter_batch([0, 1], torch.tensor([0, 1]))
+        self.assertEqual(info.greedy_rows, [True, True])
+        self.assertTrue(info.is_all_greedy)
+        self.assertTrue(info.is_any_greedy)
+
+    def test_filter_out_greedy_rows_clears_any_greedy(self):
+        """is_any_greedy goes back to False once the last greedy row leaves."""
+        info = _make_greedy_info([False, False])
+        info.merge_batch(_make_greedy_info([True]))
+        self.assertFalse(info.is_all_greedy)
+        self.assertTrue(info.is_any_greedy)
+
+        info.filter_batch([0, 1], torch.tensor([0, 1]))
+
+        self.assertEqual(info.greedy_rows, [False, False])
+        self.assertFalse(info.is_all_greedy)
+        self.assertFalse(info.is_any_greedy)
+
+    def test_merge_with_untracked_side_falls_back(self):
+        """When either side lacks per-row flags, merge combines the batch flags
+        as before and filter leaves them unchanged."""
+        for left_tracked, right_tracked in (
+            (True, False),
+            (False, True),
+            (False, False),
+        ):
+            with self.subTest(left_tracked=left_tracked, right_tracked=right_tracked):
+                info = _make_greedy_info([True, True], track_rows=left_tracked)
+                info.merge_batch(_make_greedy_info([False], track_rows=right_tracked))
+                self.assertIsNone(info.greedy_rows)
+                self.assertFalse(info.is_all_greedy)
+                self.assertTrue(info.is_any_greedy)
+
+                info.filter_batch([0, 1], torch.tensor([0, 1]))
+
+                self.assertIsNone(info.greedy_rows)
+                self.assertEqual(len(info), 2)
+                self.assertFalse(info.is_all_greedy)
+                self.assertTrue(info.is_any_greedy)
+
+    def test_filter_keeps_rows_aligned_with_keep_order(self):
+        """Per-row flags follow non-contiguous, reordered keep_indices."""
+        info = _make_greedy_info([True, False, True, False, True])
+
+        info.filter_batch([3, 0, 4], torch.tensor([3, 0, 4]))
+        self.assertEqual(info.greedy_rows, [False, True, True])
+        self.assertEqual(info.greedy_rows, [k <= 1 for k in info.top_ks.tolist()])
+        self.assertFalse(info.is_all_greedy)
+        self.assertTrue(info.is_any_greedy)
+
+        info.filter_batch([2, 1], torch.tensor([2, 1]))
+        self.assertEqual(info.greedy_rows, [True, True])
+        self.assertEqual(info.greedy_rows, [k <= 1 for k in info.top_ks.tolist()])
+        self.assertTrue(info.is_all_greedy)
+
+        info.merge_batch(_make_greedy_info([False, True]))
+        info.filter_batch([2, 0], torch.tensor([2, 0]))
+        self.assertEqual(info.greedy_rows, [False, True])
+        self.assertEqual(info.greedy_rows, [k <= 1 for k in info.top_ks.tolist()])
+        self.assertFalse(info.is_all_greedy)
+        self.assertTrue(info.is_any_greedy)
+
+
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
     def test_returns_copy_without_orchestrator(self):
@@ -754,6 +854,28 @@ class TestFromScheduleBatch(CustomTestCase):
         batch.device = DEVICE
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertTrue(info.is_all_greedy)
+
+    def test_greedy_flags_refresh_after_sampling_request_finishes(self):
+        """A sampling request that joins a greedy decode batch and finishes
+        must not leave the remaining greedy rows on the sampling path."""
+        running = MagicMock()
+        running.reqs = [self._make_req(top_k=1), self._make_req(top_k=1)]
+        running.device = DEVICE
+        info = SamplingBatchInfo.from_schedule_batch(running, VOCAB_SIZE)
+        self.assertEqual(info.greedy_rows, [True, True])
+        self.assertTrue(info.is_all_greedy)
+
+        joining = MagicMock()
+        joining.reqs = [self._make_req(temp=0.7, top_k=TOP_K_ALL)]
+        joining.device = DEVICE
+        info.merge_batch(SamplingBatchInfo.from_schedule_batch(joining, VOCAB_SIZE))
+        self.assertEqual(info.greedy_rows, [True, True, False])
+        self.assertFalse(info.is_all_greedy)
+
+        info.filter_batch([0, 1], torch.tensor([0, 1]))
+        self.assertEqual(info.greedy_rows, [True, True])
+        self.assertTrue(info.is_all_greedy)
+        self.assertTrue(info.is_any_greedy)
 
     def test_logit_bias_construction(self):
         """Test that logit_bias dict is converted to a tensor with correct values."""
