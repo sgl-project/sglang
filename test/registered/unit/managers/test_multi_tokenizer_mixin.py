@@ -239,6 +239,9 @@ class TestMultiTokenizerMixin(CustomTestCase):
                 self.assertEqual(
                     mocks["start_cpu_monitor_thread"].call_count, 1 if enabled else 0
                 )
+                mocks["MultiDetokenizerRouter"].assert_called_once_with(
+                    [], None, enable_metrics=enabled
+                )
 
     def test_batch_str_output_preserves_cached_tokens_details(self):
         output = _make_batch_str_output()

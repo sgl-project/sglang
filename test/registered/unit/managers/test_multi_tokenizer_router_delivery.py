@@ -26,6 +26,7 @@ from sglang.srt.managers.io_struct import (
     sock_recv,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiDetokenizerRouter
+from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 
 register_cpu_ci(est_time=35, suite="base-a-test-cpu")
@@ -51,6 +52,14 @@ def _child_diagnostics(errors, processes):
         for process in processes
     )
     return "\n".join(details)
+
+
+def _join_successful_child(process):
+    process.join(timeout=5)
+    if process.is_alive():
+        raise TimeoutError(f"{process.name} did not exit within 5 seconds")
+    if process.exitcode != 0:
+        raise RuntimeError(f"{process.name} failed with exitcode={process.exitcode}")
 
 
 @contextmanager
@@ -93,6 +102,37 @@ class TestTimestampFraming(CustomTestCase):
                 )
                 self.assertFalse(receiver.getsockopt(zmq.RCVMORE))
 
+    def test_send_timestamp_precedes_serialization(self):
+        message = AbortReq(rid="encode-boundary")
+        for pickle_ipc in (False, True):
+            with (
+                self.subTest(pickle_ipc=pickle_ipc),
+                _socket_pair() as (sender, receiver),
+            ):
+                io_struct._USE_PICKLE_IPC = pickle_ipc
+                encoder_owner = io_struct.pickle if pickle_ipc else io_struct
+                encoder_name = "dumps" if pickle_ipc else "msgpack_encode"
+                original_encoder = getattr(encoder_owner, encoder_name)
+                clock_ns = [1_000_000_000]
+
+                def advance_during_encoding(*args, **kwargs):
+                    clock_ns[0] += 2_000_000_000
+                    return original_encoder(*args, **kwargs)
+
+                with (
+                    patch.object(
+                        io_struct.time, "monotonic_ns", side_effect=lambda: clock_ns[0]
+                    ),
+                    patch.object(
+                        encoder_owner, encoder_name, side_effect=advance_during_encoding
+                    ),
+                ):
+                    io_struct.sock_send_with_timestamp(sender, message)
+                timestamp, decoded = io_struct.sock_recv_with_timestamp(receiver)
+                self.assertEqual(timestamp, 1_000_000_000)
+                self.assertEqual(clock_ns[0], 3_000_000_000)
+                self.assertEqual(decoded, message)
+
     def test_rejects_malformed_timestamp_frames(self):
         message = AbortReq(rid="malformed")
         for pickle_ipc in (False, True):
@@ -130,6 +170,160 @@ class TestTimestampFraming(CustomTestCase):
             ):
                 io_struct.sock_send_with_timestamp(socket, AbortReq(rid="encoding"))
             self.assertEqual(socket.mock_calls, [])
+
+
+def _test_port_args(detokenizer_endpoint):
+    return SimpleNamespace(
+        scheduler_input_ipc_name="ipc:///scheduler",
+        rpc_ipc_name="ipc:///rpc",
+        tokenizer_ipc_name="ipc:///tokenizer",
+        detokenizer_ipc_name=detokenizer_endpoint,
+        metrics_ipc_name="ipc:///metrics",
+    )
+
+
+class TestClockDomainGating(CustomTestCase):
+    def test_timestamp_only_for_local_endpoints(self):
+        cases = (
+            ("ipc:///tmp/detokenizer", True),
+            ("inproc://detokenizer", True),
+            ("tcp://127.0.0.1:23123", True),
+            ("tcp://127.0.0.2:23123", True),
+            ("tcp://[::1]:23123", True),
+            ("tcp://192.0.2.1:23123", False),
+            ("tcp://remote.example:23123", False),
+            ("tcp://localhost:23123", False),
+            ("tcp://127.0.0.1:0;192.0.2.1:23123", False),
+            ("tcp://192.0.2.1:0;127.0.0.1:23123", False),
+        )
+        for endpoint, expected in cases:
+            with (
+                self.subTest(endpoint=endpoint),
+                patch(
+                    "sglang.srt.managers.scheduler_components.ipc_channels.zmq.Context"
+                ),
+                patch(
+                    "sglang.srt.managers.scheduler_components.ipc_channels.get_zmq_socket",
+                    return_value=MagicMock(),
+                ),
+            ):
+                channels = SchedulerIpcChannels.create(
+                    port_args=_test_port_args(endpoint),
+                    is_rank_zero=True,
+                    skip_tokenizer_init=False,
+                    metrics_enabled=True,
+                    enable_scripted_runtime=False,
+                    detokenizer_router_metrics_enabled=True,
+                )
+                self.assertEqual(channels.send_to_detokenizer.timestamped, expected)
+
+    def test_remote_sender_keeps_single_frame_without_clock_read(self):
+        original_codec = io_struct._USE_PICKLE_IPC
+        self.addCleanup(setattr, io_struct, "_USE_PICKLE_IPC", original_codec)
+        endpoint = "tcp://192.0.2.1:23123"
+        for pickle_ipc in (False, True):
+            with (
+                self.subTest(pickle_ipc=pickle_ipc),
+                _socket_pair() as (sender, receiver),
+            ):
+                io_struct._USE_PICKLE_IPC = pickle_ipc
+
+                def socket_for_endpoint(_context, _kind, name, _bind):
+                    return sender if name == endpoint else MagicMock()
+
+                with (
+                    patch(
+                        "sglang.srt.managers.scheduler_components.ipc_channels.zmq.Context"
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.ipc_channels.get_zmq_socket",
+                        side_effect=socket_for_endpoint,
+                    ),
+                ):
+                    channels = SchedulerIpcChannels.create(
+                        port_args=_test_port_args(endpoint),
+                        is_rank_zero=True,
+                        skip_tokenizer_init=False,
+                        metrics_enabled=True,
+                        enable_scripted_runtime=False,
+                        detokenizer_router_metrics_enabled=True,
+                    )
+                message = AbortReq(rid="remote-legacy")
+                with patch.object(
+                    io_struct.time,
+                    "monotonic_ns",
+                    side_effect=AssertionError("clock read"),
+                ):
+                    channels.send_to_detokenizer.send_output(message)
+                self.assertEqual(
+                    io_struct.sock_recv_with_timestamp(receiver), (None, message)
+                )
+                self.assertFalse(receiver.getsockopt(zmq.RCVMORE))
+
+
+class TestProductionHistogram(CustomTestCase):
+    def test_registered_histogram_includes_decode_time(self):
+        original_codec = io_struct._USE_PICKLE_IPC
+        self.addCleanup(setattr, io_struct, "_USE_PICKLE_IPC", original_codec)
+        io_struct._USE_PICKLE_IPC = False
+        registry = CollectorRegistry()
+        clock_ns = [10_000_000_000]
+        original_decode = io_struct.msgpack_decode
+
+        def histogram_with_registry(*args, **kwargs):
+            return Histogram(*args, registry=registry, **kwargs)
+
+        def decode_with_delay(data):
+            decoded = original_decode(data)
+            clock_ns[0] += 2_000_000_000
+            return decoded
+
+        with _socket_pair() as (sender, receiver):
+            with (
+                patch(
+                    "prometheus_client.Histogram", side_effect=histogram_with_registry
+                ),
+                patch("sglang.srt.managers.multi_tokenizer_mixin.zmq.Context"),
+                patch(
+                    "sglang.srt.managers.multi_tokenizer_mixin.get_zmq_socket",
+                    return_value=receiver,
+                ),
+            ):
+                router = MultiDetokenizerRouter(
+                    ["worker"],
+                    SimpleNamespace(detokenizer_ipc_name="unused"),
+                    enable_metrics=True,
+                )
+            router._send = MagicMock(side_effect=StopIteration)
+            with patch.object(
+                io_struct.time, "monotonic_ns", side_effect=lambda: clock_ns[0]
+            ):
+                SenderWrapper(sender, timestamped=True).send_output(
+                    AbortReq(rid="timed")
+                )
+            clock_ns[0] += 1_000_000_000
+            with (
+                patch.object(
+                    io_struct, "msgpack_decode", side_effect=decode_with_delay
+                ),
+                patch(
+                    "sglang.srt.managers.multi_tokenizer_mixin.monotonic_ns",
+                    side_effect=lambda: clock_ns[0],
+                ),
+                self.assertRaises(StopIteration),
+            ):
+                router.event_loop()
+            router._send.assert_called_once()
+        self.assertEqual(
+            registry.get_sample_value(
+                "sglang:detokenizer_router_delivery_seconds_count"
+            ),
+            1.0,
+        )
+        self.assertEqual(
+            registry.get_sample_value("sglang:detokenizer_router_delivery_seconds_sum"),
+            3.0,
+        )
 
 
 class _RecordingHistogram:
@@ -188,8 +382,10 @@ def _worker(endpoint, ready, result_queue):
         objects.append(sock_recv(pull))
     result_queue.put(
         {
+            "endpoint": endpoint,
             "count": len(objects),
             "types": [type(obj).__name__ for obj in objects],
+            "rids": [obj.rid for obj in objects if isinstance(obj, AbortReq)],
         }
     )
     pull.close(0)
@@ -283,7 +479,7 @@ def _delivery_case(pickle_ipc):
                     placeholder_tokens_idx=[],
                     placeholder_tokens_val=[],
                 ),
-                AbortReq(rid="delivery-b", http_worker_ipc="worker-b"),
+                AbortReq(rid="delivery-b", http_worker_ipc="worker-d"),
             ]
             for message in messages:
                 sender.send_output(message)
@@ -293,6 +489,8 @@ def _delivery_case(pickle_ipc):
             router_start.set()
 
             worker_results = [result_queue.get(timeout=8) for _ in workers]
+            for worker in workers:
+                _join_successful_child(worker)
             samples = [observations.get(timeout=8) for _ in messages]
             try:
                 observations.get(timeout=0.5)
@@ -300,6 +498,18 @@ def _delivery_case(pickle_ipc):
                 pass
             else:
                 raise AssertionError("legacy single-frame message was observed")
+            # A failed child may still be alive while its Queue feeder flushes.
+            # Drain a reported error before terminating the long-running router.
+            try:
+                child_error = errors.get(timeout=0.1)
+            except queue.Empty:
+                pass
+            else:
+                raise RuntimeError(f"Child process reported an error:\n{child_error}")
+            if not router_process.is_alive():
+                raise RuntimeError(
+                    f"router exited unexpectedly with exitcode={router_process.exitcode}"
+                )
             return {"samples": samples, "worker_results": worker_results}
         except Exception as exc:
             raise AssertionError(
@@ -359,6 +569,7 @@ def _overhead_case(timestamped):
                 sender.send_output(message)
                 samples_us.append((time.perf_counter_ns() - start) / 1e3)
             frame_counts = result_queue.get(timeout=8)
+            _join_successful_child(sink)
         except Exception as exc:
             raise AssertionError(
                 f"Frame sink subprocess failure: {exc}\n"
@@ -405,6 +616,63 @@ class TestRouterDeliveryIntegration(CustomTestCase):
         self.assertIn("Traceback", str(error.exception))
         self.assertIn("exitcode=1", str(error.exception))
 
+    def test_router_late_failure_preserves_traceback(self):
+        def fail_after_fanout(endpoint, worker_endpoints, ready, start, observations):
+            router = MultiDetokenizerRouter(
+                worker_endpoints,
+                SimpleNamespace(detokenizer_ipc_name=endpoint),
+                enable_metrics=True,
+            )
+            router.delivery_seconds = _RecordingHistogram(observations)
+            original_send = router._send
+            send_count = [0]
+
+            def send_then_fail(target, message):
+                original_send(target, message)
+                send_count[0] += 1
+                if send_count[0] == 7:
+                    raise RuntimeError("router failed after fanout: " + "X" * 262144)
+
+            router._send = send_then_fail
+            ready.set()
+            assert start.wait(5), "producer did not send"
+            time.sleep(0.20)
+            router.event_loop()
+
+        with patch(f"{__name__}._router", side_effect=fail_after_fanout):
+            with self.assertRaisesRegex(
+                AssertionError, "RuntimeError: router failed after fanout"
+            ):
+                _delivery_case(io_struct._USE_PICKLE_IPC)
+
+    def test_worker_late_failure_preserves_traceback(self):
+        original_worker = _worker
+
+        def fail_after_report(*args):
+            original_worker(*args)
+            raise RuntimeError("worker failed after report")
+
+        with patch(f"{__name__}._worker", side_effect=fail_after_report):
+            with self.assertRaisesRegex(
+                AssertionError, "RuntimeError: worker failed after report"
+            ) as error:
+                _delivery_case(io_struct._USE_PICKLE_IPC)
+        self.assertIn("exitcode=1", str(error.exception))
+
+    def test_sink_late_failure_preserves_traceback(self):
+        original_sink = _frame_sink
+
+        def fail_after_report(*args):
+            original_sink(*args)
+            raise RuntimeError("sink failed after report")
+
+        with patch(f"{__name__}._frame_sink", side_effect=fail_after_report):
+            with self.assertRaisesRegex(
+                AssertionError, "RuntimeError: sink failed after report"
+            ) as error:
+                _overhead_case(False)
+        self.assertIn("exitcode=1", str(error.exception))
+
     def test_real_zmq_delivery_backlog_and_both_codecs(self):
         original_codec = io_struct._USE_PICKLE_IPC
         try:
@@ -441,6 +709,16 @@ class TestRouterDeliveryIntegration(CustomTestCase):
                                 "BatchEmbeddingOutput",
                             ]
                         ),
+                    )
+                    self.assertEqual(
+                        {
+                            item["endpoint"].rsplit("/", 1)[-1]: item["rids"]
+                            for item in delivery["worker_results"]
+                        },
+                        {
+                            "worker-a.sock": ["delivery-a", "legacy"],
+                            "worker-b.sock": ["delivery-b"],
+                        },
                     )
                     self.assertTrue(all(x == 1 for x in overhead_off["frame_counts"]))
                     self.assertTrue(all(x == 2 for x in overhead_on["frame_counts"]))

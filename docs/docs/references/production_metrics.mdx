@@ -13,7 +13,9 @@ With `--enable-metrics` and more than one detokenizer worker, `sglang:detokenize
 
 The router records at most one observation for each scheduler message, before routing, grouping, or control/empty-batch fan-out. It has no request labels. A legacy single-frame message is still routed but has no delivery observation. Metrics-off, single-detokenizer, and `--skip-tokenizer-init` paths retain the original single-frame codec path and do not read a new clock or add a wire frame.
 
-When this metric is enabled, the scheduler and router must run on the same host and use the same SGLang wire version: the normal payload is followed by a timestamp frame in an atomic multipart message for both pickle and msgpack IPC. Monotonic timestamps are not comparable across hosts. This metric is intended to expose scheduler-to-router backlog, not router processing time or downstream detokenizer work.
+Monotonic timestamps are not comparable across hosts. To avoid recording misleading durations, a scheduler sends timestamps only when its detokenizer endpoint uses `ipc://`, `inproc://`, or a numeric loopback TCP address. For other endpoints, including hostnames and non-loopback addresses on the same host, it logs a warning and sends the original single-frame message; the router records no delivery observation for that message. Consequently, this metric can omit some or all traffic in multi-node deployments; a zero count does not establish that there is no backlog.
+
+Timestamped senders and routers must use the same SGLang wire version: the normal payload is followed by a timestamp frame in an atomic multipart message for both pickle and msgpack IPC. This metric is intended to expose scheduler-to-router backlog, not router processing time or downstream detokenizer work.
 
 ## Language model metrics
 

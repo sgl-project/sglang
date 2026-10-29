@@ -1,5 +1,8 @@
+import ipaddress
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
+from urllib.parse import urlsplit
 
 import zmq
 
@@ -11,6 +14,26 @@ if TYPE_CHECKING:
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
     )
+
+
+logger = logging.getLogger(__name__)
+
+
+def _has_local_clock_domain(endpoint: str) -> bool:
+    """Conservatively identify endpoints that cannot route to another host."""
+    if endpoint.startswith(("ipc://", "inproc://")):
+        return True
+    # In libzmq's source;destination syntax, URL parsing sees the source.
+    if ";" in endpoint:
+        return False
+    try:
+        parsed = urlsplit(endpoint)
+        return (
+            parsed.scheme == "tcp" and ipaddress.ip_address(parsed.hostname).is_loopback
+        )
+    except ValueError:
+        # Names and nonstandard endpoints do not establish a shared clock.
+        return False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -66,10 +89,18 @@ class SchedulerIpcChannels:
                 )
 
             send_to_tokenizer = SenderWrapper(send_to_tokenizer_raw)
+            timestamped = detokenizer_router_metrics_enabled and not skip_tokenizer_init
+            if timestamped and not _has_local_clock_domain(
+                port_args.detokenizer_ipc_name
+            ):
+                logger.warning(
+                    "Scheduler-to-detokenizer-router delivery latency is not "
+                    "recorded for endpoint %s: monotonic clock domains may differ.",
+                    port_args.detokenizer_ipc_name,
+                )
+                timestamped = False
             send_to_detokenizer = SenderWrapper(
-                send_to_detokenizer_raw,
-                timestamped=detokenizer_router_metrics_enabled
-                and not skip_tokenizer_init,
+                send_to_detokenizer_raw, timestamped=timestamped
             )
         else:
             recv_from_tokenizer = None
