@@ -454,6 +454,8 @@ class Lfm2Detector(BaseFormatDetector):
         self.bot_token = "<|tool_call_start|>"
         self.eot_token = "<|tool_call_end|>"
         self.tool_call_separator = ""
+        self._streamed_parameters: Dict[int, str] = {}
+        self._stream_call_offset = 0
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains an LFM2 format tool call."""
@@ -782,18 +784,120 @@ class Lfm2Detector(BaseFormatDetector):
         """Remove special tokens from text."""
         return text.replace(self.bot_token, "").replace(self.eot_token, "")
 
+    def _stream_pythonic_prefix(
+        self, content: str, tools: List[Tool]
+    ) -> List[ToolCallItem]:
+        """Parse a provisional completion, emitting only its real JSON prefix.
+
+        Synthetic closing quotes/brackets make AST parsing possible, but are
+        never sent to the client. Scalars wait for a delimiter: e.g. ``1``
+        could still become ``1e-3``. Incomplete escape sequences also wait.
+        """
+        content = content.strip().removeprefix("[")
+        segments = _split_top_level_calls(content)
+        calls = []
+        for index, segment in enumerate(segments):
+            stack = []
+            quote = None
+            cursor = 0
+            while cursor < len(segment):
+                char = segment[cursor]
+                if quote:
+                    if char == "\\":
+                        cursor += 2
+                        continue
+                    if char == quote:
+                        quote = None
+                elif char in "\"'":
+                    quote = char
+                elif char in "([{":
+                    stack.append({"(": ")", "[": "]", "{": "}"}[char])
+                elif char in ")]}":
+                    if not stack or stack.pop() != char:
+                        break
+                cursor += 1
+            segment = segment[:cursor]
+            if not stack:
+                parsed, _ = self._parse_pythonic_content(segment, tools)
+                if parsed:
+                    item = parsed[0]
+                    item.tool_index = index
+                    calls.append(item)
+                continue
+            # Do not guess a partial number, identifier, keyword, or dict key.
+            if not quote and segment.rstrip()[-1:] not in ",)]}":
+                continue
+            suffix = "".join(reversed(stack))
+            candidate = segment
+            if quote:
+                # An incomplete Python escape cannot be committed to JSON.
+                escape = re.search(r"(?<!\\)(?:\\\\)*\\([^\\]*)$", candidate)
+                if escape:
+                    tail = escape.group(1)
+                    width = {"x": 2, "u": 4, "U": 8}.get(tail[:1])
+                    if (
+                        not tail
+                        or (width and len(tail) < width + 1)
+                        or (tail.startswith("N{") and "}" not in tail)
+                        or (tail[:1] in "01234567" and len(tail) < 3)
+                    ):
+                        candidate = candidate[: escape.end() - len(tail) - 1]
+                candidate += quote
+            # ``{'key'`` is still ambiguous between a dict and a set;
+            # ``(1`` between grouping and a tuple. Wait rather than commit
+            # a JSON container that later input could change.
+            if ")" in stack[1:]:
+                continue
+            try:
+                provisional, renamed = _rename_reserved_kwargs(candidate + suffix)
+                tree = safe_ast_parse(_escape_ctrl_chars_in_strings(provisional))
+                if any(isinstance(node, ast.Set) for node in ast.walk(tree)):
+                    continue
+            except (SyntaxError, ValueError):
+                continue
+            call = tree.body[0].value if tree.body else None
+            if not isinstance(call, ast.Call):
+                continue
+            item = self._parse_pythonic_call(
+                call,
+                index,
+                self._get_tool_indices(tools),
+                restore_reserved_kwarg=renamed,
+            )
+            if item is None:
+                continue
+            # One JSON closer per open container (including the kwargs dict).
+            item.parameters = item.parameters[: -(len(stack) + bool(quote))]
+            calls.append(item)
+        return calls
+
+    def _argument_deltas(self, calls: List[ToolCallItem]) -> List[ToolCallItem]:
+        deltas = []
+        for call in calls:
+            previous = self._streamed_parameters.get(call.tool_index)
+            if previous is not None and not call.parameters.startswith(previous):
+                # Recovery of malformed output cannot retract already sent bytes.
+                continue
+            delta = call.parameters[len(previous or "") :]
+            if delta or previous is None:
+                deltas.append(
+                    ToolCallItem(
+                        tool_index=self._stream_call_offset + call.tool_index,
+                        name=call.name if previous is None else None,
+                        parameters=delta,
+                    )
+                )
+                self._streamed_parameters[call.tool_index] = call.parameters
+        return deltas
+
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing for LFM2 tool calls.
 
-        This implementation properly handles Pythonic format by:
-        1. Buffering until we see complete <|tool_call_start|>[...]<|tool_call_end|>
-        2. Emitting normal text before tool calls immediately
-        3. Parsing complete tool call blocks using detect_and_parse
-
-        Based on PythonicDetector streaming logic.
+        Pythonic argument prefixes are emitted before the end marker. JSON
+        blocks retain the existing complete-block parsing behavior.
         """
         self._buffer += new_text
 
@@ -824,23 +928,16 @@ class Lfm2Detector(BaseFormatDetector):
         eot_pos = self._buffer.find(self.eot_token, bot_pos + len(self.bot_token))
 
         if eot_pos == -1:
-            # No end token yet - check if we might have a partial one
+            content = self._buffer[bot_pos + len(self.bot_token) :]
             if partial_eot:
-                # Hold back the partial token, but we need to keep buffering
-                # Just emit any normal text before the tool call
-                if normal_text_before:
-                    self._buffer = self._buffer[bot_pos:]
-                    return StreamingParseResult(normal_text=normal_text_before)
-                # Keep buffering
-                return StreamingParseResult(normal_text="")
-
-            # No end token and no partial - keep buffering but emit normal text
-            if normal_text_before:
-                self._buffer = self._buffer[bot_pos:]
-                return StreamingParseResult(normal_text=normal_text_before)
-
-            # Just keep buffering
-            return StreamingParseResult(normal_text="")
+                content = content[:-partial_eot]
+            self._buffer = self._buffer[bot_pos:]
+            calls = []
+            if not content.lstrip().startswith(("{", "[{")):
+                calls = self._argument_deltas(
+                    self._stream_pythonic_prefix(content, tools)
+                )
+            return StreamingParseResult(normal_text=normal_text_before, calls=calls)
 
         # We have a complete tool call block
         tool_call_block = self._buffer[bot_pos : eot_pos + len(self.eot_token)]
@@ -848,6 +945,10 @@ class Lfm2Detector(BaseFormatDetector):
 
         # Parse the complete block
         result = self.detect_and_parse(tool_call_block, tools)
+        result.calls = self._argument_deltas(result.calls)
+        if self._streamed_parameters:
+            self._stream_call_offset += max(self._streamed_parameters) + 1
+        self._streamed_parameters.clear()
 
         # Update buffer with remaining text
         self._buffer = remaining
