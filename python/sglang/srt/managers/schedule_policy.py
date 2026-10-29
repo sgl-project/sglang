@@ -1500,7 +1500,7 @@ class PrefillAdder:
                             )[0]
                         )
                         full_load_tokens = len(full_transfer.host_indices)
-                    if not self.memory_budget.prepare_load_back(
+                    load_budget = dict(
                         state_slots=state_slots,
                         full_tokens=(
                             full_load_tokens
@@ -1511,20 +1511,23 @@ class PrefillAdder:
                         extend_input_len=admission.extend_len,
                         max_new_tokens=load_max_new,
                         swa_host_hit_length=req.swa_host_hit_length,
+                        auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
                         chunk_limit=self.rem_chunk_tokens,
-                    ):
+                    )
+                    if not self.memory_budget.prepare_load_back(**load_budget):
                         self._defer_staged_for_capacity_if_idle(
                             req, pool="load_back_budget"
                         )
                         return AddReqResult.NO_TOKEN
                     promised_host_hit = req.host_hit_length
-                    loaded = self.tree_cache.init_load_back(
-                        InitLoadBackParams(
-                            best_match_node=req.best_match_node,
-                            host_hit_length=req.host_hit_length,
-                            req=req,
+                    with self.memory_budget.load_back_scope(**load_budget):
+                        loaded = self.tree_cache.init_load_back(
+                            InitLoadBackParams(
+                                best_match_node=req.best_match_node,
+                                host_hit_length=req.host_hit_length,
+                                req=req,
+                            )
                         )
-                    )
                 if loaded is None:
                     return AddReqResult.OTHER
                 req.host_loaded_length, req.last_node = loaded
@@ -1699,6 +1702,7 @@ class PrefillAdder:
                 chunk_limit=chunk_limit,
                 state_slots=state_slots,
                 swa_host_hit_length=swa_host_hit_length,
+                auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
             )
         ):
             return AddReqResult.NO_TOKEN

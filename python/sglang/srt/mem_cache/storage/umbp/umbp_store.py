@@ -269,12 +269,14 @@ class UMBPStore(HiCacheStorage):
 
         if storage_config is not None:
             self.is_mla_backend = storage_config.is_mla_model
+            self.is_rank_replicated = storage_config.is_rank_replicated
             self.local_rank = storage_config.tp_rank
             self.pp_rank = storage_config.pp_rank
             self.pp_size = storage_config.pp_size
             self.tp_size = storage_config.tp_size
         else:
             self.is_mla_backend = False
+            self.is_rank_replicated = False
             self.local_rank = 0
             self.pp_rank = 0
             self.pp_size = 1
@@ -769,7 +771,7 @@ class UMBPStore(HiCacheStorage):
         if (
             not remote_process_enabled
             and not per_rank_keyspace
-            and self.is_mla_backend
+            and self.is_rank_replicated
             and tp_size > 1
         ):
             cfg.ssd.enabled = True
@@ -878,7 +880,7 @@ class UMBPStore(HiCacheStorage):
         if (
             cfg.ssd.enabled
             and not self.is_mla_follower
-            and not (self.is_mla_backend and tp_size > 1)
+            and not (self.is_rank_replicated and tp_size > 1)
             and cfg.ssd.ssd_backend not in ("spdk", "spdk_proxy")
         ):
             rank_dir_parts = []
@@ -927,10 +929,13 @@ class UMBPStore(HiCacheStorage):
         self.enable_pp = self.pp_size > 1
         if self.enable_pp:
             self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
-            self.mla_suffix = f"{self.pp_rank}"
+            self.kv_rank_suffix = f"{self.pp_rank}"
         else:
             self.mha_suffix = f"{self.local_rank}"
-            self.mla_suffix = ""
+            self.kv_rank_suffix = ""
+
+        if not self.is_rank_replicated:
+            self.kv_rank_suffix = self.mha_suffix
 
         self.split_factor = 0
         if storage_config and storage_config.should_split_heads:
@@ -1167,9 +1172,10 @@ class UMBPStore(HiCacheStorage):
     # ------------------------------------------------------------------
     def _anchor_key_suffixes(self) -> tuple[str, ...]:
         if self._kv_anchor_is_page_envelope:
-            return (f"_{self.mha_suffix}_kv",)
+            # Object format does not determine whether TP ranks share its bytes.
+            return (f"_{self.kv_rank_suffix}_kv",)
         if self.is_mla_backend:
-            return (f"_{self.mla_suffix}_k",)
+            return (f"_{self.kv_rank_suffix}_k",)
         ranks = (
             self.mha_suffix
             if self.storage_config and self.storage_config.should_split_heads
@@ -1352,9 +1358,9 @@ class UMBPStore(HiCacheStorage):
         if host_pool is None:
             raise ValueError(f"Unregistered UMBP hybrid pool: {pool_name}")
 
-        mla_suffix = self.mla_suffix if rank_suffix is None else rank_suffix
+        kv_rank_suffix = self.kv_rank_suffix if rank_suffix is None else rank_suffix
         mha_suffix = (
-            getattr(self, "mha_suffix", mla_suffix)
+            getattr(self, "mha_suffix", kv_rank_suffix)
             if rank_suffix is None
             else rank_suffix
         )
@@ -1366,7 +1372,7 @@ class UMBPStore(HiCacheStorage):
             if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
                 suffixes = [f"_{mha_suffix}_temporal"] + suffixes
         elif components is not None and len(components) == 1:
-            suffixes = [f"_{mla_suffix}_{pool_name}"]
+            suffixes = [f"_{kv_rank_suffix}_{pool_name}"]
         elif components is not None and len(components) == 2:
             # Packed DevicePoolEntry K/V components share one stored object.
             suffixes = (
@@ -1383,7 +1389,7 @@ class UMBPStore(HiCacheStorage):
                 f"{len(components)}"
             )
         elif self.is_mla_backend:
-            suffixes = [f"_{mla_suffix}_{pool_name}"]
+            suffixes = [f"_{kv_rank_suffix}_{pool_name}"]
         elif getattr(host_pool, "v_buffer", None) is not None:
             suffixes = [
                 f"_{mha_suffix}_{pool_name}_k",

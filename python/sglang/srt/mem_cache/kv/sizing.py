@@ -173,7 +173,10 @@ def _bs1_floor_terms(plan, context_len, floor_window, strategy):
     for sub_pool in plan.sub_pools:
         if isinstance(sub_pool.lifetime, WindowLifetime):
             window = (
-                floor_window if floor_window is not None else sub_pool.lifetime.window
+                floor_window
+                if floor_window is not None
+                and sub_pool is plan.of_lifetime(WindowLifetime)
+                else sub_pool.lifetime.window
             )
             tokens = (
                 context_len

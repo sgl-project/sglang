@@ -36,6 +36,9 @@ _DEV = "cpu"
 
 
 def _swa_factory(**over):
+    from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+    setup_allocator_context()
     kw = dict(
         device=_DEV,
         kv_cache_dtype=torch.float16,
