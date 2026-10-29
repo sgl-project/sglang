@@ -119,7 +119,6 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -233,6 +232,7 @@ def build_replay_fb_view(
             else buffers.mamba_track_indices[:bs]
         ),
         spec_info=forward_batch.spec_info,
+        ragged_verify_layout=forward_batch.ragged_verify_layout,
         lora_ids=(
             None
             if forward_batch.lora_ids is None
@@ -880,9 +880,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         ragged_layout = (
-            resolve_ragged_verify_layout(forward_batch)
-            if self.ragged_verify_mode
-            else None
+            forward_batch.ragged_verify_layout if self.ragged_verify_mode else None
         )
         if ragged_layout is not None:
             return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
@@ -1195,7 +1193,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             global_dp_buffer_len = None
 
-        spec_info = self.get_spec_info(num_tokens)
+        capture_ragged_verify_layout = self._capture_ragged_verify_layout(num_tokens)
+        spec_info = self.get_spec_info(
+            num_tokens, ragged_verify_layout=capture_ragged_verify_layout
+        )
         self.capture_hidden_mode = get_required_capture_hidden_mode(
             self.capture_hidden_mode,
             spec_info,
@@ -1253,6 +1254,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
+            ragged_verify_layout=capture_ragged_verify_layout,
             capture_hidden_mode=self.capture_hidden_mode,
             # Maintained only under expert parallelism; None elsewhere so routing
             # does not mask every row against a never-filled zero count.
@@ -1565,9 +1567,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "Diffusion graph replay requires prepared input embeddings"
             )
         ragged_layout = (
-            resolve_ragged_verify_layout(forward_batch)
-            if self.ragged_verify_mode
-            else None
+            forward_batch.ragged_verify_layout if self.ragged_verify_mode else None
         )
         is_ragged = ragged_layout is not None
 
@@ -2136,7 +2136,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         """Optional eager tail executed after graph replay and inside its timer."""
         return output
 
-    def get_spec_info(self, num_tokens: int):
+    def get_spec_info(self, num_tokens: int, ragged_verify_layout=None):
         spec_info = None
         if (
             self.model_runner.spec_algorithm.is_eagle()
@@ -2198,7 +2198,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if self.model_runner.is_draft_worker
                     else CaptureHiddenMode.FULL
                 ),
-                ragged_verify_layout=self._capture_ragged_verify_layout(num_tokens),
+                ragged_verify_layout=ragged_verify_layout,
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():
