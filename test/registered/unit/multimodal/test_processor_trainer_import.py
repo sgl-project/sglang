@@ -1,6 +1,8 @@
 """A fresh trainer uses shared processor pools without loading inference modules.
 
-fresh Python -> resource-free Qwen strategy + TokenSpaceProcessor
+fresh Python -> register_token_space_models -> strategy_for -> Qwen strategy
+                     |
+resource-free Qwen strategy + TokenSpaceProcessor
                      |
 processor resources -> default: one worker; explicit: requested clone workers
                      |
@@ -66,6 +68,7 @@ def test_trainer_uses_shared_pools_without_inference_imports():
         from sglang.srt.multimodal.token_space_mm_process.processor import TokenSpaceProcessor
         from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
         from sglang.srt.multimodal.token_space_mm_process.models.qwen_vl import QwenTokenSpaceProcessStrategy
+        from sglang.srt.multimodal.token_space_mm_process.registry import register_token_space_models, strategy_for
         from sglang.srt.utils import ImageData
 
         import torch
@@ -75,6 +78,12 @@ def test_trainer_uses_shared_pools_without_inference_imports():
             BatchFeature, PreTrainedTokenizerFast, Qwen2VLImageProcessor,
             Qwen3VLConfig, Qwen3VLProcessor, Qwen3VLVideoProcessor,
         )
+
+        # Trainers register strategies without the serving import_processors.
+        register_token_space_models()
+        assert strategy_for(
+            Qwen3VLConfig(architectures=["Qwen3VLForConditionalGeneration"])
+        ) is QwenTokenSpaceProcessStrategy
 
         tokens = [
             "[UNK]", "[PAD]", "<|image_pad|>", "<|video_pad|>",

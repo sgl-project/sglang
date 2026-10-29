@@ -305,6 +305,9 @@ from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -924,7 +927,7 @@ class Scheduler(
         ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
-                import_processors("sglang.srt.multimodal.token_space_mm_process.models")
+                register_token_space_models()
                 self._mm_processor = get_mm_processor(
                     self.model_config.hf_config,
                     server_args,
