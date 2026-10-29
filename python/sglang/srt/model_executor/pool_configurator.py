@@ -355,9 +355,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
 
-        if kvc.modelslim_cache_layout is not None:
-            return kvc.modelslim_cache_layout.bytes_per_token * effective_num_layers
-
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
         dcp_size = get_parallel().attn_dcp_size
@@ -382,14 +379,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim,
             )
 
-            cell_size = (
-                calculate_mla_kv_cache_dim(
-                    model_config=model_config,
-                    kv_cache_dtype=kv_cache_dtype,
+            if kvc.modelslim_cache_layout is not None:
+                per_layer_bytes = kvc.modelslim_cache_layout.bytes_per_token
+            else:
+                per_layer_bytes = (
+                    calculate_mla_kv_cache_dim(
+                        model_config=model_config,
+                        kv_cache_dtype=kv_cache_dtype,
+                    )
+                    * kv_size
                 )
-                * effective_num_layers
-                * kv_size
-            )
+            cell_size = per_layer_bytes * effective_num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16

@@ -882,7 +882,7 @@ class HiCacheController:
             # uint8 but must land in distinct keyspaces.
             dtype=normalize_dtype(device_pool.dtype),
             page_size=self.page_size,
-            rank_replicated=isinstance(device_pool, MLAKVView),
+            rank_replicated=isinstance(device_pool, MLATokenToKVPool),
             local_kv_heads=getattr(host_pool, "head_num", 0),
             attn_tp_rank=parallel.attn_tp_rank,
             attn_tp_size=parallel.attn_tp_size,

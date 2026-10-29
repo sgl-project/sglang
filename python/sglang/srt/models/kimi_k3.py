@@ -1572,8 +1572,9 @@ class KimiK3DeltaAttention(nn.Module):
         # The full-rank [q, k, v, g] merged projection is explicitly sharded
         # using attention-TP placement, so it also supports DP attention.
         # The low-rank fused path still uses full-TP-only projection helpers.
-        # Full-rank K3 can also have quantized Q/K/V with an unquantized G;
-        # split those projections automatically on NPU.
+        # For the full-rank gate (K3) the checkpoint quantizes only the MoE
+        # experts; attention linears resolve to UnquantizedLinearMethod, so a
+        # non-None quant_config is fine for the merged projection.
         self.do_fuse_qkvbfg = quant_config is None and self.attn_tp_size == self.tp_size
         self.split_qkvg = (
             self.use_full_rank_gate
@@ -3277,8 +3278,9 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if not self.config.is_kda_layer(layer_id):
                         continue
                     layer = self.model.layers[layer_id].self_attn
-                    # Full-rank K3 uses QKV or QKVG fusion independently of
-                    # do_fuse_qkvbfg, which only gates the low-rank modules.
+                    # Full-rank K3 always instantiates fused_qkvg_proj, including
+                    # ModelSlim-quantized models. The low-rank fused modules are
+                    # still conditional on do_fuse_qkvbfg.
                     if param_name == ".fused_qkvg_proj":
                         if not getattr(layer, "use_full_rank_gate", False):
                             continue

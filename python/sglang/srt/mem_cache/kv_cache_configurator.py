@@ -403,13 +403,6 @@ class KVCacheConfigurator:
             and quant_config is not None
             and quant_config.get_name() == "modelslim"
         ):
-            if (
-                quant_config.requested_kv_cache_dtype == "fp8_e4m3"
-                and not self.use_mla_backend
-            ):
-                raise ValueError(
-                    "ModelSlim static FP8 KV cache currently supports MLA only"
-                )
             self.modelslim_cache_layout = quant_config.get_modelslim_kv_cache_layout(
                 self.model,
                 use_mla_backend=self.use_mla_backend,
@@ -2100,9 +2093,7 @@ class KVCacheConfigurator:
                 if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
             )
         use_dsa_fp8_kv_cache_storage = (
-            self.kv_cache_dtype == torch.float8_e4m3fn
-            and is_arch35
-            and self.modelslim_cache_layout is None
+            self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,

@@ -703,16 +703,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
             self.store_dtype = dtype
         if modelslim_cache_layout is not None:
-            self.store_dtype = dtype
+            self.store_dtype = modelslim_cache_layout.key_dtype
+            self.rope_dtype = modelslim_cache_layout.value_dtype
+        else:
+            self.rope_dtype = self.store_dtype
         self.kv_cache_dim = (
             requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
-        self.rope_dtype = (
-            modelslim_cache_layout.value_dtype
-            if modelslim_cache_layout is not None
-            else self.store_dtype
-        )
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
         self.index_page_size = page_size if index_page_size is None else index_page_size
