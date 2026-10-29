@@ -63,6 +63,20 @@ class TestSamplingParamsInit(CustomTestCase):
         sp = SamplingParams(top_k=50)
         self.assertEqual(sp.top_k, 50)
 
+    def test_sample_count_null_uses_default(self):
+        self.assertEqual(SamplingParams(n=None).n, 1)
+
+    def test_sample_count_positive_integer_preserved(self):
+        for n in (1, 2, 8):
+            with self.subTest(n=n):
+                self.assertEqual(SamplingParams(n=n).n, n)
+
+    def test_sample_count_rejects_invalid_values(self):
+        for n in (0, -1, 1.5, "2", True, False):
+            with self.subTest(n=n):
+                with self.assertRaisesRegex(ValueError, "n must be a positive integer"):
+                    SamplingParams(n=n)
+
     def test_stop_token_ids_stored_as_set(self):
         """Test that stop_token_ids list is converted to set."""
         sp = SamplingParams(stop_token_ids=[1, 2, 3])
