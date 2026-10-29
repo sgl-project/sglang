@@ -116,7 +116,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.is_npu = is_npu()
-        self.is_hip = is_hip()
         self.kv_pool = runner.token_to_kv_pool
         self.hisparse_coordinator = runner.hisparse_coordinator
         self.token_to_kv_pool = runner.token_to_kv_pool  # alias for TboAttnBackend
@@ -269,6 +268,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # unit bmm scales — no fp8 handling yet (follow-up).
             and not self.fp8_attn_gemm
         )
+        from sglang.srt.layers.attention.minimax_sparse_ops.indexer_cp import (
+            draft_is_chain_layout,
+        )
         from sglang.srt.model_executor.cuda_graph_config import (
             Backend,
             Phase,
@@ -277,12 +279,33 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         spec = get_spec()
         self.speculative_num_draft_tokens = spec.speculative_num_draft_tokens
-        if self.is_hip and spec.speculative_algorithm is not None:
+        # GPU verify runs each draft token as one causal sparse-decode row. ROCm
+        # accepts any draft with top-k 1; CUDA takes the chain-layout allowlist.
+        self._linear_verify = not self.is_npu
+        if is_hip() and spec.speculative_algorithm is not None:
             if spec.speculative_eagle_topk != 1:
                 raise NotImplementedError(
                     "MiniMax-M3 ROCm speculative attention requires a linear "
                     "draft chain (--speculative-eagle-topk 1)."
                 )
+        elif self._linear_verify and not draft_is_chain_layout(
+            spec.speculative_algorithm, spec.speculative_eagle_topk
+        ):
+            raise NotImplementedError(
+                "MiniMax-M3 speculative attention requires a linear EAGLE "
+                "draft chain (--speculative-eagle-topk 1)."
+            )
+        # HiSparse swap-in keeps one device buffer and one LRU slot set per request,
+        # while linear verify scores bs * ndt rows.
+        if (
+            self._linear_verify
+            and self.hisparse_coordinator is not None
+            and spec.speculative_algorithm is not None
+        ):
+            raise NotImplementedError(
+                "MiniMax-M3 HiSparse does not support speculative decoding yet. "
+                "Disable --enable-hisparse or speculative decoding."
+            )
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
@@ -290,8 +313,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             not _decode_cuda_graph or envs.SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH.get()
         )
 
-        # MSA + spec decode + cuda graph crashes mid-capture: TARGET_VERIFY batches
-        # route to forward_extend, dereferencing absent extend metadata. Fail at startup.
+        # Verify rows take the Triton decode kernels, but MSA decode with speculative
+        # decoding under CUDA graph has never been validated; fail at startup.
         if (
             self.use_msa
             and _decode_cuda_graph
@@ -425,7 +448,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # capture never allocates. num_kv_heads == 1 at TP>=4 for M3.
         if self.index_cache_enabled and (
             forward_batch.forward_mode.is_decode_or_idle()
-            or (self.is_hip and forward_batch.forward_mode.is_target_verify())
+            or (self._linear_verify and forward_batch.forward_mode.is_target_verify())
         ):
             bs = forward_batch.seq_lens.shape[0]
             if forward_batch.forward_mode.is_target_verify():
@@ -451,18 +474,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._max_seqlen_q = 1
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
-            or (
-                (self.is_npu or self.is_hip)
-                and forward_batch.forward_mode.is_target_verify()
-            )
+            or forward_batch.forward_mode.is_target_verify()
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
             self._max_seqlen_k = self.max_context_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
-            if self.is_hip and forward_batch.forward_mode.is_target_verify():
-                self._max_seqlen_k += self.speculative_num_draft_tokens
+            if self._linear_verify and forward_batch.forward_mode.is_target_verify():
+                # The last draft row reads ndt tokens past the accepted prefix.
+                self._max_seqlen_k = min(
+                    self._max_seqlen_k + self.speculative_num_draft_tokens,
+                    self.max_context_len,
+                )
 
         # Build plan + page table eager (outside capture) so captured forward_decode
         # runs only device-side ops; host-side code can't be captured.
@@ -550,7 +574,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self._msa_dec_meta = (kv_indices_buf, plan)
 
-    def _init_rocm_linear_verify_metadata(self, forward_batch: ForwardBatch):
+    def _init_linear_verify_metadata(self, forward_batch: ForwardBatch):
         ndt = self.speculative_num_draft_tokens
         # GPU seq_lens are the accepted prefix lengths. A linear EAGLE
         # chain exposes one more KV token to each successive query.
@@ -560,15 +584,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             device=forward_batch.seq_lens.device,
             dtype=forward_batch.seq_lens.dtype,
         )
+        seq_lens = (forward_batch.seq_lens[:, None] + offsets[None, :]).reshape(-1)
         self._linear_verify_meta = SimpleNamespace(
-            seq_lens=(forward_batch.seq_lens[:, None] + offsets[None, :]).reshape(-1),
+            # Rows past the context length predict positions that are never committed;
+            # the clamp keeps them inside the context-length bound of the score buffer.
+            seq_lens=seq_lens.clamp(max=self.max_context_len),
             req_pool_indices=forward_batch.req_pool_indices.repeat_interleave(ndt),
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         if not self.is_npu:
-            if self.is_hip and forward_batch.forward_mode.is_target_verify():
-                self._init_rocm_linear_verify_metadata(forward_batch)
+            if forward_batch.forward_mode.is_target_verify():
+                self._init_linear_verify_metadata(forward_batch)
             return
         # Layer-invariant decode/verify metadata as captured ops (re-read at replay).
         fm = forward_batch.forward_mode
@@ -1454,7 +1481,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_k: torch.Tensor,
         idx_v: Optional[torch.Tensor],
     ):
-        if self.is_hip and forward_batch.forward_mode.is_target_verify():
+        if self._linear_verify and forward_batch.forward_mode.is_target_verify():
             meta = self._linear_verify_meta
             if meta is None or meta.seq_lens.numel() != q.shape[0]:
                 raise RuntimeError("Missing MiniMax-M3 linear verify metadata")
@@ -1755,7 +1782,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
 
         msa_kv_indices = msa_plan = None
-        if self._use_msa_decode and attn_fn is None:
+        # The MSA decode plan covers decode batches only; verify rows stay on Triton.
+        use_msa = (
+            self._use_msa_decode and not forward_batch.forward_mode.is_target_verify()
+        )
+        if use_msa and attn_fn is None:
             if self._msa_dec_meta is not None:
                 msa_kv_indices, msa_plan = self._msa_dec_meta
             elif q.shape[0] > 0:
@@ -1830,7 +1861,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 disable_index_value=disable_value,
                 dense_main_attn_fn=attn_fn,
                 page_size=self.page_size,
-                use_msa=self._use_msa_decode,
+                use_msa=use_msa,
                 msa_kv_indices=msa_kv_indices,
                 msa_plan=msa_plan,
                 q_scale=layer.q_scale_float,
