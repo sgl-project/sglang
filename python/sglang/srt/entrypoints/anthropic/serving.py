@@ -22,6 +22,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensResponse,
     AnthropicError,
     AnthropicErrorResponse,
+    AnthropicMessage,
     AnthropicMessageEndDelta,
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
@@ -151,6 +152,14 @@ def _extract_system_text(
         if text:
             texts.append(text)
     return "\n".join(texts) if texts else None
+
+
+def _is_text_prefill(message: AnthropicMessage) -> bool:
+    # Turns with tool_use or thinking blocks are deliberately not continued.
+    return message.role == "assistant" and (
+        isinstance(message.content, str)
+        or all(block.type == "text" for block in message.content)
+    )
 
 
 def _wrap_sse_event(data: str, event_type: str) -> str:
@@ -550,12 +559,27 @@ class AnthropicServing:
                 openai_msg["content"] = ""
                 openai_messages.append(openai_msg)
 
+        # Continuation removes the assistant turn; some templates fail on an empty chat.
+        messages = anthropic_request.messages
+        continue_final_message = (
+            len(messages) > 1
+            and len(openai_messages) > 1
+            and _is_text_prefill(messages[-1])
+        )
+        if continue_final_message and isinstance(openai_messages[-1]["content"], list):
+            # Text blocks are contiguous slices of one reply; join them as-is,
+            # since the chat layer does not continue list content verbatim.
+            openai_messages[-1]["content"] = "".join(
+                part["text"] for part in openai_messages[-1]["content"]
+            )
+
         # Build ChatCompletionRequest
         request_data = {
             "messages": openai_messages,
             "model": anthropic_request.model,
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
+            "continue_final_message": continue_final_message,
             **anthropic_request.pd_routing_kwargs(),
         }
 

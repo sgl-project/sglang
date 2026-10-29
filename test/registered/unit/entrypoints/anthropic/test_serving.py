@@ -4,7 +4,7 @@ import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
@@ -130,7 +130,7 @@ async def _collect_anthropic_events(serving, anthropic_request):
     return events
 
 
-class TestAnthropicServing(unittest.TestCase):
+class TestAnthropicServing(CustomTestCase):
     # Renders system at any position (GLM/Kimi/Qwen3) → can pass through.
     INLINE_SYSTEM_TEMPLATE = (
         "{%- for message in messages %}"
@@ -1624,6 +1624,83 @@ class TestAnthropicServing(unittest.TestCase):
         # Without the fix this collapses to ['user', 'user'] and breaks
         # strict role-alternation chat templates (qwen, llama, mistral).
         self.assertEqual(roles, ["user", "assistant", "user"])
+
+    def test_final_assistant_text_is_continued_as_prefill(self):
+        """A final assistant turn is a prefill: it must be marked
+        continue_final_message, or the chat layer turns it into a user turn."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "What is the capital of France?"},
+                {"role": "assistant", "content": "The capital of France is"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertTrue(chat_request.continue_final_message)
+        self.assertEqual(chat_request.messages[-1].content, "The capital of France is")
+
+    def test_final_assistant_text_blocks_are_joined_into_one_prefill(self):
+        """Prefill text blocks are slices of one reply; join them into one string,
+        since the chat layer does not continue list content verbatim."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "What color is the grass?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "According to the document, "},
+                        {"type": "text", "text": "the grass is"},
+                    ],
+                },
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertTrue(chat_request.continue_final_message)
+        self.assertEqual(
+            chat_request.messages[-1].content,
+            "According to the document, the grass is",
+        )
+
+    def test_final_turn_without_text_prefill_is_not_continued(self):
+        """Non-text turns and prefills without earlier rendered messages must
+        keep the default generation prompt."""
+        cases = {
+            "user": [{"role": "user", "content": "hi"}],
+            "lone_assistant": [{"role": "assistant", "content": "The answer is"}],
+            "empty_inline_system": [
+                {"role": "system", "content": ""},
+                {"role": "assistant", "content": "The answer is"},
+            ],
+            "tool_use": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Checking."},
+                        {"type": "tool_use", "id": "call_1", "name": "f"},
+                    ],
+                },
+            ],
+            "thinking": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "ponder"},
+                        {"type": "text", "text": "The answer is"},
+                    ],
+                },
+            ],
+        }
+        serving = self._serving()
+        for name, messages in cases.items():
+            with self.subTest(final_turn=name):
+                request = self._anthropic_request(stream=False, messages=messages)
+                chat_request = serving._convert_to_chat_completion_request(request)
+                self.assertFalse(chat_request.continue_final_message)
 
     def test_in_messages_system_merged_when_template_requires_first(self):
         """When the chat template rejects mid-conversation ``role: "system"``
