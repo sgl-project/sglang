@@ -1897,9 +1897,12 @@ def get_mm_http_session() -> requests.Session:
 
 # Raised by the loaders below when client-supplied media cannot be fetched or
 # decoded. ValueError is in the set because invalid base64 raises binascii.Error.
+# Pillow raises DecompressionBombError from Image.open, before any decode, for an
+# image above twice Image.MAX_IMAGE_PIXELS; it subclasses Exception, not OSError.
 CLIENT_MEDIA_EXCEPTIONS = (
     ValueError,
     UnidentifiedImageError,
+    Image.DecompressionBombError,
     requests.exceptions.RequestException,
 )
 
