@@ -289,11 +289,13 @@ class ExpertLocationMetadata:
         ep_size: int,
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
-        physical_capacity: int,
+        physical_capacity: Optional[int] = None,
         moe_ep_rank: Optional[int] = None,
     ):
 
         _, num_physical_experts = physical_to_logical_map.shape
+        if physical_capacity is None:
+            physical_capacity = num_physical_experts
 
         # Pad the fan-out, not physical_to_logical_map: a -1 there faults the gather.
         logical_to_all_physical_map_padded = F.pad(
