@@ -17,10 +17,12 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
+    RequestOutputStats,
     msgpack_decode,
     msgpack_encode,
     unwrap_from_pickle,
 )
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -30,6 +32,7 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
 )
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import (
     WeightVersionSpan,
@@ -39,6 +42,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+_REQUEST_STATS = RequestOutputStats(
+    prompt_tokens=0,
+    cached_tokens=0,
+    cached_tokens_details=None,
+    retraction_count=0,
+    image_tokens=0,
+    audio_tokens=0,
+    video_tokens=0,
+    time_stats=None,
+)
 
 
 class _FakeReq:
@@ -76,7 +90,11 @@ class _FakeReq:
         self.origin_input_ids = []
         self.reasoning_tokens = 0
         self.cached_tokens = 0
+        self.cached_tokens_device = 0
+        self.cached_tokens_host = 0
+        self.cached_tokens_storage = 0
         self.retraction_count = 0
+        self.request_stats_retraction_count = None
         self.time_stats = None
         self.return_hidden_states = False
         self.return_routed_experts = False
@@ -93,6 +111,8 @@ class _FakeReq:
     def finished(self):
         return self._finished
 
+    take_request_stats_due = Req.take_request_stats_due
+
     def get_mm_token_counts(self):
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
 
@@ -108,7 +128,6 @@ def _accumulator(
     return_sampling_mask=False,
     request_level_keys=frozenset(),
     rust_server_mode=False,
-    enable_metrics=False,
 ):
     return _GenerationStreamAccumulator(
         return_logprob=False,
@@ -120,11 +139,10 @@ def _accumulator(
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
         default_force_stream_interval=1,
-        get_cached_tokens_details=lambda req: None,
+        build_request_stats=lambda req: _REQUEST_STATS,
         is_request_level_customized_info_key=request_level_keys.__contains__,
         current_weight_version=current_weight_version,
         rust_server_mode=rust_server_mode,
-        enable_metrics=enable_metrics,
     )
 
 
@@ -579,29 +597,141 @@ class TestOutputStreamerDecodeLatency(unittest.TestCase):
         self.assertEqual(python_mode.decode_latencies, {})
 
 
-class TestOutputStreamerTimeStats(unittest.TestCase):
-    def test_rows_carry_time_stats_only_with_metrics_on(self):
-        """With metrics on every emitted row carries its request's time stats,
-        None for a request whose own metrics are off; with metrics off the
-        payload carries none at all."""
+def _metered_req():
+    sampling_params = SamplingParams()
+    sampling_params.normalize(None)
+    req = Req("r", "", array("q", [1, 2, 3]), sampling_params, stream=True)
+    req.time_stats.set_metrics_collector(Mock())
+    return req
+
+
+def _streamer(outputs, enable_hicache_storage=lambda: False, is_generation=True):
+    return SchedulerOutputStreamer(
+        send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+        tree_cache=None,
+        server_args=SimpleNamespace(enable_lmcache=False),
+        is_generation=is_generation,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        disaggregation_mode=DisaggregationMode.NULL,
+        enable_hicache_storage=enable_hicache_storage,
+    )
+
+
+class TestOutputStreamerRequestStats(unittest.TestCase):
+    def setUp(self):
+        _enter_streamer_scope(self)
+
+    def _set_metrics(self, enabled):
+        observability = patch(
+            "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
+            return_value=SimpleNamespace(
+                enable_metrics=enabled, enable_request_time_stats_logging=False
+            ),
+        )
+        observability.start()
+        self.addCleanup(observability.stop)
+
+    def test_request_stats_carry_time_stats_only_with_metrics_on(self):
         timed = SchedulerReqTimeStats(enable_metrics=True)
         timed.queue_duration_s = 0.25
 
-        def req(rid, time_stats):
-            req = _FakeReq(rid, [1])
-            req.time_stats = time_stats
-            return req
+        def time_stats(enable_metrics, req_time_stats):
+            self._set_metrics(enable_metrics)
+            req = _FakeReq("r", [1])
+            req.time_stats = req_time_stats
+            return _streamer([]).build_request_stats(req).time_stats
 
-        for enable_metrics, expected in (
-            (True, [timed.to_output_time_stats(), None]),
-            (False, None),
-        ):
-            with self.subTest(enable_metrics=enable_metrics):
-                accumulator = _accumulator(enable_metrics=enable_metrics)
-                accumulator.accept(req=req("timed", timed))
-                accumulator.accept(req=req("untimed", SchedulerReqTimeStats()))
-                payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
-                self.assertEqual(payload.time_stats, expected)
+        self.assertEqual(time_stats(True, timed), timed.to_output_time_stats())
+        self.assertIsNone(time_stats(True, SchedulerReqTimeStats()))
+        self.assertIsNone(time_stats(False, timed))
+
+    def test_request_stats_go_out_on_first_output_retraction_and_finish(self):
+        """A request's stats go out with its first output, with the first
+        output after each retraction, and with its finished row; other rows
+        carry none, so they keep the values last sent."""
+        self._set_metrics(True)
+        outputs = []
+        streamer = _streamer(outputs)
+        req = _metered_req()
+        req.cached_tokens = 2
+
+        def output(finished=False):
+            req.output_ids.append(7)
+            if finished:
+                req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+            streamer.stream_output([req], False)
+            return outputs[-1].request_stats
+
+        [first] = output()
+        self.assertEqual(
+            (first.prompt_tokens, first.cached_tokens, first.retraction_count),
+            (3, 2, 0),
+        )
+        self.assertIsNone(output())
+
+        req.reset_for_retract()
+        # The overlap schedule outputs the retracted request's last decode step.
+        [retracted] = output()
+        self.assertEqual(retracted.retraction_count, 1)
+        # Re-admission adds the second wait to the queue time.
+        req.time_stats.queue_duration_s += 0.5
+        req.is_retracted = False
+        self.assertIsNone(output())
+
+        [finished] = output(finished=True)
+        self.assertEqual(finished.retraction_count, 1)
+        self.assertEqual(finished.time_stats.queue_time, 0.5)
+
+    def test_embedding_rows_carry_their_request_stats(self):
+        """An embedding request is output once, finished, and its row carries
+        its stats; embedding outputs carry no time stats even with metrics on."""
+        self._set_metrics(True)
+        outputs = []
+        streamer = _streamer(outputs, is_generation=False)
+        req = _metered_req()
+        req.cached_tokens = 2
+        req.retraction_count = 1
+        req.embedding = [0.5]
+        req.finished_reason = FINISH_LENGTH(length=1)
+
+        streamer.stream_output([req], False)
+
+        [stats] = outputs[-1].request_stats
+        self.assertIsInstance(stats, RequestOutputStats)
+        self.assertEqual(
+            (stats.prompt_tokens, stats.cached_tokens, stats.retraction_count),
+            (3, 2, 1),
+        )
+        self.assertIsNone(stats.time_stats)
+
+    def test_finished_output_carries_current_request_stats(self):
+        """A finished output carries the request's current stats even when a
+        value changed after the last one was sent: HiCache storage attached
+        mid-request adds the storage keys to cached_tokens_details."""
+        attached = False
+        outputs = []
+        streamer = _streamer(outputs, enable_hicache_storage=lambda: attached)
+        req = _metered_req()
+        req.cached_tokens = req.cached_tokens_device = 2
+
+        req.output_ids.append(7)
+        streamer.stream_output([req], False)
+        [first] = outputs[-1].request_stats
+        self.assertEqual(first.cached_tokens_details, {"device": 2, "host": 0})
+
+        attached = True
+        req.output_ids.append(8)
+        streamer.stream_output([req], False)
+        self.assertIsNone(outputs[-1].request_stats)
+
+        req.output_ids.append(9)
+        req.finished_reason = FINISH_LENGTH(length=3)
+        streamer.stream_output([req], False)
+        [finished] = outputs[-1].request_stats
+        self.assertEqual(
+            finished.cached_tokens_details,
+            {"device": 2, "host": 0, "storage": 0, "storage_backend": "none"},
+        )
 
 
 class TestOutputStreamerStreamInterval(unittest.TestCase):

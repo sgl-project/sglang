@@ -471,14 +471,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
             output_ids=recv_obj.output_ids,
-            prompt_tokens=recv_obj.prompt_tokens,
             reasoning_tokens=recv_obj.reasoning_tokens,
             completion_tokens=recv_obj.completion_tokens,
-            cached_tokens=recv_obj.cached_tokens,
-            cached_tokens_details=recv_obj.cached_tokens_details,
-            image_tokens=recv_obj.image_tokens,
-            audio_tokens=recv_obj.audio_tokens,
-            video_tokens=recv_obj.video_tokens,
+            request_stats=recv_obj.request_stats,
             spec_verify_ct=recv_obj.spec_verify_ct,
             spec_num_correct_drafts=recv_obj.spec_num_correct_drafts,
             spec_num_block_accept_tokens=recv_obj.spec_num_block_accept_tokens,
@@ -508,12 +503,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
-            retraction_counts=recv_obj.retraction_counts,
             weight_versions=recv_obj.weight_versions,
             token_steps=recv_obj.token_steps,
             beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,
-            time_stats=recv_obj.time_stats,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
