@@ -87,11 +87,6 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             "enable_multi_layer_eagle=True is not supported "
             "(MultiLayerEagleWorkerV2 does not implement adaptive)"
         )
-    if cfg.enable_two_batch_overlap:
-        return (
-            "enable_two_batch_overlap=True is not supported "
-            "(adaptive state swap would discard the TboAttnBackend wrapper)"
-        )
     if cfg.enable_pdmux:
         return (
             "enable_pdmux=True is not supported "

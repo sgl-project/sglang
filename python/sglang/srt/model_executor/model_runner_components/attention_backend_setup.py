@@ -127,21 +127,11 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
             for _ in range(get_disagg().sm_group_num)
         ]
         decode_attn_backend = decode_attn_backend_group[0]
-    elif (
-        get_exec().overlap.enable_two_batch_overlap and not model_runner.is_draft_worker
-    ):
-        attn_backend = TboAttnBackend.init_new(
-            lambda: _build_resolved_backend(
-                model_runner=model_runner,
-                resolved=resolved,
-                init_new_workspace=False,
-            )
-        )
-        decode_attn_backend = None
-        decode_attn_backend_group = []
     else:
-        attn_backend = _build_resolved_backend(
-            model_runner=model_runner, resolved=resolved, init_new_workspace=False
+        attn_backend = _build_maybe_tbo_backend(
+            model_runner=model_runner,
+            resolved=resolved,
+            init_new_workspace=False,
         )
         decode_attn_backend = None
         decode_attn_backend_group = []
@@ -180,11 +170,34 @@ def get_attention_backend(
 ) -> AttentionBackend:
     """Init attention kernel backend."""
     resolved = resolve_attention_backend_strs(model_runner=model_runner)
-    return _build_resolved_backend(
+    return _build_maybe_tbo_backend(
         model_runner=model_runner,
         resolved=resolved,
         init_new_workspace=init_new_workspace,
     )
+
+
+def _build_maybe_tbo_backend(
+    *,
+    model_runner: ModelRunner,
+    resolved: ResolvedAttentionBackendStr,
+    init_new_workspace: bool,
+) -> AttentionBackend:
+    """Build an attention backend with its configured TBO wrapper."""
+
+    def create_backend() -> AttentionBackend:
+        return _build_resolved_backend(
+            model_runner=model_runner,
+            resolved=resolved,
+            init_new_workspace=init_new_workspace,
+        )
+
+    if (
+        get_exec().overlap.enable_two_batch_overlap
+        and not model_runner.is_draft_worker
+    ):
+        return TboAttnBackend.init_new(create_backend)
+    return create_backend()
 
 
 def resolve_attention_backend_strs(
