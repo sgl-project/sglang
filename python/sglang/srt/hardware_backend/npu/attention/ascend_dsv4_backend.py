@@ -48,9 +48,14 @@ def _sparse_attn_ops(is_dspark=False):
     """
     if is_npu_arch35():
         if is_dspark:
+            from sgl_kernel_npu.operators.attention import (
+                kv_quant_sparse_attn_sharedkv,
+                kv_quant_sparse_attn_sharedkv_metadata_host,
+            )
+
             return (
-                torch.ops.npu.kv_quant_sparse_attn_sharedkv_metadata_host,
-                torch.ops.npu.kv_quant_sparse_attn_sharedkv,
+                kv_quant_sparse_attn_sharedkv_metadata_host,
+                kv_quant_sparse_attn_sharedkv,
             )
         return (
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata,
