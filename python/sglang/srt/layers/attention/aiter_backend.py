@@ -26,6 +26,9 @@ from sglang.kernels.ops.attention.kv_indices import (
     get_num_kv_index_blocks_flashmla,
     spec_kv_index_token_blocks,
 )
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
+)
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -3675,6 +3678,24 @@ class AiterAttnBackend(AttentionBackend):
             need_lse=need_lse,
             num_partial_tiles=num_partial_tiles,
         )
+
+    def pack_prefix_chunk_kv(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # With PS metadata every chunk runs the asm fp8 kernel at unit K/V scale,
+        # so one pass writes both in fp8; without it they stay bf16 for varlen.
+        if self.forward_metadata.chunked_prefix_ps_metadatas is not None:
+            return mla_kv_pack_quantize_fp8(
+                k_nope, k_pe, v, fp8_dtype=fp8_dtype, enable_pdl=False
+            )
+        nope_dim = k_nope.shape[-1]
+        k = k_nope.new_empty((*k_nope.shape[:-1], nope_dim + k_pe.shape[-1]))
+        k[..., :nope_dim] = k_nope
+        k[..., nope_dim:] = k_pe
+        return k, v
 
     def _forward_extend_prefix_chunk(
         self,

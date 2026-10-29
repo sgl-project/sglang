@@ -150,9 +150,17 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
                 q, k_nope, k_pe, v = _qkv(num_heads, q_lens, chunk_lens)
                 layer = _layer(num_heads)
 
+                k_fp8, v_fp8 = backend.pack_prefix_chunk_kv(k_nope, k_pe, v)
+                self.assertEqual((k_fp8.dtype, v_fp8.dtype), (fp8_dtype, fp8_dtype))
                 out, lse = backend._forward_extend_prefix_chunk(
+                    q, k_fp8, v_fp8, layer, batch
+                )
+                # Packing to fp8 up front must equal the kernel path's own unit-scale cast.
+                out_bf16_kv, lse_bf16_kv = backend._forward_extend_prefix_chunk(
                     q, _cat_k(k_nope, k_pe), v, layer, batch
                 )
+                torch.testing.assert_close(out, out_bf16_kv, rtol=0, atol=0)
+                torch.testing.assert_close(lse, lse_bf16_kv, rtol=0, atol=0)
 
                 ref_out, ref_lse = _reference(
                     q, _cat_k(k_nope, k_pe), v, q_lens, chunk_lens
@@ -168,6 +176,14 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
                 merged, _ = merge_state(out, lse, other_out, other_lse)
                 self.assertFalse(merged.isnan().any())
                 torch.testing.assert_close(merged[keyless], other_out[keyless])
+
+    def test_pack_without_ps_metadata_stays_bf16(self):
+        """Without chunked-prefix PS metadata the chunk runs the bf16 varlen kernel."""
+        backend = _backend(KIMI_K3_TP8_HEADS, [8])
+        _, k_nope, k_pe, v = _qkv(KIMI_K3_TP8_HEADS, [8], [64])
+        k, v_out = backend.pack_prefix_chunk_kv(k_nope, k_pe, v)
+        self.assertEqual((k.dtype, v_out.dtype), (torch.bfloat16, torch.bfloat16))
+        torch.testing.assert_close(k, _cat_k(k_nope, k_pe), rtol=0, atol=0)
 
 
 if __name__ == "__main__":
