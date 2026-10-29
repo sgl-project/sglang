@@ -288,6 +288,9 @@ class TestFlashInferVerifyHostPlan(CustomTestCase):
                         "q_data_type": q.dtype,
                         "kv_data_type": dtype,
                         "custom_mask": mask,
+                        # SGLang always hints the EAGLE verify plan; the
+                        # reference and capture plans must match it.
+                        "uniform_q_len": width,
                     }
                     wrappers[0].plan(*args, **kwargs)
                     if step == 0:
