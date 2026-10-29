@@ -216,6 +216,19 @@ def build_capture_verify_lens(
     return [base + 1] * rem + [base] * (num_slots - rem)
 
 
+def ragged_verify_token_rows(
+    layout: RaggedVerifyLayout, num_tokens: int
+) -> torch.Tensor:
+    """Request row of each of ``num_tokens`` packed verify tokens.
+
+    Fixed-size, so it is CUDA-graph safe. Empty rows own no tokens, and graph
+    padding past ``qo_indptr[-1]`` maps to row ``bs``.
+    """
+    qo_indptr = layout.qo_indptr_device
+    tokens = torch.arange(num_tokens, dtype=qo_indptr.dtype, device=qo_indptr.device)
+    return torch.searchsorted(qo_indptr[1:], tokens, right=True)
+
+
 class RaggedTargetVerifyGeometry(msgspec.Struct):
     cache_seqlens_int32: torch.Tensor
     cu_seqlens_q: torch.Tensor
