@@ -45,8 +45,10 @@ class TestSafeMergeStateTritonFallback(CustomTestCase):
             dtype=torch.float16,
         )
         # Base-2 log-sum-exp, the convention flashinfer's merge_state uses.
-        s_a = torch.randn(num_tokens, num_heads, device="cuda", dtype=torch.float16)
-        s_b = torch.randn(num_tokens, num_heads, device="cuda", dtype=torch.float16)
+        # fp32: FlashInfer returns LSE as fp32, and merge_state_triton fails
+        # to compile on fp16 LSE (ternary with mixed fp32/fp16 types).
+        s_a = torch.randn(num_tokens, num_heads, device="cuda", dtype=torch.float32)
+        s_b = torch.randn(num_tokens, num_heads, device="cuda", dtype=torch.float32)
 
         with mock.patch.object(
             backend, "_merge_state_max_safe_num_heads", return_value=0
