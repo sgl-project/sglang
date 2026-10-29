@@ -4,6 +4,7 @@ intel_xpu's paged kernels raise on head sizes outside 64/96/128/192/256/512, so 
 draft that inherits it (e.g. head_dim 80) must resolve to triton instead.
 """
 
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -60,3 +61,7 @@ def test_supported_or_explicit_draft_backend_is_kept():
     )
     explicit = _resolve(unsupported, speculative_draft_attention_backend="intel_xpu")
     assert explicit == "intel_xpu"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
