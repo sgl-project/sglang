@@ -138,4 +138,7 @@ def dcp_all_gather_rows_(buf: torch.Tensor, per: int, slot: int) -> None:
     ``buf``. Rows at and past the real row count are left unspecified."""
     group = get_parallel().dcp_group
     out = buf[: group.world_size * per]
+    if out.dtype == torch.int32:
+        # Bit copy: lets the int32 top-k take the float-only custom all-gather.
+        out = out.view(torch.float32)
     group.all_gather_into_tensor(out, out[slot : slot + per])

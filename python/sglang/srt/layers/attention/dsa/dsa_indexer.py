@@ -1382,6 +1382,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             return torch.cat(logits_chunks, dim=0)
 
+        if self._dcp_split_paged_rows(forward_batch, metadata, q_fp8.shape[0]):
+            return self._get_topk_paged_dcp_split(
+                q_fp8, kv_cache_fp8, weights, metadata, max_seq_len, block_kv
+            )
         if self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
                 q_fp8,
@@ -1464,6 +1468,85 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
+
+    def _dcp_split_paged_rows(
+        self, forward_batch: ForwardBatch, metadata: BaseIndexerMetadata, rows: int
+    ) -> bool:
+        """Whether paged (decode / verify) rows can be scored 1/W per DCP rank.
+
+        Every rank holds the whole index K, so without the split each one
+        scores every row against every key. The fused paged top-k reads the
+        page table row by row, which is what lets a row slice through it.
+        """
+        if not (
+            _is_hip
+            and getattr(metadata, "dcp_size", 1) > 1
+            and self.paged_mqa_logits_backend.is_aiter()
+        ):
+            return False
+        mode = forward_batch.forward_mode
+        if not (mode.is_decode() or mode.is_target_verify()):
+            return False
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+            TopkTransformMethod,
+        )
+
+        return (
+            envs.SGLANG_DSA_FUSE_TOPK.get()
+            and not metadata.force_unfused_topk
+            and metadata.topk_backend.should_use_topk_v2()
+            and metadata.topk_transform_method == TopkTransformMethod.PAGED
+            and 0 < self.index_topk <= 2048
+            and metadata.attn_metadata.real_page_table.shape[0] == rows
+            and metadata.get_seqlens_expanded().shape[0] == rows
+        )
+
+    def _get_topk_paged_dcp_split(
+        self,
+        q_fp8: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        max_seq_len: int,
+        block_kv: int,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.dsv4.topk import topk_transform_packed_v2
+
+        attn_metadata = metadata.attn_metadata
+        rows = q_fp8.shape[0]
+        per, slot, lo, hi = dcp_split_rows(rows)
+        lengths = metadata.get_seqlens_expanded()[lo:hi]
+        logits = aiter_paged_mqa_logits(
+            q_fp8[lo:hi],
+            kv_cache_fp8,
+            weights[lo:hi],
+            lengths,
+            attn_metadata.real_page_table[lo:hi],
+            max_seq_len,
+            preshuffle=_use_aiter_preshuffle,
+            kv_block_size=block_kv,
+        )
+        self._mask_init_and_local_tokens(logits, lengths)
+        topk = torch.empty(
+            (per * get_parallel().dcp_group.world_size, self.index_topk),
+            dtype=torch.int32,
+            device=q_fp8.device,
+        )
+        if hi > lo:
+            # Packed top-k with a row -> page-table-row map: the slice's rows
+            # keep their own page-table rows, and no full-batch plan is read.
+            row_ids = torch.arange(lo, hi, dtype=torch.int32, device=q_fp8.device)
+            topk_transform_packed_v2(
+                logits,
+                lengths,
+                attn_metadata.real_page_table,
+                topk[slot : slot + hi - lo],
+                attn_metadata.page_size,
+                row_starts=torch.zeros_like(row_ids),
+                row_to_batch=row_ids,
+            )
+        dcp_all_gather_rows_(topk, per, slot)
+        return topk[:rows]
 
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
         cached_budget = self._mqa_logits_budget_bytes.get(device_index)
