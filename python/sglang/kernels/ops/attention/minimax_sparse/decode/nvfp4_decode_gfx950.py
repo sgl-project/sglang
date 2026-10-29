@@ -642,7 +642,8 @@ def flash_decode_nvfp4_gfx950(
     v_scale: float,
     out_quant: str = "",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """`flash_decode_with_gqa_share_sparse_nvfp4` where `can_use_nvfp4_decode_gfx950`.
+    """`flash_decode_with_gqa_share_sparse` on an NVFP4 cache, where
+    `can_use_nvfp4_decode_gfx950`.
 
     ``out_quant`` is the o_proj's ``fp8_input_quant_format``; when this kernel (one
     top-k chunk) or the chunk merge (2-8 chunks, one KV head) leaves O final, O comes
