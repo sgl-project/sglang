@@ -316,7 +316,7 @@ in the GitHub search bar.
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>SenseNova Loop</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Canonical HF checkpoint with <code>model_type: sensenova_loop</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-derived dense hybrid attention with shared-weight Loop and optional manifold-constrained hyper-connections (mHC). Text generation with unquantized weights.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-derived dense hybrid attention with shared-weight Loop and optional manifold-constrained hyper-connections (mHC). Text generation from text, image, or video inputs with unquantized weights.</td>
     </tr>
 </tbody>
 </table>
@@ -342,9 +342,10 @@ sglang serve \
 
 The initial implementation supports fixed-count, ungated Loop and optional
 two- or four-stream mHC, with FP32 router parameters and log-space Sinkhorn
-normalization. An mHC interval must stay within one Loop phase. Text positions
-use ordinary 1-D RoPE, equivalent to equal positions on all mRoPE axes.
+normalization. An mHC interval must stay within one Loop phase. Image and video
+inputs use the existing Qwen3.5 vision encoder, processor, and three-axis mRoPE
+path. The original vision weights are loaded together with the shared language
+backbone. Pure text requests use the same entry point.
 
-Vision input, pipeline parallelism, quantization, and speculative decoding are
-outside this implementation's support scope. The canonical checkpoint's vision
-weights are ignored by this text-generation entry point.
+Pipeline parallelism, quantization, and speculative decoding are outside this
+implementation's support scope.

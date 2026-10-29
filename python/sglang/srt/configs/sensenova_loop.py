@@ -60,15 +60,7 @@ class SenseNovaLoopConfig(Qwen3_5Config):
             mhc=mhc,
         )
         self.text_config = SenseNovaLoopTextConfig(**text)
-        # The canonical HF checkpoint also contains a vision tower. This native
-        # entry point implements its text backbone and retains the original files.
-        self.architectures = ["SenseNovaLoopForCausalLM"]
-        self.language_model_only = True
-        # Text uses the same position on all three mRoPE axes, so ordinary
-        # 1-D RoPE is equivalent and does not require a multimodal processor.
-        for rope in (self.text_config.rope_parameters, self.text_config.rope_scaling):
-            rope.pop("mrope_section", None)
-            rope.pop("mrope_interleaved", None)
+        self.architectures = ["SenseNovaLoopForConditionalGeneration"]
 
     def _execution_plan(self, *, depth, layer_types):
         loop = self.loop_settings
@@ -138,7 +130,7 @@ register_linear_attn_model(
     LinearAttnModelSpec(
         config_class=SenseNovaLoopTextConfig,
         backend_class_name="sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend",
-        arch_names=["SenseNovaLoopForCausalLM"],
+        arch_names=["SenseNovaLoopForConditionalGeneration"],
         unwrap_text_config=True,
         uses_mamba_radix_cache=True,
         support_mamba_cache=True,

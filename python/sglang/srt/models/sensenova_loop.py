@@ -23,7 +23,6 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.models import qwen3_5
-from sglang.srt.models.qwen3_5_text import Qwen3_5ForCausalLM
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, make_pp_layers
 
@@ -208,24 +207,14 @@ class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
             hidden, forward_batch, self.norm, skip_empty=True
         )
 
-    def load_weights(self, weights):
-        def execution_weights():
-            for name, weight in weights:
-                if name.startswith("layers."):
-                    _, physical, suffix = name.split(".", 2)
-                    index = self._weight_layer_indices[int(physical)]
-                    name = f"layers.{index}.{suffix}"
-                yield name, weight
 
-        return super().load_weights(execution_weights())
-
-
-class SenseNovaLoopForCausalLM(Qwen3_5ForCausalLM):
-    body_cls = SenseNovaLoopModel
-
+class SenseNovaLoopForConditionalGeneration(qwen3_5.Qwen3_5ForConditionalGeneration):
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__(
-            config=config.get_text_config(), quant_config=quant_config, prefix=prefix
+            config=config,
+            quant_config=quant_config,
+            prefix=prefix,
+            language_model_cls=SenseNovaLoopModel,
         )
 
     def set_dflash_layers_to_capture(self, layer_ids):
@@ -239,16 +228,18 @@ class SenseNovaLoopForCausalLM(Qwen3_5ForCausalLM):
         )
 
     def load_weights(self, weights):
-        def text_weights():
+        def execution_weights():
+            prefix = "model.language_model.layers."
             for name, weight in weights:
-                if (
-                    name.startswith("model.visual.")
-                    or name == "model.language_model.loop_gate.logits"
-                ):
+                if name == "model.language_model.loop_gate.logits":
                     continue
-                yield name.replace("model.language_model.", "model."), weight
+                if name.startswith(prefix):
+                    physical, suffix = name[len(prefix) :].split(".", 1)
+                    index = self.model._weight_layer_indices[int(physical)]
+                    name = f"{prefix}{index}.{suffix}"
+                yield name, weight
 
-        return super().load_weights(text_weights())
+        return super().load_weights(execution_weights())
 
 
-EntryClass = SenseNovaLoopForCausalLM
+EntryClass = SenseNovaLoopForConditionalGeneration

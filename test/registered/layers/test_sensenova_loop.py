@@ -1,10 +1,15 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.models.sensenova_loop import SenseNovaLoopModel, SenseNovaMHCRouter
+from sglang.srt.models.sensenova_loop import (
+    SenseNovaLoopForConditionalGeneration,
+    SenseNovaLoopModel,
+    SenseNovaMHCRouter,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -134,6 +139,73 @@ class TestSenseNovaMHCRouter(CustomTestCase):
         x = torch.empty(0, 32, device="cuda", dtype=torch.bfloat16)
         branch, mix, post, _ = router(x)
         self.assertEqual(router.merge(branch, x, mix, post).shape, x.shape)
+
+
+class TestSenseNovaLoopWeights(CustomTestCase):
+    def test_canonical_weights_load_vision_and_late_shared_layers(self):
+        # Exercise the real multimodal loader with tiny parameters, without a
+        # private checkpoint or allocation of the full serving model.
+        model = SenseNovaLoopForConditionalGeneration.__new__(
+            SenseNovaLoopForConditionalGeneration
+        )
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(tie_word_embeddings=False)
+        model.pp_group = SimpleNamespace(is_last_rank=True)
+        model.pooler = None
+        body = torch.nn.Module()
+        body.start_layer, body.end_layer = 0, 56
+        plan = list(range(4)) + list(range(4, 28)) * 2 + list(range(28, 32))
+        layers = []
+        for _ in range(32):
+            layer = torch.nn.Module()
+            layer.input_layernorm = torch.nn.LayerNorm(2)
+            layers.append(layer)
+        body.layers = torch.nn.ModuleList([layers[i] for i in plan])
+        body._weight_layer_indices = {i: plan.index(i) for i in range(32)}
+        model.model = body
+        model.visual = torch.nn.Module()
+        model.visual.patch_embed = torch.nn.Linear(2, 2, bias=False)
+        model.lm_head = torch.nn.Linear(2, 2, bias=False)
+        loaded = model.load_weights(
+            iter(
+                [
+                    ("model.visual.patch_embed.weight", torch.full((2, 2), 3.0)),
+                    (
+                        "model.language_model.layers.4.input_layernorm.weight",
+                        torch.full((2,), 4.0),
+                    ),
+                    (
+                        "model.language_model.layers.31.input_layernorm.weight",
+                        torch.full((2,), 5.0),
+                    ),
+                    ("lm_head.weight", torch.full((2, 2), 6.0)),
+                    ("model.language_model.loop_gate.logits", torch.ones(1)),
+                ]
+            )
+        )
+        torch.testing.assert_close(
+            model.visual.patch_embed.weight, torch.full((2, 2), 3.0)
+        )
+        torch.testing.assert_close(
+            body.layers[4].input_layernorm.weight, torch.full((2,), 4.0)
+        )
+        self.assertIs(
+            body.layers[4].input_layernorm.weight,
+            body.layers[28].input_layernorm.weight,
+        )
+        torch.testing.assert_close(
+            body.layers[55].input_layernorm.weight, torch.full((2,), 5.0)
+        )
+        torch.testing.assert_close(model.lm_head.weight, torch.full((2, 2), 6.0))
+        self.assertEqual(
+            loaded,
+            {
+                "visual.patch_embed.weight",
+                "model.layers.4.input_layernorm.weight",
+                "model.layers.55.input_layernorm.weight",
+                "lm_head.weight",
+            },
+        )
 
 
 if __name__ == "__main__":

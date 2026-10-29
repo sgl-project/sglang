@@ -389,7 +389,7 @@ def is_qwen3_5(config) -> bool:
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5ForCausalLM",
         "Qwen3_5MoeForCausalLM",
-        "SenseNovaLoopForCausalLM",
+        "SenseNovaLoopForConditionalGeneration",
     )
 
 
@@ -2465,6 +2465,7 @@ multimodal_model_archs = [
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
+    "SenseNovaLoopForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen4ExpForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",

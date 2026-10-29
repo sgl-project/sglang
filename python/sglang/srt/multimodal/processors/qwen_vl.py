@@ -37,6 +37,7 @@ from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneratio
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+from sglang.srt.models.sensenova_loop import SenseNovaLoopForConditionalGeneration
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 from sglang.srt.multimodal.media_artifacts.base import (
     MediaArtifactCacheMixin,
@@ -340,6 +341,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         Qwen3VLMoeForConditionalGeneration,
         Qwen3_5ForConditionalGeneration,
         Qwen3_5MoeForConditionalGeneration,
+        SenseNovaLoopForConditionalGeneration,
         Qwen3_5ForCausalLMMTP,
         InternS2PreviewForConditionalGeneration,
         InternS2MobiusForConditionalGeneration,
@@ -361,6 +363,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "sensenova_loop",
             "qwen4_exp",
             "intern_s2_preview",
             "interns2_mobius",
@@ -573,6 +576,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "sensenova_loop",
             "qwen4_exp",
             "intern_s2_preview",
             "interns2_mobius",
@@ -711,6 +715,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 "qwen3_vl_moe",
                 "qwen3_5",
                 "qwen3_5_moe",
+                "sensenova_loop",
                 "qwen4_exp",
                 "intern_s2_preview",
                 "cosmos3_omni",
@@ -1044,6 +1049,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "sensenova_loop",
             "qwen4_exp",
             "intern_s2_preview",
             "interns2_mobius",
@@ -1218,7 +1224,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             self.keep_mm_features_on_device
             and supports_deferred_reconstruction
             and self.model_type
-            in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
+            in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe", "sensenova_loop")
         ):
             return
         for item in mm_items:

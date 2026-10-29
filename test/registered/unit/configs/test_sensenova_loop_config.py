@@ -4,8 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import torch
+
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
+from sglang.srt.configs.model_config import is_multimodal_model
 from sglang.srt.configs.sensenova_loop import SenseNovaLoopConfig
+from sglang.srt.layers.rotary_embedding.mrope_rope_index import get_rope_index
 from sglang.srt.utils.hf_transformers_utils import get_config
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -82,14 +86,16 @@ class TestSenseNovaLoopConfig(CustomTestCase):
         self.assertIs(text_config, config.text_config)
         self.assertTrue(spec.uses_mamba_radix_cache)
         self.assertTrue(spec.support_mamba_cache_extra_buffer)
-        self.assertEqual(spec.arch_names, ["SenseNovaLoopForCausalLM"])
+        self.assertEqual(spec.arch_names, ["SenseNovaLoopForConditionalGeneration"])
 
     def test_registered_config_does_not_need_remote_code(self):
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, "config.json").write_text(json.dumps(canonical_config()))
             config = get_config(directory, trust_remote_code=False)
         self.assertIsInstance(config, SenseNovaLoopConfig)
-        self.assertEqual(config.architectures, ["SenseNovaLoopForCausalLM"])
+        self.assertEqual(
+            config.architectures, ["SenseNovaLoopForConditionalGeneration"]
+        )
 
     def test_invalid_loop_contracts(self):
         for key, value in (
@@ -140,9 +146,40 @@ class TestSenseNovaLoopConfig(CustomTestCase):
         original = copy.deepcopy(raw)
         config = SenseNovaLoopConfig(**raw)
         self.assertEqual(raw, original)
-        self.assertTrue(config.language_model_only)
-        self.assertNotIn("mrope_section", config.text_config.rope_parameters)
+        self.assertFalse(getattr(config, "language_model_only", False))
+        self.assertEqual(
+            config.text_config.rope_parameters["mrope_section"], [11, 11, 10]
+        )
+        self.assertTrue(config.text_config.rope_parameters["mrope_interleaved"])
         self.assertEqual(config.text_config.rope_parameters["rope_theta"], 10000000)
+
+    def test_multimodal_architecture_is_registered(self):
+        config = SenseNovaLoopConfig(**canonical_config())
+        self.assertTrue(is_multimodal_model(config.architectures))
+
+    def test_image_and_video_positions_follow_qwen3_5(self):
+        # Each temporal video patch is represented by its own vision span.
+        # Without the Qwen3.5 video-grid dispatch, the second span is misindexed.
+        for video in (False, True):
+            with self.subTest(video=video):
+                span = [10, 102 if video else 101, 102 if video else 101, 11]
+                ids = [1] + span + ([2] + span if video else []) + [3]
+                kwargs = dict(
+                    spatial_merge_size=2,
+                    image_token_id=101,
+                    video_token_id=102,
+                    vision_start_token_id=10,
+                    input_ids=torch.tensor([ids]),
+                )
+                kwargs["video_grid_thw" if video else "image_grid_thw"] = torch.tensor(
+                    [[2 if video else 1, 2, 4]]
+                )
+                actual = get_rope_index(model_type="sensenova_loop", **kwargs)
+                expected = get_rope_index(model_type="qwen3_5", **kwargs)
+                for result, reference in zip(actual, expected):
+                    torch.testing.assert_close(result, reference)
+                self.assertEqual(actual[0].shape, (3, 1, len(ids)))
+                self.assertFalse(torch.equal(actual[0][0], actual[0][2]))
 
 
 if __name__ == "__main__":
