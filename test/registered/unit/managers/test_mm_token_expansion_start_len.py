@@ -5,7 +5,7 @@ positive start_len     -> require non-empty supplied IDs; 0 expands everything
 start_len list         -> one per prompt, repeated for n > 1 like input_ids
 single prompt          -> integer start_len only, whatever n is
 batch / n > 1          -> broadcast a scalar start_len
-text without IDs       -> omit start_len; tokenize later
+text without IDs       -> start_len 0 or omitted; tokenize later
 positive start_len, legacy or no mm processor -> ValueError; token-space -> accepted
 
 """
@@ -69,7 +69,7 @@ class TestMMTokenExpansionStartLen(unittest.TestCase):
     def test_native_rejects_missing_ids_and_misaligned_start_len_lists(self):
         for inputs, start_len in (
             ({"text": "hello"}, 1),
-            ({"text": ["hello", "world"]}, [0, 0]),
+            ({"text": ["hello", "world"]}, [0, 1]),
             ({"input_ids": []}, 1),
             ({"input_ids": [[10], [20, 21]]}, [0]),
             ({"input_ids": [10, 11]}, [1]),
@@ -81,6 +81,16 @@ class TestMMTokenExpansionStartLen(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(ValueError, "mm_token_expansion_start_len"):
                     request.normalize_batch_and_arguments()
+
+    def test_text_accepts_zero_start_lens(self):
+        # Zero has no expanded prefix, so a batch may send it per prompt with text.
+        request = GenerateReqInput(
+            text=["hello", "world"], mm_token_expansion_start_len=[0, 0]
+        )
+        request.normalize_batch_and_arguments()
+        self.assertEqual(
+            [request[i].mm_token_expansion_start_len for i in range(2)], [0, 0]
+        )
 
     def test_only_a_token_space_processor_accepts_a_positive_start_len(self):
         token_space = object.__new__(TokenSpaceSGLangProcessor)
