@@ -576,27 +576,23 @@ class SchedulerTimingReport(
     msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
 ):
     """The scheduler's timing of one request that the tokenizer puts in
-    meta_info. Timestamps are wall-clock; None means not stamped."""
+    meta_info. Timestamps are wall-clock; None means not stamped.
 
-    queue_time: float = 0.0
-    forward_entry_time: Optional[float] = None
-    prefill_finished_time: Optional[float] = None
+    Fields are the meta_info keys, in meta_info order."""
+
     # None while unmeasured or still waiting.
     storage_prefetch_wait: Optional[float] = None
     storage_staging_wait: Optional[float] = None
+    forward_entry_time: Optional[float] = None
+    prefill_finished_time: Optional[float] = None
+    queue_time: float = 0.0
 
     def to_meta_info(self) -> Dict[str, float]:
-        meta_info = {}
-        if self.storage_prefetch_wait is not None:
-            meta_info["storage_prefetch_wait"] = self.storage_prefetch_wait
-        if self.storage_staging_wait is not None:
-            meta_info["storage_staging_wait"] = self.storage_staging_wait
-        if self.forward_entry_time is not None:
-            meta_info["forward_entry_time"] = self.forward_entry_time
-        if self.prefill_finished_time is not None:
-            meta_info["prefill_finished_time"] = self.prefill_finished_time
-        meta_info["queue_time"] = self.queue_time
-        return meta_info
+        return {
+            key: value
+            for key, value in msgspec.structs.asdict(self).items()
+            if value is not None
+        }
 
 
 def _stamped_realtime(time_value: float) -> Optional[float]:
