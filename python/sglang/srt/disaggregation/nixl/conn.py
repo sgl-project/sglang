@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 import msgspec
 import numpy as np
 import numpy.typing as npt
+import torch
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
