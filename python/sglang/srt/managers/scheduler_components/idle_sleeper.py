@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING
 import zmq
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_utils.cuda_graph_liveness import (
+    have_live_cuda_graphs,
+)
 from sglang.srt.observability.req_time_stats import real_time
 from sglang.srt.platforms import current_platform
 
@@ -41,7 +44,8 @@ class IdleSleeper:
         ):
             self.last_empty_time = real_time()
             if self.can_empty_cache is None or self.can_empty_cache():
-                current_platform.empty_cache()
+                if not have_live_cuda_graphs():
+                    current_platform.empty_cache()
 
 
 class RustServerIdleSleeper:
@@ -71,4 +75,5 @@ class RustServerIdleSleeper:
         ):
             self.last_empty_time = real_time()
             if self.can_empty_cache is None or self.can_empty_cache():
-                current_platform.empty_cache()
+                if not have_live_cuda_graphs():
+                    current_platform.empty_cache()

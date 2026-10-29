@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -195,6 +196,76 @@ if is_cuda() and (not get_platform().is_sm120) and (fp4_quantize is not None):
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
 FP4_GEMM_ALIGNMENT = 32
+
+
+def _reuse_b12x_scale_storage(
+    source: torch.Tensor, packed: torch.Tensor, *, name: str
+) -> torch.Tensor:
+    """Move a prepared scale layout into its byte-identical source storage."""
+    if not source.is_contiguous():
+        raise ValueError(f"{name} source scale storage must be contiguous")
+    if source.device != packed.device:
+        raise ValueError(
+            f"{name} source and prepared scales must share a device: "
+            f"{source.device} != {packed.device}"
+        )
+    if source.nbytes != packed.nbytes:
+        raise ValueError(
+            f"{name} prepared scale layout changed storage size: "
+            f"{source.nbytes} != {packed.nbytes} bytes"
+        )
+
+    with torch.no_grad():
+        source.view(torch.uint8).reshape(-1).copy_(
+            packed.contiguous().view(torch.uint8).reshape(-1)
+        )
+    return source.view(packed.dtype).reshape(packed.shape)
+
+
+def _prepare_flashinfer_b12x_w4a16_inplace(layer: torch.nn.Module):
+    """Prepare SM12x W4A16 weights without retaining a checkpoint-layout copy.
+
+    FlashInfer's functional b12x API lazily caches one second packed weight and
+    scale set per MoE layer. That is tolerable for small models but exceeds the
+    remaining HBM for GLM-5.3-Flash. Its preparer already supports tiling the
+    FP4 weights into their byte-identical source storage. Reuse that storage,
+    copy the equally-sized prepared K/32 scales back over their source buffers,
+    and retain only the prepared views for the lifetime of the layer.
+    """
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
+        prepare_w4a16_packed_weights,
+    )
+
+    prepared = prepare_w4a16_packed_weights(
+        layer.w13_weight,
+        layer.w13_blockscale_swizzled,
+        layer.g1_alphas,
+        layer.w2_weight,
+        layer.w2_blockscale_swizzled,
+        layer.g2_alphas,
+        activation="silu",
+        params_dtype=layer.params_dtype,
+        source_format="modelopt_e4m3_k32",
+        w13_layout="w13",
+        reuse_input_storage=True,
+    )
+
+    if prepared.w13.data_ptr() != layer.w13_weight.data_ptr():
+        raise RuntimeError("FlashInfer W13 preparation did not reuse source storage")
+    if prepared.w2.data_ptr() != layer.w2_weight.data_ptr():
+        raise RuntimeError("FlashInfer W2 preparation did not reuse source storage")
+
+    w13_scale = _reuse_b12x_scale_storage(
+        layer.w13_blockscale_swizzled,
+        prepared.w13_scale,
+        name="W13",
+    )
+    w2_scale = _reuse_b12x_scale_storage(
+        layer.w2_blockscale_swizzled,
+        prepared.w2_scale,
+        name="W2",
+    )
+    return replace(prepared, w13_scale=w13_scale, w2_scale=w2_scale)
 
 
 def round_up_to_multiple(x: int, m: int) -> int:
@@ -826,6 +897,39 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
 
+    @property
+    def linear_fp8_config(self):
+        """The FP8 config the checkpoint's Linear layers actually use.
+
+        deepseek_weight_loader.post_load_weights dequantizes kv_b_proj for
+        MLA absorption and selects its branch from
+        quant_config.linear_fp8_config (falling back to quant_config),
+        keying off the returned config's weight_block_size. Returning
+        fp8_block_config unconditionally mis-branched per-tensor-FP8 and
+        MXFP8 attention layers in a mixed checkpoint (and a MIXED_PRECISION
+        checkpoint with FP8_PB_WO attention used to resolve weight_block_size
+        None and crash reading weight_scale on a block-quantized layer), so
+        scan the declared linear FP8 algos instead.
+        """
+        algos = {
+            layer_info.get("quant_algo", "").upper()
+            for layer_info in self.quantized_layers.values()
+        }
+        selected = []
+        if "FP8" in algos:
+            selected.append(self.fp8_config)
+        if "MXFP8" in algos:
+            selected.append(self.mxfp8_config)
+        if algos.intersection(_BLOCK_FP8_ALGOS):
+            selected.append(self.fp8_block_config)
+        if len(selected) > 1:
+            raise ValueError(
+                "MIXED_PRECISION checkpoint uses several FP8 linear flavors "
+                f"({sorted(algos)}); linear_fp8_config cannot disambiguate "
+                "the weight loader's branch."
+            )
+        return selected[0] if selected else None
+
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
         if hf_quant_config is None:
@@ -891,16 +995,20 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 "MIXED_PRECISION quantization requires a non-empty quantized_layers map."
             )
 
-        group_size = None
-        for layer_info in quantized_layers.values():
-            if layer_info.get("quant_algo", "").upper() in (
-                "NVFP4",
-                "W4A16_NVFP4",
-            ):
-                group_size = layer_info.get("group_size", 16)
-                break
-        if group_size is None:
-            group_size = 16
+        # One ModelOptFp4Config serves every NVFP4 layer (NVFP4 and
+        # W4A16_NVFP4), so their group sizes must agree — fail loudly instead
+        # of silently quantizing with the first layer's size.
+        nvfp4_group_sizes = {
+            int(layer_info.get("group_size", 16))
+            for layer_info in quantized_layers.values()
+            if layer_info.get("quant_algo", "").upper() in ("NVFP4", "W4A16_NVFP4")
+        }
+        if len(nvfp4_group_sizes) > 1:
+            raise ValueError(
+                "MIXED_PRECISION currently requires all NVFP4 layers to use "
+                f"one group_size, got {sorted(nvfp4_group_sizes)}."
+            )
+        group_size = next(iter(nvfp4_group_sizes), 16)
 
         # Block-FP8 layers carry their block size as ``group_size``
         # (default 128). One Fp8Config serves every such layer, so they must
@@ -955,8 +1063,17 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             group_size=group_size,
             use_per_token_activation=False,
         )
+        # ModelOptFp4Config.from_config derives is_w4a16 from the checkpoint
+        # quant_algo; constructing directly leaves it False and W4A16_NVFP4
+        # layers take the A4 kernel route with the wrong block-scale shape.
+        nvfp4a16_config.is_w4a16 = True
 
-        return cls(
+        # Publish the W4A16 route on the OUTER config: the MoE precompile hook
+        # (models/glm5_next.py) consults the outer quant_config's
+        # is_w4a16/group_size, which from_config used to set only on the inner
+        # nvfp4a16_config — the hook never fired on MIXED_PRECISION
+        # checkpoints. NVFP4 (A4) layers deliberately do not set the flag.
+        mixed = cls(
             kv_cache_quant_algo=kv_cache_quant_algo,
             exclude_modules=exclude_modules,
             packed_modules_mapping=packed_modules_mapping,
@@ -967,6 +1084,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
         )
+        mixed.is_w4a16 = any(
+            layer_info.get("quant_algo", "").upper() == "W4A16_NVFP4"
+            for layer_info in quantized_layers.values()
+        )
+        if mixed.is_w4a16:
+            mixed.group_size = group_size
+        return mixed
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         super().apply_weight_name_mapper(hf_to_sglang_mapper)
@@ -2404,6 +2528,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         return get_moe_runner_backend().is_flashinfer_cutlass()
 
     @property
+    def _use_flashinfer_b12x_w4a16(self) -> bool:
+        """Use the SM12x BF16-activation kernel for the E4M3 K/32 contract."""
+        return (
+            self.enable_flashinfer_cutlass_moe
+            and getattr(self.quant_config, "is_w4a16", False)
+            and self.quant_config.group_size == 32
+        )
+
+    @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
         """Access the global enable_flashinfer_cutedsl_moe setting."""
         from sglang.srt.layers.moe import get_moe_runner_backend
@@ -2552,6 +2685,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # swizzle+allocate here to avoid GPU memory fragmentation
         if (
             self.enable_flashinfer_trtllm_moe
+            or self._use_flashinfer_b12x_w4a16
             or get_moe_runner_backend().is_flashinfer_megamoe()
         ):
             layer.w13_blockscale_swizzled = None
@@ -2575,6 +2709,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if (
             self.enable_flashinfer_trtllm_moe
+            or self._use_flashinfer_b12x_w4a16
             or get_moe_runner_backend().is_flashinfer_megamoe()
         ):
             layer.w2_blockscale_swizzled = None
@@ -2714,7 +2849,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
-            up_first = self.use_flashinfer_trtllm_weight_layout
+            up_first = (
+                self.use_flashinfer_trtllm_weight_layout
+                or self._use_flashinfer_b12x_w4a16
+            )
             layer.w13_weight.data = deinterleave_w13(
                 layer.w13_weight.data, up_first=up_first
             )
@@ -2829,6 +2967,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         copy_or_rebind_param(layer, "g1_alphas", g1_alphas)
         copy_or_rebind_param(layer, "g1_alphas_up", g1_alphas_up)
+        if self._use_flashinfer_b12x_w4a16 and not torch.equal(g1_alphas, g1_alphas_up):
+            # The b12x kernel takes a single GEMM1 alpha (quant_scales carries
+            # only g1_alphas); a checkpoint with distinct gate/up weight
+            # scales would silently apply the gate scale to the up half.
+            raise ValueError(
+                "FlashInfer b12x W4A16 requires shared gate/up GEMM1 scales; "
+                "got distinct g1_alphas/g1_alphas_up for this checkpoint."
+            )
         copy_or_rebind_param(
             layer,
             "g2_alphas",
@@ -2911,7 +3057,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = (
-            not self.quant_config.use_per_token_activation
+            not self._use_flashinfer_b12x_w4a16
+            and not self.quant_config.use_per_token_activation
             and not use_w4a16
             and (
                 use_nvfp4_dispatch or should_use_flashinfer_cutlass_moe_fp4_allgather()
@@ -2962,7 +3109,30 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return
 
         # Weight processing based on strategy
-        if (
+        if self._use_flashinfer_b12x_w4a16:
+            expected_blocks = {
+                "w13": layer.w13_weight.shape[2] * 2 // 32,
+                "w2": layer.w2_weight.shape[2] * 2 // 32,
+            }
+            if layer.w13_weight_scale.shape[-1] != expected_blocks["w13"]:
+                raise ValueError(
+                    "E4M3 K/32 w13 scale shape does not match packed weights: "
+                    f"{tuple(layer.w13_weight_scale.shape)}"
+                )
+            if layer.w2_weight_scale.shape[-1] != expected_blocks["w2"]:
+                raise ValueError(
+                    "E4M3 K/32 w2 scale shape does not match packed weights: "
+                    f"{tuple(layer.w2_weight_scale.shape)}"
+                )
+            # FlashInfer's b12x preparer consumes logical [E, N, K/32] scales.
+            # Keep them unswizzled and alias the legacy field names before the
+            # one-time in-place b12x preparation below.
+            layer.w13_blockscale_swizzled = layer.w13_weight_scale
+            layer.w2_blockscale_swizzled = layer.w2_weight_scale
+            layer._flashinfer_b12x_w4a16_prepared_weights = (
+                _prepare_flashinfer_b12x_w4a16_inplace(layer)
+            )
+        elif (
             self.enable_flashinfer_trtllm_moe
             and reorder_rows_for_gated_act_gemm is not None
             and shuffle_matrix_sf_a is not None
@@ -3344,22 +3514,38 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             pair_weight = slot[0].pair[slot[1]] if slot and slot[0].is_pair else None
             quant_info = FlashInferCutlassMoeQuantInfo(
                 pair_w2_weight=pair_weight,
-                quant_type="fp4",
+                quant_type=(
+                    "w4a16_e4m3_k32" if self._use_flashinfer_b12x_w4a16 else "fp4"
+                ),
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 output_dtype=torch.bfloat16,
-                quant_scales=[
-                    layer.w13_input_scale_quant,
-                    layer.w13_blockscale_swizzled,
-                    layer.g1_alphas,
-                    layer.w2_input_scale_quant,
-                    layer.w2_blockscale_swizzled,
-                    layer.g2_alphas,
-                ],
+                quant_scales=(
+                    [
+                        layer.w13_blockscale_swizzled,
+                        layer.g1_alphas,
+                        layer.w2_blockscale_swizzled,
+                        layer.g2_alphas,
+                    ]
+                    if self._use_flashinfer_b12x_w4a16
+                    else [
+                        layer.w13_input_scale_quant,
+                        layer.w13_blockscale_swizzled,
+                        layer.g1_alphas,
+                        layer.w2_input_scale_quant,
+                        layer.w2_blockscale_swizzled,
+                        layer.g2_alphas,
+                    ]
+                ),
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
                 apply_routed_scaling_factor=False,
+                prepared_weights=(
+                    layer._flashinfer_b12x_w4a16_prepared_weights
+                    if self._use_flashinfer_b12x_w4a16
+                    else None
+                ),
             )
             return self.runner.run(dispatch_output, quant_info)
 

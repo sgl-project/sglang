@@ -39,6 +39,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     enable_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils.cuda_graph_liveness import (
+    note_cuda_graphs_captured,
+    note_cuda_graphs_released,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
     get_or_create_global_graph_memory_pool,
@@ -72,6 +76,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._cuda_graph_runner = cuda_graph_runner
         self._model_runner = cuda_graph_runner.model_runner
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
+        self._liveness_noted = False
         self._outputs: Dict[Any, Any] = {}
         self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
@@ -167,6 +172,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         stored = self._slice_output(buffer, out_rows)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
+        if not self._liveness_noted:
+            # One note per backend instance: re-capturing the sole shape must
+            # not re-fire the liveness counter (it would leak upward and keep
+            # the empty_cache gates closed forever).
+            self._liveness_noted = True
+            note_cuda_graphs_captured()
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
 
@@ -281,6 +292,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        if self._liveness_noted:
+            self._liveness_noted = False
+            note_cuda_graphs_released()
         self.close()
         self._graphs.clear()
         self._outputs.clear()

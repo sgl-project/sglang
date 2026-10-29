@@ -174,6 +174,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_executor.runner_utils.cuda_graph_liveness import (
+    have_live_cuda_graphs,
+)
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
     resolve_rocm_forward_method,
@@ -3460,7 +3463,14 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
+        if have_live_cuda_graphs():
+            logger.info(
+                "Skipping empty_cache after hot weight reload: CUDA graphs "
+                "are captured; releasing pooled allocator segments could "
+                "free memory the captured graphs reference."
+            )
+        else:
+            torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
     @classmethod

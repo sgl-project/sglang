@@ -1636,6 +1636,13 @@ class ModelRunner:
         return compute_attention_and_moe_layers(layer_model)
 
     def init_decode_cuda_graph(self):
+        # Replacing a real graph runner (recapture, PD role switch) must
+        # release its liveness note first or the counter leaks upward and the
+        # empty_cache gates stay closed. The eager runner is shared state and
+        # is never cleaned here.
+        prior = self.decode_cuda_graph_runner
+        if prior is not None and prior is not self.eager_runner:
+            prior.backend.cleanup()
         self.decode_cuda_graph_runner = None
         capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner
