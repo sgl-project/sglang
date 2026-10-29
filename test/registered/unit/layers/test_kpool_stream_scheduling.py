@@ -399,10 +399,12 @@ def _row_chunks(*, rows_per_chunk, num_rows, num_cols, device):
 
 def _fake_deep_gemm():
     # Logits carry each row's weight, so a mis-offset q/weights slice shows up.
+    def fp8_mqa_logits(q, kv, w, ks, ke, clean_logits):
+        assert clean_logits is False
+        return w[:, :1].expand(q.shape[0], kv[0].shape[0]).clone()
+
     return SimpleNamespace(
-        fp8_mqa_logits=lambda q, kv, w, ks, ke, clean_logits: (
-            w[:, :1].expand(q.shape[0], kv[0].shape[0]).clone()
-        )
+        fp8_mqa_logits=fp8_mqa_logits,
     )
 
 
@@ -477,9 +479,12 @@ def _fp8_zeros(*shape):
 def _fake_aiter_modules():
     # _fp8_mqa_logits imports AITER lazily on ROCm; same row encoding as DeepGEMM.
     kernel = ModuleType("aiter.ops.triton.fp8_mqa_logits")
-    kernel.fp8_mqa_logits = lambda q, k, scale, w, starts, ends, clean_logits: (
-        w[:, :1].expand(q.shape[0], k.shape[0]).clone()
-    )
+
+    def fp8_mqa_logits(q, k, scale, w, starts, ends, clean_logits):
+        assert clean_logits is False
+        return w[:, :1].expand(q.shape[0], k.shape[0]).clone()
+
+    kernel.fp8_mqa_logits = fp8_mqa_logits
     return {
         "aiter": ModuleType("aiter"),
         "aiter.ops": ModuleType("aiter.ops"),
