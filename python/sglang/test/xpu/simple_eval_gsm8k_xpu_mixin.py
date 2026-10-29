@@ -3,8 +3,6 @@
 Launches an SGLang server with XPU flags, then calls
 ``sglang.test.sgl_eval_utils.run_sgl_eval`` with ``eval_name="gsm8k"`` so the
 sgl-eval GSM8K benchmark (0-shot chat, boxed-answer grader) scores the run.
-Tests that set ``use_sgl_eval = False`` keep the legacy ``run_eval`` 5-shot
-scorer.
 
 Subclasses set ``model``, ``tp_size``, ``accuracy``, and may override
 ``other_args`` / ``env`` / ``num_examples`` / ``num_threads``.
@@ -18,7 +16,6 @@ from abc import ABC
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -61,9 +58,6 @@ class SimpleEvalGSM8KXPUMixin(ABC):
     top_p: float | None = None
     # Forwarded per request, e.g. {"enable_thinking": False}.
     chat_template_kwargs: dict | None = None
-    # Qwen3.5 thinking loops on sgl-eval's boxed-answer prompt; those tests
-    # stay on run_eval until they are re-baselined.
-    use_sgl_eval: bool = True
 
     @classmethod
     def setUpClass(cls):
@@ -93,7 +87,7 @@ class SimpleEvalGSM8KXPUMixin(ABC):
 
         model_metrics = {
             "server": self.server_cmd,
-            "client": "sgl_eval_gsm8k" if self.use_sgl_eval else "simple_eval_gsm8k",
+            "client": "sgl_eval_gsm8k",
             "accuracy_threshold": getattr(self, "accuracy", "N/A"),
             "output_throughput_threshold": getattr(self, "output_throughput", "N/A"),
             "num_prompts": self.num_examples,
@@ -113,7 +107,7 @@ class SimpleEvalGSM8KXPUMixin(ABC):
                 top_p=self.top_p,
                 chat_template_kwargs=self.chat_template_kwargs,
             )
-            metrics = (run_sgl_eval if self.use_sgl_eval else run_eval)(args)
+            metrics = run_sgl_eval(args)
             model_metrics["accuracy"] = metrics["score"]
             model_metrics["output_throughput"] = metrics.get("output_throughput")
             model_metrics["latency"] = metrics["latency"]
