@@ -423,8 +423,8 @@ class KVArgsRegisterInfo:
             dst_kv_mem_kinds=dst_kv_mem_kinds,
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])),
             dst_aux_item_lens=(
-                list(struct.unpack(f"{len(msg[23]) // 8}Q", msg[23]))
-                if len(msg) > 23
+                list(struct.unpack(f"{len(msg[24]) // 8}Q", msg[24]))
+                if len(msg) > 24
                 else None
             ),
             dst_state_data_ptrs=dst_state_data_ptrs,
@@ -3515,6 +3515,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             str(self.dcp_size).encode("ascii"),
             str(self.dcp_rank).encode("ascii"),
             packed_state_data_lens,
+            struct.pack(
+                f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
+            ),
         ]
 
     def build_receiver_metadata_message(

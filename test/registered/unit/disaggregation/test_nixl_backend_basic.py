@@ -438,6 +438,7 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.request_status[22] = KVPoll.WaitingForInput
         mgr.decode_kv_args_table["healthy"] = healthy.decode_kv_args_table["agent"]
         mgr.agent.check_xfer_state = MagicMock(return_value="DONE")
+        mgr.agent.check_remote_metadata = MagicMock(return_value=True)
         mgr.send_kv_status_message = MagicMock()
         mgr.send_kvcache = MagicMock(return_value="kv_handle")
         mgr.send_aux = MagicMock(return_value="aux_handle")
@@ -449,15 +450,25 @@ class TestNixlTransferWorker(CustomTestCase):
 
         self.assertEqual(mgr.request_status[21], KVPoll.Failed)
         self.assertIn("metadata buffer layout mismatch", mgr.failure_records[21])
-        self.assertIsInstance(mgr.exceptions[21], ValueError)
         self.assertEqual(mgr.request_status[22], KVPoll.Success)
+        self.assertNotIn(22, mgr.failure_records)
         mgr.send_kvcache.assert_called_once()
         self.assertEqual(mgr.send_kvcache.call_args.args[0], "healthy")
         mgr.send_aux.assert_called_once()
         self.assertEqual(mgr.send_aux.call_args.args[0], "healthy")
-        mgr.send_kv_status_message.assert_called_once()
         self.assertEqual(
-            mgr.send_kv_status_message.call_args.kwargs["status"], KVPoll.Failed
+            [
+                (
+                    call.kwargs["bootstrap_room"],
+                    call.kwargs["status"],
+                    call.kwargs["failure_reason"],
+                )
+                for call in mgr.send_kv_status_message.call_args_list
+            ],
+            [
+                (21, KVPoll.Failed, mgr.failure_records[21]),
+                (22, KVPoll.Success, None),
+            ],
         )
         self.assertEqual(mgr._staging_outstanding.get(21, 0), 0)
 

@@ -165,7 +165,12 @@ class TestNixlAbortNotification(
         manager.transfer_source_rank = 0
         manager.src_mem_kind = "VRAM"
         manager._num_slots_src = 4
-        manager.kv_args = SimpleNamespace(kv_data_ptrs=[0x1000], kv_item_lens=[16])
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[0x1000],
+            kv_item_lens=[16],
+            aux_data_ptrs=[0x3000],
+            aux_item_lens=[64],
+        )
         manager.prep_handles = {"": "src-prep"}
         manager.decode_kv_args_table = {}
         manager.transfer_infos = {ROOM: {}}
@@ -178,6 +183,8 @@ class TestNixlAbortNotification(
                 kv_xfer_segments=None,
                 dst_homogeneous_mem_kind="VRAM",
                 dst_kv_ptrs=[0x2000],
+                dst_aux_ptrs=[0x4000],
+                dst_aux_item_lens=[64],
                 dst_num_slots=None,
                 gpu_id=0,
             )

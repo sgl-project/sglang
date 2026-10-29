@@ -20,8 +20,18 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
-from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.mooncake.conn import (
+    KVArgsRegisterInfo as MooncakeKVArgsRegisterInfo,
+)
+from sglang.srt.disaggregation.mooncake.conn import (
+    MooncakeKVManager,
+)
+from sglang.srt.disaggregation.nixl.conn import (
+    KVArgsRegisterInfo as NixlKVArgsRegisterInfo,
+)
+from sglang.srt.disaggregation.nixl.conn import (
+    NixlKVManager,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -171,6 +181,7 @@ class TestReceiverControlMessages(CustomTestCase):
             kv_data_mem_kinds=["VRAM"],
             kv_layer_ids=[7],
             aux_data_ptrs=[0x2000],
+            aux_item_lens=[64],
             state_data_ptrs=[[0x3000]],
             state_data_lens=[[512]],
             state_item_lens=[[32]],
@@ -237,6 +248,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"0",
                 b"",
                 struct.pack("Q", 16),
+                struct.pack("Q", 64),
             ],
             "nixl": [
                 b"NixlMsgGuard",
@@ -264,6 +276,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"1",
                 b"0",
                 struct.pack("<IIQ", 1, 8, 512),
+                struct.pack("Q", 64),
             ],
             "mori": [
                 b"MoriMsgGuard",
@@ -292,6 +305,23 @@ class TestReceiverControlMessages(CustomTestCase):
                 self.assertTrue(receiver._register_kv_args())
                 self.assertEqual(
                     sent, [(port, expected[backend]) for port in (6000, 6001, 6002)]
+                )
+                if backend == "mori":
+                    continue
+                frames = sent[0][1]
+                if backend == "nixl":
+                    frames = frames[1:]
+                    registration_type = NixlKVArgsRegisterInfo
+                else:
+                    registration_type = MooncakeKVArgsRegisterInfo
+                info = registration_type.from_zmq(frames)
+                self.assertEqual(info.dst_aux_item_lens, [64])
+                self.assertEqual(info.dst_kv_item_lens, [16])
+                self.assertEqual(info.dst_state_item_lens, [[32]])
+                if backend == "nixl":
+                    self.assertEqual(info.dst_state_data_lens, [[512]])
+                self.assertIsNone(
+                    registration_type.from_zmq(frames[:-1]).dst_aux_item_lens
                 )
 
     def test_metadata_wire_is_preserved_for_all_peers(self):

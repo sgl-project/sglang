@@ -3301,6 +3301,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{len(self.kv_args.kv_item_lens)}Q",
                 *self.kv_args.kv_item_lens,
             ),
+            struct.pack(
+                f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
+            ),
         ]
 
     def build_receiver_metadata_message(

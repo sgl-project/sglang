@@ -1,3 +1,4 @@
+from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -6,13 +7,18 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.disaggregation.utils import MetadataBuffers
+from sglang.srt.disaggregation.utils import DisaggregationMode, MetadataBuffers
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import RequestOutputStats
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
+from sglang.srt.managers.scheduler_components.output_streamer import (
+    _GenerationStreamAccumulator,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -97,15 +103,14 @@ def _free_req(req, _tree_cache, *, checkpoint):
 
 @pytest.mark.parametrize(
     "customized_info",
-    [{"scores": ["x" * 8192]}, {"scores": [object()]}, {1: [0.5]}],
-    ids=["overflow", "encoding", "non-string-key"],
+    [{"scores": ["x" * 8192]}, {"scores": [lambda: None]}, {1: [0.5]}, {"scores": 1}],
+    ids=["overflow", "encoding", "non-string-key", "non-list-value"],
 )
 @patch("sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group")
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache")
 def test_customized_info_failure_is_request_local(
     release_kv_cache, poll, customized_info
 ):
-    """Invalid sampler metadata aborts its request before reaching decode."""
     scheduler = _Scheduler()
     scheduler.scheduler_stage_metrics = None
     scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = None
@@ -129,7 +134,7 @@ def test_customized_info_failure_is_request_local(
     poll.return_value = [KVPoll.Failed]
 
     for index, payload in enumerate((customized_info, {"scores": [0.5]})):
-        req = Req(f"customized-info-{index}", "", [1], SamplingParams())
+        req = Req(f"customized-info-{index}", "", array("q", [1]), SamplingParams())
         req.kv = ReqKvInfo(req_pool_idx=0, kv_allocated_len=1)
         req.metadata_buffer_index = 0
         req.extend_end = 1
@@ -169,6 +174,33 @@ def test_customized_info_failure_is_request_local(
             )
             assert not req.kv.holds_kv
             assert req.metadata_buffer_index == -1
+            req.time_stats = None
+            accumulator = _GenerationStreamAccumulator(
+                return_logprob=False,
+                return_hidden_states=False,
+                return_routed_experts=False,
+                return_indexer_topk=False,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                disaggregation_mode=DisaggregationMode.PREFILL,
+                default_stream_interval=1,
+                default_force_stream_interval=1,
+                build_request_stats=lambda req: RequestOutputStats(
+                    prompt_tokens=1,
+                    cached_tokens=0,
+                    cached_tokens_details=None,
+                    retraction_count=0,
+                    image_tokens=0,
+                    audio_tokens=0,
+                    video_tokens=0,
+                    time_stats=None,
+                ),
+                is_request_level_customized_info_key=lambda key: False,
+                current_weight_version=None,
+            )
+            accumulator.accept(req=req)
+            output = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+            assert output.finished_reasons == [finish_reason.to_json()]
+            assert output.customized_info is None
         else:
             assert not req.finished()
             req.disagg_kv_sender.abort.assert_not_called()
@@ -188,6 +220,8 @@ def test_customized_info_failure_is_request_local(
         pytest.raises(RuntimeError, match="device failure"),
     ):
         scheduler._send_kv_chunk(req, last_chunk=True)
+
+
 class TestPrefillCompleteResult(CustomTestCase):
     def setUp(self):
         super().setUp()
@@ -238,6 +272,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         scheduler = _Scheduler()
         req = _Req(inflight_middle_chunks=0)
         scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        release.assert_called_once_with(req, scheduler.tree_cache, checkpoint=False)
         self.assertTrue(req.finished())
         self.assertFalse(req.kv.holds_kv)
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
@@ -298,5 +333,7 @@ def test_early_send_wait_event_comes_from_the_scheduler_device_module():
     assert isinstance(req.disagg_kv_sender._early_send_wait_event, _Event)
     assert recorded == [scheduler.forward_stream]
     scheduler.send_kv_chunk.assert_called_once()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

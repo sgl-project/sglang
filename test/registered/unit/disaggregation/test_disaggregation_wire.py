@@ -712,7 +712,6 @@ class TestDisaggregationWire(unittest.TestCase):
                 prefill_kv_indices=np.array([], dtype=np.int32),
                 index_slice=slice(0, 0),
                 is_last_chunk=True,
-                chunk_id=0,
                 prefill_aux_index=0,
                 state_indices=None,
             )
