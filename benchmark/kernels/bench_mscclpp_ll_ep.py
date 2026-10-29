@@ -19,6 +19,16 @@ Pass ``--balanced-routing`` to distribute aggregate top-k routes exactly evenly
 across every global expert. This is useful for separating communication and
 synchronization costs from router-induced expert load imbalance.
 
+Timing: ``total`` is the median over ``--total-repeats`` CUDA Graph timing
+windows of the per-iteration window average, maximized across ranks. Phase
+times come from ``--phase-repeats`` passes in which every rank profiles its
+CUDA kernels. Each rank's kernel timeline is split into pipeline iterations,
+and each kernel counts only the time not overlapped by an earlier-starting
+kernel. Per iteration, dispatch and combine take the minimum across ranks (the
+rank that waits least for its peers), compute takes the maximum (the slowest
+rank) and unclassified takes the median; reported values are medians over
+iterations, then over passes.
+
 Teardown closes MSCCL++ dispatchers after releasing captured graphs, then clears
 shared communicators before destroying process groups.
 """
@@ -72,6 +82,8 @@ class BenchmarkConfig(msgspec.Struct, frozen=True):
     balanced_routing: bool
     warmup_iters: int
     benchmark_iters: int
+    total_repeats: int
+    phase_repeats: int
     seed: int
     atol: float
     rtol: float
@@ -107,6 +119,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup-iters", type=int, default=20)
     parser.add_argument("--benchmark-iters", type=int, default=100)
+    parser.add_argument(
+        "--total-repeats",
+        type=int,
+        default=5,
+        help="Graph timing windows for total latency; the median is reported.",
+    )
+    parser.add_argument(
+        "--phase-repeats",
+        type=int,
+        default=3,
+        help="All-rank profiled passes for phase latencies; the median is reported.",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--atol",
@@ -171,6 +195,8 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("token and intermediate sizes must be positive")
     if args.warmup_iters < 1 or args.benchmark_iters < 1:
         raise ValueError("warmup and benchmark iteration counts must be positive")
+    if args.total_repeats < 1 or args.phase_repeats < 1:
+        raise ValueError("--total-repeats and --phase-repeats must be positive")
     if args.layout == "rank-major":
         from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
@@ -368,22 +394,66 @@ def synchronize() -> None:
     dist.barrier()
 
 
+PHASES = ("dispatch", "compute", "combine", "unclassified")
+
+
 class PhaseLatencies(msgspec.Struct, frozen=True):
-    """Wall-clock graph latency and profiled CUDA kernel time per phase."""
+    """Graph latency and per-iteration critical-path CUDA kernel time per phase.
+
+    Ranges are (min, max) across timing windows for ``total`` and across
+    profiled passes for the phases. ``median_rank_us`` and ``rank0_us`` hold
+    (dispatch, compute, combine) for the median rank and rank 0; their gap to
+    the headline dispatch/combine is time spent waiting for slower ranks.
+    ``legacy_rank0_us`` is the previous metric (rank-0 median kernel duration
+    times invocations per iteration, overlap counted twice) from the same
+    profiled passes. ``iteration_split`` is False when some rank's kernel
+    timeline could not be split into pipeline iterations and per-rank mean
+    times were used instead.
+    """
 
     total_us: float
     dispatch_us: float
     compute_us: float
     combine_us: float
     unclassified_us: float
+    total_range_us: tuple[float, float]
+    dispatch_range_us: tuple[float, float]
+    compute_range_us: tuple[float, float]
+    combine_range_us: tuple[float, float]
+    median_rank_us: tuple[float, float, float]
+    rank0_us: tuple[float, float, float]
+    profiled_window_us: float
+    legacy_rank0_us: tuple[float, float, float, float]
+    iteration_split: bool
 
     def __str__(self) -> str:
+        def span(values: tuple[float, float]) -> str:
+            return f"{values[0]:.2f}-{values[1]:.2f} us"
+
+        def phases(values: tuple[float, ...]) -> str:
+            return ", ".join(
+                f"{phase}={value:.2f} us" for phase, value in zip(PHASES, values)
+            )
+
+        phase_sum = (
+            self.dispatch_us + self.compute_us + self.combine_us + self.unclassified_us
+        )
+        split = "per iteration" if self.iteration_split else "per-rank means"
         return (
             f"total={self.total_us:.2f} us "
-            f"(median rank-0 CUDA kernels: dispatch={self.dispatch_us:.2f} us, "
+            f"(critical-path CUDA kernels: dispatch={self.dispatch_us:.2f} us, "
             f"compute={self.compute_us:.2f} us, "
             f"combine={self.combine_us:.2f} us, "
-            f"unclassified={self.unclassified_us:.2f} us)"
+            f"unclassified={self.unclassified_us:.2f} us)\n"
+            f"  ranges: total {span(self.total_range_us)} across windows; "
+            f"dispatch {span(self.dispatch_range_us)}, "
+            f"compute {span(self.compute_range_us)}, "
+            f"combine {span(self.combine_range_us)} across profiled passes\n"
+            f"  median rank: {phases(self.median_rank_us)}; "
+            f"rank 0: {phases(self.rank0_us)}\n"
+            f"  profiled window={self.profiled_window_us:.2f} us, "
+            f"phase sum={phase_sum:.2f} us ({split}); "
+            f"legacy rank-0 median kernels: {phases(self.legacy_rank0_us)}"
         )
 
 
@@ -443,68 +513,200 @@ def calibrate_phase_kernel_names(
     return dispatch_names, compute_names, combine_names
 
 
+def _profiled_kernel_intervals(prof: profile) -> list[tuple[float, float, str]]:
+    return [
+        (evt.time_range.start, evt.time_range.end, evt.key)
+        for evt in prof.events()
+        if evt.device_type == torch.autograd.DeviceType.CUDA
+        and evt.self_device_time_total > 0
+    ]
+
+
+def split_phase_timeline_us(
+    kernels: list[tuple[float, float, str]],
+    phase_kernel_names: tuple[set[str], set[str], set[str]],
+) -> list[list[float]]:
+    """Return one rank's non-overlapping kernel time per pipeline iteration.
+
+    ``kernels`` holds ``(start_us, end_us, name)`` intervals. Kernels are
+    ordered by start time and each counts only its time after the end of every
+    earlier-starting kernel, so overlap (e.g. a programmatic dependent launch
+    starting before its predecessor ends) is counted once, for the earlier
+    kernel. An iteration starts at a dispatch kernel whose preceding classified
+    kernel is not a dispatch kernel; kernels before the first dispatch kernel
+    (e.g. the barrier that aligns ranks) are ignored. Each iteration is
+    ``[dispatch, compute, combine, unclassified]`` in microseconds.
+    """
+    dispatch_names, compute_names, combine_names = phase_kernel_names
+    iterations: list[list[float]] = []
+    previous_phase = None
+    max_end = float("-inf")
+    for start, end, name in sorted(kernels):
+        if name in dispatch_names:
+            phase = 0
+        elif name in compute_names:
+            phase = 1
+        elif name in combine_names:
+            phase = 2
+        else:
+            phase = 3
+        exclusive = max(0.0, end - max(start, max_end))
+        max_end = max(max_end, end)
+        if phase == 0 and previous_phase != 0:
+            iterations.append([0.0] * len(PHASES))
+        if phase != 3:
+            previous_phase = phase
+        if iterations:
+            iterations[-1][phase] += exclusive
+    return iterations
+
+
+def reduce_phase_times_us(per_iteration: torch.Tensor) -> list[float]:
+    """Reduce ``[ranks, iterations, phases]`` kernel times to medians over
+    iterations of: dispatch and combine minimized, compute maximized and
+    unclassified median across ranks; then (dispatch, compute, combine) of the
+    median rank and of rank 0."""
+    per_iteration = per_iteration.double()
+    rank_min = per_iteration.amin(dim=0)
+    rank_max = per_iteration.amax(dim=0)
+    rank_median = per_iteration.quantile(0.5, dim=0)
+    critical = (rank_min[:, 0], rank_max[:, 1], rank_min[:, 2], rank_median[:, 3])
+    return (
+        [values.quantile(0.5).item() for values in critical]
+        + [rank_median[:, phase].quantile(0.5).item() for phase in range(3)]
+        + [per_iteration[0, :, phase].quantile(0.5).item() for phase in range(3)]
+    )
+
+
 def profile_graph_phase_latencies_us(
     graph: torch.cuda.CUDAGraph,
     phase_kernel_names: tuple[set[str], set[str], set[str]],
-    total_us: float,
+    total_us: tuple[float, float, float],
     warmup_iters: int,
     benchmark_iters: int,
     graph_iters: int,
+    repeats: int,
 ) -> PhaseLatencies:
-    """Profile CUDA kernels launched by actual graph replays.
+    """Profile CUDA kernels launched by actual graph replays on every rank.
 
-    Rank 0 profiles ``benchmark_iters`` replays of a graph containing
-    ``graph_iters`` full pipeline iterations while every other rank replays
-    without CUPTI instrumentation. For each CUDA kernel, its median invocation
-    duration is multiplied by its occurrences per pipeline iteration, then
-    summed into its phase. These are rank-0 graph kernel measurements, not
-    rescaled eager estimates; their sum can differ from wall-clock ``total_us``
-    when kernels overlap.
+    Each of ``repeats`` passes replays a graph containing ``graph_iters`` full
+    pipeline iterations ``benchmark_iters`` times while every rank records its
+    CUDA kernels, so profiler overhead is the same on all ranks. Each rank's
+    kernel timeline is split into iterations by ``split_phase_timeline_us``
+    and the ranks are combined per iteration by ``reduce_phase_times_us``:
+    dispatch and combine exclude time spent waiting for slower ranks, and
+    compute is the slowest rank's. Values are medians over iterations, then
+    over passes. If a rank's timeline cannot be split into exactly
+    ``benchmark_iters * graph_iters`` iterations, per-rank mean times are
+    reduced the same way instead. These are graph kernel measurements under
+    CUPTI, not rescaled eager estimates; their sum approximates the profiled
+    window per iteration. ``total_us`` is (median, min, max) from
+    ``median_graph_latency_us``.
     """
-    for _ in range(warmup_iters):
-        graph.replay()
-    synchronize()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    iterations = benchmark_iters * graph_iters
+    debug = os.environ.get("SGLANG_BENCH_PHASE_DEBUG") == "1"
+    passes = []
+    iteration_split = True
+    for pass_index in range(repeats):
+        for _ in range(warmup_iters):
+            graph.replay()
+        synchronize()
 
-    prof = None
-    if dist.get_rank() == 0:
-        with profile(activities=[ProfilerActivity.CUDA]) as rank_zero_prof:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
             dist.barrier()
+            start.record()
             for _ in range(benchmark_iters):
                 graph.replay()
+            end.record()
             torch.cuda.synchronize()
-        prof = rank_zero_prof
-    else:
-        dist.barrier()
-        for _ in range(benchmark_iters):
-            graph.replay()
-        torch.cuda.synchronize()
-    dist.barrier()
+        window_us = start.elapsed_time(end) * 1000.0 / iterations
 
-    phase_totals = _aggregate_profiled_phase_latencies(
-        prof,
-        phase_kernel_names,
-        benchmark_iters * graph_iters,
-    )
+        timeline = split_phase_timeline_us(
+            _profiled_kernel_intervals(prof), phase_kernel_names
+        )
+        phase_sums = [sum(phases) for phases in zip(*timeline)] or [0.0] * 4
+        if len(timeline) == iterations:
+            local_iterations = torch.tensor(timeline, dtype=torch.float64)
+        else:
+            local_iterations = torch.full((iterations, len(PHASES)), float("nan"))
+        legacy = _aggregate_profiled_phase_latencies(
+            prof if rank == 0 else None, phase_kernel_names, iterations
+        )
+        local_summary = torch.tensor(
+            [window_us, len(timeline)]
+            + [phase_sum / iterations for phase_sum in phase_sums]
+            + [legacy[phase] for phase in PHASES],
+            dtype=torch.float64,
+            device="cuda",
+        )
+        summary = local_summary.new_empty((world_size, local_summary.numel()))
+        dist.all_gather_into_tensor(summary, local_summary)
+        local_iterations = local_iterations.to(device="cuda", dtype=torch.float64)
+        per_iteration = local_iterations.new_empty(
+            (world_size, *local_iterations.shape)
+        )
+        dist.all_gather_into_tensor(per_iteration, local_iterations)
+        summary = summary.cpu()
 
-    phase_times = torch.tensor(
-        [
-            phase_totals["dispatch"],
-            phase_totals["compute"],
-            phase_totals["combine"],
-            phase_totals["unclassified"],
-        ],
-        dtype=torch.float64,
-        device="cuda",
-    )
-    dist.broadcast(phase_times, src=0)
-    dispatch_us, compute_us, combine_us, unclassified_us = phase_times.tolist()
+        split_counts = summary[:, 1]
+        if bool((split_counts == iterations).all()):
+            values = reduce_phase_times_us(per_iteration.cpu())
+        else:
+            iteration_split = False
+            values = reduce_phase_times_us(summary[:, 2:6].unsqueeze(1))
+            if rank == 0:
+                bad = [
+                    f"rank {r}: {int(count)}"
+                    for r, count in enumerate(split_counts.tolist())
+                    if count != iterations
+                ]
+                print(
+                    f"WARNING: expected {iterations} pipeline iterations in "
+                    f"each kernel timeline, found {', '.join(bad)}; phase "
+                    "times use per-rank means",
+                    flush=True,
+                )
+        passes.append(values + [summary[:, 0].max().item()] + summary[0, 6:].tolist())
+
+        if debug and rank == 0:
+            for r, row in enumerate(summary.tolist()):
+                print(
+                    f"PHASE_DEBUG pass={pass_index} rank={r} window={row[0]:.2f} "
+                    f"iterations={int(row[1])} "
+                    + " ".join(
+                        f"{phase}={value:.2f}" for phase, value in zip(PHASES, row[2:6])
+                    ),
+                    flush=True,
+                )
+
+    def median(index: int) -> float:
+        return statistics.median(values[index] for values in passes)
+
+    def value_range(index: int) -> tuple[float, float]:
+        return (
+            min(values[index] for values in passes),
+            max(values[index] for values in passes),
+        )
 
     return PhaseLatencies(
-        total_us=total_us,
-        dispatch_us=dispatch_us,
-        compute_us=compute_us,
-        combine_us=combine_us,
-        unclassified_us=unclassified_us,
+        total_us=total_us[0],
+        dispatch_us=median(0),
+        compute_us=median(1),
+        combine_us=median(2),
+        unclassified_us=median(3),
+        total_range_us=(total_us[1], total_us[2]),
+        dispatch_range_us=value_range(0),
+        compute_range_us=value_range(1),
+        combine_range_us=value_range(2),
+        median_rank_us=(median(4), median(5), median(6)),
+        rank0_us=(median(7), median(8), median(9)),
+        profiled_window_us=median(10),
+        legacy_rank0_us=(median(11), median(12), median(13), median(14)),
+        iteration_split=iteration_split,
     )
 
 
@@ -673,31 +875,39 @@ def median_graph_latency_us(
     warmup_iters: int,
     benchmark_iters: int,
     graph_iters: int = 1,
-) -> float:
+    repeats: int = 1,
+) -> tuple[float, float, float]:
     """Time ``benchmark_iters`` graph replays as a single elapsed-time
     window (start/end events outside the loop, per ``bench_time`` in
     mscclpp's ``python/test/executor_test.py``), rather than timing each
     replay individually -- this avoids per-replay CPU/event-recording
-    overhead from skewing small-workload measurements. The result is
+    overhead from skewing small-workload measurements. Each window gives the
     per-iteration average latency (elapsed time divided by
     ``benchmark_iters * graph_iters``, since each graph replay itself runs
-    ``graph_iters`` captured iterations)."""
+    ``graph_iters`` captured iterations), maximized across ranks. The window
+    is repeated ``repeats`` times, each after a barrier; returns the median,
+    min and max over windows."""
     for _ in range(warmup_iters):
         graph.replay()
-    synchronize()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(benchmark_iters):
-        graph.replay()
-    end.record()
-    end.synchronize()
-    elapsed_us = start.elapsed_time(end) * 1000.0 / benchmark_iters / graph_iters
+    windows_us = []
+    for _ in range(repeats):
+        synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(benchmark_iters):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        windows_us.append(
+            start.elapsed_time(end) * 1000.0 / benchmark_iters / graph_iters
+        )
 
-    latency = torch.tensor(elapsed_us, dtype=torch.float64, device="cuda")
+    latency = torch.tensor(windows_us, dtype=torch.float64, device="cuda")
     dist.all_reduce(latency, op=dist.ReduceOp.MAX)
-    return latency.item()
+    windows_us = latency.tolist()
+    return statistics.median(windows_us), min(windows_us), max(windows_us)
 
 
 def median_eager_latency_us(
@@ -776,7 +986,11 @@ def run_rank_major(
                 assert_close(eager, graph_output, config, f"{name} eager vs graph")
                 outputs[name] = graph_output.detach().cpu()
                 total_us = median_graph_latency_us(
-                    graph, config.warmup_iters, config.benchmark_iters, graph_iters
+                    graph,
+                    config.warmup_iters,
+                    config.benchmark_iters,
+                    graph_iters,
+                    config.total_repeats,
                 )
                 if rank == 0:
                     print(f"Profiling {name} CUDA Graph kernels...", flush=True)
@@ -787,6 +1001,7 @@ def run_rank_major(
                     config.warmup_iters,
                     config.benchmark_iters,
                     graph_iters,
+                    config.phase_repeats,
                 )
                 if rank == 0:
                     print(f"Finished {name}.", flush=True)
@@ -985,6 +1200,7 @@ def run_expert_major(
                 config.warmup_iters,
                 config.benchmark_iters,
                 graph_iters,
+                config.total_repeats,
             )
             mscclpp_latencies = profile_graph_phase_latencies_us(
                 graph,
@@ -993,6 +1209,7 @@ def run_expert_major(
                 config.warmup_iters,
                 config.benchmark_iters,
                 graph_iters,
+                config.phase_repeats,
             )
         finally:
             synchronize()
@@ -1073,9 +1290,13 @@ def main() -> None:
         print(json.dumps(msgspec.to_builtins(config), indent=2, sort_keys=True))
         print(f"nodes={world_size // local_world_size}, dtype={DTYPE}")
         print(
-            "Timing unit: microseconds; total is the graph-window average "
-            "maximized across ranks; phase values sum rank-0 median CUDA "
-            "kernel invocation durations"
+            "Timing unit: microseconds per pipeline iteration; total is the "
+            "median over --total-repeats graph timing windows of the window "
+            "average maximized across ranks; phases come from --phase-repeats "
+            "passes profiling CUDA kernels on every rank: non-overlapping "
+            "kernel time per phase and iteration, with dispatch and combine "
+            "minimized, compute maximized and unclassified the median across "
+            "ranks, then medians over iterations and passes"
         )
 
     try:
