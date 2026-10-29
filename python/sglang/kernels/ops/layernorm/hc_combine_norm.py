@@ -73,7 +73,7 @@ def hc_combine_norm(
     # Four CTAs per row trade redundant statistics for more concurrent loads
     # when only a few speculative tokens are being processed; wider batches have
     # enough rows to split the 5120 columns fewer ways.
-    parts = 4 if m <= 8 else (2 if m <= 48 else 1)
+    parts = _parts_for(m, 5120)
     _hc_combine_norm[(m, parts)](
         x, pre, weight, y, x.stride(0), pre.stride(0), eps, parts, num_warps=8
     )
@@ -123,9 +123,6 @@ def _hc_combine_norm_mxfp8_kernel(
 
 
 def _parts_for(m: int, k: int) -> int:
-    # Row splits: with only a few rows, recomputing the statistic in four CTAs
-    # beats leaving SMs idle; wider batches have enough rows to split the
-    # columns fewer ways (the same split as hc_combine_norm above).
     parts = 4 if m <= 8 else (2 if m <= 48 else 1)
     while parts > 1 and (k % (parts * 32)):
         parts //= 2
