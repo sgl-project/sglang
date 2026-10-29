@@ -8,7 +8,6 @@ import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
-from sglang.srt.kernel_plugins.nvidia.binding import megakernel_graph_variants
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -285,18 +284,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             dsa_seed_topk=dsa_seed_topk,
         )
         self.buffers.share_buffers()
-        # the batch sizes whose graphs run the draft megakernel's draft_loop, captured
-        # once per label of the graph variants it offers this runner
-        self.megakernel = eagle_worker.megakernel
-        self.megakernel_served = (
-            frozenset()
-            if self.megakernel is None
-            else self.megakernel.bind_draft_graphs(self)
+        # Resolve the always-present graph dispatch before capture. Specialized
+        # batch sizes are used only to select compatible graph variants.
+        self.draft_runtime = eagle_worker.draft_runtime
+        self.specialized_batches = self.draft_runtime.bind_draft_graphs(self)
+        self.attention_graph_variants = self.draft_runtime.graph_variants(
+            model_runner.model,
+            "draft_loop",
+            batch_sizes=self.specialized_batches,
         )
-        self.attention_graph_variants = megakernel_graph_variants(
-            model_runner.model, "draft_loop", batch_sizes=self.megakernel_served
-        )
-        self.attention_variant_sizes = self.megakernel_served
+        self.attention_variant_sizes = self.specialized_batches
 
         self.backend = resolve_decode_backend(self)
 
@@ -518,7 +515,18 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             ),
         )
         self.model_runner.runner_ids.bind_runner_slots(forward_batch)
-        served = num_seqs in self.megakernel_served
+        def run_stock():
+            output_cache_loc_backup = forward_batch.out_cache_loc
+            hidden_states_backup = forward_batch.spec_info.hidden_states
+            dsa_topk_indices_backup = forward_batch.spec_info.dsa_topk_indices
+
+            ret = self.eagle_worker.draft_forward(forward_batch)
+
+            forward_batch.out_cache_loc = output_cache_loc_backup
+            forward_batch.spec_info.hidden_states = hidden_states_backup
+            forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
+            forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
+            return ret
 
         def run_once():
             self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -531,23 +539,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
-            if served:
-                # leaves positions as they are, so nothing is subtracted after it
-                return self.megakernel.run_draft_loop(
-                    runner=self, forward_batch=forward_batch
-                )
-
-            output_cache_loc_backup = forward_batch.out_cache_loc
-            hidden_states_backup = forward_batch.spec_info.hidden_states
-            dsa_topk_indices_backup = forward_batch.spec_info.dsa_topk_indices
-
-            ret = self.eagle_worker.draft_forward(forward_batch)
-
-            forward_batch.out_cache_loc = output_cache_loc_backup
-            forward_batch.spec_info.hidden_states = hidden_states_backup
-            forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
-            forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
-            return ret
+            return self.draft_runtime.run_draft_loop(
+                runner=self,
+                forward_batch=forward_batch,
+                stock=run_stock,
+            )
 
         with forward_context(
             ForwardContext(attn_backend=self.draft_attn_backend),

@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
-from sglang.srt.kernel_plugins.nvidia.binding import megakernel_graph_variants
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -295,18 +294,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # shape [max_bs]. Sharing by field name and shape would alias those
         # width-specific indices and can make a narrower graph gather OOB.
         self.buffers.share_buffers(exclude={"select_index"})
-        # the batch sizes whose graphs run the draft megakernel's draft_extend,
-        # captured once per label of the graph variants it offers this runner
-        self.megakernel = self.eagle_worker.megakernel
-        self.megakernel_served = (
-            frozenset()
-            if self.megakernel is None
-            else self.megakernel.bind_extend_graphs(self)
+        # Resolve the always-present graph dispatch before capture. Specialized
+        # batch sizes are used only to select compatible graph variants.
+        self.draft_runtime = self.eagle_worker.draft_runtime
+        self.specialized_batches = self.draft_runtime.bind_extend_graphs(self)
+        self.attention_graph_variants = self.draft_runtime.graph_variants(
+            model_runner.model,
+            "draft_extend",
+            batch_sizes=self.specialized_batches,
         )
-        self.attention_graph_variants = megakernel_graph_variants(
-            model_runner.model, "draft_extend", batch_sizes=self.megakernel_served
-        )
-        self.attention_variant_sizes = self.megakernel_served
+        self.attention_variant_sizes = self.specialized_batches
 
         self.backend = resolve_decode_backend(self)
 
@@ -476,7 +473,19 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info.dsa_seed_topk_capture = self.buffers.dsa_seed_topk_capture[
                 :num_tokens
             ]
-        served = bs in self.megakernel_served
+        def run_stock():
+            output_cache_loc_backup = forward_batch.out_cache_loc
+            hidden_states_backup = forward_batch.spec_info.hidden_states
+
+            ret = self.model_runner.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+            )
+
+            forward_batch.out_cache_loc = output_cache_loc_backup
+            forward_batch.spec_info.hidden_states = hidden_states_backup
+            return ret
 
         def run_once():
             self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -490,23 +499,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
-            if served:
-                return self.megakernel.run_draft_extend(
-                    runner=self, forward_batch=forward_batch
-                )
-
-            output_cache_loc_backup = forward_batch.out_cache_loc
-            hidden_states_backup = forward_batch.spec_info.hidden_states
-
-            ret = self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
+            return self.draft_runtime.run_draft_extend(
+                runner=self,
+                forward_batch=forward_batch,
+                stock=run_stock,
             )
-
-            forward_batch.out_cache_loc = output_cache_loc_backup
-            forward_batch.spec_info.hidden_states = hidden_states_backup
-            return ret
 
         with forward_context(
             ForwardContext(attn_backend=self.draft_extend_attn_backend),
