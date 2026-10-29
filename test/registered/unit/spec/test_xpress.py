@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,10 @@ from torch import nn
 from sglang.srt.models.dflash import DFlashDraftModel, _radix_topk
 from sglang.srt.models.xpress import Qwen3XPressModel, XPressRefinerHead
 from sglang.srt.speculative.dflash_worker_v2 import _validate_xpress_lm_head
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 
 def _head(device, topc=0):
@@ -137,3 +142,7 @@ def test_xpress_fused_jacobi_matches_reference(topc):
             ).squeeze(-1)
     actual = head.jacobi_refine_greedy(base, hidden, anchor, 4)
     torch.testing.assert_close(actual, block[:, 1:])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -17,7 +17,6 @@ only to reduce them; fusing the add into the reduction never writes them.
 """
 
 import torch
-
 import triton
 import triton.language as tl
 
