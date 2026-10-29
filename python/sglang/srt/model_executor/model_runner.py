@@ -152,6 +152,7 @@ from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     AttentionAndMoeLayers,
     ModelLayerInfo,
+    check_layer_types_hybrid_swa_split,
     compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
@@ -743,6 +744,10 @@ class ModelRunner:
         self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
+        if self.model_config.is_layer_types_hybrid_swa:
+            check_layer_types_hybrid_swa_split(
+                model=self.model, model_config=self.model_config
+            )
         prepare_moe_topk(model=self.model, model_config=self.model_config)
 
         self.maybe_init_dwdp()
@@ -1900,6 +1905,8 @@ class ModelRunner:
                     split_forward_count,
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+        if isinstance(output.logits_output, LogitsProcessorOutput):
+            output.logits_output.own_customized_info()
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (

@@ -13,6 +13,7 @@ mod info;
 mod test_utils;
 mod tokenize;
 
+pub(crate) use control::ProfileOutcome;
 pub(crate) use generate::{CoreCall, recv_indexed};
 pub(crate) use handle::{CoreConfig, CoreHandle, CoreMetadata};
 pub(crate) use hicache::HiCacheManager;
