@@ -125,7 +125,7 @@ def _assert_matches_per_row(inputs, *, num_draft, local_blocks=1, radix_topk=Tru
 
 
 def _sparse_decode_args(inputs, *, seed, extra_rows=0):
-    """`minimax_sparse_decode` arguments over `inputs`; `extra_rows` appends rows
+    """``minimax_sparse_decode`` arguments over ``inputs``; ``extra_rows`` appends rows
     that repeat the first rows' lengths and slots."""
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
 

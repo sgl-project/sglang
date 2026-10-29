@@ -53,8 +53,8 @@ def sparse_qk_index_norm_rope_cache(
     also stores K/V into an fp8 main cache or the packed NVFP4 pool."""
     kv_pool = attn._get_sparse_kv_pool()
     nvfp4_pool = isinstance(kv_pool, MiniMaxM3Nvfp4KVPool)
-    # The kernel casts K/V to an fp8 main cache or quantizes them to the packed
-    # NVFP4 pool itself; other quantized caches keep the separate store.
+    # the kernel casts K/V to an fp8 main cache or quantizes them to the packed
+    # NVFP4 pool itself; other quantized caches keep the separate store
     main_kv_dtype_ok = kv_pool is not None and (
         nvfp4_pool or kv_pool.dtype == q.dtype or kv_pool.dtype in _FP8_KV_DTYPES
     )

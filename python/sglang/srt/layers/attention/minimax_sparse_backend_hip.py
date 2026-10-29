@@ -52,7 +52,7 @@ def nvfp4_layer_caches(
 def verify_num_draft(backend, forward_batch: ForwardBatch) -> Optional[int]:
     """Drafts per request for the grouped verify indexer, which minimax_sparse_decode
     runs only for K-only layers off the dense-main path."""
-    # _init_rocm_linear_verify_metadata lays each request's drafts out as consecutive rows
+    # _init_rocm_linear_verify_metadata lays each request's drafts out as consecutive rows.
     if (
         backend._use_grouped_verify_indexer
         and forward_batch.forward_mode.is_target_verify()

@@ -38,7 +38,7 @@ def validate_nvfp4(cfg: Any) -> None:
     if algorithm == "DFLASH" or (algorithm == "DSPARK" and not get_platform().is_gfx95):
         supported = "Blackwell or AMD gfx950" if algorithm == "DSPARK" else "Blackwell"
         raise ValueError(f"M3.1 NVFP4 {algorithm} requires {supported}")
-    # TP8 with attention DP ran away on whitespace in 12% of GSM8K answers on MI350X
+    # TP8 with attention DP ran away on whitespace in GSM8K answers on MI350X
     if cfg.tp_size > 4:
         raise ValueError("M3.1 NVFP4 on ROCm is validated at --tp-size 4 or less")
 
@@ -109,9 +109,8 @@ def is_m31_quark_export(hf_config: Any) -> bool:
 
 def _m31_quark_gfx950_overrides(cfg: Any, overrides: dict) -> None:
     """The gfx950 defaults minimax_m3_nvfp4 resolves, for an M3.1 Quark export: same
-    MXFP8 linears, same MXFP4 aiter experts. At TP4 on MI355X the Triton MXFP8
-    GEMMs alone halve batch-1 decode."""
-    # the aiter block-scale GEMMs instead of the Triton MXFP8 linear kernel
+    MXFP8 linears, same MXFP4 aiter experts."""
+    # the aiter block-scale GEMMs: the Triton MXFP8 linear kernel measured slower on MI355X
     if not envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.is_set():
         envs.SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE.set(True)
     if cfg.kv_cache_dtype == "auto":
@@ -126,8 +125,8 @@ def _m31_gfx950_all_reduce(cfg: Any) -> None:
     """The quick all-reduce both M3.1 checkpoints take at TP4, where it was measured."""
     if cfg.tp_size != 4:
         return
-    # INT4 halves the long-prefill all-reduce with GSM8K unchanged; ROCm images export
-    # INT8 for every model, so only another level the user set stays
+    # INT4 measured faster on the long-prefill all-reduce with GSM8K unchanged; ROCm images
+    # export INT8 for every model, so only another level the user set stays
     level = "ROCM_QUICK_REDUCE_QUANTIZATION"
     if (
         os.environ.get(level, "INT8") == "INT8"
@@ -150,8 +149,7 @@ def _m31_gfx950_all_reduce(cfg: Any) -> None:
     if not envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.is_set():
         envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.set(True)
     if envs.SGLANG_ROCM_QUICK_ALL_REDUCE_JIT.get():
-        # its INT8 beats aiter's custom AR from about 2 MiB, so custom AR stops at 2.4 MiB
-        # (decode at 26+ requests, extends of 205+ tokens) instead of 64 MiB
+        # custom AR stops at 2.4 MiB instead of 64 MiB: past that the JIT INT8 measured faster
         os.environ.setdefault("AITER_CUSTOM_AR_MAX_SIZE", "2516582")
 
 

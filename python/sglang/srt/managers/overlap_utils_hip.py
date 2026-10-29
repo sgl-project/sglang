@@ -85,7 +85,7 @@ class DeferredSeqLensPull:
             assert future_map._publish_fresh, "resolve without a fresh forward publish"
             future_map._publish_fresh = False
         batch.seq_lens = future_map.new_seq_lens_buf[fi]
-        # unknown until apply: the previous step's would pass for this one's
+        # Unknown until apply: the previous step's would pass for this one's.
         batch.seq_lens_cpu = batch.seq_lens_sum = None
         self._rows_cpu = batch.req_pool_indices_cpu
 
@@ -105,7 +105,7 @@ class DeferredSeqLensPull:
             )
 
     def before_publish(self) -> None:
-        # a deferred pull reads the previous publish, which this one overwrites
+        # A deferred pull reads the previous publish, which this one overwrites.
         self._pull()
 
     def on_publish(self, new_seq_lens_buf: torch.Tensor) -> None:

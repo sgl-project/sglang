@@ -59,11 +59,8 @@ class QuarkMxfp8BaseConfig(QuarkConfig):
             ignore=self.exclude_layers,
             fused_mapping=self.packed_modules_mapping,
         ):
-            # An MXFP8-base source lists only its bf16 modules as excludes
-            # (lm_head / embeddings / vision tower / routers).
+            # the source excludes only bf16 modules (lm_head, embeddings, vision tower, routers)
             return UnquantizedLinearMethod()
-        # Serialized MXFP8 (fp8 weight + e8m0 [1, 32] scale) stays as-is;
-        # only the routed experts go through NVFP4 -> MXFP4.
         return Fp8LinearMethod(quant_config=self.excluded_fp8_config)
 
     @classmethod
