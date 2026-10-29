@@ -26,8 +26,8 @@ from sglang.srt.models import spark2_5
 from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.models.spark2_5 import Spark2_5ForCausalLM
 from sglang.srt.models.spark2_5_dspark import (
+    DsparkSparkX25DraftModel,
     Spark2_5DSparkAttention,
-    SparkX25DsparkDraftModel,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -101,7 +101,7 @@ def _model_config(config=None, *, is_draft=True, algorithm="DSPARK"):
 def test_spark_bundled_checkpoint_rewrites_to_dspark_draft(algorithm):
     model_config = _model_config(algorithm=algorithm)
 
-    assert model_config.hf_config.architectures == ["SparkX25DsparkDraftModel"]
+    assert model_config.hf_config.architectures == ["DsparkSparkX25DraftModel"]
     assert is_dspark_draft(model_config.hf_config)
     assert model_config.hf_config.num_hidden_layers == 3
     assert model_config.hf_config.layer_types == [
@@ -160,7 +160,7 @@ def test_spark_draft_builds_all_sliding_layers_with_matching_context_width(
             nested if nested_kind == "dict" else SimpleNamespace(**nested)
         )
     draft_config = _model_config(config).hf_config
-    model = SparkX25DsparkDraftModel(draft_config)
+    model = DsparkSparkX25DraftModel(draft_config)
 
     assert model.num_context_features == 3
     assert model.fc.weight.shape == (8, 24)
@@ -198,7 +198,7 @@ def test_spark_mlp_matches_exact_gelu_formula(single_rank_native):
 
 
 def _projection_model(num_context_features=2):
-    model = object.__new__(SparkX25DsparkDraftModel)
+    model = object.__new__(DsparkSparkX25DraftModel)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(target_hidden_size=4, hidden_size=4)
     model.num_context_features = num_context_features
@@ -256,7 +256,7 @@ def test_spark_capture_configuration_requires_single_pipeline_stage():
 
 
 def test_spark_capture_preserves_boundary_residuals(single_rank_native, monkeypatch):
-    draft = SparkX25DsparkDraftModel(_model_config().hf_config)
+    draft = DsparkSparkX25DraftModel(_model_config().hf_config)
     target = spark2_5.Spark2_5Model.__new__(spark2_5.Spark2_5Model)
     nn.Module.__init__(target)
     target.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
@@ -402,7 +402,7 @@ def test_spark_swa_write_location_preserves_physical_page_offset():
             translate_loc_from_full_to_swa=translate,
         ),
     )
-    result = SparkX25DsparkDraftModel._swa_write_loc(pool, torch.tensor([4, 7, 9]))
+    result = DsparkSparkX25DraftModel._swa_write_loc(pool, torch.tensor([4, 7, 9]))
     torch.testing.assert_close(translate.call_args.args[0], torch.tensor([12, 15, 5]))
     torch.testing.assert_close(result, torch.tensor([52, 55, 45]))
 
@@ -422,7 +422,7 @@ def test_spark_prefix_writer_uses_sliding_pool_locations_and_layer_id():
     key = torch.arange(16, dtype=torch.float32).reshape(4, 1, 4)
     value = key + 1
 
-    assert SparkX25DsparkDraftModel._set_swa_kv_buffer_prefix_valid(
+    assert DsparkSparkX25DraftModel._set_swa_kv_buffer_prefix_valid(
         pool=pool,
         attn=attention,
         full_loc_2d=full_loc,

@@ -134,7 +134,7 @@ class Spark2_5DSparkDecoderLayer(nn.Module):
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
-class SparkX25DsparkDraftModel(DSparkDraftModel):
+class DsparkSparkX25DraftModel(DSparkDraftModel):
     """DSpark draft model whose transformer layers follow Spark2.5."""
 
     decoder_layer_cls = Spark2_5DSparkDecoderLayer
@@ -411,4 +411,4 @@ class SparkX25DsparkDraftModel(DSparkDraftModel):
         torch.cuda.empty_cache()
 
 
-EntryClass = [SparkX25DsparkDraftModel]
+EntryClass = [DsparkSparkX25DraftModel]
