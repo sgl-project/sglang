@@ -464,6 +464,7 @@ class _TokenEndsPolicy(_WindowPolicy):
         *,
         full_evictable_tokens: int = 0,
         swa_evictable_tokens: int = 0,
+        auxiliary_swa_evictable_tokens: int = 0,
         empty_pool: bool = False,
         prefer_swa: bool = False,
     ) -> Optional[Tuple[int, int]]:
@@ -487,6 +488,8 @@ class _TokenEndsPolicy(_WindowPolicy):
         *,
         full_evictable_tokens: int = 0,
         swa_evictable_tokens: int = 0,
+        auxiliary_swa_evictable_tokens: int = 0,
+        state_evictable_slots: int = 0,
         empty_pool: bool = False,
         require_token_slack: bool = False,
     ) -> bool:
@@ -675,6 +678,8 @@ class _FloatChainPolicy(_WindowPolicy):
         *,
         full_evictable_tokens: int = 0,
         swa_evictable_tokens: int = 0,
+        auxiliary_swa_evictable_tokens: int = 0,
+        state_evictable_slots: int = 0,
         empty_pool: bool = False,
         require_token_slack: bool = False,
     ) -> bool:
@@ -976,8 +981,8 @@ class _FloatChainPolicy(_WindowPolicy):
 class _MultiWindowPolicy(_WindowPolicy):
     """Conservative admission for independently retained window bands.
 
-    Queries credit only the physical takes that can succeed now. Relief and
-    eviction happen before reservation, never while part of a take is live.
+    Admission can credit evictable pages while reservation checks only current
+    geometry. Relief and eviction finish before any physical take is published.
     Inherited per-side budgets are distinct from equal-demand joint availability.
     """
 
@@ -1176,11 +1181,34 @@ class _MultiWindowPolicy(_WindowPolicy):
         full_budget_tokens,
         swa_budget_tokens=None,
     ):
-        return (
-            full_tokens <= full_budget_tokens
-            and (swa_budget_tokens is None or swa_tokens <= swa_budget_tokens)
-            and self.can_reserve(c, full_tokens, swa_tokens)
+        if full_tokens > full_budget_tokens or (
+            swa_budget_tokens is not None and swa_tokens > swa_budget_tokens
+        ):
+            return False
+        full_evictable = tree_cache.full_evictable_size()
+        swa_evictable = tree_cache.swa_evictable_size()
+        # Budgets already subtract pending requests and decode headroom. Price
+        # those reservations together with this request in the shared envelope.
+        full_tokens += max(
+            0, c.full_available_size() + full_evictable - full_budget_tokens
         )
+        if swa_budget_tokens is not None:
+            swa_tokens += max(
+                0, c.conserve_swa_available_size() + swa_evictable - swa_budget_tokens
+            )
+        return c.can_reserve(
+            full_tokens,
+            swa_tokens,
+            full_evictable_tokens=full_evictable,
+            swa_evictable_tokens=swa_evictable,
+            auxiliary_swa_evictable_tokens=tree_cache.auxiliary_swa_evictable_size(),
+            state_evictable_slots=(
+                tree_cache.mamba_evictable_size() if c.roles.state is not None else 0
+            ),
+        )
+
+    def prealloc_fits_assumes_reclaim(self, c):
+        return True
 
     def reclaim_plan(self, c, full_tokens, swa_tokens, **kwargs):
         # A two-token quota cannot describe independent state/window donors.
