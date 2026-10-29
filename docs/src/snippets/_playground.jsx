@@ -564,6 +564,7 @@ export const Playground = ({ config }) => {
           cpOn: cpEnabledIn(flags),
           cpStrategy: bakedCpStrategy(flags) || "interleave",
           effTp: h.parseIntFlagAny(flags, h.TP_HEADS),
+          hicacheOn: h.hasFlag(flags, "--enable-hierarchical-cache"),
         });
         // The runtime derives the prefill-CP size as attn_cp_size = tp/dp
         // (a mismatched --attn-cp-size is overridden), so with DP-Attention

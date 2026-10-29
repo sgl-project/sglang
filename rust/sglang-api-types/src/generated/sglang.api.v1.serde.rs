@@ -115,25 +115,30 @@ impl<'de> ::serde::Deserialize<'de> for StringListOrList {
                         value: Some(string_list_or_list::Value::One(StringList::default())),
                     });
                 };
-                let is_number = first.is_string();
+                if first.is_string() {
+                    let first =
+                        <::prost::alloc::string::String as ::serde::Deserialize>::deserialize(
+                            first,
+                        )
+                        .map_err(::serde::de::Error::custom)?;
+                    let mut items = vec![first];
+                    while let Some(v) = seq.next_element::<::prost::alloc::string::String>()? {
+                        items.push(v);
+                    }
+                    return Ok(StringListOrList {
+                        value: Some(string_list_or_list::Value::One(StringList { items })),
+                    });
+                }
                 let mut rest = vec![first];
                 while let Some(v) = seq.next_element::<::serde_json::Value>()? {
                     rest.push(v);
                 }
-                let reparse = ::serde_json::Value::Array(rest);
-                if is_number {
-                    let one: StringList =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(StringListOrList {
-                        value: Some(string_list_or_list::Value::One(one)),
-                    })
-                } else {
-                    let many: StringListList =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(StringListOrList {
-                        value: Some(string_list_or_list::Value::Many(many)),
-                    })
-                }
+                let many: StringListList =
+                    ::serde_json::from_value(::serde_json::Value::Array(rest))
+                        .map_err(::serde::de::Error::custom)?;
+                Ok(StringListOrList {
+                    value: Some(string_list_or_list::Value::Many(many)),
+                })
             }
         }
         deserializer.deserialize_any(V)
@@ -311,25 +316,26 @@ impl<'de> ::serde::Deserialize<'de> for TokenIdsOrList {
                         value: Some(token_ids_or_list::Value::One(TokenIds::default())),
                     });
                 };
-                let is_number = first.is_number();
+                if first.is_number() {
+                    let first = <i64 as ::serde::Deserialize>::deserialize(first)
+                        .map_err(::serde::de::Error::custom)?;
+                    let mut ids = vec![first];
+                    while let Some(v) = seq.next_element::<i64>()? {
+                        ids.push(v);
+                    }
+                    return Ok(TokenIdsOrList {
+                        value: Some(token_ids_or_list::Value::One(TokenIds { ids })),
+                    });
+                }
                 let mut rest = vec![first];
                 while let Some(v) = seq.next_element::<::serde_json::Value>()? {
                     rest.push(v);
                 }
-                let reparse = ::serde_json::Value::Array(rest);
-                if is_number {
-                    let one: TokenIds =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(TokenIdsOrList {
-                        value: Some(token_ids_or_list::Value::One(one)),
-                    })
-                } else {
-                    let many: TokenIdsList =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(TokenIdsOrList {
-                        value: Some(token_ids_or_list::Value::Many(many)),
-                    })
-                }
+                let many: TokenIdsList = ::serde_json::from_value(::serde_json::Value::Array(rest))
+                    .map_err(::serde::de::Error::custom)?;
+                Ok(TokenIdsOrList {
+                    value: Some(token_ids_or_list::Value::Many(many)),
+                })
             }
         }
         deserializer.deserialize_any(V)
