@@ -8,9 +8,10 @@ import time
 import uuid
 from contextlib import AsyncExitStack
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import zmq
@@ -28,13 +29,15 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.stores import AsyncDictSto
 from sglang.multimodal_gen.runtime.managers import request_cancel
 from sglang.multimodal_gen.runtime.managers import scheduler as scheduler_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.managers.progress_reporter import ReportingTqdm
 from sglang.multimodal_gen.runtime.managers.request_cancel import (
     CancelListener,
     RequestCancelledError,
     raise_if_cancelled,
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.pipelines_core.executors import (
+    parallel_executor,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.executors import (
     pipeline_executor as pipeline_executor_module,
 )
@@ -46,6 +49,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import base as stage_ba
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -186,7 +190,6 @@ def test_raise_if_cancelled_is_disabled_without_endpoint(cancel_state, monkeypat
     cancel_state("job")
     monkeypatch.setattr(request_cancel, "_enabled", False)
     raise_if_cancelled([_req()])
-    assert request_cancel.step_cancel_check(_req()) is None
 
 
 def _agree_on_cancel(rank, init_file, driver_cancelled, result_dir):
@@ -226,46 +229,37 @@ def test_replica_ranks_follow_the_driver(tmp_path, driver_cancelled):
     assert results == [driver_cancelled, driver_cancelled]
 
 
-def test_step_check_runs_after_each_step():
-    calls = []
-    with ReportingTqdm(
-        total=3,
-        disable=True,
-        reporter=None,
-        request_ids=[],
-        on_step=lambda: calls.append("update"),
-    ) as bar:
-        for _ in range(3):
-            bar.update()
-    # mininterval=0 makes tqdm call update() from its own __iter__ every step
-    for _ in ReportingTqdm(
-        range(3),
-        mininterval=0,
-        reporter=None,
-        request_ids=[],
-        on_step=lambda: calls.append("iter"),
-    ):
-        pass
-    assert calls == ["update"] * 3 + ["iter"] * 3
+@pytest.mark.parametrize("progress_interval", [1, 3])
+def test_denoising_cancellation_does_not_wait_for_progress(
+    cancel_state, progress_interval
+):
+    stage = DenoisingStage.__new__(DenoisingStage)
+    stage._before_denoising_loop = Mock()
+    stage._apply_nvtx_gate = lambda _: False
+    stage._prepare_step_state = lambda ctx, batch, args, index, *rest: index
+    stage._record_trajectory = Mock()
+    stage.step_profile = Mock()
+    steps = []
 
+    def run_step(ctx, index, batch, args):
+        steps.append(index)
+        if index == 1:
+            cancel_state("job")
 
-def test_step_check_stops_the_loop(cancel_state):
-    batch = _req()
-    steps = 0
+    stage._run_denoising_step = run_step
+    ctx = SimpleNamespace(
+        timesteps=torch.arange(5),
+        extra={"progress_step_interval": progress_interval},
+        scheduler=SimpleNamespace(order=progress_interval),
+        num_inference_steps=5,
+        num_warmup_steps=0,
+        is_warmup=False,
+        target_dtype=torch.float32,
+        autocast_enabled=False,
+    )
     with pytest.raises(RequestCancelledError):
-        with ReportingTqdm(
-            total=10,
-            disable=True,
-            reporter=None,
-            request_ids=[],
-            on_step=request_cancel.step_cancel_check(batch),
-        ) as bar:
-            for step in range(10):
-                steps += 1
-                if step == 2:
-                    cancel_state("job")
-                bar.update()
-    assert steps == 3
+        stage._run_denoising_loop(ctx, _req(), SimpleNamespace(disable_autocast=True))
+    assert steps == [0, 1]
 
 
 class _Stage(stage_base.PipelineStage):
@@ -292,16 +286,120 @@ class _Stage(stage_base.PipelineStage):
         (_req(is_warmup=True), StageParallelismType.REPLICATED, False),
     ],
 )
-def test_progress_bar_checks_only_replicated_stages(
+def test_explicit_step_check_only_in_replicated_stages(
     cancel_state, monkeypatch, batch, parallelism, checked
 ):
     monkeypatch.setattr(stage_base, "get_progress_reporter", lambda: None)
-    bar = _Stage(parallelism).progress_bar(total=3, batch=batch, disable=True)
-    if checked:
-        assert type(bar) is ReportingTqdm and bar._on_step is not None
-        assert bar._reporter is None
-    else:
+    stage = _Stage(parallelism)
+    cancel_state("job")
+    # displaying or updating a progress bar never participates in collectives
+    with stage.progress_bar(total=3, batch=batch, disable=True) as bar:
         assert type(bar) is tqdm
+        bar.update(3)
+    if checked:
+        with pytest.raises(RequestCancelledError):
+            stage.check_cancelled(batch)
+    else:
+        stage.check_cancelled(batch)
+
+
+def _checkpoint_executor(executor_type):
+    args = SimpleNamespace(
+        disable_conditioning_cache=True,
+        use_fsdp_inference=False,
+        enable_layerwise_nvtx_marker=False,
+        enable_cfg_parallel=False,
+    )
+    executor = executor_type(args)
+    executor.component_residency_manager = Mock()
+    return executor, args
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_executor_cancellation_skips_later_stages_and_unwinds(
+    cancel_state, terminal, grouped
+):
+    executor, args = _checkpoint_executor(SyncExecutor)
+    requests = [_req()]
+    payload = requests if grouped else requests[0]
+    stages = [_Stage()] if terminal else [_Stage(), _Stage()]
+    executed = []
+
+    def run_stage(stage, batch):
+        executed.append(stage)
+        cancel_state("job")
+        # the terminal stage need not return Req: keep the original cancel identity
+        return OutputBatch() if terminal else batch
+
+    with pytest.raises(RequestCancelledError):
+        executor._run_profile_all_stages(stages, payload, args, run_stage)
+    assert executed == stages[:1]
+    executor.component_residency_manager.end_stage.assert_called_once()
+    executor.component_residency_manager.finish_request.assert_called_once()
+
+
+def _cancel_between_parallel_stages(rank, init_file, paradigm, terminal):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2
+    )
+    try:
+        group = SimpleNamespace(world_size=2, ranks=[0, 1], cpu_group=dist.group.WORLD)
+        listener = _FakeListener([])
+        with (
+            patch.object(request_cancel, "_enabled", True),
+            patch.object(request_cancel, "_listener", listener if rank == 0 else None),
+            patch.object(request_cancel, "model_parallel_is_initialized", lambda: True),
+            patch.object(request_cancel, "get_replica_group", lambda: group),
+            patch.object(parallel_executor, "get_world_rank", lambda: rank),
+            patch.object(parallel_executor, "get_world_group", lambda: group),
+            patch.object(parallel_executor, "get_cfg_group", lambda: group),
+        ):
+            executor, args = _checkpoint_executor(parallel_executor.ParallelExecutor)
+            stages = [_Stage(paradigm)]
+            if not terminal:
+                stages.append(_Stage())
+
+            def run_stage(stage, batch):
+                assert stage is stages[0], "cancelled request entered the next stage"
+                if rank == 0:
+                    listener.cancelled_ids.add("job")
+                return OutputBatch() if terminal else batch
+
+            with pytest.raises(RequestCancelledError):
+                executor._execute_stages(stages, _req(), args, run_stage)
+            executor.component_residency_manager.finish_request.assert_called_once()
+            # a subsequent collective still succeeds: no rank escaped out of order
+            dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize(
+    "paradigm",
+    [
+        StageParallelismType.MAIN_RANK_ONLY,
+        StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS,
+        StageParallelismType.REPLICATED,
+    ],
+)
+def test_parallel_executor_agrees_at_stage_boundaries(tmp_path, paradigm, terminal):
+    context = mp.spawn(
+        _cancel_between_parallel_stages,
+        args=(str(tmp_path / "init"), paradigm, terminal),
+        nprocs=2,
+        join=False,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not context.join(timeout=1):
+            assert time.monotonic() < deadline, "stage cancellation deadlocked"
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=10)
 
 
 def _bare_worker(monkeypatch):
@@ -335,6 +433,34 @@ def test_worker_skips_forward_of_cancelled_request(monkeypatch):
     forward.assert_not_called()
     assert isinstance(result, OutputBatch)
     assert result.cancelled and "cancelled" in result.error
+
+
+@pytest.mark.parametrize("defer_finalize", [False, True])
+def test_worker_cancels_before_output_finalization(
+    monkeypatch, cancel_state, defer_finalize
+):
+    worker = _bare_worker(monkeypatch)
+    worker.server_args = SimpleNamespace()
+    req = _req()
+    req.log = lambda **kwargs: None
+    saved = []
+
+    def forward():
+        cancel_state("job")
+        return OutputBatch(output=torch.ones(1))
+
+    result = worker._execute_forward_common(
+        req,
+        forward_fn=forward,
+        log_reqs=[req],
+        return_req=False,
+        save_output_paths=lambda output: saved.append(output),
+        error_context="request job",
+        defer_finalize=defer_finalize,
+    )
+    assert result.cancelled
+    assert saved == []
+    assert worker._deferred_finalize is None
 
 
 def test_stage_profiler_does_not_log_a_cancel_as_an_error():

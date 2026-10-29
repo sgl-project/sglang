@@ -831,6 +831,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             ):
 
                 def on_step(_step, _video_rows, _audio_rows):
+                    self.check_cancelled(batch)
                     progress_bar.update()
                     if not batch.is_warmup:
                         self.step_profile()

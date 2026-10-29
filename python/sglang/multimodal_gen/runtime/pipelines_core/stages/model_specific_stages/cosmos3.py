@@ -1971,6 +1971,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                     velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
                 )
 
+            self.check_cancelled(batch)
             if batch.profile and not batch.is_warmup:
                 self.step_profile()
 

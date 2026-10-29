@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stops cancelled requests before their forward and at each denoising step.
+"""Stops cancelled requests at request, stage, and sampling-step boundaries.
 
 The HTTP server publishes the id of each cancelled request. A replica driver
 cannot read its request socket while a forward runs, so it subscribes to these
@@ -11,7 +11,6 @@ step and no rank waits in a collective that the others left.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -138,10 +137,3 @@ def raise_if_cancelled(reqs: list[Req]) -> None:
             cancelled = bool(decision.item())
     if cancelled:
         raise RequestCancelledError(request_ids)
-
-
-def step_cancel_check(batch: Req | None) -> Callable[[], None] | None:
-    """Return the check to run after each denoising step of batch, or None."""
-    if not _enabled or batch is None or not _is_checked(batch):
-        return None
-    return lambda: raise_if_cancelled([batch])

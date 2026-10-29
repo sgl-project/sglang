@@ -1411,6 +1411,7 @@ class HunyuanImage3AR(PipelineStage):
             latents = scheduler.step(pred, t, latents, return_dict=False)[0].to(
                 dtype=latent_dtype
             )
+            self.check_cancelled(reqs)
 
         # [B, C, H, W] -> [B, C, 1, H, W]
         latents = latents.to(torch.bfloat16)
