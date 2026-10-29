@@ -69,11 +69,14 @@ class CPAttentionBackendKind(IntEnum):
     DSA = 1
     TRTLLM_MHA = 2
     DSV4 = 3
+    FLASHINFER = 4
 
     @classmethod
     def from_string(cls, value: str) -> CPAttentionBackendKind:
-        if value in ("fa3", "fa4", "flashinfer"):
+        if value in ("fa3", "fa4"):
             return cls.FLASH_ATTENTION
+        if value == "flashinfer":
+            return cls.FLASHINFER
         if value == "dsa":
             return cls.DSA
         if value == "trtllm_mha":
@@ -209,7 +212,7 @@ class ContextParallelStrategy(ABC):
         q: Any,
         forward_batch: ForwardBatch,
         device: Any,
-        attn_fn: Callable[[Any, Any, Any, int], Any],
+        attn_fn: Callable[..., Any],
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
     ) -> Any:
         """Dispatch CP attention using the selected backend convention."""
