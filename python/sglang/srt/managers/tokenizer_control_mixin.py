@@ -86,6 +86,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
     get_lora,
@@ -405,6 +406,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         req = req or ProfileReq()
         req.req_type = ProfileReqType.START_PROFILE
+        current_platform.apply_profile_request_defaults(req)
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
         req.with_stack = (
             False if req.with_stack is False or env_with_stack is False else True

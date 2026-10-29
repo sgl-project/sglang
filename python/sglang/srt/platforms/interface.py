@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     import torch
 
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.managers.io_struct import ProfileReq
 
 # Re-export for convenience
 __all__ = [
@@ -97,6 +98,16 @@ class SRTPlatform(DeviceMixin):
         """Apply platform-specific default values to server arguments.
 
         Called after ServerArgs is parsed.
+        """
+        pass
+
+    def apply_profile_request_defaults(self, req: ProfileReq) -> None:
+        """Fill platform defaults for fields a profile request leaves unset.
+
+        Called in the tokenizer process at the start of ``start_profile``,
+        before core fills unset ``with_stack`` and ``record_shapes`` from
+        ``SGLANG_PROFILE_WITH_STACK`` and ``SGLANG_PROFILE_RECORD_SHAPES``.
+        Mutate ``req`` in place and leave explicitly set fields unchanged.
         """
         pass
 
