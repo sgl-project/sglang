@@ -96,7 +96,11 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
             draft_model=draft_model,
             draft_model_runner=SimpleNamespace(
                 token_to_kv_pool=pool,
-                runner_ids=SimpleNamespace(),
+                runner_ids=SimpleNamespace(
+                    swa_write_ids=mock.Mock(
+                        side_effect=AssertionError("full-only KV needs no SWA ids")
+                    )
+                ),
             ),
             model_runner=SimpleNamespace(device=torch.device("cpu")),
             device=torch.device("cpu"),

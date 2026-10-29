@@ -220,6 +220,23 @@ class RunnerIds:
         spaces = self._spaces if self._call_spaces is None else self._call_spaces
         return spaces[kind].ids(virtual_ids)
 
+    def swa_write_ids(self, full_loc: torch.Tensor) -> Optional[torch.Tensor]:
+        """Map owner write ids to sliding-window ids when that route exists.
+
+        A fused draft may have its sliding-window layers folded into the full
+        host when the target has no sliding-window storage.  In that layout
+        the owner ids are already the locations the draft writes, so there is
+        no secondary location to attach to ``KVWriteLoc``.
+        """
+        space = self.space(IdSpaceKind.SLIDING_WINDOW)
+        if space is None:
+            return None
+        if self.is_translating:
+            return self._token_to_kv_pool_allocator.translate_full_physical_to_swa(
+                full_loc
+            )
+        return space.ids(full_loc)
+
     @functools.cached_property
     def _state_spaces(self) -> Dict[str, IdSpace]:
         # State slots live in the request table every runner of the scheduler

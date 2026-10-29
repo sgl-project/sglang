@@ -3,30 +3,24 @@
 from __future__ import annotations
 
 from copy import copy
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.layers.layer_boundary import (
-    append_stages,
-    declare_attn,
-    declare_ffn,
-    layer_stack,
-)
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.kv.memory.views import MHAKVView
+from sglang.srt.mem_cache.memory_pool import KVCache, KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.dspark import DSparkDraftModel, VanillaMarkov
 from sglang.srt.models.spark2_5 import (
     Spark2_5Attention,
-    Spark2_5MLP,
-    _get_attention_sliding_window_size,
+    Spark2_5DecoderLayer,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
@@ -53,9 +47,7 @@ class Spark2_5DSparkAttention(Spark2_5Attention):
         return k
 
 
-class Spark2_5DSparkDecoderLayer(nn.Module):
-    """Spark2.5 decoder layer with the constructor expected by DSpark."""
-
+class Spark2_5DSparkDecoderLayer(Spark2_5DecoderLayer):
     attention_cls = Spark2_5DSparkAttention
     attention_conv = mlp_conv = None
 
@@ -69,83 +61,29 @@ class Spark2_5DSparkDecoderLayer(nn.Module):
         quant_config=None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
         if attention_conv is not None or mlp_conv is not None:
             raise ValueError("Spark2.5 DSpark does not support draft convolutions")
-
-        layer_type = config.layer_types[layer_id]
-        rope_params = config.rope_parameters[layer_type]
-        attention_prefix = f"{prefix}.self_attn" if prefix else "self_attn"
-        attention_cls = attention_cls or self.attention_cls
-        self.self_attn = attention_cls(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=getattr(config, "head_dim", None),
-            layer_id=layer_id,
-            rope_theta=rope_params["rope_theta"],
-            partial_rotary_factor=rope_params.get("partial_rotary_factor", 1.0),
-            max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
-            quant_config=quant_config,
-            sliding_window=_get_attention_sliding_window_size(config),
-            layer_type=layer_type,
-            headwise_attn_output_gate=getattr(
-                config, "headwise_attn_output_gate", True
-            ),
-            prefix=attention_prefix,
-        )
-        mlp_prefix = f"{prefix}.mlp" if prefix else "mlp"
-        self.mlp = Spark2_5MLP(
-            config.hidden_size,
-            config.intermediate_size,
-            quant_config=quant_config,
-            prefix=mlp_prefix,
-            reduce_results=False,
-        )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        if attention_cls is not None:
+            self.attention_cls = attention_cls
+        super().__init__(
+            config=config, layer_id=layer_id, quant_config=quant_config, prefix=prefix
         )
 
-        self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(sparse=False, next_layer_sparse=False),
-                self.post_attention_layernorm,
-            ),
-        )
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
-        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self.mlp(hidden_states)
-        return self.ffn_boundary.finish(hidden_states, forward_batch)
-
-
-class DsparkSparkX25DraftModel(DSparkDraftModel):
+class DSparkSpark25DraftModel(DSparkDraftModel):
     """DSpark draft model whose transformer layers follow Spark2.5."""
 
     decoder_layer_cls = Spark2_5DSparkDecoderLayer
     supports_fused_context_kv = False
+    attention_output_projection = "out_proj"
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
+        config = copy(config)
+        config.markov_rank = dspark_config.markov_rank
         if dspark_config.target_layer_ids is not None:
             # The parent builds fc from the DFlash config, while target capture
             # honors DSpark's prefixed IDs. Give both the same feature count.
-            config = copy(config)
             raw_dflash_config = getattr(config, "dflash_config", None)
             if raw_dflash_config is None:
                 dflash_config = {}
@@ -175,7 +113,7 @@ class DsparkSparkX25DraftModel(DSparkDraftModel):
         # Markov head (markov_w1 embedding + markov_w2 projection).
         self.markov_head = VanillaMarkov(
             vocab_size=int(getattr(config, "draft_vocab_size", config.vocab_size)),
-            markov_rank=int(config.markov_rank),
+            markov_rank=dspark_config.markov_rank,
         )
         self.fc_norm = nn.ModuleList(
             [
@@ -241,31 +179,9 @@ class DsparkSparkX25DraftModel(DSparkDraftModel):
         super().load_weights(draft_weights())
 
     @staticmethod
-    def _swa_write_loc(pool, full_loc: torch.Tensor) -> Optional[torch.Tensor]:
-        """Resolve the SWA physical ids paired with a full physical write.
-
-        Private SWA pools receive virtual ids and translate them directly. A
-        fused draft pool receives full physical ids from ``KVLocPlan``; recover
-        the virtual page before asking its shared allocator for the SWA page.
-        """
-        if getattr(pool, "requires_physical_write_loc", False):
-            host_allocator = getattr(pool, "host_allocator", None)
-            full_allocator = getattr(host_allocator, "full_attn_allocator", None)
-            if full_allocator is not None:
-                page_size = int(full_allocator.pool_page_size)
-                full_page = full_loc // page_size
-                page_offset = full_loc.remainder(page_size)
-                virtual_page = full_allocator.physical_to_virtual[full_page]
-                virtual_loc = virtual_page * page_size + page_offset
-                return host_allocator.translate_loc_from_full_to_swa(virtual_loc)
-        if hasattr(pool, "translate_loc_from_full_to_swa"):
-            return pool.translate_loc_from_full_to_swa(full_loc)
-        return None
-
-    @staticmethod
     def _set_swa_kv_buffer_prefix_valid(
         *,
-        pool,
+        pool: KVCache,
         attn,
         full_loc_2d: torch.Tensor,
         swa_loc_2d: Optional[torch.Tensor],
@@ -273,32 +189,25 @@ class DsparkSparkX25DraftModel(DSparkDraftModel):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> bool:
-        """Use the underlying MHA pool's GPU prefix-valid writer for SWA."""
-        layer_id = attn.attn.layer_id
-        loc_2d = full_loc_2d
-        if isinstance(pool, SWAKVPool):
-            layer_id, is_swa_layer = pool.layers_mapping[layer_id]
-            if is_swa_layer:
-                if swa_loc_2d is None:
-                    return False
-                loc_2d = swa_loc_2d
-                pool = pool.swa_kv_pool
-            else:
-                pool = pool.full_kv_pool
+        """Write committed prefixes through the layer's routed MHA view."""
+        kv_layer = pool.layer_router.layer(attn.attn.layer_id)
+        view = kv_layer.view
+        if not isinstance(view, MHAKVView):
+            return False
+        if not kv_layer.owner and swa_loc_2d is None:
+            return False
+        loc_2d = full_loc_2d if kv_layer.owner else swa_loc_2d
         # The tiled writer assumes dense token rows and ordinary/FP8 KV.
         # Other layouts and quantization formats keep their native writer.
         if (
-            getattr(pool, "use_hnd", False)
-            or getattr(pool, "is_quantized_kv_cache", False)
-            or getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
-            or (getattr(pool, "requires_physical_write_loc", False) and not k.is_cuda)
+            view.use_hnd
+            or view.is_quantized_kv_cache
+            or view.kv_cache_layout == "vectorized_5d"
+            or (view.requires_physical_write_loc and not k.is_cuda)
         ):
             return False
-        writer = getattr(pool, "set_kv_buffer_prefix_valid", None)
-        if writer is None:
-            return False
         try:
-            writer(
+            view.set_kv_buffer_prefix_valid(
                 attn.attn,
                 loc_2d,
                 commit_lens,
@@ -306,7 +215,7 @@ class DsparkSparkX25DraftModel(DSparkDraftModel):
                 v,
                 attn.attn.k_scale,
                 attn.attn.v_scale,
-                layer_id_override=layer_id,
+                layer_id_override=kv_layer.view_layer_id,
             )
         except NotImplementedError:
             return False
@@ -319,16 +228,14 @@ class DsparkSparkX25DraftModel(DSparkDraftModel):
         pool,
         positions: torch.Tensor,
         cache_loc: torch.Tensor,
+        swa_write_ids: Optional[
+            Callable[[torch.Tensor], Optional[torch.Tensor]]
+        ] = None,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
     ) -> None:
-        """Materialize Spark2.5 draft KV with hybrid-SWA locations.
-
-        Spark2.5 draft layers are sliding-attention layers. Keep this
-        location handling local to the Spark adapter so generic DSpark models
-        retain their existing single-pool write path.
-        """
+        """Write context KV at the draft runner's routed physical locations."""
         ctx_hidden = (
             target_hidden
             if target_hidden_is_projected
@@ -350,11 +257,11 @@ class DsparkSparkX25DraftModel(DSparkDraftModel):
                 cache_loc_2d.shape[1], device=cache_loc_2d.device
             ).view(1, -1) < commit_lens.to(device=cache_loc_2d.device).view(-1, 1)
             # Uncommitted entries may contain padding or stale locations. Map
-            # them to the reserved slot before indexing the SWA page tables.
+            # them to the reserved slot before resolving sub-pool locations.
             full_loc = torch.where(row_mask, cache_loc_2d, 0).reshape(-1)
         else:
             full_loc = cache_loc
-        swa_loc = self._swa_write_loc(pool, full_loc)
+        swa_loc = None if swa_write_ids is None else swa_write_ids(full_loc)
         write_loc = KVWriteLoc(full_loc, swa_loc=swa_loc, physical=True)
         fallback_write_loc = None
         for layer in self.layers:
@@ -370,7 +277,7 @@ class DsparkSparkX25DraftModel(DSparkDraftModel):
                     attn=attn,
                     full_loc_2d=full_loc.view_as(cache_loc_2d),
                     swa_loc_2d=(
-                        swa_loc.view_as(cache_loc_2d) if swa_loc is not None else None
+                        None if swa_loc is None else swa_loc.view_as(cache_loc_2d)
                     ),
                     commit_lens=commit_lens,
                     k=k,
@@ -382,9 +289,9 @@ class DsparkSparkX25DraftModel(DSparkDraftModel):
                     fallback_write_loc = KVWriteLoc(
                         full_loc.index_select(0, valid_indices),
                         swa_loc=(
-                            swa_loc.index_select(0, valid_indices)
-                            if swa_loc is not None
-                            else None
+                            None
+                            if swa_loc is None
+                            else swa_loc.index_select(0, valid_indices)
                         ),
                         physical=True,
                     )
@@ -402,13 +309,5 @@ class DsparkSparkX25DraftModel(DSparkDraftModel):
                 attn.attn.v_scale,
             )
 
-    def prune_to_ctx_kv_injection(self) -> None:
-        self.markov_head = None
-        self.confidence_head = None
-        for layer in self.layers:
-            layer.mlp = None
-            layer.self_attn.out_proj = None
-        torch.cuda.empty_cache()
 
-
-EntryClass = [DsparkSparkX25DraftModel]
+EntryClass = [DSparkSpark25DraftModel]

@@ -458,6 +458,20 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         cuda-graph buffer stability."""
         return self.full_attn_allocator.ids.translate(loc, out=out)
 
+    def translate_full_physical_to_swa(self, loc: torch.Tensor) -> torch.Tensor:
+        """Map owner physical token ids to sliding-window physical token ids."""
+        if self.swa_attn_allocator is None:
+            raise ValueError("The allocator has no sliding-window band")
+        owner_ids = self.full_attn_allocator.ids
+        if owner_ids.shards_under_dcp and get_parallel().attn_dcp_size > 1:
+            raise NotImplementedError(
+                "Physical owner-to-SWA translation does not support DCP-sharded KV"
+            )
+        page_size = owner_ids.unit_tokens
+        virtual_page = owner_ids.physical_to_virtual[loc // page_size]
+        virtual_loc = virtual_page * page_size + loc.remainder(page_size)
+        return self.swa_attn_allocator.ids.translate(virtual_loc)
+
     @property
     def full_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the owner; kernels that build a

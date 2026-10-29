@@ -219,6 +219,8 @@ class Spark2_5DecoderLayer(nn.Module):
     output of the same size.
     """
 
+    attention_cls = Spark2_5Attention
+
     def __init__(
         self,
         config: Spark2_5Config,
@@ -237,7 +239,7 @@ class Spark2_5DecoderLayer(nn.Module):
         if partial_rotary_factor is None:
             partial_rotary_factor = 1.0
 
-        self.self_attn = Spark2_5Attention(
+        self.self_attn = self.attention_cls(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -575,8 +577,6 @@ class Spark2_5ForCausalLM(nn.Module):
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
         if self.pp_group.world_size > 1:
             raise NotImplementedError("Spark2.5 DSpark requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."

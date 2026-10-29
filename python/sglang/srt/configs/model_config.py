@@ -265,7 +265,7 @@ def is_dspark_draft(config) -> bool:
     return _hf_arch(config) in (
         "DSparkDraftModel",
         "DSparkMiniMaxDraftModel",
-        "DsparkSparkX25DraftModel",
+        "DSparkSpark25DraftModel",
     )
 
 
@@ -1139,17 +1139,16 @@ class ModelConfig:
             if checkpoint_bundles_dspark_draft(self.hf_config) and (
                 self.speculative_algorithm in (None, "DSPARK")
             ):
-                draft_num_layers = getattr(self.hf_config, "num_draft_layers", None)
-                draft_num_layers = int(draft_num_layers)
+                draft_num_layers = int(self.hf_config.num_draft_layers)
 
                 self.hf_config.num_hidden_layers = draft_num_layers
                 self.hf_config.layer_types = ["sliding_attention"] * draft_num_layers
                 self.hf_config.hybrid_layer_pattern = [1] * draft_num_layers
                 self.hf_config.is_hybrid_swa = True
-                self.hf_config.architectures[0] = "DsparkSparkX25DraftModel"
+                self.hf_config.architectures[0] = "DSparkSpark25DraftModel"
                 logger.info(
                     "Draft checkpoint bundles Spark2.5 DSpark weights; loading "
-                    "DsparkSparkX25DraftModel."
+                    "DSparkSpark25DraftModel."
                 )
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",

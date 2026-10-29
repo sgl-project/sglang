@@ -850,6 +850,9 @@ class DSparkDraftMixin:
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        swa_write_ids: Optional[
+            Callable[[torch.Tensor], Optional[torch.Tensor]]
+        ] = None,
     ) -> None:
         ctx_hidden = (
             target_hidden
@@ -980,12 +983,14 @@ class DSparkDraftMixin:
 
 
 class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
+    attention_output_projection = "o_proj"
+
     def prune_to_ctx_kv_injection(self) -> None:
         self.markov_head = None
         self.confidence_head = None
         for layer in self.layers:
             layer.mlp = None
-            layer.self_attn.o_proj = None
+            setattr(layer.self_attn, self.attention_output_projection, None)
         torch.cuda.empty_cache()
 
 

@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mem_cache_utils import routed
+from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     arena_of,
     plan_stand_in,
@@ -164,7 +165,7 @@ def _source(allocator, pool_obj):
     )
 
 
-class TestRunnerIdsDraftDisposition(unittest.TestCase):
+class TestRunnerIdsDraftDisposition(CustomTestCase):
     def setUp(self):
         # `RunnerIds.__init__` reads `attn_dcp_size`, a derived
         # parallel width that only exists once a config is published.
@@ -247,6 +248,56 @@ class TestRunnerIdsDraftDisposition(unittest.TestCase):
         )
         self.assertTrue(torch.equal(draft_write, target_write))
         self.assertTrue(torch.equal(draft_read, target_read))
+
+    def test_context_injection_maps_fused_owner_ids_to_swa(self):
+        swa_region = DenseDraftRegion(
+            lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+        )
+        pool, allocator, _, _ = _build(swa_region=swa_region)
+        draft_pool = routed_draft_pool(
+            arena=pool,
+            plan=plan_stand_in(pool),
+            owner="full",
+            page_size=_PS,
+            lanes_by_host={"swa": {0: 0}},
+        )
+        runner_ids = _source(allocator, draft_pool)
+        virtual = allocator.alloc(2 * _PS)
+        self.assertIsNotNone(virtual)
+        virtual = torch.cat([torch.zeros(1, dtype=virtual.dtype), virtual])
+        full_physical = allocator.translate_kv_loc(virtual)
+        self.assertFalse(torch.equal(full_physical, virtual))
+
+        actual = runner_ids.swa_write_ids(full_physical)
+
+        expected = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(virtual)
+        torch.testing.assert_close(actual, expected)
+        self.assertEqual(actual[0].item(), 0)
+        torch.testing.assert_close(actual[1:] % _PS, virtual[1:] % _PS)
+
+    def test_context_injection_maps_private_pool_ids_to_swa(self):
+        pool = _FakeKVCache(16)
+        mapping = torch.tensor([0, 8, 9, 10, 11])
+        pool.id_spaces = lambda: {
+            IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None)),
+            IdSpaceKind.SLIDING_WINDOW: IdSpace(
+                key=(IdSpaceKind.SLIDING_WINDOW, id(pool)),
+                write=lambda ids: mapping[ids],
+            ),
+        }
+        runner_ids = _source(None, pool)
+
+        actual = runner_ids.swa_write_ids(torch.tensor([0, 2, 4]))
+
+        torch.testing.assert_close(actual, torch.tensor([0, 9, 11]))
+
+    def test_context_injection_uses_owner_ids_without_a_sliding_window_space(self):
+        """A full-only fallback writes target-hidden KV in the owner space."""
+        runner_ids = _source(None, _FakeKVCache(16))
+
+        full_loc = torch.tensor([0, 3, 7])
+        self.assertIsNone(runner_ids.space(IdSpaceKind.SLIDING_WINDOW))
+        self.assertIsNone(runner_ids.swa_write_ids(full_loc))
 
     def test_a_window_depth_reads_the_plan_a_dense_depth_built(self):
         """A multi-layer draft plans each draft extend once, through its first
@@ -342,6 +393,9 @@ class TestRunnerIdsDraftDisposition(unittest.TestCase):
             """A translating runner whose physical id is the virtual + 100."""
 
             is_translating = True
+
+            def swa_write_ids(self, full_loc):
+                raise AssertionError("full-only KV needs no SWA ids")
 
         virtual = torch.tensor([4, 5, 6, 9], dtype=torch.int64)
         physical = virtual + 100

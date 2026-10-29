@@ -1,10 +1,4 @@
-"""CPU unit tests for the Spark2.5 DSpark adapter.
-
-These tests exercise Spark-specific model construction and adapter behavior
-with small configurations and CPU tensors. They do not download a checkpoint
-or require a GPU. Acceptance length and distributed execution require separate
-tests with a real Spark2.5 checkpoint.
-"""
+"""CPU unit tests for the Spark2.5 DSpark adapter."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -23,17 +17,21 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import spark2_5
-from sglang.srt.models.dspark import VanillaMarkov
+from sglang.srt.models.dspark import DSparkDraftModel, VanillaMarkov
 from sglang.srt.models.spark2_5 import Spark2_5ForCausalLM
 from sglang.srt.models.spark2_5_dspark import (
-    DsparkSparkX25DraftModel,
+    DSparkSpark25DraftModel,
     Spark2_5DSparkAttention,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
 )
+from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
+    TargetHiddenKvInjector,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mem_cache_utils import routed
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -101,7 +99,7 @@ def _model_config(config=None, *, is_draft=True, algorithm="DSPARK"):
 def test_spark_bundled_checkpoint_rewrites_to_dspark_draft(algorithm):
     model_config = _model_config(algorithm=algorithm)
 
-    assert model_config.hf_config.architectures == ["DsparkSparkX25DraftModel"]
+    assert model_config.hf_config.architectures == ["DSparkSpark25DraftModel"]
     assert is_dspark_draft(model_config.hf_config)
     assert model_config.hf_config.num_hidden_layers == 3
     assert model_config.hf_config.layer_types == [
@@ -160,7 +158,7 @@ def test_spark_draft_builds_all_sliding_layers_with_matching_context_width(
             nested if nested_kind == "dict" else SimpleNamespace(**nested)
         )
     draft_config = _model_config(config).hf_config
-    model = DsparkSparkX25DraftModel(draft_config)
+    model = DSparkSpark25DraftModel(draft_config)
 
     assert model.num_context_features == 3
     assert model.fc.weight.shape == (8, 24)
@@ -186,6 +184,25 @@ def test_spark_draft_builds_all_sliding_layers_with_matching_context_width(
     assert not model.supports_fused_context_kv
 
 
+@pytest.mark.parametrize("raw_rank", [None, 2], ids=["prefixed-only", "conflicting"])
+def test_spark_markov_head_uses_resolved_dspark_rank(single_rank_native, raw_rank):
+    """A prefixed rank must construct the head even without a matching raw rank."""
+    config = _bundled_spark_config(markov_rank=raw_rank)
+    if raw_rank is None:
+        del config.markov_rank
+    draft_config = _model_config(config).hf_config
+
+    model = DSparkSpark25DraftModel(draft_config)
+
+    assert model.config.markov_rank == 4
+    assert model.markov_head.markov_w1.weight.shape == (32, 4)
+    assert model.markov_head.markov_w2.weight.shape == (32, 4)
+    if raw_rank is None:
+        assert not hasattr(draft_config, "markov_rank")
+    else:
+        assert draft_config.markov_rank == raw_rank
+
+
 def test_spark_mlp_matches_exact_gelu_formula(single_rank_native):
     mlp = spark2_5.Spark2_5MLP(4, 3, reduce_results=False)
     with torch.no_grad():
@@ -198,7 +215,7 @@ def test_spark_mlp_matches_exact_gelu_formula(single_rank_native):
 
 
 def _projection_model(num_context_features=2):
-    model = object.__new__(DsparkSparkX25DraftModel)
+    model = object.__new__(DSparkSpark25DraftModel)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(target_hidden_size=4, hidden_size=4)
     model.num_context_features = num_context_features
@@ -256,7 +273,7 @@ def test_spark_capture_configuration_requires_single_pipeline_stage():
 
 
 def test_spark_capture_preserves_boundary_residuals(single_rank_native, monkeypatch):
-    draft = DsparkSparkX25DraftModel(_model_config().hf_config)
+    draft = DSparkSpark25DraftModel(_model_config().hf_config)
     target = spark2_5.Spark2_5Model.__new__(spark2_5.Spark2_5Model)
     nn.Module.__init__(target)
     target.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
@@ -348,16 +365,24 @@ def test_spark_context_kv_writes_only_committed_rows(preprojected, commit_lens):
         translated.append(loc.clone())
         return loc + 20
 
-    pool = SimpleNamespace(
-        translate_loc_from_full_to_swa=translate, set_kv_buffer=Mock()
+    pool = routed(SimpleNamespace(set_kv_buffer=Mock()))
+    runner_ids = SimpleNamespace(swa_write_ids=translate)
+    injector = TargetHiddenKvInjector(
+        draft_model=model,
+        draft_model_runner=SimpleNamespace(
+            token_to_kv_pool=pool, runner_ids=runner_ids
+        ),
+        model_runner=SimpleNamespace(device=torch.device("cpu")),
+        device=torch.device("cpu"),
+        verify_num_draft_tokens=2,
+        block_pos_offsets=torch.arange(2),
     )
     loc_2d = torch.tensor([[3, 4], [8, 999]])
     if commit_lens is None:
         loc_2d[1, 1] = 9
-    model.write_target_hidden_kv(
+    injector.inject_target_hidden(
         target_hidden=hidden,
         target_hidden_is_projected=preprojected,
-        pool=pool,
         positions=positions,
         cache_loc=loc_2d.flatten(),
         cache_loc_2d=loc_2d if commit_lens is not None else None,
@@ -391,28 +416,20 @@ def test_spark_context_kv_writes_only_committed_rows(preprojected, commit_lens):
     assert (k_scale, v_scale) == (0.5, 0.25)
 
 
-def test_spark_swa_write_location_preserves_physical_page_offset():
-    translate = Mock(side_effect=lambda loc: loc + 40)
-    pool = SimpleNamespace(
-        requires_physical_write_loc=True,
-        host_allocator=SimpleNamespace(
-            full_attn_allocator=SimpleNamespace(
-                pool_page_size=4, physical_to_virtual=torch.tensor([0, 3, 1])
-            ),
-            translate_loc_from_full_to_swa=translate,
-        ),
-    )
-    result = DsparkSparkX25DraftModel._swa_write_loc(pool, torch.tensor([4, 7, 9]))
-    torch.testing.assert_close(translate.call_args.args[0], torch.tensor([12, 15, 5]))
-    torch.testing.assert_close(result, torch.tensor([52, 55, 45]))
-
-
 def test_spark_prefix_writer_uses_sliding_pool_locations_and_layer_id():
-    writer = Mock()
-    pool = SWAKVPool.__new__(SWAKVPool)
-    pool.layers_mapping = {2: (0, True)}
-    pool.swa_kv_pool = SimpleNamespace(set_kv_buffer_prefix_valid=writer)
-    pool.full_kv_pool = SimpleNamespace(set_kv_buffer_prefix_valid=Mock())
+    pool = SWAKVPool(
+        size=32,
+        size_swa=32,
+        page_size=1,
+        dtype=torch.float32,
+        head_num=1,
+        head_dim=4,
+        swa_attention_layer_ids=[0, 2],
+        full_attention_layer_ids=[1],
+        device="cpu",
+        enable_alt_stream=False,
+        kv_cache_layout="nhd",
+    )
     attention = SimpleNamespace(
         attn=SimpleNamespace(layer_id=2, k_scale=0.5, v_scale=0.25)
     )
@@ -422,26 +439,91 @@ def test_spark_prefix_writer_uses_sliding_pool_locations_and_layer_id():
     key = torch.arange(16, dtype=torch.float32).reshape(4, 1, 4)
     value = key + 1
 
-    assert DsparkSparkX25DraftModel._set_swa_kv_buffer_prefix_valid(
+    with (
+        patch("sglang.srt.mem_cache.memory_pool._is_cuda", False),
+        patch("sglang.srt.mem_cache.memory_pool._is_hip", False),
+    ):
+        assert DSparkSpark25DraftModel._set_swa_kv_buffer_prefix_valid(
+            pool=pool,
+            attn=attention,
+            full_loc_2d=full_loc,
+            swa_loc_2d=swa_loc,
+            commit_lens=commit_lens,
+            k=key,
+            v=value,
+        )
+
+    written_k, written_v = pool.get_kv_buffer(2)
+    expected_k = torch.zeros_like(written_k)
+    expected_v = torch.zeros_like(written_v)
+    expected_k[torch.tensor([21, 22, 23])] = key[:3]
+    expected_v[torch.tensor([21, 22, 23])] = value[:3]
+    torch.testing.assert_close(written_k, expected_k)
+    torch.testing.assert_close(written_v, expected_v)
+    for layer_id in (0, 1):
+        for buffer in pool.get_kv_buffer(layer_id):
+            assert torch.count_nonzero(buffer) == 0
+
+
+def test_spark_prefix_writer_falls_back_to_full_owner_locations():
+    """A fused draft folded into FULL must inject committed rows without SWA ids."""
+    model = _projection_model()
+    hidden = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    model.project_target_hidden = Mock(return_value=hidden)
+    positions = torch.arange(4)
+    attention = SimpleNamespace(
+        num_kv_heads=1,
+        head_dim=4,
+        attn=SimpleNamespace(layer_id=0, k_scale=0.5, v_scale=0.25),
+        kv_proj_only=Mock(side_effect=lambda x: (x + 1, x + 2)),
+        apply_k_rope=Mock(side_effect=lambda pos, k: k + pos[:, None]),
+    )
+    model.layers = [SimpleNamespace(self_attn=attention)]
+    pool = routed(SimpleNamespace(set_kv_buffer=Mock()))
+    full_loc_2d = torch.tensor([[3, 4], [8, 999]])
+
+    model.write_target_hidden_kv(
+        target_hidden=hidden,
         pool=pool,
-        attn=attention,
-        full_loc_2d=full_loc,
-        swa_loc_2d=swa_loc,
-        commit_lens=commit_lens,
-        k=key,
-        v=value,
+        positions=positions,
+        cache_loc=full_loc_2d.flatten(),
+        cache_loc_2d=full_loc_2d,
+        commit_lens=torch.tensor([2, 1]),
+        swa_write_ids=lambda _full_loc: None,
     )
 
-    writer.assert_called_once()
-    args = writer.call_args.args
-    assert args[0] is attention.attn
-    assert args[1] is swa_loc
-    assert args[2] is commit_lens
-    assert args[3] is key
-    assert args[4] is value
-    assert args[5:] == (0.5, 0.25)
-    assert writer.call_args.kwargs == dict(layer_id_override=0)
-    pool.full_kv_pool.set_kv_buffer_prefix_valid.assert_not_called()
+    _, write_loc, _, _, _, _ = pool.set_kv_buffer.call_args.args
+    assert write_loc.physical
+    assert write_loc.swa_loc is None
+    torch.testing.assert_close(write_loc.loc, torch.tensor([3, 4, 8]))
+
+
+@pytest.mark.parametrize(
+    "model_cls,projection_name",
+    [(DSparkDraftModel, "o_proj"), (DSparkSpark25DraftModel, "out_proj")],
+)
+def test_context_kv_pruning_releases_each_models_output_projection(
+    model_cls, projection_name
+):
+    model = object.__new__(model_cls)
+    nn.Module.__init__(model)
+    model.markov_head = nn.Linear(4, 4)
+    model.confidence_head = nn.Linear(4, 1)
+    layer = nn.Module()
+    layer.mlp = nn.Linear(4, 4)
+    layer.self_attn = nn.Module()
+    layer.self_attn.k_proj = nn.Linear(4, 4)
+    setattr(layer.self_attn, projection_name, nn.Linear(4, 4))
+    model.layers = nn.ModuleList([layer])
+
+    with patch("torch.cuda.empty_cache"):
+        model.prune_to_ctx_kv_injection()
+
+    assert model.markov_head is None
+    assert model.confidence_head is None
+    assert layer.mlp is None
+    assert getattr(layer.self_attn, projection_name) is None
+    assert layer.self_attn.k_proj is not None
 
 
 if __name__ == "__main__":
