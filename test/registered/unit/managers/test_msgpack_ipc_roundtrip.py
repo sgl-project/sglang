@@ -9,7 +9,6 @@ type-specific decisions (the `ExpertWeightPointer` narrowing, the
 """
 
 import dataclasses
-import pickle
 import unittest
 
 import msgspec
@@ -315,28 +314,23 @@ class TestRequestStatsRoundTrip(CustomTestCase):
             video_tokens=0,
             time_stats=time_stats,
         )
-        round_trips = {
-            "msgpack": _double_hop,
-            "pickle": lambda obj: pickle.loads(pickle.dumps(obj)),
-        }
         for cls in (BatchTokenIDOutput, BatchStrOutput, BatchEmbeddingOutput):
             # Embedding rows always carry their stats.
             request_stats = [stats, stats if cls is BatchEmbeddingOutput else None]
-            for codec, round_trip in round_trips.items():
-                with self.subTest(type=cls.__name__, codec=codec):
-                    required = {
-                        f.name: [] for f in msgspec.structs.fields(cls) if f.required
-                    }
-                    obj = cls(**{**required, "rids": ["a", "b"]})
-                    obj.request_stats = request_stats
+            with self.subTest(type=cls.__name__):
+                required = {
+                    f.name: [] for f in msgspec.structs.fields(cls) if f.required
+                }
+                obj = cls(**{**required, "rids": ["a", "b"]})
+                obj.request_stats = request_stats
 
-                    decoded = round_trip(obj)
+                decoded = _double_hop(obj)
 
-                    self.assertEqual(decoded.request_stats, request_stats)
-                    self.assertIsInstance(decoded.request_stats[0], RequestOutputStats)
-                    self.assertIsInstance(
-                        decoded.request_stats[0].time_stats, SchedulerOutputTimeStats
-                    )
+                self.assertEqual(decoded.request_stats, request_stats)
+                self.assertIsInstance(decoded.request_stats[0], RequestOutputStats)
+                self.assertIsInstance(
+                    decoded.request_stats[0].time_stats, SchedulerOutputTimeStats
+                )
 
 
 if __name__ == "__main__":

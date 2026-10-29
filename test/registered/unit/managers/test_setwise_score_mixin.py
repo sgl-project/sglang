@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.io_struct import RequestOutputStats
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     ScoreResult,
     TokenizerManagerScoreMixin,
@@ -24,6 +25,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+_REQUEST_STATS = RequestOutputStats(
+    prompt_tokens=0,
+    cached_tokens=0,
+    cached_tokens_details=None,
+    retraction_count=0,
+    image_tokens=0,
+    audio_tokens=0,
+    video_tokens=0,
+    time_stats=None,
+)
 
 # Config that satisfies _validate_score_extraction (dedicated setwise endpoint).
 _VALID_SETWISE_CONFIG = dict(
@@ -626,7 +638,7 @@ class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
             )
 
         fake_self = SimpleNamespace(
-            build_request_stats=lambda req: None,
+            build_request_stats=lambda req: _REQUEST_STATS,
             send_to_detokenizer=SimpleNamespace(
                 send_output=lambda obj: captured.append(obj)
             ),

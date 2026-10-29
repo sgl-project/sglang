@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.io_struct import RequestOutputStats
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
@@ -10,6 +11,17 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+_REQUEST_STATS = RequestOutputStats(
+    prompt_tokens=0,
+    cached_tokens=0,
+    cached_tokens_details=None,
+    retraction_count=0,
+    image_tokens=0,
+    audio_tokens=0,
+    video_tokens=0,
+    time_stats=None,
+)
 
 
 class _FakeReq:
@@ -82,7 +94,7 @@ def _make_accumulator(
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
         default_force_stream_interval=1,
-        build_request_stats=lambda req: None,
+        build_request_stats=lambda req: _REQUEST_STATS,
         rust_server_mode=rust_server_mode,
         is_request_level_customized_info_key=lambda key: False,
         current_weight_version=None,

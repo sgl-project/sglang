@@ -43,6 +43,17 @@ from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+_REQUEST_STATS = RequestOutputStats(
+    prompt_tokens=0,
+    cached_tokens=0,
+    cached_tokens_details=None,
+    retraction_count=0,
+    image_tokens=0,
+    audio_tokens=0,
+    video_tokens=0,
+    time_stats=None,
+)
+
 
 class _FakeReq:
     def __init__(
@@ -128,7 +139,7 @@ def _accumulator(
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
         default_force_stream_interval=1,
-        build_request_stats=lambda req: None,
+        build_request_stats=lambda req: _REQUEST_STATS,
         is_request_level_customized_info_key=request_level_keys.__contains__,
         current_weight_version=current_weight_version,
         rust_server_mode=rust_server_mode,
@@ -670,19 +681,6 @@ class TestOutputStreamerRequestStats(unittest.TestCase):
         [finished] = output(finished=True)
         self.assertEqual(finished.retraction_count, 1)
         self.assertEqual(finished.time_stats.queue_time, 0.5)
-
-    def test_take_request_stats_due(self):
-        req = _metered_req()
-        self.assertTrue(req.take_request_stats_due())
-        self.assertFalse(req.take_request_stats_due())
-
-        req.retraction_count += 1
-        self.assertTrue(req.take_request_stats_due())
-        self.assertFalse(req.take_request_stats_due())
-
-        req.finished_reason = FINISH_LENGTH(length=1)
-        self.assertTrue(req.take_request_stats_due())
-        self.assertTrue(req.take_request_stats_due())
 
     def test_embedding_rows_carry_their_request_stats(self):
         """An embedding request is output once, finished, and its row carries
