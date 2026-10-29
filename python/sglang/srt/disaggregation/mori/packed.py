@@ -92,11 +92,17 @@ def negotiate_packed_slice(
     return layout
 
 
-def packed_page_offsets(num_tensors: int, dst_pages, page_bytes: int):
-    """Return offsets relative to one staging MR and each destination MR."""
+def _validate_page_metadata(num_tensors: int, dst_pages, page_bytes: int):
+    """Normalize and validate pages without constructing descriptor matrices."""
     pages = [int(page) for page in dst_pages]
     if num_tensors <= 0 or page_bytes <= 0 or any(page < 0 for page in pages):
         raise ValueError("Invalid packed page descriptor metadata")
+    return pages
+
+
+def packed_page_offsets(num_tensors: int, dst_pages, page_bytes: int):
+    """Return offsets relative to one staging MR and each destination MR."""
+    pages = _validate_page_metadata(num_tensors, dst_pages, page_bytes)
     count = len(pages)
     return (
         [
@@ -299,10 +305,11 @@ class MoriPackedKVSender:
             raise ValueError("Packing requires paired nonempty tensor lists")
         if len(src_pages) != len(dst_pages):
             raise ValueError("Packing requires paired source and destination pages")
-        if any(int(page) < 0 for page in src_pages):
+        src_pages = [int(page) for page in src_pages]
+        if any(page < 0 for page in src_pages):
             raise ValueError("Negative source page")
         # Validate before launching a gather, even if the first batch is empty.
-        packed_page_offsets(len(src_ptrs), dst_pages, dst_page_bytes)
+        dst_pages = _validate_page_metadata(len(src_ptrs), dst_pages, dst_page_bytes)
         batch_pages = self.buffer.get_size() // (len(src_ptrs) * dst_page_bytes)
         if batch_pages == 0:
             raise ValueError("MoRI pack buffer cannot hold one page across all tensors")
