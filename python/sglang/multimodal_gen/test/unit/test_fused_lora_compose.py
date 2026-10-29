@@ -5,14 +5,16 @@ from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     LoRAPipeline,
+    _store_fused_lora_groups,
     stack_or_compose_fused_lora,
 )
 from sglang.multimodal_gen.runtime.post_training.weights_updater import (
@@ -62,6 +64,31 @@ def test_compose_unequal_sections_matches_reference():
         rtol=1e-5,
         atol=1e-5,
     )
+
+
+def test_fused_sections_preserve_per_layer_alpha():
+    a_list, b_list = _make_ab_lists([2, 3, 1])
+    alphas = [2, 6, 1]
+    pending = defaultdict(dict)
+    for index, (lora_a, lora_b, alpha) in enumerate(zip(a_list, b_list, alphas)):
+        pending["attn.qkv.lora_A"][index] = lora_a
+        pending["attn.qkv.lora_B"][index] = lora_b
+        pending["attn.qkv.alpha"][index] = torch.tensor(alpha)
+
+    adapter = {}
+    _store_fused_lora_groups(adapter, pending, adapter_alpha=4, device="cpu")
+
+    x = torch.randn(5, IN_DIM)
+    actual = x @ adapter["attn.qkv.lora_A"].T @ adapter["attn.qkv.lora_B"].T
+    expected = torch.cat(
+        [
+            (x @ lora_a.T @ lora_b.T) * (alpha / lora_a.shape[0])
+            for lora_a, lora_b, alpha in zip(a_list, b_list, alphas)
+        ],
+        dim=-1,
+    )
+    assert adapter["attn.qkv.alpha"].item() == sum(a.shape[0] for a in a_list)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_stack_kept_for_equal_sections():
@@ -201,6 +228,15 @@ def test_composed_pair_shards_correctly_under_mock_tp():
     )
 
 
+def test_mis_sized_fused_lora_b_is_rejected():
+    layer = _make_layer()
+    with (
+        patch(_TP_RANK_PATCH, return_value=0),
+        pytest.raises(ValueError, match="fused LoRA B"),
+    ):
+        layer.slice_lora_b_weights(torch.zeros(sum(OUTPUT_SIZES) + 1, 2))
+
+
 def test_ipc_key_resolution_returns_fused_merge_index():
     module = torch.nn.Module()
     module.param_names_mapping = {
@@ -272,7 +308,7 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
 
 
 def _load_adapter(pipeline, state_dict, lora_alpha=None):
-    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline"
+    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
     with (
         patch(f"{loader_mod}.maybe_download_lora", return_value="/adapter"),
         patch(f"{loader_mod}.load_file", return_value=state_dict),
@@ -344,7 +380,7 @@ def test_apply_composed_adapter_end_to_end():
 
     strength = 2.0
     with patch(
-        "sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline.dist.get_rank",
+        "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline.dist.get_rank",
         return_value=0,
     ):
         applied = pipeline._apply_lora_to_layers(
@@ -371,3 +407,42 @@ def test_apply_composed_adapter_end_to_end():
         + _reference_delta(x, a_list, b_list, adapter_alpha) * strength
     )
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "fused", "sections", "rows"),
+    [
+        ("attn", "attn.to_qkv", ("q", "k", "v"), (8, 2, 2)),
+        ("mlp", "mlp.gate_up", ("gate", "up"), (4, 4)),
+    ],
+)
+def test_loader_folds_distinct_section_alphas(prefix, fused, sections, rows):
+    torch.manual_seed(5)
+    alphas = (0.5, 1.0, 2.0)
+    state = {}
+    for name, out_rows, alpha in zip(sections, rows, alphas):
+        state[f"{prefix}.{name}.lora_A.weight"] = torch.randn(2, IN_DIM)
+        state[f"{prefix}.{name}.lora_B.weight"] = torch.randn(out_rows, 2)
+        state[f"{prefix}.{name}.alpha"] = torch.tensor(alpha)
+    pipeline = _make_loader_pipeline()
+    _load_adapter(pipeline, state)
+
+    adapter = pipeline.lora_adapters["adapter"]
+    a, b = adapter[f"{fused}.lora_A"], adapter[f"{fused}.lora_B"]
+    x = torch.randn(3, IN_DIM)
+    scale = adapter[f"{fused}.alpha"].item() / a.shape[-2]
+    if a.ndim == 3:
+        delta = torch.cat([x @ a_i.T @ b_i.T for a_i, b_i in zip(a, b)], dim=-1)
+    else:
+        delta = x @ a.T @ b.T
+    expected = torch.cat(
+        [
+            x
+            @ state[f"{prefix}.{name}.lora_A.weight"].T
+            @ state[f"{prefix}.{name}.lora_B.weight"].T
+            * (alpha / 2)
+            for name, alpha in zip(sections, alphas)
+        ],
+        dim=-1,
+    )
+    torch.testing.assert_close(delta * scale, expected, rtol=1e-5, atol=1e-5)

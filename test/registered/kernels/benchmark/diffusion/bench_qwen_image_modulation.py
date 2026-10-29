@@ -7,20 +7,23 @@ from sglang.kernels.jit.benchmark.utils import run_benchmark_no_cudagraph
 from sglang.kernels.ops.diffusion import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
+    fused_layernorm_modulate_raw,
     norm_infer,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci
 
 register_cuda_ci(
-    est_time=13, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=15, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 register_amd_ci(est_time=13, stage="jit-kernel-benchmark", runner_config="amd")
 
 if is_in_ci():
     B_RANGE, S_RANGE, D_RANGE = [1], [128], [3072]
+    NORM_OUT_S_RANGE = [128]
 else:
     B_RANGE, S_RANGE, D_RANGE = [1, 2], [128, 512, 2048], [1024, 1536, 3072]
+    NORM_OUT_S_RANGE = [128, 512, 2048, 4096, 4608]
 
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
@@ -29,6 +32,7 @@ LINE_VALS = ["split", "fused"]
 LINE_NAMES = ["Triton Norm + Torch Select", "Fused Triton"]
 STYLES = [("red", "-"), ("blue", "--")]
 CONFIG = [(b, s, d) for b in B_RANGE for s in S_RANGE for d in D_RANGE]
+NORM_OUT_CONFIG = [(1, s, 3072) for s in NORM_OUT_S_RANGE]
 
 
 def _make_common_inputs(batch_size: int, seq_len: int, hidden_size: int):
@@ -60,6 +64,40 @@ def _apply_select01_modulation(
     shift = torch.where(idx, shift1.unsqueeze(1), shift0.unsqueeze(1))
     gate = torch.where(idx, gate1.unsqueeze(1), gate0.unsqueeze(1))
     return x * (1 + scale) + shift, gate
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["B", "S", "D"],
+        x_vals=NORM_OUT_CONFIG,
+        line_arg="provider",
+        line_vals=LINE_VALS,
+        line_names=["Torch LayerNorm + Modulate", "Fused Triton"],
+        styles=STYLES,
+        ylabel="us",
+        plot_name="qwen_image_norm_out",
+        args={},
+    )
+)
+def bench_norm_out(B: int, S: int, D: int, provider: str) -> Tuple[float, float, float]:
+    x = torch.randn(B, S, D, dtype=DTYPE, device=DEVICE)
+    scale = torch.randn(B, D, dtype=DTYPE, device=DEVICE)
+    shift = torch.randn(B, D, dtype=DTYPE, device=DEVICE)
+    norm = torch.nn.LayerNorm(
+        D, eps=EPS, elementwise_affine=False, device=DEVICE, dtype=DTYPE
+    )
+
+    if provider == "split":
+
+        def fn():
+            return norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
+
+    else:
+
+        def fn():
+            return fused_layernorm_modulate_raw(x, scale, shift, EPS)
+
+    return run_benchmark_no_cudagraph(fn)
 
 
 @triton.testing.perf_report(
@@ -176,6 +214,14 @@ def bench_residual_layernorm_scale_shift_gate_select01(
 
 
 if __name__ == "__main__":
+    # The bit-exact LayerNorm kernel uses CUDA inline PTX; keep the shared
+    # Qwen modulation benchmark runnable on its registered ROCm lane.
+    if torch.version.hip is None:
+        print(f"\n{'=' * 80}")
+        print("Benchmark: qwen_image norm_out")
+        print(f"{'=' * 80}\n")
+        bench_norm_out.run(print_data=True)
+
     print(f"\n{'=' * 80}")
     print("Benchmark: qwen_image layernorm + scale_shift_gate_select01")
     print(f"{'=' * 80}\n")

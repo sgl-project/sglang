@@ -38,7 +38,7 @@ _PARAM_RE = re.compile(
 )
 
 # Recipients whose bodies are prose, never tool calls.
-_NON_TOOL_RECIPIENTS = frozenset({"self", "user"})
+_NON_TOOL_RECIPIENTS = frozenset({"commentary", "self", "user"})
 
 
 def _is_tool_channel(recipient: Optional[str]) -> bool:

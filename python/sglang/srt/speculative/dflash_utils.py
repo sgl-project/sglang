@@ -8,23 +8,27 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
+from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
+from sglang.kernels.ops.speculative.verify_sampling import (
+    tree_speculative_sampling_target_only,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
     top_p_normalize_probs_torch,
 )
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+_DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "mla"})
 
 logger = logging.getLogger(__name__)
 
-_DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
@@ -34,36 +38,15 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TritonAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
+        "XPUAttentionBackend",
     }
 )
 
 
-if is_cuda() or is_musa():
-    try:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
-
-        _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
-    except Exception:
-        top_k_renorm_prob = None
-        top_p_renorm_prob = None
-        tree_speculative_sampling_target_only = None
-elif is_hip():
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_k_renorm_probs_triton as top_k_renorm_prob,
-    )
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_p_renorm_probs_triton as top_p_renorm_prob,
-    )
-
-    tree_speculative_sampling_target_only = None
-else:
-    top_k_renorm_prob = None
-    top_p_renorm_prob = None
-    tree_speculative_sampling_target_only = None
+# DFlash does not run sampling verify on NPU, even where the op exists.
+_DFLASH_SAMPLING_VERIFY_AVAILABLE = (
+    tree_speculative_sampling_target_only is not None and not is_npu()
+)
 
 
 def is_dflash_sampling_verify_available() -> bool:
@@ -146,9 +129,21 @@ def dflash_draft_cell_size_per_token(
     """Exact bytes/token of the DFLASH draft KV pool."""
     if draft_num_layers <= 0:
         return 0
+    from sglang.srt.configs.model_config import AttentionArch
+
+    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
+    if getattr(draft_model_config, "attention_arch", None) == AttentionArch.MLA:
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+
+        # One latent row per token, replicated across TP ranks.
+        kv_dim = calculate_mla_kv_cache_dim(
+            model_config=draft_model_config, kv_cache_dtype=draft_kv_cache_dtype
+        )
+        return int(kv_dim * int(draft_num_layers) * dtype_size)
     num_kv_heads = draft_model_config.get_num_kv_heads(tp_size)
     kv_dim_per_head = draft_model_config.head_dim + draft_model_config.v_head_dim
-    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
     return int(num_kv_heads * kv_dim_per_head * int(draft_num_layers) * dtype_size)
 
 
@@ -194,8 +189,20 @@ def scale_kv_cell_size_per_token_for_dflash(
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+    from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
     backend = attn_backend
     for _ in range(4):
+        if isinstance(backend, HybridAttnBackend):
+            # Resolve wrappers down to the backend that runs TARGET_VERIFY
+            backend = backend._select_backend(ForwardMode.TARGET_VERIFY)
+            continue
+        if isinstance(backend, TboAttnBackend):
+            # primary and children come from the same creator.
+            backend = backend.primary
+            continue
         full_backend = getattr(backend, "full_attn_backend", None)
         if full_backend is None:
             break
@@ -220,8 +227,7 @@ def apply_dflash_verify_logits_adjustments(
         return
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
     if draft_token_num <= 0:
         raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
@@ -413,6 +419,8 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     sliding_window = _cfg_get(
         text_config, "sliding_window", _cfg_get(config, "sliding_window")
     )
+    if sliding_window is None and is_nemotron_35_draft_config(config):
+        sliding_window = _get_dflash_config(config).get("swa_window_size")
     if sliding_window is None:
         raise ValueError(
             "DFLASH sliding_attention layers require config.sliding_window."
@@ -463,6 +471,46 @@ def _get_dflash_config(config: Any) -> dict:
         return {}
 
 
+def is_nemotron_35_draft_config(config: Any) -> bool:
+    """Identify the published Nemotron 3.5 DFlash/DSpark draft layout.
+
+    Keep the non-anchor query layout and checkpoint-local vocabulary modules
+    scoped to this structurally distinct family instead of changing every
+    DFlash/DSpark checkpoint that happens to expose one of these fields.
+    """
+    architectures = _cfg_get(config, "architectures", None) or []
+    if not {"DFlashDraftModel", "Qwen3DSparkModel"}.intersection(architectures):
+        return False
+    if not bool(_cfg_get(config, "has_embed_tokens", False)):
+        return False
+    if bool(_cfg_get(config, "has_lm_head", False)):
+        return False
+
+    quant_config = _cfg_get(config, "quantization_config", None) or {}
+    if _cfg_get(quant_config, "quant_algo", None) != "W4A16_NVFP4":
+        return False
+
+    dflash_config = _get_dflash_config(config)
+    target_layer_ids = dflash_config.get(
+        "target_layer_ids", _cfg_get(config, "target_layer_ids", None)
+    )
+    aux_layer_ids = _cfg_get(config, "eagle_aux_hidden_state_layer_ids", None)
+    if not target_layer_ids or not aux_layer_ids:
+        return False
+    if len(target_layer_ids) != len(aux_layer_ids):
+        return False
+    if any(
+        int(target) + 1 != int(aux)
+        for target, aux in zip(target_layer_ids, aux_layer_ids)
+    ):
+        return False
+
+    sample_from_anchor = dflash_config.get(
+        "sample_from_anchor", _cfg_get(config, "sample_from_anchor", True)
+    )
+    return sample_from_anchor is False
+
+
 def _parse_optional_int(
     value: Any,
     *,
@@ -481,6 +529,67 @@ def _parse_optional_int(
     return parsed
 
 
+def _parse_dflash_is_mla(dflash_cfg: dict, num_hidden_layers: Optional[int]) -> bool:
+    # SpecForge exports attention_mode; forks that mix modes list attention_modes.
+    if "attention_mode" in dflash_cfg and "attention_modes" in dflash_cfg:
+        raise ValueError(
+            "DFLASH dflash_config sets both attention_mode and attention_modes; "
+            "set only one."
+        )
+    raw_modes = dflash_cfg.get("attention_modes")
+    if raw_modes is None:
+        raw_modes = [dflash_cfg.get("attention_mode", "gqa")]
+    elif not isinstance(raw_modes, (list, tuple)) or len(raw_modes) != (
+        num_hidden_layers
+    ):
+        raise ValueError(
+            "DFLASH dflash_config.attention_modes must list one mode per draft "
+            f"layer (num_hidden_layers={num_hidden_layers}), got {raw_modes!r}."
+        )
+
+    modes = {str(mode).lower() for mode in raw_modes}
+    unsupported = modes - _DFLASH_ATTENTION_MODES
+    if unsupported:
+        raise ValueError(
+            f"DFLASH draft attention mode(s) {sorted(unsupported)} are not "
+            f"supported; expected one of {sorted(_DFLASH_ATTENTION_MODES)}."
+        )
+    if "mla" not in modes:
+        return False
+    # The draft KV pool has a single per-layer row layout.
+    if modes != {"mla"}:
+        raise ValueError(
+            "DFLASH drafts that mix mla with gqa/mha layers are not supported, "
+            f"got attention modes {list(raw_modes)}."
+        )
+    return True
+
+
+# The served MLA layer reinterprets any RoPE scaling as DeepSeek YaRN.
+_DFLASH_MLA_ROPE_TYPES = frozenset({"default", "yarn", "deepseek_yarn"})
+
+
+def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
+    text_config = _get_text_config(draft_hf_config)
+    required = ("kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim")
+    missing = [name for name in required if _cfg_get(text_config, name) is None]
+    if missing:
+        raise ValueError(f"DFLASH mla draft config is missing {missing}.")
+    if _cfg_get(text_config, "attention_bias", False):
+        raise ValueError("DFLASH mla drafts do not support attention_bias.")
+    rope = (
+        _cfg_get(text_config, "rope_parameters")
+        or _cfg_get(text_config, "rope_scaling")
+        or {}
+    )
+    rope_type = rope.get("rope_type", rope.get("type", "default"))
+    if rope_type not in _DFLASH_MLA_ROPE_TYPES:
+        raise ValueError(
+            f"DFLASH mla drafts support rope_type in {sorted(_DFLASH_MLA_ROPE_TYPES)}, "
+            f"got {rope_type!r}."
+        )
+
+
 @dataclass(frozen=True)
 class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
@@ -495,6 +604,18 @@ class DFlashDraftConfig:
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
+    projector_type: Optional[str]
+    shift_label: Optional[bool]
+    pure_draft_prefix_len: Optional[int]
+    gru_hidden_dim: Optional[int]
+    emb_dim: Optional[int]
+    attention_sink_bias: bool = False
+    attention_value_scale: Optional[float] = None
+    is_mla: bool = False
+
+    @property
+    def is_domino(self) -> bool:
+        return self.projector_type == "domino"
 
     def require_num_layers(self) -> int:
         if self.num_hidden_layers is None:
@@ -655,6 +776,102 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"got {mask_token_id}."
             )
 
+    # MiMo DFlash draft extras: per-head attention sink bias and V value scale.
+    raw_attention_sink_bias = dflash_cfg.get("attention_sink_bias", False)
+    if not isinstance(raw_attention_sink_bias, bool):
+        raise ValueError(
+            "DFLASH dflash_config.attention_sink_bias must be a bool, "
+            f"got {raw_attention_sink_bias!r} (type={type(raw_attention_sink_bias).__name__})."
+        )
+    attention_sink_bias = bool(raw_attention_sink_bias)
+
+    raw_attention_value_scale = dflash_cfg.get("attention_value_scale", None)
+    if raw_attention_value_scale is None:
+        attention_value_scale: Optional[float] = None
+    else:
+        if isinstance(raw_attention_value_scale, bool) or not isinstance(
+            raw_attention_value_scale, (int, float)
+        ):
+            raise ValueError(
+                "DFLASH dflash_config.attention_value_scale must be int|float|None, "
+                f"got {raw_attention_value_scale!r} "
+                f"(type={type(raw_attention_value_scale).__name__})."
+            )
+        attention_value_scale = float(raw_attention_value_scale)
+
+    is_mla = _parse_dflash_is_mla(dflash_cfg, num_hidden_layers)
+    if is_mla and (attention_sink_bias or attention_value_scale is not None):
+        raise ValueError(
+            "DFLASH mla drafts support neither attention_sink_bias nor "
+            "attention_value_scale."
+        )
+
+    projector_type = dflash_cfg.get(
+        "projector_type", _cfg_get(draft_hf_config, "projector_type", None)
+    )
+    shift_label = None
+    pure_draft_prefix_len = None
+    gru_hidden_dim = None
+    emb_dim = None
+    if projector_type == "domino":
+        shift_label = dflash_cfg.get(
+            "shift_label", _cfg_get(draft_hf_config, "shift_label", None)
+        )
+        pure_draft_prefix_len = _parse_optional_int(
+            dflash_cfg.get(
+                "pure_draft_prefix_len",
+                _cfg_get(draft_hf_config, "pure_draft_prefix_len", None),
+            ),
+            field_name="DFLASH Domino pure_draft_prefix_len",
+            min_value=0,
+        )
+        gru_hidden_dim = _parse_optional_int(
+            dflash_cfg.get(
+                "gru_hidden_dim", _cfg_get(draft_hf_config, "gru_hidden_dim", None)
+            ),
+            field_name="DFLASH Domino gru_hidden_dim",
+            min_value=1,
+        )
+        nested_emb_dim = _parse_optional_int(
+            dflash_cfg.get("emb_dim", None),
+            field_name="DFLASH Domino dflash_config.emb_dim",
+            min_value=1,
+        )
+        top_level_emb_dim = _parse_optional_int(
+            _cfg_get(draft_hf_config, "emb_dim", None),
+            field_name="DFLASH Domino top-level emb_dim",
+            min_value=1,
+        )
+        if (
+            nested_emb_dim is not None
+            and top_level_emb_dim is not None
+            and nested_emb_dim != top_level_emb_dim
+        ):
+            raise ValueError(
+                "DFLASH Domino emb_dim differs between dflash_config and the "
+                f"top-level config: {nested_emb_dim} != {top_level_emb_dim}."
+            )
+        emb_dim = nested_emb_dim if nested_emb_dim is not None else top_level_emb_dim
+
+        if not isinstance(shift_label, bool):
+            raise ValueError(
+                "DFLASH Domino requires dflash_config.shift_label to be a bool, "
+                f"got {shift_label!r}."
+            )
+        if pure_draft_prefix_len != 1:
+            raise ValueError(
+                "DFLASH Domino currently requires pure_draft_prefix_len=1, "
+                f"got {pure_draft_prefix_len!r}."
+            )
+        if gru_hidden_dim is None:
+            raise ValueError("DFLASH Domino requires dflash_config.gru_hidden_dim.")
+        if emb_dim is None:
+            raise ValueError("DFLASH Domino requires dflash_config.emb_dim.")
+        if block_size is not None and block_size <= 1:
+            raise ValueError(
+                f"DFLASH Domino requires block_size > 1, got {block_size}."
+            )
+
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
@@ -668,6 +885,14 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,
+        projector_type=projector_type,
+        shift_label=shift_label,
+        pure_draft_prefix_len=pure_draft_prefix_len,
+        gru_hidden_dim=gru_hidden_dim,
+        emb_dim=emb_dim,
+        attention_sink_bias=attention_sink_bias,
+        attention_value_scale=attention_value_scale,
+        is_mla=is_mla,
     )
 
 
@@ -706,85 +931,6 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
-@triton.jit
-def _fused_correct_drafts_and_bonus_kernel(
-    candidates_ptr,
-    target_predict_ptr,
-    num_correct_drafts_ptr,
-    bonus_tokens_ptr,
-    block_size,
-    BLOCK: tl.constexpr,
-):
-    b = tl.program_id(0).to(tl.int64)
-    offs = tl.arange(0, BLOCK)
-    in_row = offs < block_size - 1
-    drafts = tl.load(candidates_ptr + b * block_size + 1 + offs, mask=in_row, other=-1)
-    targets = tl.load(target_predict_ptr + b * block_size + offs, mask=in_row, other=-2)
-    eq = (drafts == targets) & in_row
-    # Leading-match count = index of the first mismatch lane; lanes past the
-    # row and all-match rows both resolve to block_size - 1 via the min.
-    num_correct = tl.min(tl.where(eq, BLOCK, offs), 0)
-    bonus_token = tl.load(target_predict_ptr + b * block_size + num_correct)
-    tl.store(num_correct_drafts_ptr + b, num_correct.to(tl.int32))
-    tl.store(bonus_tokens_ptr + b, bonus_token.to(tl.int64))
-
-
-def compute_dflash_correct_drafts_and_bonus(
-    *,
-    candidates: torch.Tensor,
-    target_predict: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute DFlash accept lengths and bonus tokens (greedy verify rule).
-
-    Args:
-        candidates: Token ids proposed by the DFlash draft, including the current token.
-            Shape: [bs, block_size]. candidates[:, 0] is the current token.
-        target_predict: Token ids predicted by the target model for each position in the block.
-            Shape: [bs, block_size]. target_predict[:, t] corresponds to argmax at position t.
-
-    Returns:
-        correct_len: int32 tensor [bs], number of accepted *draft* tokens (excluding current token and bonus token).
-        bonus: int64 tensor [bs], the target-predicted token at index correct_len (the "bonus" token to append).
-
-    Notes:
-        Matches the reference implementation rule:
-          accept while candidates[:, 1:] == target_predict[:, :-1] consecutively.
-    """
-    if candidates.ndim != 2:
-        raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
-    if target_predict.shape != candidates.shape:
-        raise ValueError(
-            "target_predict must have the same shape as candidates. "
-            f"candidates.shape={tuple(candidates.shape)}, target_predict.shape={tuple(target_predict.shape)}"
-        )
-
-    bs, block_size = candidates.shape
-    if bs <= 0:
-        raise ValueError(f"batch size must be positive, got {bs}.")
-    if block_size <= 0:
-        raise ValueError(f"block_size must be positive, got {block_size}.")
-
-    if candidates.is_cuda:
-        num_correct_drafts = torch.empty(
-            bs, dtype=torch.int32, device=candidates.device
-        )
-        bonus_tokens = torch.empty(bs, dtype=torch.int64, device=candidates.device)
-        _fused_correct_drafts_and_bonus_kernel[(bs,)](
-            candidates.contiguous(),
-            target_predict.contiguous(),
-            num_correct_drafts,
-            bonus_tokens,
-            block_size,
-            BLOCK=triton.next_power_of_2(max(block_size - 1, 1)),
-        )
-        return num_correct_drafts, bonus_tokens
-
-    matches = candidates[:, 1:] == target_predict[:, :-1]
-    correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
-    bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
-    return correct_len.to(torch.int32), bonus.to(torch.int64)
-
-
 def apply_dflash_simulated_acceptance(
     *,
     candidates: torch.Tensor,
@@ -796,10 +942,15 @@ def apply_dflash_simulated_acceptance(
     simulate_acc_len: float,
     simulate_acc_method: str,
     simulate_acc_token_mode: str,
+    next_token_logits: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
 ) -> None:
-    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
-    block_size = candidates.shape[1]
+    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
+    ``next_token_logits`` gives the target argmax when ``target_predict`` is None."""
+    bs, block_size = candidates.shape
+    if simulate_acc_token_mode == "real-draft-token" and target_predict is None:
+        # The sampling-verify branch does not materialize the target argmax.
+        target_predict = torch.argmax(next_token_logits, dim=-1).view(bs, block_size)
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(
@@ -850,8 +1001,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
 
     bs, draft_token_num = candidates.shape
@@ -871,56 +1021,30 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         )
 
     if threshold_single is None:
-        from sglang.srt.runtime_context import get_spec
-
         threshold_single = get_spec().speculative_accept_threshold_single
     if threshold_acc is None:
-        from sglang.srt.runtime_context import get_spec
-
         threshold_acc = get_spec().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)
 
     device = next_token_logits.device
 
-    if uniform_samples is None:
-        uniform_samples = torch.rand(
-            (bs, draft_token_num), dtype=torch.float32, device=device
+    if uniform_samples is not None and uniform_samples.shape != (bs, draft_token_num):
+        raise ValueError(
+            "uniform_samples shape mismatch. "
+            f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
         )
-    else:
-        if uniform_samples.shape != (bs, draft_token_num):
-            raise ValueError(
-                "uniform_samples shape mismatch. "
-                f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
-            )
-        uniform_samples = uniform_samples.to(device=device, dtype=torch.float32)
-
-    if uniform_samples_for_final_sampling is None:
-        uniform_samples_for_final_sampling = torch.rand(
-            (bs,), dtype=torch.float32, device=device
-        )
-    else:
-        if uniform_samples_for_final_sampling.shape != (bs,):
-            raise ValueError(
-                "uniform_samples_for_final_sampling shape mismatch. "
-                f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
-            )
-        uniform_samples_for_final_sampling = uniform_samples_for_final_sampling.to(
-            device=device,
-            dtype=torch.float32,
+    if (
+        uniform_samples_for_final_sampling is not None
+        and uniform_samples_for_final_sampling.shape != (bs,)
+    ):
+        raise ValueError(
+            "uniform_samples_for_final_sampling shape mismatch. "
+            f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
         )
 
-    target_probs = build_dflash_verify_target_probs(
-        next_token_logits=next_token_logits,
-        sampling_info=sampling_info,
-        draft_token_num=draft_token_num,
-        bs=bs,
-        max_top_k=max_top_k,
-        uniform_top_k_value=uniform_top_k_value,
-        use_sparse_topk=use_sparse_topk,
-    )
-    draft_probs = torch.zeros_like(target_probs)
-
+    # Cached across steps, and `correct_len` below aliases `accept_token_num`,
+    # so these must predate the borrow scope the next replay reclaims.
     (
         retrieve_index,
         retrieve_next_token,
@@ -933,25 +1057,59 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         draft_token_num=draft_token_num,
         device=device,
     )
-    candidates_i64 = (
-        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
-    )
-    tree_speculative_sampling_target_only(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
+
+    # The full-vocabulary matrices die with this step, so their bytes may come
+    # from the graph pool's idle storage. Anything outliving the scope is not.
+    with borrow_graph_pool(user="DFLASH verify probabilities"):
+        if uniform_samples is None:
+            coins = torch.rand(
+                (bs, draft_token_num), dtype=torch.float32, device=device
+            )
+        else:
+            coins = uniform_samples.to(device=device, dtype=torch.float32)
+        if uniform_samples_for_final_sampling is None:
+            coins_for_final_sampling = torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            )
+        else:
+            coins_for_final_sampling = uniform_samples_for_final_sampling.to(
+                device=device,
+                dtype=torch.float32,
+            )
+
+        target_probs = build_speculative_verify_target_probs(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=draft_token_num,
+            bs=bs,
+            max_top_k=max_top_k,
+            uniform_top_k_value=uniform_top_k_value,
+            use_sparse_topk=use_sparse_topk,
+        )
+        draft_probs = torch.zeros_like(target_probs)
+        candidates_i64 = (
+            candidates
+            if candidates.dtype == torch.int64
+            else candidates.to(torch.int64)
+        )
+        tree_speculative_sampling_target_only(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=coins_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            deterministic=True,
+        )
+        del target_probs, draft_probs, candidates_i64
+        del coins, coins_for_final_sampling
 
     correct_len = accept_token_num
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
@@ -960,7 +1118,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
-def build_dflash_verify_target_probs(
+def build_speculative_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
@@ -1035,83 +1193,3 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
     return None
-
-
-@triton.jit
-def _table_qk_norm_rope_kernel(
-    qkv_ptr,
-    q_weight_ptr,
-    k_weight_ptr,
-    cos_sin_ptr,
-    pos_ptr,
-    row_stride,
-    q_size,
-    NHQ: tl.constexpr,
-    D: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    t = tl.program_id(0).to(tl.int64)
-    h = tl.program_id(1)
-    pos = tl.load(pos_ptr + t).to(tl.int64)
-
-    HALF: tl.constexpr = D // 2
-    half_ar = tl.arange(0, HALF)
-    d_ar = tl.arange(0, D)
-    cos = tl.load(cos_sin_ptr + pos * D + half_ar).to(tl.float32)
-    sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar).to(tl.float32)
-
-    is_q = h < NHQ
-    col0 = tl.where(is_q, h * D, q_size + (h - NHQ) * D).to(tl.int64)
-    w_ptr = tl.where(is_q, q_weight_ptr.to(tl.int64), k_weight_ptr.to(tl.int64)).to(
-        tl.pointer_type(tl.bfloat16)
-    )
-
-    row = qkv_ptr + t * row_stride + col0
-    x = tl.load(row + d_ar).to(tl.float32)
-    ms = tl.sum(x * x, 0) / D
-    inv = 1.0 / tl.sqrt(ms + EPS)
-    w1 = tl.load(w_ptr + half_ar).to(tl.float32)
-    w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
-    x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
-    x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
-    x1 = x1.to(tl.bfloat16).to(tl.float32)
-    x2 = x2.to(tl.bfloat16).to(tl.float32)
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-    tl.store(row + half_ar, o1.to(tl.bfloat16))
-    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
-
-
-def table_qk_norm_rope_(
-    qkv: torch.Tensor,
-    positions: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    num_q_heads: int,
-    num_k_heads: int,
-    head_dim: int,
-    eps: float,
-) -> None:
-    """In-place QK RMSNorm + table-lookup neox RoPE on the fused QKV tensor.
-
-    Reads cos/sin from the SAME rotary table as the unfused path, so there is
-    no large-position angle drift (unlike theta-recompute kernels). V columns
-    are untouched.
-    """
-    T = qkv.shape[0]
-    if T == 0:
-        return
-    grid = (T, num_q_heads + num_k_heads)
-    _table_qk_norm_rope_kernel[grid](
-        qkv,
-        q_weight,
-        k_weight,
-        cos_sin_cache,
-        positions,
-        qkv.stride(0),
-        num_q_heads * head_dim,
-        NHQ=num_q_heads,
-        D=head_dim,
-        EPS=eps,
-    )

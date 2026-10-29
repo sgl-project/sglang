@@ -109,9 +109,9 @@ class TestKimiK27CodeMXFP4AiterMlaEvalMI35x(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():
@@ -137,7 +137,7 @@ class TestKimiK27CodeMXFP4AiterMlaEvalMI35x(unittest.TestCase):
                             num_questions=self.num_questions,
                             parallel=self.num_questions,
                             max_new_tokens=512,
-                            host="http://127.0.0.1",
+                            host="127.0.0.1",
                             port=int(self.base_url.split(":")[-1]),
                         )
                         metrics = run_eval_few_shot_gsm8k(args)

@@ -5,20 +5,26 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
-from sglang.srt.distributed import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import init_cublas
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sglang.srt.runtime_context import attention_backends, get_disagg, get_exec
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +58,12 @@ def configure_aux_hidden_state_capture(
     include aux hidden state output paths.
     """
     if eagle_use_aux_hidden_state:
+        if not hasattr(model, "set_eagle3_layers_to_capture"):
+            raise ValueError(
+                f"Model {model.__class__.__name__} does not implement "
+                "set_eagle3_layers_to_capture, which EAGLE3 aux hidden-state "
+                "capture requires."
+            )
         model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
     if dflash_use_aux_hidden_state:
         if is_dspark and hasattr(model, "set_dspark_layers_to_capture"):
@@ -68,10 +80,30 @@ def configure_aux_hidden_state_capture(
 
 def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
     """Init attention kernel backend."""
+    from sglang.srt.configs.model_config import AttentionArch
 
     # TODO: Refactor device-specific init branches into platform interface (separate PR).
+    # Must run before the SSM early-return below; Mamba mixers still issue GEMMs.
     if model_runner.device in ("cuda", "musa"):
         init_cublas()
+
+    # SSM models use the Mamba backend, not attention. Import inside the branch so
+    # non-SSM models don't load the Mamba-specific backend deps.
+    if model_runner.model_config.attention_arch == AttentionArch.SSM:
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            Mamba2AttnBackend,
+        )
+
+        mamba_backend = Mamba2AttnBackend(model_runner)
+        return AttentionBackends(
+            attn_backend=mamba_backend,
+            decode_attn_backend=None,
+            decode_attn_backend_group=[],
+            prefill_attention_backend_str="mamba2",
+            decode_attention_backend_str="mamba2",
+        )
+
+    server_args = model_runner.server_args
 
     # Already resolved and stamped on the runner before this call.
     resolved = ResolvedAttentionBackendStr(
@@ -125,9 +157,9 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         lazy_init_zbal_gva_mem(
             model_runner.device,
             model_runner.gpu_id,
-            get_world_group().rank_in_group,
-            get_world_group().world_size,
-            get_world_group().cpu_group,
+            get_parallel().world_group.rank_in_group,
+            get_parallel().launch_world_size,
+            get_parallel().world_group.cpu_group,
         )
 
     # Record resolved per-mode backends on the backend for model dispatch.
@@ -185,10 +217,13 @@ def _build_resolved_backend(
     init_new_workspace: bool,
 ) -> AttentionBackend:
     if resolved.is_draft_override:
-        attn_backend = _build_backend_from_str(
-            model_runner=model_runner,
-            backend_str=resolved.prefill,
-            init_new_workspace=init_new_workspace,
+        attn_backend = attn_backend_wrapper(
+            model_runner,
+            _build_full_attention_backend_from_str(
+                model_runner=model_runner,
+                backend_str=resolved.prefill,
+                init_new_workspace=init_new_workspace,
+            ),
         )
     elif resolved.decode != resolved.prefill:
         from sglang.srt.layers.attention.hybrid_attn_backend import (
@@ -201,22 +236,21 @@ def _build_resolved_backend(
         # dispatchers for Qwen3.5 when prefill and decode use different MHA
         # backends), duplicating initialization and associated state while only
         # one side backend can be active in a forward pass.
-        attn_backend = attn_backend_wrapper(
-            model_runner,
-            HybridAttnBackend(
+        hybrid = HybridAttnBackend(
+            model_runner=model_runner,
+            decode_backend=_build_full_attention_backend_from_str(
                 model_runner=model_runner,
-                decode_backend=_build_full_attention_backend_from_str(
-                    model_runner=model_runner,
-                    backend_str=resolved.decode,
-                    init_new_workspace=init_new_workspace,
-                ),
-                prefill_backend=_build_full_attention_backend_from_str(
-                    model_runner=model_runner,
-                    backend_str=resolved.prefill,
-                    init_new_workspace=init_new_workspace,
-                ),
+                backend_str=resolved.decode,
+                init_new_workspace=init_new_workspace,
+            ),
+            prefill_backend=_build_full_attention_backend_from_str(
+                model_runner=model_runner,
+                backend_str=resolved.prefill,
+                init_new_workspace=init_new_workspace,
             ),
         )
+        _require_dcp_target_verify(model_runner, hybrid.target_verify_backend())
+        attn_backend = attn_backend_wrapper(model_runner, hybrid)
         logger.info(
             f"Using hybrid attention backend for decode and prefill: "
             f"decode_backend={resolved.decode}, "
@@ -227,25 +261,38 @@ def _build_resolved_backend(
             "The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
         )
     else:
-        attn_backend = _build_backend_from_str(
+        full = _build_full_attention_backend_from_str(
             model_runner=model_runner,
             backend_str=resolved.prefill,
             init_new_workspace=init_new_workspace,
         )
+        _require_dcp_target_verify(model_runner, full)
+        attn_backend = attn_backend_wrapper(model_runner, full)
     return attn_backend
 
 
-def _build_backend_from_str(
-    *, model_runner: ModelRunner, backend_str: str, init_new_workspace: bool
-) -> AttentionBackend:
-    return attn_backend_wrapper(
-        model_runner,
-        _build_full_attention_backend_from_str(
-            model_runner=model_runner,
-            backend_str=backend_str,
-            init_new_workspace=init_new_workspace,
-        ),
-    )
+def _require_dcp_target_verify(
+    model_runner: ModelRunner, verify_backend: AttentionBackend
+) -> None:
+    """Under decode context parallelism a unified pool's target verify reads
+    each rank's shard of DCP-widened pages and merges across ranks. The backend
+    that runs it, as speculative_attention_mode selects, must declare that it
+    can; one that cannot would fail at the first verify."""
+    if (
+        model_runner.is_draft_worker
+        or model_runner.spec_algorithm.is_none()
+        or not get_parallel().dcp_enabled
+        or not get_memory().enable_unified_memory
+    ):
+        return
+    if not verify_backend.supports_dcp_target_verify:
+        raise ValueError(
+            "--enable-unified-memory with --dcp-size > 1 runs target verify on "
+            f"{type(verify_backend).__name__} (speculative_attention_mode "
+            f"{get_spec().speculative_attention_mode!r}), which does not "
+            "implement target verify under decode context parallelism. Use a "
+            "backend that does (cutedsl_mla) for the side that verifies."
+        )
 
 
 def _build_full_attention_backend_from_str(

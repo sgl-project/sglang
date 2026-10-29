@@ -1,9 +1,37 @@
 from __future__ import annotations
 
+import dataclasses
+import json
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.engram_config import (
+    EngramConfig,
+    EngramLookup,
+    EngramPlacement,
+    EngramReplication,
+    cols_per_rank,
+)
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    context_parallel_attn_dp_size,
+)
+from sglang.srt.arg_groups.overrides import (
+    _deepseek_v4_kv_cache_dtype,
+    declare_resolution,
+    model_config_of,
+    resolved_view,
+    resolving_view,
+    run_post_process_pass,
+)
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    derive_attn_tp_size,
+    get_platform,
+)
+from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -11,114 +39,119 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def validate_deepseek_v4_mega_moe_token_budget(
-    server_args: ServerArgs,
-) -> None:
-    """Ensure the DSV4 prefill budget fits MegaMoE's per-rank buffer."""
-    mega_moe_enabled = server_args.moe_a2a_backend == "megamoe"
-    if not mega_moe_enabled or server_args.disaggregation_mode == "decode":
-        # decode node will skip the check because decode bs is not relevant with --chunk-prefill-size
-        return
+def _attention_is_tensor_parallel(cfg) -> bool:
+    # validate_deepseek_v4_cp sets attn_cp_size to the whole TP group after this runs.
+    if cfg.enable_prefill_cp:
+        return False
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    return attn_tp_size > 1
 
-    if server_args.pp_size > 1 and server_args.enable_dynamic_chunking:
-        return
 
+def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
+    from sglang.srt.utils.common import is_sm100_supported
+
+    cfg = resolving_view(server_args)
+    layout = envs.SGLANG_DSV4_KV_LAYOUT
     if (
-        server_args.chunked_prefill_size is None
-        or server_args.chunked_prefill_size <= 0
+        model_config_of(server_args).hf_config.model_type != "deepseek_v41"
+        or cfg.device != "cuda"
+        or not is_sm100_supported()
+        or cfg.kv_cache_dtype != "fp8_e4m3"
+        # MegaAttention pads each rank to a 64-head tile under attention TP.
+        or (cfg.disaggregation_mode == "null" and _attention_is_tensor_parallel(cfg))
+        or (layout.is_set() and layout.get().lower() not in ("auto", "v41", "v41_new"))
+    ):
+        return "flashmla"
+    return "flashmla_mega"
+
+
+_DEPRECATED_ENGRAM_ENVS = (
+    "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE",
+    "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT",
+    "SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS",
+)
+
+
+def _engram_config_from_env(cfg) -> EngramConfig:
+    if (
+        envs.SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS.get()
+        and cfg.tp_size > 1
+        and get_platform().is_cuda
+    ):
+        return EngramConfig(lookup=EngramLookup.PEER_READ)
+    if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        shared = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get() == "shared"
+        return EngramConfig(
+            placement=EngramPlacement.CPU,
+            replication=EngramReplication.PER_NODE
+            if shared
+            else EngramReplication.NONE,
+        )
+    return EngramConfig()
+
+
+def _resolve_engram_config(server_args: ServerArgs) -> None:
+    """Validate --engram-config and declare it. A `lookup` of `auto` stays as is:
+    the layers resolve it at model construction (`resolve_engram_config`), once the
+    parallel layout and the GPUs are known."""
+    cfg = resolving_view(server_args)
+    raw = cfg.engram_config
+    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+        if raw is not None:
+            raise ValueError("--engram-config applies to DeepSeek-V4.1 only.")
+        return
+    legacy = [n for n in _DEPRECATED_ENGRAM_ENVS if getattr(envs, n).is_set()]
+    if raw is None:
+        config = _engram_config_from_env(cfg)
+        if legacy:
+            logger.warning(
+                "%s deprecated; use --engram-config '%s' instead.",
+                ", ".join(legacy),
+                json.dumps(dataclasses.asdict(config)),
+            )
+    else:
+        if legacy:
+            logger.warning("--engram-config is set; ignoring %s.", ", ".join(legacy))
+        config = EngramConfig.from_dict(raw)
+    if config.lookup == EngramLookup.PEER_READ and not get_platform().is_cuda:
+        raise ValueError("--engram-config: lookup 'peer_read' needs CUDA.")
+    if config.lookup in (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL) and (
+        cfg.attn_dp_size <= 1 or not get_platform().is_cuda
     ):
         raise ValueError(
-            "DeepSeekV4 with MegaMoE requires chunked prefill to be enabled. "
-            "Set --chunked-prefill-size to a positive value; "
-            "--chunked-prefill-size=-1 is unsafe because MegaMoE's per-rank "
-            "token requirement would not have a strict prefill-forward bound."
+            f"--engram-config: lookup {config.lookup!r} applies to DP attention on CUDA."
         )
-
-    if server_args.enable_prefill_cp:
-        token_partition_size = server_args.attn_cp_size
-        token_partition_name = "attn_cp_size"
-        token_alignment = 1
-        local_chunked_prefill_size = (
-            server_args.chunked_prefill_size + token_partition_size - 1
-        ) // token_partition_size
-    elif server_args.enable_dp_attention:
-        token_partition_size = server_args.dp_size
-        token_partition_name = "dp_size"
-        token_alignment = max(
-            server_args.tp_size // server_args.dp_size // server_args.attn_cp_size,
-            1,
-        )
-        local_chunked_prefill_size = (
-            server_args.chunked_prefill_size // token_partition_size
-        )
-    else:
-        # Pure TP and PP with static chunking are handled here.
-        token_partition_size = 1
-        token_partition_name = "none"
-        # global_num_tokens will ceil_align to attn_tp_size so the validation needs to do alignment as well
-        token_alignment = max(
-            server_args.tp_size // token_partition_size // server_args.attn_cp_size,
-            1,
-        )
-        local_chunked_prefill_size = server_args.chunked_prefill_size
-
-    if local_chunked_prefill_size <= 0:
+    if config.lookup == EngramLookup.ALL_TO_ALL:
+        text_config = model_config_of(server_args).hf_text_config
+        columns = text_config.engram_n_heads * (text_config.engram_max_ngram_size - 1)
+        if cols_per_rank(columns, cfg.tp_size) is None:
+            raise ValueError(
+                f"--engram-config: lookup 'all_to_all' needs the {columns} hash "
+                f"columns to divide over --tp-size {cfg.tp_size}."
+            )
+    # One mapping per TP group, which its ranks open through /proc.
+    if config.replication == EngramReplication.PER_NODE and cfg.nnodes > 1:
         raise ValueError(
-            "DeepSeekV4 with MegaMoE requires a positive effective per-rank "
-            "chunked prefill size. "
-            f"Current values: chunked_prefill_size="
-            f"{server_args.chunked_prefill_size}, "
-            f"token_partition={token_partition_name}, "
-            f"token_partition_size={token_partition_size}."
+            "--engram-config: replication 'per_node' needs the TP group on one node."
         )
-
-    required_tokens_per_rank = (
-        (local_chunked_prefill_size + token_alignment - 1)
-        // token_alignment
-        * token_alignment
-    )
-    max_tokens_per_rank = (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    )
-    if max_tokens_per_rank < required_tokens_per_rank:
-        raise ValueError(
-            "DeepSeekV4 with MegaMoE requires "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to "
-            "cover each rank's effective prefill token budget. "
-            f"Current values: chunked_prefill_size="
-            f"{server_args.chunked_prefill_size}, "
-            f"token_partition={token_partition_name}, "
-            f"token_partition_size={token_partition_size}, "
-            f"token_alignment={token_alignment}, "
-            f"required_per_rank={required_tokens_per_rank}, "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
-            f"{max_tokens_per_rank}. Set "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to at "
-            f"least {required_tokens_per_rank}, or lower "
-            "--chunked-prefill-size until the effective per-rank budget fits. "
-            "Otherwise MegaMoE falls back to the fused MoE path at runtime."
-        )
+    declare_resolution(server_args, "_resolve_engram_config", engram_config=config)
+    logger.info("DeepSeek-V4.1 Engram tables: %s", config)
 
 
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
-    """Residual imperative arm of the DeepSeek V4 defaults.
-
-    The attention/page/window/MoE-runner declarations moved to the override
-    registry (arg_groups/overrides.py: _deepseek_v4_overrides) and the
-    kv-cache dtype default to the resolution pipeline
-    (_deepseek_v4_kv_cache_dtype, invoked below at its legacy slot). This
-    keeps, at the legacy slot: the ROCm env fill (env-write policy), the
-    max_running_requests fill (the speculative hook is a later writer of
-    that field) and the validations.
-    """
-    from sglang.srt.utils import is_hip
+    """Apply DeepSeek V4 environment defaults, request limits, and validation."""
+    cfg = resolving_view(server_args)
 
     # FlashMLA sparse prefill (SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, default on)
     # currently returns incorrect output for DeepSeek-V4-Flash on ROCm/HIP
     # (MI355X), which breaks the disaggregation nightly. Keep the previous
     # (dense prefill) behavior on ROCm until the sparse kernel is validated
     # there;
-    if is_hip():
+    if get_platform().is_hip:
         logger.warning(
             "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
             f"for {model_arch}; set it explicitly to override."
@@ -128,66 +161,355 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # The kv-cache dtype default moved to the resolution pipeline
     # (arg_groups/overrides.py: _deepseek_v4_kv_cache_dtype), invoked here at
     # its legacy slot.
-    from sglang.srt.arg_groups.overrides import (
-        _deepseek_v4_kv_cache_dtype,
-        run_post_process_pass,
-    )
 
     run_post_process_pass(server_args, _deepseek_v4_kv_cache_dtype)
+    _resolve_engram_config(server_args)
 
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 256
-        logger.warning(
-            f"Setting max_running_requests to {server_args.max_running_requests} for {model_arch}."
+    if cfg.dsv4_attn_backend == "auto":
+        declare_resolution(
+            server_args,
+            "apply_deepseek_v4_defaults",
+            dsv4_attn_backend=_default_dsv4_attention_backend(server_args),
         )
 
-    if server_args.speculative_algorithm is not None:
-        assert server_args.speculative_algorithm in (
+    if cfg.dsv4_attn_backend == "flashmla_mega":
+        from sglang.srt.utils.common import is_sm100_supported
+
+        assert (
+            model_config_of(server_args).hf_config.model_type == "deepseek_v41"
+            and cfg.device == "cuda"
+            and is_sm100_supported()
+        ), "--dsv4-attn-backend flashmla_mega requires DeepSeek-V4.1 on SM100/SM103."
+
+    if cfg.dsv4_attn_backend == "trtllm":
+        from sglang.srt.utils.common import is_sm100_supported
+
+        assert cfg.device == "cuda" and is_sm100_supported(), (
+            "--dsv4-attn-backend trtllm requires an SM100/SM103 (Blackwell) GPU."
+        )
+        # The resolution pipeline materializes "auto" as fp8_e4m3 on CUDA.
+        assert cfg.kv_cache_dtype in ("auto", "fp8_e4m3"), (
+            "--dsv4-attn-backend trtllm requires kv_cache_dtype=fp8_e4m3, "
+            f"got {cfg.kv_cache_dtype}."
+        )
+        assert not cfg.enable_hisparse, (
+            "--dsv4-attn-backend trtllm does not support enable_hisparse."
+        )
+        assert not (
+            cfg.attn_cp_size > 1 or cfg.dcp_size > 1 or cfg.enable_prefill_cp
+        ), (
+            "--dsv4-attn-backend trtllm does not support context parallelism "
+            "(prefill CP, attention CP, or decode CP)."
+        )
+        # The PD handshake rejects peers whose KV layouts differ, but the
+        # uniform-FP8 layout has not been run under PD (#37838).
+        assert cfg.disaggregation_mode == "null", (
+            "--dsv4-attn-backend trtllm does not support PD disaggregation yet "
+            "(untested; see https://github.com/sgl-project/sglang/issues/37838)."
+        )
+        # The trtllm-gen semaphore buffer is sized from the prefill chunk
+        # bound; with chunking disabled a single long request has no bound.
+        assert cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0, (
+            "--dsv4-attn-backend trtllm requires chunked prefill "
+            "(--chunked-prefill-size > 0)."
+        )
+        logger.info(
+            "DeepSeek V4 attention: trtllm backend enabled "
+            "(uniform-FP8 KV pool, decode + sparse prefill)."
+        )
+
+    if cfg.max_running_requests is None:
+        declare_resolution(
+            server_args,
+            "apply_deepseek_v4_defaults",
+            max_running_requests=256,
+        )
+        logger.warning(
+            f"Setting max_running_requests to {cfg.max_running_requests} for {model_arch}."
+        )
+
+    if cfg.speculative_algorithm is not None:
+        assert cfg.speculative_algorithm in (
             "EAGLE",
             "DSPARK",
-        ), f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
-        if server_args.speculative_algorithm == "EAGLE":
-            assert (
-                server_args.speculative_eagle_topk == 1
-            ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+        ), (
+            f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
+        )
+        if cfg.speculative_algorithm == "EAGLE":
+            assert cfg.speculative_eagle_topk == 1, (
+                f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+            )
 
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
-    if not server_args.enable_prefill_cp:
+    cfg = resolving_view(server_args)
+    if not cfg.enable_prefill_cp:
         return
 
-    if server_args.cp_strategy != "interleave":
+    if cfg.cp_strategy not in ("interleave", "zigzag"):
         raise ValueError(
-            "DeepSeekV4 only supports interleave CP strategy, "
-            f"got {server_args.cp_strategy}"
+            f"DeepSeekV4 only supports interleave/zigzag CP strategy, got {cfg.cp_strategy}"
         )
 
-    server_args.enable_dsa_prefill_context_parallel = True
-    server_args.enable_prefill_context_parallel = False
-    server_args.dsa_prefill_cp_mode = "round-robin-split"
-    server_args.enable_dp_attention = True
-    server_args.moe_dense_tp_size = 1
-    server_args.attn_cp_size = server_args.tp_size // server_args.dp_size
-    assert (
-        server_args.dp_size == 1
-    ), "For round-robin split mode, dp attention is not supported."
-    assert (
-        server_args.tp_size <= 8
-    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-    if server_args.moe_a2a_backend not in ("none", "deepep", "megamoe"):
+    if cfg.cp_strategy == "zigzag" and not is_npu():
         raise ValueError(
-            "DeepSeekV4 CP supports moe_a2a_backend in "
-            "('none', 'deepep', 'megamoe'), "
-            f"got {server_args.moe_a2a_backend!r}."
+            "DeepSeekV4 zigzag CP requires the NPU backend; CUDA/HIP backends "
+            "reindex with interleave order."
         )
-    logger.warning(
-        "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
-        "context parallelism is enabled."
+    if get_platform().is_hip:
+        prefill_backend, decode_backend = attention_backends_of(
+            resolved_view(server_args)
+        )
+        if (prefill_backend, decode_backend) != ("dsv4", "dsv4"):
+            raise ValueError(
+                "DeepSeekV4 prefill CP on HIP requires the dsv4 attention "
+                f"backend for both phases, got prefill={prefill_backend!r}, "
+                f"decode={decode_backend!r}."
+            )
+        unsupported = (
+            ("multiple nodes", cfg.nnodes > 1),
+            (
+                "DeepSeek-V4.1",
+                model_config_of(server_args).hf_config.model_type == "deepseek_v41",
+            ),
+            (
+                "decoder SWA bounded replay",
+                cfg.enable_decoder_swa_bounded_replay,
+            ),
+            ("--enable-two-batch-overlap", cfg.enable_two_batch_overlap),
+        )
+        for feature, enabled in unsupported:
+            if enabled:
+                raise ValueError(
+                    f"DeepSeekV4 prefill CP on HIP does not support {feature} yet."
+                )
+
+    attn_dp_size = context_parallel_attn_dp_size(cfg, "DeepSeek-V4 context parallelism")
+    declare_resolution(
+        server_args,
+        "validate_deepseek_v4_cp",
+        attn_dp_size=attn_dp_size,
+        dp_size=1,
     )
-    envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
+    declare_resolution(
+        server_args,
+        "validate_deepseek_v4_cp",
+        moe_dense_tp_size=1,
+    )
+    declare_resolution(
+        server_args,
+        "validate_deepseek_v4_cp",
+        attn_cp_size=cfg.tp_size // attn_dp_size,
+    )
+    if not is_npu():
+        assert attn_dp_size == 1, (
+            "For round-robin split mode, dp attention is not supported."
+        )
+        assert cfg.tp_size <= 8, (
+            "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+        )
+    supported_a2a_backends = ("none", "deepep", "megamoe", "mori", "ascend_ops")
+    if cfg.moe_a2a_backend not in supported_a2a_backends:
+        raise ValueError(
+            f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "
+            f"got {cfg.moe_a2a_backend!r}."
+        )
+    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+        # The CP-aware sparse prefill chunk cache is validated on V4.1 only.
+        logger.warning(
+            "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
+            "context parallelism is enabled."
+        )
+        envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
-        f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
-        f"attn_cp_size={server_args.attn_cp_size}, ep_size={server_args.ep_size}, tp_size={server_args.tp_size}"
+        f"strategy={cfg.cp_strategy}, "
+        f"attn_dp_size={attn_dp_size}, moe_dense_tp_size={cfg.moe_dense_tp_size}, "
+        f"attn_cp_size={cfg.attn_cp_size}, ep_size={cfg.ep_size}, tp_size={cfg.tp_size}"
     )
+
+
+def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.enable_encoder_swa_bounded_replay:
+        return
+    # A hit's first chunk also runs up to 128 replay rows and floors its extend to
+    # whole pages, so a smaller chunk leaves the hit no page and it never admits.
+    min_chunk = 128 + (cfg.page_size or 1)
+    if (
+        cfg.max_running_requests is None
+        or cfg.max_running_requests <= 0
+        or not cfg.chunked_prefill_size
+        or cfg.chunked_prefill_size < min_chunk
+    ):
+        raise ValueError(
+            "encoder SWA replay requires --max-running-requests > 0 and at least "
+            f"{min_chunk} chunked prefill tokens per attention DP rank (128 replay "
+            "tokens plus one page)"
+        )
+
+
+def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+        is_unified_kv_triton,
+    )
+
+    cfg = resolving_view(server_args)
+    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+        if cfg.enable_encoder_swa_bounded_replay:
+            raise ValueError(
+                "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
+            )
+        return
+    if (
+        cfg.dsv4_attn_backend == "trtllm"
+        and cfg.cuda_graph_config.prefill.backend
+        not in (Backend.DISABLED, Backend.BREAKABLE)
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill "
+            "disabled or breakable"
+        )
+    if cfg.enable_encoder_swa_bounded_replay:
+        incompatible = (
+            (
+                "hardware other than CUDA or gfx950",
+                not (
+                    get_platform().is_cuda
+                    or (get_platform().is_hip and is_gfx95_supported())
+                ),
+            ),
+            (
+                "prefill CUDA graphs other than breakable",
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
+            ),
+            # ROCm replays hits in a forward of their own, outside the graph.
+            (
+                "the prefill CUDA graph on ROCm",
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+                and get_platform().is_hip,
+            ),
+            ("context parallelism", cfg.attn_cp_size > 1),
+            # ROCm replays hits in a forward of their own, which only the hitting
+            # attention-DP ranks would enter; CUDA folds them into the extend.
+            ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)),
+            ("unified memory", cfg.enable_unified_memory),
+            # Decode receives the last SWA window from prefill and never replays.
+            ("PD decode", cfg.disaggregation_mode == "decode"),
+            # On ROCm the draft keeps paged SWA, so it cannot share the window's pages.
+            (
+                "PD prefill on ROCm",
+                cfg.disaggregation_mode == "prefill" and get_platform().is_hip,
+            ),
+            ("mixed prefill/decode", cfg.enable_mixed_chunk),
+            ("LoRA", cfg.enable_lora),
+            ("radix sessions", cfg.enable_session_radix_cache),
+        )
+        for feature, enabled in incompatible:
+            if enabled:
+                raise ValueError(
+                    f"--enable-encoder-swa-bounded-replay does not support {feature} yet"
+                )
+
+    unsupported = (
+        (
+            "speculative decoding other than DSpark",
+            cfg.speculative_algorithm is not None
+            and str(cfg.speculative_algorithm).upper() != "DSPARK",
+        ),
+        ("HiSparse", cfg.enable_hisparse),
+        ("the unified KV layout", is_unified_kv_triton()),
+        (
+            "TRT-LLM with encoder SWA bounded replay",
+            cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
+        ),
+        ("two-batch overlap", cfg.enable_two_batch_overlap),
+        ("pipeline parallelism", cfg.pp_size > 1),
+    )
+    for feature, enabled in unsupported:
+        if enabled:
+            raise ValueError(
+                f"DeepSeek-V4.1 does not support {feature} yet; disable it to "
+                "serve this model."
+            )
+
+    if cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None:
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
+        supported_prefill_cp = (
+            cfg.disaggregation_mode == "prefill"
+            and cfg.enable_prefill_cp
+            and cfg.cp_strategy == "interleave"
+        )
+        if (
+            read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "mori")
+            or (
+                (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
+                and not supported_prefill_cp
+            )
+            or cfg.dcp_size != 1
+        ):
+            raise ValueError(
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL, "
+                "or MoRI, DCP=1, and CP=1 on decode. Prefill CP requires "
+                "--enable-prefill-cp with the interleave strategy. "
+                "DP attention is supported when "
+                "both servers use the same block size and target/draft KV layout."
+            )
+
+    incompatible = (
+        (
+            "the prefill CUDA graph",
+            cfg.cuda_graph_config.prefill.backend
+            not in (Backend.DISABLED, Backend.BREAKABLE),
+        ),
+        (
+            "DP attention other than attention TP 1 with supported MoE backends",
+            attn_dp_enabled_of(cfg)
+            and not (
+                cfg.attn_dp_size == cfg.tp_size
+                and cfg.attn_cp_size == 1
+                and (
+                    (get_platform().is_hip and cfg.moe_a2a_backend == "none")
+                    or (
+                        get_platform().is_cuda
+                        and cfg.moe_a2a_backend in ("none", "megamoe")
+                    )
+                )
+            ),
+        ),
+    )
+    if cfg.enable_decoder_swa_bounded_replay:
+        for feature, unsupported in incompatible:
+            if unsupported:
+                raise ValueError(
+                    "--enable-decoder-swa-bounded-replay cannot be combined with "
+                    f"{feature} yet; disable one of them."
+                )
+        return
+
+    if cfg.enable_decoder_swa_bounded_replay is False:
+        return
+
+    enabled = (
+        (get_platform().is_cuda or get_platform().is_hip)
+        # Both PD roles run it on CUDA; PD on ROCm has not been run with it.
+        and (cfg.disaggregation_mode == "null" or get_platform().is_cuda)
+        and not (cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1)
+        # Returning every hidden state runs every prompt row: nothing to trim.
+        and not cfg.enable_return_hidden_states
+        and not any(enabled for _, enabled in incompatible)
+    )
+    declare_resolution(
+        server_args,
+        "validate_deepseek_v41_features",
+        enable_decoder_swa_bounded_replay=enabled,
+    )
+    logger.info("DeepSeek-V4.1 decoder SWA bounded replay resolved to %s", enabled)

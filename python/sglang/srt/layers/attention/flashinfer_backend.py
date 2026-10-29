@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_buffer,
+    get_exec,
+    get_parallel,
+    get_platform,
+)
 
 """
 Support different attention backends.
@@ -19,18 +24,27 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.kernels.ops.attention.kv_indices import spec_kv_index_token_blocks
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
-    create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    resolve_window_id_space,
+    resolve_window_kv_pool,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.kv.alloc.id_space import (
+    IdSpace,
+    IdSpaceKind,
+    WindowRead,
+    window_read,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -41,27 +55,28 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_buffer
+from sglang.srt.speculative.eagle_utils import draft_step_writes
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
+    fill_draft_window_rail,
     generate_draft_decode_kv_indices,
+    resolve_draft_decode_window,
 )
 from sglang.srt.utils import (
     get_cuda_graph_max_batch_size,
     get_int_env_var,
     is_flashinfer_available,
-    is_sm100_supported,
     next_power_of_2,
 )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
@@ -170,6 +185,8 @@ FULL_CG_PREFILL_WORKSPACE_MARGIN = 1.25
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
+# The same for a multi-step draft step's window read rail.
+global_override_window_indptr_cpu = None
 
 
 def fast_prefill_plan(
@@ -205,9 +222,10 @@ def fast_prefill_plan(
     kv_lens_host: torch.Tensor,
     max_q_len: int,
     max_kv_len: int,
+    uniform_verify_width: Optional[int] = None,
 ) -> None:
     """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
-    draft-extend CUDA graph (FlashInfer fa2, cuda-graph mode only).
+    draft-extend or uniform-width verify CUDA graph (FlashInfer fa2 only).
 
     Upstream plan() always does qo/paged_kv/last_page_len ``.to("cpu")`` to build
     its host scheduling metadata, a blocking D2H that drains the GPU queue every
@@ -216,12 +234,12 @@ def fast_prefill_plan(
     is identical to plan()'s.
     """
     assert self.is_cuda_graph_enabled, "fast_prefill_plan is cuda-graph only"
-    assert (
-        getattr(self, "_backend", None) == "fa2"
-    ), "fast_prefill_plan supports the fa2 backend only"
-    assert (
-        getattr(self, "_cached_module", None) is not None
-    ), "fast_prefill_plan requires _cached_module from a prior real plan() (capture)"
+    assert getattr(self, "_backend", None) == "fa2", (
+        "fast_prefill_plan supports the fa2 backend only"
+    )
+    assert getattr(self, "_cached_module", None) is not None, (
+        "fast_prefill_plan requires _cached_module from a prior real plan() (capture)"
+    )
 
     if head_dim_vo is None:
         head_dim_vo = head_dim_qk
@@ -231,6 +249,7 @@ def fast_prefill_plan(
     self._qo_indptr_last = total_num_rows
     self._max_q_len = max_q_len
     self._max_kv_len = max_kv_len
+    self._window_left = window_left
 
     if self._max_total_num_rows is None:
         self._max_total_num_rows = total_num_rows
@@ -253,6 +272,30 @@ def fast_prefill_plan(
         paged_kv_indices,
         non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
     )
+
+    if custom_mask is not None:
+        # EAGLE's mask remains data-dependent: pack every actual tree-mask
+        # bit, including rejected branches. Only its row lengths are known
+        # on the host, so no device scalar read is needed for allocation.
+        assert uniform_verify_width is not None and page_size == 1
+        from sglang.kernels.ops.speculative.pack_verify_mask import (
+            pack_verify_mask_into,
+        )
+
+        packed_lengths = (kv_lens_host * uniform_verify_width + 7) // 8
+        packed_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cpu")
+        packed_indptr[1:] = torch.cumsum(packed_lengths, dim=0)
+        assert int(packed_indptr[-1]) <= self._custom_mask_buf.numel()
+        self._mask_indptr_buf.copy_(packed_indptr, non_blocking=non_blocking)
+        pack_verify_mask_into(
+            custom_mask,
+            paged_kv_indptr,
+            self._mask_indptr_buf,
+            self._custom_mask_buf,
+            batch_size=batch_size,
+            query_width=uniform_verify_width,
+            max_kv_len=max_kv_len,
+        )
 
     self._cached_q_data_type = q_data_type
     self._cached_kv_data_type = (
@@ -300,6 +343,7 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         init_new_workspace: bool = False,
+        window_kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.prefill_backend = "fa2"
@@ -307,11 +351,14 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
-            model_runner
+        self.runner_ids = model_runner.runner_ids
+        self._swa_kv_pool = resolve_window_kv_pool(model_runner)
+        # The window id space of that pool, which these reads map through.
+        self._swa_space: Optional[IdSpace] = resolve_window_id_space(
+            model_runner, self._swa_kv_pool
         )
         self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
-        self.enable_mis = model_runner.server_args.enable_mis
+        self.enable_mis = get_exec().features.enable_mis
 
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -403,7 +450,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
         # More information can be found here: https://github.com/flashinfer-ai/flashinfer/pull/1675
         self.enable_deterministic = (
-            model_runner.server_args.enable_deterministic_inference
+            get_exec().deterministic.enable_deterministic_inference
         )
         self.prefill_split_tile_size = None
         self.decode_split_tile_size = None
@@ -439,9 +486,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             self.workspace_buffer = global_workspace_buffer
-        max_bs = get_cuda_graph_max_batch_size(
-            model_runner.server_args, model_runner.req_to_token_pool.size
-        )
+        max_bs = get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
         if kv_indptr_buf is None:
             self.kv_indptr = [
                 torch.zeros(
@@ -449,6 +494,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 for _ in range(self.num_wrappers)
             ]
+        elif window_kv_indptr_buf is not None:
+            # A multi-step draft step of a window model: the window wrapper
+            # plans the step's window rail, the full wrapper the draft's
+            # shared indices.
+            assert self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+            self.kv_indptr = [window_kv_indptr_buf, kv_indptr_buf]
         else:
             assert self.num_wrappers == 1
             self.kv_indptr = [kv_indptr_buf]
@@ -458,7 +509,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 (max_bs,), dtype=torch.int32, device=model_runner.device
             )
         else:
-            assert self.num_wrappers == 1
+            # One-token pages: every wrapper reads the same last-page lengths.
+            assert self.num_wrappers == 1 or window_kv_indptr_buf is not None
             self.kv_last_page_len = kv_last_page_len_buf
 
         if not self.skip_prefill:
@@ -470,10 +522,26 @@ class FlashInferAttnBackend(AttentionBackend):
             ]
 
         fmha_backend = "auto"
-        if is_sm100_supported():
+        if get_platform().is_sm100:
+            fmha_backend = "fa2"
             # Disable CUTLASS backend when piecewise cuda graph is enabled
-            # due to TMA descriptor initialization issues on SM100 GPUs.
-            if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+            # due to TMA descriptor initialization issues on SM100 GPUs. The
+            # current FlashInfer SM100 CUTLASS FMHA dispatch only instantiates
+            # 64x64, 128x128, and 192x128 head dimensions. Keep unsupported
+            # shapes (for example Qwen3.5's 256x256) on the FA2 fallback.
+            cutlass_supported_head_dims = {
+                (64, 64),
+                (128, 128),
+                (192, 128),
+            }
+            head_dims = (
+                model_runner.model_config.head_dim,
+                model_runner.model_config.v_head_dim,
+            )
+            if (
+                head_dims in cutlass_supported_head_dims
+                and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+            ):
                 fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
@@ -538,27 +606,6 @@ class FlashInferAttnBackend(AttentionBackend):
             f"KV cache method {method_name!r} does not support {phase} with "
             f"flashinfer attention backend. Available {phase} accesses: {available}."
         )
-
-    @staticmethod
-    def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
-        """Return the SWA KV pool to translate against, or None for non-SWA models.
-
-        EAGLE-like draft workers share the target allocator for token bookkeeping,
-        but own a separate draft KV pool. Do not use the target allocator's SWA
-        mapping for that draft pool. FROZEN_KV MTP is the exception: its draft
-        path reads target KV directly, so it still needs the allocator pool when
-        the active pool is not SWA.
-        """
-        active_pool = model_runner.token_to_kv_pool
-        if isinstance(active_pool, BaseSWAKVPool):
-            return active_pool
-
-        if model_runner.is_draft_worker:
-            if not model_runner.spec_algorithm.is_frozen_kv_mtp():
-                return None
-
-        kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
-        return kvcache if isinstance(kvcache, BaseSWAKVPool) else None
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -707,8 +754,7 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
 
         if (
-            spec_info is not None
-            and spec_info.ragged_verify_layout is not None
+            forward_batch.ragged_verify_layout is not None
             and forward_mode.is_target_verify()
         ):
             raise NotImplementedError(
@@ -722,7 +768,6 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
-                req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
@@ -731,6 +776,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
+                req_pool_indices=req_pool_indices,
+                plan=forward_batch.iteration_ids,
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -743,6 +790,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                plan=forward_batch.iteration_ids,
             )
         elif forward_mode.is_dllm_extend():
             self.indices_updater_prefill.update(
@@ -755,6 +803,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+                plan=forward_batch.iteration_ids,
             )
         elif forward_mode.is_draft_extend_v2():
             self.indices_updater_prefill.update(
@@ -767,6 +816,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                plan=forward_batch.iteration_ids,
             )
         elif forward_mode.is_extend():
             # Plain EXTEND under full prefill CUDA graph. plan() runs
@@ -785,6 +835,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+                plan=forward_batch.iteration_ids,
             )
         else:
             raise ValueError("Invalid forward mode")
@@ -809,17 +860,59 @@ class FlashInferAttnBackend(AttentionBackend):
             for w in self.draft_extend_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
+        if (
+            in_capture
+            and forward_mode.is_target_verify()
+            and spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+            and getattr(spec_info, "custom_mask", None) is None
+            and self.prefill_backend == "fa2"
+            # Host-rebuilt layout only matches full attention (single wrapper);
+            # SWA/cross-attn keep the plain plan().
+            and self.dispatch_reason is None
+        ):
+            # DFLASH target-verify replays are shape-static per
+            # (bs, draft_token_num): qo_indptr is a constant arange stride of
+            # num_tokens_per_req, and the batch carries seq_lens_cpu =
+            # prefix + draft_token_num (dspark_draft._run_forward /
+            # dspark_verify.run_non_compact / dflash_worker_v2 all add the
+            # verify window host-side), which equals the device kv length
+            # generate_attn_arg_prefill produces. The host-kwargs assembly in
+            # call_begin_forward therefore applies verbatim; installing the
+            # sync-free plan removes three blocking .to("cpu") reads per
+            # replay that otherwise stall the CPU behind the in-flight graph.
+            # EAGLE uses the separate opt-in branch below because it must
+            # also pack its actual tree mask on every replay.
+            for w in self.prefill_cuda_graph_metadata[bs]:
+                w.begin_forward = partial(fast_prefill_plan, w)
+
+        if (
+            in_capture
+            and envs.SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN.get()
+            and forward_mode.is_target_verify()
+            and spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+            and spec_info.topk == 1
+            and seq_lens_cpu is not None
+            and self.prefill_backend == "fa2"
+            and self.dispatch_reason is None
+            and self.flashinfer_kv_cache_dtype
+            in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2)
+        ):
+            for w in self.prefill_cuda_graph_metadata[bs]:
+                w.begin_forward = partial(fast_prefill_plan, w)
+
         # Refill the SWA write-target buffer from the live out_cache_loc before
         # replay (bound onto the metadata at capture below).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            assert self._swa_kv_pool is not None
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+            if in_capture:
+                self.cuda_graph_swa_out_cache_loc[:n].zero_()
+            else:
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                    self.runner_ids.write_ids(forward_batch, IdSpaceKind.SLIDING_WINDOW)
                 )
-            )
             if in_capture:
                 self.forward_metadata.swa_out_cache_loc = (
                     self.cuda_graph_swa_out_cache_loc[:n]
@@ -908,14 +1001,12 @@ class FlashInferAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            assert self._swa_kv_pool is not None
-            swa_out_cache_loc = self._swa_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
+            swa_out_cache_loc = self.runner_ids.write_ids(
+                forward_batch, IdSpaceKind.SLIDING_WINDOW
             )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
-                forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
@@ -924,6 +1015,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=forward_batch.spec_info,
                 fixed_split_size=self.decode_split_tile_size,
                 disable_split_kv=False,
+                req_pool_indices=forward_batch.req_pool_indices,
+                plan=forward_batch.iteration_ids,
             )
             self.forward_metadata = DecodeMetadata(
                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
@@ -939,6 +1032,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=forward_batch.spec_info,
+                plan=forward_batch.iteration_ids,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_verify,
@@ -992,6 +1086,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
                 custom_kv_indices=self.dq_page_table,
+                plan=forward_batch.iteration_ids,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -1006,6 +1101,7 @@ class FlashInferAttnBackend(AttentionBackend):
         max_bs: int,
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
+        window_kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
@@ -1016,9 +1112,16 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             cuda_graph_kv_indices = kv_indices_buf
 
-        self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
-            cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
-        ]
+        if window_kv_indices_buf is not None:
+            # A multi-step draft step: the window wrapper plans the step's
+            # window rail into its own buffer, the full wrapper the draft's
+            # shared indices.
+            assert self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+            self.cuda_graph_kv_indices = [window_kv_indices_buf, cuda_graph_kv_indices]
+        else:
+            self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
+                cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
+            ]
 
         # SWA write-target buffer; refilled and bound onto forward_metadata in
         # init_forward_metadata_out_graph before each replay.
@@ -1057,6 +1160,23 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             for i in range(self.num_wrappers)
         ]
+
+    def get_cuda_graph_decode_wrappers(
+        self,
+        *,
+        bs: int,
+        num_tokens: int,
+    ) -> list:
+        wrappers = self.decode_cuda_graph_metadata.get(bs)
+        if wrappers is None:
+            self._prepare_cuda_graph_metadata(
+                bs,
+                num_tokens,
+                ForwardMode.DECODE,
+                spec_info=None,
+            )
+            wrappers = self.decode_cuda_graph_metadata[bs]
+        return wrappers
 
     def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
         # FlashInfer's prefill wrapper decides mask mode based on whether
@@ -1253,19 +1373,25 @@ class FlashInferAttnBackend(AttentionBackend):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
+        # Window-read planning may put the window in a custom mask. Other
+        # wrappers leave per-layer windows to forward, even when planned with -1.
+        paged_window_left = layer.sliding_window_size
+        if (
+            self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+            and prefill_wrapper_paged._window_left < 0
+        ) or (
+            self.forward_metadata.multi_item_params
+            and self.forward_metadata.multi_item_params.is_enabled()
+        ):
+            paged_window_left = -1
 
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
 
-        assert not (
-            self.prefill_uses_dequant_workspace and layer.is_cross_attention
-        ), "FP4 dequant KV cache is not supported for cross-attention"
+        assert not (self.prefill_uses_dequant_workspace and layer.is_cross_attention), (
+            "FP4 dequant KV cache is not supported for cross-attention"
+        )
 
         # We perform dequant for chunk prefill/cache reuse.
         pool = self.token_to_kv_pool
@@ -1283,15 +1409,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 v_cur=v,
             )
         else:
-            kv_cache = pool.get_kv_buffer(layer.layer_id)
+            kv_cache = self.kv_layers.read(layer.layer_id).kv()
 
         # use paged attention
         if not self.forward_metadata.use_ragged:
             if k is not None and save_kv_cache:
                 assert v is not None
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1306,20 +1436,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 kv_cache,
                 causal=causal,
                 sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
+                window_left=paged_window_left,
                 logits_soft_cap=logits_soft_cap,
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                 k_scale=layer.k_scale_float,
@@ -1331,11 +1448,11 @@ class FlashInferAttnBackend(AttentionBackend):
             # previously cached context without re-materializing KV tensors (e.g., the
             # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
             if k is None and v is None:
-                assert (
-                    not self.prefill_uses_dequant_workspace
-                ), "KV cache must be provided for ragged attention when using FP4 dequant KV cache"
-                k = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
-                v = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
+                assert not self.prefill_uses_dequant_workspace, (
+                    "KV cache must be provided for ragged attention when using FP4 dequant KV cache"
+                )
+                k = self.kv_layers.read(layer.layer_id).kv()[0]
+                v = self.kv_layers.read(layer.layer_id).kv()[1]
             causal = True
             if (
                 layer.is_cross_attention
@@ -1381,7 +1498,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     kv_cache,
                     causal=False,
                     sm_scale=layer.scaling,
-                    window_left=swa_window_left,
+                    window_left=paged_window_left,
                     logits_soft_cap=logits_soft_cap,
                     # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                     k_scale=layer.k_scale_float,
@@ -1391,9 +1508,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1414,18 +1535,17 @@ class FlashInferAttnBackend(AttentionBackend):
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                    ),
                     k,
                     v,
                     *self._kv_write_scales(layer),
@@ -1445,7 +1565,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
         else:
-            kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            kv_cache = self.kv_layers.read(layer.layer_id).kv()
 
         # Call the wrapped function
         o = decode_wrapper.forward(
@@ -1494,8 +1614,8 @@ class FlashInferIndicesUpdaterDecode:
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
+        self._swa_space = attn_backend._swa_space
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1508,7 +1628,6 @@ class FlashInferIndicesUpdaterDecode:
 
     def update(
         self,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
@@ -1517,13 +1636,15 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        *,
+        plan: IterationIds,
+        req_pool_indices: torch.Tensor,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
 
     def update_single_wrapper(
         self,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
@@ -1532,11 +1653,13 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        *,
+        plan: IterationIds,
+        req_pool_indices: torch.Tensor,
     ):
         decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
             decode_wrappers[0],
-            req_pool_indices,
             seq_lens,
             seq_lens_sum,
             self.kv_indptr[0],
@@ -1545,11 +1668,12 @@ class FlashInferIndicesUpdaterDecode:
             seq_lens_cpu,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            plan=plan,
+            req_pool_indices=req_pool_indices,
         )
 
     def update_sliding_window(
         self,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
@@ -1558,6 +1682,9 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        *,
+        plan: IterationIds,
+        req_pool_indices: torch.Tensor,
     ):
         assert self.sliding_window_size is not None
         for wrapper_id in range(2):
@@ -1587,7 +1714,6 @@ class FlashInferIndicesUpdaterDecode:
 
             self.call_begin_forward(
                 decode_wrappers[wrapper_id],
-                req_pool_indices,
                 paged_kernel_lens_tmp,
                 paged_kernel_lens_sum_tmp,
                 self.kv_indptr[wrapper_id],
@@ -1597,11 +1723,17 @@ class FlashInferIndicesUpdaterDecode:
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
+                plan=plan,
+                req_pool_indices=req_pool_indices,
+                window_rail=(
+                    wrapper_id == 0
+                    and spec_info is not None
+                    and spec_info.window_kv_indices is not None
+                ),
             )
 
     def update_cross_attention(
         self,
-        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
@@ -1610,6 +1742,9 @@ class FlashInferIndicesUpdaterDecode:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        *,
+        plan: IterationIds,
+        req_pool_indices: torch.Tensor,
     ):
         # Cache encoder_lens on CPU to avoid GPU→CPU transfer per call
         encoder_lens_cpu = encoder_lens.cpu() if encoder_lens is not None else None
@@ -1627,7 +1762,6 @@ class FlashInferIndicesUpdaterDecode:
 
             self.call_begin_forward(
                 decode_wrappers[wrapper_id],
-                req_pool_indices,
                 paged_kernel_lens,
                 seq_lens_sum,
                 self.kv_indptr[wrapper_id],
@@ -1636,12 +1770,13 @@ class FlashInferIndicesUpdaterDecode:
                 seq_lens_cpu=kv_lens_cpu,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
+                plan=plan,
+                req_pool_indices=req_pool_indices,
             )
 
     def call_begin_forward(
         self,
         wrapper: BatchDecodeWithPagedKVCacheWrapper,
-        req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
@@ -1651,9 +1786,25 @@ class FlashInferIndicesUpdaterDecode:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
+        *,
+        plan: IterationIds,
+        req_pool_indices: torch.Tensor,
+        window_rail: bool = False,
     ):
-        if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
-            bs = len(req_pool_indices)
+        # Unified SWA wrapper-0: gather from the swa canonical directly -- its
+        # entries are already swa-side physical ids, so the in-place
+        # full->swa translate below must not run on top of them.
+        runner_ids = self.attn_backend.runner_ids
+        use_swa_source = use_sliding_window_kv_pool and runner_ids.reads_are_translated
+        read_kind = IdSpaceKind.SLIDING_WINDOW if use_swa_source else IdSpaceKind.FULL
+        if window_rail:
+            # A multi-step draft step's window layers read the step's
+            # window-clipped rail, already in the window storage's ids.
+            kv_indptr = spec_info.window_kv_indptr
+            kv_indices = spec_info.window_kv_indices
+            bs = kv_indptr.shape[0] - 1
+        elif spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
+            bs = len(paged_kernel_lens)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
 
@@ -1665,31 +1816,31 @@ class FlashInferIndicesUpdaterDecode:
                     paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
                 )
 
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
+            runner_ids.pack_read_stream(
+                plan,
+                req_pool_indices=req_pool_indices,
+                seq_lens=paged_kernel_lens,
+                indptr=kv_indptr,
+                out=kv_indices,
+                kv_start_idx=kv_start_idx,
+                kind=read_kind,
             )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
 
-        if use_sliding_window_kv_pool:
+        if use_sliding_window_kv_pool and not use_swa_source and not window_rail:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
-            kv_indices[:kv_last_index] = (
-                self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    kv_indices[:kv_last_index]
-                )
-            )
+            kv_indices[:kv_last_index] = self._swa_space.ids(kv_indices[:kv_last_index])
 
         global global_override_indptr_cpu
         locally_override = False
-        if seq_lens_cpu is not None and global_override_indptr_cpu is None:
+        if (
+            not window_rail
+            and seq_lens_cpu is not None
+            and global_override_indptr_cpu is None
+        ):
             locally_override = True
             global_override_indptr_cpu = torch.empty_like(kv_indptr, device="cpu")
             global_override_indptr_cpu[0] = 0
@@ -1719,7 +1870,11 @@ class FlashInferIndicesUpdaterDecode:
                 disable_split_kv=(
                     disable_split_kv if disable_split_kv is not None else False
                 ),
-                global_override_indptr_cpu=global_override_indptr_cpu,
+                global_override_indptr_cpu=(
+                    global_override_window_indptr_cpu
+                    if window_rail
+                    else global_override_indptr_cpu
+                ),
             )
         else:
             # When using original begin_forward, don't pass global_override_indptr_cpu
@@ -1766,8 +1921,8 @@ class FlashInferIndicesUpdaterPrefill:
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
         self.qo_indptr = attn_backend.qo_indptr
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._swa_kv_pool = attn_backend._swa_kv_pool
+        self._swa_space = attn_backend._swa_space
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
         # Dispatch the update function
@@ -1795,6 +1950,8 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        *,
+        plan: IterationIds,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1815,6 +1972,8 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        *,
+        plan: IterationIds,
     ):
         if use_ragged:
             assert prefix_lens is not None
@@ -1845,6 +2004,7 @@ class FlashInferIndicesUpdaterPrefill:
             multi_item_params=multi_item_params,
             seq_lens_cpu=seq_lens_cpu,
             custom_kv_indices=custom_kv_indices,
+            plan=plan,
         )
 
     def update_sliding_window(
@@ -1863,6 +2023,8 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        *,
+        plan: IterationIds,
     ):
         if custom_kv_indices is not None:
             raise RuntimeError(
@@ -1870,41 +2032,58 @@ class FlashInferIndicesUpdaterPrefill:
             )
         if prefix_lens is None:
             num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
+            # Spec verify keeps its query block outside seq_lens, so an unset
+            # prefix means the whole sequence is already-cached prefix.
+            prefix_is_full_seq = num_accept_tokens is None
             prefix_lens = (
                 seq_lens
-                if num_accept_tokens is None
+                if prefix_is_full_seq
                 else seq_lens
                 - num_accept_tokens[: seq_lens.shape[0]].to(
                     device=seq_lens.device, dtype=seq_lens.dtype
                 )
             )
+        else:
+            prefix_is_full_seq = False
         sliding_window_size = self.sliding_window_size
         assert sliding_window_size is not None
+        # One window read for the window wrapper, whatever the mode: extend,
+        # target verify or draft extend, planned eagerly or for a graph replay.
+        # K for a ragged extend's tokens is written after the paged pass, so
+        # that pass reads the prefix alone and masks it itself.
+        window = window_read(
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            window=sliding_window_size,
+            prefix_only=use_ragged,
+        )
         for wrapper_id in range(2):
             swa_paged_custom_mask = None
             if wrapper_id == 0:
+                paged_kernel_lens = window.lens
+                kv_start_idx = window.start
                 if use_ragged:
-                    # K for extend tokens is written after the paged wrapper runs, so
-                    # the paged wrapper sees prefix-only. Trim to the last `window` tokens
-                    # (required for SWATokenToKVPoolAllocator; also keeps mask O(window)).
-                    effective_start = torch.clamp(
-                        prefix_lens - sliding_window_size, min=0
-                    )
-                    paged_kernel_lens = prefix_lens - effective_start
                     paged_kernel_lens_sum = paged_kernel_lens.sum().item()
-                    kv_start_idx = effective_start
                     swa_paged_custom_mask = self._build_swa_prefix_custom_mask(
-                        prefix_lens, seq_lens, effective_start
+                        prefix_lens, seq_lens, kv_start_idx
                     )
                 else:
-                    # window attention use paged only; the trim below is
-                    # request-granular, exactness comes from plan-time window_left
-                    paged_kernel_lens = torch.minimum(
-                        seq_lens,
-                        sliding_window_size + seq_lens - prefix_lens,
-                    )
-                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
-                    kv_start_idx = seq_lens - paged_kernel_lens
+                    if prefix_is_full_seq and seq_lens_cpu is not None:
+                        # prefix_lens is seq_lens, so the trim is min(seq_lens, window);
+                        # summing the host mirror avoids draining the stream.
+                        paged_kernel_lens_sum = int(
+                            torch.clamp(seq_lens_cpu, max=sliding_window_size).sum()
+                        )
+                    else:
+                        paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+            elif use_ragged:
+                # Extend K/V lands after the paged pass: plan over the prefix only.
+                paged_kernel_lens = prefix_lens
+                if extend_prefix_lens_cpu is not None:
+                    paged_kernel_lens_sum = sum(extend_prefix_lens_cpu)
+                else:
+                    paged_kernel_lens_sum = prefix_lens.sum().item()
+                kv_start_idx = None
             else:
                 # full attention
                 paged_kernel_lens = seq_lens
@@ -1931,13 +2110,8 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
-                # paged-only SWA path only; ragged keeps its custom prefix
-                # mask, spec-verify keeps its tree mask
-                window_left=(
-                    sliding_window_size
-                    if (wrapper_id == 0 and not use_ragged and spec_info is None)
-                    else -1
-                ),
+                window=window if wrapper_id == 0 else None,
+                plan=plan,
             )
 
     def _build_swa_prefix_custom_mask(
@@ -1997,6 +2171,8 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        *,
+        plan: IterationIds,
     ):
         if custom_kv_indices is not None:
             raise RuntimeError(
@@ -2032,6 +2208,7 @@ class FlashInferIndicesUpdaterPrefill:
                 cross_attention_custom_mask=(
                     cross_attention_custom_mask if wrapper_id == 1 else None
                 ),
+                plan=plan,
             )
 
     def call_begin_forward(
@@ -2054,9 +2231,17 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
-        window_left: int = -1,
+        window: Optional[WindowRead] = None,
+        *,
+        plan: IterationIds,
     ):
         bs = len(seq_lens)
+        # Unified SWA wrapper-0: gather from the swa canonical directly -- its
+        # entries are already swa-side physical ids, so the in-place
+        # full->swa translate below must not run on top of them.
+        runner_ids = self.attn_backend.runner_ids
+        use_swa_source = use_sliding_window_kv_pool and runner_ids.reads_are_translated
+        read_kind = IdSpaceKind.SLIDING_WINDOW if use_swa_source else IdSpaceKind.FULL
         if spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
@@ -2082,14 +2267,14 @@ class FlashInferIndicesUpdaterPrefill:
                     dtype=torch.int32,
                     device=req_pool_indices.device,
                 )
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    kv_indptr,
-                    kv_start_idx,
-                    kv_indices,
-                    self.req_to_token.shape[1],
+                runner_ids.pack_read_stream(
+                    plan,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=paged_kernel_lens,
+                    indptr=kv_indptr,
+                    out=kv_indices,
+                    kv_start_idx=kv_start_idx,
+                    kind=read_kind,
                 )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
@@ -2097,25 +2282,19 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = cross_attention_custom_mask
         else:
             assert isinstance(spec_info, SpecInput)
-            if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
-                kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                    spec_info.generate_attn_arg_prefill(
-                        req_pool_indices,
-                        paged_kernel_lens,
-                        paged_kernel_lens_sum,
-                        self.req_to_token,
-                        kv_start_idx=kv_start_idx,
-                    )
+            # Every mode reads from its window read's first token on; a mask
+            # it returns carries the window.
+            kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                spec_info.generate_attn_arg_prefill(
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    runner_ids=runner_ids,
+                    plan=plan,
+                    kind=read_kind,
+                    window=window,
                 )
-            else:
-                kv_indices, kv_indptr, qo_indptr, custom_mask = (
-                    spec_info.generate_attn_arg_prefill(
-                        req_pool_indices,
-                        paged_kernel_lens,
-                        paged_kernel_lens_sum,
-                        self.req_to_token,
-                    )
-                )
+            )
 
         # extend part
         if use_ragged:
@@ -2128,18 +2307,17 @@ class FlashInferIndicesUpdaterPrefill:
                 q_data_type=self.q_data_type,
             )
 
-        if use_sliding_window_kv_pool:
+        if use_sliding_window_kv_pool and not use_swa_source:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
-            kv_indices[:kv_last_index] = (
-                self._swa_kv_pool.translate_loc_from_full_to_swa(
-                    kv_indices[:kv_last_index]
-                )
-            )
+            kv_indices[:kv_last_index] = self._swa_space.ids(kv_indices[:kv_last_index])
 
         # cached part
         # Conditionally set multi-item parameters
-        if multi_item_params is not None and multi_item_params.is_enabled():
+        multi_item_enabled = (
+            multi_item_params is not None and multi_item_params.is_enabled()
+        )
+        if multi_item_enabled:
             # Multi-item scoring is active - use specialized parameters and disable generic custom_mask
             use_custom_mask = None
             prefix_len_ptr = multi_item_params.prefix_len_ptr
@@ -2154,6 +2332,21 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len = 0
             max_item_len_ptr = None
 
+        # A cuda-graph wrapper built with custom_mask_buf always runs MaskMode.CUSTOM,
+        # but plan(custom_mask=None) skips refilling that buffer, so the kernel would
+        # silently read stale capture-time mask bits.
+        if (
+            spec_info is not None
+            and use_custom_mask is None
+            and wrapper_paged.is_cuda_graph_enabled
+            and wrapper_paged._custom_mask_buf is not None
+        ):
+            raise RuntimeError(
+                f"{spec_info.spec_input_type} verify planned without a custom mask on "
+                "a cuda-graph wrapper captured with one; capture and replay must agree "
+                "on custom_mask."
+            )
+
         # fast_prefill_plan (installed at capture) is sync-free: it needs the
         # host-known qo/kv layout from the caller. Assert rather than silently
         # fall back to plan()'s blocking D2H on the replay hot-path.
@@ -2166,13 +2359,19 @@ class FlashInferIndicesUpdaterPrefill:
             and wrapper_paged.begin_forward.func is fast_prefill_plan
         )
         if uses_fast_prefill:
-            assert (
-                seq_lens_cpu is not None
-            ), "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
-            assert (
-                num_tokens_per_req is not None and num_tokens_per_req > 0
-            ), f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
+            assert seq_lens_cpu is not None, (
+                "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
+            )
+            assert num_tokens_per_req is not None and num_tokens_per_req > 0, (
+                f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
+            )
             seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
+            eagle_verify = spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
+            assert use_custom_mask is None or eagle_verify
+            if eagle_verify:
+                # EAGLE carries the committed prefix length; its generated KV
+                # layout includes the complete candidate window after it.
+                seq_lens_cpu_i32 = seq_lens_cpu_i32 + num_tokens_per_req
             qo_indptr_host = torch.arange(
                 0,
                 (bs + 1) * num_tokens_per_req,
@@ -2189,10 +2388,19 @@ class FlashInferIndicesUpdaterPrefill:
                 max_q_len=num_tokens_per_req,
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
+            if eagle_verify:
+                paged_plan_kwargs["uniform_verify_width"] = num_tokens_per_req
 
-        if window_left >= 0:
-            # selects the module with the per-element window mask compiled in
-            paged_plan_kwargs["window_left"] = window_left
+        # The kernel masks the window itself unless a mask carries it: the
+        # window selects the module with the per-element window mask compiled
+        # in.
+        if (
+            window is not None
+            and use_custom_mask is None
+            and not multi_item_enabled
+            and window.window_left >= 0
+        ):
+            paged_plan_kwargs["window_left"] = window.window_left
 
         wrapper_paged.begin_forward(
             qo_indptr,
@@ -2216,6 +2424,46 @@ class FlashInferIndicesUpdaterPrefill:
         )
 
 
+def _build_draft_indptr_host(
+    seq_lens_cpu: torch.Tensor, topk: int, num_steps: int
+) -> torch.Tensor:
+    """Mirror the draft kernel's prefix sums from resolved host lengths.
+
+    At draft entry, positions repeat each committed sequence length ``topk``
+    times. Step i adds i+1 tokens per branch. Only live entries match the
+    device prefix sums: graph padding fills CPU lengths with 1 while device
+    positions stay 0, so padded entries differ.
+    """
+    assert seq_lens_cpu.device.type == "cpu" and seq_lens_cpu.ndim == 1
+    offsets = [0]
+    for length in seq_lens_cpu.tolist():
+        for _ in range(topk):
+            offsets.append(offsets[-1] + length)
+    return torch.tensor(
+        [
+            [offset + branch * (step + 1) for branch, offset in enumerate(offsets)]
+            for step in range(num_steps)
+        ],
+        dtype=torch.int32,
+        device="cpu",
+    )
+
+
+def _build_draft_window_indptr_host(
+    seq_lens_cpu: torch.Tensor, topk: int, num_steps: int, window: int
+) -> torch.Tensor:
+    """Mirror the draft window rail's prefix sums from resolved host lengths:
+    step i of a branch reads ``min(length + i + 1, window)`` tokens. Live
+    entries only, as `_build_draft_indptr_host`."""
+    assert seq_lens_cpu.device.type == "cpu" and seq_lens_cpu.ndim == 1
+    branch_lens = seq_lens_cpu.repeat_interleave(topk)
+    rows = []
+    for step in range(num_steps):
+        lens = torch.clamp(branch_lens + step + 1, max=window)
+        rows.append(torch.nn.functional.pad(torch.cumsum(lens, dim=0), (1, 0)))
+    return torch.stack(rows).to(torch.int32)
+
+
 class FlashInferMultiStepDraftBackend:
     """
     Wrap multiple flashinfer attention backends as one for multiple consecutive
@@ -2234,7 +2482,7 @@ class FlashInferMultiStepDraftBackend:
         self.page_size = model_runner.page_size
 
         max_bs = get_cuda_graph_max_batch_size(
-            model_runner.server_args, model_runner.req_to_token_pool.size * self.topk
+            model_runner.req_to_token_pool.size * self.topk
         )
         self.kv_indptr = torch.zeros(
             (
@@ -2247,6 +2495,25 @@ class FlashInferMultiStepDraftBackend:
         self.kv_last_page_len = torch.ones(
             (max_bs,), dtype=torch.int32, device=model_runner.device
         )
+        # Window layers read a window-clipped rail of their own per step, in
+        # the ids of the storage they live in: the shared draft indices are
+        # FULL ids, and the draft's chain is not part of the committed prefix
+        # yet. They attend window + 1 tokens, as the decode window wrapper
+        # clamps them.
+        self.window_rail = model_runner.sliding_window_size is not None
+        self.window_tokens = (
+            model_runner.sliding_window_size + 1 if self.window_rail else 0
+        )
+        self.window_kv_indptr = (
+            torch.zeros(
+                (self.speculative_num_steps, max_bs + 1),
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+            if self.window_rail
+            else None
+        )
+        self.cuda_graph_window_kv_indices = None
         self.attn_backends: List[FlashInferAttnBackend] = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
@@ -2255,6 +2522,9 @@ class FlashInferMultiStepDraftBackend:
                     skip_prefill=True,
                     kv_indptr_buf=self.kv_indptr[i],
                     kv_last_page_len_buf=self.kv_last_page_len,
+                    window_kv_indptr_buf=(
+                        self.window_kv_indptr[i] if self.window_rail else None
+                    ),
                 )
             )
 
@@ -2263,12 +2533,26 @@ class FlashInferMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
+            model_runner
+        )
+        self.runner_ids = model_runner.runner_ids
+
+    def _step_writes(self, forward_batch, step: int):
+        return draft_step_writes(
+            forward_batch,
+            step,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            enabled=self.attn_backends[step].use_sliding_window_kv_pool,
+        )
 
     def common_template(
         self,
         forward_batch: ForwardBatch,
         kv_indices_buffer: torch.Tensor,
         call_fn: Callable,
+        window_kv_indices_buffer: Optional[torch.Tensor] = None,
     ):
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
@@ -2285,40 +2569,133 @@ class FlashInferMultiStepDraftBackend:
             seq_lens_sum=seq_lens_sum,
         )
 
+        # Blocks from the length sum (upper bound on the longest live row),
+        # capped by the draft window, not from the table width. pool_len is
+        # the req_to_token row width, the same table width the other call
+        # sites size from.
+        num_token_blocks = spec_kv_index_token_blocks(
+            table_width=self.pool_len,
+            kv_lens_sum=seq_lens_sum,
+            batch_size=num_seqs,
+            base_programs=self.speculative_num_steps * num_seqs * self.topk,
+            length_cap=(
+                self.draft_window_size + self.draft_sink_size
+                if self.draft_window_size > 0
+                else None
+            ),
+        )
+        src = self.runner_ids.read_source(
+            forward_batch.iteration_ids,
+            req_pool_indices=forward_batch.req_pool_indices,
+            bs=num_seqs,
+        )
+        host_lengths = forward_batch.seq_lens_cpu
+        use_host_indptr = (
+            envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.get()
+            and self.draft_window_size == 0
+            and host_lengths is not None
+            and host_lengths.device.type == "cpu"
+            and host_lengths.numel() == num_seqs
+        )
+        # The existing token-block kernel copies every index, but distributes
+        # long contexts across CTAs instead of serially walking them in 3 CTAs.
+        num_blocks = (
+            min(32, max(1, (max(host_lengths.tolist(), default=0) + 511) // 512))
+            if use_host_indptr
+            else 1
+        )
+        # One launch, the larger of the two tilings: the host-plan path never
+        # drops below its 512-token blocks.
+        num_token_blocks = max(num_token_blocks, num_blocks)
         self.generate_draft_decode_kv_indices[
-            (self.speculative_num_steps, num_seqs, self.topk)
+            (self.speculative_num_steps * num_token_blocks, num_seqs, self.topk)
         ](
-            forward_batch.req_pool_indices,
-            self.req_to_token_pool.req_to_token,
+            src.row_ids,
+            src.ids,
             forward_batch.seq_lens,
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
-            self.pool_len,
+            src.row_stride,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
             next_power_of_2(num_seqs),
             next_power_of_2(self.speculative_num_steps),
             next_power_of_2(bs),
             self.page_size,
+            self.draft_window_size,
+            self.draft_sink_size,
+            ENTRY_PAGE_SIZE=src.entry_page_size,
+            v2p=src.v2p,
+            TRANSLATE=src.v2p is not None,
+            # A single token block without the host plan is the historical
+            # launch; NUM_STEPS=0 keeps its 128-wide program instead of the
+            # token-block specialization.
+            NUM_STEPS=(
+                self.speculative_num_steps
+                if num_token_blocks > 1 or use_host_indptr
+                else 0
+            ),
         )
+
+        if self.window_rail:
+            fill_draft_window_rail(
+                self.runner_ids,
+                forward_batch,
+                window_kv_indices_buffer,
+                self.window_kv_indptr,
+                topk=self.topk,
+                num_steps=self.speculative_num_steps,
+                page_size=self.page_size,
+                window=self.window_tokens,
+            )
 
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
-        # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
-        indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
-        global global_override_indptr_cpu
-
-        for i in range(self.speculative_num_steps - 1):
-            forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
-            forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-                : draft_kv_indices_used_len(seq_lens_sum, self.topk, bs, i + 1)
-            ]
-            global_override_indptr_cpu = indptr_cpu_whole[i]
-            call_fn(i, forward_batch)
-
-        global_override_indptr_cpu = None
+        # resolve_seq_lens_cpu already supplies the committed lengths after
+        # acceptance/rollback. Do not drain the GPU queue to read them again.
+        indptr_cpu_whole = (
+            _build_draft_indptr_host(
+                host_lengths, self.topk, self.speculative_num_steps
+            )
+            if use_host_indptr
+            else self.kv_indptr[:, : bs + 1].cpu()
+        )
+        window_indptr_cpu_whole = None
+        if self.window_rail:
+            window_indptr_cpu_whole = (
+                _build_draft_window_indptr_host(
+                    host_lengths,
+                    self.topk,
+                    self.speculative_num_steps,
+                    self.window_tokens,
+                )
+                if use_host_indptr
+                else self.window_kv_indptr[:, : bs + 1].cpu()
+            )
+        global global_override_indptr_cpu, global_override_window_indptr_cpu
+        previous_override = global_override_indptr_cpu
+        previous_window_override = global_override_window_indptr_cpu
+        try:
+            for i in range(self.speculative_num_steps - 1):
+                forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
+                forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
+                    : draft_kv_indices_used_len(seq_lens_sum, self.topk, bs, i + 1)
+                ]
+                global_override_indptr_cpu = indptr_cpu_whole[i]
+                if self.window_rail:
+                    forward_batch.spec_info.window_kv_indptr = self.window_kv_indptr[
+                        i, : bs + 1
+                    ]
+                    forward_batch.spec_info.window_kv_indices = (
+                        window_kv_indices_buffer[i][: bs * self.window_tokens]
+                    )
+                    global_override_window_indptr_cpu = window_indptr_cpu_whole[i]
+                call_fn(i, forward_batch)
+        finally:
+            global_override_indptr_cpu = previous_override
+            global_override_window_indptr_cpu = previous_window_override
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
@@ -2329,6 +2706,17 @@ class FlashInferMultiStepDraftBackend:
             dtype=torch.int32,
             device="cuda",
         )
+        window_kv_indices = None
+        if self.window_rail:
+            # zeros, not empty: a static pool translates the whole row.
+            window_kv_indices = torch.zeros(
+                (
+                    self.speculative_num_steps,
+                    forward_batch.batch_size * self.topk * self.window_tokens,
+                ),
+                dtype=torch.int32,
+                device="cuda",
+            )
 
         def call_fn(i, forward_batch):
             forward_batch.spec_info.kv_indptr = (
@@ -2337,9 +2725,22 @@ class FlashInferMultiStepDraftBackend:
             forward_batch.spec_info.kv_indices = (
                 forward_batch.spec_info.kv_indices.clone()
             )
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+            if self.window_rail:
+                forward_batch.spec_info.window_kv_indptr = (
+                    forward_batch.spec_info.window_kv_indptr.clone()
+                )
+                forward_batch.spec_info.window_kv_indices = (
+                    forward_batch.spec_info.window_kv_indices.clone()
+                )
+            with self._step_writes(forward_batch, i):
+                self.attn_backends[i].init_forward_metadata(forward_batch)
 
-        self.common_template(forward_batch, kv_indices, call_fn)
+        self.common_template(
+            forward_batch,
+            kv_indices,
+            call_fn,
+            window_kv_indices_buffer=window_kv_indices,
+        )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         # generate_draft_decode_kv_indices packs topk per-branch sequences per row,
@@ -2353,10 +2754,21 @@ class FlashInferMultiStepDraftBackend:
             dtype=torch.int32,
             device="cuda",
         )
+        if self.window_rail:
+            self.cuda_graph_window_kv_indices = torch.zeros(
+                (self.speculative_num_steps, max_bs * self.topk * self.window_tokens),
+                dtype=torch.int32,
+                device="cuda",
+            )
 
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(
-                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
+                max_bs,
+                max_num_tokens,
+                kv_indices_buf=self.cuda_graph_kv_indices[i],
+                window_kv_indices_buf=(
+                    self.cuda_graph_window_kv_indices[i] if self.window_rail else None
+                ),
             )
 
     def init_forward_metadata_out_graph(
@@ -2370,11 +2782,17 @@ class FlashInferMultiStepDraftBackend:
 
         def call_fn(i, fb):
             inner_fb = build_inner_fb_view(fb, bs=bs, forward_mode=ForwardMode.DECODE)
-            self.attn_backends[i].init_forward_metadata_out_graph(
-                inner_fb, in_capture=in_capture
-            )
+            with self._step_writes(inner_fb, i):
+                self.attn_backends[i].init_forward_metadata_out_graph(
+                    inner_fb, in_capture=in_capture
+                )
 
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+        self.common_template(
+            forward_batch,
+            self.cuda_graph_kv_indices,
+            call_fn,
+            window_kv_indices_buffer=self.cuda_graph_window_kv_indices,
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for attn_backend in self.attn_backends:

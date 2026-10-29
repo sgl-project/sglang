@@ -17,7 +17,9 @@ from sglang.kernels.jit.utils.common import (
     cache_once,
     is_hip_runtime,
     is_musa_runtime,
+    is_sail_runtime,
 )
+from sglang.srt.utils.common import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +44,7 @@ def _jit_cuda_version() -> tuple[int, ...]:
     """CUDA version of the nvcc that JIT builds actually run.
 
     The target has to match the compiler, not the toolkit PyTorch was built
-    against: a cu129 wheel on a CUDA 12.8 toolkit would otherwise select
+    against: a cu130 wheel on a CUDA 12.8 toolkit would otherwise select
     `sm_120f`, which nvcc 12.8 rejects. Resolve nvcc the way tvm-ffi does
     (`CUDA_HOME` / `CUDA_PATH`, then `$PATH`, then `/usr/local/cuda`) and fall
     back to `torch.version.cuda` when it cannot be probed.
@@ -67,6 +69,14 @@ def _jit_cuda_version() -> tuple[int, ...]:
     from sglang.srt.utils.common import get_cuda_version
 
     return get_cuda_version()
+
+
+def _sail_arch_suffix(major: int, minor: int) -> str:
+    """SAIL devices below the SM89 capability require the arch-specific target
+    variant for JIT compilation (the ``"a"`` suffix); SM89+ SAIL devices stay
+    unsuffixed like HIP/MUSA.
+    """
+    return "a" if (major <= 8 and minor < 9) else ""
 
 
 def _cuda_arch_suffix(major: int, minor: int) -> str:
@@ -103,11 +113,18 @@ def _init_jit_cuda_arch_once():
     # JIT builds target the exact local GPU, so the arch-specific target is
     # always correct on Hopper+ and unlocks arch-only instructions (redux.f32).
     # HIP/MUSA capability numbers aren't CUDA SM versions and stay unsuffixed.
-    suffix = (
-        ""
-        if (is_hip_runtime() or is_musa_runtime())
-        else _cuda_arch_suffix(major, minor)
-    )
+    if is_hip_runtime() or is_musa_runtime():
+        suffix = ""
+    elif is_sail_runtime():
+        suffix = _sail_arch_suffix(major, minor)
+    else:
+        suffix = _cuda_arch_suffix(major, minor)
+        if (major, minor) == (10, 7):
+            from flashinfer.compilation_context import cutlass_supports_sm107
+
+            if not cutlass_supports_sm107():
+                major, minor, suffix = 10, 0, "f"
+
     _CUDA_ARCH = ArchInfo(major, minor, suffix)
 
 
@@ -179,3 +196,9 @@ def is_arch_support_pdl() -> bool:
     if is_hip_runtime() or is_musa_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
+
+
+def get_activation_cuda_cflags() -> list[str]:
+    if is_cuda():
+        return ["--use_fast_math"]
+    return []

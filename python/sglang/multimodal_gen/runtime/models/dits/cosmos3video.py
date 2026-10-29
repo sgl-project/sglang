@@ -7,19 +7,21 @@ cross-attends from noisy visual tokens to that cache at every denoising step.
 """
 
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.activation.activation import relu2
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_qknorm_rope_pack_kv,
 )
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_world_size,
@@ -43,6 +45,13 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8_step_precision import (
+    MODELOPT_FP8_QUANT_CONFIGS,
+    StepMixedPrecisionController,
+    install_step_mixed_precision,
+    read_checkpoint_step_policy,
+    resolve_step_policy,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     Qwen3VLTextRotaryEmbedding,
 )
@@ -55,6 +64,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -63,6 +73,27 @@ logger = init_logger(__name__)
 
 def is_cosmos_layer(name: str, _module: object) -> bool:
     return is_module_list_entry_in(name, ("layers", "gen_layers"))
+
+
+def _can_enable_t1_fused_qk_norm_rope(
+    *,
+    is_blackwell: bool,
+    is_hopper: bool,
+    hidden_act: str,
+    tp_size: int,
+    sp_size: int,
+    is_compiled: bool,
+    hidden_size: int = 0,
+) -> bool:
+    if is_compiled:
+        return False
+    if is_blackwell:
+        return True
+    if not is_hopper or sp_size != 1:
+        return False
+    if tp_size == 1:
+        return hidden_act != "relu2" or hidden_size == 2048
+    return tp_size == 2 and hidden_act == "silu" and hidden_size == 5120
 
 
 # -----------------------------------------------------------------------------
@@ -99,6 +130,7 @@ def compute_mrope_position_ids_vision(
     temporal_compression_factor: int = 4,
     base_temporal_compression_factor: int | None = None,
     start_frame_offset: int = 0,
+    temporal_position_period: int | None = None,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate 3D mRoPE position IDs for vision tokens.
 
@@ -115,6 +147,11 @@ def compute_mrope_position_ids_vision(
     Returns:
         (position_ids [3, grid_t * grid_h * grid_w], next_temporal_offset)
     """
+    if temporal_position_period is not None and temporal_position_period <= 0:
+        raise ValueError(
+            "Cosmos3 temporal_position_period must be positive, "
+            f"got {temporal_position_period}."
+        )
     fps_modulation = fps is not None and grid_t > 1
 
     if fps_modulation:
@@ -126,6 +163,10 @@ def compute_mrope_position_ids_vision(
         )
         base_tps = base_fps / effective_base_tcf
         frame_indices = torch.arange(grid_t, dtype=torch.float32, device=device)
+        if temporal_position_period is not None:
+            # Camera-major multiview packing: frame indexes wrap per view so
+            # matching frames of every camera share one temporal coordinate.
+            frame_indices = frame_indices.remainder(temporal_position_period)
         t_index = (
             ((frame_indices + start_frame_offset) / tps * base_tps + temporal_offset)
             .view(-1, 1)
@@ -133,11 +174,11 @@ def compute_mrope_position_ids_vision(
             .flatten()
         )
     else:
+        frame_indices = torch.arange(grid_t, dtype=torch.long, device=device)
+        if temporal_position_period is not None:
+            frame_indices = frame_indices.remainder(temporal_position_period)
         t_index = (
-            torch.arange(grid_t, dtype=torch.long, device=device)
-            .view(-1, 1)
-            .expand(-1, grid_h * grid_w)
-            .flatten()
+            frame_indices.view(-1, 1).expand(-1, grid_h * grid_w).flatten()
             + int(temporal_offset)
             + start_frame_offset
         )
@@ -248,6 +289,8 @@ def _apply_qwen3_qk_norm_rope(
     )
 
 
+# Also writes K/V into one packed buffer in the same launch, which
+# apply_qk_norm_rope cannot.
 def _apply_qwen3_qk_norm_rope_pack_kv(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -344,7 +387,6 @@ class DomainAwareLinear(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
-        self.num_domains = num_domains
         self.fc = nn.Embedding(num_domains, output_size * input_size)
         self.bias = nn.Embedding(num_domains, output_size)
         nn.init.xavier_uniform_(
@@ -516,8 +558,17 @@ class Cosmos3DenseMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         up, _ = self.up_proj(x)
-        up = F.relu(up)
-        out, _ = self.down_proj(up * up)
+        if (
+            up.is_cuda
+            and up.dtype == torch.bfloat16
+            and up.is_contiguous()
+            and not torch.is_grad_enabled()
+        ):
+            up = relu2(up, fast_math=False)
+        else:
+            up = F.relu(up)
+            up = up * up
+        out, _ = self.down_proj(up)
         return out
 
 
@@ -540,6 +591,27 @@ def _build_mlp(
 # -----------------------------------------------------------------------------
 # Cosmos3 UND Causal Attention
 # -----------------------------------------------------------------------------
+
+
+def _initialize_attention_projections(module, prefix, quant_config):
+    module.q_size = module.num_attention_heads * module.head_dim
+    module.kv_size = module.num_key_value_heads * module.head_dim
+    module.to_qkv = MergedColumnParallelLinear(
+        module.hidden_size,
+        [module.q_size, module.kv_size, module.kv_size],
+        bias=False,
+        gather_output=False,
+        quant_config=quant_config,
+        prefix=add_prefix("to_qkv", prefix),
+    )
+    module.to_out = RowParallelLinear(
+        module.q_size,
+        module.hidden_size,
+        bias=False,
+        input_is_parallel=True,
+        quant_config=quant_config,
+        prefix=add_prefix("to_out", prefix),
+    )
 
 
 class Cosmos3CausalAttention(nn.Module):
@@ -577,24 +649,7 @@ class Cosmos3CausalAttention(nn.Module):
         self.local_num_attention_heads = num_attention_heads // self.tp_size
         self.local_num_key_value_heads = num_key_value_heads // self.tp_size
 
-        self.q_size = num_attention_heads * head_dim
-        self.kv_size = num_key_value_heads * head_dim
-        self.to_qkv = MergedColumnParallelLinear(
-            hidden_size,
-            [self.q_size, self.kv_size, self.kv_size],
-            bias=False,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_qkv", prefix),
-        )
-        self.to_out = RowParallelLinear(
-            num_attention_heads * head_dim,
-            hidden_size,
-            bias=False,
-            input_is_parallel=True,
-            quant_config=quant_config,
-            prefix=add_prefix("to_out", prefix),
-        )
+        _initialize_attention_projections(self, prefix, quant_config)
 
         # Per-head QK norm (optional; some backbones omit it on text).
         if qk_norm:
@@ -713,24 +768,7 @@ class Cosmos3CrossAttention(nn.Module):
         self.local_num_attention_heads = num_attention_heads // self.tp_size
         self.local_num_key_value_heads = num_key_value_heads // self.tp_size
 
-        self.q_size = num_attention_heads * head_dim
-        self.kv_size = num_key_value_heads * head_dim
-        self.to_qkv = MergedColumnParallelLinear(
-            hidden_size,
-            [self.q_size, self.kv_size, self.kv_size],
-            bias=False,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_qkv", prefix),
-        )
-        self.to_out = RowParallelLinear(
-            num_attention_heads * head_dim,
-            hidden_size,
-            bias=False,
-            input_is_parallel=True,
-            quant_config=quant_config,
-            prefix=add_prefix("to_out", prefix),
-        )
+        _initialize_attention_projections(self, prefix, quant_config)
 
         self.norm_q = RMSNorm(head_dim, eps=1e-6)
         self.norm_k = RMSNorm(head_dim, eps=1e-6)
@@ -742,6 +780,7 @@ class Cosmos3CrossAttention(nn.Module):
             causal=False,
             supported_attention_backends=supported_attention_backends,
             prefix=add_prefix("attn", prefix),
+            is_cross_attention=True,
         )
 
     def forward(
@@ -753,6 +792,7 @@ class Cosmos3CrossAttention(nn.Module):
         rope_cache_positions: torch.Tensor,
         use_fused_qk_norm_rope: bool,
         round_norm_before_rope: bool = False,
+        multiview_layout: Any | None = None,
     ) -> torch.Tensor:
         """Cross-attention from GEN to cached UND K/V.
 
@@ -789,8 +829,8 @@ class Cosmos3CrossAttention(nn.Module):
 
         use_fused_kv_pack = (
             use_fused_qk_norm_rope
+            and multiview_layout is None
             and q.device.type == "cuda"
-            and not torch.compiler.is_compiling()
             and get_sp_world_size() == 1
             and q.dtype == k.dtype == v.dtype == k_und.dtype == v_und.dtype
             and self.norm_q.weight.dtype == q.dtype
@@ -836,13 +876,34 @@ class Cosmos3CrossAttention(nn.Module):
             q, k = _apply_qwen3_qk_norm_rope_split(
                 q, k, self.norm_q, self.norm_k, self.head_dim, cos_sin_cache
             )
-        if not use_fused_kv_pack:
+        if multiview_layout is not None:
+            # Sparse cross-camera attention (Cosmos3 Multiview-AV): the mask
+            # replaces the dense [UND | GEN] key layout; the subclass applies
+            # the Ulysses collectives itself.
+            out = self._forward_multiview(q, k, v, k_und, v_und, multiview_layout)
+        elif not use_fused_kv_pack:
             # K/V = [UND prefix (replicated on SP ranks) | GEN suffix].
             # USPAttention applies the configured backend and SP collectives.
             out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
         out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)
         return out
+
+    def _forward_multiview(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
+        multiview_layout: Any,
+    ) -> torch.Tensor:
+        """Hook for the multiview transformer variant; the base has no sparse path."""
+        del q, k, v, k_und, v_und, multiview_layout
+        raise TypeError(
+            "The base Cosmos3 transformer does not support multiview attention "
+            "layouts; load the checkpoint through Cosmos3MultiviewTransformer."
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -939,11 +1000,12 @@ class Cosmos3GenDecoderLayer(nn.Module):
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
         supported_attention_backends: set | None = None,
+        cross_attention_cls: type[nn.Module] = Cosmos3CrossAttention,
     ):
         super().__init__()
         self.layer_idx = layer_idx
 
-        self.cross_attention = Cosmos3CrossAttention(
+        self.cross_attention = cross_attention_cls(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             num_key_value_heads=num_key_value_heads,
@@ -972,6 +1034,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         use_fused_qk_norm_rope: bool,
         round_norm_before_rope: bool = False,
         residual: torch.Tensor | None = None,
+        multiview_layout: Any | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Fused add+rmsnorm: each `(hidden_states, residual) = norm(...)`
         # collapses the residual add and RMSNorm into one kernel. The
@@ -991,6 +1054,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             rope_cache_positions,
             use_fused_qk_norm_rope,
             round_norm_before_rope,
+            multiview_layout=multiview_layout,
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -1058,6 +1122,7 @@ class Cosmos3LanguageModel(nn.Module):
             ]
         )
 
+    @cached_conditioning
     def forward(
         self,
         text_ids: torch.Tensor,
@@ -1109,6 +1174,11 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         Cosmos3VideoConfig().arch_config.reverse_param_names_mapping
     )
     lora_param_names_mapping = Cosmos3VideoConfig().arch_config.lora_param_names_mapping
+
+    # Variants swap the GEN layer / cross-attention implementation (e.g. the
+    # Multiview-AV sparse attention) without redeclaring the weight layout.
+    _gen_layer_cls: type[nn.Module] = Cosmos3GenDecoderLayer
+    _cross_attention_cls: type[nn.Module] = Cosmos3CrossAttention
 
     def __init__(
         self,
@@ -1237,7 +1307,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         # Generation layers (GEN pathway)
         self.gen_layers = nn.ModuleList(
             [
-                Cosmos3GenDecoderLayer(
+                self._gen_layer_cls(
                     hidden_size=arch.hidden_size,
                     num_attention_heads=arch.num_attention_heads,
                     num_key_value_heads=arch.num_key_value_heads,
@@ -1249,6 +1319,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     prefix=f"gen_layers.{i}",
                     quant_config=quant_config,
                     supported_attention_backends=self._supported_attention_backends,
+                    cross_attention_cls=self._cross_attention_cls,
                 )
                 for i in range(arch.num_hidden_layers)
             ]
@@ -1262,6 +1333,12 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         # prompts, avoiding recomputation on every denoising step
         self.cached_kv: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
         self.cached_gen_rope_inputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        # Installed in post_load_weights when step mixed precision is enabled.
+        self.step_precision_controller: StepMixedPrecisionController | None = None
+        self.modelopt_fp8_checkpoint = isinstance(
+            quant_config, MODELOPT_FP8_QUANT_CONFIGS
+        )
 
         self.__post_init__()
 
@@ -1315,12 +1392,31 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         action_frames: int = 0,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
+        control_frames: int | Sequence[int] = 0,
+        share_vision_temporal_positions: bool = True,
+        temporal_position_period: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute mRoPE position IDs for UND text and GEN visual + action + sound tokens."""
+        """Compute mRoPE position IDs for UND text and GEN tokens.
+
+        The GEN sequence is ordered ``[control, video, action, sound]``.
+        Control and target videos either share matching temporal coordinates or
+        occupy consecutive temporal ranges, according to
+        ``share_vision_temporal_positions``.
+        """
         B = text_mask.shape[0]
         S_text = text_mask.shape[1]
         text_lengths = text_mask.sum(dim=1).long()
         effective_fps = fps if fps is not None and T > 1 else None
+        control_frame_counts = (
+            [control_frames]
+            if isinstance(control_frames, int) and control_frames > 0
+            else (
+                [int(count) for count in control_frames if int(count) > 0]
+                if not isinstance(control_frames, int)
+                else []
+            )
+        )
+        vision_frame_counts = [*control_frame_counts, T]
 
         text_pos_list = []
         vis_pos_list = []
@@ -1330,16 +1426,29 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 real_len, temporal_offset=0, device=device
             )
             media_offset = t_offset + self.temporal_margin
-            v_pos, _ = compute_mrope_position_ids_vision(
-                T,
-                Hp,
-                Wp,
-                temporal_offset=media_offset,
-                device=device,
-                fps=effective_fps,
-                base_fps=self.base_fps,
-                temporal_compression_factor=self.temporal_compression_factor,
-            )
+            vision_offset = media_offset
+            vision_pos_blocks = []
+            for frame_count in vision_frame_counts:
+                temporal_offset = (
+                    media_offset if share_vision_temporal_positions else vision_offset
+                )
+                vision_pos, vision_offset = compute_mrope_position_ids_vision(
+                    frame_count,
+                    Hp,
+                    Wp,
+                    temporal_offset=temporal_offset,
+                    device=device,
+                    fps=effective_fps,
+                    base_fps=self.base_fps,
+                    temporal_compression_factor=self.temporal_compression_factor,
+                    temporal_position_period=temporal_position_period,
+                )
+                vision_pos_blocks.append(vision_pos)
+
+            pos_dtype = vision_pos_blocks[0].dtype
+            for pos in vision_pos_blocks[1:]:
+                pos_dtype = torch.promote_types(pos_dtype, pos.dtype)
+            v_pos = torch.cat([pos.to(pos_dtype) for pos in vision_pos_blocks], dim=1)
             if action_frames > 0:
                 a_pos, _ = compute_mrope_position_ids_action(
                     action_frames,
@@ -1376,9 +1485,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             text_pos_list.append(t_pos)
             vis_pos_list.append(v_pos)
 
-        text_pos_ids = torch.stack(text_pos_list, dim=1).to(device)  # [3, B, S_text]
-        vis_pos_ids = torch.stack(vis_pos_list, dim=1).to(device)  # [3, B, S_gen]
-
+        text_pos_ids = torch.stack(text_pos_list, dim=1).to(device)
+        vis_pos_ids = torch.stack(vis_pos_list, dim=1).to(device)
         return text_pos_ids, vis_pos_ids
 
     def reset_cache(self, cache_key: str | None = None):
@@ -1425,6 +1533,10 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         action_noisy_mask: torch.Tensor | None = None,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
+        control_latents: torch.Tensor | list[torch.Tensor] | None = None,
+        transfer_share_vision_temporal_positions: bool = True,
+        temporal_position_period: int | None = None,
+        multiview_layout: Any | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Forward pass for denoising.
@@ -1455,6 +1567,19 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 Defaults to the video fps when None.
             action_start_frame_offset: Temporal offset applied to action
                 position IDs relative to the video's media_offset (default 1).
+            control_latents: Optional [B, C, T_ctrl, H, W] control-video latents
+                (transfer / control-net conditioning). They are patchified and
+                projected with the shared ``proj_in``, prepended to the GEN
+                sequence as clean (noise-free) tokens that share the video's
+                temporal positions, and excluded from the output projection.
+            temporal_position_period: Wrap the vision frame index at this
+                period when computing temporal mRoPE positions. Camera-major
+                multiview packing uses it so frame ``f`` of every camera
+                shares one temporal coordinate. ``None`` keeps consecutive
+                positions.
+            multiview_layout: Opaque attention layout handed to each GEN
+                layer's cross-attention; only the multiview transformer
+                variant accepts it.
 
         Returns:
             [B, C, T, H, W] velocity prediction, or a tuple
@@ -1487,8 +1612,44 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     device=action_latents.device,
                 )
 
+        # Transfer / control-video conditioning: one or more control clips
+        # (e.g. edge + depth) are packed as clean vision tokens that prefix the
+        # target clip in the GEN sequence. Each clip reuses ``proj_in`` and the
+        # shared transformer; blocks are concatenated in input order.
+        control_clips: list[torch.Tensor] = []
+        if control_latents is not None:
+            control_clips = (
+                list(control_latents)
+                if isinstance(control_latents, (list, tuple))
+                else [control_latents]
+            )
+        control_frame_counts: list[int] = []
+        hidden_control_blocks: list[torch.Tensor] = []
+        control_token_len = 0
+        for clip in control_clips:
+            _, _, c_frames, Hc, Wc = clip.shape
+            if (Hc, Wc) != (H, W):
+                raise ValueError(
+                    "control_latents spatial dims "
+                    f"{(Hc, Wc)} must match hidden_states {(H, W)}"
+                )
+            block, _ = self.proj_in(
+                self.patchify(clip.to(hidden_states.dtype), c_frames, Hc, Wc)
+            )
+            hidden_control_blocks.append(block)
+            control_frame_counts.append(c_frames)
+            control_token_len += block.shape[1]
+        has_control = len(hidden_control_blocks) > 0
+        hidden_control = (
+            torch.cat(hidden_control_blocks, dim=1) if has_control else None
+        )
+
         extra_frames = action_frames + sound_frames
         sequence_shard_enabled = self.sp_size > 1
+        # When a control clip is present we always assemble the combined GEN
+        # stream (control prefix + video [+ action] [+ sound]) instead of the
+        # video-only fast path.
+        use_assembly_path = extra_frames > 0 or has_control
 
         # Add timestep embedding (computed in float32 for numerical stability, then cast back)
         time_embed = self.time_embedder(timestep.float())
@@ -1513,7 +1674,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 .to(hidden_gen.dtype)
             )
 
-        if extra_frames == 0:
+        if not use_assembly_path:
             # Video-only: shard the visual tokens, then add the timestep
             # embedding on the local shard.
             if sequence_shard_enabled:
@@ -1549,14 +1710,20 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_gen = hidden_gen + time_embed.unsqueeze(1)
         else:
             # Multi-modal: assemble the full GEN sequence
-            # (video[, action][, sound]) with timestep embeddings, then shard
-            # the combined stream so sequence parallelism splits every modality
-            # evenly. The per-modality output heads run after the post-loop
-            # all-gather reassembles the sequence.
+            # ([control,] video[, action][, sound]) with timestep embeddings,
+            # then shard the combined stream so sequence parallelism splits
+            # every modality evenly. The per-modality output heads run after the
+            # post-loop all-gather reassembles the sequence.
             if token_noisy_mask is not None:
                 hidden_gen = hidden_gen + time_embed.unsqueeze(1) * token_noisy_mask
             else:
                 hidden_gen = hidden_gen + time_embed.unsqueeze(1)
+
+            # Control tokens are clean conditioning: prepend them WITHOUT a
+            # timestep embedding so the GEN tokens can attend to the raw control
+            # map. They are stripped before the output projection.
+            if has_control:
+                hidden_gen = torch.cat([hidden_control, hidden_gen], dim=1)
 
             if action_latents is not None:
                 hidden_action = self.action_proj_in(
@@ -1600,6 +1767,20 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         self._ensure_cache_dicts()
 
+        # The T=1 fused path is faster on Blackwell. It also benefits the
+        # single-GPU Hopper Nano (SwiGLU) and Edge (2048-wide dense) workloads,
+        # as well as TP2 Super-Text2Image (SwiGLU). The older dense-MLP Super
+        # workload remains on the split path because that shape regresses.
+        enable_t1_fused_qk_norm_rope = T == 1 and _can_enable_t1_fused_qk_norm_rope(
+            is_blackwell=current_platform.is_blackwell(),
+            is_hopper=current_platform.is_hopper(),
+            hidden_act=self.hidden_act,
+            hidden_size=self.hidden_size,
+            tp_size=get_tp_world_size(),
+            sp_size=get_sp_world_size(),
+            is_compiled=self._gen_layers_torch_compiled,
+        )
+
         # Compute UND K/V cache for this cache_key if not already cached
         # This allows reusing the cache across denoising steps for the same text
         if (
@@ -1617,6 +1798,11 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 action_frames=action_frames,
                 action_fps=action_fps if action_fps is not None else fps,
                 action_start_frame_offset=action_start_frame_offset,
+                control_frames=control_frame_counts,
+                share_vision_temporal_positions=(
+                    transfer_share_vision_temporal_positions
+                ),
+                temporal_position_period=temporal_position_period,
             )
             # UND K/V cache is kept FULL on all ranks (not sharded). Text
             # sequence is short, so memory impact is minimal, and the GEN
@@ -1636,7 +1822,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     vis_pos_ids, cache_dtype=hidden_gen.dtype
                 )
             )
-            if T == 1 and not self._gen_layers_torch_compiled:
+            if enable_t1_fused_qk_norm_rope:
                 # build_rope_cache_inputs already rounds through cache_dtype
                 # before returning FP32 storage. Keep that rounded cache in the
                 # activation dtype so the exact fused QKNorm+RoPE kernel can
@@ -1654,11 +1840,10 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         # fused add+rmsnorm path instead of separate add + norm kernels.
         cached_kv_for_key = self.cached_kv[cache_key]
         residual: torch.Tensor | None = None
-        round_norm_before_rope = T == 1
+        round_norm_before_rope = enable_t1_fused_qk_norm_rope
         use_fused_qk_norm_rope = T > 1 or (
-            hidden_gen.device.type == "cuda"
-            and not torch.compiler.is_compiling()
-            and not self._gen_layers_torch_compiled
+            enable_t1_fused_qk_norm_rope
+            and hidden_gen.device.type == "cuda"
             and get_sp_world_size() == 1
             and can_use_fused_inplace_qknorm_rope(
                 self.head_dim,
@@ -1681,6 +1866,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 use_fused_qk_norm_rope,
                 round_norm_before_rope,
                 residual=residual,
+                multiview_layout=multiview_layout,
             )
 
         # Collapse the trailing residual carry. RMSNorm and the linear
@@ -1691,7 +1877,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         hidden_gen = hidden_gen + residual
         hidden_gen = self.norm_moe_gen(hidden_gen)
 
-        if extra_frames == 0:
+        if not use_assembly_path:
             # Video-only: project on the local shard and gather the (much
             # smaller) patch-space output. With patch_latent_dim ~=
             # hidden_size / 21 for cosmos3, this cuts the post-loop SP
@@ -1710,12 +1896,15 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             if seq_shard_pad > 0:
                 hidden_gen = hidden_gen[:, :seq_len_orig, :]
 
-        s_video = seq_len_orig - extra_frames
-        output, _ = self.proj_out(hidden_gen[:, :s_video, :])
+        # Sequence layout: [control prefix | video | action | sound]. Control
+        # tokens are conditioning only and produce no output.
+        s_video = seq_len_orig - extra_frames - control_token_len
+        video_start = control_token_len
+        output, _ = self.proj_out(hidden_gen[:, video_start : video_start + s_video, :])
         video_pred = self.unpatchify(output, T, H, W)
 
         extra_outputs: list[torch.Tensor] = []
-        idx = s_video
+        idx = video_start + s_video
         if action_frames > 0:
             action_hidden = hidden_gen[:, idx : idx + action_frames, :]
             extra_outputs.append(self.action_proj_out(action_hidden, action_domain_ids))
@@ -1725,6 +1914,10 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             sound_output, _ = self.audio_proj_out(sound_hidden)
             extra_outputs.append(sound_output.permute(0, 2, 1).contiguous())
 
+        # Control-only conditioning (no action/sound): keep the bare-tensor
+        # return type identical to the video-only path.
+        if not extra_outputs:
+            return video_pred
         return (video_pred, *extra_outputs)
 
     def preprocess_loaded_state_dict(
@@ -1882,6 +2075,77 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         for module in self.modules():
             if isinstance(module, RMSNorm):
                 module.to(target_dtype)
+
+        self._maybe_install_step_mixed_precision()
+
+    def _maybe_install_step_mixed_precision(self) -> None:
+        """Wrap ModelOpt FP8 linears for per-denoising-step W8A16 dispatch.
+
+        The checkpoint owns the behavior: mixed precision runs only when the
+        checkpoint carries a diffusion_step_policy
+        (quantization_config.runtime in config.json). Explicitly-set env vars
+        act as a manual override, and
+        SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION=0 disables. Runs
+        at the end of post_load_weights so the base quant method has already
+        transposed weights and collapsed scales.
+        """
+        checkpoint_quant_config = self.hf_config.get("quantization_config")
+        if not self.modelopt_fp8_checkpoint:
+            # A checkpoint that carries a step policy the runtime cannot honor
+            # must fail closed rather than silently run without it.
+            if read_checkpoint_step_policy(checkpoint_quant_config) is not None:
+                raise ValueError(
+                    "Checkpoint carries a diffusion_step_policy but was not "
+                    "loaded as a ModelOpt FP8 checkpoint; step mixed precision "
+                    "supports only ModelOpt FP8 in sglang."
+                )
+            return
+        policy, source = resolve_step_policy(checkpoint_quant_config)
+        if policy is None:
+            logger.info(
+                "Step mixed precision off (%s); running W8A8 on every denoising step.",
+                source,
+            )
+            return
+        controller = StepMixedPrecisionController(
+            first_steps=policy.first_steps,
+            last_steps=policy.last_steps,
+            reasoner_a16=policy.reasoner_a16,
+        )
+        reasoner_wrapped, generation_wrapped = install_step_mixed_precision(
+            reasoner_modules=[self.language_model.layers],
+            generation_modules=[self.gen_layers],
+            controller=controller,
+        )
+        if reasoner_wrapped + generation_wrapped == 0:
+            logger.warning(
+                "ModelOpt FP8 quant config detected but no ModelOpt FP8 "
+                "linears were found; running without step mixed precision."
+            )
+            return
+        self.step_precision_controller = controller
+        logger.info(
+            "Step mixed precision enabled (policy source: %s): %d generation "
+            "FP8 linears run W8A16 on the first %d and last %d denoising "
+            "steps; %d reasoner FP8 linears run %s.",
+            source,
+            generation_wrapped,
+            controller.first_steps,
+            controller.last_steps,
+            reasoner_wrapped,
+            "W8A16" if controller.reasoner_a16 else "W8A8",
+        )
+
+    def set_denoising_step(self, step_index: int, num_steps: int) -> None:
+        """Select this step's precision before any transformer call for it."""
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.set_step(
+                step_index=step_index, num_steps=num_steps
+            )
+
+    def reset_denoising_step(self) -> None:
+        if self.step_precision_controller is not None:
+            self.step_precision_controller.reset()
 
 
 EntryClass = Cosmos3OmniTransformer

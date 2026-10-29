@@ -282,9 +282,9 @@ class TestSeedSlot:
                 write_req_capacity=write_req_capacity,
             )
             actual_seed = int(w_plan.write_seed_slot_indices[0].item())
-            assert (
-                actual_seed == expected_seed
-            ), f"[{label}] permuted-LUT seed expected {expected_seed} got {actual_seed}"
+            assert actual_seed == expected_seed, (
+                f"[{label}] permuted-LUT seed expected {expected_seed} got {actual_seed}"
+            )
 
     def test_swa_window_head_prev_slot_is_real_predecessor(self) -> None:
         """SWA window with non-zero window_start: head entry's prev_slot != -1; it is the real predecessor."""
@@ -327,12 +327,12 @@ class TestSeedSlot:
                 write_req_capacity=write_req_capacity,
             )
             actual_prev = int(v_plan.verify_prev_slot_indices[0].item())
-            assert (
-                actual_prev != -1
-            ), f"[{label}] SWA window head must have real predecessor, got -1"
-            assert (
-                actual_prev == expected_prev
-            ), f"[{label}] expected prev={expected_prev} got {actual_prev}"
+            assert actual_prev != -1, (
+                f"[{label}] SWA window head must have real predecessor, got -1"
+            )
+            assert actual_prev == expected_prev, (
+                f"[{label}] expected prev={expected_prev} got {actual_prev}"
+            )
 
 
 class TestPadding:
@@ -404,9 +404,9 @@ class TestPadding:
                 write_req_capacity=write_req_capacity,
             )
             actual_slots = v_plan.verify_slot_indices[:prefix].detach().cpu().tolist()
-            assert (
-                actual_slots == expected_slots
-            ), f"[{label}] sparse-rtt slots expected {expected_slots} got {actual_slots}"
+            assert actual_slots == expected_slots, (
+                f"[{label}] sparse-rtt slots expected {expected_slots} got {actual_slots}"
+            )
 
     def test_padding_row_with_garbage_prefix_does_not_oob(self) -> None:
         """rpi==0 padding row with absurd prefix_lens must not OOB-read req_to_token (row is skipped)."""
@@ -435,9 +435,9 @@ class TestPadding:
                 write_req_capacity=write_req_capacity,
             )
             assert int(v_plan.verify_num_valid[0].item()) == 8, label
-            assert (
-                int(w_plan.write_seed_slot_indices[1].item()) == -1
-            ), f"[{label}] padding row seed must be -1"
+            assert int(w_plan.write_seed_slot_indices[1].item()) == -1, (
+                f"[{label}] padding row seed must be -1"
+            )
             PlanInvariants.assert_all(
                 verify_plan=v_plan,
                 write_plan=w_plan,
@@ -848,9 +848,9 @@ class TestMisc:
             tail_offsets = (
                 write_plan.write_offsets[n_active + 1 : 8].detach().cpu().tolist()
             )
-            assert all(
-                v == 0 for v in tail_offsets
-            ), f"[{label}] stale write_offsets tail not cleared: {tail_offsets}"
+            assert all(v == 0 for v in tail_offsets), (
+                f"[{label}] stale write_offsets tail not cleared: {tail_offsets}"
+            )
 
 
 class TestVerifyContent:
@@ -983,16 +983,16 @@ class TestByteEqual:
         ]
 
         for i, value in enumerate(expected_write_offsets):
-            assert (
-                int(triton_w.write_offsets[i].item()) == value
-            ), f"write_offsets[{i}] expected {value} got {int(triton_w.write_offsets[i].item())}"
-        assert (
-            int(triton_v.verify_num_valid[0].item()) == expected_verify_num_valid
-        ), f"verify_num_valid expected {expected_verify_num_valid}"
+            assert int(triton_w.write_offsets[i].item()) == value, (
+                f"write_offsets[{i}] expected {value} got {int(triton_w.write_offsets[i].item())}"
+            )
+        assert int(triton_v.verify_num_valid[0].item()) == expected_verify_num_valid, (
+            f"verify_num_valid expected {expected_verify_num_valid}"
+        )
         for i, expected_seed in enumerate(expected_seeds):
-            assert (
-                int(triton_w.write_seed_slot_indices[i].item()) == expected_seed
-            ), f"write_seed_slot_indices[{i}] expected {expected_seed}"
+            assert int(triton_w.write_seed_slot_indices[i].item()) == expected_seed, (
+                f"write_seed_slot_indices[{i}] expected {expected_seed}"
+            )
 
 
 class TestBoundarySweep:

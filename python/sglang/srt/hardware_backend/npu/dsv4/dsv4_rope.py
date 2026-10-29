@@ -179,3 +179,57 @@ class Dsv4NpuRoPE:
                 rotary_mode="interleave",
                 partial_slice=[qk_nope_dim, qk_nope_dim + rope_dim],
             )
+
+
+# Per-forward memo of position-gathered (cos, sin), stashed on the ForwardBatch
+# under this attribute by prime_rope_cos_sin (the single writer).
+_ROPE_MEMO_ATTR = "_dsv4_npu_rope_memo"
+
+
+def prime_rope_cos_sin(attn_modules, forward_batch, positions) -> None:
+    memo: dict = {}
+    for attn in attn_modules:
+        freqs_cis = attn.freqs_cis
+        fwd_key = (id(freqs_cis), torch.bfloat16, False)
+        if fwd_key in memo:
+            continue
+        cos, sin = Dsv4NpuRoPE.for_freqs(
+            freqs_cis, getattr(attn, "rotary_emb", None)
+        ).get_cos_sin(
+            positions,
+            torch.bfloat16,
+            view_4d=True,
+            inverse=False,
+            allow_build=False,
+            cache_dtype=torch.bfloat16,
+        )
+        memo[fwd_key] = (positions, cos, sin)
+        memo[(id(freqs_cis), torch.bfloat16, True)] = (positions, cos, -sin)
+    setattr(forward_batch, _ROPE_MEMO_ATTR, memo)
+
+
+def rope_cos_sin(
+    freqs_cis: torch.Tensor,
+    rotary_emb,
+    forward_batch,
+    positions: torch.Tensor,
+    dtype: torch.dtype,
+    *,
+    inverse: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    memo = getattr(forward_batch, _ROPE_MEMO_ATTR, None)
+    entry = memo.get((id(freqs_cis), dtype, inverse)) if memo is not None else None
+    if entry is not None and entry[0] is positions:
+        return entry[1], entry[2]
+    # bf16 tables are ensured at layer init; gathering in the activation dtype
+    # skips the fp32-gather + cast pair. Bit-identical values: rounding the
+    # table once equals rounding each gathered element.
+    cache_dtype = dtype if dtype == torch.bfloat16 else torch.float32
+    return Dsv4NpuRoPE.for_freqs(freqs_cis, rotary_emb).get_cos_sin(
+        positions,
+        dtype,
+        view_4d=True,
+        inverse=inverse,
+        allow_build=False,
+        cache_dtype=cache_dtype,
+    )

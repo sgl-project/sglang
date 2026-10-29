@@ -21,6 +21,11 @@ Measured avg_kl_div:
            multiturn branching                     0.0    2.01e-07        0.0
            lazy test_prefill_cache_hit        5.56e-06         n/a        0.0
   #29792   multiturn branching       9.43e-06/1.16e-05    5.14e-04        0.0
+  unified  test_logprobs_match                     n/a    1.82e-03        0.0
+  memory   test_prefill_cache_hit                  n/a    1.73e-03        0.0
+  track    test_decode_cache_hit                   n/a    2.44e-03        0.0
+
+The unified-memory rows were measured on SM90 only.
 
 The lazy row was measured in the same session as the 1.18e-05 the non-lazy
 `test_prefill_cache_hit` read on that GPU, so read the pair as "both fire",
@@ -40,11 +45,20 @@ as tests.
 
 import os
 import random
+import re
+import shutil
+import tempfile
 import unittest
 
-from sglang.srt.utils import kill_process_tree
+import requests
+
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
+    _extract_output_logprobs,
+    _flush_cache,
+    _generate,
+    _replay_and_compare_kl,
     make_mamba_decode_assert,
 )
 from sglang.test.kl_multiturn_utils import (
@@ -67,9 +81,11 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
+    unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=1150, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=837, stage="extra-a", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -91,13 +107,28 @@ PAGE_SIZE = 128
 # handover from prompt tokens to generated ones.
 MAX_NEW_TOKENS = 1024
 
+# flush_cache drains staged file-backend writes, which can exceed 30 seconds.
+_FLUSH_TIMEOUT_S = 600
+
+# Seed a checkpoint strictly inside the prompt: prefix reuse excludes its last
+# token. Keep file-backend writes bounded while decoding past the 512-token SWA.
+BUFFER_ONLY_SAMPLES = 8
+BUFFER_ONLY_SEED_TOKENS = 512
+BUFFER_ONLY_PROMPT_TOKENS = 768
+BUFFER_ONLY_MAX_NEW_TOKENS = 640
+
 
 def _random_suffixes(n: int, length: int, seed: int) -> list[list[int]]:
     rng = random.Random(seed)
     return [[rng.randint(1, 30000) for _ in range(length)] for _ in range(n)]
 
 
-def _base_args(mamba_strategy: str = "extra_buffer") -> list[str]:
+def _base_args(
+    mamba_strategy: str = "extra_buffer",
+    swa_full_tokens_ratio: str = "0.1",
+    *,
+    mem_fraction_static: float = 0.6,
+) -> list[str]:
     return [
         "--trust-remote-code",
         "--attention-backend",
@@ -107,18 +138,29 @@ def _base_args(mamba_strategy: str = "extra_buffer") -> list[str]:
         "--mamba-radix-cache-strategy",
         mamba_strategy,
         "--swa-full-tokens-ratio",
-        "0.1",
+        swa_full_tokens_ratio,
         "--mamba-full-memory-ratio",
         "0.1",
         # 0.85 was carried over from the 4-GPU B200 test and OOMs an 80 GB card:
         # the static pool leaves ~19 GB for the prefill graphs, the fa4 workspace
         # and the chunked-prefill activations, which is what this config needs.
         "--mem-fraction-static",
-        "0.6",
+        str(mem_fraction_static),
         "--mamba-track-interval",
         str(TRACK_INTERVAL),
         "--enable-deterministic-inference",
     ]
+
+
+def _prefill_graph_count(base_url: str) -> float:
+    metrics = requests.get(base_url + "/metrics", timeout=30).text
+    matches = re.findall(
+        r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
+        r"\s+([0-9.eE+-]+)$",
+        metrics,
+        re.MULTILINE,
+    )
+    return sum(map(float, matches), 0.0)
 
 
 class TestUnifiedHybridBitExact(CustomTestCase):
@@ -132,6 +174,8 @@ class TestUnifiedHybridBitExact(CustomTestCase):
     test_decode_cache_hit stays 0.0 even with the fix reverted, so it covers
     decode-region state reuse in general rather than that regression.
     """
+
+    tree_core_backend = "python"
 
     @classmethod
     def setUpClass(cls):
@@ -152,13 +196,13 @@ class TestUnifiedHybridBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def _run(self, helper):
         helper(
@@ -210,7 +254,30 @@ class TestUnifiedHybridLazyBitExact(TestUnifiedHybridBitExact):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
+        )
+
+
+class TestUnifiedMemoryHybridBitExact(TestUnifiedHybridBitExact):
+    """Same exactness bar on the unified memory pool (virtual mamba slot ids)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = _base_args() + [
+            "--enable-unified-memory",
+            "--chunked-prefill-size",
+            "16384",
+        ]
+        if _MODEL_REVISION:
+            other_args += ["--revision", _MODEL_REVISION]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
 
@@ -227,11 +294,14 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     cannot produce a non-aligned hit length, which this regression needs.
     """
 
+    tree_core_backend = "python"
+
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = _base_args() + [
+            "--enable-metrics",
             "--enable-hierarchical-cache",
             "--hicache-ratio",
             "4",
@@ -261,7 +331,7 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
         cls.input_ids = get_input_ids(
             tokenizer_path=cls.model, num_samples=9, trust_remote_code=True
@@ -270,7 +340,7 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_multiturn_decode_cache_hit_branching(self):
         groups, branches = 3, 3
@@ -299,6 +369,27 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
         )
 
 
+class TestUnifiedHybridHiCacheSlowLoadBitExact(TestUnifiedHybridHiCacheBitExact):
+    """A prefill CUDA graph must not replay over a host-to-device load that has not
+    landed; the delay makes the load lose that race every time."""
+
+    @classmethod
+    def setUpClass(cls):
+        with envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.override(50_000_000):
+            super().setUpClass()
+
+    def test_multiturn_decode_cache_hit_branching(self):
+        server_info = requests.get(self.base_url + "/server_info", timeout=30).json()
+        self.assertEqual(server_info["cuda_graph_config"]["prefill"]["backend"], "full")
+        graph_count = _prefill_graph_count(self.base_url)
+        super().test_multiturn_decode_cache_hit_branching()
+        self.assertGreater(
+            _prefill_graph_count(self.base_url),
+            graph_count,
+            "Delayed HiCache test did not replay the configured Full CUDA graph.",
+        )
+
+
 class TestUnifiedHybridMTPBitExact(CustomTestCase):
     """Same exactness bar with MTP driving the decode loop.
 
@@ -317,11 +408,15 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
     environment override; a regression there surfaces here as a nonzero KL.
     """
 
+    tree_core_backend = "python"
+
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = _base_args() + [
+        # Target FullCG and both MTP draft workers retain graph pools, so this
+        # class needs more dynamic-memory headroom than the non-spec tests.
+        other_args = _base_args(mem_fraction_static=0.58) + [
             "--speculative-algorithm",
             "EAGLE",
             "--enable-multi-layer-eagle",
@@ -333,6 +428,7 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
             "3",
             "--chunked-prefill-size",
             "16384",
+            "--enable-metrics",
         ]
         if _MODEL_REVISION:
             other_args += ["--revision", _MODEL_REVISION]
@@ -341,18 +437,18 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={
-                **os.environ,
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-            },
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def _run(self, helper):
+        server_info = requests.get(self.base_url + "/server_info", timeout=30).json()
+        self.assertEqual(server_info["cuda_graph_config"]["prefill"]["backend"], "full")
+        graph_count = _prefill_graph_count(self.base_url)
         helper(
             self.base_url,
             {self.model: {"kl_div": KL_DIV_THRESHOLD}},
@@ -361,12 +457,138 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
             max_new_tokens=MAX_NEW_TOKENS,
             trust_remote_code=True,
         )
+        self.assertGreater(
+            _prefill_graph_count(self.base_url),
+            graph_count,
+            "MTP target prefill did not replay the configured Full CUDA graph.",
+        )
 
     def test_logprobs_match(self):
         self._run(assert_logprobs_match)
 
     def test_decode_cache_hit(self):
         self._run(assert_decode_cache_hit)
+
+
+class TestRustUnifiedHybridBitExact(TestUnifiedHybridBitExact):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedHybridLazyBitExact(TestUnifiedHybridLazyBitExact):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedHybridHiCacheBitExact(TestUnifiedHybridHiCacheBitExact):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedHybridMTPBitExact(TestUnifiedHybridMTPBitExact):
+    tree_core_backend = "rust"
+
+
+class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
+    """Restore FULL/SWA/Mamba from L3 and compare against recomputed logprobs.
+
+    Flushing the device tree after seeding ensures hits come from storage.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.storage_dir = tempfile.mkdtemp(prefix="sgl-buffer-only-kl-")
+        # Keep all seed SWA windows resident until their backups are staged.
+        other_args = _base_args(swa_full_tokens_ratio="0.5") + [
+            "--enable-hierarchical-cache",
+            "--hicache-host-memory-mode",
+            "buffer_only",
+            "--hicache-storage-backend",
+            "file",
+            "--hicache-storage-backend-extra-config",
+            '{"enable_metadata_cache": true}',
+            "--hicache-write-policy",
+            "write_through",
+            "--hicache-io-backend",
+            "direct",
+            # The mamba host pool only supports page_first and page_first_direct.
+            "--hicache-mem-layout",
+            "page_first_direct",
+            # Partial fetches would make the hit assertions timing-dependent.
+            "--hicache-storage-prefetch-policy",
+            "wait_complete",
+            "--chunked-prefill-size",
+            "2048",
+            "--max-total-tokens",
+            "65536",
+            "--max-mamba-cache-size",
+            "500",
+            "--max-running-requests",
+            "4",
+        ]
+        if _MODEL_REVISION:
+            other_args += ["--revision", _MODEL_REVISION]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env=unified_radix_tree_server_env(
+                "python", SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=cls.storage_dir
+            ),
+        )
+        cls.input_ids = [
+            ids[:BUFFER_ONLY_PROMPT_TOKENS]
+            for ids in get_input_ids(
+                tokenizer_path=cls.model,
+                num_samples=BUFFER_ONLY_SAMPLES,
+                trust_remote_code=True,
+            )
+        ]
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+        shutil.rmtree(cls.storage_dir, ignore_errors=True)
+
+    def test_prefill_cache_hit_from_storage(self):
+        full_ids = self.input_ids
+        seed_ids = [ids[:BUFFER_ONLY_SEED_TOKENS] for ids in full_ids]
+
+        # The second flush also waits for seed writes to reach L3.
+        _flush_cache(self.base_url, timeout_s=_FLUSH_TIMEOUT_S)
+        _generate(self.base_url, seed_ids, max_new_tokens=0)
+        _flush_cache(self.base_url, timeout_s=_FLUSH_TIMEOUT_S)
+
+        results = _generate(
+            self.base_url,
+            full_ids,
+            BUFFER_ONLY_MAX_NEW_TOKENS,
+            return_logprob=True,
+        )
+        self.assertEqual(len(results), len(full_ids))
+
+        # The device tree was flushed: every hit comes back from L3, on the
+        # checkpoint grid and within the seed.
+        cached = [r["meta_info"]["cached_tokens"] for r in results]
+        print(f"buffer_only storage hits: {cached}")
+        self.assertTrue(all(0 < h <= BUFFER_ONLY_SEED_TOKENS for h in cached), cached)
+        self.assertTrue(all(h % TRACK_INTERVAL == 0 for h in cached), cached)
+
+        # Drain this pass's storage writes here: the replay's own flush uses
+        # the 30s default, which they can outlast.
+        _flush_cache(self.base_url, timeout_s=_FLUSH_TIMEOUT_S)
+        _replay_and_compare_kl(
+            self.base_url,
+            self.model,
+            KL_DIV_THRESHOLD,
+            [full_ids[i] + results[i]["output_ids"] for i in range(len(results))],
+            [_extract_output_logprobs(r) for r in results],
+            label="buffer_only_prefill_cache_hit",
+            # One batch avoids repeated 30s flushes while replay writes drain.
+            batch_size=BUFFER_ONLY_SAMPLES,
+            sampling_temperature=0,
+        )
 
 
 if __name__ == "__main__":

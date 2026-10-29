@@ -179,9 +179,9 @@ def test_v2_jit_masked_matches_aot(num_experts, hidden, tokens_pad):
     )
     torch.cuda.synchronize()
 
-    assert torch.equal(
-        x_q.view(torch.int8), q_ref.view(torch.int8)
-    ), "masked fp8 differ"
+    assert torch.equal(x_q.view(torch.int8), q_ref.view(torch.int8)), (
+        "masked fp8 differ"
+    )
     assert torch.equal(x_s, s_ref), "masked scales differ"
 
 

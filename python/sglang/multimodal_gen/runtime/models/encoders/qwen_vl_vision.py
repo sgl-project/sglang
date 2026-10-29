@@ -59,7 +59,14 @@ def _apply_rotary_embedding(
 
 
 class QwenVLVisionAttention(nn.Module):
-    def __init__(self, config: Any, *, prefix: str, model_name: str) -> None:
+    def __init__(
+        self,
+        config: Any,
+        *,
+        prefix: str,
+        model_name: str,
+        quant_config: Any = None,
+    ) -> None:
         super().__init__()
         parallel = get_parallel()
         self.num_heads = config.num_heads // parallel.tp_size
@@ -70,17 +77,17 @@ class QwenVLVisionAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=config.num_heads,
             bias=True,
+            quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
-            tp_rank=parallel.tp_rank,
-            tp_size=parallel.tp_size,
+            parallel_group="tp",
         )
         self.proj = RowParallelLinear(
             input_size=config.hidden_size,
             output_size=config.hidden_size,
             bias=True,
+            quant_config=quant_config,
             prefix=f"{prefix}.proj",
-            tp_rank=parallel.tp_rank,
-            tp_size=parallel.tp_size,
+            parallel_group="tp",
         )
 
         backend = get_attn_backend(self.head_dim, torch.get_default_dtype())

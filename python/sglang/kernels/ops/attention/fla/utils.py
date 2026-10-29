@@ -15,6 +15,7 @@ import torch
 import triton
 from packaging import version
 
+import sglang.kernels.ops.attention.triton_block_ptr_compat  # noqa: F401
 from sglang.srt.utils.common import torch_release
 
 logger = logging.getLogger(__name__)
@@ -326,9 +327,9 @@ if torch_release >= (2, 4):
         return device_torch_lib.device(index)
 
 else:
-    assert (
-        device == "cuda"
-    ), "Only cuda device is supported for PyTorch version < 2.4.0."
+    assert device == "cuda", (
+        "Only cuda device is supported for PyTorch version < 2.4.0."
+    )
     autocast_custom_fwd = device_torch_lib.amp.custom_fwd
     autocast_custom_bwd = device_torch_lib.amp.custom_bwd
 

@@ -6,12 +6,11 @@ from typing import Optional, Union
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     ScheduleVerifyLensTopk,
     compute_sort_survival,
 )
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import (
@@ -20,8 +19,8 @@ from sglang.srt.managers.overlap_utils import (
     ResolvedConfidence,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
@@ -41,10 +40,10 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     round_up_grid,
 )
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.utils.common import require_mlp_tp_gather
 from sglang.srt.utils.invariants import (
     Bucket,
-    InClosedRange,
     Invariant,
     IsTrue,
     expect,
@@ -53,10 +52,6 @@ from sglang.srt.utils.invariants import (
 
 logger = logging.getLogger(__name__)
 
-# DSpark confidence is a per-token score that must stay in [0, 1].
-_CONFIDENCE = Invariant(
-    "dspark.planner.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
-)
 # Scheduled verify lengths must not exceed the per-step token budget.
 _VERIFY_LEN_BUDGET = Invariant("dspark.verify_len_budget", Bucket.GUARD, IsTrue())
 
@@ -65,6 +60,9 @@ class VerifyWindow(msgspec.Struct, frozen=True):
     positions_2d: torch.Tensor
     verify_cache_loc: torch.Tensor
     verify_cache_loc_2d: torch.Tensor
+    # The iteration's plan of `verify_cache_loc`: the draft block, the verify
+    # and the target-hidden KV writes all take their ids from it.
+    iteration_ids: IterationIds
 
 
 class DSparkVerifyPlanner:
@@ -76,22 +74,22 @@ class DSparkVerifyPlanner:
         model_runner,
         device,
         tp_rank: int,
-        server_args: ServerArgs,
         verify_num_draft_tokens: int,
+        tp_sync: SpecTpSync,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
         self.model_runner = model_runner
         self.device = device
-        self.server_args = server_args
         self.verify_num_draft_tokens = verify_num_draft_tokens
+        self._tp_sync = tp_sync
         self._align_verify_tokens_to_graph_tier = (
-            server_args.speculative_dspark_align_verify_tokens_to_graph_tier
+            get_spec().speculative_dspark_align_verify_tokens_to_graph_tier
         )
 
         self._confidence_head = getattr(self.draft_model, "confidence_head", None)
 
-        sts_path = server_args.speculative_dspark_confidence_sts_path
+        sts_path = get_spec().speculative_dspark_confidence_sts_path
         if sts_path and self._confidence_head is not None:
             calibration = load_sts_calibration_from_path(sts_path)
             sts_temperatures = torch.tensor(
@@ -148,7 +146,6 @@ class DSparkVerifyPlanner:
                     f"SGLANG_RAGGED_VERIFY_MODE=static."
                 )
             sps_table = build_sps_cost_table(
-                server_args=self.server_args,
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
             )
             self._is_verify_all = (
@@ -172,9 +169,8 @@ class DSparkVerifyPlanner:
                 and is_dp_attention_enabled()
                 and get_parallel().attn_tp_size == 1
                 and get_parallel().attn_cp_size == 1
-                and require_mlp_tp_gather(self.server_args)
+                and require_mlp_tp_gather()
                 and not get_schedule().disable_overlap_schedule
-                and not get_spec().speculative_skip_dp_mlp_sync
                 and get_disagg().disaggregation_mode == "null"
                 and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
@@ -212,12 +208,6 @@ class DSparkVerifyPlanner:
         return self._confidence_head is not None
 
     @property
-    def last_confidence_raw(self) -> Optional[torch.Tensor]:
-        if self._confidence_head is None:
-            return None
-        return self._confidence_head._last_confidence_raw
-
-    @property
     def schedules_verify_budget(self) -> bool:
         return self._budget_planner is not None
 
@@ -247,37 +237,6 @@ class DSparkVerifyPlanner:
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
         return (
             self._ragged_verify_mode is RaggedVerifyMode.COMPACT and layout is not None
-        )
-
-    def compute_confidence_tensor(
-        self,
-        *,
-        draft_hidden: Optional[torch.Tensor],
-        anchor_tokens: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        confidence_tap: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        if self._confidence_head is None:
-            return None
-        compute_confidence_hook = getattr(self.draft_model, "compute_confidence", None)
-        if compute_confidence_hook is not None:
-            assert (
-                confidence_tap is not None
-            ), "dsv4 compute_confidence needs the compute_base_logits tap"
-            with torch.inference_mode():
-                return compute_confidence_hook(
-                    anchor_tokens=anchor_tokens,
-                    sampled_tokens=draft_tokens,
-                    x_post_hc=confidence_tap,
-                )
-        assert draft_hidden is not None
-        return compute_confidence(
-            draft_hidden=draft_hidden,
-            anchor_tokens=anchor_tokens,
-            draft_tokens=draft_tokens,
-            confidence_head=self._confidence_head,
-            markov_head=self.draft_model.markov_head,
-            gamma=self.gamma,
         )
 
     def prepare_verify_budget(
@@ -318,14 +277,12 @@ class DSparkVerifyPlanner:
         if batch.is_extend_in_batch:
             batch.global_spec_verify_tier_num_tokens = None
             return
-        cpu_group = get_tp_group().cpu_group
+        cpu_group = get_parallel().tp_group.cpu_group
         local_tensor = torch.tensor([local_tier_num_tokens], dtype=torch.int64)
         gathered = torch.empty(
             (torch.distributed.get_world_size(group=cpu_group),), dtype=torch.int64
         )
-        torch.distributed.all_gather_into_tensor(
-            gathered, local_tensor, group=cpu_group
-        )
+        all_gather_single(gathered, local_tensor, group=cpu_group)
         batch.global_spec_verify_tier_num_tokens = gathered.tolist()
 
     def note_non_decode_step(self) -> None:
@@ -372,11 +329,15 @@ class DSparkVerifyPlanner:
             return None
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
-        return self.compute_budget_sync(
+
+        # No collective: the budget derives only from the broadcast draft tokens
+        # (via confidence), replicated req_generation, and the static sps table.
+        draft_input.verify_token_budget = self.compute_budget_sync(
             confidence=confidence,
             prefix_lens=prefix_lens,
             req_pool_indices=req_pool_indices,
         )
+        return draft_input.verify_token_budget
 
     def confidence_budget_prepare(self):
         if not self.schedules_verify_budget:
@@ -578,6 +539,7 @@ class DSparkVerifyPlanner:
             budget=budget,
             cfg=self._schedule_cfg,
         ).to(device=device, dtype=torch.int32)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_PLAN, verify_lens)
 
         if resolve_level() >= InvariantCheckLevel.WARN:
             verify_lens_64 = verify_lens.to(torch.int64)
@@ -596,12 +558,6 @@ class DSparkVerifyPlanner:
                 sort_survival=compute_sort_survival(confidence),
                 verify_lens=verify_lens,
             )
-
-        broadcast_group, group_size = verify_lens_broadcast_group(
-            tp_size=get_parallel().tp_size
-        )
-        if group_size > 1:
-            broadcast_group.broadcast(verify_lens, src=0)
 
         return verify_lens
 
@@ -755,12 +711,6 @@ def uniform_ragged_layout(
     )
 
 
-def verify_lens_broadcast_group(*, tp_size: int) -> tuple:
-    if is_dp_attention_enabled():
-        return get_parallel().attn_tp_group, get_parallel().attn_tp_size
-    return get_tp_group(), tp_size
-
-
 def verify_layout_grid(
     *,
     verify_lens_cpu: list[int],
@@ -837,24 +787,37 @@ def alloc_verify_window(
     verify_num_draft_tokens: int,
     block_pos_offsets: torch.Tensor,
     model_runner,
+    seq_lens_cpu: Optional[torch.Tensor],
+    bonus: Optional[torch.Tensor] = None,
+    anchor_ids: Optional[torch.Tensor] = None,
 ) -> VerifyWindow:
+    """``seq_lens_cpu``: a host bound on ``batch.seq_lens``, which sizes the
+    plan's read table. ``anchor_ids``, when given, gets ``bonus`` in column 0
+    by the same launch (SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE)."""
     prefix_lens = batch.seq_lens
     verify_w = verify_num_draft_tokens
-    positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
-    verify_cache_loc = assign_extend_cache_locs_func(
+    positions_2d = None
+    if anchor_ids is not None:
+        positions_2d = torch.empty(
+            (bs, verify_w), dtype=torch.int64, device=prefix_lens.device
+        )
+    plan = model_runner.runner_ids.plan_uniform_extend(
         req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
-        start_offset=prefix_lens,
-        end_offset=prefix_lens + verify_w,
-        batch_size=bs,
-        draft_token_num=verify_w,
-        device=device,
+        seq_lens=prefix_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        width=verify_w,
+        positions_out=positions_2d,
+        anchor_src=bonus,
+        anchor_out=anchor_ids,
     )
-    verify_cache_loc_2d = verify_cache_loc.view(bs, verify_w)
+    if positions_2d is None:
+        positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets
+    verify_cache_loc = plan.write_virtual
     return VerifyWindow(
         positions_2d=positions_2d,
         verify_cache_loc=verify_cache_loc,
-        verify_cache_loc_2d=verify_cache_loc_2d,
+        verify_cache_loc_2d=verify_cache_loc.view(bs, verify_w),
+        iteration_ids=plan,
     )
 
 
@@ -871,44 +834,6 @@ def apply_logits_adjustments_strided(
         sampling_info=sampling_info,
         draft_token_num=verify_num_draft_tokens,
     )
-
-
-def build_markov_embed_stack(
-    *,
-    anchor_tokens: torch.Tensor,
-    draft_tokens: torch.Tensor,
-    markov_head,
-    gamma: int,
-) -> torch.Tensor:
-    prev_seq = torch.cat(
-        [anchor_tokens.view(-1, 1), draft_tokens[:, : gamma - 1]], dim=1
-    )
-    return markov_head.get_prev_embeddings(prev_seq)
-
-
-def compute_confidence(
-    *,
-    draft_hidden: torch.Tensor,
-    anchor_tokens: torch.Tensor,
-    draft_tokens: torch.Tensor,
-    confidence_head,
-    markov_head,
-    gamma: int,
-) -> torch.Tensor:
-    assert confidence_head is not None
-    if confidence_head.with_markov:
-        markov_embed_stack = build_markov_embed_stack(
-            anchor_tokens=anchor_tokens,
-            draft_tokens=draft_tokens,
-            markov_head=markov_head,
-            gamma=gamma,
-        )
-    else:
-        markov_embed_stack = None
-    confidence_raw = confidence_head(draft_hidden, markov_embed_stack)
-    confidence = confidence_head.apply_sts(confidence_raw)
-    expect(_CONFIDENCE, confidence)
-    return confidence
 
 
 class DSparkScheduleConfig(msgspec.Struct):
@@ -1009,7 +934,6 @@ def _additive_step_time_tensor(
 
 
 class HostConfidenceBudgetPlanner:
-
     def __init__(
         self,
         *,
@@ -1120,10 +1044,9 @@ class HostConfidenceBudgetPlanner:
 
 def build_sps_cost_table(
     *,
-    server_args: ServerArgs,
     verify_num_draft_tokens: int,
 ) -> Union[SpsCostTable, SpsAdditiveCostTable]:
-    sps_table_path = server_args.speculative_dspark_sps_table_path
+    sps_table_path = get_spec().speculative_dspark_sps_table_path
     if sps_table_path:
         return load_sps_table_from_path(sps_table_path)
     max_batch_tokens = max(

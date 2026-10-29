@@ -7,7 +7,7 @@ import os
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
@@ -27,7 +27,6 @@ logger = init_logger(__name__)
 
 
 class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
-
     pipeline_name = "ErnieImagePipeline"
 
     _required_config_modules = [
@@ -41,7 +40,9 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
     def _has_pe_in_model_index(self, server_args) -> bool:
         try:
             model_index = maybe_download_model_index(server_args.model_path)
-            return "pe" in model_index and model_index["pe"] is not None
+            entry = model_index.get("pe")
+            # model_index.json records an absent component as [null, null].
+            return bool(entry) and entry[0] is not None
         except Exception:
             return False
 
@@ -153,9 +154,9 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 hasattr(pipeline_config, "text_encoder_extra_args")
                 and pipeline_config.text_encoder_extra_args
             ):
-                pipeline_config.text_encoder_extra_args[0][
-                    "max_length"
-                ] = text_model_max_length
+                pipeline_config.text_encoder_extra_args[0]["max_length"] = (
+                    text_model_max_length
+                )
             logger.info(
                 "Set text encoder model_max_length=%d from tokenizer/tokenizer_config.json",
                 text_model_max_length,

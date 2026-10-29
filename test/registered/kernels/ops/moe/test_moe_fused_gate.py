@@ -1,17 +1,4 @@
-"""Correctness tests for the Triton :func:`moe_fused_gate` router.
-
-The Triton kernel is a drop-in reimplementation of the CUDA fused gate for the
-ungrouped case (``num_expert_group == 1``). We validate it three ways:
-
-* against an explicit, definition-based torch reference (documents the math),
-* against the CUDA JIT kernel it mirrors (:func:`moe_fused_gate_jit`), and
-* against the production ``biased_grouped_topk_impl`` for the sigmoid / no-shared
-  path that the kernel actually replaces in ``topk.py``.
-
-Comparisons are order-independent: weights are scattered back to a dense
-``[M, num_experts + num_shared]`` layout so the per-row column order (and any
-tie-break choice) does not matter.
-"""
+"""Triton routing must match independent math and supported production routes."""
 
 from __future__ import annotations
 
@@ -22,7 +9,7 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
+from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -55,7 +42,7 @@ def _reference_gate(
     routed_scaling_factor: float,
     apply_routed_scaling_factor_on_output: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Definition-based eager reference matching the CUDA fused-gate semantics."""
+    """Definition-based eager reference for the fused-gate semantics."""
     if scoring_func == "sigmoid":
         activated = scores.sigmoid()
     else:
@@ -80,20 +67,24 @@ def _reference_gate(
         work.scatter_(1, winner.long().unsqueeze(1), float("-inf"))
 
     routed_sum = routed_wgt.sum(dim=1, keepdim=True)
+    if renormalize:
+        norm = torch.where(routed_sum > 0.0, routed_sum, torch.ones_like(routed_sum))
+        routed_wgt = routed_wgt / norm
+    if apply_routed_scaling_factor_on_output:
+        routed_wgt = routed_wgt * routed_scaling_factor
     weights = torch.empty(bs, topk, dtype=torch.float32, device=scores.device)
     indices = torch.empty(bs, topk, dtype=torch.int32, device=scores.device)
     weights[:, :num_routed] = routed_wgt
     indices[:, :num_routed] = routed_idx
     if num_fused_shared_experts > 0:
-        weights[:, num_routed:] = routed_sum / routed_scaling_factor
+        weights[:, num_routed:] = (
+            1.0
+            if apply_routed_scaling_factor_on_output
+            else 1.0 / routed_scaling_factor
+        )
         for j in range(num_fused_shared_experts):
             indices[:, num_routed + j] = num_experts + j
 
-    if renormalize:
-        norm = torch.where(routed_sum > 0.0, routed_sum, torch.ones_like(routed_sum))
-        weights = weights / norm
-    if apply_routed_scaling_factor_on_output:
-        weights = weights * routed_scaling_factor
     return weights, indices
 
 
@@ -176,10 +167,9 @@ def test_moe_fused_gate_matches_reference(
         (8192, 512, 8, 1, "sigmoid"),
     ],
 )
-def test_moe_fused_gate_matches_cuda_jit(
+def test_moe_fused_gate_matches_reference_at_model_shapes(
     M: int, num_experts: int, topk: int, num_shared: int, scoring_func: str
 ) -> None:
-    """Triton output must match the CUDA JIT kernel it reimplements."""
     scores, bias = _make_inputs(M, num_experts, seed=123)
 
     kwargs = dict(
@@ -191,13 +181,13 @@ def test_moe_fused_gate_matches_cuda_jit(
         apply_routed_scaling_factor_on_output=True,
     )
     triton_w, triton_i = moe_fused_gate(scores, bias, **kwargs)
-    cuda_w, cuda_i = moe_fused_gate_jit(scores, bias, **kwargs)
+    ref_w, ref_i = _reference_gate(scores, bias, **kwargs)
     torch.cuda.synchronize()
 
     num_columns = num_experts + num_shared
     torch.testing.assert_close(
         _scatter_by_expert(triton_w, triton_i, num_columns),
-        _scatter_by_expert(cuda_w, cuda_i, num_columns),
+        _scatter_by_expert(ref_w, ref_i, num_columns),
         rtol=1e-4,
         atol=1e-5,
     )
@@ -205,15 +195,14 @@ def test_moe_fused_gate_matches_cuda_jit(
 
 @pytest.mark.parametrize("num_experts,topk", [(256, 6), (384, 8), (512, 8)])
 @pytest.mark.parametrize("apply_scale", [True, False])
+@pytest.mark.parametrize("renormalize", [True, False])
 def test_moe_fused_gate_matches_production_impl(
-    num_experts: int, topk: int, apply_scale: bool
+    num_experts: int, topk: int, apply_scale: bool, renormalize: bool
 ) -> None:
     """Match production ``biased_grouped_topk_impl`` on the path it replaces.
 
-    The kernel supersedes the ungrouped sigmoid CUDA path in ``topk.py``; that
-    reference hardcodes sigmoid and no fused shared expert, and the production
-    path always renormalizes (the impl only applies the scaling factor when
-    ``renormalize`` is set), so we compare on the renormalized path.
+    Compare ungrouped sigmoid routing without shared slots, with normalization
+    and explicit routed scaling enabled independently.
     """
     from sglang.srt.layers.moe.topk import biased_grouped_topk_impl
 
@@ -226,7 +215,7 @@ def test_moe_fused_gate_matches_production_impl(
         bias,
         topk=topk,
         scoring_func="sigmoid",
-        renormalize=True,
+        renormalize=renormalize,
         routed_scaling_factor=scale,
         apply_routed_scaling_factor_on_output=apply_scale,
     )
@@ -236,7 +225,7 @@ def test_moe_fused_gate_matches_production_impl(
         scores,
         bias,
         topk,
-        True,
+        renormalize,
         num_expert_group=1,
         topk_group=1,
         routed_scaling_factor=scale,
@@ -341,6 +330,23 @@ def test_moe_fused_gate_softmax_matches_aot(
     torch.testing.assert_close(
         dense_tri, _scatter_by_expert(aot_w, aot_i, num_experts), rtol=1e-3, atol=1e-3
     )
+
+
+@pytest.mark.parametrize("M", [1, 8, 32])
+def test_moe_fused_gate_softmax_none_bias_matches_zero_bias(M: int) -> None:
+    torch.manual_seed(M)
+    scores = torch.randn(M, 256, dtype=torch.float32, device=DEVICE)
+    zero_bias = torch.zeros(256, dtype=torch.float32, device=DEVICE)
+
+    none_w, none_i = moe_fused_gate(
+        scores, None, topk=8, scoring_func="softmax", renormalize=True
+    )
+    zero_w, zero_i = moe_fused_gate(
+        scores, zero_bias, topk=8, scoring_func="softmax", renormalize=True
+    )
+
+    torch.testing.assert_close(none_w, zero_w, rtol=0, atol=0)
+    torch.testing.assert_close(none_i, zero_i, rtol=0, atol=0)
 
 
 _SIGMOID_AOT_CASES = get_ci_test_range(
@@ -518,6 +524,42 @@ def test_grouped_dispatch_flag_matches_default(
         _scatter_by_expert(jit_w[:, :topk_routed], jit_i[:, :topk_routed], num_experts),
         rtol=1e-3,
         atol=1e-3,
+    )
+
+
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("scoring_func", ["sigmoid", "sqrtsoftplus"])
+def test_moe_fused_gate_accepts_non_fp32_bias(
+    bias_dtype: torch.dtype, scoring_func: str
+) -> None:
+    """A non-fp32 correction bias must route identically to its fp32 copy.
+
+    DeepSeek-V4 stores ``e_score_correction_bias`` in bf16 and topk.py now passes
+    it straight through (no host-side fp32 copy per MoE invocation). The kernel
+    upcasts the bias to fp32 on load, so a bf16/fp16 bias must be bit-identical to
+    casting it to fp32 first -- this guards both the relaxed dtype assertion and
+    the removed per-call cast. (top-6 exercises the DSV4 non-pow2 routing width.)
+    """
+    M, num_experts, topk = 256, 128, 6
+    torch.manual_seed(num_experts * 11 + topk)
+    gating = torch.randn(M, num_experts, dtype=torch.float32, device=DEVICE) * 2.0
+    bias_lowp = torch.randn(num_experts, dtype=bias_dtype, device=DEVICE) * 0.5
+    bias_fp32 = bias_lowp.to(torch.float32)
+
+    lowp_w, lowp_i = moe_fused_gate(
+        gating, bias_lowp, topk=topk, scoring_func=scoring_func, renormalize=True
+    )
+    fp32_w, fp32_i = moe_fused_gate(
+        gating, bias_fp32, topk=topk, scoring_func=scoring_func, renormalize=True
+    )
+    torch.cuda.synchronize()
+
+    # Widening bf16/fp16 -> fp32 is exact, so the two routings must match exactly.
+    torch.testing.assert_close(
+        _scatter_by_expert(lowp_w, lowp_i, num_experts),
+        _scatter_by_expert(fp32_w, fp32_i, num_experts),
+        rtol=0,
+        atol=0,
     )
 
 
