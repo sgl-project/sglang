@@ -13,6 +13,7 @@ from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_p
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -22,7 +23,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 _DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "mla"})
@@ -1131,6 +1132,17 @@ def build_speculative_verify_target_probs(
     device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+    if is_hip() and not need_top_k and envs.SGLANG_OPT_ROCM_SPEC_SOFTMAX_TOP_P.get():
+        from sglang.kernels.ops.sampling.softmax_top_p import softmax_top_p_probs
+
+        # temperature, softmax and top-p in one kernel, each row over many blocks
+        target_probs = softmax_top_p_probs(
+            next_token_logits,
+            sampling_info.temperatures,
+            sampling_info.top_ps if need_top_p else None,
+            rows_per_request=draft_token_num,
+        )
+        return target_probs.view(bs, draft_token_num, -1)
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
