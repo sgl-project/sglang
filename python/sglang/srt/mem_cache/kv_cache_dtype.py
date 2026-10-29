@@ -96,4 +96,21 @@ def configure_kv_cache_dtype(
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
         resolved_kv_cache_dtype = "auto"
 
+    quant_config = getattr(model, "quant_config", None)
+    kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
+    if (
+        isinstance(kv_cache_quant_algo, str)
+        and kv_cache_quant_algo.upper() == "NVFP4"
+        and (
+            server_args_kv_cache_dtype != "nvfp4"
+            or kv_cache_dtype != getattr(torch, "float4_e2m1fn_x2", None)
+        )
+    ):
+        raise ValueError(
+            "Checkpoint NVFP4 KV calibration requires --kv-cache-dtype nvfp4 "
+            "and a backend that preserves that cache format. For BF16/FP8 "
+            "controls, use a checkpoint configuration without NVFP4 KV "
+            "calibration and omit its KV scale tensors."
+        )
+
     return resolved_kv_cache_dtype, kv_cache_dtype
