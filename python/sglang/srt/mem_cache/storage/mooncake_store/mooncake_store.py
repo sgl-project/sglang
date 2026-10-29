@@ -1454,6 +1454,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
 
+        if self.unified_suffixes is not None:
+            # Mooncake reads a shorter object into a larger buffer and reports
+            # success; the rest of that chunk's span would keep stale bytes.
+            get_results = [
+                result if result == size else -1
+                for result, size in zip(get_results, buffer_sizes)
+            ]
         return self._batch_postprocess(get_results, is_set_operate=False)
 
     def batch_set_v1(
@@ -1504,14 +1511,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             end_time = time.perf_counter()
 
             if self.enable_storage_metrics:
-                backup_pages = len(set_keys)
                 if self.unified_suffixes is not None:
-                    # A unified object is one chunk of a page.
-                    backup_pages /= key_multiplier
+                    # Chunks differ in size (a short final layer range), so count
+                    # the pages touched and the bytes actually put.
+                    backup_pages = len({i // key_multiplier for i in set_indices})
+                    backup_gb = sum(set_buffer_sizes) / (1 << 30)
+                else:
+                    backup_pages = len(set_keys)
+                    backup_gb = backup_pages * self.gb_per_page
                 self.backup_pgs.append(backup_pages)
-                self.backup_bandwidth.append(
-                    backup_pages / (end_time - start_time) * self.gb_per_page
-                )
+                self.backup_bandwidth.append(backup_gb / (end_time - start_time))
 
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
