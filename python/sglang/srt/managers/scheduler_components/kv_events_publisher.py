@@ -64,7 +64,7 @@ class SchedulerKvEventsPublisher:
 
         if self.enable_kv_cache_events:
             parallel = get_parallel()
-            controller = getattr(self.tree_cache, "cache_controller", None)
+            controller = self.tree_cache.cache_controller
             for source in controller.get_kv_hint_sources() if controller else ():
                 if "kvcr_inventory" in source.get("capabilities", ()):
                     config = KVEventsConfig.from_cli(kv_events_config)

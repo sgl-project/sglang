@@ -3546,11 +3546,12 @@ macro_rules! tree_core_binding {
                 })
             }
 
-            /// Drain the queued placement events as tagged tuples.
+            /// Get storage keys and their placement-event metadata.
             fn storage_event_metadata(&self, py: Python<'_>, node_id: NodeId) -> PyResult<(Vec<String>, Py<PyList>)> {
                 catch_native_panic(|| self.inner.storage_event_metadata(py, node_id))
             }
 
+            /// Drain the queued placement events as tagged tuples.
             fn take_events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
                 catch_native_panic(|| self.inner.take_events(py))
             }

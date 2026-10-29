@@ -21,8 +21,9 @@ it; the recorder owns the queue and needs nothing back from its owner.
 from __future__ import annotations
 
 from array import array
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Optional
+
+import msgspec
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -40,18 +41,18 @@ from sglang.srt.mem_cache.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.lora.lora_registry import LoRARef
+    from sglang.srt.mem_cache.radix_cache import RadixKey
 
 # Length of LoRARef.lora_id, a uuid4 or uuid5 hex string. Req adds the id to the
 # end of extra_key, so the last 32 characters of extra_key are the id.
 _LORA_ID_LEN = 32
 
 
-@dataclass
-class _StorageEventSpan:
-    key: Any
-    parent: Any = None
-    hash_value: Any = None
-    event_hash_value: Any = None
+class _StorageEventSpan(msgspec.Struct):
+    key: RadixKey
+    parent: Optional[_StorageEventSpan] = None
+    hash_value: Optional[list[str]] = None
+    event_hash_value: Optional[list[str]] = None
 
 
 class LoRANameTable:

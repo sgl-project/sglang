@@ -168,7 +168,7 @@ class TestLocalKvEventSources(CustomTestCase):
         scheduler.max_total_num_tokens = 64
         scheduler.max_req_input_len = 32
         scheduler.startup_time = {}
-        scheduler.tree_cache = SimpleNamespace()
+        scheduler.tree_cache = SimpleNamespace(cache_controller=None)
         scheduler.page_size = 64
         scheduler.kv_events_publisher = component
         publisher = MagicMock()
@@ -182,9 +182,9 @@ class TestLocalKvEventSources(CustomTestCase):
                 get_context().override_server_args(grpc_port=50051, dcp_size=4),
             ):
                 component.kv_event_publisher = owned_publisher
-                self.assertEqual(
-                    scheduler.get_init_info()["kv_event_sources"], expected
-                )
+                info = scheduler.get_init_info()
+                self.assertEqual(info["kv_event_sources"], expected)
+                self.assertNotIn("kv_hint_sources", info)
         publisher.describe_local_source.assert_called_once_with(256)
 
         from sglang.srt.managers.cache_controller import HiCacheController

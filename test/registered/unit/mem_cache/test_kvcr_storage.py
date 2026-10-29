@@ -43,7 +43,11 @@ from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     resume_boundaries,
     storage_namespace,
 )
-from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore, _allocate_dram_pool
+from sglang.srt.mem_cache.storage.kvcr.kvcr_store import (
+    KVCRStore,
+    _allocate_dram_pool,
+    _bool_option,
+)
 from sglang.srt.mem_cache.storage_key_binding import storage_key_to_event_hashes
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
@@ -1513,6 +1517,26 @@ class TestKVCRStorage(CustomTestCase):
                 config = SimpleNamespace(**vars(self.config))
                 config.extra_config = {"align_storage_prefix": value}
                 KVCRStore(config, self.pool)
+
+    def test_boolean_options_are_strict_and_default_to_false(self):
+        for name in (
+            "publish_inventory",
+            "verify_transfer_bytes",
+            "align_storage_prefix",
+            "diagnostic_telemetry",
+            "combine_page_reads",
+            "combine_page_writes",
+            "share_replicated_mla",
+        ):
+            with self.subTest(name=name):
+                self.assertIs(_bool_option({}, name), False)
+                self.assertIs(_bool_option({name: True}, name), True)
+                self.assertIs(_bool_option({name: False}, name), False)
+                for value in ("false", 1, None):
+                    with self.assertRaisesRegex(
+                        ValueError, f"{name} must be a boolean"
+                    ):
+                        _bool_option({name: value}, name)
 
     def test_diagnostic_intervals_preserve_labels_and_bound_sample_memory(self):
         """Unpolled telemetry must not grow with operations or merge distinct scopes."""
