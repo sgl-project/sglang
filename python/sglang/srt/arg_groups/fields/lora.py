@@ -65,7 +65,7 @@ class Lora(msgspec.Struct):
     ] = None
     max_loras_per_batch: A[
         int,
-        "Maximum number of adapters for a running batch, include base-only request.",
+        "GPU pool capacity in distinct adapter IDs, including None for base-model requests. With pipeline parallelism, shared across all in-flight microbatches.",
     ] = 8
     lora_eviction_policy: A[
         str,

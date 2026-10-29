@@ -18,6 +18,7 @@ from sglang.srt.layers.cp import zigzag
 from sglang.srt.layers.cp.base import ContextParallelStrategyKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mem_cache_utils import routed
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
@@ -191,7 +192,7 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
     row_ends = (positions[local_rows] + 1).to(torch.int32) // 2
     pool = SimpleNamespace(qsa_compressed_dtype=compressed_dtype)
     metadata = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         pending_ring_slots=torch.arange(8),
         get_token_to_batch_idx=lambda: torch.zeros(8, dtype=torch.int32),
         prefill_max_row_keys=lambda *_: None,
@@ -378,7 +379,8 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
             "zero prefix needs no cache read"
         )
     backend = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
+        kv_layers=pool.layer_router,
         _pad_extend_output=QwenSparseAttnBackend._pad_extend_output,
         # Per-forward metadata: row i of the slot table is request i's row.
         _resolve_metadata=lambda forward_batch: SimpleNamespace(
