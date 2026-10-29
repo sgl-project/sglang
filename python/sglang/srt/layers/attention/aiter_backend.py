@@ -3446,6 +3446,11 @@ class AiterAttnBackend(AttentionBackend):
         # base class NotImplementedError.
         pass
 
+    def takes_fp8_dcp_verify_q(self) -> bool:
+        # The cprr kernel casts the query to fp8 at unit scale,
+        # and reads the verify window from the cache rather than k_window.
+        return self.forward_metadata.use_asm_cprr_verify
+
     def _use_fused_fp8_kv_write(self, layer: RadixAttention) -> bool:
         # Fused write reuses K's num_heads/head_dim for V, so it needs FP8,
         # non-MLA, non-SWA, and matching K/V head count + head_dim.

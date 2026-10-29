@@ -289,6 +289,24 @@ def all_gather_q_for_mla_decode(
     return q_nope_out, q_pe
 
 
+def all_gather_q_fp8_for_mla_verify(
+    *, q_nope_out: torch.Tensor, q_pe: torch.Tensor, fp8_dtype: torch.dtype
+) -> torch.Tensor:
+    """Gather [B, H, nope] and [B, H, rope] into a unit-scale fp8 [B, H * dcp, nope + rope]."""
+    group = get_parallel().dcp_group
+    d_nope = q_nope_out.size(-1)
+    num_tokens, num_heads, d_pe = q_pe.shape
+    with use_symmetric_memory(group):
+        local = q_pe.new_empty((num_heads, num_tokens, d_nope + d_pe), dtype=fp8_dtype)
+    # The cast is elementwise and the gather copies bytes,
+    # so this matches casting the gathered bf16 query bit for bit.
+    local[..., :d_nope].copy_(q_nope_out.transpose(0, 1))
+    local[..., d_nope:].copy_(q_pe.transpose(0, 1))
+    # The custom all-gather moves only 16- and 32-bit floats.
+    gathered = group.all_gather(local.view(torch.bfloat16), dim=0)
+    return gathered.view(fp8_dtype).transpose(0, 1).contiguous()
+
+
 def all_gather_kv_cache_for_mla_extend(
     token_to_kv_pool,
     attn_mqa,

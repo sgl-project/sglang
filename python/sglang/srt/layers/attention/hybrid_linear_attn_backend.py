@@ -1339,6 +1339,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         # The mask lives on the full-attn child; the linear side reads none.
         return self.full_attn_backend.verify_mask
 
+    def takes_fp8_dcp_verify_q(self) -> bool:
+        return self.full_attn_backend.takes_fp8_dcp_verify_q()
+
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
