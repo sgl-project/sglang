@@ -959,7 +959,8 @@ class ReqKvInfo:
     # Match observations and scheduling state stay on the Req itself.
     req_pool_idx: Optional[int] = None  # req_to_token row, the register for the slots
 
-    # The request's own KV is [cache_protected_len, kv_allocated_len).
+    # The request's own KV is [cache_protected_len, kv_allocated_len). Only the
+    # methods below write the lengths.
     cache_protected_len: int = 0  # Tree cache owns [0, here) (matched or inserted)
     # This request already inserted [0, here) into the tree; later inserts count
     # a hit only on the nodes past it, so a request counts each node once.
@@ -1031,6 +1032,9 @@ class ReqKvInfo:
     def set_evicted_seqlen(self, component_type: ComponentType, length: int) -> None:
         self.component_evicted_seqlens[component_type] = length
 
+    def copy_evicted_seqlens(self) -> dict[ComponentType, int]:
+        return self.component_evicted_seqlens.copy()
+
     def clamp_evicted_seqlens(self, length: int) -> None:
         for component, cursor in self.component_evicted_seqlens.items():
             self.component_evicted_seqlens[component] = min(cursor, length)
@@ -1038,6 +1042,85 @@ class ReqKvInfo:
     def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
         self.component_evicted_seqlens.clear()
+
+    def set_row_len(self, end: int) -> None:
+        """The row holds exactly [0, end), all of it committed."""
+        self.kv_allocated_len = end
+        self.kv_committed_len = end
+
+    def allocate_decode(self, num_tokens: int) -> None:
+        """A decode step holds num_tokens more slots and commits them at
+        allocation, before the step runs."""
+        self.kv_allocated_len += num_tokens
+        self.kv_committed_len += num_tokens
+
+    def allocate_spec_decode(self, end: int) -> None:
+        """A speculative step holds at least [0, end) and commits nothing; a
+        reservation an earlier step left past end stays."""
+        self.kv_allocated_len = max(self.kv_allocated_len, end)
+
+    def allocate_prealloc(self, fill_len: int) -> None:
+        """PD decode: the preallocated row holds [0, fill_len)."""
+        self.kv_allocated_len = fill_len
+
+    def commit_prealloc(self, fill_len: int) -> None:
+        """PD decode: [0, fill_len) counts as committed, since the prefill
+        node computes it and the transfer writes its KV."""
+        self.kv_committed_len = fill_len
+
+    def commit_decode(self, num_tokens: int) -> None:
+        """num_tokens more decode tokens (a verify's accepted run) are committed."""
+        self.kv_committed_len += num_tokens
+
+    def commit_finished(self, end: int) -> None:
+        """A finished turn kept by a streaming session commits up to end,
+        capped at what the row holds."""
+        self.kv_committed_len = min(end, self.kv_allocated_len)
+
+    def truncate_committed(self, end: int) -> None:
+        """Committed drops to end if it is past it; nothing else changes."""
+        self.kv_committed_len = min(self.kv_committed_len, end)
+
+    def truncate(self, end: int) -> None:
+        """The row keeps at most [0, end): every length past end drops to it."""
+        self.kv_allocated_len = min(self.kv_allocated_len, end)
+        self.kv_committed_len = min(self.kv_committed_len, end)
+        self.clamp_evicted_seqlens(end)
+
+    def protect_prefix(self, length: int) -> None:
+        """The tree owns [0, length) of the row; the request frees only past it."""
+        self.cache_protected_len = length
+
+    def record_insert(self, length: int) -> None:
+        """The request inserted [0, length) into the tree; a shorter insert
+        than an earlier one leaves the record as it is."""
+        self.cache_inserted_len = max(self.cache_inserted_len, length)
+
+    def clear_tree_prefix(self) -> None:
+        """The tree owns none of the row and the request inserted none of it."""
+        self.cache_protected_len = 0
+        self.cache_inserted_len = 0
+
+    def shield_swa_prefill(self, extend_end: int) -> None:
+        """Prefill-aware SWA: the window never evicts [0, extend_end)."""
+        self.swa_evict_floor = extend_end
+
+    def reset_for_retract(self) -> None:
+        """A retracted request, its row already released, starts over: the tree
+        prefix, the committed length and the mamba state are reset."""
+        assert not self.holds_kv, "expect it is already released"
+        self.clear_tree_prefix()
+        self.mamba_pool_idx = None
+        self.mamba_ping_pong_track_buffer = None
+        self.mamba_ping_pong_empty = None
+        self.mamba_next_track_idx = None
+        self.mamba_last_track_idx = None
+        self.mamba_last_track_seqlen = None
+        self.mamba_prev_track_seqlen = None
+        self.mamba_untracked_decode_batch_idx = None
+        self.mamba_cow_src_index = None
+        self.mamba_needs_clear = False
+        self.kv_committed_len = 0
 
 
 class Req(ReqDllmMixin):
@@ -1215,7 +1298,6 @@ class Req(ReqDllmMixin):
         # 3: last token
         self.surr_offset = None  # Surrounding offset to defeat the cleanup algorithm
         self.read_offset = None
-        self.decoded_text = ""
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
@@ -1393,6 +1475,10 @@ class Req(ReqDllmMixin):
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         self.retraction_mb_id = None
+
+        # The retraction_count of the last RequestOutputStats sent; None before
+        # the first output.
+        self.request_stats_retraction_count: Optional[int] = None
 
         # For observability
         self.metrics_collector = metrics_collector
@@ -1670,6 +1756,18 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def take_request_stats_due(self) -> bool:
+        """Whether this output row carries the request's stats, recording the
+        send: due on the first output, the first after each retraction, and the
+        finished row."""
+        if (
+            self.request_stats_retraction_count != self.retraction_count
+            or self.finished()
+        ):
+            self.request_stats_retraction_count = self.retraction_count
+            return True
+        return False
+
     def next_output_finishes_by_length(self) -> bool:
         # Whether committing one more output token reaches max_new_tokens
         return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
@@ -1752,7 +1850,7 @@ class Req(ReqDllmMixin):
             )
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
             if match_result.cache_protected_len is None:
-                self.kv.cache_protected_len = self.prefix_len
+                self.kv.protect_prefix(self.prefix_len)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1930,13 +2028,11 @@ class Req(ReqDllmMixin):
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
                 for stop_str in self.sampling_params.stop_strs:
-                    stop_str_in_tail = stop_str in tail_str
-                    if stop_str_in_tail or stop_str in self.decoded_text:
+                    if stop_str in tail_str:
                         self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
-                        if stop_str_in_tail:
-                            self.finished_len = self._locate_str_stop_finished_len(
-                                new_accepted_len, stop_str=stop_str
-                            )
+                        self.finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len, stop_str=stop_str
+                        )
                         return True
 
             # Check stop regex
@@ -2067,8 +2163,6 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None
-        self.kv.cache_protected_len = 0
-        self.kv.cache_inserted_len = 0
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
         self.lock = None
@@ -2083,20 +2177,9 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
-        self.kv.mamba_pool_idx = None
-        self.kv.mamba_ping_pong_track_buffer = None
-        self.kv.mamba_ping_pong_empty = None
-        self.kv.mamba_next_track_idx = None
-        self.kv.mamba_last_track_idx = None
-        self.kv.mamba_last_track_seqlen = None
-        self.kv.mamba_prev_track_seqlen = None
-        self.kv.mamba_untracked_decode_batch_idx = None
         self.mamba_branching_seqlen = None
-        self.kv.mamba_cow_src_index = None
-        self.kv.mamba_needs_clear = False
         self.already_computed = 0
-        assert not self.kv.holds_kv, "expect it is already released"
-        self.kv.kv_committed_len = 0
+        self.kv.reset_for_retract()
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 

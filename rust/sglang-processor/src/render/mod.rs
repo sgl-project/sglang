@@ -20,11 +20,16 @@ mod thinking;
 
 use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
+pub(crate) use self::models::deepseek_v4_thinking;
 pub use self::models::{DeepSeekTokenizer, continues_final_message};
 use self::models::{
-    deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, is_minimax_m3,
-    is_qwen38, render_deepseek_v4, render_glm53, render_kimi_k3, render_minimax_m3, render_qwen38,
-    takes_content_parts,
+    deep_sort, encode_tools_to_typescript, is_glm53, is_minimax_m3, is_qwen38, render_deepseek_v4,
+    render_glm53, render_kimi_k3, render_minimax_m3, render_qwen38, takes_content_parts,
+};
+#[cfg(feature = "openai")]
+pub(crate) use self::models::{
+    deepseek_v4_continued_message, deepseek_v4_parse_start, deepseek_v4_special_tokens,
+    deepseek_v4_task, pydantic_bool,
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
