@@ -253,6 +253,8 @@ class Qwen3Attention(nn.Module):
         )
         self.alt_stream = alt_stream
 
+        # Qwen3 guarantees matching norm eps and full-head NeoX RoPE; these
+        # CUDA head sizes also select the non-fallback RoPE implementation.
         self.use_table_qk_norm_rope = (
             _is_cuda
             and get_exec().kernel.enable_fused_qk_norm_rope
@@ -261,11 +263,7 @@ class Qwen3Attention(nn.Module):
             and get_exec().deterministic.rl_on_policy_target is None
             and get_exec().graph.cuda_graph_config.prefill.tc_compiler != "inductor"
             and type(self.rotary_emb) is RotaryEmbedding
-            and self.rotary_emb.rotary_dim == self.head_dim
-            and self.rotary_emb.is_neox_style
-            and not self.rotary_emb.use_fallback_kernel
             and self.head_dim in (64, 128, 256)
-            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
         )
 
         self.use_fused_qk_norm_mrope = (
@@ -301,13 +299,12 @@ class Qwen3Attention(nn.Module):
             )
         return self._fused_kv_scales
 
-    def forward_prepare_native(self, positions, hidden_states, forward_batch=None):
+    def forward_prepare_native(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if (
             self.use_table_qk_norm_rope
-            and forward_batch is not None
             and forward_batch.forward_mode.is_decode()
             and qkv.dtype == torch.bfloat16
             and self.q_norm.weight.dtype == torch.bfloat16
