@@ -58,6 +58,9 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         self.strategy = strategy_class(
             hf_config, processor, mm_process_config=self.mm_process_config
         )
+        self._video_preprocessing_device = self.mm_process_config.get(
+            "video_preprocessing_device", strategy_class.video_preprocessing_device
+        )
 
     def _worker_thread_initializer(self):
         # Media decodes and preprocesses on device "cuda", which a new thread
@@ -99,7 +102,8 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             mm_token_expansion_start_len: Length of an already expanded prefix.
             video_metadata: Per-video frame metadata, in video order.
             image_device, video_device: Preprocessing devices; None keeps defaults.
-                Videos also decode on CPU when `video_device` is "cpu".
+                Videos also decode on CPU when `video_device` is "cpu". A video
+                request takes both from the video preprocessing device, if any.
             compute_mrope_positions: Also return M-RoPE positions; off for trainers
                 such as Megatron Bridge that compute them themselves.
             package_output: Runs on the BatchFeature in the same worker task,
@@ -112,6 +116,9 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         """
         sources = (image_data, video_data, audio_data)
         self._check_media_sources(*sources)
+        # As legacy: a video request preprocesses all its media on the video device.
+        if video_data and self._video_preprocessing_device is not None:
+            image_device = video_device = self._video_preprocessing_device
         loaded = await self._load_media_lists(
             *sources,
             audio_sample_rate=self.strategy.audio_sample_rate,
