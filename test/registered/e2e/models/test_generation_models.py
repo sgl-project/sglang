@@ -119,6 +119,7 @@ ALL_MODELS = [
         "ibm-granite/granite-4.0-h-micro",
         trust_remote_code=True,
     ),
+    ModelCase("HuggingFaceTB/SmolLM3-3B", skip_long_prompt=True),
 ]
 
 MAMBA_MODEL_PATHS = [
