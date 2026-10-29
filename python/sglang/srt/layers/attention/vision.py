@@ -1076,9 +1076,6 @@ class VisionAttention(nn.Module):
         softmax_in_single_precision (bool, default to False):
             if ``True``, the softmax will be performed in single-precision
             Otherwise, it will be performed in half-precision
-        rotary_embedding_in_fp32 (bool, default to False):
-            Apply cos/sin RoPE in FP32 and cast Q/K back to their input dtypes.
-            The caller must also supply FP32 cos/sin to avoid cache rounding.
 
     """
 
@@ -1113,7 +1110,6 @@ class VisionAttention(nn.Module):
         workspace_buffer: Optional[torch.Tensor] = None,
         use_sink: bool = False,
         window_size: Tuple[int, int] = (-1, -1),
-        rotary_embedding_in_fp32: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -1171,7 +1167,6 @@ class VisionAttention(nn.Module):
         self.customized_position_embedding_applier = (
             customized_position_embedding_applier
         )
-        self.rotary_embedding_in_fp32 = rotary_embedding_in_fp32
         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
             head_dim=self.head_size,
             num_heads=self.num_attention_heads_per_partition,
@@ -1492,12 +1487,10 @@ class VisionAttention(nn.Module):
             # is being captured, which makes Inductor attempt an illegal
             # CPU-to-CUDA copy. The eager version is captured as part of the
             # graph, so its pointwise work is still replayed without launch
-            # overhead. It also provides explicit FP32 arithmetic for models
-            # whose device-specific rotary kernel otherwise runs in Q/K dtype.
+            # overhead. On NPU, use FP32 rotation and cast Q/K back.
             rotary_fn = (
                 apply_rotary_pos_emb_native_eager
-                if self.rotary_embedding_in_fp32
-                or envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+                if _is_npu or envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
                 else apply_rotary_pos_emb
             )
             q, k = rotary_fn(q, k, cos, sin)

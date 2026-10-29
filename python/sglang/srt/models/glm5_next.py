@@ -242,8 +242,6 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
             proj_bias=True,
             qk_normalization_by_head_size=True,
             layer_norm_eps=rms_norm_eps,
-            # Match NPU with GPU's RoPE implementation: rotate Q/K in FP32, then cast back.
-            rotary_embedding_in_fp32=is_npu(),
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
