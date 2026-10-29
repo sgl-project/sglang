@@ -1,9 +1,12 @@
-"""V4 packed-page addressing, softmax/sink and dynamic graph replay checks."""
+"""V4 packed-page addressing, softmax/sink and dynamic graph replay checks, plus the
+gfx950 kernel's buffer gather, dequant and combine RoPE-tile checks."""
 
 import unittest
 
 import torch
+import triton
 
+from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import _combine
 from sglang.kernels.ops.attention.dsv4.norm_rope import fused_rope_inplace
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -11,17 +14,51 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # backend-specific: the HIP swap-AB Gluon kernel runs on gfx950.
-register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 if is_hip():
     from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import (
         MAX_BATCH,
+        combine_gfx950,
         swapab_attention,
     )
 else:
     from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
         swapab_attention,
     )
+
+if is_gfx95_supported():
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+
+    from sglang.kernels.ops.attention.dsv4.decode_attention_sm100_gluon import _load_v4
+    from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import _load_v4_hip
+
+    @gluon.jit
+    def load_both(
+        K,
+        IDS,
+        VALID,
+        BASE,
+        FUSED,
+        PAGE: gl.constexpr,
+        STRIDE: gl.constexpr,
+        BT: gl.constexpr,
+    ):
+        layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, 4], [1, 0])
+        n = gl.arange(0, BT, gl.SliceLayout(1, layout))
+        ids = gl.load(IDS + n)
+        valid = gl.load(VALID + n) != 0
+        d = gl.arange(0, 512, gl.SliceLayout(0, layout))
+        out = n[:, None] * 512 + d[None, :]
+        gl.store(BASE + out, _load_v4(K, ids, valid, PAGE, STRIDE, layout, 576, 8, 64))
+        gl.store(
+            FUSED + out, _load_v4_hip(K, ids, valid, PAGE, STRIDE, layout, 576, 8, 64)
+        )
+
+
+# fp8 e4m3 0xFF and bf16 0xFFFF are NaN, so a read of a poisoned byte shows as NaN
+POISON = 0xFF
 
 
 def make_cache(page, pages=11):
@@ -261,6 +298,193 @@ class TestSwapABAttention(CustomTestCase):
             with self.subTest(case=case):
                 self.check_case(*case)
         self.check_case(40, 64, 192, 512, graph=True)
+
+
+def poisoned_cache(page, pages=11):
+    raw, _, values = make_cache(page, pages)
+    stride = raw.shape[1]
+    storage = torch.full((pages + 2, stride), POISON, dtype=torch.uint8, device="cuda")
+    storage[:pages] = raw
+    storage[0, :576] = POISON
+    storage[0, page * 576 : page * 576 + 8] = POISON
+    values[0] = float("nan")
+    cache = storage[:pages].as_strided((pages, page, 1, 584), (stride, 584, 584, 1))
+    return cache, values
+
+
+def cache_at_top(raw, page, pages_total):
+    pages, stride = raw.shape
+    big = torch.empty((pages_total, stride), dtype=torch.uint8, device="cuda")
+    big[-pages:] = raw
+    cache = big.as_strided((pages_total, page, 1, 584), (stride, 584, 584, 1))
+    return cache, (pages_total - pages) * page
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and is_hip() and is_gfx95_supported(), "requires gfx950"
+)
+class TestSwapABBufferGather(CustomTestCase):
+    def test_poisoned_invalid_rows(self):
+        torch.manual_seed(7)
+        b, nk, ne = 4, 200, 100
+        kv, values = poisoned_cache(64)
+        extra_kv, extra_values = poisoned_cache(16)
+        q = torch.randn(b, 1, 16, 512, device="cuda").bfloat16() * 0.5
+        ids = torch.randint(1, values.shape[0], (b, 1, nk), device="cuda").int()
+        ei = torch.randint(1, extra_values.shape[0], (b, 1, ne), device="cuda").int()
+        ids[..., ::5] = -1
+        ids[..., 1::7] = values.shape[0] + 2
+        ei[..., ::3] = -2
+        ei[..., 1::4] = extra_values.shape[0] + 17
+        lengths = torch.tensor([nk, nk - 37, 64, 0], device="cuda", dtype=torch.int32)
+        el = torch.tensor([ne, 5, 0, ne], device="cuda", dtype=torch.int32)
+        sink = torch.randn(64, device="cuda")
+        out = swapab_attention(q, kv, ids, lengths, sink, extra_kv, ei, el)
+        gold = reference(q, values, ids, lengths, sink, (extra_values, ei, el))
+        self.assertFalse(out.isnan().any().item())
+        torch.testing.assert_close(out.float(), gold.float(), atol=2e-5, rtol=0.004)
+
+    def check_top_pages(self, pages_total, past_buffer_range):
+        torch.manual_seed(11)
+        b, nk, page = 2, 96, 64
+        raw, _, values = make_cache(page)
+        kv, shift = cache_at_top(raw, page, pages_total)
+        self.assertEqual(shift // page * raw.shape[1] > 2**31, past_buffer_range)
+        q = torch.randn(b, 1, 16, 512, device="cuda").bfloat16() * 0.5
+        ids = torch.randint(0, values.shape[0], (b, 1, nk), device="cuda").int()
+        ids[..., ::9] = -1
+        lengths = torch.tensor([nk, nk - 21], device="cuda", dtype=torch.int32)
+        sink = torch.randn(64, device="cuda")
+        shifted = torch.where(ids >= 0, ids + shift, ids)
+        out = swapab_attention(q, kv, shifted, lengths, sink)
+        gold = reference(q, values, ids, lengths, sink)
+        torch.testing.assert_close(out.float(), gold.float(), atol=2e-5, rtol=0.004)
+
+    def test_odd_page_stride(self):
+        torch.manual_seed(13)
+        b, nk, page, pages = 2, 96, 64, 11
+        raw, _, values = make_cache(page, pages)
+        stride = raw.shape[1] + 1
+        storage = torch.zeros((pages, stride), dtype=torch.uint8, device="cuda")
+        storage[:, :-1] = raw
+        kv = storage.as_strided((pages, page, 1, 584), (stride, 584, 584, 1))
+        q = torch.randn(b, 1, 16, 512, device="cuda").bfloat16() * 0.5
+        ids = torch.randint(0, values.shape[0], (b, 1, nk), device="cuda").int()
+        ids[..., ::9] = -1
+        lengths = torch.tensor([nk, nk - 21], device="cuda", dtype=torch.int32)
+        sink = torch.randn(64, device="cuda")
+        out = swapab_attention(q, kv, ids, lengths, sink)
+        gold = reference(q, values, ids, lengths, sink)
+        torch.testing.assert_close(out.float(), gold.float(), atol=2e-5, rtol=0.004)
+
+    def test_top_of_buffer_range(self):
+        stride = 64 * 584 + 256
+        self.check_top_pages((2**31 - 2) // stride, past_buffer_range=False)
+
+    def test_past_buffer_range(self):
+        stride = 64 * 584 + 256
+        self.check_top_pages(2**31 // stride + 12, past_buffer_range=True)
+
+
+@unittest.skipUnless(is_gfx95_supported(), "requires AMD gfx950")
+class TestSwapABDequantHip(CustomTestCase):
+    def check(self, lo, hi, seed):
+        page, pages, bt = 64, 9, 64
+        stride = page * 584 + 256
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        raw = torch.randint(
+            0, 256, (pages, stride), dtype=torch.uint8, device="cuda", generator=gen
+        )
+        scales = raw[:, page * 576 : page * 584].view(pages, page, 8)
+        scales[:] = torch.randint(
+            lo, hi, scales.shape, dtype=torch.uint8, device="cuda", generator=gen
+        )
+        ids = torch.randint(
+            0, pages * page, (bt,), dtype=torch.int32, device="cuda", generator=gen
+        )
+        valid = torch.rand(bt, device="cuda", generator=gen) > 0.2
+        base = torch.empty(bt, 512, dtype=torch.bfloat16, device="cuda")
+        fused = torch.empty_like(base)
+        load_both[(1,)](
+            raw, ids, valid.to(torch.int8), base, fused, page, stride, bt, num_warps=4
+        )
+
+        a, b = base.view(torch.int16), fused.view(torch.int16)
+        both_nan = base.isnan() & fused.isnan()
+        bad = (a != b) & ~both_nan
+        self.assertEqual(int(bad.sum()), 0, f"{int(bad.sum())} of {bad.numel()} differ")
+        self.assertTrue(bool(valid.any()) and bool((~valid).any()))
+        self.assertTrue(bool(base[~valid].eq(0).all()))
+
+    def test_serving_exponents(self):
+        self.check(100, 150, 1)
+
+    def test_wide_exponents(self):
+        self.check(1, 255, 2)
+
+    def test_zero_exponent(self):
+        self.check(0, 1, 3)
+
+
+def launch_combine(combine, b, nt, bd, rope_dim, inputs):
+    part, mx, den, sink, freqs, positions = inputs
+    out = torch.empty((b, 16, 512), dtype=torch.bfloat16, device="cuda")
+    combine[(b, 16, 512 // bd)](
+        part,
+        mx,
+        den,
+        sink,
+        out,
+        freqs,
+        positions,
+        FREQ_STRIDE=freqs.stride(0),
+        ROPE_DIM=rope_dim,
+        NT=nt,
+        ST=triton.next_power_of_2(nt),
+        H=16,
+        BD=bd,
+        num_warps=4,
+    )
+    return out
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and is_hip() and is_gfx95_supported(), "requires gfx950"
+)
+class TestSwapABCombineRopeTiles(CustomTestCase):
+    def check(self, b, nt, bd, rope_dim, sink_values=None, seed=0):
+        self.assertEqual((512 - rope_dim) % bd, 0)
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        part = torch.randn(b, nt, 16, 512, device="cuda", generator=gen) * 8
+        part[torch.rand(part.shape, device="cuda", generator=gen) < 0.1] = 0
+        mx = torch.randn(b, nt, 16, device="cuda", generator=gen) * 3
+        den = torch.rand(b, nt, 16, device="cuda", generator=gen)
+        den[torch.rand(den.shape, device="cuda", generator=gen) < 0.2] = 0
+        sink = torch.randn(16, device="cuda", generator=gen)
+        if sink_values is not None:
+            sink[: len(sink_values)] = torch.tensor(sink_values, device="cuda")
+        angles = torch.randn(64, rope_dim // 2, device="cuda", generator=gen)
+        freqs = torch.stack((angles.cos(), angles.sin()), dim=-1).flatten(1)
+        freqs[:, :4] = torch.tensor([1.0, 0.0, 0.0, -1.0], device="cuda")
+        positions = torch.randint(0, 64, (b,), device="cuda", generator=gen)
+        inputs = (part, mx, den, sink, freqs, positions)
+        tiled = launch_combine(combine_gfx950, b, nt, bd, rope_dim, inputs)
+        generic = launch_combine(_combine, b, nt, bd, rope_dim, inputs)
+        self.assertTrue(
+            torch.equal(tiled.view(torch.int16), generic.view(torch.int16)),
+            f"b={b} nt={nt} bd={bd} rope_dim={rope_dim}",
+        )
+
+    def test_bit_identical(self):
+        for rope_dim in (64, 128):
+            for b, nt, bd in [(1, 4, 64), (4, 20, 64), (3, 17, 64), (4, 5, 128)]:
+                if (512 - rope_dim) % bd == 0:
+                    self.check(b, nt, bd, rope_dim, seed=b + nt)
+
+    def test_inf_sinks(self):
+        self.check(
+            2, 9, 64, 64, sink_values=[float("inf"), float("-inf"), 0.0, 1e4], seed=5
+        )
 
 
 if __name__ == "__main__":
