@@ -91,12 +91,13 @@ def _decode_queue(sched):
         pending_reqs=[],
         _check_if_req_exceed_kv_capacity=MagicMock(return_value=False),
         _create_receiver_and_enqueue=MagicMock(
-            return_value=SimpleNamespace(kv_receiver=MagicMock())
+            return_value=SimpleNamespace(req=SimpleNamespace(), kv_receiver=MagicMock())
         ),
         _resolve_prefill_dp_rank=MagicMock(return_value=0),
     )
     # Exercise the production initializer reached by the cache-hit fast path.
     q._init_receiver = MethodType(DecodePreallocQueue._init_receiver, q)
+    q._init_kv_receiver = MethodType(DecodePreallocQueue._init_kv_receiver, q)
     return q
 
 
