@@ -32,6 +32,16 @@ logger = logging.getLogger(__name__)
 # chunk, so the re-enqueue retry does not busy-spin a core.
 STAGING_WATERMARK_WAIT_S = 0.001
 
+# Bounded spin for a chunk whose decode-side allocation is still in flight
+# (the STAGING_REQ was just sent). Re-enqueueing immediately would move this
+# chunk behind every other queued chunk (~seconds under load) and let later
+# chunks of the same room transfer before it, dropping its scatter on decode.
+STAGING_READY_SPIN_S = 0.5
+# Fail the room when a chunk never becomes ready past this wall-clock budget;
+# a wedged decode-side staging allocator (watermark frozen) would otherwise
+# re-enqueue forever until the decode's own 300s poll timeout.
+STAGING_MAX_WAIT_S = 60
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
 
@@ -61,6 +71,8 @@ class PrefillStagingContext:
     )
     # (room, chunk_idx, session_id) keys for chunks already requested.
     prefetch_requested: set = dataclasses.field(default_factory=set)
+    # Serialize on-demand allocation deduplication and submission.
+    request_lock: object = dataclasses.field(default_factory=threading.Lock)
     # Rooms that have already had their full prefetch fan-out triggered. Used
     # to short-circuit per-room prefetch entry on every chunk after the first.
     prefetched_rooms: set = dataclasses.field(default_factory=set)
@@ -586,20 +598,23 @@ def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
 
 @dataclasses.dataclass
 class StagingTransferInfo:
-    """Per-chunk staging allocation info attached to a TransferInfo."""
+    """Per-chunk staging allocation info attached to a TransferInfo.
 
-    offsets: List[int] = dataclasses.field(default_factory=lambda: [-1])
-    rounds: List[int] = dataclasses.field(default_factory=lambda: [0])
-    ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
+    Each chunk is published as one immutable (offset, round, end) tuple. The
+    prefill bootstrap thread writes these while transfer workers read them; a
+    tuple store is atomic, so readers never observe an offset paired with a
+    stale round/end (which could skip the staging-ring watermark wait).
+    """
+
+    entries: List[Tuple[int, int, int]] = dataclasses.field(
+        default_factory=lambda: [(-1, 0, -1)]
+    )
 
     def set_chunk(self, idx: int, offset: int, rnd: int, end: int):
-        while len(self.offsets) <= idx:
-            self.offsets.append(-1)
-            self.rounds.append(0)
-            self.ends.append(-1)
-        self.offsets[idx] = offset
-        self.rounds[idx] = rnd
-        self.ends[idx] = end
+        entries = self.entries
+        while len(entries) <= idx:
+            entries.append((-1, 0, -1))
+        entries[idx] = (offset, rnd, end)
 
 
 @dataclasses.dataclass
@@ -689,17 +704,15 @@ class PrefillStagingStrategy:
         )
 
         stg = req.staging
-        if stg is None or chunk_idx >= len(stg.offsets):
+        if stg is None or chunk_idx >= len(stg.entries):
             return (False, chunk_idx, -1, 0, -1)
 
-        c_offset = stg.offsets[chunk_idx]
+        # Single atomic tuple read: no torn (offset, round, end) combinations.
+        c_offset, c_round, c_end = stg.entries[chunk_idx]
         if c_offset == StagingAllocator.ALLOC_OVERSIZED:
             return (False, chunk_idx, StagingAllocator.ALLOC_OVERSIZED, 0, -1)
         if c_offset < 0:
             return (False, chunk_idx, -1, 0, -1)
-
-        c_round = stg.rounds[chunk_idx]
-        c_end = stg.ends[chunk_idx]
 
         if session_id is None:
             session_id = req.mooncake_session_id

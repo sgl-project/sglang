@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import torch
+import zmq
 from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
@@ -26,7 +27,8 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
-    STAGING_WATERMARK_WAIT_S,
+    STAGING_MAX_WAIT_S,
+    STAGING_READY_SPIN_S,
     DecodeStagingContext,
     PrefillStagingContext,
     StagingManagerMixin,
@@ -229,6 +231,10 @@ class KVArgsRegisterInfo:
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
         )
+
+
+# Allocation failure before any transfer is submitted; not a dead session.
+_STAGING_REQUEST_FAILED = object()
 
 
 def _uses_flat_entry_layout(
@@ -596,6 +602,87 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         return PrefillStagingStrategy(self, staging_buffer)
 
+    def _fragmented_groups(self, src_indices, dst_indices) -> int:
+        """Concurrent-contiguity group count, same criterion as
+        group_concurrent_contiguous but light (numpy diff only).
+
+        Fragmentation (issue #5450) appears when either side has holes, so a
+        group is a maximal run where src AND dst advance by exactly 1.
+        """
+        if src_indices is None or dst_indices is None:
+            return 1
+        if len(src_indices) < 2 or len(src_indices) != len(dst_indices):
+            return 1
+        return 1 + int(
+            np.count_nonzero((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))
+        )
+
+    def _is_first_staging_piece(strategy, start, num_pages):
+        # Only the first piece of a grid slot may stage. Its actual length is
+        # carried by STAGING_REQ and CHUNK_READY. Later pieces start inside
+        # the slot and remain direct, so they never reuse its allocation.
+        size = strategy.full_chunk_pages
+        return size > 0 and start % size == 0 and 0 < num_pages <= size
+
+    def _ensure_equal_tp_staging_req(self, kv_chunk, req) -> bool:
+        """Request decode-side staging allocation for a fragmented equal-TP
+        chunk (issue #5450). The batch prefetch gate skips equal-TP rooms, so
+        the first fragmented chunk must poke the STAGING_REQ itself.
+
+        Requests ONLY this chunk, not the whole room: prefetching every chunk
+        of the room would allocate staging for chunks that take the direct
+        path, wasting the decode ring and scattering garbage into unfragmented
+        chunks' KV.
+
+        Idempotent per (room, chunk_idx, session_id) via
+        self._staging_ctx.prefetch_requested.
+        """
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            staging_grid_tokens,
+        )
+        from sglang.srt.utils.network import NetworkAddress
+
+        page_size = self.kv_buffer_tensors["page_size"]
+        cps = self.server_args.chunked_prefill_size or 8192
+        full_chunk_pages = max(1, staging_grid_tokens(cps, page_size) // page_size)
+        # Chunk identity = the folded grid index, the same formula
+        # PrefillStagingStrategy.check_ready uses, so the STAGING_RSP offset
+        # lands exactly where check_ready looks it up. The sender aligns chunk
+        # starts to the staging grid for staged pieces. A later continuation
+        # inside the same grid slot is direct and cannot reuse this identity.
+        chunk_idx = kv_chunk.index_slice.start // full_chunk_pages
+        stg_key = (kv_chunk.room, chunk_idx, req.mooncake_session_id)
+        with self._staging_ctx.request_lock:
+            if stg_key in self._staging_ctx.prefetch_requested:
+                return True
+            self._staging_ctx.prefetch_requested.add(stg_key)
+            try:
+                na = NetworkAddress(req.endpoint, req.dst_port)
+                self._send_multipart_locked(
+                    na.to_tcp(),
+                    [
+                        b"STAGING_REQ",
+                        str(kv_chunk.room).encode("ascii"),
+                        str(chunk_idx).encode("ascii"),
+                        str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                        req.mooncake_session_id.encode("ascii"),
+                        str(self.pp_rank).encode("ascii"),
+                    ],
+                    is_ipv6=na.is_ipv6,
+                )
+            except zmq.Again:
+                self._staging_ctx.prefetch_requested.discard(stg_key)
+                logger.warning(
+                    "[Staging] allocation request send timed out room=%s chunk=%s",
+                    kv_chunk.room,
+                    chunk_idx,
+                )
+                return False
+            except Exception:
+                self._staging_ctx.prefetch_requested.discard(stg_key)
+                raise
+            return True
+
     def _do_staging_transfer(
         self,
         staging_strategy,
@@ -609,7 +696,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """Execute staging transfer for one chunk. Returns (ret, deferred).
 
         Handles readiness check, transfer, and CHUNK_READY notification; a chunk
-        that cannot fit returns -1 (the caller fails only this room) instead of
+        that cannot fit returns _STAGING_REQUEST_FAILED instead of
         falling back to the slice path, which would leak the decode-side
         allocation. deferred=True means caller should re-enqueue and break.
         """
@@ -629,14 +716,65 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     "requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB or "
                     "reduce chunked_prefill_size."
                 )
-                return (-1, False)
-            # Not ready yet: wait (bounded) for a watermark advance, then
-            # re-enqueue to retry. A plain block-until-ready would head-of-line
-            # block other rooms on this single worker thread.
-            with self._staging_ctx.watermark_cv:
-                self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
-            queue.put(kv_chunk)
-            return (-1, True)
+                return (_STAGING_REQUEST_FAILED, False)
+            # Not ready yet (allocation in flight or watermark pending). Bounded
+            # spin: STAGING_REQ was just sent and the decode-side allocation +
+            # STAGING_RSP land within ms, so re-checking beats re-enqueueing.
+            # Re-enqueueing immediately moves this chunk behind every other
+            # queued chunk (~seconds under load), and lets later chunks of the
+            # same room transfer before it -- their SUCCESS then fires before
+            # this chunk's data has been sent, dropping its scatter on decode.
+            # Blocking this worker for the spin is cheaper than that.
+            deadline = time.monotonic() + STAGING_READY_SPIN_S
+            while time.monotonic() < deadline:
+                ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
+                    req,
+                    kv_chunk.index_slice.start,
+                    len(kv_chunk.prefill_kv_indices),
+                )
+                if ready:
+                    break
+                if c_offset == StagingAllocator.ALLOC_OVERSIZED:
+                    logger.warning_once(
+                        "[Staging] a chunk exceeds the staging ring; failing "
+                        "affected requests. Increase "
+                        "SGLANG_DISAGG_STAGING_POOL_SIZE_MB or reduce "
+                        "chunked_prefill_size."
+                    )
+                    return (_STAGING_REQUEST_FAILED, False)
+                with self._staging_ctx.watermark_cv:
+                    ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
+                        req,
+                        kv_chunk.index_slice.start,
+                        len(kv_chunk.prefill_kv_indices),
+                    )
+                    if not ready and c_offset != StagingAllocator.ALLOC_OVERSIZED:
+                        self._staging_ctx.watermark_cv.wait(0.01)
+            if not ready:
+                # Persistent unreadiness (ring exhausted): re-enqueue, bounded
+                # by the caller's deferral loop, so other rooms still progress.
+                # Bound the wait wall-clock: a decode-side allocation leak
+                # (watermark frozen) would otherwise re-enqueue forever until
+                # the decode's own 300s poll timeout. Fail the room after
+                # STAGING_MAX_WAIT_S so the decode's release_room frees the
+                # staging allocation promptly.
+                if kv_chunk.staging_first_attempt is None:
+                    kv_chunk.staging_first_attempt = time.monotonic()
+                elif (
+                    time.monotonic() - kv_chunk.staging_first_attempt
+                    > STAGING_MAX_WAIT_S
+                ):
+                    logger.warning_once(
+                        "[Staging] chunk never became ready in %.0fs "
+                        "(decode-side staging allocator likely wedged); "
+                        "failing room=%s chunk=%s",
+                        STAGING_MAX_WAIT_S,
+                        kv_chunk.room,
+                        kv_chunk.index_slice.start,
+                    )
+                    return (_STAGING_REQUEST_FAILED, False)
+                queue.put(kv_chunk)
+                return (-1, True)
 
         ret = staging_strategy.transfer(
             req.mooncake_session_id,
@@ -646,14 +784,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             target_info,
         )
         if ret == -1:
-            # Doesn't fit the ring: fail this room (caller's ret != 0 path), do
-            # not fall back to the slice path (leaks the decode-side allocation).
+            # Doesn't fit the ring: fail this room, do not fall back to the
+            # slice path (leaks the decode-side allocation).
             logger.warning_once(
-                "[Staging] a chunk does not fit the staging ring; failing affected "
-                "requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB or "
-                "reduce chunked_prefill_size."
+                "[Staging] a chunk does not fit the staging ring; failing "
+                "affected requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB "
+                "or reduce chunked_prefill_size."
             )
-            return (-1, False)
+            return (_STAGING_REQUEST_FAILED, False)
         if ret == 0:
             self.send_chunk_ready(
                 room=req.room,
@@ -815,7 +953,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             ]
         ret = self._transfer_data(mooncake_session_id, transfer_blocks)
         if ret != 0:
-            raise RuntimeError(
+            logger.error(
                 f"[Staging] Bulk RDMA transfer failed with ret={ret}. "
                 f"src_ptr=0x{staging_buffer.get_ptr():x}, "
                 f"dst_ptr=0x{dst_staging_ptr + rank_offset:x}, size={local_bytes}. "
@@ -2697,6 +2835,55 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                             )
                         elif (
+                            not (self.is_mla_backend or self.is_hybrid_mla_backend)
+                            and self.attn_tp_size
+                            == target_rank_registration_info.dst_attn_tp_size
+                            and self.enable_staging
+                            and self.pp_size == 1
+                            and staging_strategy is not None
+                            and self._is_first_staging_piece(
+                                staging_strategy,
+                                kv_chunk.index_slice.start,
+                                len(kv_chunk.prefill_kv_indices),
+                            )
+                            and (
+                                target_rank_registration_info.staging_base_ptr != 0
+                                or target_rank_registration_info.staging_total_size != 0
+                            )
+                            and (
+                                self._fragmented_groups(
+                                    kv_chunk.prefill_kv_indices,
+                                    chunked_dst_kv_indice,
+                                )
+                                >= envs.SGLANG_DISAGG_STAGING_MIN_GROUPS.get()
+                                or envs.SGLANG_DISAGG_STAGING_ALWAYS.get()
+                            )
+                        ):
+                            # Equal-TP fragmented chunk (#5450): GxL per-entry
+                            # overheads collapse bandwidth; stage it instead
+                            # (gather -> 1 bulk -> scatter). Staging allocation
+                            # is requested on demand; check_ready spins until
+                            # the decode-side STAGING_RSP lands.
+                            allocation_sent = self._ensure_equal_tp_staging_req(
+                                kv_chunk, req
+                            )
+                            if allocation_sent:
+                                ret, deferred = self._do_staging_transfer(
+                                    staging_strategy,
+                                    kv_chunk,
+                                    req,
+                                    target_rank_registration_info,
+                                    chunked_dst_kv_indice,
+                                    executor,
+                                    queue,
+                                )
+                            else:
+                                ret, deferred = _STAGING_REQUEST_FAILED, False
+                            if deferred:
+                                staging_deferred = True
+                                # Chunk re-enqueued; stop processing remaining reqs for this chunk
+                                break
+                        elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend
                             or self.attn_tp_size
@@ -2747,14 +2934,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_kv_layer_ids,
                             )
                         if ret != 0:
-                            with self.session_lock:
-                                self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self.failed_sessions.add(req.mooncake_session_id)
-                                    logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
-                                    )
+                            if ret is not _STAGING_REQUEST_FAILED:
+                                with self.session_lock:
+                                    self.session_failures[req.mooncake_session_id] += 1
+                                    # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
+                                    if (
+                                        self.session_failures[req.mooncake_session_id]
+                                        >= 1
+                                    ):
+                                        self.failed_sessions.add(
+                                            req.mooncake_session_id
+                                        )
+                                        logger.error(
+                                            f"Session {req.mooncake_session_id} failed."
+                                        )
                             self._poison_unsettled_send(kv_chunk.room)
                             self.conclude_failure(
                                 bootstrap_room=kv_chunk.room,
@@ -2980,7 +3173,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 # Staging: decode replies with allocated staging offset
                 if room == "STAGING_RSP":
-                    handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                    with self._staging_ctx.watermark_cv:
+                        handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                        self._staging_ctx.watermark_cv.notify_all()
                     continue
                 if self._handle_abort_notification(waiting_req_bytes):
                     continue
@@ -3319,6 +3514,46 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
 class MooncakeKVSender(CommonKVSender):
     supports_host_tensor_indices = True
+
+    def should_split_staging(self, page_indices, grid_pages, min_groups):
+        if self.requires_staging_grid_alignment():
+            return True
+        if envs.SGLANG_DISAGG_STAGING_ALWAYS.get():
+            return True
+        # Leave direct sends intact unless a grid-aligned piece, including
+        # a partial final piece, can stage for at least one destination.
+        # Snapshot: decode ranks register concurrently on the bootstrap thread,
+        # so iterating the live dict can raise "dictionary changed size during
+        # iteration" on this scheduler thread.
+        infos = list(self.kv_mgr.transfer_infos.get(self.bootstrap_room, {}).values())
+        end = self.curr_idx + len(page_indices)
+        first = ((self.curr_idx + grid_pages - 1) // grid_pages) * grid_pages
+        for start in range(first, end, grid_pages):
+            src = page_indices[
+                start - self.curr_idx : start - self.curr_idx + grid_pages
+            ]
+            for info in infos:
+                if info.is_dummy:
+                    continue
+                dst = info.dst_kv_indices[start : start + len(src)]
+                if len(dst) != len(src):
+                    return True
+                if self.kv_mgr._fragmented_groups(src, dst) >= min_groups:
+                    return True
+        return False
+
+    def requires_staging_grid_alignment(self):
+        if self.kv_mgr.pp_size != 1:
+            return True
+        infos = list(self.kv_mgr.transfer_infos.get(self.bootstrap_room, {}).values())
+        active = [info for info in infos if not info.is_dummy]
+        if not active:
+            return True
+        for info in active:
+            target = self.kv_mgr.decode_kv_args_table.get(info.mooncake_session_id)
+            if target is None or target.dst_attn_tp_size != self.kv_mgr.attn_tp_size:
+                return True
+        return False
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(

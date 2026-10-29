@@ -1549,7 +1549,14 @@ class SchedulerDisaggregationPrefillMixin:
         if not last_chunk:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
-            if self.enable_staging:
+            if (
+                self.enable_staging
+                and getattr(
+                    req.disagg_kv_sender,
+                    "requires_staging_grid_alignment",
+                    lambda: True,
+                )()
+            ):
                 # Staging identifies chunks positionally against a uniform
                 # prefetched grid, so non-last sends must end on a grid
                 # boundary; the remainder rides with the next send.
@@ -1723,14 +1730,44 @@ class SchedulerDisaggregationPrefillMixin:
                 payloads[st]() if st in payloads else None for st in state_types
             ]
 
+        all_page_indices = None
         transfer_chunk_tokens = req.disagg_kv_sender.get_max_transfer_tokens()
-        if self.enable_staging:
-            # One sender.send per grid slot; the sender's cumulative page
-            # counter marks only the final sub-send of the final chunk as
-            # is_last, routing aux/state correctly.
-            transfer_chunk_tokens = staging_grid_tokens(
+        split_staging = self.enable_staging
+        if split_staging:
+            # Materialize the send range once: the equal-TP split decision needs
+            # the destination page ids, so only staging deployments pay this
+            # scheduler-thread D2H; the direct path below keeps main's async
+            # per-segment pinned copy.
+            kv_indices_all = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, start_idx:end_idx
+            ]
+            kv_indices_all = (
+                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    kv_indices_all
+                )
+            )
+            all_page_indices = kv_to_page_indices(kv_indices_all, page_size)
+            grid_tokens = staging_grid_tokens(
                 get_schedule().chunked_prefill_size, page_size
             )
+            split_predicate = getattr(
+                req.disagg_kv_sender, "should_split_staging", None
+            )
+            if split_predicate is not None:
+                split_staging = split_predicate(
+                    all_page_indices,
+                    max(1, grid_tokens // page_size),
+                    envs.SGLANG_DISAGG_STAGING_MIN_GROUPS.get(),
+                )
+            if split_staging:
+                # DCP packing has a finite source-buffer bound. Staging must not
+                # enlarge a segment beyond that bound, even though DCP itself
+                # bypasses the staging transfer branch.
+                transfer_chunk_tokens = (
+                    grid_tokens
+                    if transfer_chunk_tokens is None
+                    else min(transfer_chunk_tokens, grid_tokens)
+                )
         if transfer_chunk_tokens is not None:
             # Prefill cache hits can leave more KV to transfer than the DCP pack buffer holds.
             segments = compute_grid_segments(
@@ -1744,36 +1781,41 @@ class SchedulerDisaggregationPrefillMixin:
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
-            raw_kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, seg_start:seg_end
-            ]
-            # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
-            # physical ones. Per segment, since each is its own gather.
-            kv_indices = (
-                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                    raw_kv_indices
-                )
-            )
             sender = req.disagg_kv_sender
             indices_event = None
-            if getattr(sender, "supports_host_tensor_indices", False) and not (
-                sender.kv_mgr.enable_all_cp_ranks_for_transfer
-                and not get_parallel().enable_dsa_cache_layer_split
-            ):
-                # The schedule stream may wait on the in-flight forward; move the
-                # D2H wait to the transfer worker so scheduling can continue.
-                page_indices_dev = kv_indices[::page_size] // page_size
-                page_indices = torch.empty(
-                    page_indices_dev.shape,
-                    dtype=page_indices_dev.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                page_indices.copy_(page_indices_dev, non_blocking=True)
-                indices_event = torch.cuda.Event()
-                indices_event.record(torch.cuda.current_stream())
+            if all_page_indices is not None:
+                page_start = (seg_start - start_idx) // page_size
+                page_end = (seg_end - start_idx + page_size - 1) // page_size
+                page_indices = all_page_indices[page_start:page_end]
             else:
-                page_indices = kv_to_page_indices(kv_indices, page_size)
+                raw_kv_indices = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, seg_start:seg_end
+                ]
+                # Unified memory: req_to_token holds VIRTUAL ids; the transfer
+                # needs physical ones. Per segment, since each is its own gather.
+                kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        raw_kv_indices
+                    )
+                )
+                if getattr(sender, "supports_host_tensor_indices", False) and not (
+                    sender.kv_mgr.enable_all_cp_ranks_for_transfer
+                    and not get_parallel().enable_dsa_cache_layer_split
+                ):
+                    # The schedule stream may wait on the in-flight forward; move
+                    # the D2H wait to the transfer worker so scheduling can continue.
+                    page_indices_dev = kv_indices[::page_size] // page_size
+                    page_indices = torch.empty(
+                        page_indices_dev.shape,
+                        dtype=page_indices_dev.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    page_indices.copy_(page_indices_dev, non_blocking=True)
+                    indices_event = torch.cuda.Event()
+                    indices_event.record(torch.cuda.current_stream())
+                else:
+                    page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
