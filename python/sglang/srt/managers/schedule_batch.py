@@ -151,6 +151,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.state_capturer.routed_experts_history import RoutedExpertsHistory
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -1425,6 +1426,7 @@ class Req(ReqDllmMixin):
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
+        self.routed_experts_history: Optional[RoutedExpertsHistory] = None
 
         self.return_indexer_topk = return_indexer_topk
         self.indexer_topk: Optional[torch.Tensor] = (
@@ -2154,6 +2156,34 @@ class Req(ReqDllmMixin):
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
+    def preserve_routed_experts(self, req_to_token_pool: ReqToTokenPool):
+        # Before the first output token, a partial prefill has no sampled
+        # history to preserve. In particular, do not gather uncomputed slots
+        # using the full prompt length when retracting a middle chunk.
+        if (
+            not self.return_routed_experts
+            or not self.output_ids
+            or self.input_embeds is not None
+        ):
+            return
+
+        from sglang.srt.state_capturer.routed_experts import (
+            get_global_experts_capturer,
+        )
+
+        capturer = get_global_experts_capturer()
+        if capturer is None:
+            return
+        if self.routed_experts_history is None:
+            self.routed_experts_history = RoutedExpertsHistory(
+                self.routed_experts_start_len
+            )
+        # Only include predictors of accepted tokens; overlap may already have
+        # allocated KV for a forward whose output has not been processed yet.
+        self.routed_experts_history.extend(
+            capturer, req_to_token_pool, self.kv.req_pool_idx, self.seqlen - 1
+        )
+
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
@@ -2190,6 +2220,7 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = array("q")
+            self.routed_experts_history = None
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
@@ -2463,6 +2494,9 @@ def release_req(
     offload_kv: bool = True,
 ) -> bool:
     """Returns False when the KV backup failed and the request cannot be resumed."""
+    # KV slot indices become invalid below. Capture routing history first;
+    # reset_for_retract deliberately keeps it alongside output_ids/logprobs.
+    req.preserve_routed_experts(req_to_token_pool)
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 

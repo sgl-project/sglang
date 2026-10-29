@@ -189,12 +189,18 @@ class SchedulerBatchResultProcessor:
             return
         start_len = req.routed_experts_start_len
         seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
-        req.routed_experts = capturer.get_topk(
-            req_pool_idx=req.kv.req_pool_idx,
-            seqlen=seqlen,
-            req_to_token_pool=self.req_to_token_pool,
-            start_len=start_len,
-        )
+        if req.routed_experts_history is None:
+            req.routed_experts = capturer.get_topk(
+                req_pool_idx=req.kv.req_pool_idx,
+                seqlen=seqlen,
+                req_to_token_pool=self.req_to_token_pool,
+                start_len=start_len,
+            )
+        else:
+            req.routed_experts = req.routed_experts_history.collect(
+                capturer, self.req_to_token_pool, req.kv.req_pool_idx, seqlen - 1
+            )
+            req.routed_experts_history = None
 
         expected_rows = max(0, seqlen - 1 - start_len)
         if (
