@@ -424,43 +424,6 @@ def check_role(allowed_roles: Union[str, Iterable[str]]):
 
 
 # Launch master/worker node
-def _ensure_port_free(host_ip, port):
-    """Probe the service port before launching; clean stale sglang processes.
-
-    A leftover server squatting on the port would only surface as an
-    "address already in use" crash after the new server finishes its
-    ~15-minute model load. Probe first, then either clean it up or fail
-    fast with the occupier visible in the log.
-    """
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    probe.settimeout(1)
-    occupied = probe.connect_ex((host_ip, port)) == 0
-    probe.close()
-    if not occupied:
-        return
-    logger.warning(
-        f"Port {port} on {host_ip} is already in use before launch; "
-        f"trying to kill stale sglang processes"
-    )
-    subprocess.run(["pkill", "-9", "-f", f"sglang.*--port {port}"], check=False)
-    time.sleep(3)
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    probe.settimeout(1)
-    still_occupied = probe.connect_ex((host_ip, port)) == 0
-    probe.close()
-    if still_occupied:
-        out = subprocess.run(
-            ["ss", "-tlnp"],
-            capture_output=True,
-            text=True,
-        )
-        logger.warning(f"Port {port} occupier: {out.stdout}")
-        raise RuntimeError(
-            f"Port {port} on {host_ip} is still in use after cleanup; "
-            f"refusing to launch into a port conflict"
-        )
-
-
 def launch_pd_mix_node(model_config):
     logger.info(f"Launch pd mix node start ......")
     host_name = get_host_name()
@@ -520,7 +483,6 @@ def launch_pd_mix_node(model_config):
         os.environ[key] = value
 
     host_ip = get_host_ip()
-    _ensure_port_free(host_ip, SERVICE_PORT)
     logger.info(f"Starting node, {host_ip=} {other_args=}")
     try:
         process = popen_launch_server(
