@@ -5,6 +5,7 @@ use crate::message::buffers::{Buffer, BufferData, find};
 use crate::message::request::{GenerateRequest, TokenizeInput};
 use crate::message::response::ResponseSink;
 use crate::message::sampling::SamplingParams;
+use crate::multi_modality::worker::MediaError;
 use crate::tokenizer_manager::channel::{ToSchedulerRx, to_scheduler};
 use crate::utils::fsm::{AfterTokenize, RequestState};
 use crate::utils::shm::{shm_path, unique_name};
@@ -1268,7 +1269,9 @@ fn mm_failure_rejects_returned_request() {
 
     let mut req = mm_rx.try_recv().expect("sent to the mm pool");
     req.state
-        .apply(Event::Error(Error::Encode("bad image".into())))
+        .apply(Event::Error(Error::Encode(MediaError::Client(
+            "bad image".into(),
+        ))))
         .unwrap();
     intake.drive(req);
     assert!(
