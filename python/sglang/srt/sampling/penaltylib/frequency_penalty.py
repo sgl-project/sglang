@@ -1,6 +1,9 @@
 import torch
 
-from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
+from sglang.srt.sampling.penaltylib.orchestrator import (
+    _BatchedPenalizer,
+    _scatter_history,
+)
 from sglang.srt.utils.common import is_pin_memory_available
 
 
@@ -41,6 +44,14 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
             dim=1,
             index=output_ids.unsqueeze(1),
             src=self.frequency_penalties,
+        )
+
+    def _cumulate_output_history(self, rows: torch.Tensor, output_ids: torch.Tensor):
+        self.cumulated_frequency_penalties[rows] = _scatter_history(
+            self.cumulated_frequency_penalties[rows],
+            output_ids,
+            self.frequency_penalties[rows],
+            accumulate=True,
         )
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:

@@ -3145,6 +3145,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+        # A retracted request is re-prefilled with the output_ids it already
+        # generated, but its penalizer rows above start from zero. Replay those
+        # tokens so its penalties continue from where the retraction cut it off.
+        orchestrator = self.sampling_info.penalizer_orchestrator
+        if orchestrator is not None and orchestrator.is_required and not self.is_dllm():
+            retained = [(i, r.output_ids) for i, r in enumerate(reqs) if r.output_ids]
+            if retained:
+                orchestrator.cumulate_output_history(
+                    rows=[i for i, _ in retained],
+                    output_ids=[ids for _, ids in retained],
+                )
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,

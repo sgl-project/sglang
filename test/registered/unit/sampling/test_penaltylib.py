@@ -22,6 +22,9 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
 from sglang.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
 )
+from sglang.srt.sampling.penaltylib.repetition_penalty import (
+    BatchedRepetitionPenalizer,
+)
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -524,6 +527,73 @@ class TestOrchestratorMultiplePenalizers(CustomTestCase):
         self.assertTrue(orch_a.is_required)
         pen = orch_a.penalizers[BatchedFrequencyPenalizer]
         self.assertEqual(pen.frequency_penalties.shape[0], 2)
+
+
+# Replaying a retained output history (retracted request re-prefill)
+ALL_PENALIZERS = {
+    BatchedFrequencyPenalizer,
+    BatchedMinNewTokensPenalizer,
+    BatchedPresencePenalizer,
+    BatchedRepetitionPenalizer,
+}
+
+
+def _make_penalized_req():
+    req = _make_req(freq=0.5, presence=0.25, min_tokens=6)
+    req.sampling_params.repetition_penalty = 1.5
+    return req
+
+
+class TestCumulateOutputHistory(CustomTestCase):
+    def _penalties(self, orch, batch_size):
+        # Read additive and scaling penalties separately: apply() would run the
+        # torch.compile'd repetition kernel, which needs a C++ toolchain on CPU.
+        additive = torch.zeros(batch_size, VOCAB_SIZE)
+        orch.accumulate_additive_penalties(additive)
+        return additive, orch.accumulate_scaling_penalties()
+
+    def test_history_matches_step_by_step_cumulation(self):
+        """Replaying output_ids into a fresh orchestrator gives the same penalties
+        as cumulating them one decode step at a time."""
+        histories = [[5, 7, 5, 9], [], [3, 3, 3]]
+        reqs = [_make_penalized_req() for _ in histories]
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, _make_batch(reqs), ALL_PENALIZERS
+        )
+        orch.cumulate_output_history(
+            rows=[0, 2], output_ids=[histories[0], histories[2]]
+        )
+        replayed_additive, replayed_scaling = self._penalties(orch, len(reqs))
+
+        for row, history in enumerate(histories):
+            single = BatchedPenalizerOrchestrator(
+                VOCAB_SIZE, _make_batch([_make_penalized_req()]), ALL_PENALIZERS
+            )
+            for token in history:
+                single.cumulate_output_tokens(torch.tensor([token]))
+            additive, scaling = self._penalties(single, 1)
+            torch.testing.assert_close(replayed_additive[row : row + 1], additive)
+            torch.testing.assert_close(replayed_scaling[row : row + 1], scaling)
+
+    def test_history_counts_toward_min_new_tokens(self):
+        """Retained tokens count toward min_new_tokens after a re-prefill."""
+        reqs = [_make_req(min_tokens=3, eos_id=2)]
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, _make_batch(reqs), {BatchedMinNewTokensPenalizer}
+        )
+        orch.cumulate_output_history(rows=[0], output_ids=[[5, 6, 7]])
+        logits = torch.zeros(1, VOCAB_SIZE)
+        orch.apply(logits)
+        self.assertEqual(logits[0, 2].item(), 0.0)
+
+    def test_history_not_required_is_noop(self):
+        """No penalizer is prepared, so replaying a history does nothing."""
+        reqs = [_make_req()]
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, _make_batch(reqs), {BatchedFrequencyPenalizer}
+        )
+        orch.cumulate_output_history(rows=[0], output_ids=[[1, 2]])
+        self.assertFalse(orch.is_required)
 
 
 if __name__ == "__main__":

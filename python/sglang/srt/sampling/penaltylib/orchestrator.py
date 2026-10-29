@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import abc
 import weakref
-from typing import TYPE_CHECKING, Optional, Set, Type
+from typing import TYPE_CHECKING, List, Optional, Sequence, Set, Type
 
 import torch
 
@@ -51,6 +51,38 @@ class BatchedPenalizerOrchestrator:
         """
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(output_ids=output_ids)
+
+    def cumulate_output_history(self, rows: List[int], output_ids: List[Sequence[int]]):
+        """
+        Replay already generated tokens into freshly prepared penalizer rows.
+
+        A retracted request keeps its ``output_ids`` but is re-prefilled with a
+        new orchestrator, so its rows start from zero. Replaying the history
+        gives the same state as feeding ``output_ids[i]`` one token at a time
+        through ``cumulate_output_tokens``.
+
+        Args:
+            rows: Batch row of each request to replay.
+            output_ids: Tokens to replay for each entry of ``rows``.
+        """
+        if not self.is_required:
+            return
+        keep = [(row, ids) for row, ids in zip(rows, output_ids) if len(ids) > 0]
+        if not keep:
+            return
+
+        # Pad with vocab_size: penalizers scatter into a vocab_size + 1 wide
+        # buffer and drop the padding column.
+        padded = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(list(ids), dtype=torch.int64) for _, ids in keep],
+            batch_first=True,
+            padding_value=self.vocab_size,
+        ).to(self.device, non_blocking=True)
+        row_indices = torch.tensor(
+            [row for row, _ in keep], dtype=torch.int64, device=self.device
+        )
+        for penalizer in self.penalizers.values():
+            penalizer.cumulate_output_history(row_indices, padded)
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
@@ -215,6 +247,12 @@ class _BatchedPenalizer(abc.ABC):
 
         self._cumulate_output_tokens(output_ids=output_ids)
 
+    def cumulate_output_history(self, rows: torch.Tensor, output_ids: torch.Tensor):
+        if not self._is_prepared:
+            return
+
+        self._cumulate_output_history(rows=rows, output_ids=output_ids)
+
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
             return
@@ -259,6 +297,14 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
+    def _cumulate_output_history(self, rows: torch.Tensor, output_ids: torch.Tensor):
+        """
+        Cumulate a history of output tokens into the given rows.
+        ``output_ids`` is a (len(rows), max_len) tensor padded with vocab_size.
+        """
+        pass
+
+    @abc.abstractmethod
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         """
         Apply the penalizer to the logits.
@@ -293,3 +339,20 @@ class _BatchedPenalizer(abc.ABC):
         Teardown the penalizer.
         """
         pass
+
+
+def _scatter_history(
+    rows_values: torch.Tensor,
+    output_ids: torch.Tensor,
+    src: torch.Tensor,
+    accumulate: bool,
+) -> torch.Tensor:
+    """Scatter ``src`` at ``output_ids`` (padded with vocab_size) into a copy of
+    ``rows_values`` and return it without the padding column."""
+    widened = torch.nn.functional.pad(rows_values, (0, 1))
+    src = src.expand(output_ids.shape)
+    if accumulate:
+        widened.scatter_add_(dim=1, index=output_ids, src=src)
+    else:
+        widened.scatter_(dim=1, index=output_ids, src=src)
+    return widened[:, :-1]
