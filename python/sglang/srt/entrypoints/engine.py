@@ -33,6 +33,7 @@ import tempfile
 import threading
 import time
 import types
+from contextlib import ExitStack
 from typing import (
     Any,
     AsyncIterator,
@@ -69,7 +70,10 @@ from sglang.srt.managers.data_parallel_controller import (
     run_scheduler_process_with_init_pipe,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
-from sglang.srt.managers.disagg_service import start_disagg_service_for_rust_server
+from sglang.srt.managers.disagg_service import (
+    start_disagg_service,
+    start_disagg_service_for_rust_server,
+)
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     CloseSessionReqInput,
@@ -182,14 +186,18 @@ class SchedulerInitResult:
     wait_for_ready: Callable[[], None] = lambda: None
     block_until_scheduler_exits: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
-    # Rust-server mode only: a KV bootstrap server the Rust server cannot serve.
-    kv_bootstrap_server: Optional[Any] = None
+    disaggregation_bootstrap_server: Optional[Any] = None
     grpc_server: Optional[Any] = None
 
     def stop_grpc_server(self) -> None:
         if self.grpc_server is not None:
             self.grpc_server.shutdown()
             self.grpc_server = None
+
+    def stop_disaggregation_bootstrap_server(self) -> None:
+        if self.disaggregation_bootstrap_server is not None:
+            self.disaggregation_bootstrap_server.close()
+            self.disaggregation_bootstrap_server = None
 
 
 def init_tokenizer_manager(
@@ -1173,81 +1181,136 @@ class Engine(EngineScoreMixin, EngineBase):
         context_before_publish = snapshot_context()
         publish(server_args, role="tokenizer")
 
-        # Nothing below has spawned yet, so a failure here leaves a record the
-        # caller can hand back -- but only once the publication goes with it:
-        # the validation stage writes through late resolution, which refuses a
-        # record that is already published.
-        try:
-            # Allocate ports for inter-process communications
-            if port_args is None:
-                port_args = PortArgs.init_new(server_args)
-            logger.info(f"server_args={_server_args_for_logging(server_args)}")
-
-            # Start the engine info bootstrap server if per-rank info is needed.
-            engine_info_bootstrap_server = None
-            if (
-                get_model().remote_instance_weight_loader_start_seed_via_transfer_engine
-                and get_parallel().node_rank == 0
-            ):
-                bootstrap_port = get_model().engine_info_bootstrap_port
-                if not is_port_available(bootstrap_port):
-                    raise RuntimeError(
-                        f"engine_info_bootstrap_port {bootstrap_port} is already in use. "
-                        f"When running multiple instances on the same node, each instance must use a "
-                        f"different --engine-info-bootstrap-port."
-                    )
-                engine_info_bootstrap_server = EngineInfoBootstrapServer(
-                    host=get_serving().host, port=bootstrap_port
-                )
-
-            # Launch daemons (daemon mode only). The handles travel back to the
-            # Engine that spawned them; shutdown() reaps from there.
-            weight_cache_daemon_procs: List = []
-            if get_model().weight_cache_mode == "daemon":
-                weight_cache_daemon_procs = cls._launch_weight_cache_daemons(
-                    server_args
-                )
-        except BaseException:
-            restore_context(context_before_publish)
-            raise
-
-        # Launch scheduler processes
-        # Passed only when there is one: this hook is an override point, and a
-        # subclass written against the three-argument signature must keep working.
-        launch_kwargs = (
-            {"placement_group": placement_group} if placement_group is not None else {}
-        )
-        scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
-            server_args, port_args, run_scheduler_process_func, **launch_kwargs
-        )
-        scheduler_init_result.engine_info_bootstrap_server = (
-            engine_info_bootstrap_server
-        )
-
-        if (
-            get_exec().moe.enable_elastic_expert_backup
-            and get_exec().moe.elastic_ep_backend is not None
-        ):
-            run_expert_backup_manager(server_args, port_args)
-
-        if get_parallel().node_rank >= 1:
-            # Non-zero-rank nodes do not run tokenizer processes.
-            scheduler_init_result.wait_for_ready()
-
+        with ExitStack() as startup_cleanup:
+            # Nothing below has spawned yet, so a failure here leaves a record the
+            # caller can hand back -- but only once the publication goes with it:
+            # the validation stage writes through late resolution, which refuses a
+            # record that is already published.
             try:
-                scheduler_init_result.grpc_server = start_follower_grpc_server(
-                    server_args, scheduler_init_result.scheduler_infos[0]
-                )
+                # Allocate ports for inter-process communications
+                if port_args is None:
+                    port_args = PortArgs.init_new(server_args)
+                logger.info(f"server_args={_server_args_for_logging(server_args)}")
+
+                # Start the engine info bootstrap server if per-rank info is needed.
+                engine_info_bootstrap_server = None
+                if (
+                    get_model().remote_instance_weight_loader_start_seed_via_transfer_engine
+                    and get_parallel().node_rank == 0
+                ):
+                    bootstrap_port = get_model().engine_info_bootstrap_port
+                    if not is_port_available(bootstrap_port):
+                        raise RuntimeError(
+                            f"engine_info_bootstrap_port {bootstrap_port} is already in use. "
+                            f"When running multiple instances on the same node, each instance must use a "
+                            f"different --engine-info-bootstrap-port."
+                        )
+                    engine_info_bootstrap_server = EngineInfoBootstrapServer(
+                        host=get_serving().host, port=bootstrap_port
+                    )
+
+                # Prefill schedulers register to it once, during init, so it must
+                # listen before they launch.
+                disaggregation_bootstrap_server = None
+                if get_parallel().node_rank == 0:
+                    disaggregation_bootstrap_server = (
+                        start_disagg_service_for_rust_server()
+                        if envs.SGLANG_RUST_SERVER.get()
+                        else start_disagg_service()
+                    )
+                    if disaggregation_bootstrap_server is not None:
+                        startup_cleanup.callback(disaggregation_bootstrap_server.close)
+
+                # Launch daemons (daemon mode only). The handles travel back to the
+                # Engine that spawned them; shutdown() reaps from there.
+                weight_cache_daemon_procs: List = []
+                if get_model().weight_cache_mode == "daemon":
+                    weight_cache_daemon_procs = cls._launch_weight_cache_daemons(
+                        server_args
+                    )
             except BaseException:
-                # Engine.__init__ has not received these handles yet. Do not
-                # leave GPU workers behind if binding the metadata port fails.
-                for proc in scheduler_procs or []:
-                    kill_process_tree(proc.pid, wait_timeout=60)
-                cls._terminate_weight_cache_daemons(weight_cache_daemon_procs)
+                restore_context(context_before_publish)
                 raise
 
-            if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
-                # When using `Engine` as a Python API, we don't want to block here.
+            # Launch scheduler processes
+            # Passed only when there is one: this hook is an override point, and a
+            # subclass written against the three-argument signature must keep working.
+            launch_kwargs = (
+                {"placement_group": placement_group}
+                if placement_group is not None
+                else {}
+            )
+            scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
+                server_args, port_args, run_scheduler_process_func, **launch_kwargs
+            )
+            scheduler_init_result.engine_info_bootstrap_server = (
+                engine_info_bootstrap_server
+            )
+            scheduler_init_result.disaggregation_bootstrap_server = (
+                disaggregation_bootstrap_server
+            )
+
+            if (
+                get_exec().moe.enable_elastic_expert_backup
+                and get_exec().moe.elastic_ep_backend is not None
+            ):
+                run_expert_backup_manager(server_args, port_args)
+
+            if get_parallel().node_rank >= 1:
+                # Non-zero-rank nodes do not run tokenizer processes.
+                scheduler_init_result.wait_for_ready()
+
+                try:
+                    scheduler_init_result.grpc_server = start_follower_grpc_server(
+                        server_args, scheduler_init_result.scheduler_infos[0]
+                    )
+                except BaseException:
+                    # Engine.__init__ has not received these handles yet. Do not
+                    # leave GPU workers behind if binding the metadata port fails.
+                    for proc in scheduler_procs or []:
+                        kill_process_tree(proc.pid, wait_timeout=60)
+                    cls._terminate_weight_cache_daemons(weight_cache_daemon_procs)
+                    raise
+
+                if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
+                    # When using `Engine` as a Python API, we don't want to block here.
+                    return (
+                        None,
+                        None,
+                        port_args,
+                        scheduler_init_result,
+                        None,
+                        weight_cache_daemon_procs,
+                    )
+
+                # Non-zero ranks cannot drain on their own: rank 0 stops every TP rank
+                # via the ShutdownReq broadcast, and the orchestrator's kill timeout is
+                # the backstop.
+                if threading.current_thread() is threading.main_thread():
+
+                    def sigterm_handler(signum, frame):
+                        logger.warning(
+                            f"SIGTERM received on node_rank {get_parallel().node_rank}; "
+                            "waiting for the rank-0 ShutdownReq broadcast to stop "
+                            "the schedulers."
+                        )
+
+                    signal.signal(signal.SIGTERM, sigterm_handler)
+
+                # A node-local Rust listener owns the health endpoints when present.
+                rust_server_owns_base_port = (
+                    envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
+                )
+                try:
+                    if not rust_server_owns_base_port:
+                        launch_dummy_health_check_server(
+                            get_serving().host,
+                            get_serving().port,
+                            get_observability().enable_metrics,
+                        )
+                    scheduler_init_result.block_until_scheduler_exits()
+                finally:
+                    scheduler_init_result.stop_grpc_server()
                 return (
                     None,
                     None,
@@ -1257,126 +1320,92 @@ class Engine(EngineScoreMixin, EngineBase):
                     weight_cache_daemon_procs,
                 )
 
-            # Non-zero ranks cannot drain on their own: rank 0 stops every TP rank
-            # via the ShutdownReq broadcast, and the orchestrator's kill timeout is
-            # the backstop.
-            if threading.current_thread() is threading.main_thread():
+            # The embedded Rust server (started inside the rank-0 scheduler) owns
+            # the API server, tokenization, and detokenization. In that mode we do
+            # not start the Python detokenizer subprocess(es) or tokenizer manager.
+            # Do not use RayEngine with the Rust server, as it is not supported.
+            if envs.SGLANG_RUST_SERVER.get():
+                scheduler_init_result.wait_for_ready()
+                # Set up subprocess liveness watchdog to detect crashes
+                processes = list(scheduler_procs or [])
+                names = [f"scheduler_{i}" for i in range(len(processes))]
+                subprocess_watchdog = SubprocessWatchdog(
+                    processes=processes, process_names=names
+                )
+                subprocess_watchdog.start()
 
-                def sigterm_handler(signum, frame):
-                    logger.warning(
-                        f"SIGTERM received on node_rank {get_parallel().node_rank}; "
-                        "waiting for the rank-0 ShutdownReq broadcast to stop "
-                        "the schedulers."
-                    )
+                # The caller now owns the bootstrap service through SchedulerInitResult.
+                startup_cleanup.pop_all()
+                return (
+                    None,
+                    None,
+                    port_args,
+                    scheduler_init_result,
+                    subprocess_watchdog,
+                    None,
+                )
 
-                signal.signal(signal.SIGTERM, sigterm_handler)
-
-            # A node-local Rust listener owns the health endpoints when present.
-            rust_server_owns_base_port = (
-                envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
+            # Launch detokenizer process(es) — optionally fronted by a router when
+            # detokenizer_worker_num > 1.
+            detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
+                server_args=server_args,
+                port_args=port_args,
+                run_detokenizer_process_func=run_detokenizer_process_func,
             )
+            for p in detoken_procs:
+                scheduler_init_result.all_child_pids.append(p.pid)
+
+            # Init tokenizer manager before waiting, so it overlaps scheduler startup
+            if get_serving().tokenizer_worker_num == 1:
+                tokenizer_manager, template_manager = init_tokenizer_manager_func(
+                    server_args, port_args
+                )
+            else:
+                # Launch multi-tokenizer router
+                tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
+                template_manager = None
+
+            startup_complete = False
             try:
-                if not rust_server_owns_base_port:
-                    launch_dummy_health_check_server(
-                        get_serving().host,
-                        get_serving().port,
-                        get_observability().enable_metrics,
-                    )
-                scheduler_init_result.block_until_scheduler_exits()
+                # Wait for the model to finish loading
+                scheduler_init_result.wait_for_ready()
+
+                cls._set_startup_time(
+                    tokenizer_manager, scheduler_init_result, startup_tic
+                )
+
+                # Get back some info from scheduler to tokenizer_manager
+                tokenizer_manager.max_req_input_len = (
+                    scheduler_init_result.scheduler_infos[0]["max_req_input_len"]
+                )
+
+                # Set up subprocess liveness watchdog to detect crashes
+                # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
+                processes = list(scheduler_procs or [])
+                names = [f"scheduler_{i}" for i in range(len(processes))]
+                processes.extend(detoken_procs)
+                names.extend(detoken_names)
+                subprocess_watchdog = SubprocessWatchdog(
+                    processes=processes, process_names=names
+                )
+                subprocess_watchdog.start()
+                startup_complete = True
             finally:
-                scheduler_init_result.stop_grpc_server()
-            return (
-                None,
-                None,
-                port_args,
-                scheduler_init_result,
-                None,
-                weight_cache_daemon_procs,
-            )
+                if not startup_complete and isinstance(
+                    tokenizer_manager, TokenizerManager
+                ):
+                    tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
-        # The embedded Rust server (started inside the rank-0 scheduler) owns
-        # the API server, tokenization, and detokenization. In that mode we do
-        # not start the Python detokenizer subprocess(es) or tokenizer manager.
-        # Do not use RayEngine with the Rust server, as it is not supported.
-        if envs.SGLANG_RUST_SERVER.get():
-            # In place of the tokenizer manager, which starts the KV bootstrap
-            # server in Python mode.
-            scheduler_init_result.kv_bootstrap_server = (
-                start_disagg_service_for_rust_server()
-            )
-            scheduler_init_result.wait_for_ready()
-            # Set up subprocess liveness watchdog to detect crashes
-            processes = list(scheduler_procs or [])
-            names = [f"scheduler_{i}" for i in range(len(processes))]
-            subprocess_watchdog = SubprocessWatchdog(
-                processes=processes, process_names=names
-            )
-            subprocess_watchdog.start()
-
+            # The caller now owns the bootstrap service through SchedulerInitResult.
+            startup_cleanup.pop_all()
             return (
-                None,
-                None,
+                tokenizer_manager,
+                template_manager,
                 port_args,
                 scheduler_init_result,
                 subprocess_watchdog,
-                None,
+                weight_cache_daemon_procs,
             )
-
-        # Launch detokenizer process(es) — optionally fronted by a router when
-        # detokenizer_worker_num > 1.
-        detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
-            server_args=server_args,
-            port_args=port_args,
-            run_detokenizer_process_func=run_detokenizer_process_func,
-        )
-        for p in detoken_procs:
-            scheduler_init_result.all_child_pids.append(p.pid)
-
-        # Init tokenizer manager first, as the bootstrap server is initialized here
-        if get_serving().tokenizer_worker_num == 1:
-            tokenizer_manager, template_manager = init_tokenizer_manager_func(
-                server_args, port_args
-            )
-        else:
-            # Launch multi-tokenizer router
-            tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-            template_manager = None
-
-        startup_complete = False
-        try:
-            # Wait for the model to finish loading
-            scheduler_init_result.wait_for_ready()
-
-            cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
-
-            # Get back some info from scheduler to tokenizer_manager
-            tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
-                0
-            ]["max_req_input_len"]
-
-            # Set up subprocess liveness watchdog to detect crashes
-            # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
-            processes = list(scheduler_procs or [])
-            names = [f"scheduler_{i}" for i in range(len(processes))]
-            processes.extend(detoken_procs)
-            names.extend(detoken_names)
-            subprocess_watchdog = SubprocessWatchdog(
-                processes=processes, process_names=names
-            )
-            subprocess_watchdog.start()
-            startup_complete = True
-        finally:
-            if not startup_complete and isinstance(tokenizer_manager, TokenizerManager):
-                tokenizer_manager.cuda_vmm_feature_transport.shutdown()
-
-        return (
-            tokenizer_manager,
-            template_manager,
-            port_args,
-            scheduler_init_result,
-            subprocess_watchdog,
-            weight_cache_daemon_procs,
-        )
 
     @staticmethod
     def _init_tokenizer_worker(
@@ -1488,11 +1517,15 @@ class Engine(EngineScoreMixin, EngineBase):
 
             kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
         finally:
-            if isinstance(self.tokenizer_manager, TokenizerManager):
-                mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
-                if mm_processor is not None:
-                    mm_processor.shutdown()
-                self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+            try:
+                if scheduler_init_result is not None:
+                    scheduler_init_result.stop_disaggregation_bootstrap_server()
+            finally:
+                if isinstance(self.tokenizer_manager, TokenizerManager):
+                    mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
+                    if mm_processor is not None:
+                        mm_processor.shutdown()
+                    self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
     def __enter__(self):
         return self

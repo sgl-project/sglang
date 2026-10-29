@@ -1634,20 +1634,23 @@ class CommonKVManager(BaseKVManager):
 
     def _register_topology_row(self, url: str, payload: Dict) -> None:
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
+        last_failure = None
         for attempt in range(max_retries):
             try:
                 response = requests.put(url, json=payload, timeout=5)
                 if response.status_code == 200:
                     logger.debug("Prefill successfully registered to bootstrap server.")
                     return
+                last_failure = f"status {response.status_code}"
                 logger.warning(
-                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
+                    f"Prefill register attempt {attempt + 1}/{max_retries} failed: {last_failure}"
                 )
             except Exception as e:
                 # Walk to root cause to skip misleading urllib3 wrapper messages
                 cause = e
                 while cause.__cause__ is not None:
                     cause = cause.__cause__
+                last_failure = cause
                 logger.warning(
                     f"Prefill register attempt {attempt + 1}/{max_retries} failed: {cause}"
                 )
@@ -1657,8 +1660,11 @@ class CommonKVManager(BaseKVManager):
                 0.75 + 0.25 * (time.monotonic() % 1)
             )
             time.sleep(delay)
-        logger.error(
-            f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
+        # Prefill never re-registers, so an unregistered rank would leave every
+        # PD request unroutable; fail instead of serving.
+        raise RuntimeError(
+            f"Prefill instance failed to register to bootstrap server {url} "
+            f"after {max_retries} attempts: {last_failure}"
         )
 
     def _connect(self, endpoint: str, is_ipv6: bool = False):
@@ -3046,6 +3052,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         )
 
         # Start bootstrap server
+        # Create the loop before starting the thread so an immediate launch
+        # failure can request shutdown even before the thread begins running.
+        self._loop = asyncio.new_event_loop()
+        self._shutdown_event = asyncio.Event()
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
 
@@ -3302,7 +3312,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def _run_server(self):
         try:
             # Event Loop
-            self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
 
             cleanup_task = self._loop.create_task(self._cleanup_expired_entries())
@@ -3321,19 +3330,29 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             logger.info(
                 f"CommonKVBootstrapServer started successfully on {self.host}:{self.port}"
             )
-            self._loop.run_forever()
+            self._loop.run_until_complete(self._shutdown_event.wait())
         except Exception as e:
             logger.error(f"Server error: {str(e)}", exc_info=True)
         finally:
             # Cleanup
             self._loop.run_until_complete(self._runner.cleanup())
+            tasks = tuple(self._background_tasks)
+            for task in tasks:
+                task.cancel()
+            self._loop.run_until_complete(
+                asyncio.gather(*tasks, return_exceptions=True)
+            )
             self._loop.close()
 
     def close(self):
         """Shutdown"""
-        if self._loop is not None and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            logger.info("Stopping server loop...")
+        if not self._loop.is_closed():
+            try:
+                self._loop.call_soon_threadsafe(self._shutdown_event.set)
+            except RuntimeError:
+                # The server may have failed and closed its loop concurrently.
+                if not self._loop.is_closed():
+                    raise
 
         if self.thread.is_alive():
             self.thread.join(timeout=2)

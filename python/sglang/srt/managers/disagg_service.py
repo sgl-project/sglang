@@ -46,7 +46,17 @@ def start_disagg_service():
             host=get_serving().host,
             port=get_disagg().disaggregation_bootstrap_port,
         )
-        maybe_create_ascend_config_store(transfer_backend=transfer_backend)
+        try:
+            maybe_create_ascend_config_store(transfer_backend=transfer_backend)
+        except BaseException:
+            # The caller cannot own the listener until this factory returns.
+            try:
+                bootstrap_server.close()
+            except Exception:
+                logger.exception(
+                    "Failed to close bootstrap server after startup failure"
+                )
+            raise
 
         return bootstrap_server
 
@@ -67,9 +77,9 @@ def rust_server_serves_kv_bootstrap(transfer_backend: str) -> bool:
 
 
 def start_disagg_service_for_rust_server():
-    """Rust-server mode has no TokenizerManager to call ``start_disagg_service``.
-    Its prefill server serves the HTTP registry itself, so start only a
-    bootstrap server it cannot stand in for, before the prefill ranks register."""
+    """Rust-server variant of ``start_disagg_service``. The Rust prefill server
+    serves the HTTP registry itself, so start only a bootstrap server it cannot
+    stand in for, before the prefill ranks register."""
     if get_disagg().disaggregation_mode != "prefill" or (
         rust_server_serves_kv_bootstrap(get_disagg().disaggregation_transfer_backend)
     ):

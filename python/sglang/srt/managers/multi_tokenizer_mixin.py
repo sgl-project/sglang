@@ -40,7 +40,6 @@ import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.environ import envs
-from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     BaseReq,
@@ -647,8 +646,6 @@ class MultiTokenizerRouter:
             )
             self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
 
-        self.disaggregation_bootstrap_server = start_disagg_service()
-
         # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: set[str] = set()
         # Shared socket mapping (both coroutines run on self._loop, so safe)
@@ -848,11 +845,7 @@ class TokenizerWorker(TokenizerManager):
         import torch
 
         torch.set_num_threads(1)
-        super().__init__(
-            server_args,
-            port_args,
-            start_pd_bootstrap_service=False,
-        )
+        super().__init__(server_args, port_args)
 
         self.worker_id = os.getpid()
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name

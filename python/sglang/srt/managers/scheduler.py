@@ -1516,7 +1516,7 @@ class Scheduler(
 
         # In rust-server mode the KV bootstrap server is already up before the
         # PrefillBootstrapQueue's KVManager below registers to it (synchronously;
-        # a failed registration only retries ~60s then logs, leaving every PD
+        # a registration that never succeeds raises instead of leaving every PD
         # request unroutable): either the rust api listener serves the HTTP
         # registry (maybe_init_rust_server runs before this method), or, for a
         # transfer backend with its own bootstrap server, the main process has
