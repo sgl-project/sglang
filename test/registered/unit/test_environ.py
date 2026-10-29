@@ -44,6 +44,21 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND",
 )
 
+AMD_MONO_RUNTIME_CHILDREN = (
+    "SGLANG_OPT_DSV41_DSPARK_POST_FOLD",
+    "SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS",
+    "SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE",
+    "SGLANG_OPT_DSV41_DSPARK_MID_FOLD",
+    "SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE",
+    "SGLANG_OPT_DSV41_TARGET_METADATA_EARLY",
+)
+
+# each master switch and the children that follow it
+RUNTIME_MASTERS = (
+    ("SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION", NV_MEGA_RUNTIME_CHILDREN),
+    ("SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION", AMD_MONO_RUNTIME_CHILDREN),
+)
+
 
 class TestEnvField(unittest.TestCase):
     def setUp(self):
@@ -135,48 +150,61 @@ class TestEnvField(unittest.TestCase):
         self.assertIn("Invalid value", str(caught[0].message))
 
     def test_mega_runtime_defaults_and_registry_scope(self):
-        with ExitStack() as stack:
-            for field in self.env_fields.values():
-                stack.enter_context(field.override(False))
-                field.clear()
-            defaults = {name: field.get() for name, field in self.env_fields.items()}
-            master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
-            self.assertIs(master.get(), False)
-            for master_value in (False, True, False):
-                with master.override(master_value):
-                    for name, expected in defaults.items():
-                        if name == master.name or name in NV_MEGA_RUNTIME_CHILDREN:
-                            expected = master_value
-                        with self.subTest(master=master_value, name=name):
-                            self.assertEqual(self.env_fields[name].get(), expected)
-                    for name in NV_MEGA_RUNTIME_CHILDREN:
-                        with self.subTest(master=master_value, child=name):
-                            child = self.env_fields[name]
-                            self.assertIs(child.get(), master_value)
-                            self.assertFalse(child.is_set())
+        for master_name, children in RUNTIME_MASTERS:
+            with ExitStack() as stack:
+                for field in self.env_fields.values():
+                    stack.enter_context(field.override(False))
+                    field.clear()
+                defaults = {
+                    name: field.get() for name, field in self.env_fields.items()
+                }
+                master = self.env_fields[master_name]
+                self.assertIs(master.get(), False)
+                for master_value in (False, True, False):
+                    with master.override(master_value):
+                        for name, expected in defaults.items():
+                            if name == master.name or name in children:
+                                expected = master_value
+                            with self.subTest(
+                                master=master_name, value=master_value, name=name
+                            ):
+                                self.assertEqual(self.env_fields[name].get(), expected)
+                        for name in children:
+                            with self.subTest(
+                                master=master_name, value=master_value, child=name
+                            ):
+                                child = self.env_fields[name]
+                                self.assertIs(child.get(), master_value)
+                                self.assertFalse(child.is_set())
 
     def test_mega_runtime_explicit_children_override_master(self):
-        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
-        for master_value, child_value in ((True, "0"), (True, "false"), (False, "1")):
-            with master.override(master_value):
-                for name in NV_MEGA_RUNTIME_CHILDREN:
-                    child = self.env_fields[name]
-                    with self.subTest(
-                        master=master_value, child=name, value=child_value
-                    ):
-                        with child.override(child_value):
-                            self.assertIs(child.get(), not master_value)
-                            self.assertTrue(child.is_set())
-                            child.clear()
-                            self.assertIs(child.get(), master_value)
+        for master_name, children in RUNTIME_MASTERS:
+            master = self.env_fields[master_name]
+            for master_value, child_value in (
+                (True, "0"),
+                (True, "false"),
+                (False, "1"),
+            ):
+                with master.override(master_value):
+                    for name in children:
+                        child = self.env_fields[name]
+                        with self.subTest(
+                            master=master_name, child=name, value=child_value
+                        ):
+                            with child.override(child_value):
+                                self.assertIs(child.get(), not master_value)
+                                self.assertTrue(child.is_set())
+                                child.clear()
+                                self.assertIs(child.get(), master_value)
 
     def test_mega_runtime_does_not_override_explicit_none(self):
-        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
-            for name in NV_MEGA_RUNTIME_CHILDREN:
-                with self.subTest(child=name):
-                    child = self.env_fields[name]
-                    with child.override(None):
-                        self.assertIsNone(child.get())
+        for master_name, children in RUNTIME_MASTERS:
+            with self.env_fields[master_name].override(True):
+                for name in children:
+                    with self.subTest(master=master_name, child=name):
+                        child = self.env_fields[name]
+                        with child.override(None):
+                            self.assertIsNone(child.get())
 
 
 class TestDeprecatedEnvRegistry(unittest.TestCase):

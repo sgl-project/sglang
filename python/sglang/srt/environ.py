@@ -25,6 +25,15 @@ def _default_hip() -> bool:
         return False
 
 
+def _mega_or_mono_runtime() -> bool:
+    """Default of a runtime optimization both megakernel backends take: on with either
+    vendor's master switch."""
+    return (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        or envs.SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get()
+    )
+
+
 _NON_UTF8_PREFIX = "base64:"
 
 
@@ -282,6 +291,8 @@ class Envs:
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     # Explicit child values override this default for megakernel runtime optimizations.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
+    # The same for the runtime optimizations accompanying AMD monokernels (sgl-amd-mono).
+    SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
@@ -594,14 +605,10 @@ class Envs:
     )
     # DSpark static verify: the verify graph scatters new seq lens and the bonus into
     # the FutureMap's slots; the host skips those scatters for folded accepts.
-    SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(_mega_or_mono_runtime)
     # DSpark target verify: a pre-planned replay skips re-copying input_ids / positions
     # the plan-time load already copied from the same tensors.
-    SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS = EnvBool(_mega_or_mono_runtime)
     # DSpark: draw the simulated acceptance length (and the sim bonus seed) before the
     # draft launch instead of between the draft and the target verify.
     SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD = EnvBool(False)
@@ -1971,24 +1978,16 @@ class Envs:
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     # DSpark decode: build the verify window and the draft anchor column in one
     # launch instead of two adds, assign_extend_cache_locs and a copy.
-    SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(_mega_or_mono_runtime)
     # DSpark folded draft: the draft graph's tail writes [anchor | draft tokens]
     # into the sampler's own buffer, so the step skips its eager concat.
-    SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(_mega_or_mono_runtime)
     # DSpark static verify: run the target verify runner's metadata prep through the
     # metadata glue graph where its backend declares the prep host-free.
-    SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(_mega_or_mono_runtime)
     # DSpark static verify: build the target verify metadata on a side stream beside the
     # draft graph, for requests up to the candidate span (needs the glue switch above).
-    SGLANG_OPT_DSV41_TARGET_METADATA_EARLY = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    SGLANG_OPT_DSV41_TARGET_METADATA_EARLY = EnvBool(_mega_or_mono_runtime)
     # Decode / verify graph replays whose metadata glue graph is captured skip the
     # replay ForwardBatch view (the graph reads slots and buffers by address).
     SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW = EnvBool(
