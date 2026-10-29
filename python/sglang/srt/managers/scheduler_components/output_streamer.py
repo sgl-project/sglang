@@ -25,7 +25,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
     CachedTokensDetails,
-    RequestOutputMeta,
+    RequestOutputHeader,
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -137,9 +137,9 @@ class SchedulerOutputStreamer:
 
         return None
 
-    def build_request_meta(self, req: Req) -> RequestOutputMeta:
+    def build_request_header(self, req: Req) -> RequestOutputHeader:
         image_tokens, audio_tokens, video_tokens = req.get_mm_token_counts()
-        return RequestOutputMeta(
+        return RequestOutputHeader(
             prompt_tokens=len(req.origin_input_ids),
             cached_tokens=req.cached_tokens,
             cached_tokens_details=self.get_cached_tokens_details(req),
@@ -214,7 +214,7 @@ class SchedulerOutputStreamer:
             disaggregation_mode=self.disaggregation_mode,
             default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
-            build_request_meta=self.build_request_meta,
+            build_request_header=self.build_request_header,
             is_request_level_customized_info_key=(
                 self.is_request_level_customized_info_key
             ),
@@ -293,7 +293,7 @@ class SchedulerOutputStreamer:
         finished_reasons: List[BaseFinishReason] = []
 
         embeddings = []
-        request_metas = []
+        request_headers = []
         phs_list = []
         has_phs = False
         for req in reqs:
@@ -302,7 +302,7 @@ class SchedulerOutputStreamer:
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
                 embeddings.append(req.embedding)
-                request_metas.append(self.build_request_meta(req))
+                request_headers.append(self.build_request_header(req))
 
                 phs = req.pooled_hidden_state
                 phs_list.append(phs)
@@ -338,7 +338,7 @@ class SchedulerOutputStreamer:
                 http_worker_ipcs=http_worker_ipcs,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
-                request_metas=request_metas,
+                request_headers=request_headers,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
                 pooled_hidden_states=stacked_phs,
@@ -357,7 +357,7 @@ class _GenerationStreamAccumulator:
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
     default_force_stream_interval: int
-    build_request_meta: Callable[[Req], RequestOutputMeta]
+    build_request_header: Callable[[Req], RequestOutputHeader]
     is_request_level_customized_info_key: Callable[[str], bool]
     current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
@@ -373,8 +373,8 @@ class _GenerationStreamAccumulator:
     no_stop_trim: list = field(default_factory=list)
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
-    request_metas: list = field(default_factory=list)
-    has_request_meta: bool = False
+    request_headers: list = field(default_factory=list)
+    has_request_header: bool = False
     # Rust server mode only; see BatchTokenIDOutput.prompt_tokens.
     prompt_tokens: Optional[list] = None
     cached_tokens: Optional[list] = None
@@ -550,14 +550,14 @@ class _GenerationStreamAccumulator:
                 else len(output_ids_)
             )
 
-            # The tokenizer keeps each request's latest metadata. A finished row
+            # The tokenizer keeps each request's latest header. A finished row
             # always carries it, so the final output reflects any late change.
-            if req.request_meta_stale or req.finished():
-                self.request_metas.append(self.build_request_meta(req))
-                self.has_request_meta = True
-                req.request_meta_stale = False
+            stale = req.take_request_header_stale()
+            if stale or req.finished():
+                self.request_headers.append(self.build_request_header(req))
+                self.has_request_header = True
             else:
-                self.request_metas.append(None)
+                self.request_headers.append(None)
 
         if req.finished():
             self.weight_versions.append(
@@ -759,7 +759,7 @@ class _GenerationStreamAccumulator:
             no_stop_trim=self.no_stop_trim,
             reasoning_tokens=self.reasoning_tokens,
             completion_tokens=self.completion_tokens,
-            request_metas=self.request_metas if self.has_request_meta else None,
+            request_headers=self.request_headers if self.has_request_header else None,
             prompt_tokens=self.prompt_tokens,
             cached_tokens=self.cached_tokens,
             image_tokens=self.image_tokens,

@@ -1580,10 +1580,10 @@ CachedTokensDetails = Dict[str, Union[int, str]]
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
 
-class RequestOutputMeta(
+class RequestOutputHeader(
     msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
 ):
-    """A request's output metadata that changes only at a few lifecycle points.
+    """A request's output header: values that change only at a few lifecycle points.
     The scheduler sends it when it changes; the tokenizer keeps the latest."""
 
     prompt_tokens: int
@@ -1707,10 +1707,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
-    # By row, the request's metadata when it is new since the request's last
+    # By row, the request's header when it is new since the request's last
     # output or when the row finishes, else None; the whole field is None when
     # no row carries one.
-    request_metas: Optional[List[Optional[RequestOutputMeta]]] = None
+    request_headers: Optional[List[Optional[RequestOutputHeader]]] = None
 
     # Rust server mode only: per-step header columns of
     # `RustServer.push_generation`; None otherwise.
@@ -1798,8 +1798,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
-    # See BatchTokenIDOutput.request_metas.
-    request_metas: Optional[List[Optional[RequestOutputMeta]]] = None
+    # See BatchTokenIDOutput.request_headers.
+    request_headers: Optional[List[Optional[RequestOutputHeader]]] = None
 
     # Verify count: number of verification forward passes
     spec_verify_ct: Optional[List[int]] = None
@@ -1823,8 +1823,8 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output embedding
     embeddings: List[Union[List[Union[float, List[float]]], Dict[int, float], float]]
-    # Each request is output once, so every row carries its metadata.
-    request_metas: List[RequestOutputMeta]
+    # Each request is output once, so every row carries its header.
+    request_headers: List[RequestOutputHeader]
     # Placeholder token info
     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
     placeholder_tokens_val: Optional[List[Optional[List[int]]]]

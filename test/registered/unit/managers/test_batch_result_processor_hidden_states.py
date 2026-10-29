@@ -179,6 +179,9 @@ class _PrefillReq:
     def update_finish_state(self):
         return None
 
+    def mark_request_header_stale(self):
+        pass
+
 
 class _DecodeReq:
     def __init__(self):

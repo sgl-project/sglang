@@ -30,7 +30,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     ParallelismInfo,
-    RequestOutputMeta,
+    RequestOutputHeader,
     RpcReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
@@ -297,15 +297,15 @@ class TestWeightVersionSpansRoundTrip(CustomTestCase):
         self.assertIsNone(_round_trip(AbortReq(rid="r0")).weight_versions)
 
 
-class TestRequestMetasRoundTrip(CustomTestCase):
-    """Per-row request metadata, with its time stats, decodes back to typed
+class TestRequestHeadersRoundTrip(CustomTestCase):
+    """Per-row request headers, with their time stats, decode back to typed
     structs, not plain lists."""
 
-    def test_batch_outputs_carry_request_metas(self):
+    def test_batch_outputs_carry_request_headers(self):
         time_stats = SchedulerOutputTimeStats(
             queue_time=0.5, forward_entry_time=1.7e9, storage_staging_wait=0.0
         )
-        meta = RequestOutputMeta(
+        header = RequestOutputHeader(
             prompt_tokens=7,
             cached_tokens=3,
             cached_tokens_details={"device": 3, "host": 0, "storage_backend": "X"},
@@ -320,22 +320,24 @@ class TestRequestMetasRoundTrip(CustomTestCase):
             "pickle": lambda obj: pickle.loads(pickle.dumps(obj)),
         }
         for cls in (BatchTokenIDOutput, BatchStrOutput, BatchEmbeddingOutput):
-            # Embedding rows always carry their metadata.
-            request_metas = [meta, meta if cls is BatchEmbeddingOutput else None]
+            # Embedding rows always carry their header.
+            request_headers = [header, header if cls is BatchEmbeddingOutput else None]
             for codec, round_trip in round_trips.items():
                 with self.subTest(type=cls.__name__, codec=codec):
                     required = {
                         f.name: [] for f in msgspec.structs.fields(cls) if f.required
                     }
                     obj = cls(**{**required, "rids": ["a", "b"]})
-                    obj.request_metas = request_metas
+                    obj.request_headers = request_headers
 
                     decoded = round_trip(obj)
 
-                    self.assertEqual(decoded.request_metas, request_metas)
-                    self.assertIsInstance(decoded.request_metas[0], RequestOutputMeta)
+                    self.assertEqual(decoded.request_headers, request_headers)
                     self.assertIsInstance(
-                        decoded.request_metas[0].time_stats, SchedulerOutputTimeStats
+                        decoded.request_headers[0], RequestOutputHeader
+                    )
+                    self.assertIsInstance(
+                        decoded.request_headers[0].time_stats, SchedulerOutputTimeStats
                     )
 
 

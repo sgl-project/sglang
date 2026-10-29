@@ -587,6 +587,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
             set_prefill_finished_time=Mock(),
             set_prefill_transfer_queue_entry_time=Mock(),
         ),
+        mark_request_header_stale=Mock(),
     )
     batch = SimpleNamespace(
         reqs=[req],

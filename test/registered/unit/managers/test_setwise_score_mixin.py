@@ -626,7 +626,7 @@ class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
             )
 
         fake_self = SimpleNamespace(
-            build_request_meta=lambda req: None,
+            build_request_header=lambda req: None,
             send_to_detokenizer=SimpleNamespace(
                 send_output=lambda obj: captured.append(obj)
             ),

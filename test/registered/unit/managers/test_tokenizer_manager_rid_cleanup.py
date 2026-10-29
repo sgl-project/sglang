@@ -35,7 +35,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     BatchStrOutput,
     EmbeddingReqInput,
     GenerateReqInput,
-    RequestOutputMeta,
+    RequestOutputHeader,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -175,7 +175,7 @@ def _make_abort_req(rid: str, abort_message: str = "Aborted") -> AbortReq:
     )
 
 
-def _request_meta(**overrides) -> RequestOutputMeta:
+def _request_header(**overrides) -> RequestOutputHeader:
     fields = dict(
         prompt_tokens=0,
         cached_tokens=0,
@@ -186,7 +186,7 @@ def _request_meta(**overrides) -> RequestOutputMeta:
         video_tokens=0,
         time_stats=None,
     )
-    return RequestOutputMeta(**{**fields, **overrides})
+    return RequestOutputHeader(**{**fields, **overrides})
 
 
 def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
@@ -213,8 +213,8 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [fr]
         elif f.name == "output_strs":
             kwargs[f.name] = ["hello"]
-        elif f.name == "request_metas":
-            kwargs[f.name] = [_request_meta()]
+        elif f.name == "request_headers":
+            kwargs[f.name] = [_request_header()]
         elif f.name in _PER_REQUEST_INT_FIELDS:
             kwargs[f.name] = [0]
         elif f.name in _PER_REQUEST_FLOAT_FIELDS:
@@ -537,25 +537,27 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
 
-class TestStoredRequestMeta(CustomTestCase):
-    def test_rows_without_meta_read_the_latest_meta(self):
-        """The scheduler sends a request's metadata only when it changes; a row
+class TestStoredRequestHeader(CustomTestCase):
+    def test_rows_without_header_read_the_latest_header(self):
+        """The scheduler sends a request's header only when it changes; a row
         without one reports the latest received, and a row before any is dropped."""
         tm = _make_tokenizer_manager(self)
-        rid = "meta_rid"
+        rid = "header_rid"
         state = _make_req_state(rid)
         state.obj.stream = True
         tm.rid_to_state[rid] = state
-        first = _request_meta(prompt_tokens=5, cached_tokens=2)
-        retracted = _request_meta(prompt_tokens=5, cached_tokens=3, retraction_count=1)
-        for request_metas, finished_reason in (
+        first = _request_header(prompt_tokens=5, cached_tokens=2)
+        retracted = _request_header(
+            prompt_tokens=5, cached_tokens=3, retraction_count=1
+        )
+        for request_headers, finished_reason in (
             ([first], _NOT_FINISHED),
             (None, _NOT_FINISHED),
             ([retracted], _NOT_FINISHED),
             ([None], None),
         ):
             batch_output = _make_batch_str_output(rid, finished_reason)
-            batch_output.request_metas = request_metas
+            batch_output.request_headers = request_headers
             asyncio.run(tm._handle_batch_output(batch_output))
 
         self.assertEqual(
@@ -569,7 +571,7 @@ class TestStoredRequestMeta(CustomTestCase):
         # A late row of an aborted request whose rid a new request reused.
         reused = tm.rid_to_state[rid] = _make_req_state(rid)
         batch_output = _make_batch_str_output(rid, _NOT_FINISHED)
-        batch_output.request_metas = None
+        batch_output.request_headers = None
         asyncio.run(tm._handle_batch_output(batch_output))
         self.assertEqual(reused.out_list, [])
         self.assertIs(tm.rid_to_state[rid], reused)
@@ -606,8 +608,8 @@ class TestRequestTpotGating(CustomTestCase):
         for completion_tokens, finished_reason in batches:
             batch_output = _make_batch_str_output(rid, finished_reason)
             batch_output.completion_tokens = [completion_tokens]
-            batch_output.request_metas = [
-                _request_meta(time_stats=sched_stats.to_output_time_stats())
+            batch_output.request_headers = [
+                _request_header(time_stats=sched_stats.to_output_time_stats())
             ]
             asyncio.run(tm._handle_batch_output(batch_output))
         (call,) = tm.metrics_collector.observe_one_finished_request.call_args_list
@@ -659,8 +661,8 @@ class TestNonStreamingFirstTokenTime(CustomTestCase):
             enable_metrics=True, prefill_finished_time=prefill_finished_time
         )
         batch_output = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
-        batch_output.request_metas = [
-            _request_meta(time_stats=sched_stats.to_output_time_stats())
+        batch_output.request_headers = [
+            _request_header(time_stats=sched_stats.to_output_time_stats())
         ]
         arrival = time.perf_counter()
         asyncio.run(tm._handle_batch_output(batch_output))

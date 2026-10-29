@@ -83,7 +83,7 @@ class _FakeReq:
         self.cached_tokens_host = 0
         self.cached_tokens_storage = 0
         self.retraction_count = 0
-        self.request_meta_stale = True
+        self._request_header_stale = True
         self.time_stats = None
         self.return_hidden_states = False
         self.return_routed_experts = False
@@ -96,6 +96,11 @@ class _FakeReq:
         self.multimodal_inputs = None
         self.customized_info = customized_info
         self.weight_version_events = []
+
+    def take_request_header_stale(self):
+        stale = self._request_header_stale
+        self._request_header_stale = False
+        return stale
 
     def finished(self):
         return self._finished
@@ -126,7 +131,7 @@ def _accumulator(
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
         default_force_stream_interval=1,
-        build_request_meta=lambda req: None,
+        build_request_header=lambda req: None,
         is_request_level_customized_info_key=request_level_keys.__contains__,
         current_weight_version=current_weight_version,
         rust_server_mode=rust_server_mode,
@@ -654,7 +659,7 @@ def _run_prefill_result(processor, reqs, decoding_reqs=None):
         processor.process_batch_result_prefill(batch, result)
 
 
-class TestOutputStreamerRequestMeta(unittest.TestCase):
+class TestOutputStreamerRequestHeader(unittest.TestCase):
     def setUp(self):
         _enter_streamer_scope(self)
 
@@ -669,7 +674,7 @@ class TestOutputStreamerRequestMeta(unittest.TestCase):
         self.addCleanup(observability.stop)
 
     def test_meta_carries_time_stats_only_with_metrics_on(self):
-        """With metrics on a request's metadata carries its time stats, None for
+        """With metrics on a request's header carries its time stats, None for
         a request whose own metrics are off; with metrics off it carries none."""
         timed = SchedulerReqTimeStats(enable_metrics=True)
         timed.queue_duration_s = 0.25
@@ -678,14 +683,14 @@ class TestOutputStreamerRequestMeta(unittest.TestCase):
             self._set_metrics(enable_metrics)
             req = _FakeReq("r", [1])
             req.time_stats = req_time_stats
-            return _streamer([]).build_request_meta(req).time_stats
+            return _streamer([]).build_request_header(req).time_stats
 
         self.assertEqual(time_stats(True, timed), timed.to_output_time_stats())
         self.assertIsNone(time_stats(True, SchedulerReqTimeStats()))
         self.assertIsNone(time_stats(False, timed))
 
-    def test_output_after_reprefill_carries_current_meta(self):
-        """A request's metadata goes out with its first output, and again with
+    def test_output_after_reprefill_carries_current_header(self):
+        """A request's header goes out with its first output, and again with
         the first output after each prefill result or retraction, so the output
         after a re-prefill carries the new retraction count and queue time even
         when an output went out between the retraction and the re-prefill."""
@@ -698,12 +703,12 @@ class TestOutputStreamerRequestMeta(unittest.TestCase):
 
         def prefill_result():
             _run_prefill_result(processor, [req])
-            return outputs[-1].request_metas
+            return outputs[-1].request_headers
 
         def decode_result():
             req.output_ids.append(8)
             streamer.stream_output([req], False)
-            return outputs[-1].request_metas
+            return outputs[-1].request_headers
 
         [first] = prefill_result()
         self.assertEqual(
@@ -725,9 +730,9 @@ class TestOutputStreamerRequestMeta(unittest.TestCase):
         self.assertEqual(reprefilled.time_stats.queue_time, 0.5)
         self.assertIsNone(decode_result())
 
-    def test_output_after_prebuilt_carries_current_meta(self):
+    def test_output_after_prebuilt_carries_current_header(self):
         """PD decode: the first output after a prebuilt result carries fresh
-        metadata, so a rebootstrapped request reports its new transfer's cached
+        header, so a rebootstrapped request reports its new transfer's cached
         tokens even when an output went out since its retraction."""
         outputs = []
         streamer = _streamer(outputs)
@@ -749,12 +754,12 @@ class TestOutputStreamerRequestMeta(unittest.TestCase):
                 processor.process_batch_result_prebuilt(
                     SimpleNamespace(reqs=[req], return_logprob=False)
                 )
-            return outputs[-1].request_metas
+            return outputs[-1].request_headers
 
         def decode_result():
             req.output_ids.append(8)
             streamer.stream_output([req], False)
-            return outputs[-1].request_metas
+            return outputs[-1].request_headers
 
         [first] = prebuilt_result()
         self.assertEqual(first.cached_tokens, 2)
@@ -769,9 +774,9 @@ class TestOutputStreamerRequestMeta(unittest.TestCase):
         [resumed] = prebuilt_result()
         self.assertEqual(resumed.cached_tokens, 5)
 
-    def test_output_after_dllm_block_carries_current_meta(self):
+    def test_output_after_dllm_block_carries_current_header(self):
         """dLLM: each block is an extend that can change cached_tokens, so the
-        output after each block result carries fresh metadata."""
+        output after each block result carries a fresh header."""
         from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 
         outputs = []
@@ -810,16 +815,16 @@ class TestOutputStreamerRequestMeta(unittest.TestCase):
                 can_run_cuda_graph=False,
             )
             SchedulerDllmMixin.process_batch_result_dllm(scheduler, batch, result)
-            return outputs[-1].request_metas
+            return outputs[-1].request_headers
 
         [first] = block_result(2)
         self.assertEqual(first.cached_tokens, 2)
         [second] = block_result(3)
         self.assertEqual(second.cached_tokens, 3)
 
-    def test_mixed_batch_decode_row_keeps_its_meta(self):
+    def test_mixed_batch_decode_row_keeps_its_header(self):
         """A decode row riding in an extend batch (mixed chunk, or a decode batch
-        DP attention converted) ran no prefill, so its metadata is not resent;
+        DP attention converted) ran no prefill, so its header is not resent;
         the prefill row's is."""
         outputs = []
         streamer = _streamer(outputs)
@@ -831,12 +836,12 @@ class TestOutputStreamerRequestMeta(unittest.TestCase):
 
         _run_prefill_result(processor, [prefilling, decoding], decoding_reqs=[decoding])
 
-        prefill_meta, decode_meta = outputs[-1].request_metas
-        self.assertIsNotNone(prefill_meta)
-        self.assertIsNone(decode_meta)
+        prefill_header, decode_header = outputs[-1].request_headers
+        self.assertIsNotNone(prefill_header)
+        self.assertIsNone(decode_header)
 
-    def test_finished_output_carries_current_meta(self):
-        """A finished output carries the request's current metadata even when a
+    def test_finished_output_carries_current_header(self):
+        """A finished output carries the request's current header even when a
         value changed with no flag set: HiCache storage attached mid-request adds
         the storage keys to cached_tokens_details."""
         attached = False
@@ -847,18 +852,18 @@ class TestOutputStreamerRequestMeta(unittest.TestCase):
 
         req.output_ids.append(7)
         streamer.stream_output([req], False)
-        [first] = outputs[-1].request_metas
+        [first] = outputs[-1].request_headers
         self.assertEqual(first.cached_tokens_details, {"device": 2, "host": 0})
 
         attached = True
         req.output_ids.append(8)
         streamer.stream_output([req], False)
-        self.assertIsNone(outputs[-1].request_metas)
+        self.assertIsNone(outputs[-1].request_headers)
 
         req.output_ids.append(9)
         req.finished_reason = FINISH_LENGTH(length=3)
         streamer.stream_output([req], False)
-        [finished] = outputs[-1].request_metas
+        [finished] = outputs[-1].request_headers
         self.assertEqual(
             finished.cached_tokens_details,
             {"device": 2, "host": 0, "storage": 0, "storage_backend": "none"},

@@ -105,7 +105,7 @@ class SchedulerDllmMixin:
             for idx in range(batch.batch_size()):
                 req = batch.reqs[idx]
                 # Each block is an extend that can update cached_tokens.
-                req.request_meta_stale = True
+                req.mark_request_header_stale()
 
                 if not fdfo_mode:
                     next_token_ids = result.next_token_ids[idx].tolist()

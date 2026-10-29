@@ -122,7 +122,7 @@ class SchedulerBatchResultProcessor:
             self.token_to_kv_pool_allocator.free_group_begin()
         for req in batch.reqs:
             req.time_stats.set_decode_prebuilt_finish_time()
-            req.request_meta_stale = True
+            req.mark_request_header_stale()
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
@@ -356,7 +356,7 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
                     if not is_decoding:
-                        req.request_meta_stale = True
+                        req.mark_request_header_stale()
 
                     if discard_finish_reason is not None:
                         req.to_finish = discard_finish_reason
