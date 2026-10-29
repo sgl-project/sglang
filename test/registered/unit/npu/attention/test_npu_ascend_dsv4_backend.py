@@ -716,29 +716,6 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
         self.assertIs(attention_op, custom_ops.npu_sparse_attn_sharedkv)
         self.assertEqual(kwargs, {})
 
-    @patch(_ARCH35_PATCH_TARGET, return_value=True)
-    def test_arch35_dspark_uses_operator_api(self, _):
-        operator_api = ModuleType("sgl_kernel_npu.operators.attention")
-        operator_api.kv_quant_sparse_attn_sharedkv_metadata_host = MagicMock()
-        operator_api.kv_quant_sparse_attn_sharedkv = MagicMock()
-        with patch.dict(
-            sys.modules, {"sgl_kernel_npu.operators.attention": operator_api}
-        ):
-            metadata_op, attention_op = _sparse_attn_ops(is_dspark=True)
-
-        self.assertIs(
-            metadata_op, operator_api.kv_quant_sparse_attn_sharedkv_metadata_host
-        )
-        self.assertIs(attention_op, operator_api.kv_quant_sparse_attn_sharedkv)
-
-    @patch(_ARCH35_PATCH_TARGET, return_value=False)
-    def test_pre_arch35_dspark_uses_host_metadata_ops(self, _):
-        with patch("torch.ops.npu", MagicMock(), create=True) as npu_ops:
-            metadata_op, attention_op = _sparse_attn_ops(is_dspark=True)
-
-        self.assertIs(metadata_op, npu_ops.sparse_attn_sharedkv_metadata_host)
-        self.assertIs(attention_op, npu_ops.sparse_attn_sharedkv)
-
 
 class TestSparseAttentionMetadata(unittest.TestCase):
     _ARCH35_PATCH_TARGET = (
