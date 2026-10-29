@@ -4813,6 +4813,37 @@ class TestRustServerDpAttentionControlBroadcast(unittest.TestCase):
         )
 
 
+class TestRustServerPrefillReplicaDp(CustomTestCase):
+    def test_prefill_rejects_replica_dp(self):
+        """A plain-DP prefill replica's listener must not advertise a KV
+        bootstrap registry its ranks never register with."""
+
+        def args(**kwargs):
+            return ServerArgs(
+                model_path="dummy",
+                served_model_name="dummy",
+                chunked_prefill_size=-1,
+                **kwargs,
+            )
+
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            self.assertRaisesRegex(ValueError, "prefill does not support"),
+        ):
+            args(disaggregation_mode="prefill", dp_size=2).check_server_args()
+
+        for rust_server, kwargs in (
+            (True, dict(disaggregation_mode="prefill", tp_size=2, attn_dp_size=2)),
+            (True, dict(disaggregation_mode="decode", dp_size=2)),
+            (False, dict(disaggregation_mode="prefill", dp_size=2)),
+        ):
+            with (
+                self.subTest(rust_server=rust_server, **kwargs),
+                envs.SGLANG_RUST_SERVER.override(rust_server),
+            ):
+                args(**kwargs).check_server_args()
+
+
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
     """A decode graph that can capture a collective must not run with NCCL's
     graph buffer registration: the registered graph-pool temporaries alias
