@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       run_all_tests:
-        description: "Build and run both sanity files even without PPU path changes"
+        description: "Build and run the PPU model sanity suite even without PPU path changes"
         required: false
         type: boolean
         default: true
@@ -95,13 +95,24 @@ jobs:
             ppu:
               - ".github/workflows/pr-test-ppu.yml"
               - "scripts/ci/ppu/**"
+              - "python/pyproject_other.toml"
               - "python/sglang/srt/platforms/sail.py"
+              - "python/sglang/srt/hardware_backend/sail/**"
+              - "python/sglang/srt/layers/attention/flashmla_backend.py"
+              - "python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py"
+              - "python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py"
+              - "python/sglang/srt/models/deepseek_common/utils.py"
+              - "python/sglang/kernels/aot/python/sgl_kernel/flash_attn.py"
+              - "python/sglang/kernels/aot/python/sgl_kernel/utils.py"
               - "python/sglang/kernels/aot/setup_sail.py"
               - "python/sglang/kernels/aot/pyproject_sail.toml"
               - "python/sglang/kernels/aot/csrc/common_extension_sail.cc"
               - "python/sglang/kernels/jit/utils/compile/sailify.py"
               - "test/registered/core/test_basic_sanity_eagle3.py"
               - "test/registered/core/test_basic_sanity_dflash.py"
+              - "test/registered/core/test_basic_sanity.py"
+              - "test/registered/radix_cache/test_radix_attention.py"
+              - "test/registered/ppu/**"
 
   pr-gate:
     name: >-
@@ -227,15 +238,17 @@ jobs:
           merge-multiple: true
           path: ${{ env.PPU_CI_WHEEL_DIR }}
 
-      - name: Run both speculative sanity files in isolated Docker
+      - name: Run the PPU model sanity suite in isolated Docker
         env:
           CONFIG_PPU_CI_DEVICE: ${{ vars.PPU_CI_DEVICE }}
           CONFIG_PPU_CI_TARGET_MODEL_PATH: ${{ vars.PPU_CI_TARGET_MODEL_PATH }}
           CONFIG_PPU_CI_EAGLE3_MODEL_PATH: ${{ vars.PPU_CI_EAGLE3_MODEL_PATH }}
           CONFIG_PPU_CI_DFLASH_MODEL_PATH: ${{ vars.PPU_CI_DFLASH_MODEL_PATH }}
+          CONFIG_PPU_CI_MLA_MODEL_PATH: ${{ vars.PPU_CI_MLA_MODEL_PATH }}
+          CONFIG_PPU_CI_SMALL_MODEL_PATH: ${{ vars.PPU_CI_SMALL_MODEL_PATH }}
           CONFIG_PPU_CI_EVAL_CACHE: ${{ vars.PPU_CI_EVAL_CACHE }}
         run: |
-          for key in PPU_CI_DEVICE PPU_CI_TARGET_MODEL_PATH PPU_CI_EAGLE3_MODEL_PATH PPU_CI_DFLASH_MODEL_PATH PPU_CI_EVAL_CACHE; do
+          for key in PPU_CI_DEVICE PPU_CI_TARGET_MODEL_PATH PPU_CI_EAGLE3_MODEL_PATH PPU_CI_DFLASH_MODEL_PATH PPU_CI_MLA_MODEL_PATH PPU_CI_SMALL_MODEL_PATH PPU_CI_EVAL_CACHE; do
             override="CONFIG_$key"
             if [[ -n "${!override}" ]]; then
               export "$key=${!override}"
