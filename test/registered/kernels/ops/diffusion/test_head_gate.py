@@ -13,7 +13,14 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 @pytest.mark.parametrize(
     "batch,tokens,heads,head_dim",
-    [(2, 1536, 32, 128), (2, 126, 32, 64), (1, 7, 4, 16), (3, 5, 8, 24)],
+    [
+        (1, 1536, 32, 128),
+        (1, 126, 32, 64),
+        (2, 1536, 32, 128),
+        (2, 126, 32, 64),
+        (1, 7, 4, 16),
+        (3, 5, 8, 24),
+    ],
 )
 @pytest.mark.parametrize("flat", [False, True])
 def test_head_gate_mul_matches_eager_bitwise(
