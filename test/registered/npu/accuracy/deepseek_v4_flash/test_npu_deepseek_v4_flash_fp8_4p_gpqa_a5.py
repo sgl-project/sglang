@@ -88,7 +88,6 @@ DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
     "--kv-cache-dtype",
     "auto",
     "--enable-dp-lm-head",
-    "--disable-radix-cache",
     "--enable-dp-attention",
     "--dp-size",
     4,
