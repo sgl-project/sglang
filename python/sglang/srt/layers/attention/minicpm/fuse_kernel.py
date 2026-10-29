@@ -5,8 +5,8 @@ import tilelang
 import tilelang.language as T
 import tilelang.math
 
+# Shared Q/K tiles need block barriers before cross-warp MMA operand loads.
 _pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
 }
@@ -153,12 +153,12 @@ def _fused_attn_pooling_online_topk(
                 active = cache_len + 1 >= dense_len
                 q_current_seqlen = T.if_then_else(active, q_current_seqlen, 0)
                 k_current_seqlen = T.if_then_else(active, k_current_seqlen, 0)
-            if is_causal:
-                actual_pooled_k_len = (
-                    k_current_seqlen - 1 + pad_len
-                ) // block_stride + 1
-            else:
-                actual_pooled_k_len = (1 + cache_len + block_size - 1) // block_size
+            # The local-block boost selects the token's own block even before
+            # its compressed row exists; the clamp bounds padded rows' pool rounds.
+            query_token_pos = cache_len + (
+                T.min(original_q_idx, q_current_seqlen - 1) if is_causal else 0
+            )
+            actual_pooled_k_len = query_token_pos // block_size + 1
             effective_pooled_k_len = T.min(actual_pooled_k_len, pooled_k_len)
 
             T.fill(topk_index_shared, -1)
