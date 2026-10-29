@@ -401,6 +401,10 @@ class GDNKernelDispatcher:
     def extend_uses_state_checkpoints(self) -> bool:
         return self.extend_kernel.uses_state_checkpoints
 
+    @property
+    def extend_honors_slot_pitch(self) -> bool:
+        return self.extend_kernel.extend_honors_slot_pitch
+
     def packed_decode(
         self,
         mixed_qkv: torch.Tensor,
@@ -1075,6 +1079,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         return (core_attn_out, z) if return_z else core_attn_out
 
+    def _prefill_kernels_follow_slot_pitch(self, ssm_states: torch.Tensor) -> bool:
+        return (
+            (is_cuda() or _is_hip)
+            and self.kernel_dispatcher.extend_honors_slot_pitch
+            and ssm_states[0].is_contiguous()
+        )
+
     def _convolve_prefill(
         self,
         layer: RadixLinearAttention,
@@ -1258,22 +1269,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and not mamba_pool.replayssm_is_kda
             )
 
-        # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
-        # chunk_gated_delta_rule) write state back in place assuming a contiguous
-        # slot layout, so they silently drop the write to the strided envelope
-        # pool. Run them on contiguous per-sequence copies (identity-indexed) and
-        # scatter the result back. No-op for the default contiguous pool.
-        # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
-        # proper indexed writes and handle non-contiguous pools directly via
-        # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
-        # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
-        # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
-        # int64 indexing, like packed_decode / causal_conv1d_update already do.
+        # An envelope-strided pool (unified memory, page-major) pitches each slot
+        # wider than its state. Prefill runs on it in place when its kernels follow
+        # that pitch (CPU kernels always do), else on packed copies scattered back.
         needs_state_gather = (
             self.requires_contiguous_prefill_state
             and (not is_target_verify)
             and (not is_cpu())
             and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
+            and not self._prefill_kernels_follow_slot_pitch(ssm_states)
         )
         if needs_state_gather:
             conv_states_contig = conv_states[cache_indices].contiguous()

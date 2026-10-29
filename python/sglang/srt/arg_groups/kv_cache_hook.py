@@ -779,7 +779,8 @@ def handle_page_major_kv_layout(server_args: Any):
     #   stride as a free int64); helion (specializes KDA state strides 0-3
     #   and rejects a non-unit innermost stride); cutedsl (KDA fused sigmoid-
     #   gating update is stride-safe) on KDA-hybrid models only.
-    # - prefill: triton; flashinfer (GDN gathers/scatters contiguous state);
+    # - prefill: triton; flashinfer (gathers each sequence's state by index and
+    #   writes it back with index_copy_, both stride-following);
     #   flashkda (the wrapper gathers/scatters a contiguous per-slot copy);
     #   helion; cutedsl (kernel_h compiles h0/ht with dynamic
     #   int64 strides), with the same KDA-only caveat.
