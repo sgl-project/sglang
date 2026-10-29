@@ -19,10 +19,13 @@ def _draft_topk1_kernel(
     draft_tokens,
     draft_tokens_stride,
     draft_token_column,
+    first_tokens,
+    first_tokens_stride,
     logits_row_stride,
     vocab_size: tl.constexpr,
     num_splits: tl.constexpr,
     WRITE_DRAFT_TOKEN: tl.constexpr,
+    WRITE_FIRST_TOKEN: tl.constexpr,
     ADVANCE_POSITIONS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -61,6 +64,9 @@ def _draft_topk1_kernel(
             tl.store(
                 draft_tokens + row * draft_tokens_stride + draft_token_column, token
             )
+        if WRITE_FIRST_TOKEN:
+            first = tl.load(first_tokens + row * first_tokens_stride)
+            tl.store(draft_tokens + row * draft_tokens_stride, first)
         if ADVANCE_POSITIONS:
             position = tl.load(positions + row)
             tl.store(positions + row, position + 1)
@@ -92,6 +98,7 @@ def draft_topk1_postprocess(
     positions: torch.Tensor | None,
     draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0,
+    first_tokens: torch.Tensor | None = None,
 ):
     """Argmax draft logits for topk=1 and advance positions.
 
@@ -103,7 +110,9 @@ def draft_topk1_postprocess(
 
     If ``draft_tokens`` is given, the finalize kernel also stores the argmax
     into ``draft_tokens[:, draft_token_column]``, mutating the caller-owned
-    buffer in place. ``topk_p`` is returned as constant 1.0: topk=1 drafting
+    buffer in place; with ``first_tokens`` ([bs, 1], the tokens the step's rows
+    took) it also stores those into ``draft_tokens[:, 0]``, in place of a copy before
+    the first step. ``topk_p`` is returned as constant 1.0: topk=1 drafting
     is greedy and the chain probabilities are unused downstream. With
     ``positions`` None nothing is advanced.
     """
@@ -123,6 +132,12 @@ def draft_topk1_postprocess(
         assert draft_tokens.shape[0] == next_token_logits.shape[0]
         assert draft_tokens.stride(1) == 1
         assert 0 <= draft_token_column < draft_tokens.shape[1]
+    write_first = first_tokens is not None
+    if write_first:
+        assert write_draft_token and draft_token_column > 0
+        assert first_tokens.shape[0] == next_token_logits.shape[0]
+        assert first_tokens.dtype == torch.long
+        assert first_tokens.device == next_token_logits.device
 
     bs, vocab_size = next_token_logits.shape
     topk_p = torch.empty((bs, 1), dtype=torch.float32, device=next_token_logits.device)
@@ -147,10 +162,13 @@ def draft_topk1_postprocess(
         draft_tokens if write_draft_token else topk_index,
         draft_tokens.stride(0) if write_draft_token else 0,
         draft_token_column,
+        first_tokens if write_first else topk_index,
+        first_tokens.stride(0) if write_first else 0,
         next_token_logits.stride(0),
         vocab_size,
         num_splits,
         WRITE_DRAFT_TOKEN=write_draft_token,
+        WRITE_FIRST_TOKEN=write_first,
         ADVANCE_POSITIONS=advance,
         BLOCK=block,
         num_warps=8,

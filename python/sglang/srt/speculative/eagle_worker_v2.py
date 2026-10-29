@@ -821,7 +821,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 dtype=topk_index.dtype,
                 device=topk_index.device,
             )
-            draft_tokens_topk1[:, :1].copy_(topk_index)
+            # with more than one step, the first step's top-1 launch writes column 0
+            if self.speculative_num_steps == 1:
+                draft_tokens_topk1[:, :1].copy_(topk_index)
 
         # Forward multiple steps
         scores = None
@@ -896,6 +898,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                             forward_batch.positions,
                             draft_tokens_topk1,
                             i + 1,
+                            first_tokens=(
+                                topk_index
+                                if i == 0 and draft_tokens_topk1 is not None
+                                else None
+                            ),
                         )
                     else:
                         topk_index = torch.argmax(
