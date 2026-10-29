@@ -157,6 +157,32 @@ class TestSpecTopk1Triton(CustomTestCase):
             positions, torch.ones_like(positions), rtol=0, atol=0
         )
 
+    def test_draft_topk1_postprocess_writes_first_tokens_into_column_zero(self):
+        batch_size = 5
+        vocab_size = 50000
+        logits, expected_index = _make_logits_with_unique_argmax(
+            batch_size,
+            vocab_size,
+            dtype=torch.float32,
+            device=self.device,
+            seed=1,
+        )
+        positions = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        backing = torch.full((batch_size, 5), -1, dtype=torch.long, device=self.device)
+        draft_tokens = backing[:, 1:4]
+        first = torch.arange(7, 7 + batch_size, device=self.device).view(-1, 1)
+
+        _, topk_index = draft_topk1_postprocess(
+            logits, positions, draft_tokens, draft_token_column=1, first_tokens=first
+        )
+
+        torch.testing.assert_close(topk_index, expected_index, rtol=0, atol=0)
+        # the copy it replaces: draft_tokens[:, :1].copy_(first) before the launch
+        expected_backing = torch.full_like(backing, -1)
+        expected_backing[:, 1] = first[:, 0]
+        expected_backing[:, 2] = expected_index[:, 0]
+        torch.testing.assert_close(backing, expected_backing, rtol=0, atol=0)
+
     def test_row_strided_logits_view_matches_argmax(self):
         batch_size = 5
         vocab_size = 8193
