@@ -75,7 +75,16 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
         else:
             continue
         if ".." in relative.parts:
-            raise ValueError(f"Cannot resolve cgroup memory path: {membership}")
+            # Some container runtimes expose a cgroup namespace whose procfs
+            # paths traverse above the mounted subtree (for example Pyxis).
+            # The mount itself is still a safe, conservative ancestor bound.
+            logger.warning(
+                "Cannot resolve cgroup membership %s beneath mount root %s; "
+                "using the visible cgroup mount root",
+                membership,
+                root,
+            )
+            relative = PurePosixPath()
         directory = mount / relative
         if not directory.is_dir():
             continue
@@ -138,7 +147,7 @@ def available_host_memory_bytes(*, allow_cgroup_fallback: bool = False) -> int:
     available = psutil.virtual_memory().available
     try:
         cgroup_headroom = _cgroup_memory_headroom()
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         if not allow_cgroup_fallback:
             raise RuntimeError(
                 "Cannot automatically size HiCache host memory; "
