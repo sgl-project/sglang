@@ -548,6 +548,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
 
+    def _create_kernel_dispatcher(self, backends):
+        return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
@@ -562,9 +565,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         backends = model_runner.linear_attn_backends
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
-        self.kernel_dispatcher = GDNKernelDispatcher(
-            backends.decode, backends.prefill, backends.verify
-        )
+        self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(

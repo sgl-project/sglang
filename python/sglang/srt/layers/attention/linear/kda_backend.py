@@ -484,6 +484,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
 
+    def _create_kernel_dispatcher(self, backends):
+        return KDAKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.prefill_graph_max_seqs = envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get()
@@ -508,9 +511,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "KDA FlashInfer speculative decoding only supports topk=1 "
                 "(EAGLE tree verify / retrieve_parent_token is unsupported)."
             )
-        self.kernel_dispatcher = KDAKernelDispatcher(
-            decode_backend, prefill_backend, verify_backend
-        )
+        self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
         if prefill_backend.is_flashinfer():
             _validate_flashinfer_kda_prefill(
                 chunk_size=self.mamba_chunk_size,

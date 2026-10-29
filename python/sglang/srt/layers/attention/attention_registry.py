@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
+OOT_LINEAR_ATTENTION_BACKENDS = {}
 HYBRID_GDN_SM100_BACKENDS = {"triton", "trtllm_mha", "fa4", "flashinfer"}
 
 
@@ -51,6 +52,28 @@ def register_attention_backend(name):
         return fn
 
     return decorator
+
+
+def register_oot_linear_attention_backend(backend_class_name, factory, platform_key):
+    """Register a platform factory for a linear-attention backend class."""
+    OOT_LINEAR_ATTENTION_BACKENDS.setdefault(platform_key, {})[backend_class_name] = (
+        factory
+    )
+
+
+def _create_linear_attention_backend(runner, fallback):
+    from sglang.srt.platforms import current_platform
+
+    factory = fallback
+    if current_platform.is_out_of_tree():
+        backend_class_name = f"{fallback.__module__}.{fallback.__qualname__}"
+        factory = OOT_LINEAR_ATTENTION_BACKENDS.get(
+            current_platform.get_dispatch_key_name(), {}
+        ).get(backend_class_name, fallback)
+    backend = factory(runner)
+    if factory is not fallback:
+        logger.info("Using OOT linear attention backend: %s", type(backend).__name__)
+    return backend
 
 
 @register_attention_backend("flashinfer")
@@ -506,7 +529,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     "ascend backend is the only supported backend on NPU for hybrid GDN models, use --attention-backend ascend to specify the backend."
                 )
             logger.info(f"Using hybrid linear attention backend for hybrid GDN models.")
-            linear_attn_backend = GDNAttnBackend(runner)
+            linear_attn_backend = _create_linear_attention_backend(
+                runner, GDNAttnBackend
+            )
             from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
 
             if is_qwen_qsa(runner.model_config.hf_config):
@@ -564,12 +589,18 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     AscendKDAHybridLinearAttnBackend,
                 )
 
-                linear_attn_backend = AscendKDAAttnBackend(runner)
+                linear_attn_backend = _create_linear_attention_backend(
+                    runner, AscendKDAAttnBackend
+                )
                 hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
             else:
-                linear_attn_backend = KDAAttnBackend(runner)
+                linear_attn_backend = _create_linear_attention_backend(
+                    runner, KDAAttnBackend
+                )
         elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = KDAAttnBackend(runner)
+            linear_attn_backend = _create_linear_attention_backend(
+                runner, KDAAttnBackend
+            )
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
@@ -577,7 +608,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             if spec_result is not None:
                 spec, cfg = spec_result
                 BackendClass = import_backend_class(spec.backend_class_name)
-                linear_attn_backend = BackendClass(runner)
+                linear_attn_backend = _create_linear_attention_backend(
+                    runner, BackendClass
+                )
                 if spec.hybrid_backend_class_name is not None:
                     hybrid_backend_cls = import_backend_class(
                         spec.hybrid_backend_class_name
