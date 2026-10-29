@@ -14,6 +14,7 @@ Usage:
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 # CPU-only unit test; no CUDA/distributed dependencies.
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
@@ -1644,15 +1645,18 @@ class TestColumnParallelLoraBShardsByBaseLinear(unittest.TestCase):
         self.assertEqual(pool.get_lora_B_shape("qkv_proj", model, 8, 0), (1, 48, 8))
 
 
-class TestDenseOnlyAdapterPools(unittest.TestCase):
-    def _allocate(self, routed, shared_fused=False):
+class TestDenseOnlyAdapterPools(CustomTestCase):
+    def _allocate(self, routed, shared_fused=False, layer_ids=(0,), num_layers=1):
         model = torch.nn.Module()
         model.weight = torch.nn.Parameter(torch.zeros(1))
         model.config = types.SimpleNamespace(shared_expert_intermediate_size=8)
         pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
         pool.enable_routed_expert_lora = routed
+        pool.lora_layer_ids = frozenset(layer_ids)
+        pool.has_embed_tokens_lora = False
+        pool.has_lm_head_lora = False
         pool.dtype = torch.float32
-        pool.num_layer = 1
+        pool.num_layer = num_layers
         pool.max_lora_rank = 4
         pool.lora_added_tokens_size = 0
         pool.target_modules = {"gate_up_proj", "down_proj"}
@@ -1680,6 +1684,14 @@ class TestDenseOnlyAdapterPools(unittest.TestCase):
         self.assertIn("gate_up_proj_shared_moe", pool.A_buffer)
         self.assertIn("down_proj_shared_moe", pool.B_buffer)
         self.assertNotIn("gate_up_proj_moe", pool.A_buffer)
+
+    def test_dense_only_pool_preserves_pipeline_stage_layer_selection(self):
+        # Backporting the gate must not reintroduce allocation for other PP stages.
+        pool = self._allocate(routed=False, layer_ids=(1,), num_layers=2)
+        for buffers in (pool.A_buffer, pool.B_buffer):
+            for layers in buffers.values():
+                self.assertIsNone(layers[0])
+                self.assertIsInstance(layers[1], torch.Tensor)
 
 
 if __name__ == "__main__":

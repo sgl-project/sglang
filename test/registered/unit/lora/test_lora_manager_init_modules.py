@@ -177,6 +177,44 @@ class TestShouldApplyLoRAGate(CustomTestCase):
                     name = encoder + ".layers.0.qkv_proj"
                     self.assertFalse(model.should_apply_lora(name), name)
 
+    def test_initial_adapters_choose_routed_pool_without_breaking_dynamic_loading(self):
+        # No initial adapters must retain capacity for later expert loads.
+        shared = "model.layers.0.mlp.shared_expert.gate_proj.lora_A.weight"
+        routed = "model.layers.0.mlp.experts.0.gate_up_proj.lora_A.weight"
+        for names, expected in (
+            ([], True),
+            ([shared], False),
+            ([shared, routed], True),
+        ):
+            with self.subTest(names=names):
+                manager = LoRAManager.__new__(LoRAManager)
+                manager.base_model = torch.nn.Module()
+                manager.target_modules = {"gate_up_proj", "down_proj"}
+                manager._experts_shared_outer_override = False
+                manager.lora_backend = SimpleNamespace(
+                    validate_lora_targets=lambda **kw: None
+                )
+                manager.loras = {
+                    str(i): SimpleNamespace(
+                        layers=[SimpleNamespace(weights={name: torch.zeros(1)})]
+                    )
+                    for i, name in enumerate(names)
+                }
+                with (
+                    patch.object(manager, "init_lora_adapters"),
+                    patch.object(manager, "init_lora_shapes"),
+                    patch.object(
+                        manager, "_validate_replicated_q_targets", create=True
+                    ),
+                    patch.object(manager, "init_lora_modules"),
+                    patch.object(manager, "init_memory_pool"),
+                    patch.object(manager, "update_lora_info"),
+                ):
+                    manager.init_state(
+                        max_lora_rank=4, target_modules=manager.target_modules
+                    )
+                self.assertEqual(manager.routed_expert_lora_enabled, expected)
+
     def test_dense_shared_expert_does_not_wrap_routed_bank(self):
         routed = FusedMoE.__new__(FusedMoE)
         torch.nn.Module.__init__(routed)

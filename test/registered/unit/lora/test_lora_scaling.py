@@ -64,7 +64,7 @@ def _new_adapter(config):
 
 class TestLoRAScaling(CustomTestCase):
     def test_scaling_from_dict(self):
-        for rank in (1, 8, 64):
+        for rank in (1, 8, 16, 64):
             for flag in (None, False, True):
                 with self.subTest(rank=rank, use_rslora=flag):
                     options = {} if flag is None else {"use_rslora": flag}
