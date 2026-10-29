@@ -37,6 +37,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool,
     ):
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
+        self._stage_releases = torch.device(device).type == "cpu"
         self.clear()
 
     def clear(self):
@@ -46,13 +47,37 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.free_group = None
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self.staged_pages: list[torch.Tensor] = []
+        self.num_staged_pages = 0
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
-        return len(self.free_pages) + len(self.release_pages)
+        return len(self.free_pages) + len(self.release_pages) + self.num_staged_pages
+
+    def get_all_free_pages(self):
+        if not self._stage_releases:
+            return super().get_all_free_pages()
+        if not self.staged_pages:
+            return self.free_pages
+        return torch.cat((self.free_pages, *self.staged_pages))
+
+    def merge_and_sort_free(self):
+        if not self._stage_releases:
+            return super().merge_and_sort_free()
+        if not self.staged_pages:
+            return
+        self.free_pages = self.get_all_free_pages()
+        if self.need_sort:
+            self.free_pages, _ = torch.sort(self.free_pages)
+        self.staged_pages = []
+        self.num_staged_pages = 0
 
     def alloc(self, need_size: int):
-        if self.need_sort and need_size > len(self.free_pages):
+        if self._stage_releases and need_size > len(self.free_pages):
+            if need_size > self.available_size():
+                return None
+            self.merge_and_sort_free()
+        elif self.need_sort and need_size > len(self.free_pages):
             self.merge_and_sort_free()
 
         if need_size > len(self.free_pages):
@@ -67,7 +92,12 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.free_group is None:
-            if self.need_sort:
+            if self._stage_releases:
+                # CPU copies scale with the growing free list on every release.
+                # Own the released view; callers can mutate request-token rows.
+                self.staged_pages.append(free_index.clone())
+                self.num_staged_pages += free_index.numel()
+            elif self.need_sort:
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
                 self.free_pages = torch.cat((self.free_pages, free_index))
