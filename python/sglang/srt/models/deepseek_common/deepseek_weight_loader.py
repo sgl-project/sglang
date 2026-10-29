@@ -59,7 +59,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
-    get_nextn_layer_id,
     is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.utils import bind_or_assign, log_info_on_rank0
@@ -527,7 +526,10 @@ class DeepseekV2WeightLoaderMixin:
         num_nextn_layers = self.config.num_nextn_predict_layers
         assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
 
-        nextn_layer_id = get_nextn_layer_id(self.config)
+        # compatible with old design
+        nextn_layer_id = (
+            0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
+        )
 
         return NextNEnabledConfig(
             num_nextn_layers=num_nextn_layers,

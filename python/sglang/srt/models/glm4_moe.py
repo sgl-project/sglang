@@ -81,7 +81,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.deepseek_common.utils import get_nextn_layer_id
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
@@ -1317,8 +1316,7 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
 
     def _maybe_quant_glm_nextn_moe_to_ptpc(self, weights):
         """Cast this GLM-5.2 draft layer's routed experts to per-channel FP8."""
-        # The MTP block keeps the index it had in the unreduced checkpoint.
-        layer_id = get_nextn_layer_id(self.config)
+        layer_id = self.config.num_hidden_layers
         if not should_apply_glm_nextn_moe_ptpc(self.quant_config, layer_id):
             return weights
 

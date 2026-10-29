@@ -162,7 +162,6 @@ from sglang.srt.models.deepseek_common.moe_transport import (
 )
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
-    get_nextn_layer_id,
     is_wint4afp8_or_wint4a16_config,
     quant_blocks_shared_experts_fusion,
 )
@@ -5131,7 +5130,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
-                nextn_layer_id = get_nextn_layer_id(self.config)
+                nextn_layer_id = (
+                    0
+                    if self.config.num_hidden_layers == 1
+                    else self.config.num_hidden_layers
+                )
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
@@ -5208,11 +5211,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
                         is_nextn=is_nextn,
-                        num_hidden_layers=(
-                            get_nextn_layer_id(self.config)
-                            if is_nextn
-                            else self.config.num_hidden_layers
-                        ),
+                        num_hidden_layers=self.config.num_hidden_layers,
                     )
 
                     # V4.1 checkpoint tensors with no module in the text model yet.

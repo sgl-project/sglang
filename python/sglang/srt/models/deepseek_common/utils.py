@@ -172,24 +172,6 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-def get_nextn_layer_id(config) -> int:
-    """Checkpoint layer index that holds the NextN/MTP block.
-
-    The block sits one past the last target layer, i.e. at ``num_hidden_layers``
-    of the *unreduced* checkpoint. A checkpoint cut down with
-    ``--json-model-override-args`` keeps the block at its original index and
-    reports the original depth as ``original_num_hidden_layers``, so the reduced
-    ``num_hidden_layers`` must not be used here: it would both miss the block
-    and prefix-match real layers (``model.layers.4`` also matches
-    ``model.layers.40``).
-    """
-    num_layers = getattr(config, "original_num_hidden_layers", None)
-    if not num_layers:
-        num_layers = config.num_hidden_layers
-    # compatible with old design
-    return 0 if num_layers == 1 else int(num_layers)
-
-
 def _get_llama_4_scaling(
     original_max_position_embeddings: int, scaling_beta: float, positions: torch.Tensor
 ) -> torch.Tensor:

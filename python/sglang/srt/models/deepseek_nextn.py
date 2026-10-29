@@ -42,10 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.models.deepseek_common.utils import (
-    enable_nextn_moe_bf16_cast_to_fp8,
-    get_nextn_layer_id,
-)
+from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_model, get_parallel, get_spec
@@ -123,9 +120,7 @@ class DeepseekModelNextN(nn.Module):
         if _is_npu and (
             get_spec().speculative_draft_model_path == get_model().model_path
         ):
-            # The MTP block keeps its index from the unreduced checkpoint, so
-            # a --json-model-override-args reduction must not shift it.
-            layer_name = "layers." + str(get_nextn_layer_id(config))
+            layer_name = "layers." + str(config.num_hidden_layers)
 
         self.quant_config = quant_config
         with layer_stack():
