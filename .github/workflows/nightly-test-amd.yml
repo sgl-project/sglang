@@ -2,7 +2,8 @@ name: Nightly Test (AMD)
 
 on:
   schedule:
-    # Off-peak for the AMD runners, and well after the 10:00/11:00 UTC image builds.
+    # Off-peak for the AMD runners, after the image builds and the scheduled
+    # PR tests on them (see pr-test-amd.yml), and before the 03:00 UTC MILES nightlies.
     - cron: '0 23 * * *'
   push:
     branches:

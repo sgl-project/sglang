@@ -2,8 +2,9 @@ name: Nightly Test Miles (AMD ROCm 10 MI30X)
 
 on:
   schedule:
-    # Runs after the 12:00 UTC miles image build has pushed the dated image.
-    - cron: "0 21 * * *"
+    # Runs after the 12:00 UTC miles image build has pushed the dated image,
+    # and after the 23:00 UTC sglang nightly has claimed its runners.
+    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       image_tag:
