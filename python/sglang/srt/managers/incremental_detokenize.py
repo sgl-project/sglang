@@ -3,19 +3,15 @@ turn each row's decode ids into text."""
 
 from __future__ import annotations
 
-import os
 from collections import OrderedDict
 from typing import Callable, Dict, List, Optional, Tuple
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.utils import find_printable_text
 
-# Maximum number of request states that detokenizer can hold. When exceeded,
-# oldest request states will be evicted. Default: 65536 (1<<16).
-# For more details, see: https://github.com/sgl-project/sglang/issues/2812
-# Use power of 2 values for better memory allocation.
-DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 << 16))
+DETOKENIZER_MAX_STATES = envs.SGLANG_DETOKENIZER_MAX_STATES.get()
 
 
 def _clamp_decode_ids(ids: List[int], vocab_size: Optional[int]) -> List[int]:
