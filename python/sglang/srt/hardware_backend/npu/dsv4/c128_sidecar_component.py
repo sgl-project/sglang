@@ -126,6 +126,29 @@ class C128SidecarComponent(TreeComponent):
     def _group_tokens(self) -> int:
         return self.tree_core.page_size * self._kernel_page_size()
 
+    def _block_endpoint_keys(self, node: UnifiedTreeNode, blocks: int) -> list[str]:
+        """Storage keys for the C128 pages of ``node``: the absolute block
+        boundary hashes, not the node's trailing hashes.
+
+        A C128 page is addressed by the FULL page that ends its block, i.e. by a
+        hash whose absolute page index is a multiple of ``block_pages``. Taking
+        ``node.hash_value[-blocks:]`` only coincides with those when the node
+        happens to end on a block boundary; a node spanning several blocks would
+        then be backed up under keys the restore side never asks for, while the
+        prefetch side resolves its keys from the absolute offsets.
+        """
+        page = self.tree_core.page_size
+        coverage = self.block_pages()
+        hashes = list(node.hash_value or [])
+        node_end_pages = self._node_depth(node) // page
+        node_start_pages = node_end_pages - len(hashes)
+        endpoints = [
+            page_hash
+            for offset, page_hash in enumerate(hashes, start=1)
+            if (node_start_pages + offset) % coverage == 0
+        ]
+        return endpoints[-blocks:] if blocks else []
+
     def _block_transfer(self, blocks: int) -> PoolTransfer:
         return PoolTransfer(
             name=self.pool_name,
@@ -560,13 +583,17 @@ class C128SidecarComponent(TreeComponent):
             blocks = cd.host_value.numel() // page_size
             if blocks == 0:
                 return None
-            # The node's C128 pages end at its own group boundaries, so they are
-            # keyed by the trailing FULL page hashes of the node.
+            keys = self._block_endpoint_keys(node, blocks)
+            if len(keys) != blocks:
+                # The node's span does not end on a block boundary, so some of
+                # its pages have no endpoint hash to be keyed by. Skip the backup
+                # rather than store a page under a key nobody will look up.
+                return None
             return [
                 PoolTransfer(
                     name=self.pool_name,
                     host_indices=cd.host_value[-blocks * page_size :],
-                    keys=node.hash_value[-blocks:],
+                    keys=keys,
                     hit_policy=PoolHitPolicy.BLOCK_GROUPS,
                     block_pages=self.block_pages(),
                     group_pages=1,
