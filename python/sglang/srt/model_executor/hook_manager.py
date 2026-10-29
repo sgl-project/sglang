@@ -7,6 +7,25 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
+FORWARD_HOOKS_CUDA_GRAPH_WARNING = (
+    "forward_hooks are registered after CUDA graph capture and do not run on "
+    "graph replay. CUDA graphs are enabled, so hooks may never fire. Disable "
+    "them with --disable-decode-cuda-graph --disable-prefill-cuda-graph (or "
+    "Engine kwargs disable_decode_cuda_graph=True, "
+    "disable_prefill_cuda_graph=True) to run hooks on every forward pass. "
+    "This lowers throughput."
+)
+
+
+def warn_if_cuda_graphs_skip_forward_hooks(
+    hook_specs: Optional[List[dict[str, Any]]],
+    *,
+    cuda_graphs_enabled: bool,
+) -> None:
+    """Warn at startup when configured hooks will be skipped by graph replay."""
+    if hook_specs and cuda_graphs_enabled:
+        logger.warning(FORWARD_HOOKS_CUDA_GRAPH_WARNING)
+
 
 def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
     """
