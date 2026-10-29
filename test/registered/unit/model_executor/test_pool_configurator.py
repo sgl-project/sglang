@@ -1179,6 +1179,118 @@ class TestEagleConfigurator(CustomTestCase):
                 )
                 self.assertEqual(padded.selected_kv_bytes, 8 * 2048 * 1152)
 
+    def test_sparse_mtp_budget_rows_follow_attention_dp_worker_capacity(self):
+        """Budget both MTP managers per attention-DP worker, then add PD rows."""
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        mr = _make_model_runner(
+            self,
+            num_layers=4,
+            use_mla_backend=True,
+            page_size=128,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            speculative_eagle_topk=1,
+        )
+        _configure_dsa_model(mr)
+        mr.kv_cache_dtype = torch.bfloat16
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+
+        cases = (
+            # requested, attention-DP, outer DP, PD extras, expected rows
+            (8, 1, 1, 0, 9),
+            (8, 2, 1, 0, 5),
+            (8, 4, 1, 0, 3),
+            (8, 1, 2, 0, 9),
+            (2, 4, 1, 0, 2),
+            (10, 4, 1, 3, 6),
+        )
+        with (
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_COPY_SFA.override(True),
+            envs.SGLANG_NPU_SPARSE_KV_INDEXER.override("lim"),
+            envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(2048),
+            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_npu",
+                return_value=True,
+            ),
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_glm_dsa_cp_layer_shard_info",
+                return_value=(None, 1),
+            ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_glm_dsa_layer_split_effective_num_layers",
+                side_effect=lambda kvc, count: count,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_sparsity_driven_kv_offload_enabled",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparsity_driven_kv_offload_sparse_context_len",
+                return_value=2048,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparse_kv_budget",
+                return_value=SimpleNamespace(managed_hbm_bytes=123),
+            ) as mock_sparse_budget,
+            mock_cpu_env(tp_size=16),
+        ):
+            for requested, attn_dp, dp, extra, expected_rows in cases:
+                with self.subTest(
+                    requested=requested,
+                    attn_dp=attn_dp,
+                    dp=dp,
+                    extra=extra,
+                ):
+                    mock_sparse_budget.reset_mock()
+                    with (
+                        get_context().override_server_args(
+                            attention_backend="ascend",
+                            max_running_requests=requested,
+                            page_size=128,
+                            speculative_algorithm="EAGLE",
+                            speculative_num_steps=2,
+                            speculative_num_draft_tokens=3,
+                            speculative_eagle_topk=1,
+                            disaggregation_mode="decode" if extra else "null",
+                            disaggregation_decode_extra_slots=extra,
+                        ),
+                        get_parallel().override(
+                            dp_size=dp,
+                            tp_size=16,
+                            attn_tp_size=16 // attn_dp,
+                            attn_dp_size=attn_dp,
+                        ),
+                    ):
+                        mr.dp_size = dp
+                        mr.attn_dp_size = attn_dp
+                        DefaultPoolConfigurator(mr)
+
+                    calls = mock_sparse_budget.call_args_list
+                    self.assertEqual(len(calls), 2)
+                    self.assertEqual(
+                        [call.kwargs["num_layers"] for call in calls], [4, 1]
+                    )
+                    self.assertEqual(
+                        [call.kwargs["request_rows"] for call in calls],
+                        [expected_rows, expected_rows],
+                        msg=(
+                            f"{requested=}, {attn_dp=}, {dp=}, {extra=}: "
+                            "target and draft budgets should use the same local row count"
+                        ),
+                    )
+
     def test_eagle_does_not_exceed_budget(self):
         """Total memory (target + draft KV cache) must not exceed available."""
         available = 10_000_000

@@ -274,8 +274,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     or disagg.enable_pd_role_switch
                     else 0
                 )
+                max_running_requests_per_worker = max(
+                    1, get_schedule().max_running_requests // kvc.attn_dp_size
+                )
                 budget_options = dict(
-                    request_rows=get_schedule().max_running_requests + extra_rows + 1,
+                    request_rows=max_running_requests_per_worker + extra_rows + 1,
                     context_len=kvc.model_config.context_len
                     + get_req_to_token_extra_context_len(),
                     top_k=get_sparsity_driven_kv_offload_sparse_context_len(
