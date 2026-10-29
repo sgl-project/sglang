@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_sm120
 from sglang.srt.utils.common import is_gfx1250_supported
 
 _is_hip = is_hip()
@@ -2302,7 +2302,9 @@ def _hc_mix_stats_reduce_kernel(
 # a row must produce the same bits alone and in any batch routed to this backend.
 _HC_MIX_SLICE_CHOICES = (80, 64, 40, 32, 16, 8, 4, 2, 1)
 _HC_MIX_BLOCK_M = 32
-_HC_MIX_BLOCK_K = 64
+# SM120: BLOCK_K=32 is 1.4-1.55x faster at M>=1024 on RTX PRO 5000 and never
+# slower; still a per-platform constant, so batch invariance holds.
+_HC_MIX_BLOCK_K = 32 if is_sm120() else 64
 _HC_MIX_NUM_WARPS = 4
 # Triton on AMD has no tf32x3 (gfx942 adds only tf32); "ieee" is the fp32 MFMA
 _HC_MIX_DOT_PRECISION = "ieee" if _is_hip else "tf32x3"
