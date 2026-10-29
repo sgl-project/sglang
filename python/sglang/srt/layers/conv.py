@@ -16,9 +16,10 @@ import torch.nn.functional as F
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, use_intel_amx_backend
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, use_intel_amx_backend
 
 _is_cpu = is_cpu()
+_is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 if _is_cpu and _is_cpu_amx_available:
     conv3d_embed = torch.ops.sgl_kernel.conv3d_embed_cpu
@@ -274,7 +275,15 @@ class Conv3dLayer(BaseFusedOp):
         x = x.unfold(2, K1, K1).unfold(3, K2, K2).unfold(4, K3, K3)
         N, Dp, Hp, Wp = x.shape[0], x.shape[2], x.shape[3], x.shape[4]
         x = x.permute(0, 2, 3, 4, 1, 5, 6, 7).reshape(N, Dp, Hp, Wp, -1)
-        x = F.linear(x, self.weight.reshape(self.out_channels, -1), self.bias)
+        # CUDA convolution rounds the dot product before adding bias.
+        separate_bias = _is_cuda and x.is_cuda
+        x = F.linear(
+            x,
+            self.weight.reshape(self.out_channels, -1),
+            None if separate_bias else self.bias,
+        )
+        if separate_bias and self.bias is not None:
+            x.add_(self.bias)
         return x.permute(0, 4, 1, 2, 3)
 
     def _forward_conv(self, x: torch.Tensor) -> torch.Tensor:
