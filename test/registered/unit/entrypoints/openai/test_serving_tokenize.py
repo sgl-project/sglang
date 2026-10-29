@@ -58,11 +58,13 @@ def _ids(text):
     return [WORDS.index(word) for word in text.split()]
 
 
-def _tokenize(serving, **body):
+def _tokenize_response(serving, **body):
     request = TokenizeRequest.model_validate(body)
-    response = asyncio.run(
-        serving._handle_non_streaming_request(request, request, None)
-    )
+    return asyncio.run(serving._handle_non_streaming_request(request, request, None))
+
+
+def _tokenize(serving, **body):
+    response = _tokenize_response(serving, **body)
     if isinstance(response, TokenizeResponse):
         return 200, response.tokens
     return response.status_code, json.loads(response.body)["message"]
@@ -104,6 +106,28 @@ class TestTokenizeFormattingOptions(CustomTestCase):
                 body["add_special_tokens"] = special
             with self.subTest(prompt=prompt, special=special):
                 self.assertEqual(_tokenize(serving, **body), (200, _ids(text)))
+
+    def test_max_model_len_is_server_context_len(self):
+        # Regression test for #41748: the tokenizer's model_max_length
+        # (131072 for Qwen3-0.6B) must not leak into the response when
+        # the server runs with a smaller context_len (4096 here, via
+        # the mock tokenizer manager), since prompts at or above
+        # context_len are rejected with a 400.
+        serving = self._serving()
+        serving.tokenizer_manager.tokenizer.model_max_length = 131072
+        response = _tokenize_response(serving, prompt="hi")
+        self.assertIsInstance(response, TokenizeResponse)
+        self.assertEqual(response.max_model_len, 4096)
+        self.assertEqual(response.tokens, _ids("<bos> hi"))
+
+        # Same for chat messages and for a batched prompt.
+        response = _tokenize_response(serving, messages=HISTORY)
+        self.assertIsInstance(response, TokenizeResponse)
+        self.assertEqual(response.max_model_len, 4096)
+        response = _tokenize_response(serving, prompt=["hi", "hello"])
+        self.assertIsInstance(response, TokenizeResponse)
+        self.assertEqual(response.max_model_len, 4096)
+        self.assertEqual(response.count, [2, 2])
 
     def test_options_that_cannot_apply_are_rejected(self):
         chatml = self._serving(chat_template="chatml")
