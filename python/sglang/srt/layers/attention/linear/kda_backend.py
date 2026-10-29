@@ -42,14 +42,14 @@ if is_npu():
         causal_conv1d_update_npu,
     )
     from sgl_kernel_npu.operators.mamba import (
-        causal_conv1d_target_verify_npu,
+        causal_conv1d_target_verify,
     )
 
     causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update_decode = causal_conv1d_update_npu
     # Use the public tree-verify API for intermediate convolution checkpoints;
     # regular decode keeps its existing sgl-kernel-npu entry point.
-    causal_conv1d_update_target_verify = causal_conv1d_target_verify_npu
+    causal_conv1d_update_target_verify = causal_conv1d_target_verify
 elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_update_cpu
 

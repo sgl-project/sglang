@@ -885,7 +885,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         round_scale: bool = False,
     ) -> None:
         from sgl_kernel_npu.operators.mem_cache import (
-            kpool_decode_update_and_maybe_write_cache_bf16,
+            kpool_decode_update_and_maybe_write_cache,
         )
 
         assert self.kpool_use_compress, (
@@ -893,7 +893,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         idx = layer_id - self.start_layer
         buf = self.get_index_k_with_scale_buffer(layer_id)
-        kpool_decode_update_and_maybe_write_cache_bf16(
+        kpool_decode_update_and_maybe_write_cache(
             buf=buf,
             tail_k=self._compress_tail_k[idx],
             tail_score=self._compress_tail_score[idx],

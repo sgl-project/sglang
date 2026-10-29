@@ -2037,7 +2037,7 @@ class IndexerKPool(MultiPlatformOp):
         tokens that were not accepted during draft extend.
         """
         from sgl_kernel_npu.operators.mem_cache import (
-            kpool_write_tail_and_maybe_compress_npu,
+            kpool_write_tail_and_maybe_compress,
         )
 
         plan = metadata.attn_metadata.kpool_write_plan
@@ -2047,7 +2047,7 @@ class IndexerKPool(MultiPlatformOp):
         # MTP writes must maintain both the incomplete-pool tail and the
         # compressed BF16 index cache.
         tail_k, tail_score = pool.get_compress_tail_buffers(layer_id)
-        kpool_write_tail_and_maybe_compress_npu(
+        kpool_write_tail_and_maybe_compress(
             index_k_cache=pool.get_index_k_with_scale_buffer(layer_id),
             key=key,
             score=gate_score,
@@ -2103,13 +2103,13 @@ class IndexerKPool(MultiPlatformOp):
         # The NPU index cache is BF16, so tail updates cannot reuse the GPU
         # FP8 scatter implementation.
         from sgl_kernel_npu.operators.mem_cache import (
-            kpool_assemble_softmax_write_cache_npu,
-            scatter_kpool_tail_updates_npu,
+            kpool_assemble_softmax_rotate_write_cache,
+            scatter_kpool_tail_updates,
         )
 
         writes, tails = plan.writes, plan.tails
         if not writes.is_empty:
-            kpool_assemble_softmax_write_cache_npu(
+            kpool_assemble_softmax_rotate_write_cache(
                 index_k_cache=buf,
                 chunk_k=key,
                 chunk_score=gate_score,
@@ -2123,7 +2123,7 @@ class IndexerKPool(MultiPlatformOp):
                 loc=writes.write_loc,
             )
         if not tails.is_empty:
-            scatter_kpool_tail_updates_npu(
+            scatter_kpool_tail_updates(
                 pool=pool,
                 chunk_k=key,
                 chunk_score=gate_score,
@@ -2143,7 +2143,7 @@ class IndexerKPool(MultiPlatformOp):
         torch.compile splits into ~13 small ops.
         """
         from sgl_kernel_npu.operators.indexer import (
-            fused_decode_prepare_indexer,
+            kpool_indexer_prepare_decode_input,
         )
 
         seqlens_32 = metadata.get_seqlens_int32()
@@ -2152,7 +2152,7 @@ class IndexerKPool(MultiPlatformOp):
         x = x[: seqlens_32.shape[0]]
         block_tables = metadata.get_page_table_64().contiguous()
 
-        return fused_decode_prepare_indexer(
+        return kpool_indexer_prepare_decode_input(
             x,
             self.weights_proj.weight,
             seqlens_32,
@@ -2224,7 +2224,7 @@ class IndexerKPool(MultiPlatformOp):
         """
         import torch_npu
         from sgl_kernel_npu.operators.attention import (
-            build_pooled_page_table_64 as build_pooled_page_table,
+            build_pooled_page_table,
         )
 
         pool = get_token_to_kv_pool()
@@ -2304,14 +2304,14 @@ class IndexerKPool(MultiPlatformOp):
             [num_q_padded, index_topk + pool_size - 1] int32 token-level indices
         """
         from sgl_kernel_npu.operators.indexer import (
-            expand_pool_topk_and_append_tail_batched_npu,
+            expand_kpool_group_and_tail_to_topk,
         )
 
         pool_size = self.index_kpool
         n_pool_topk = pool_indices.shape[1]
         index_topk = n_pool_topk * pool_size
 
-        return expand_pool_topk_and_append_tail_batched_npu(
+        return expand_kpool_group_and_tail_to_topk(
             pool_indices.to(torch.int32),
             seq_lens_per_token.to(torch.int32),
             n_real,
