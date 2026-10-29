@@ -3,7 +3,7 @@ name: Release Docker Images Nightly Miles ROCm7.2.4 (AMD)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 12 * * *"
+    - cron: "0 11 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.number || github.sha }}

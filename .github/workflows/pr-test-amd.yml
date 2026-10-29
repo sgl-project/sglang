@@ -6,11 +6,11 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 on:
   schedule:
     # Daily AMD order (UTC), all ending before the 02:00-11:00 PR peak:
-    # images (10:00-12:00) -> rocm10 PR test (14:00) -> rocm724/rocm720 PR
+    # images (09:00-11:00) -> rocm10 PR test (13:00) -> rocm724/rocm720 PR
     # test (16:00) -> nightly (19:00) -> MILES (22:00).
     # rocm10 runs every day. rocm724/rocm720 run on even days of the month, here
     # and in nightly-test-amd.yml, so their PR test and nightly land on the same day.
-    - cron: '0 1,14 * * *'  # rocm10: twice daily, 14:00 first after the 10:00 UTC rocm10 image
+    - cron: '0 1,13 * * *'  # rocm10: every 12 hours, 13:00 first after the 09:00 UTC rocm10 image
     - cron: '0 16 2-30/2 * *'  # rocm724/rocm720: even days of the month
   pull_request:
     paths:
