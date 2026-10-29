@@ -1052,7 +1052,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if forward_batch.forward_mode.is_target_verify():
             physical_num_tokens = mixed_qkv.shape[0]
             logical_num_tokens = physical_num_tokens
-            if forward_batch.spec_info.ragged_verify_layout is None:
+            if forward_batch.ragged_verify_layout is None:
                 # MoE may append token padding that is not a complete verify
                 # sequence. Keep it out of convolution and state updates.
                 logical_num_tokens = (
@@ -1306,7 +1306,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
-        ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        ragged_layout = forward_batch.ragged_verify_layout
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,

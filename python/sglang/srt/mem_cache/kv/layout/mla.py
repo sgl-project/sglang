@@ -161,9 +161,10 @@ class MLAView(MLAKVView):
     post_capture_active = False
     host_capacity_tokens: Optional[int] = None
     host_capacity_bytes: Optional[int] = None
-    # Set by HiCache when it stages write-backs for this view. The unified
-    # host pool reads it for every layout, including MLA.
-    hicache_write_back_staging: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Set by HiCache when it stages write-backs for this view.
+    hicache_write_back_staging: Optional[
+        torch.Tensor | Tuple[torch.Tensor, torch.Tensor]
+    ] = None
     enable_custom_mem_pool = False
     custom_mem_pool = None
     allocation_label = None
