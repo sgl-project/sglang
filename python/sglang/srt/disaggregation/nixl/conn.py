@@ -2200,9 +2200,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     if kv_chunk.staging_counted:
                         kv_chunk.staging_counted = False
                         self._staging_outstanding[room] -= 1
-                    # Leave the room to the decode's waiting timeout.
-                    self.record_failure(room, str(e))
-                    self.update_status(room, KVPoll.Failed)
+                    if self.enable_deferred_decode_kv_release:
+                        if isinstance(e, _NixlPostError):
+                            # The rejected request is not among the reaper's
+                            # handles and may still land: no drain ACK, so the
+                            # decode falls back to its release timeout.
+                            self.poison_deferred_ack_room(room)
+                        else:
+                            # The reaper may have settled the room before the
+                            # decrement; a no-op while it is still abandoned.
+                            self._maybe_ack_drained_abort(room)
+                    # Tell the decode now: its ABORT is acked only once the
+                    # reaper settles these WRITEs, and it holds the room until
+                    # then. Leaving it to the waiting timeout instead pins the
+                    # room's ring grants, and with them the decode's FIFO ring
+                    # for every writer, for the whole timeout.
+                    self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
                 else:
                     # A handle can still write into the decode's KV pages, so
                     # leave the room to the decode's waiting timeout rather

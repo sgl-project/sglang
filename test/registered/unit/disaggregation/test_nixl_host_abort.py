@@ -262,7 +262,6 @@ class HostAbortTest(unittest.TestCase):
         agent.check_xfer_state = lambda x: (
             "ERR" if getattr(x, "err", False) else "DONE" if x.done else "PROC"
         )
-        generation = rig.decode.register_deferred_abort_room(h.ROOM)
         with patch(
             "sglang.srt.disaggregation.nixl.conn.NIXL_ERR_SETTLE_TIMEOUT_S", 0.01
         ):
@@ -275,17 +274,17 @@ class HostAbortTest(unittest.TestCase):
         self.assertEqual(rig.prefill.check_status(h.ROOM), KVPoll.Failed)
         self.assertFalse(rig.prefill._staging_outstanding.get(h.ROOM))
         self.assertTrue(rig.sender.is_aux_in_flight())
-        # Decode's ABORT is not acked while an abandoned WRITE may still land,
-        # though the live count is zero: decode keeps the room's memory.
-        rig.prefill._handle_abort_notification(
-            [b"ABORT", b"37", b"decode", b"1", str(generation).encode("ascii")]
-        )
+        # Told the room failed, decode sent its ABORT. It is not acked while an
+        # abandoned WRITE may still land, though the live count is zero: decode
+        # keeps the room's memory.
+        self.assertTrue(rig.receiver.abort_notified)
         rig.prefill.host_staging.progress()
         self.assertFalse(rig.decode.is_abort_release_safe(h.ROOM, 1))
         # Nor once the scheduler cleared the room (an ABORT for an unknown room).
         rig.sender.clear()
+        generation = str(rig.receiver._abort_generation).encode("ascii")
         rig.prefill._handle_abort_notification(
-            [b"ABORT", b"37", b"decode", b"1", str(generation).encode("ascii")]
+            [b"ABORT", b"37", b"decode", b"1", generation]
         )
         self.assertFalse(rig.decode.is_abort_release_safe(h.ROOM, 1))
         for _ in range(500):
@@ -336,6 +335,83 @@ class HostAbortTest(unittest.TestCase):
                 break
             time.sleep(0.001)
         self.assertFalse(rig.sender.is_aux_in_flight())
+
+    def test_abandoned_room_tells_decode_without_releasing_its_ack(self):
+        # Leaving an abandoned room to the decode's waiting timeout pins its
+        # ring grants, and so the decode's FIFO ring, for every writer.
+        rig = self.rig()
+        for x in ring_handles(rig):
+            x.err = True  # The ring WRITE settles as ERR; the aux keeps running.
+        agent = rig.prefill.agent
+        agent.check_xfer_state = lambda x: (
+            "ERR" if getattr(x, "err", False) else "DONE" if x.done else "PROC"
+        )
+        abandoned_when_told = []
+        rig.prefill.send_kv_status_message = Mock(
+            side_effect=lambda **kw: abandoned_when_told.append(
+                h.ROOM in rig.prefill._abandoned
+            )
+        )
+        generation = rig.decode.register_deferred_abort_room(h.ROOM)
+        with patch(
+            "sglang.srt.disaggregation.nixl.conn.NIXL_ERR_SETTLE_TIMEOUT_S", 0.01
+        ):
+            for _ in range(500):
+                rig.prefill.host_staging.progress()
+                if rig.prefill.send_kv_status_message.called:
+                    break
+                time.sleep(0.001)
+        rig.prefill.send_kv_status_message.assert_called_once()
+        kwargs = rig.prefill.send_kv_status_message.call_args.kwargs
+        self.assertEqual(kwargs["bootstrap_room"], h.ROOM)
+        self.assertEqual(kwargs["status"], KVPoll.Failed)
+        # Abandoned before the decode heard: its ABORT cannot be acked early.
+        self.assertEqual(abandoned_when_told, [True])
+        rig.prefill._handle_abort_notification(
+            [b"ABORT", b"37", b"decode", b"1", str(generation).encode("ascii")]
+        )
+        rig.prefill.host_staging.progress()
+        self.assertFalse(rig.decode.is_abort_release_safe(h.ROOM, 1))
+        for x in agent.handles:
+            if not getattr(x, "err", False):
+                agent.complete(x)
+        for _ in range(500):
+            rig.prefill.host_staging.progress()  # Reaps once all settled.
+            if h.ROOM not in rig.prefill._abandoned:
+                break
+            time.sleep(0.001)
+        self.wait_for_ack(rig)
+
+    def test_abandoned_room_with_a_rejected_post_gets_no_drain_ack(self):
+        # A rejected aux post may still land, so the decode is told at once but
+        # gets no drain ACK: it falls back to its release timeout.
+        rig = h.Rig(count=2)
+        agent = rig.prefill.agent
+        agent.manual = True  # The ring WRITE stays PROC: the batch is abandoned.
+
+        def transfer(handle):
+            if not handle.notif:  # The aux: only ring WRITEs carry one.
+                raise RuntimeError("NIXL_ERR_BACKEND")
+            return "PROC"
+
+        agent.transfer = transfer
+        rig.prefill.send_kv_status_message = Mock()
+        with patch(
+            "sglang.srt.disaggregation.nixl.conn.NIXL_ERR_SETTLE_TIMEOUT_S", 0.01
+        ):
+            rig.submit([2])
+            for _ in range(2000):
+                rig.tick()
+                if rig.prefill.send_kv_status_message.called:
+                    break
+                time.sleep(0.001)
+        rig.prefill.send_kv_status_message.assert_called_once()
+        self.assertEqual(
+            rig.prefill.send_kv_status_message.call_args.kwargs["status"],
+            KVPoll.Failed,
+        )
+        self.assertIn(h.ROOM, rig.prefill._abandoned)
+        self.assertIn(h.ROOM, rig.prefill._deferred_ack_poisoned_rooms)
 
     def test_blocked_ack_does_not_delay_progress_or_another_write_deadline(self):
         for blocked in ("send", "lock"):
