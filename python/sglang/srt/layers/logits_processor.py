@@ -1669,6 +1669,10 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     # carrying the draft model's stale ModelOpt quant_method. Only use the
     # ModelOpt lm_head kernel when the runtime quantization state matches it.
     if method_name == "ModelOptFp4LinearMethod":
+        if quant_method.quant_mode == "phase" and not _has_lm_head_runtime_attrs(
+            lm_head, ("weight_scale_mma", "weight_global_scale")
+        ):
+            return False
         if quant_method.quant_mode == "w4a16":
             return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
                 lm_head,

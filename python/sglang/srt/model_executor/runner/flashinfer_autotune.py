@@ -50,6 +50,36 @@ logger = logging.getLogger(__name__)
 FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
 
 
+def _flashinfer_w4a16_setting(model_runner: ModelRunner) -> bool | str:
+    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+
+    moe_backend = get_exec().moe.moe_runner_backend
+    if model_runner.is_draft_worker:
+        moe_backend = get_spec().speculative_moe_runner_backend or moe_backend
+    if (
+        moe_backend
+        in (
+            "flashinfer_cutedsl",
+            "flashinfer_megamoe",
+        )
+        or get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
+    ):
+        return envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+    return False
+
+
+def flashinfer_autotune_moe_phases(model_runner: ModelRunner) -> tuple:
+    """Warm both kernels when activation precision changes between phases."""
+    split_precision = any(
+        isinstance(setting, str)
+        for setting in (
+            _flashinfer_w4a16_setting(model_runner),
+            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get(),
+        )
+    )
+    return ("decode", "prefill") if split_precision else (None,)
+
+
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     skip_ops = set(get_exec().kernel.flashinfer_autotune_skip_ops or ())
     skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
@@ -174,6 +204,8 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.dtype),
         str(get_model().quantization),
         str(get_exec().moe.moe_runner_backend),
+        str(_flashinfer_w4a16_setting(mr)),
+        str(envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()),
         str(get_parallel().tp_size),
         str(get_parallel().pp_size),
         str(get_parallel().attn_dp_size),

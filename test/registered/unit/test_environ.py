@@ -179,6 +179,33 @@ class TestEnvField(unittest.TestCase):
                         self.assertIsNone(child.get())
 
 
+class TestEnvBoolOrPhase(unittest.TestCase):
+    def test_boolean_and_phase_values(self):
+        for field in (
+            envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16,
+            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION,
+        ):
+            for value, expected in (
+                ("true", True),
+                ("1", True),
+                ("all", True),
+                ("FALSE", False),
+                ("0", False),
+                ("prefill", "prefill"),
+                ("DECODE", "decode"),
+            ):
+                with self.subTest(field=field.name, value=value), field.override(value):
+                    self.assertEqual(field.get(), expected)
+
+    def test_invalid_value_warns_and_uses_default(self):
+        field = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
+        with (
+            field.override("invalid-phase"),
+            self.assertWarnsRegex(UserWarning, "must be a boolean"),
+        ):
+            self.assertIs(field.get(), False)
+
+
 class TestDeprecatedEnvRegistry(unittest.TestCase):
     def _apply(self, old_name, deprecation):
         with warnings.catch_warnings(record=True) as caught:

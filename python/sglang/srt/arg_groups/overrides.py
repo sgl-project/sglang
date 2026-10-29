@@ -1488,7 +1488,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if view.quantization == "nvfp4_online":
         use_megamoe_w4a16 = (
             view.moe_a2a_backend == "flashinfer_megamoe"
-            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
         )
         if not get_platform().is_sm100:
             raise ValueError(

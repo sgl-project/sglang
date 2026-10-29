@@ -49,6 +49,56 @@ class _FakeArgs:
     metadata_but_not_overridable: A[bool, Arg(help="z")] = False
 
 
+class TestNvfp4PhaseAttentionDpValidation(CustomTestCase):
+    def test_public_values_and_attention_dp_compatibility(self):
+        from sglang.srt.arg_groups.validation_hook import (
+            validate_nvfp4_phase_attention_dp,
+        )
+
+        w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
+        per_token = envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION
+        defaults = {
+            "attn_dp_size": 1,
+            "ep_join_mode": None,
+            "moe_runner_backend": "flashinfer_cutedsl",
+            "fp4_gemm_runner_backend": "flashinfer_cutlass",
+            "speculative_algorithm": None,
+            "speculative_moe_runner_backend": None,
+        }
+        dp_cases = (
+            ({}, False),
+            ({"attn_dp_size": 2}, True),
+            ({"ep_join_mode": "scale"}, True),
+            ({"_resolved_overrides": [("resolved", {"attn_dp_size": 2})]}, True),
+        )
+        with w4a16.override(False), per_token.override(False):
+            for field in (w4a16, per_token):
+                for value in (True, False, "prefill", "decode"):
+                    for overrides, has_dp in dp_cases:
+                        cfg = SimpleNamespace(**(defaults | overrides))
+                        with (
+                            self.subTest(
+                                field=field.name, value=value, config=overrides
+                            ),
+                            field.override(value),
+                        ):
+                            if isinstance(value, str) and has_dp:
+                                with self.assertRaisesRegex(ValueError, "attention DP"):
+                                    validate_nvfp4_phase_attention_dp(cfg)
+                            else:
+                                validate_nvfp4_phase_attention_dp(cfg)
+            # W4A16 remains a no-op when both selected backends ignore it.
+            cfg = SimpleNamespace(
+                **(
+                    defaults
+                    | {"attn_dp_size": 2, "moe_runner_backend": "flashinfer_trtllm"}
+                )
+            )
+            for phase in ("prefill", "decode"):
+                with self.subTest(unsupported=phase), w4a16.override(phase):
+                    validate_nvfp4_phase_attention_dp(cfg)
+
+
 class TestBoundaryParallelismResolution(CustomTestCase):
     def config(self, **options):
         return SimpleNamespace(

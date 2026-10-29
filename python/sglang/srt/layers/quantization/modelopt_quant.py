@@ -325,6 +325,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         self.exclude_modules = exclude_modules or []
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.use_per_token_activation = False
+        self.per_token_activation_phase = None
 
     def _get_quant_method(
         self,
@@ -1514,10 +1515,14 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 )
             self.use_per_token_activation = False
         else:
-            self.use_per_token_activation = (
+            per_token_activation = (
                 envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
                 if use_per_token_activation is None
                 else use_per_token_activation
+            )
+            self.use_per_token_activation = bool(per_token_activation)
+            self.per_token_activation_phase = (
+                per_token_activation if isinstance(per_token_activation, str) else None
             )
 
     @classmethod
@@ -1784,14 +1789,19 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
+        w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
         self.quant_mode = (
-            "w4a16"
-            if (
-                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-                and get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
-            )
+            ("w4a16" if w4a16 is True else "phase")
+            if w4a16 and get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
             else "w4a4"
         )
+        if self.quant_mode == "phase" and not get_platform().is_sm100:
+            raise ValueError(
+                "Phase-specific SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 for dense "
+                "CuTe DSL requires SM100-family GPUs, where W4A4 and W4A16 share "
+                "the same weight layout. Use a global true/1 or false/0 setting "
+                "on other architectures."
+            )
 
     def create_weights(
         self,
@@ -1890,6 +1900,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if self.quant_mode == "w4a16":
             from flashinfer import prepare_bf16_fp4_weights
 
+            # Preserve FlashInfer's architecture-specific global W4A16 layout.
+            # SM110/SM120 use a different representation from W4A4.
             weight, weight_scale, alpha = prepare_bf16_fp4_weights(
                 layer.weight,
                 swizzle_blockscale(layer.weight_scale),
@@ -1900,7 +1912,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             copy_or_rebind_param(layer, "weight_scale_interleaved", weight_scale)
             copy_or_rebind_param(layer, "alpha", alpha)
             return
-        elif self.quant_mode != "w4a4":
+        elif self.quant_mode not in ("w4a4", "phase"):
             raise ValueError(f"Unsupported FP4 GEMM quant mode: {self.quant_mode}")
 
         # alpha / input_scale_inv stay as scalar Parameters. Aliasing them into
@@ -2027,6 +2039,21 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer, "weight_scale", "weight_scale_interleaved", padded_scales
         )
 
+        if self.quant_mode == "phase":
+            from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+            # Both kernels consume the same packed weights and swizzled scales.
+            # W4A16's TMA descriptor only needs a strided view of that storage.
+            layer.weight_scale_mma = convert_sf_to_mma_layout(
+                layer.weight_scale_interleaved,
+                m=layer.weight.shape[0],
+                k=layer.weight.shape[1] * 2,
+                sf_vec_size=self.quant_config.group_size,
+            )
+            copy_or_rebind_param(
+                layer, "weight_global_scale", weight_scale_2.reshape(1)
+            )
+
         if getattr(layer, "_interleave_for_swiglu_fusion", False):
             from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
                 interleave_linear_and_gate,
@@ -2091,7 +2118,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        if self.quant_mode == "w4a4":
+        quant_mode = self.quant_mode
+        if quant_mode == "phase":
+            from sglang.srt.layers.moe.phase import is_w4a16_enabled
+
+            quant_mode = "w4a16" if is_w4a16_enabled() else "w4a4"
+
+        if quant_mode == "w4a4":
             # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
             # tuple from unrelated code can't silently bypass quantization.
             if getattr(layer, "_accepts_prequantized_fp4", False) and isinstance(
@@ -2143,22 +2176,34 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             if bias is not None:
                 out = out + bias
             return out.view(*output_shape)
-        elif self.quant_mode == "w4a16":
+        elif quant_mode == "w4a16":
             if self.quant_config.is_awq:
                 x = x * layer.pre_quant_scale
+            input_shape = x.shape
+            x = x.reshape(-1, x.shape[-1])
+            weight_scale = layer.weight_scale_interleaved
+            alpha = layer.alpha
+            if self.quant_mode == "phase":
+                weight_scale = layer.weight_scale_mma
+                alpha = layer.weight_global_scale
+                padded_k = layer.weight.shape[1] * 2
+                if x.shape[1] != padded_k:
+                    x = torch.nn.functional.pad(x, (0, padded_k - x.shape[1]))
             out = fp4_gemm(
-                x.reshape(-1, x.shape[-1]),
+                x,
                 layer.weight,
                 None,
-                layer.weight_scale_interleaved,
-                layer.alpha,
+                weight_scale,
+                alpha,
                 torch.bfloat16,
                 layer.output_size_per_partition,
-                self.quant_mode,
+                quant_mode,
             )
+            if self.quant_mode == "phase":
+                out = slice_nvfp4_output(out, layer.output_size_per_partition)
             if bias is not None:
                 out = out + bias
-            return out.view(*x.shape[:-1], layer.output_size_per_partition)
+            return out.view(*input_shape[:-1], layer.output_size_per_partition)
         else:
             raise ValueError(f"Unsupported FP4 GEMM quant mode: {self.quant_mode}")
 
@@ -2335,7 +2380,7 @@ def _input_scale_to_local_experts(
 
 def _compute_gemm1_alphas(
     w13_weight_scale_2: torch.Tensor,
-    w13_input_scale: torch.Tensor,
+    w13_input_scale: torch.Tensor | float,
     is_gated: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GEMM1 weight x input alphas for the gate (w1) and up (w3) halves of w13.
@@ -2627,14 +2672,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
 
-        is_nvfp4_online = self.quant_config.get_name() == "nvfp4_online"
-        # nvfp4_online installs per-token activation scales after loading;
-        # per-tensor paths default to 1.0 here.
-        input_scale_fill = 1.0 if not is_nvfp4_online else None
+        # Source checkpoints used by nvfp4_online have no calibrated NVFP4
+        # activation scales. Initialize the static fallback too: a phase
+        # selector can leave one phase using per-tensor activation quantization.
         w13_input_scale = _make_per_tensor_scale_parameter(
             (layer.num_experts, num_shards),
             weight_loader=weight_loader,
-            fill_value=input_scale_fill,
+            fill_value=1.0,
         )
         w13_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w13_input_scale", w13_input_scale)
@@ -2642,7 +2686,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale = _make_per_tensor_scale_parameter(
             (layer.num_experts,),
             weight_loader=weight_loader,
-            fill_value=input_scale_fill,
+            fill_value=1.0,
         )
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
@@ -2811,29 +2855,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         use_w4a16 = (
             self._is_cutedsl_v2_standard or moe_runner_backend.is_flashinfer_megamoe()
-        ) and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-        if self.quant_config.use_per_token_activation or use_w4a16:
-            # FlashInfer computes activation scales dynamically per token, so
-            # the static checkpoint activation scale is intentionally neutral.
-            # CuTe DSL W4A16 keeps activations in BF16, so its GEMM alphas must
-            # likewise contain only the NVFP4 weight decode scales.
-            w13_input_scale = torch.ones_like(w13_input_scale, dtype=torch.float32)
-            w2_input_scale = torch.ones_like(w2_input_scale, dtype=torch.float32)
+        ) and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() is True
 
-        # Create shared parameters. g1_alphas / g1_alphas_up are the gate (w1)
-        # and up (w3) GEMM1 scales (equal for shared-scale checkpoints).
-        g1_alphas, g1_alphas_up = _compute_gemm1_alphas(
-            layer.w13_weight_scale_2,
-            w13_input_scale,
-            layer.moe_runner_config.is_gated,
+        # Keep checkpoint activation scales and both small scalar variants.
+        # Static W4A4 uses weight * activation scales; per-token/W4A16 kernels
+        # use weight-only scales. No weight buffers change between these modes.
+        weight_g1, weight_g1_up = _compute_gemm1_alphas(
+            layer.w13_weight_scale_2, 1.0, layer.moe_runner_config.is_gated
         )
-        copy_or_rebind_param(layer, "g1_alphas", g1_alphas)
-        copy_or_rebind_param(layer, "g1_alphas_up", g1_alphas_up)
-        copy_or_rebind_param(
-            layer,
-            "g2_alphas",
-            (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
-        )
+        weight_g2 = layer.w2_weight_scale_2.to(torch.float32)
         copy_or_rebind_param(
             layer,
             "w13_input_scale_quant",
@@ -2844,60 +2874,87 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             "w2_input_scale_quant",
             (1 / w2_input_scale).to(torch.float32),
         )
-
-        if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
-            runner_config = layer.moe_runner_config
-            is_situ = runner_config.activation == "situ"
-            gemm1_clamp_limit = (
-                None
-                if is_situ
-                else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
+        variants = [
+            (
+                "",
+                weight_g1 * w13_input_scale,
+                weight_g1_up * w13_input_scale,
+                weight_g2 * w2_input_scale,
             )
-            if gemm1_clamp_limit is not None:
-                # The kernel clamps both raw halves with one limit, so move both onto
-                # the larger alpha by rescaling the smaller half's E4M3 block scales.
-                untied = layer.g1_alphas != layer.g1_alphas_up
-                if untied.any():
-                    shared_alphas = torch.maximum(layer.g1_alphas, layer.g1_alphas_up)
-                    # Block-scale rows are [up, gate] in the TRT-LLM weight layout.
-                    ratios = torch.stack([layer.g1_alphas_up, layer.g1_alphas], dim=1)
-                    ratios = torch.where(
-                        untied[:, None], ratios / shared_alphas[:, None], 1.0
+        ]
+        if (
+            self.enable_flashinfer_trtllm_moe
+            and self.quant_config.use_per_token_activation
+        ):
+            variants.append(("_per_token_", weight_g1, weight_g1_up, weight_g2))
+
+        runner_config = layer.moe_runner_config
+        for prefix, g1_alphas, g1_alphas_up, g2_alphas in variants:
+            if runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
+                is_situ = runner_config.activation == "situ"
+                clamp_limit = (
+                    None
+                    if is_situ
+                    else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
+                )
+                if clamp_limit is not None:
+                    shared_alphas = torch.maximum(g1_alphas, g1_alphas_up)
+                    if not prefix:
+                        # Both variants use the same block-scale correction.
+                        # Apply it once; TRT-LLM rows are [up, gate].
+                        untied = g1_alphas != g1_alphas_up
+                        if untied.any():
+                            ratios = torch.stack([g1_alphas_up, g1_alphas], dim=1)
+                            ratios = torch.where(
+                                untied[:, None], ratios / shared_alphas[:, None], 1.0
+                            )
+                            block_scales = layer.w13_weight_scale.data.unflatten(
+                                1, (2, -1)
+                            )
+                            block_scales.copy_(
+                                block_scales.float().mul_(ratios[:, :, None, None])
+                            )
+                    g1_alphas = g1_alphas_up = shared_alphas
+                    copy_or_rebind_param(
+                        layer,
+                        f"{prefix}gemm1_clamp_limit",
+                        (clamp_limit / g1_alphas).to(torch.float32),
                     )
-                    block_scales = layer.w13_weight_scale.data.unflatten(1, (2, -1))
-                    block_scales.copy_(
-                        block_scales.float().mul_(ratios[:, :, None, None])
+
+                if runner_config.gemm1_alpha is not None:
+                    if not prefix:
+                        copy_or_rebind_param(
+                            layer,
+                            "gemm1_alpha",
+                            torch.full_like(g1_alphas, runner_config.gemm1_alpha),
+                        )
+                    # SwiGLU adds beta to the raw up half before dequantization.
+                    beta = (
+                        torch.full_like(g1_alphas, runner_config.gemm1_clamp_limit)
+                        if is_situ
+                        else (1.0 / g1_alphas_up).to(torch.float32)
                     )
-                    copy_or_rebind_param(layer, "g1_alphas", shared_alphas)
-                    copy_or_rebind_param(layer, "g1_alphas_up", shared_alphas)
-                copy_or_rebind_param(
-                    layer,
-                    "gemm1_clamp_limit",
-                    (gemm1_clamp_limit / layer.g1_alphas).to(torch.float32),
+                    copy_or_rebind_param(layer, f"{prefix}gemm1_beta", beta)
+
+            copy_or_rebind_param(layer, f"{prefix}g1_alphas", g1_alphas)
+            copy_or_rebind_param(layer, f"{prefix}g1_alphas_up", g1_alphas_up)
+            copy_or_rebind_param(layer, f"{prefix}g2_alphas", g2_alphas)
+            if prefix:
+                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                    _compute_g1_scale_c,
                 )
 
-            if runner_config.gemm1_alpha is not None:
                 copy_or_rebind_param(
                     layer,
-                    "gemm1_alpha",
-                    torch.full_like(
-                        layer.g1_alphas,
-                        runner_config.gemm1_alpha,
-                        dtype=torch.float32,
+                    f"{prefix}g1_scale_c",
+                    _compute_g1_scale_c(
+                        torch.ones_like(layer.w2_input_scale_quant),
+                        g1_alphas,
+                        g1_alphas_up,
+                        runner_config.is_gated,
+                        runner_config.activation,
                     ),
                 )
-                # SwiGLU adds beta to the raw up half before dequantization.
-                gemm1_beta = (
-                    torch.full_like(
-                        layer.g1_alphas,
-                        runner_config.gemm1_clamp_limit,
-                        dtype=torch.float32,
-                    )
-                    if is_situ
-                    else (1.0 / layer.g1_alphas_up).to(torch.float32)
-                )
-                copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
-
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
                 materialize_swiglu_params_for_cutlass,
@@ -2958,6 +3015,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 prepare_nvfp4_moe_weights_for_flashinfer_megamoe,
             )
 
+            if use_w4a16:
+                # MegaMoE needs a contiguous gate-scale vector. Keep this fixed
+                # weight-only descriptor separate from calibrated g1_alphas.
+                copy_or_rebind_param(
+                    layer,
+                    "_w4a16_g1_alphas",
+                    weight_g1,
+                )
             prepare_nvfp4_moe_weights_for_flashinfer_megamoe(layer)
             return
 
@@ -3094,7 +3159,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         sf_vec_size=sf_vec_size,
                     ),
                 )
-                if layer._cutedsl_wrapper is not None:
+                if getattr(layer, "_cutedsl_states", None):
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
 
     @property
@@ -3136,7 +3201,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
-            layer._cutedsl_wrapper = None
+            layer._cutedsl_states = None
 
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
@@ -3217,12 +3282,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             mega = ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer)
-            use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+            use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.enabled_for_all()
             quant_info = FlashInferMegaMoeQuantInfo(
                 mega=mega,
                 mega_forward=layer._flashinfer_megamoe_forward,
-                fc1_alpha=layer.g1_alphas,
-                fc2_alpha=layer.g2_alphas,
+                fc1_alpha=(layer._w4a16_g1_alphas if use_w4a16 else layer.g1_alphas),
+                fc2_alpha=(layer.w2_weight_scale_2 if use_w4a16 else layer.g2_alphas),
                 fc1_norm_const=None if use_w4a16 else layer.w2_input_scale_quant,
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk
@@ -3242,7 +3307,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,
             )
+            from sglang.srt.layers.moe.phase import use_nvfp4_per_token_activation
             from sglang.srt.layers.moe.utils import RoutingMethodType
+
+            use_per_token = use_nvfp4_per_token_activation(self.quant_config)
 
             # Determine routing method type based on layer configuration
             routing_method_type = getattr(
@@ -3252,21 +3320,38 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             gemm1_clamp = getattr(layer, "gemm1_clamp_limit", None)
             gemm1_alpha = getattr(layer, "gemm1_alpha", None)
             gemm1_beta = getattr(layer, "gemm1_beta", None)
+            if use_per_token:
+                gemm1_clamp = getattr(
+                    layer, "_per_token_gemm1_clamp_limit", gemm1_clamp
+                )
+                gemm1_beta = getattr(layer, "_per_token_gemm1_beta", gemm1_beta)
             quant_info = FlashInferTrtllmFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight.data,
                 w2_weight=layer.w2_weight.data,
                 w13_weight_scale=layer.w13_weight_scale.data,
                 w2_weight_scale=layer.w2_weight_scale.data,
-                g1_scale_c=layer.g1_scale_c.data,
-                g1_alphas=layer.g1_alphas.data,
-                g2_alphas=layer.g2_alphas.data,
+                g1_scale_c=(
+                    getattr(layer, "_per_token_g1_scale_c", layer.g1_scale_c)
+                    if use_per_token
+                    else layer.g1_scale_c
+                ).data,
+                g1_alphas=(
+                    getattr(layer, "_per_token_g1_alphas", layer.g1_alphas)
+                    if use_per_token
+                    else layer.g1_alphas
+                ).data,
+                g2_alphas=(
+                    getattr(layer, "_per_token_g2_alphas", layer.g2_alphas)
+                    if use_per_token
+                    else layer.g2_alphas
+                ).data,
                 w13_input_scale_quant=layer.w13_input_scale_quant,
                 global_num_experts=layer.num_experts,
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
                 local_num_experts=layer.num_local_experts,
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=routing_method_type,
-                use_per_token_activation=self.quant_config.use_per_token_activation,
+                use_per_token_activation=use_per_token,
                 padded_hidden_size=layer.trtllm_padded_hidden_size,
                 gemm1_alpha=gemm1_alpha.data if gemm1_alpha is not None else None,
                 gemm1_beta=gemm1_beta.data if gemm1_beta is not None else None,
@@ -3282,7 +3367,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             if self._is_cutedsl_v1_deepep:
-                if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+                from sglang.srt.layers.moe.phase import is_w4a16_enabled
+
+                if is_w4a16_enabled():
                     raise ValueError(
                         "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 does not support "
                         "the CuTe DSL v1 DeepEP masked MoE path."
@@ -3307,9 +3394,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # v2 standard path (a2a=none/flashinfer): uses CuteDslMoEWrapper
             # with [Up, Gate] interleaved weights and MMA blockscales.
-            ensure_cutedsl_wrapper(layer)
-            w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
-            quant_mode = layer._cutedsl_wrapper.quant_mode
+            state = ensure_cutedsl_wrapper(layer)
+            w1_alpha, fc2_input_scale, w2_alpha = state.scales
+            quant_mode = state.wrapper.quant_mode
             quant_info = CuteDslFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -3321,12 +3408,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 ),
                 w1_alpha=w1_alpha,
                 w2_alpha=w2_alpha,
-                a1_scale=layer._cutedsl_input_scale,
+                a1_scale=state.input_scale,
                 a2_scale=fc2_input_scale,
-                wrapper=layer._cutedsl_wrapper,
-                use_per_token_activation=(
-                    self.quant_config.use_per_token_activation and quant_mode == "w4a4"
-                ),
+                wrapper=state.wrapper,
+                use_per_token_activation=state.use_per_token_activation,
                 quant_mode=quant_mode,
             )
             return self.runner.run(dispatch_output, quant_info)

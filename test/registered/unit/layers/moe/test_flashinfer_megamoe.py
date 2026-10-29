@@ -55,6 +55,10 @@ def _load_megamoe_module(monkeypatch):
             get=lambda: False
         ),
     )
+    w4a16 = fake_modules[
+        "sglang.srt.environ"
+    ].envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
+    w4a16.enabled_for_all = lambda: w4a16.get() is True
     runtime_context = fake_modules["sglang.srt.runtime_context"]
     runtime_context.cutedsl_moe_max_num_tokens = lambda: 2048
     base = fake_modules["sglang.srt.layers.moe.moe_runner.base"]
@@ -679,6 +683,7 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
         apply_router_weight_on_input=False,
     )
     layer.g1_alphas = layer.g1_alphas_up = torch.ones(2)
+    layer.w13_weight_scale_2 = torch.ones(2, 2)
     layer.g2_alphas = torch.ones(2)
     layer.w13_input_scale_quant = torch.tensor(1.0)
     layer.w2_input_scale_quant = torch.ones(2)
