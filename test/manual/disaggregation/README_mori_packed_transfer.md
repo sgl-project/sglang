@@ -103,3 +103,8 @@ This is one fixed prompt and does not measure task accuracy.
 A separate post-timing trace recorded two full gather kernels with grid
 `[32,256,1]` and two SWA gathers with grid `[92,256,1]` on each prefill rank,
 corresponding to both destination peers. Trace timings are excluded above.
+
+The later validation cleanup at `6b67ebcd62` avoids constructing and discarding
+full descriptor matrices before each transfer. Actual submitted offsets remain
+unchanged. The updated patch passes 41 CPU/GPU tests and native RDMA byte/guard
+checks; the serving table above records its original measured code revision.
