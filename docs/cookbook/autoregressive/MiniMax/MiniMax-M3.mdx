@@ -119,6 +119,10 @@ The first import JIT-compiles the kernels, which can take 30 s to a few minutes 
 The gate requires `--attention-backend fa4` (MSA's sparse blocks are 128 tokens, so the page size must be 128). SGLang auto-forces `page_size` to 128 for the `fa4` backend — including the combined `--attention-backend fa4` the M3 recipe uses (#28976) — so `--page-size 128` is omitted from the Blackwell cells below. Force the Triton path at any time with the env var `SGLANG_DISABLE_MSA=1`. MSA is a Blackwell (SM100) kernel and does not apply to the AMD ROCm paths.
 
 <Note>
+**GB300: per-phase attention split.** The GB300 cell adds `--decode-attention-backend trtllm_mha`: decode runs on FlashInfer's trtllm-gen paged decode (~2x faster than fa4 on M3's full-attention decode shapes at this TP4 geometry; +11–15% median per-user interactivity in 900 s serving replays at concurrency 1–60), while `--attention-backend fa4` stays — it serves prefill (where fa4 remains the faster backend) and keys the page-128 auto-force MSA requires. The MSA sparse layers are unaffected in both phases. `trtllm_mha` accepts page 128 through trtllm-gen's dynamic tokens-per-page kernels (FlashInfer ≥ 0.6.12; allowed in-tree on current `main`), so the split needs a build from current `main` — the pre-built dev image (last pushed 2026-06) predates that support and clamps `trtllm_mha` to page 64, which MSA rejects. B200 (TP8, different shard geometry) and GB200 are not benchmarked with the split and keep fa4-only.
+</Note>
+
+<Note>
 For multimodal (image) serving, keep the same text recipe above — `--attention-backend fa4` (MSA) is unchanged — and add `--mm-attention-backend flashinfer_cudnn` for the vision tower. The text and vision-tower attention backends are independent knobs; MSA only touches the language-model sparse attention, not image handling.
 </Note>
 

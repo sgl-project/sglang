@@ -264,6 +264,14 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
+      // GB300: decode runs on trtllm_mha (FlashInfer trtllm-gen paged decode,
+      // ~2x faster than fa4 on M3's decode shapes; see the cookbook page's
+      // per-phase note). --attention-backend fa4 still serves prefill (fa4
+      // wins there) and keys the page-128 auto-force MSA needs; trtllm_mha
+      // accepts page 128 via trtllm-gen's dynamic tokens-per-page kernels
+      // (flashinfer >= 0.6.12), so this needs a build from current main —
+      // the 2026-06 dev image predates that support. B200/GB200 (different
+      // or unbenchmarked shard geometry) intentionally keep fa4-only.
       match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
@@ -274,6 +282,7 @@ sgl-eval run mmmu_pro \\
         "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend fa4",
+        "--decode-attention-backend trtllm_mha",
         "--moe-runner-backend deep_gemm",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.75",
