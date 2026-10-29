@@ -120,11 +120,8 @@ class C128SidecarComponent(TreeComponent):
         """FULL pages spanned by one C128 page."""
         return self.allocator.c128_attn_allocator.page_size
 
-    def _kernel_page_size(self) -> int:
-        return self.allocator.c128_attn_allocator.page_size
-
     def _group_tokens(self) -> int:
-        return self.tree_core.page_size * self._kernel_page_size()
+        return self.tree_core.page_size * self.block_pages()
 
     def _block_endpoint_keys(self, node: UnifiedTreeNode, blocks: int) -> list[str]:
         """Storage keys for the C128 pages of ``node``: the absolute block
@@ -171,18 +168,6 @@ class C128SidecarComponent(TreeComponent):
             host_indices = self._c128_kv_pool_host.alloc(num_tokens)
         return host_indices
 
-    def _attach_host_value(self, node: UnifiedTreeNode, host_value: torch.Tensor) -> None:
-        """Publish fetched C128 host slots on a node and refresh tree state."""
-        ct = self.component_type
-        cd = node.component_data[ct]
-        cd.host_value = host_value.clone()
-        host_lru = self.tree_core.host_lru_lists[ct]
-        if cd.value is None and not host_lru.in_list(node):
-            host_lru.insert_mru(node)
-        self.tree_core._update_evictable_leaf_sets(node)
-        if node.parent is not None:
-            self.tree_core._update_evictable_leaf_sets(node.parent)
-
     def _commit_prefetch(
         self,
         anchor: UnifiedTreeNode,
@@ -202,7 +187,7 @@ class C128SidecarComponent(TreeComponent):
         if not transfers:
             return
         ct = self.component_type
-        kernel_page_size = self._kernel_page_size()
+        kernel_page_size = self.block_pages()
         host_indices = transfers[0].host_indices
         if host_indices is None or host_indices.numel() == 0:
             return
@@ -229,9 +214,14 @@ class C128SidecarComponent(TreeComponent):
             return
         cd = target.component_data[ct]
         if cd.host_value is None:
-            self._attach_host_value(
-                target, host_indices[: blocks_required * kernel_page_size]
-            )
+            # Publish the fetched slots on the node and refresh eviction state.
+            cd.host_value = host_indices[: blocks_required * kernel_page_size].clone()
+            host_lru = self.tree_core.host_lru_lists[ct]
+            if cd.value is None and not host_lru.in_list(target):
+                host_lru.insert_mru(target)
+            self.tree_core._update_evictable_leaf_sets(target)
+            if target.parent is not None:
+                self.tree_core._update_evictable_leaf_sets(target.parent)
         else:
             cache_actions.append(
                 FreeComponentHostSlot([host_indices], component_type=ct)
