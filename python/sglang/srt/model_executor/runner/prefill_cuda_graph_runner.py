@@ -2343,9 +2343,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _wait_for_layer_loads(self) -> None:
         # Full replay skips the per-layer load waits in the pool accessors; breakable
-        # replay still runs them at its eager breaks, except for a linear-attention
-        # extend captured in the graph, whose state-pool wait ran only at capture:
-        # wait for this stage's host-cache loads before replaying it.
+        # replay still runs them at its eager breaks, unless the linear extend is
+        # captured in the graph.
         linear_extend_in_graph = (
             self.use_captured_attn_metadata
             and self.model_runner.attn_backend.breakable_cuda_graph_captures_linear_extend
