@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     temp_dir_if_disabled,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_cancel import (
+    CancelDeliveryError,
     publish_cancel,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
@@ -849,13 +850,24 @@ async def retrieve_video(video_id: str = Path(...)):
 
 @router.delete("/{video_id}", response_model=VideoResponse)
 async def delete_video(video_id: str = Path(...)):
-    job = await VIDEO_STORE.pop(video_id)
+    job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
     # A queued job does not start; a running job stops after its current
     # denoising step. Publish also when the job task is done: a job that hit
     # the scheduler RPC timeout is marked failed but still runs on the GPU.
-    publish_cancel(video_id)
+    if job["status"] != "completed":
+        try:
+            publish_cancel(video_id)
+        except CancelDeliveryError as e:
+            raise HTTPException(
+                status_code=503,
+                detail="Cancellation unavailable; retry DELETE with the same video ID",
+                headers={"Retry-After": "1"},
+            ) from e
+    job = await VIDEO_STORE.pop(video_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Video not found")
     # Mark as deleted in response semantics
     job["status"] = "deleted"
     return VideoResponse(**job)

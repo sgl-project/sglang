@@ -5,23 +5,24 @@ from contextlib import suppress
 
 import zmq
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-logger = init_logger(__name__)
+class CancelDeliveryError(RuntimeError):
+    """The caller must retain the job and retry cancellation."""
 
 
 class CancelPublisher:
-    """Sends each cancelled request id to every connected replica driver.
+    """Enqueue cancellations for all replica drivers, or reject for retry."""
 
-    A driver that is not connected when an id is sent does not receive it, so
-    its request runs to the end, as before cancellation was supported.
-    """
-
-    def __init__(self, endpoint: str):
+    def __init__(self, endpoint: str, replicas: int = 1):
         self._endpoint = endpoint
+        self._replicas = replicas
+        self._subscribers = 0
         self._context = zmq.Context()
-        self._socket = self._context.socket(zmq.PUB)
+        self._socket = self._context.socket(zmq.XPUB)
         self._socket.setsockopt(zmq.LINGER, 0)
+        # cancellation is a control command: backpressure must not silently drop it
+        self._socket.setsockopt(zmq.XPUB_NODROP, 1)
+        self._socket.setsockopt(zmq.XPUB_VERBOSER, 1)
         try:
             self._socket.bind(endpoint)
         except zmq.ZMQError:
@@ -30,9 +31,16 @@ class CancelPublisher:
 
     def publish(self, request_id: str) -> None:
         try:
+            while self._socket.poll(0, zmq.POLLIN):
+                subscribed = self._socket.recv(zmq.NOBLOCK)
+                self._subscribers += 1 if subscribed[0] else -1
+            if self._subscribers < self._replicas:
+                raise CancelDeliveryError("Not all replica drivers are connected")
             self._socket.send(request_id.encode(), flags=zmq.NOBLOCK)
         except zmq.ZMQError as e:
-            logger.warning("Failed to publish cancel of %s: %s", request_id, e)
+            raise CancelDeliveryError(
+                "Cancellation channel is unavailable or full"
+            ) from e
 
     def close(self) -> None:
         self._context.destroy(linger=0)
@@ -43,16 +51,9 @@ class CancelPublisher:
 _publisher: CancelPublisher | None = None
 
 
-def start_cancel_publisher(endpoint: str) -> None:
+def start_cancel_publisher(endpoint: str, replicas: int = 1) -> None:
     global _publisher
-    try:
-        _publisher = CancelPublisher(endpoint)
-    except zmq.ZMQError as e:
-        logger.warning(
-            "Failed to bind cancel endpoint %s, request cancellation disabled: %s",
-            endpoint,
-            e,
-        )
+    _publisher = CancelPublisher(endpoint, replicas)
 
 
 def stop_cancel_publisher() -> None:

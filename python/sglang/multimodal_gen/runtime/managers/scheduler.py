@@ -58,7 +58,10 @@ from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     get_progress_reporter,
     init_progress_reporter,
 )
-from sglang.multimodal_gen.runtime.managers.request_cancel import init_request_cancel
+from sglang.multimodal_gen.runtime.managers.request_cancel import (
+    init_request_cancel,
+    poll_cancellations,
+)
 from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -350,6 +353,39 @@ class Scheduler(
     ):
         """Dispatch generation requests, merging compatible requests when allowed."""
         reqs = self._normalize_generation_reqs(reqs)
+        if (
+            allow_dynamic_batching
+            and len(reqs) > 1
+            and any(req.cancellable for req in reqs)
+        ):
+            # filter before merging; a running mixed batch cannot stop just one member
+            errors = [GPUWorker._cancel_error(req) for req in reqs]
+            if any(error is not None for error in errors):
+                live = [req for req, error in zip(reqs, errors) if error is None]
+                outputs = (
+                    self._handle_generation(
+                        live, allow_dynamic_batching=allow_dynamic_batching
+                    )
+                    if live
+                    else []
+                )
+                streaming = isinstance(outputs, _SequentiallyReturnedOutputs)
+                if streaming:
+                    outputs = outputs.outputs
+                elif not isinstance(outputs, list):
+                    outputs = [outputs]
+                live_outputs = iter(outputs)
+                restored = (
+                    OutputBatch(error=str(error), cancelled=True)
+                    if error is not None
+                    else next(live_outputs)
+                    for error in errors
+                )
+                return (
+                    _SequentiallyReturnedOutputs(restored)
+                    if streaming
+                    else list(restored)
+                )
         if self._async_output_save:
             # continuous forward/save overlap must occasionally leave GC enabled
             if request_gc.needs_collection_window() or any(
@@ -1411,6 +1447,7 @@ class Scheduler(
         tensors on NCCL so per-step latents do not pickle onto the gloo group.
         """
         if self.receiver is not None:
+            poll_cancellations()
             recv_reqs: list[tuple[bytes, Any]] = []
             received: list[list[bytes]] = []
             with self._socket_lock:

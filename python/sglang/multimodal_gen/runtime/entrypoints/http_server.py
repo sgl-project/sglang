@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         )
     # 4. Send the ids of deleted video jobs to the replica drivers
     if server_args.cancel_endpoint is not None:
-        start_cancel_publisher(server_args.cancel_endpoint)
+        start_cancel_publisher(server_args.cancel_endpoint, server_args.dp_size)
     warmup_task = None
     if server_args.warmup_mode == "server":
         warmup_task = asyncio.create_task(

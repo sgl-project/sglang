@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import AsyncExitStack
@@ -17,6 +18,7 @@ from fastapi import HTTPException
 from tqdm.auto import tqdm
 
 import sglang.multimodal_gen.runtime.managers.gpu_worker as gpu_worker_module
+from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints import http_server
@@ -86,18 +88,25 @@ def _cancel_endpoint():
     return f"ipc:///tmp/sglang-cancel-test-{uuid.uuid4().hex[:8]}"
 
 
+def _deliver_cancel(publish, listener, request_id="job"):
+    for _ in range(500):
+        try:
+            publish(request_id)
+        except video_cancel.CancelDeliveryError:
+            pass
+        if listener.is_cancelled([request_id]):
+            return
+        time.sleep(0.01)
+    pytest.fail("Cancellation did not reach the listener")
+
+
 def test_published_cancel_reaches_listener():
     endpoint = _cancel_endpoint()
     publisher = video_cancel.CancelPublisher(endpoint)
     context = zmq.Context()
     listener = CancelListener(context, endpoint)
     try:
-        # a SUB socket drops what is sent before it is connected
-        for _ in range(500):
-            publisher.publish("job")
-            if listener.is_cancelled(["job"]):
-                break
-            time.sleep(0.01)
+        _deliver_cancel(publisher.publish, listener)
         assert listener.is_cancelled(["job"])
         assert listener.is_cancelled(["job:0", "job:1"])
         assert not listener.is_cancelled(["other"])
@@ -116,11 +125,7 @@ def test_listener_forgets_oldest_ids(monkeypatch):
     context = zmq.Context()
     listener = CancelListener(context, endpoint)
     try:
-        for _ in range(500):
-            publisher.publish("probe")
-            if listener.is_cancelled(["probe"]):
-                break
-            time.sleep(0.01)
+        _deliver_cancel(publisher.publish, listener, "probe")
         for request_id in ("a", "b"):
             publisher.publish(request_id)
         for _ in range(500):
@@ -540,6 +545,52 @@ def test_delete_publishes_cancel(monkeypatch):
     assert published == ["job"]
 
 
+def test_delete_preserves_job_when_cancel_needs_retry(monkeypatch):
+    store = AsyncDictStore()
+    endpoint = _cancel_endpoint()
+    publisher = video_cancel.CancelPublisher(endpoint)
+    context = zmq.Context()
+    monkeypatch.setattr(video_api, "VIDEO_STORE", store)
+    monkeypatch.setattr(video_api, "publish_cancel", publisher.publish)
+
+    async def run_test():
+        await store.upsert("job", dict(_VIDEO_JOB))
+        with pytest.raises(HTTPException) as error:
+            await video_api.delete_video("job")
+        assert error.value.status_code == 503
+        assert error.value.headers == {"Retry-After": "1"}
+        assert (await store.get("job"))["status"] == "in_progress"
+        listener = CancelListener(context, endpoint)
+        _deliver_cancel(publisher.publish, listener, "ready")
+        assert (await video_api.delete_video("job")).status == "deleted"
+        assert await store.get("job") is None
+        for _ in range(500):
+            if listener.is_cancelled(["job"]):
+                break
+            await asyncio.sleep(0.01)
+        assert listener.is_cancelled(["job"])
+
+    try:
+        asyncio.run(run_test())
+    finally:
+        context.destroy(linger=0)
+        publisher.close()
+
+
+def test_delete_completed_job_needs_no_cancel_channel(monkeypatch):
+    store = AsyncDictStore()
+    publish = Mock(side_effect=video_cancel.CancelDeliveryError("unavailable"))
+    monkeypatch.setattr(video_api, "VIDEO_STORE", store)
+    monkeypatch.setattr(video_api, "publish_cancel", publish)
+
+    async def run_test():
+        await store.upsert("job", {**_VIDEO_JOB, "status": "completed"})
+        assert (await video_api.delete_video("job")).status == "deleted"
+
+    asyncio.run(run_test())
+    publish.assert_not_called()
+
+
 def test_delete_after_rpc_timeout_publishes_cancel(monkeypatch):
     """A timeout marks the job failed, but the GPU still runs it."""
     store = AsyncDictStore()
@@ -646,11 +697,7 @@ def test_cancel_publisher_start_and_stop(monkeypatch):
     context = zmq.Context()
     listener = CancelListener(context, endpoint)
     try:
-        for _ in range(500):
-            video_cancel.publish_cancel("job")
-            if listener.is_cancelled(["job"]):
-                break
-            time.sleep(0.01)
+        _deliver_cancel(video_cancel.publish_cancel, listener)
         assert listener.is_cancelled(["job"])
     finally:
         context.destroy(linger=0)
@@ -662,16 +709,104 @@ def test_cancel_publisher_start_and_stop(monkeypatch):
 
 def test_cancel_publisher_failures(monkeypatch):
     monkeypatch.setattr(video_cancel, "_publisher", None)
-    video_cancel.start_cancel_publisher("bogus://endpoint")
+    with pytest.raises(zmq.ZMQError):
+        video_cancel.start_cancel_publisher("bogus://endpoint")
     assert video_cancel._publisher is None
 
-    warning = Mock()
-    monkeypatch.setattr(video_cancel.logger, "warning", warning)
     publisher = video_cancel.CancelPublisher(_cancel_endpoint())
-    publisher._socket.close()
-    publisher.publish("job")
-    publisher.close()
-    warning.assert_called_once()
+    try:
+        with pytest.raises(video_cancel.CancelDeliveryError, match="connected"):
+            publisher.publish("job")
+        publisher._socket.close()
+        with pytest.raises(video_cancel.CancelDeliveryError):
+            publisher.publish("job")
+    finally:
+        publisher.close()
+
+
+def test_cancel_backpressure_does_not_drop_accepted_commands():
+    endpoint = _cancel_endpoint()
+    publisher = video_cancel.CancelPublisher(endpoint)
+    context = zmq.Context()
+    listener = CancelListener(context, endpoint)
+    try:
+        _deliver_cancel(publisher.publish, listener, "ready")
+        accepted = set()
+        rejected = set()
+        for index in range(3500):
+            request_id = f"job-{index}"
+            try:
+                publisher.publish(request_id)
+                accepted.add(request_id)
+            except video_cancel.CancelDeliveryError:
+                rejected.add(request_id)
+        assert rejected, "The burst must exercise backpressure"
+        for _ in range(500):
+            listener.is_cancelled([])
+            if accepted.issubset(listener._cancelled):
+                break
+            time.sleep(0.01)
+        assert accepted.issubset(listener._cancelled)
+        for request_id in rejected:
+            _deliver_cancel(publisher.publish, listener, request_id)
+        assert all(listener._is_cancelled(f"job-{i}") for i in range(3500))
+    finally:
+        context.destroy(linger=0)
+        publisher.close()
+
+
+def test_cancel_waits_for_all_replica_subscriptions():
+    endpoint = _cancel_endpoint()
+    publisher = video_cancel.CancelPublisher(endpoint, replicas=2)
+    context = zmq.Context()
+    first = CancelListener(context, endpoint)
+    try:
+        for _ in range(100):
+            with pytest.raises(video_cancel.CancelDeliveryError):
+                publisher.publish("job")
+            time.sleep(0.001)
+        second = CancelListener(context, endpoint)
+        _deliver_cancel(publisher.publish, second)
+        assert first.is_cancelled(["job"])
+        first._socket.close(linger=0)
+        for _ in range(500):
+            try:
+                publisher.publish("next")
+            except video_cancel.CancelDeliveryError:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("Disconnected replica was not detected")
+    finally:
+        context.destroy(linger=0)
+        publisher.close()
+
+
+def test_idle_scheduler_drains_cancellations(monkeypatch):
+    endpoint = _cancel_endpoint()
+    publisher = video_cancel.CancelPublisher(endpoint)
+    context = zmq.Context()
+    listener = CancelListener(context, endpoint)
+    monkeypatch.setattr(request_cancel, "_listener", listener)
+    scheduler = object.__new__(Scheduler)
+    scheduler.receiver = Mock()
+    scheduler.receiver.recv_multipart.side_effect = zmq.Again
+    scheduler._socket_lock = threading.Lock()
+    scheduler.server_args = SimpleNamespace(
+        comfyui_mode=False, sp_degree=1, enable_cfg_parallel=False, tp_size=1
+    )
+    try:
+        _deliver_cancel(publisher.publish, listener, "ready")
+        publisher.publish("idle")
+        for _ in range(500):
+            assert scheduler.recv_reqs() == []
+            if "idle" in listener._cancelled:
+                break
+            time.sleep(0.01)
+        assert "idle" in listener._cancelled
+    finally:
+        context.destroy(linger=0)
+        publisher.close()
 
 
 @pytest.mark.parametrize(
@@ -697,6 +832,93 @@ def test_merged_batch_is_cancellable_only_when_each_member_is(
     merged = scheduler._try_merge_generation_reqs(reqs)
 
     assert merged.cancellable is cancellable
+
+
+@pytest.mark.parametrize("cancelled", [(), ("b",), ("a", "b"), ("a", "b", "c")])
+def test_queued_cancel_is_filtered_before_dynamic_batch(cancel_state, cancelled):
+    scheduler = object.__new__(Scheduler)
+    scheduler._async_output_save = False
+    scheduler.server_args = SimpleNamespace(pipeline_config=WanT2V480PConfig())
+    scheduler._batching_max_size = 3
+    scheduler._batching_delay_s = 0
+    reqs = [_req(name) for name in ("a", "b", "c")]
+    for req in reqs:
+        req.report_progress = True
+    assert scheduler.server_args.pipeline_config.supports_dynamic_batching()
+    assert scheduler._can_dynamic_batch(reqs[0], reqs[1])
+    executed = []
+
+    def forward(batches):
+        raise_if_cancelled(batches)
+        ids = [rid for batch in batches for rid in batch.client_request_ids()]
+        executed.append(ids)
+        return OutputBatch(output=ids)
+
+    scheduler.worker = SimpleNamespace(
+        is_sleeping=lambda: False, execute_forward=forward
+    )
+    scheduler._split_batched_output = lambda output, batches: [
+        OutputBatch(output=[batch.request_id]) for batch in batches
+    ]
+    cancel_state(*cancelled)
+
+    outputs = scheduler._handle_generation(reqs)
+
+    live = [req.request_id for req in reqs if req.request_id not in cancelled]
+    assert executed == ([live] if live else [])
+    for req, output in zip(reqs, outputs, strict=True):
+        assert output.cancelled is (req.request_id in cancelled)
+        if not output.cancelled:
+            assert output.output == [req.request_id]
+
+
+def test_explicit_group_keeps_single_reply(cancel_state):
+    scheduler = object.__new__(Scheduler)
+    scheduler._async_output_save = False
+    scheduler.server_args = SimpleNamespace(pipeline_config=WanT2V480PConfig())
+    output = OutputBatch(output=["grouped output"])
+    forward = Mock(return_value=output)
+    scheduler.worker = SimpleNamespace(
+        is_sleeping=lambda: False, execute_forward=forward
+    )
+    reqs = [_req("cancelled"), _req("live"), _req("another")]
+    cancel_state("cancelled")
+
+    assert scheduler._handle_generation(reqs, allow_dynamic_batching=False) is output
+    forward.assert_called_once_with(reqs)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_filtered_batch_preserves_reply_mode(cancel_state, streaming):
+    scheduler = object.__new__(Scheduler)
+    scheduler._async_output_save = not streaming
+    scheduler._inflight_finalizes = []
+    scheduler._reap_finalizes = lambda: None
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            supports_sequential_multi_output_inference=lambda: streaming,
+        )
+    )
+    output = OutputBatch(output=["live"])
+    result = (
+        scheduler_module._SequentiallyReturnedOutputs(iter([output]))
+        if streaming
+        else scheduler_module._DeferredOutput(output, lambda: None)
+    )
+    scheduler.worker = SimpleNamespace(is_sleeping=lambda: False)
+    scheduler._iter_grouped_outputs_sequentially = lambda reqs: result.outputs
+    scheduler._execute_forward_with_deferred_save = lambda reqs: result
+    live = _req("live")
+    live.num_outputs_per_prompt = 2 if streaming else 1
+    cancel_state("cancelled")
+
+    outputs = scheduler._handle_generation([_req("cancelled"), live])
+
+    if streaming:
+        assert isinstance(outputs, scheduler_module._SequentiallyReturnedOutputs)
+        outputs = list(outputs.outputs)
+    assert outputs[0].cancelled
+    assert outputs[1] is (output if streaming else result)
 
 
 @pytest.mark.parametrize("native_grouped", [False, True])
@@ -731,9 +953,9 @@ def test_cancelled_batch_returns_cancelled_outputs(monkeypatch, native_grouped):
 
 
 def test_lifespan_starts_and_stops_the_cancel_publisher(monkeypatch):
-    started = []
+    started = Mock()
     stopped = Mock()
-    monkeypatch.setattr(http_server, "start_cancel_publisher", started.append)
+    monkeypatch.setattr(http_server, "start_cancel_publisher", started)
     monkeypatch.setattr(http_server, "stop_cancel_publisher", stopped)
     with zmq.Context() as context, context.socket(zmq.REP) as probe:
         broker_port = probe.bind_to_random_port("tcp://127.0.0.1")
@@ -743,6 +965,7 @@ def test_lifespan_starts_and_stops_the_cancel_publisher(monkeypatch):
         warmup_mode="off",
         progress_endpoint=None,
         cancel_endpoint="ipc:///tmp/sglang-cancel-lifespan",
+        dp_size=2,
         broker_port=broker_port,
         prompt_enhancer_config=None,
         log_requests=False,
@@ -760,7 +983,7 @@ def test_lifespan_starts_and_stops_the_cancel_publisher(monkeypatch):
         monkeypatch.setattr(http_server, "async_scheduler_client", client)
         app = http_server.create_app(args)
         async with http_server.lifespan(app):
-            assert started == ["ipc:///tmp/sglang-cancel-lifespan"]
+            started.assert_called_once_with("ipc:///tmp/sglang-cancel-lifespan", 2)
             stopped.assert_not_called()
         stopped.assert_called_once()
 

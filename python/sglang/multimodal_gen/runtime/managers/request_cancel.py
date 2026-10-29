@@ -88,6 +88,12 @@ _enabled = False
 _listener: CancelListener | None = None
 
 
+def poll_cancellations() -> None:
+    """Drain idle drivers too, so they do not backpressure other replicas."""
+    if _listener is not None:
+        _listener._receive()
+
+
 def init_request_cancel(endpoint: str, context: zmq.Context | None) -> None:
     """Enable the checks on this rank; a replica driver also gives its context."""
     global _enabled, _listener
