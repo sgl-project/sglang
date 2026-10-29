@@ -18,7 +18,7 @@ impl CoreHandle {
     /// signal rather than this probe's own result, matching Python's
     /// `last_receive_tstamp` behavior on a busy server.
     pub(crate) async fn probe_health(&self, timeout: Duration) -> Result<HealthStatus, CoreError> {
-        if !self.is_ready() {
+        if !self.is_serving() {
             return Ok(HealthStatus::NotReady);
         }
 

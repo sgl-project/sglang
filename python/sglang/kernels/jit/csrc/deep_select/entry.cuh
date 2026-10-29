@@ -204,7 +204,7 @@ auto make_plan(
  *         leaves it defaulted; one kernel is then instantiated and the SM-count
  *         query drops out.
  */
-template <typename ConfigWave1, typename ConfigWaves = ConfigWave1>
+template <typename ConfigWave1, typename ConfigWaves = ConfigWave1, typename ConfigMoreCtas = ConfigWaves>
 struct TopkNormal {
   static_assert(ConfigWave1::cluster_size == 1 && ConfigWaves::cluster_size == 1);
   static_assert(std::is_same_v<typename ConfigWave1::ValueT, typename ConfigWaves::ValueT>);
@@ -250,6 +250,16 @@ struct TopkNormal {
       const auto num_sm = host::runtime::get_sm_count(plan.device.device_id);
       if (plan.args.batch_size <= num_sm) {
         details::run_normal<ConfigWave1>(plan.args);
+      } else if constexpr (ConfigMoreCtas::target_occupancy > ConfigWaves::target_occupancy) {
+        // Residency costs per-CTA throughput always and saves a round only sometimes.
+        const auto rounds = [&](uint32_t occupancy) {
+          return host::div_ceil(uint64_t{plan.args.batch_size}, uint64_t{num_sm} * occupancy);
+        };
+        if (rounds(ConfigMoreCtas::target_occupancy) < rounds(ConfigWaves::target_occupancy)) {
+          details::run_normal<ConfigMoreCtas>(plan.args);
+        } else {
+          details::run_normal<ConfigWaves>(plan.args);
+        }
       } else {
         details::run_normal<ConfigWaves>(plan.args);
       }
