@@ -66,6 +66,9 @@ DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:
+    # Not a hardware gap: the kernel needs tcgen05 UMMA and TMEM, absent on SM12x, but
+    # DeepGEMM's sm120 port (deepseek-ai/DeepGEMM#324, nv_dev) has it on block-scaled
+    # mma.sync. No published sgl-deep-gemm build does, so SM12x keeps dense blocks.
     if not DEEPGEMM_BLACKWELL:
         return False
     import deep_gemm
