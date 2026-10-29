@@ -9,7 +9,7 @@ Offline quantization loads pre-quantized model weights directly during inference
 such as GPTQ and AWQ, which collect and pre-compute various statistics from the original weights using the calibration dataset.
 
 Online quantization dynamically computes scaling parameters—such as the maximum/minimum values of model weights—during runtime.
-Like NVIDIA FP8 training's [delayed scaling](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html#Mixed-precision-training-with-FP8) mechanism, online quantization calculates the appropriate scaling factors
+Like NVIDIA FP8 training's [delayed scaling](https://docs.nvidia.com/deeplearning/transformer-engine/examples/fp8_primer.html#Mixed-precision-training-with-FP8) mechanism, online quantization calculates the appropriate scaling factors
 on-the-fly to convert high-precision weights into a lower-precision format.
 
 **Note: For better performance, usability and convenience, offline quantization is recommended over online quantization.**
