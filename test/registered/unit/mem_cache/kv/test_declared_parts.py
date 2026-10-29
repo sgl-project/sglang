@@ -324,6 +324,102 @@ class TestDeclaredParts(CustomTestCase):
                 regions.update(zip(pointers, lengths))
             self.assertEqual(regions, {(arena.raw.data_ptr(), prefix)})
 
+    def test_reserved_request_backing_is_not_allocatable_capacity(self):
+        """Capped concurrency must satisfy idle accounting even with larger backing."""
+        from sglang.srt.mem_cache.kv.requests import RequestTable
+
+        for prealloc in (0, 2):
+            table = RequestTable(
+                size=3,
+                pre_alloc_size=prealloc,
+                reserved_rows=12,
+                max_context_len=64,
+                state_sub_pool=None,
+                tracking=None,
+                device="cpu",
+                enable_memory_saver=False,
+            )
+            pointer = table.req_to_token.data_ptr()
+            for _ in range(2):
+                self.assertEqual(table.available_size(), 3 + prealloc)
+                rows = table.alloc_rows(3 + prealloc)
+                self.assertEqual(set(rows), set(range(1, 4 + prealloc)))
+                self.assertIsNone(table.alloc_rows(1))
+                table.free_rows(rows)
+                table.clear()
+            self.assertEqual(table.req_to_token.shape[0], 12)
+            self.assertEqual(table.req_to_token.data_ptr(), pointer)
+
+    def test_initial_scratch_and_concurrency_fit_together(self):
+        """An oversized initial request estimate must not reject a feasible pool."""
+        setup_allocator_context()
+        dense = MHAGeometry(
+            head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16
+        )
+        state = StateGeometry(
+            conv_state_shapes=((1,),),
+            conv_dtype=torch.float32,
+            temporal_state_shape=(1024, 1024),
+            temporal_dtype=torch.float32,
+            scratch_parts=(
+                TensorPartDecl(
+                    name="intermediate", shape=(4 * 1024 * 1024,), dtype=torch.float32
+                ),
+            ),
+        )
+        plan = plan_kv_storage(
+            kv_layer_decls(
+                full_layer_ids=(0,),
+                full_geometry=dense,
+                state_layer_ids=(1,),
+                state_geometry=state,
+            ),
+            page_size=4,
+        )
+        inp = KVSizingInputs(
+            budget_bytes=512 * 1024 * 1024,
+            context_len=1024,
+            max_running_requests=48,
+            state_share=0.1,
+            alignment=4096,
+        )
+        sized = size_plan(plan, inp)
+        smaller_estimate = size_plan(
+            plan, msgspec.structs.replace(inp, max_running_requests=8)
+        )
+        self.assertEqual(sized, smaller_estimate)
+        self.assertGreaterEqual(sized.max_running_requests, 1)
+        self.assertLess(sized.max_running_requests, 8)
+        self.assertEqual(sized.scratch_rows, sized.max_running_requests + 1)
+        self.assertEqual(sized.request_rows, sized.scratch_rows)
+        self.assertLessEqual(sized.fixed_bytes + sized.total_bytes, inp.budget_bytes)
+        frozen = size_plan(
+            plan,
+            msgspec.structs.replace(inp, budget_bytes=400 * 1024 * 1024),
+            frozen=sized,
+        )
+        self.assertEqual(frozen.fixed, sized.fixed)
+        self.assertEqual(frozen.scratch_rows, sized.scratch_rows)
+        self.assertLessEqual(frozen.max_running_requests, sized.max_running_requests)
+        from sglang.srt.mem_cache.kv.state_policy import StateSlotStrategy
+
+        strategy = StateSlotStrategy(radix_cache=False, extra_buffer=True)
+        uncached = size_plan(
+            plan,
+            msgspec.structs.replace(
+                inp,
+                radix_cache=False,
+                state_strategy=strategy,
+            ),
+        )
+        self.assertGreater(uncached.max_running_requests, 0)
+        self.assertGreaterEqual(
+            uncached.units("mamba"),
+            uncached.max_running_requests * strategy.slots_per_request(),
+        )
+        with self.assertRaises(RuntimeError):
+            size_plan(plan, msgspec.structs.replace(inp, budget_bytes=16 * 1024 * 1024))
+
     def test_each_request_part_resets_only_on_fresh_acquisition(self):
         declarations = tuple(
             RequestPartDecl(part=p)
@@ -914,6 +1010,65 @@ class TestDeclaredParts(CustomTestCase):
                 tensor.stride(0) * tensor.itemsize,
                 plan.sub_pool("mamba").spec.entry_bytes(),
             )
+
+    def test_frozen_sizing_reduces_auto_state_demand_with_concurrency(self):
+        for gamma in (None, 3):
+            with self.subTest(scratch=gamma):
+                _, plan, _ = _build(state=True, ple=True, gamma=gamma)
+                inp = KVSizingInputs(
+                    budget_bytes=1 << 20,
+                    context_len=16,
+                    max_running_requests=10,
+                    radix_cache=False,
+                    alignment=1,
+                )
+                captured = size_plan(plan, inp)
+                self.assertEqual(captured.max_running_requests, 10)
+                state_bytes = plan.sub_pool("mamba").spec.entry_bytes()
+                budget = (
+                    captured.fixed_bytes
+                    + plan.sink_bytes()
+                    + 5 * state_bytes
+                    + 16 * plan.owner().spec.entry_bytes()
+                )
+                smaller = msgspec.structs.replace(inp, budget_bytes=budget)
+                sized = size_plan(plan, smaller, frozen=captured)
+                self.assertEqual(sized.max_running_requests, 5)
+                self.assertEqual(sized.units("mamba"), 5)
+                self.assertGreaterEqual(
+                    sized.full_tokens, 2 * sized.max_running_requests
+                )
+                self.assertEqual(sized.fixed, captured.fixed)
+                self.assertEqual(sized.request_rows, captured.request_rows)
+                self.assertEqual(sized.scratch_rows, captured.scratch_rows)
+                self.assertLessEqual(sized.fixed_bytes + sized.total_bytes, budget)
+                # An explicit state capacity remains a constraint, even if fewer
+                # requests would fit after reducing an automatic capacity.
+                with self.assertRaises(RuntimeError):
+                    size_plan(
+                        plan,
+                        msgspec.structs.replace(smaller, state_slots=10),
+                        frozen=captured,
+                    )
+                with self.assertRaises(RuntimeError):
+                    size_plan(
+                        plan,
+                        msgspec.structs.replace(
+                            smaller,
+                            budget_bytes=captured.fixed_bytes + plan.sink_bytes(),
+                        ),
+                        frozen=captured,
+                    )
+                larger = size_plan(
+                    plan,
+                    msgspec.structs.replace(inp, budget_bytes=2 << 20),
+                    frozen=captured,
+                )
+                self.assertEqual(larger.fixed, captured.fixed)
+                self.assertEqual(
+                    larger.max_running_requests, captured.max_running_requests
+                )
+                self.assertLessEqual(larger.full_tokens, captured.full_tokens)
 
     def test_runtime_budget_adapter_returns_the_declared_plan_sizes(self):
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
