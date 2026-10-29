@@ -87,6 +87,10 @@ _enabled = False
 _listener: CancelListener | None = None
 
 
+def is_request_cancel_enabled() -> bool:
+    return _enabled
+
+
 def poll_cancellations() -> None:
     """Drain idle drivers too, so they do not backpressure other replicas."""
     if _listener is not None:
