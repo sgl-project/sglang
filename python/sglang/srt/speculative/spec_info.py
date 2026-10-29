@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
-    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
 class SpeculativeAlgorithm(Enum):
@@ -300,6 +299,14 @@ class SpeculativeAlgorithm(Enum):
             return num_draft_tokens - 1
         return num_draft_tokens
 
+    def get_platform_worker_cls(self) -> Optional[type]:
+        """Out-of-tree platform's replacement worker, or None for the built-in one."""
+        from sglang.srt.platforms import current_platform
+
+        if not current_platform.is_out_of_tree():
+            return None
+        return current_platform.get_speculative_worker_cls(algorithm=self.name)
+
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
@@ -308,6 +315,10 @@ class SpeculativeAlgorithm(Enum):
         assert not self.is_none(), (
             "Cannot create worker for NONE speculative algorithm."
         )
+
+        platform_worker_cls = self.get_platform_worker_cls()
+        if platform_worker_cls is not None:
+            return platform_worker_cls
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -387,14 +398,6 @@ class SpecInput(ABC):
     # Algorithm-specific dataclass subclasses can override this per input.
     cuda_graph_compatible: bool = True
 
-    # Per-request verify lengths for the ragged-verify graphs (see
-    # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with
-    # supports_ragged_verify() override it per step. Must stay a class-level
-    # default, not an __init__ assignment: dataclass subclasses declare it as
-    # a field and run __post_init__ -> super().__init__ *after* field
-    # assignment, so an init-time default would clobber the passed layout.
-    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
-
     # Uniform per-request token width of this forward (and its logits-row
     # counterpart). Doubles as the DP-attention global_num_tokens multiplier
     # (ragged forwards carry 1 there). -1 = not set by this flow.
@@ -405,9 +408,9 @@ class SpecInput(ABC):
     # assigning None there would overwrite the constructor's custom_mask.
     custom_mask: Optional[torch.Tensor] = None
 
-    # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
-    # ragged_verify_layout) so scheduler/relay/attention code reads them
-    # uniformly on any SpecInput; only the EAGLE-family inputs override them.
+    # DSA MTP IndexShare seed relay: readable on any SpecInput; only the
+    # EAGLE-family inputs override them. Class-level defaults, same rationale
+    # as custom_mask.
     dsa_topk_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None

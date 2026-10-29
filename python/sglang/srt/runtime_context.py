@@ -571,6 +571,7 @@ class MoeFlags(_FlagGroupBase):
     mscclpp_mode: Any = None
     mscclpp_ep_layout: Any = None
     deepep_config: str | None = None
+    moe_ascend_ops_config: Any = None
     tbo_enabled: bool | None = None
     sbo_enabled: bool | None = None
     tbo_token_distribution_threshold: float | None = None
@@ -599,6 +600,9 @@ class DpFlags(_FlagGroupBase):
     # gather/scatter helpers, whose captured geometry needs one shared bucket.
     capturing_prefill_graph: bool = False
     prefill_graph_has_dp_gather: bool = False
+    # Set during prefill-graph capture by breaks that capture graphs of their own
+    # behind TP-group barriers; every DP rank must then take the same path.
+    prefill_graph_has_rank_barrier: bool = False
     # This process's slot in the target's DP sync while a draft scope narrows
     # attention; dp_gather_width() also reads it as the in-scope marker.
     scoped_gather_slot: Optional[int] = None

@@ -1,5 +1,6 @@
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
+    AscendOpsConfig,
     DeepEPMode,
     MoeA2ABackend,
     MoeRunnerBackend,
@@ -10,6 +11,7 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_config,
     get_deepep_mode,
     get_moe_a2a_backend,
+    get_moe_ascend_ops_config,
     get_moe_runner_backend,
     get_mscclpp_ep_layout,
     get_mscclpp_format_name,
@@ -31,6 +33,7 @@ from sglang.srt.layers.moe.utils import (
 
 __all__ = [
     "DeepEPMode",
+    "AscendOpsConfig",
     "MoeA2ABackend",
     "MoeRunner",
     "MoeRunnerConfig",
@@ -59,4 +62,5 @@ __all__ = [
     "is_tbo_enabled",
     "get_tbo_token_distribution_threshold",
     "get_deepep_config",
+    "get_moe_ascend_ops_config",
 ]
