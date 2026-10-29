@@ -194,14 +194,14 @@ def _bs1_floor_terms(plan, context_len, floor_window, strategy):
     return tuple(terms)
 
 
-def _state_targets(plan, inp, chain, running, states, frozen):
+def _state_targets(plan, inp, chain, running, states, frozen, strategy):
     units = {}
     state_budget = int(chain * inp.state_share)
     for sub_pool in states:
         count = inp.state_slots
         if count is None:
             count = (
-                running
+                running * strategy.slots_per_request()
                 if not inp.radix_cache
                 else state_budget // sub_pool.spec.entry_bytes()
             )
@@ -249,6 +249,22 @@ def _token_targets(plan, inp, chain, running, states, windows, units, frozen):
     return full, window
 
 
+def _initial_targets(
+    plan, inp, budget, running, strategy, states, windows, explicit_chain
+):
+    fixed = _fixed_terms(plan, inp, running, strategy)
+    chain = (
+        _chain_budget(plan, budget, fixed, inp.alignment)
+        if explicit_chain is None
+        else explicit_chain
+    )
+    units = _state_targets(plan, inp, chain, running, states, None, strategy)
+    full, window = _token_targets(
+        plan, inp, chain, running, states, windows, units, None
+    )
+    return chain, fixed, units, full, window
+
+
 def size_plan(
     plan: KVStoragePlan, inp: KVSizingInputs, *, frozen: Optional[SizedKVStorage] = None
 ) -> SizedKVStorage:
@@ -265,16 +281,52 @@ def size_plan(
     states = [s for s in plan.sub_pools if isinstance(s.lifetime, StateLifetime)]
     windows = [s for s in plan.sub_pools if isinstance(s.lifetime, WindowLifetime)]
     budget = inp.budget_bytes
+    explicit_chain = None
     if budget is None:
         if inp.full_tokens is None:
             raise ValueError("sizing needs the total byte budget")
         chain = inp.full_tokens * plan.owner().spec.entry_bytes() + plan.sink_bytes()
         chain += sum((inp.window_tokens or 0) * s.spec.entry_bytes() for s in windows)
         chain += sum((inp.state_slots or 0) * s.spec.entry_bytes() for s in states)
+        explicit_chain = chain // inp.alignment * inp.alignment
         budget = chain + sum(t.bytes for t in (*fixed, *_derived_terms(plan, chain)))
+    terms = (
+        ()
+        if inp.context_len is None
+        else _bs1_floor_terms(plan, inp.context_len, inp.floor_window, strategy)
+    )
     if frozen is None:
-        chain = _chain_budget(plan, budget, fixed, inp.alignment)
+        # Fixed request and scratch rows compete with the chain. Solve their
+        # initial extent together, before exposing any addresses to capture.
+        low, high = 0, running
+        floor = sum(cost for _, cost in terms)
+        while low < high:
+            candidate = (low + high + 1) // 2
+            chain, fixed, units, full, window = _initial_targets(
+                plan, inp, budget, candidate, strategy, states, windows, explicit_chain
+            )
+            capacity = min(
+                [full // 2]
+                + [units[s.name] // strategy.slots_per_request() for s in states]
+            )
+            if candidate <= capacity and chain >= floor:
+                low = candidate
+            else:
+                high = candidate - 1
+        running = low
+        chain, fixed, units, full, window = _initial_targets(
+            plan,
+            inp,
+            budget,
+            max(1, running),
+            strategy,
+            states,
+            windows,
+            explicit_chain,
+        )
         fixed += _derived_terms(plan, chain)
+        if explicit_chain is not None:
+            budget = chain + sum(t.bytes for t in fixed)
         scratch_rows, request_rows = running + 1, running + inp.pre_alloc_rows + 1
     else:
         fixed = frozen.fixed
@@ -284,20 +336,15 @@ def size_plan(
         )
         scratch_rows, request_rows = frozen.scratch_rows, frozen.request_rows
         running = min(running, frozen.max_running_requests)
-    units = _state_targets(plan, inp, chain, running, states, frozen)
-    full, window = _token_targets(
-        plan, inp, chain, running, states, windows, units, frozen
-    )
-    running = min(
-        running,
-        full // 2,
-        *(units[s.name] // strategy.slots_per_request() for s in states),
-    )
-    terms = (
-        ()
-        if inp.context_len is None
-        else _bs1_floor_terms(plan, inp.context_len, inp.floor_window, strategy)
-    )
+        units = _state_targets(plan, inp, chain, running, states, frozen, strategy)
+        full, window = _token_targets(
+            plan, inp, chain, running, states, windows, units, frozen
+        )
+        running = min(
+            running,
+            full // 2,
+            *(units[s.name] // strategy.slots_per_request() for s in states),
+        )
     check_bs1_floor(total_bytes=chain, floor_terms=terms, where="size_plan")
     if full <= 0 or running <= 0:
         raise RuntimeError("the declared storage budget cannot serve one request")

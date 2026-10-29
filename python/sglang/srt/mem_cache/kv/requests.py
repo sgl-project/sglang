@@ -78,7 +78,7 @@ class RequestTable:
             self.req_to_token = torch.zeros(
                 (self._num_rows, max_context_len), dtype=torch.int32, device=device
             )
-        self.free_slots = list(range(1, self._num_rows))
+        self.free_slots = list(range(1, self.size + self.pre_alloc_size + 1))
         # Bumped on every hand-out: a reader detects a reused row by comparing
         # the generation it stored.
         self.req_generation = torch.zeros(self._num_rows, dtype=torch.int64)
@@ -152,7 +152,7 @@ class RequestTable:
 
     def clear(self) -> None:
         logger.info("Reset the request table")
-        self.free_slots = list(range(1, self._num_rows))
+        self.free_slots = list(range(1, self.size + self.pre_alloc_size + 1))
         # The generation stays monotonic across a reset.
         if self.holds_state_slots:
             self.req_index_to_mamba_index_mapping.zero_()

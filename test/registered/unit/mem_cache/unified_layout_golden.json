@@ -1,5 +1,5 @@
 {
- "source": "test/manual/mem_cache/gen_unified_layout_golden.py at d130897266 with consistent state-slot sizing",
+ "source": "test/manual/mem_cache/gen_unified_layout_golden.py with joint initial request and scratch sizing",
  "layouts": {
   "swa_p1": {
    "chain": [["swa", "up"], ["full", "down"]],
@@ -814,9 +814,9 @@
   },
   "mamba_p16_bytes": {
    "chain": [["mamba", "up"], ["full", "down"]],
-   "total_bytes": 1043416,
+   "total_bytes": 1045480,
    "reserved_floor": 1024,
-   "active_allocation_bytes": 1043416,
+   "active_allocation_bytes": 1045480,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
@@ -824,12 +824,12 @@
      "entry_bytes": 352,
      "host_entry_bytes": 352,
      "draft_offset": null,
-     "max_slots": 2964,
+     "max_slots": 2970,
      "min_slot_index": 3,
      "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
      "views": {
-      "conv": [[0, [2, 2964, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 2964, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 2970, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
+      "temporal": [96, [2, 2970, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
      }
     },
     "full": {
@@ -838,28 +838,28 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 16303,
+     "max_slots": 16335,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [16288, 1, 8], [32, 8, 1], "torch.float16"], [32, [16288, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [16288, 1, 8], [32, 8, 1], "torch.float16"], [48, [16288, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [16320, 1, 8], [32, 8, 1], "torch.float16"], [32, [16320, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [16320, 1, 8], [32, 8, 1], "torch.float16"], [48, [16320, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "mamba": ["up", 2964, 3, 2964, 352],
-    "full": ["down", 1018, 1, 1018, 1024]
+    "mamba": ["up", 2970, 3, 2970, 352],
+    "full": ["down", 1020, 1, 1020, 1024]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 1043416, 1024]],
+     "buf_infos": [[0, 1045480, 1024]],
      "host_capacity": [64, 4096],
-     "page_envelope": [1018, 1024]
+     "page_envelope": [1020, 1024]
     },
     "mamba": {
-     "buf_infos": [[0, 1043416, 352]],
-     "host_capacity": [2963, 1042976]
+     "buf_infos": [[0, 1045480, 352]],
+     "host_capacity": [2969, 1045088]
     }
    },
    "layer_maps": {
@@ -867,10 +867,10 @@
     "state": [[2, 0], [3, 1]]
    },
    "capacity": {
-    "available": 16256,
-    "size_full": 16302,
-    "draft_virtual_id_space": 16302,
-    "state_slots": 2963
+    "available": 16288,
+    "size_full": 16334,
+    "draft_virtual_id_space": 16334,
+    "state_slots": 2969
    }
   },
   "mamba_p16_slice_axis": {
@@ -1920,18 +1920,18 @@
  "bs1_floors": {
   "swa_p16": {
    "terms": [["swa_window_kv", 3072], ["sink", 1024]],
-   "budget_at_floor": 9236,
-   "minimum_usable_budget": 9236
+   "budget_at_floor": 6152,
+   "minimum_usable_budget": 6152
   },
   "mamba_p16": {
    "terms": [["mamba_bs1_state_slots", 1056], ["sink", 1024]],
-   "budget_at_floor": 7240,
-   "minimum_usable_budget": 8264
+   "budget_at_floor": 4144,
+   "minimum_usable_budget": 5168
   },
   "tri_p16": {
    "terms": [["mamba_bs1_state_slots", 1056], ["swa_window_kv", 3072], ["sink", 1024]],
-   "budget_at_floor": 10312,
-   "minimum_usable_budget": 11048
+   "budget_at_floor": 7216,
+   "minimum_usable_budget": 7952
   }
  }
 }
