@@ -73,6 +73,7 @@ if _is_cuda:
     from sglang.kernels.ops.activation.activation import (
         silu_and_mul as _jit_silu_and_mul,
     )
+    from sglang.kernels.ops.activation.xielu import xielu
 
     # The jit act-and-mul kernel requires the per-rank hidden size to be a
     # multiple of the vector width (kMaxVecBytes/dtype: 32B on SM100+, else 16B --
@@ -312,10 +313,14 @@ class QuickGELU(BaseFusedOp):
 
 
 class XIELU(BaseFusedOp):
-    """
-    Applies the xIELU activation function introduced in https://arxiv.org/abs/2411.13010
-    If the user has installed the nickjbrowning/XIELU, we import xIELU CUDA
-    Otherwise, we emit a single warning and use xIELU Python
+    """xIELU activation (https://arxiv.org/abs/2411.13010), used by Apertus.
+
+    ``alpha_p`` and ``alpha_n`` are stored in the checkpoint's pre-softplus
+    form. The effective coefficients ``softplus(alpha_p)`` and
+    ``beta + softplus(alpha_n)`` are constant at inference time, so
+    :meth:`update_coefficients` derives them once in fp32 after the weights are
+    loaded, and the CUDA kernel takes them as plain floats. Both paths evaluate
+    the expression in fp32 and round once to the input dtype.
     """
 
     def __init__(
@@ -325,7 +330,6 @@ class XIELU(BaseFusedOp):
         beta: float = 0.5,
         eps: float = -1e-6,
         dtype: torch.dtype = torch.bfloat16,
-        with_vector_loads: bool = False,
     ):
         super().__init__()
         self.alpha_p = nn.Parameter(
@@ -340,82 +344,37 @@ class XIELU(BaseFusedOp):
         )
         self.register_buffer("beta", torch.tensor(beta, dtype=dtype))
         self.register_buffer("eps", torch.tensor(eps, dtype=dtype))
-        self.with_vector_loads = with_vector_loads
-        # Temporary until xIELU CUDA fully implemented
-        self._beta_scalar = torch.tensor(beta, dtype=dtype, device="cpu").item()
-        self._eps_scalar = torch.tensor(eps, dtype=dtype, device="cpu").item()
+        self.update_coefficients()
 
-        self._xielu_cuda_obj = None
-        try:
-            import xielu.ops  # noqa: F401
-
-            self._xielu_cuda_obj = torch.classes.xielu.XIELU()
-            msg = "Using experimental xIELU CUDA."
-            try:
-                from torch._dynamo import allow_in_graph
-
-                self._xielu_cuda_fn = allow_in_graph(self._xielu_cuda)
-                msg += " Enabled torch._dynamo for xIELU CUDA."
-            except Exception as err:
-                msg += (
-                    f" Could not enable torch._dynamo for xIELU ({err}) - "
-                    "this may result in slower performance."
-                )
-                self._xielu_cuda_fn = self._xielu_cuda
-            logger.warning_once(msg)
-        except Exception:
-            pass
-
-    def _xielu_python(self, x: torch.Tensor) -> torch.Tensor:
-        alpha_p = nn.functional.softplus(self.alpha_p)
-        alpha_n = self.beta + nn.functional.softplus(self.alpha_n)
-        return torch.where(
-            x > 0,
-            alpha_p * x * x + self.beta * x,
-            (torch.expm1(torch.min(x, self.eps)) - x) * alpha_n + self.beta * x,
-        )
+    def update_coefficients(self) -> None:
+        """Derive the effective coefficients; call after loading weights."""
+        beta = self.beta.float()
+        self._alpha_p = F.softplus(self.alpha_p.float()).item()
+        self._alpha_n = (beta + F.softplus(self.alpha_n.float())).item()
+        self._beta = beta.item()
+        self._eps = self.eps.float().item()
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        return self._xielu_python(x)
-
-    def _xielu_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        """Firewall function to prevent torch.compile from seeing .item()"""
-        assert self._xielu_cuda_obj is not None, "XIELU CUDA object must not be None"
-        original_shape = x.shape
-        # CUDA kernel expects 3D tensors, reshape if needed
-        while x.dim() < 3:
-            x = x.unsqueeze(0)
-        if x.dim() > 3:
-            x = x.view(-1, 1, x.size(-1))
-        if original_shape != x.shape:
-            logger.warning_once(
-                "Warning: xIELU input tensor expects 3 dimensions"
-                " but got (shape: %s). Reshaping to (shape: %s).\n"
-                "Note: For SGLang this may be expected if sending"
-                "[B*S,D] instead of [B,S,D].",
-                original_shape,
-                x.shape,
-            )
-        result = self._xielu_cuda_obj.forward(
-            x,
-            self.alpha_p,
-            self.alpha_n,
-            # Temporary until xIELU CUDA fully implemented -> self.{beta,eps}.item()
-            self._beta_scalar,
-            self._eps_scalar,
-            self.with_vector_loads,
+        beta = self.beta.float()
+        alpha_p = F.softplus(self.alpha_p.float())
+        alpha_n = beta + F.softplus(self.alpha_n.float())
+        xf = x.float()
+        out = torch.where(
+            xf > 0,
+            alpha_p * xf * xf + beta * xf,
+            (torch.expm1(torch.clamp_max(xf, self.eps.float())) - xf) * alpha_n
+            + beta * xf,
         )
-        return result.view(original_shape)
+        return out.to(x.dtype)
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if self._xielu_cuda_obj is not None and input.is_cuda:
-            if not torch._dynamo.is_compiling():
-                return self._xielu_cuda_fn(input)
-            else:
-                logger.warning_once(
-                    "torch._dynamo is compiling, using Python version of xIELU."
-                )
-        return self._xielu_python(input)
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_contiguous():
+            return self.forward_native(x)
+        return xielu(x, self._alpha_p, self._alpha_n, self._beta, self._eps)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # The JIT xielu kernel is CUDA-only and not imported on ROCm.
+        return self.forward_native(x)
 
 
 class ScaledActivation(nn.Module):

@@ -643,6 +643,13 @@ class ApertusForCausalLM(nn.Module):
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
 
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        for module in self.modules():
+            if isinstance(module, XIELU):
+                module.update_coefficients()
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
