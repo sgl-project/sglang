@@ -207,6 +207,7 @@ def build_load_config(
     draft_model_idx: int | None,
     weight_cache_mode: str,
     weight_cache_socket: str | None,
+    weight_cache_transport: str = "auto",
     load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
@@ -237,6 +238,7 @@ def build_load_config(
         draft_model_idx=draft_model_idx,
         weight_cache_mode=weight_cache_mode,
         weight_cache_socket=weight_cache_socket,
+        weight_cache_transport=weight_cache_transport,
         load_group=load_group,
     )
 

@@ -1325,6 +1325,7 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=get_model().weight_cache_mode,
             weight_cache_socket=get_model().weight_cache_socket,
+            weight_cache_transport=get_model().weight_cache_transport,
             load_group=self.load_group,
         )
 

@@ -89,3 +89,4 @@
 --weight-cache-mode
 --weight-cache-socket
 --weight-cache-timeout
+--weight-cache-transport
