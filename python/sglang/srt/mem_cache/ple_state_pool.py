@@ -18,6 +18,10 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 # owned by any model layer.
 PLE_NGRAM_STATE_LAYER_ID = (1 << 32) - 1
 
+# The parts a KV pool's layer router names these states by.
+SHORT_CONV_PART = "short_conv"
+NGRAM_PART = "ngram"
+
 
 class SlotIndexedState(Protocol):
     """Per-request state addressed by MambaPool slot index,
@@ -202,11 +206,20 @@ class NGramPool:
                 device=self.context.device, dtype=self.context.dtype
             )
 
-    def set_intermediate_context(self, context: torch.Tensor):
+    def set_intermediate_context(
+        self, context: torch.Tensor, indices: Optional[torch.Tensor] = None
+    ):
         if self.intermediate_context is not None and context.numel() > 0:
-            self.intermediate_context[: context.shape[0], : context.shape[1]].copy_(
-                context.to(device=self.context.device, dtype=self.context.dtype)
-            )
+            context = context.to(device=self.context.device, dtype=self.context.dtype)
+            if indices is None:
+                self.intermediate_context[: context.shape[0], : context.shape[1]].copy_(
+                    context
+                )
+            else:
+                self.intermediate_context[
+                    indices.to(device=self.context.device, dtype=torch.long),
+                    : context.shape[1],
+                ] = context
 
     def clear(self):
         if self.context is not None:

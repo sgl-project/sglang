@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
-    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
 class SpeculativeAlgorithm(Enum):
@@ -138,9 +137,10 @@ class SpeculativeAlgorithm(Enum):
     def supports_prefill_shared_read_done(self) -> bool:
         """Whether target EXTEND has no later speculative shared-buffer reader.
 
-        The backend must still declare a pre-replay read end. Other algorithms
-        must stage their draft's shared reads before publishing the target event.
+        The backend must still declare a pre-replay read end.
         """
+        # DSPARK's draft KV inject runs after the target prefill, but on write
+        # locations it computes before the target forward.
         return self.is_none() or self.is_dflash_family()
 
     def supports_mixed_chunk(self) -> bool:
@@ -299,6 +299,14 @@ class SpeculativeAlgorithm(Enum):
             return num_draft_tokens - 1
         return num_draft_tokens
 
+    def get_platform_worker_cls(self) -> Optional[type]:
+        """Out-of-tree platform's replacement worker, or None for the built-in one."""
+        from sglang.srt.platforms import current_platform
+
+        if not current_platform.is_out_of_tree():
+            return None
+        return current_platform.get_speculative_worker_cls(algorithm=self.name)
+
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
@@ -307,6 +315,10 @@ class SpeculativeAlgorithm(Enum):
         assert not self.is_none(), (
             "Cannot create worker for NONE speculative algorithm."
         )
+
+        platform_worker_cls = self.get_platform_worker_cls()
+        if platform_worker_cls is not None:
+            return platform_worker_cls
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -382,13 +394,9 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
-    # Per-request verify lengths for the ragged-verify graphs (see
-    # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with
-    # supports_ragged_verify() override it per step. Must stay a class-level
-    # default, not an __init__ assignment: dataclass subclasses declare it as
-    # a field and run __post_init__ -> super().__init__ *after* field
-    # assignment, so an init-time default would clobber the passed layout.
-    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+    # Whether this input carries all state required for CUDA graph replay.
+    # Algorithm-specific dataclass subclasses can override this per input.
+    cuda_graph_compatible: bool = True
 
     # Uniform per-request token width of this forward (and its logits-row
     # counterpart). Doubles as the DP-attention global_num_tokens multiplier
@@ -400,12 +408,17 @@ class SpecInput(ABC):
     # assigning None there would overwrite the constructor's custom_mask.
     custom_mask: Optional[torch.Tensor] = None
 
-    # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
-    # ragged_verify_layout) so scheduler/relay/attention code reads them
-    # uniformly on any SpecInput; only the EAGLE-family inputs override them.
+    # DSA MTP IndexShare seed relay: readable on any SpecInput; only the
+    # EAGLE-family inputs override them. Class-level defaults, same rationale
+    # as custom_mask.
     dsa_topk_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
+
+    # A multi-step draft's per-step sliding-window read rail; only the
+    # multi-step draft backend of a sliding-window KV pool builds it.
+    window_kv_indptr: Optional[torch.Tensor] = None
+    window_kv_indices: Optional[torch.Tensor] = None
 
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type

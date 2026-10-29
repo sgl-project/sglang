@@ -68,7 +68,6 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
             prefix=prefix,
             **extra_impl_args,
         )
-        self._reported_fallbacks: set[str] = set()
 
     # --- dispatch -------------------------------------------------------------
 
@@ -89,10 +88,7 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
         return None
 
     def _report_fallback(self, reason: str) -> None:
-        if reason in self._reported_fallbacks:
-            return
-        self._reported_fallbacks.add(reason)
-        logger.warning(
+        logger.warning_once(
             "fp8_fa_sm120 attention: %s; using cuDNN SDPA for these calls.", reason
         )
 

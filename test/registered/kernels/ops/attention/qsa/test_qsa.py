@@ -1,4 +1,5 @@
 import sys
+from itertools import accumulate
 from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
@@ -25,9 +26,11 @@ from sglang.srt.layers.attention.qsa.mqa import (
 )
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    pack_qsa_prefill_kv,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     sparse_gqa_fwd_interface_triton_ck,
+    sparse_gqa_paged_prefill_triton,
 )
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
@@ -35,6 +38,7 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.mem_cache_utils import routed
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -147,8 +151,8 @@ def test_qsa_trtllm_sparse_decode_arch_gate(
     flashinfer_decode = ModuleType("flashinfer.decode")
     flashinfer_decode.trtllm_batch_decode_with_kv_cache = trtllm_decode_func
 
-    monkeypatch.setattr("sglang.srt.utils.is_sm100_supported", lambda: sm100)
-    monkeypatch.setattr("sglang.srt.utils.is_sm120", lambda: sm120)
+    monkeypatch.setattr(qsa_backend_module, "is_sm100_supported", lambda: sm100)
+    monkeypatch.setattr(qsa_backend_module, "is_sm120", lambda: sm120)
     monkeypatch.setitem(sys.modules, flashinfer_decode.__name__, flashinfer_decode)
 
     try:
@@ -361,7 +365,7 @@ def test_qsa_glue_fetches_indexer_metadata_without_model_unwrap():
         get_indexer_metadata=lambda layer_id, forward_batch: f"meta-{layer_id}",
         token_to_kv_pool=None,
         req_to_token_pool=None,
-        kv_index_translator=None,
+        runner_ids=None,
         needs_cpu_seq_lens=True,
     )
     hybrid = HybridLinearAttnBackend(
@@ -413,7 +417,7 @@ def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
     )
     runner = SimpleNamespace(
         device="cpu",
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
         model_config=SimpleNamespace(
             context_len=64,
@@ -425,7 +429,7 @@ def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
     )
     full_out_cache_loc = loc_base + torch.arange(bs * steps, dtype=torch.int32)
     forward_batch = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         req_to_token_pool=runner.req_to_token_pool,
         batch_size=bs,
         req_pool_indices=torch.arange(bs, dtype=torch.int32),
@@ -538,6 +542,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
             decode_logical_positions=None,
             pending_ring_slots=None,
             get_token_to_batch_idx=lambda: mapping,
+            prefill_max_row_keys=lambda *_: None,
             get_prefill_mqa_inputs=lambda layer_id, logical_positions: (
                 torch.empty(0, 1, 128),
                 torch.zeros(15, dtype=torch.int32),
@@ -562,7 +567,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
                     rope_rows=rope.numel(),
                 )
             ),
-            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths: (
+            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths, **_: (
                 q.squeeze(1)
             ),
         )
@@ -599,14 +604,14 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
     monkeypatch.setattr(
         qsa_backend_module, "sparse_gqa_fwd_interface_triton", fake_sparse_gqa
     )
-    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend = QwenSparseAttnBackend()
 
     class Pool:
         def set_kv_buffer(self, layer, loc, k, v):
             pass
 
     pool = Pool()
-    backend.token_to_kv_pool = pool
+    backend.token_to_kv_pool = routed(pool)
     layer = SimpleNamespace(tp_q_head_num=1, head_dim=2, layer_id=0, scaling=1.0)
     topk = torch.zeros(15, 3, dtype=torch.int32, device="cuda")
 
@@ -616,7 +621,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
-            token_to_kv_pool=pool,
+            token_to_kv_pool=routed(pool),
             out_cache_loc=torch.arange(num_rows, dtype=torch.int32, device="cuda"),
             extend_seq_lens=torch.tensor([15], dtype=torch.int32, device="cuda"),
             extend_seq_lens_cpu=[15],
@@ -639,7 +644,7 @@ def _make_paged_extend_backend():
         sequence_lengths=torch.tensor([8], dtype=torch.int32),
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
     )
-    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend = QwenSparseAttnBackend()
     backend.forward_metadata = metadata
 
     class Pool:
@@ -654,7 +659,7 @@ def _make_paged_extend_backend():
 
     layer = SimpleNamespace(tp_q_head_num=1, head_dim=2, layer_id=0, scaling=1.0)
     pool = Pool()
-    backend.token_to_kv_pool = pool
+    backend.token_to_kv_pool = routed(pool)
     return backend, pool, layer
 
 
@@ -675,7 +680,7 @@ def test_qsa_paged_extend_trims_padding_rows_and_restores_output(monkeypatch):
         values = torch.arange(num_rows * 2, dtype=torch.float32).reshape(num_rows, 2)
         batch = SimpleNamespace(
             forward_mode=mode,
-            token_to_kv_pool=pool,
+            token_to_kv_pool=routed(pool),
             out_cache_loc=torch.arange(num_rows, dtype=torch.int32),
         )
         return backend.forward_extend(
@@ -698,7 +703,7 @@ def test_qsa_paged_extend_trims_padding_rows_and_restores_output(monkeypatch):
     short_q = torch.zeros(2, 2, dtype=torch.float32)
     batch = SimpleNamespace(
         forward_mode=ForwardMode.TARGET_VERIFY,
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         out_cache_loc=torch.arange(2, dtype=torch.int32),
     )
     try:
@@ -735,7 +740,7 @@ def _make_qsa_runner_and_pool(num_reqs=4):
     )
     runner = SimpleNamespace(
         device="cpu",
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
         model_config=SimpleNamespace(
             context_len=64,
@@ -748,7 +753,7 @@ def _make_qsa_runner_and_pool(num_reqs=4):
 def test_qsa_idle_metadata_builds_empty_rows():
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     idle_batch = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         req_to_token_pool=req_pool,
         req_pool_indices=torch.empty(0, dtype=torch.int32),
         seq_lens=torch.empty(0, dtype=torch.int32),
@@ -783,7 +788,7 @@ def test_qsa_decode_requires_one_query_row_per_request():
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     backend = QwenSparseAttnBackend(runner)
     forward_batch = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         req_to_token_pool=req_pool,
         req_pool_indices=torch.tensor([1, 3], dtype=torch.int32),
         seq_lens=torch.tensor([8, 16], dtype=torch.int32),
@@ -810,7 +815,7 @@ def test_qsa_extend_rope_matrix_uses_mrope_coordinates():
     flat = torch.arange(num_tokens, dtype=torch.int64)
     mrope = torch.stack([flat, flat + 100, flat + 200])
     forward_batch = SimpleNamespace(
-        token_to_kv_pool=pool,
+        token_to_kv_pool=routed(pool),
         req_to_token_pool=req_pool,
         req_pool_indices=torch.tensor([1], dtype=torch.int32),
         seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
@@ -835,7 +840,7 @@ def test_qsa_speculative_pseudo_extend_is_rejected():
     backend = QwenSparseAttnBackend(runner)
     for original_mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2):
         forward_batch = SimpleNamespace(
-            token_to_kv_pool=pool,
+            token_to_kv_pool=routed(pool),
             req_to_token_pool=req_pool,
             req_pool_indices=torch.tensor([1], dtype=torch.int32),
             seq_lens=torch.tensor([10], dtype=torch.int32),
@@ -975,11 +980,11 @@ class _DispatchIndexer:
         rows = hidden_states.shape[0]
         return torch.zeros(rows, 4, 128), torch.zeros(rows, 1, 128), False
 
-    def select_prefill_tokens(self, *args):
+    def select_prefill_tokens(self, *args, **kwargs):
         self.selected = "prefill"
         return torch.tensor([1])
 
-    def select_decode_tokens(self, *args):
+    def select_decode_tokens(self, *args, defer_expansion=False):
         self.selected = "decode"
         return torch.tensor([2])
 
@@ -1011,6 +1016,10 @@ class _DispatchMetadata:
         )
 
     @staticmethod
+    def prefill_max_row_keys(*_):
+        return None
+
+    @staticmethod
     def get_prefill_mqa_inputs(layer_id, positions):
         return (
             torch.zeros(1, 1, 128),
@@ -1038,6 +1047,98 @@ class _ForwardMode:
 
     def is_decode(self):
         return self.decode
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_qsa_prefill_mqa_inputs_gather_all_compressed_keys_at_once(dtype):
+    """One launch packs every request's complete compressed keys, byte-equal
+    to the per-request index_select it replaces, without a host sync when the
+    host lengths are known."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+    torch.manual_seed(11)
+    page, lengths = 64, [131, 3, 4096 + 7, 64, 257]
+    max_len = max(lengths)
+    pages_per_request = -(-max_len // page)
+    pages = torch.randperm(len(lengths) * pages_per_request * 2)[
+        : len(lengths) * pages_per_request
+    ].reshape(len(lengths), pages_per_request, 1)
+    # Page-aligned token slots, as the QSA allocator hands them out.
+    token_slot_table = (
+        (pages * page + torch.arange(page)).reshape(len(lengths), -1)[:, :max_len]
+    ).to(device="cuda", dtype=torch.int32)
+    capacity = int(token_slot_table.max()) // COMPRESS_RATIO + 1
+    compressed = torch.randn(capacity, 1, 128, device="cuda").to(dtype)
+    pool = SimpleNamespace(
+        get_qsa_compressed_k_buffer=lambda layer_id: compressed,
+        qsa_index_kv_heads=1,
+        qsa_index_head_dim=128,
+    )
+    rows = torch.repeat_interleave(torch.arange(len(lengths)), 2).to(torch.int32)
+    positions = torch.tensor(
+        [p for n in lengths for p in (n - 2, n - 1)], device="cuda"
+    )
+    metadata = QSAIndexerMetadata(
+        sequence_lengths=torch.tensor(lengths, dtype=torch.int32, device="cuda"),
+        token_to_batch_idx=rows.cuda(),
+        token_slot_table=token_slot_table,
+        out_cache_loc=torch.empty(0, dtype=torch.int32, device="cuda"),
+        token_to_kv_pool=routed(pool),
+        compress_ratio=COMPRESS_RATIO,
+        block_topk=BLOCK_TOPK,
+        prefill_sequence_lengths_cpu=tuple(lengths),
+    )
+    metadata.get_prefill_mqa_inputs(0, positions)  # compile outside the check
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        keys, starts, ends, _ = metadata.get_prefill_mqa_inputs(0, positions)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    expected = torch.cat(
+        [
+            compressed.index_select(
+                0,
+                token_slot_table[i, : (n // COMPRESS_RATIO) * COMPRESS_RATIO].long()[
+                    ::COMPRESS_RATIO
+                ]
+                // COMPRESS_RATIO,
+            )
+            for i, n in enumerate(lengths)
+        ]
+    )
+    assert keys.dtype == dtype
+    assert torch.equal(keys.view(torch.uint8), expected.view(torch.uint8))
+    blocks = [n // COMPRESS_RATIO for n in lengths]
+    cu = [0, *accumulate(blocks)]
+    assert starts.tolist() == [cu[i] for i in rows.tolist()]
+    assert ends.tolist() == [
+        cu[i] + min((p + 1) // COMPRESS_RATIO, blocks[i])
+        for i, p in zip(rows.tolist(), positions.tolist())
+    ]
+
+
+def test_qsa_extend_metadata_carries_host_sequence_lengths():
+    runner, pool, req_pool = _make_qsa_runner_and_pool()
+    backend = QwenSparseAttnBackend(runner)
+    forward_batch = SimpleNamespace(
+        token_to_kv_pool=routed(pool),
+        req_to_token_pool=req_pool,
+        req_pool_indices=torch.tensor([1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([8, 6], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([8, 6], dtype=torch.int32),
+        forward_mode=ForwardMode.EXTEND,
+        extend_seq_lens=torch.tensor([4, 6], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([4, 0], dtype=torch.int32),
+        positions=torch.tensor([4, 5, 6, 7, 0, 1, 2, 3, 4, 5]),
+        mrope_positions=None,
+        input_ids=torch.zeros(10, dtype=torch.int32),
+        out_cache_loc=torch.arange(10, dtype=torch.int32),
+        _original_forward_mode=None,
+    )
+    backend.init_forward_metadata(forward_batch)
+    indexer = backend.forward_metadata.indexer_metadata
+    assert indexer.prefill_sequence_lengths_cpu == (8, 6)
 
 
 def test_qsa_row_ranges_do_not_cross_sequences():
@@ -1245,7 +1346,8 @@ def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
     assert torch.equal(backend._step_out_cache_loc(fb, 0), flat)
 
 
-def test_qsa_graph_metadata_kernels_match_legacy_host_path():
+@pytest.mark.parametrize("max_pages", [32, 129, 2048, 8193])
+def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
     """For decode rows and target-verify fan-out (boundary and non-boundary),
     replay kernels and the host refresh must build identical graph buffers."""
     from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
@@ -1263,11 +1365,13 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
         pool = _Pool()
         backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
         # A page-aligned token table: request r's token i lives in full page
-        # (r * 32 + i // 64) at offset i % 64, mirroring the paged allocator.
+        # (r * max_pages + i // 64) at offset i % 64, mirroring the paged allocator.
         rows = torch.arange(8, dtype=torch.int32, device=device)[:, None]
-        cols = torch.arange(2048, dtype=torch.int32, device=device)[None, :]
+        cols = torch.arange(max_pages * full_page, dtype=torch.int32, device=device)[
+            None, :
+        ]
         backend.req_to_token = (
-            (rows * 32 + cols // full_page) * full_page + cols % full_page
+            (rows * max_pages + cols // full_page) * full_page + cols % full_page
         ).contiguous()
         seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
         req_pool_indices = torch.arange(bs, dtype=torch.int32, device=device)
@@ -1284,7 +1388,7 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
                     (num_rows, 1), dtype=torch.int32, device=device
                 ),
                 out_cache_loc=torch.zeros(num_rows, dtype=torch.int64, device=device),
-                token_to_kv_pool=pool,
+                token_to_kv_pool=routed(pool),
                 compress_ratio=ratio,
                 block_topk=512,
                 req_pool_indices=torch.zeros(
@@ -1295,7 +1399,7 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
                     num_rows, dtype=torch.int32, device=device
                 ),
                 graph_compressed_page_table=torch.zeros(
-                    (num_rows, 32), dtype=torch.int32, device=device
+                    (num_rows, max_pages), dtype=torch.int32, device=device
                 ),
                 graph_compressed_lengths=torch.zeros(
                     num_rows, dtype=torch.int32, device=device
@@ -1386,9 +1490,10 @@ def _qsa_expected_graph_layout(
     for pid in range(bs):
         base = seq_lens[pid]
         if mode == 0:
+            base = base if pid < real_reqs else 1
             row_lens.append(base)
             row_prefix.append(max(base - 1, 0))
-            row_reqs.append(req_pool[pid])
+            row_reqs.append(req_pool[pid] if pid < real_reqs else 0)
             continue
         eff = (
             (extend_len if pid < real_reqs else 0)
@@ -1409,7 +1514,8 @@ def _qsa_expected_graph_layout(
     return row_lens, row_prefix, row_reqs
 
 
-def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
+@pytest.mark.parametrize("seq_offset", [0, 1, 3])
+def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail(seq_offset):
     """The layout kernel must rebuild speculative row fan-out and the padded dummy tail;
     the row-metadata kernel must derive compressed slots from those rows."""
     from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
@@ -1439,7 +1545,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
                 (num_rows, 1), dtype=torch.int32, device=device
             ),
             out_cache_loc=torch.zeros(num_rows, dtype=torch.int64, device=device),
-            token_to_kv_pool=pool,
+            token_to_kv_pool=routed(pool),
             compress_ratio=ratio,
             block_topk=512,
             req_pool_indices=torch.zeros(num_rows, dtype=torch.int32, device=device),
@@ -1488,6 +1594,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
             metadata=metadata,
             req_to_token=backend.req_to_token,
             pool=pool,
+            seq_offset=seq_offset if mode == 0 else 0,
         )
         torch.cuda.synchronize()
 
@@ -1495,7 +1602,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
             mode=mode,
             bs=bs,
             num_rows=num_rows,
-            seq_lens=seq_lens,
+            seq_lens=[x + seq_offset for x in seq_lens] if mode == 0 else seq_lens,
             req_pool=req_pool,
             extend_lens=extend_lens,
             extend_len=extend_len,
@@ -1534,16 +1641,595 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
         extend_len=0,
         num_padding=2,
     )
+    run_case(
+        mode=0,
+        bs=4,
+        num_rows=4,
+        seq_lens=[255, 1024, 4096, 4096],
+        extend_lens=None,
+        extend_len=0,
+        num_padding=2,
+    )
     # Decode with a padded tail (dummy rows alias request slot 0).
     run_case(
         mode=0,
         bs=4,
         num_rows=4,
-        seq_lens=[256, 1024, 1025, 4096],
+        seq_lens=[256, 1024, 1025, 4080],
         extend_lens=None,
         extend_len=0,
         num_padding=0,
     )
+
+
+@pytest.mark.parametrize("bs", [1, 3, 128])
+@pytest.mark.parametrize("padding", [0, 1])
+def test_qsa_draft_metadata_multi_step_graph(bs, padding):
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.attention.qsa.graph_metadata import (
+        launch_draft_graph_metadata,
+        launch_graph_metadata,
+        prepare_draft_graph_metadata,
+    )
+
+    pages, ratio, full_page = 129, 4, 64
+    pool = SimpleNamespace(qsa_compress_ratio=ratio, qsa_compressed_page_size=16)
+    table = torch.arange(
+        (bs + 2) * pages * full_page, dtype=torch.int32, device="cuda"
+    ).reshape(bs + 2, -1)
+    seq = torch.full((bs,), 8190, dtype=torch.int64, device="cuda")
+    reqs = torch.arange(1, bs + 1, dtype=torch.int32, device="cuda")
+
+    def metadata():
+        indexer = SimpleNamespace(
+            graph_compressed_lengths=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            graph_write_locs=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            graph_compressed_page_table=torch.empty(
+                (bs, pages), dtype=torch.int32, device="cuda"
+            ),
+            decode_logical_positions=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            pending_ring_slots=torch.empty(bs, dtype=torch.int64, device="cuda"),
+            graph_ring_group_locs=torch.empty(
+                (bs, ratio), dtype=torch.int32, device="cuda"
+            ),
+            graph_prefix_lengths=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            compress_ratio=ratio,
+        )
+        return SimpleNamespace(
+            sequence_lengths=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            row_req_pool_indices=torch.empty(bs, dtype=torch.int32, device="cuda"),
+            indexer_metadata=indexer,
+        )
+
+    outputs = [metadata() for _ in range(3)]
+    references = [metadata() for _ in range(3)]
+    args = prepare_draft_graph_metadata(outputs, table, pool)
+    launch_draft_graph_metadata(args, seq, reqs, bs, padding)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch_draft_graph_metadata(args, seq, reqs, bs, padding)
+    for replay in range(3):
+        seq.add_(replay)
+        reqs.copy_(reqs.roll(1))
+        graph.replay()
+        for step, (out, ref) in enumerate(zip(outputs, references)):
+            launch_graph_metadata(
+                mode=0,
+                bs=bs,
+                num_rows=bs,
+                seq_lens=seq,
+                req_pool_indices=reqs,
+                extend_lens=None,
+                extend_len=0,
+                num_padding=padding,
+                metadata=ref,
+                req_to_token=table,
+                pool=pool,
+                seq_offset=step + 1,
+            )
+            torch.testing.assert_close(
+                out.sequence_lengths, ref.sequence_lengths, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                out.row_req_pool_indices, ref.row_req_pool_indices, rtol=0, atol=0
+            )
+            for key, value in vars(out.indexer_metadata).items():
+                if isinstance(value, torch.Tensor):
+                    torch.testing.assert_close(
+                        value, getattr(ref.indexer_metadata, key), rtol=0, atol=0
+                    )
+
+
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize(
+    "dtype,output_dtype",
+    [
+        (torch.bfloat16, None),
+        (torch.float8_e4m3fn, None),
+        (torch.float8_e4m3fn, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("head_dim,num_kv_heads,group_size", [(128, 2, 4), (256, 1, 6)])
+@pytest.mark.parametrize(
+    "query_lens,prefix_lens",
+    [
+        ([1, 7], [31, 19]),
+        ([17, 33], [23, 0]),
+        ([2049, 3], [7, 40]),
+        ([3, 1, 2], [1018, 128, 128]),
+        ([3, 1, 2], [253, 63, 62]),
+        ([3, 1, 2], [254, 63, 62]),
+        ([3, 1, 2], [8189, 2047, 2046]),
+        ([3, 1, 2], [8190, 2047, 2046]),
+    ],
+)
+def test_qsa_prefill_kv_packing(
+    dtype,
+    output_dtype,
+    head_dim,
+    num_kv_heads,
+    group_size,
+    query_lens,
+    prefix_lens,
+    strided,
+):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+    torch.manual_seed(42)
+    device = "cuda"
+    lens = [q + p for q, p in zip(query_lens, prefix_lens)]
+    request_ids = [3, 1, 0][: len(lens)]
+    replay_ids = [2, 0, 3][: len(lens)]
+    table_width = max(lens) + 11
+    pool_size = 16 * table_width
+    table = torch.randperm(pool_size, device=device).reshape(8, table_width * 2)[
+        ::2, ::2
+    ]
+    if strided:
+        table = table.to(torch.int32)
+    req_indices = torch.tensor(request_ids, device=device, dtype=torch.int64)
+    k = torch.randn(
+        pool_size, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    ).to(dtype)
+    v = torch.randn_like(k.to(torch.bfloat16)).to(dtype)
+    if strided:
+        k_storage = torch.empty(
+            pool_size, num_kv_heads, head_dim * 2, device=device, dtype=dtype
+        )
+        v_storage = torch.empty_like(k_storage)
+        k = k_storage[..., ::2].copy_(k)
+        v = v_storage[..., ::2].copy_(v)
+    q = torch.randn(
+        sum(query_lens),
+        num_kv_heads * group_size,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    cu_q = torch.tensor([0, *accumulate(query_lens)], device=device, dtype=torch.int32)
+    cu_k = torch.tensor([0, *accumulate(lens)], device=device, dtype=torch.int32)
+    kv_lens = torch.tensor(lens, device=device, dtype=torch.int32)
+    indices = torch.full((sum(query_lens), 32), -1, device=device, dtype=torch.int32)
+    row = 0
+    for count, prefix in zip(query_lens, prefix_lens):
+        for offset in range(count):
+            visible = prefix + offset + 1
+            selected = torch.randperm(visible, device=device)[:32]
+            indices[row, : selected.numel()] = selected
+            row += 1
+
+    def reference(request_ids):
+        slots = torch.cat([table[request_ids[i], :n] for i, n in enumerate(lens)])
+        return sparse_gqa_fwd_interface_triton_ck(
+            q,
+            k.index_select(0, slots).to(output_dtype or k.dtype),
+            v.index_select(0, slots).to(output_dtype or v.dtype),
+            indices,
+            cu_q,
+            cu_k,
+            kv_lens,
+            head_dim**-0.5,
+        )
+
+    def packed():
+        packed_k, packed_v = pack_qsa_prefill_kv(
+            k=k,
+            v=v,
+            req_to_token=table,
+            req_indices=req_indices,
+            cu_k=cu_k,
+            total_k=sum(lens),
+            max_k=max(lens),
+            output_dtype=output_dtype,
+        )
+        if not torch.cuda.is_current_stream_capturing():
+            slots = torch.cat([table[req_indices[i], :n] for i, n in enumerate(lens)])
+            torch.testing.assert_close(
+                packed_k.float(), k.index_select(0, slots).float(), rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                packed_v.float(), v.index_select(0, slots).float(), rtol=0, atol=0
+            )
+        return packed_k, packed_v
+
+    def attend(packed_k, packed_v):
+        return sparse_gqa_fwd_interface_triton_ck(
+            q,
+            packed_k,
+            packed_v,
+            indices,
+            cu_q,
+            cu_k,
+            kv_lens,
+            head_dim**-0.5,
+        )
+
+    expected = reference(request_ids)
+    actual = attend(*packed())
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = packed()
+    req_indices.copy_(torch.tensor(replay_ids, device=device))
+    expected = reference(replay_ids)
+    graph.replay()
+    torch.testing.assert_close(attend(*captured), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("two_entries_per_request", [False, True])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("head_dim,num_kv_heads,group_size", [(128, 2, 4), (256, 1, 6)])
+@pytest.mark.parametrize(
+    "query_lens,prefix_lens",
+    [
+        ([2, 7], [31, 19]),
+        ([17, 33], [23, 0]),
+        ([2049, 3], [7, 40]),
+        ([3, 2, 2], [1018, 128, 128]),
+        ([3, 2, 2], [253, 63, 62]),
+        ([3, 2, 2], [254, 63, 62]),
+        ([3, 2, 2], [8189, 2047, 2046]),
+        ([3, 2, 2], [8190, 2047, 2046]),
+    ],
+)
+def test_qsa_paged_prefill_matches_packed_context(
+    dtype,
+    head_dim,
+    num_kv_heads,
+    group_size,
+    query_lens,
+    prefix_lens,
+    strided,
+    two_entries_per_request,
+):
+    """Reading each selected token in place through the slot table is the
+    packed-context kernel bit for bit: same entries, same values, same tile.
+    Two entries per request is the prefill-CP geometry (zigzag prev blocks,
+    then next blocks, over one slot-table row per request)."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+    torch.manual_seed(42)
+    device = "cuda"
+    lens = [q + p for q, p in zip(query_lens, prefix_lens)]
+    request_ids = [3, 1, 0][: len(lens)]
+    replay_ids = [2, 0, 3][: len(lens)]
+    table_width = max(lens) + 11
+    pool_size = 16 * table_width
+    table = torch.randperm(pool_size, device=device).reshape(8, table_width * 2)[
+        ::2, ::2
+    ]
+    if strided:
+        table = table.to(torch.int32)
+    k = torch.randn(
+        pool_size, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    ).to(dtype)
+    v = torch.randn_like(k.to(torch.bfloat16)).to(dtype)
+    if strided:
+        k_storage = torch.empty(
+            pool_size, num_kv_heads, head_dim * 2, device=device, dtype=dtype
+        )
+        v_storage = torch.empty_like(k_storage)
+        k = k_storage[..., ::2].copy_(k)
+        v = v_storage[..., ::2].copy_(v)
+
+    # Entries: (request, first query offset, query count). Prefill CP lists every
+    # request's first block, then every request's second block.
+    if two_entries_per_request:
+        halves = [count // 2 for count in query_lens]
+        entries = [(i, 0, h) for i, h in enumerate(halves)] + [
+            (i, h, count - h) for i, (h, count) in enumerate(zip(halves, query_lens))
+        ]
+    else:
+        entries = [(i, 0, count) for i, count in enumerate(query_lens)]
+    entry_rows = [count for _, _, count in entries]
+    total_q = sum(entry_rows)
+    q = torch.randn(
+        total_q,
+        num_kv_heads * group_size,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    cu_q = torch.tensor([0, *accumulate(entry_rows)], device=device, dtype=torch.int32)
+    kv_lens = torch.tensor(
+        [prefix_lens[i] + first + count for i, first, count in entries],
+        device=device,
+        dtype=torch.int32,
+    )
+    indices = torch.full((total_q, 32), -1, device=device, dtype=torch.int32)
+    row = 0
+    for i, first, count in entries:
+        for offset in range(first, first + count):
+            visible = prefix_lens[i] + offset + 1
+            selected = torch.randperm(visible, device=device)[:32]
+            indices[row, : selected.numel()] = selected
+            row += 1
+    request_base = [0, *accumulate(lens)][:-1]
+    cu_k = torch.tensor(
+        [request_base[i] for i, _, _ in entries], device=device, dtype=torch.int32
+    )
+
+    def packed_reference(ids):
+        # Keep the pool dtype: both kernels then convert FP8 in registers alike.
+        slots = torch.cat([table[ids[i], :n] for i, n in enumerate(lens)])
+        return sparse_gqa_fwd_interface_triton_ck(
+            q,
+            k.index_select(0, slots),
+            v.index_select(0, slots),
+            indices,
+            cu_q,
+            cu_k,
+            kv_lens,
+            head_dim**-0.5,
+        )
+
+    slot_table = table[torch.tensor(request_ids, device=device)]
+
+    def paged():
+        return sparse_gqa_paged_prefill_triton(
+            q,
+            k,
+            v,
+            slot_table,
+            indices,
+            cu_q,
+            kv_lens,
+            head_dim**-0.5,
+            max_q=max(entry_rows),
+        )
+
+    torch.testing.assert_close(paged(), packed_reference(request_ids), rtol=0, atol=0)
+    # No host sync: the launch replays from a graph with the table updated in place.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = paged()
+    slot_table.copy_(table[torch.tensor(replay_ids, device=device)])
+    graph.replay()
+    torch.testing.assert_close(captured, packed_reference(replay_ids), rtol=0, atol=0)
+
+
+def _qsa_prefix_case(cache_dtype, prefix_lens, extend_lens, *, heads=(4, 2), dim=64):
+    """A pool holding each request's cached prefix, random request slots, and
+    the new tokens' full-precision K/V (rounded to the cache on store)."""
+    device = "cuda"
+    num_q_heads, num_kv_heads = heads
+    seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+    req_indices = [5, 2][: len(seq_lens)]
+    num_slots = 4 * sum(seq_lens) + 64
+    k_cache = torch.full(
+        (num_slots, num_kv_heads, dim), float("nan"), device=device
+    ).to(cache_dtype)
+    v_cache = torch.full_like(k_cache, float("nan"))
+    req_to_token = torch.zeros(8, max(seq_lens) + 9, dtype=torch.int32, device=device)
+    slots = torch.randperm(num_slots - 1, device=device)[: sum(seq_lens)] + 1
+    keys = torch.randn(sum(seq_lens), num_kv_heads, dim, device=device)
+    values = torch.randn_like(keys)
+    out_cache_loc, new_k, new_v, offset = [], [], [], 0
+    for i, (length, prefix) in enumerate(zip(seq_lens, prefix_lens)):
+        request = slots[offset : offset + length]
+        req_to_token[req_indices[i], :length] = request.to(torch.int32)
+        k_cache[request[:prefix]] = keys[offset : offset + prefix].to(cache_dtype)
+        v_cache[request[:prefix]] = values[offset : offset + prefix].to(cache_dtype)
+        out_cache_loc.append(request[prefix:])
+        new_k.append(keys[offset + prefix : offset + length].to(torch.bfloat16))
+        new_v.append(values[offset + prefix : offset + length].to(torch.bfloat16))
+        offset += length
+
+    def store(layer, loc, k, v):
+        k_cache[loc.long()] = k.reshape(-1, num_kv_heads, dim).to(cache_dtype)
+        v_cache[loc.long()] = v.reshape(-1, num_kv_heads, dim).to(cache_dtype)
+
+    pool = SimpleNamespace(
+        set_kv_buffer=store,
+        get_key_buffer=lambda layer_id: k_cache,
+        get_value_buffer=lambda layer_id: v_cache,
+    )
+    backend = QwenSparseAttnBackend()
+    backend.token_to_kv_pool = routed(pool)
+    backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+    rows = torch.tensor(req_indices, device=device)
+    backend.forward_metadata = SimpleNamespace(
+        token_slot_table=req_to_token[rows, : max(seq_lens)],
+        sequence_lengths=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=num_q_heads,
+        tp_k_head_num=num_kv_heads,
+        tp_v_head_num=num_kv_heads,
+        head_dim=dim,
+        qk_head_dim=dim,
+        v_head_dim=dim,
+        scaling=dim**-0.5,
+    )
+    return SimpleNamespace(
+        backend=backend,
+        layer=layer,
+        seq_lens=seq_lens,
+        req_indices=req_indices,
+        out_cache_loc=torch.cat(out_cache_loc),
+        new_k=torch.cat(new_k),
+        new_v=torch.cat(new_v),
+        k_cache=k_cache,
+        v_cache=v_cache,
+        req_to_token=req_to_token,
+    )
+
+
+def _qsa_selection(positions, width=48):
+    """Per row, up to ``width`` distinct causal positions, -1 padded at the end."""
+    rows = []
+    for position in positions.tolist():
+        chosen = torch.randperm(position + 1)[:width].sort().values
+        rows.append(
+            torch.cat([chosen, torch.full((width - chosen.numel(),), -1)]).int()
+        )
+    return torch.stack(rows).cuda()
+
+
+def _qsa_float_reference(case, q, indices, row_requests):
+    """Attention over each row's selected tokens as stored in the pool."""
+    scale = case.layer.scaling
+    group = q.shape[1] // case.k_cache.shape[1]
+    out = torch.empty(q.shape, dtype=torch.float64, device=q.device)
+    for row, request in enumerate(row_requests):
+        selected = indices[row][indices[row] >= 0].long()
+        slots = case.req_to_token[case.req_indices[request], selected].long()
+        keys = case.k_cache[slots].double().repeat_interleave(group, dim=1)
+        values = case.v_cache[slots].double().repeat_interleave(group, dim=1)
+        scores = torch.einsum("hd,nhd->hn", q[row].double(), keys) * scale
+        out[row] = torch.einsum("hn,nhd->hd", scores.softmax(-1), values)
+    return out
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("prefix_lens", [(200, 75), (0, 75)])
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_qsa_cp_extend_reads_cached_prefix_in_place(
+    monkeypatch, cache_dtype, rank, prefix_lens, prefetch
+):
+    """Prefill CP with a cached prefix attends this rank's zigzag rows straight
+    off the pool (the gathered new tokens are stored first); with bf16 K/V it
+    matches the per-request pack it replaces bit for bit."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+    from sglang.srt.layers.cp import base as cp_base
+    from sglang.srt.layers.cp import zigzag
+
+    torch.manual_seed(5 + rank)
+    extend_lens = [40, 27]
+    case = _qsa_prefix_case(cache_dtype, list(prefix_lens), extend_lens)
+    monkeypatch.setattr(
+        cp_base, "get_parallel", lambda: SimpleNamespace(attn_cp_rank=rank)
+    )
+    monkeypatch.setattr(zigzag, "get_device", lambda: SimpleNamespace(device="cuda"))
+    strategy = zigzag.ZigzagCPStrategy(cp_size=2)
+    meta = strategy.build_metadata(sum(extend_lens), case.seq_lens, extend_lens)
+    monkeypatch.setattr(qsa_backend_module, "get_cp_strategy", lambda: strategy)
+    batch = SimpleNamespace(
+        attn_cp_metadata=meta,
+        seq_lens_cpu=case.seq_lens,
+        extend_seq_lens_cpu=extend_lens,
+        req_pool_indices=torch.tensor(case.req_indices, device="cuda"),
+        out_cache_loc=case.out_cache_loc,
+    )
+    num_local = meta.total_q_prev_tokens + meta.total_q_next_tokens
+    local_rows = strategy.shard_hidden_states(
+        torch.arange(sum(extend_lens), device="cuda"), batch
+    )[:num_local]
+    positions = torch.cat(
+        [torch.arange(p, p + e) for p, e in zip(prefix_lens, extend_lens)]
+    ).cuda()[local_rows]
+    requests = torch.repeat_interleave(
+        torch.arange(len(extend_lens)), torch.tensor(extend_lens)
+    ).cuda()[local_rows]
+    full_kv = torch.cat([case.new_k.flatten(1), case.new_v.flatten(1)], dim=-1)
+    monkeypatch.setattr(
+        qsa_backend_module,
+        "cp_materialize_global_token_order",
+        lambda local, forward_batch: full_kv,
+    )
+    q = torch.randn(num_local, 4, 64, device="cuda", dtype=torch.bfloat16)
+    indices = _qsa_selection(positions.cpu())
+    local_k = case.new_k[local_rows]
+    local_v = case.new_v[local_rows]
+
+    side_stream = qsa_backend_module.get_stream("qsa_cp_kv")
+    release_waits = []
+    wait_stream = torch.cuda.Stream.wait_stream
+
+    def track_wait(stream, other):
+        if stream == side_stream:
+            release_waits.append(other)
+        return wait_stream(stream, other)
+
+    monkeypatch.setattr(torch.cuda.Stream, "wait_stream", track_wait)
+
+    def run(save_kv_cache):
+        if prefetch:
+            case.backend.prefetch_cp_kv(
+                case.layer, local_k.flatten(1), local_v.flatten(1), batch
+            )
+        release_waits.clear()
+        output = QwenSparseAttnBackend._forward_extend_cp(
+            case.backend,
+            q.flatten(1),
+            local_k.flatten(1),
+            local_v.flatten(1),
+            case.layer,
+            batch,
+            indices,
+            save_kv_cache,
+        )
+        assert case.backend._cp_kv_pending is None
+        assert release_waits == ([torch.cuda.current_stream()] if prefetch else [])
+        return output
+
+    actual = run(save_kv_cache=True)
+    expected = _qsa_float_reference(case, q, indices, requests.tolist())
+    torch.testing.assert_close(
+        actual.double(), expected.flatten(1), rtol=2e-2, atol=2e-2
+    )
+    if cache_dtype == torch.bfloat16:
+        # The pack path (still taken when the new K/V is not stored) reads the
+        # same values; the pool already holds this forward's tokens.
+        torch.testing.assert_close(run(save_kv_cache=False), actual, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("heads", [1, 3, 6, 12])
+def test_qsa_large_fp8_prefill_float_reference(head_dim, heads):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+    torch.manual_seed(19)
+    rows, prefix, topk = 2053, 64, 64
+    q = torch.randn(rows, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(rows + prefix, 1, head_dim, device="cuda", dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    v = torch.randn_like(k.to(torch.bfloat16)).to(k.dtype)
+    visible = torch.arange(rows, device="cuda") + prefix + 1
+    indices = (
+        torch.arange(topk, device="cuda")[None, :]
+        + torch.arange(rows, device="cuda")[:, None] * 7
+    ) % visible[:, None]
+    indices = indices.to(torch.int32)
+    cu_q = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, rows + prefix], device="cuda", dtype=torch.int32)
+    lengths = cu_k[1:]
+    actual = sparse_gqa_fwd_interface_triton_ck(
+        q, k, v, indices, cu_q, cu_k, lengths, head_dim**-0.5
+    )
+    for row in [0, 17, rows // 2, rows - 1]:
+        keys = k.index_select(0, indices[row].long()).squeeze(1).double()
+        values = v.index_select(0, indices[row].long()).squeeze(1).double()
+        expected = (
+            torch.softmax(q[row].double() @ keys.T * head_dim**-0.5, dim=-1) @ values
+        )
+        torch.testing.assert_close(actual[row].double(), expected, rtol=2e-2, atol=2e-2)
 
 
 if __name__ == "__main__":

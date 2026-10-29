@@ -12,6 +12,11 @@ per-request from ``batch.data_type`` and the presence of
 import copy
 import json
 import math
+from collections import deque
+from collections.abc import Iterator
+from contextlib import closing
+from fractions import Fraction
+from itertools import islice
 from typing import Any
 
 import numpy as np
@@ -20,7 +25,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.kernels import get_kernel
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    quality_allows,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_reduce,
@@ -35,10 +44,17 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    use_vae_fast_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+    EncodeWhileDecoding,
+    streamed_video_output_path,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
     ACTION_MODE_FORWARD_DYNAMICS,
@@ -59,8 +75,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
-    RolloutDenoisingMixin,
+from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    finalize_rollout_if_enabled,
+    init_rollout_env_if_enabled,
+    prepare_rollout_if_enabled,
+    rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
     prepare_rollout_request_scheduler,
@@ -68,7 +87,12 @@ from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
+from sglang.multimodal_gen.runtime.utils.vision import (
+    load_image,
+    load_video,
+    preprocess_image,
+)
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -192,6 +216,83 @@ def _pad_transfer_frames(video: torch.Tensor, target_frames: int) -> torch.Tenso
     return video.contiguous()
 
 
+def _iter_video_frames_pyav(
+    video_path: str, num_frames: int, keep: str = "first"
+) -> Iterator[np.ndarray]:
+    """Yield the first/last RGB frames without materializing the whole video.
+
+    Tail access seeks backwards to a keyframe and decodes through EOF. If the
+    estimate leaves fewer than the requested frames, back off further. Unknown
+    duration/rate falls back to a bounded tail buffer, preserving VFR semantics.
+    """
+    import av
+
+    if num_frames <= 0:
+        raise ValueError("num_frames must be positive")
+    if keep not in ("first", "last"):
+        raise ValueError("keep must be 'first' or 'last'")
+
+    with av.open(video_path) as container:
+        if not container.streams.video:
+            raise ValueError(f"No video stream in {video_path!r}")
+        stream = container.streams.video[0]
+        stream.codec_context.thread_type = "SLICE"
+        stream.codec_context.thread_count = 1
+
+        if keep == "first":
+            frames = islice(container.decode(stream), num_frames)
+        else:
+            start = stream.start_time or 0
+            duration, rate = stream.duration, stream.average_rate
+            if duration is None and container.duration is not None:
+                duration = int(
+                    Fraction(container.duration, av.time_base) / stream.time_base
+                )
+            if duration is not None and duration > 0 and rate:
+                span = max(1, int(num_frames / rate / stream.time_base))
+                while True:
+                    offset = max(start, start + duration - span)
+                    container.seek(offset, stream=stream, backward=True)
+                    frames = deque(container.decode(stream), maxlen=num_frames)
+                    if len(frames) == num_frames or offset == start:
+                        break
+                    span *= 2
+            else:
+                frames = deque(container.decode(stream), maxlen=num_frames)
+
+        for frame in frames:
+            yield frame.to_ndarray(format="rgb24")
+
+
+def _preprocess_video_frames_gpu(
+    frames: Iterator[np.ndarray], height: int, width: int
+) -> list[torch.Tensor]:
+    """Resize/crop/normalize batches of up to eight RGB frames on CUDA."""
+    lanczos_resize = get_kernel("mm.lanczos_resize")
+    processed = []
+    while batch := list(islice(frames, 8)):
+        pixels = torch.from_numpy(np.stack(batch)).pin_memory().cuda(non_blocking=True)
+        source_h, source_w = pixels.shape[1:3]
+        scale = max(width / source_w, height / source_h)
+        resized_h = math.ceil(scale * source_h)
+        resized_w = math.ceil(scale * source_w)
+        output = lanczos_resize(
+            pixels,
+            resized_h,
+            resized_w,
+            crop=(
+                (resized_h - height) // 2,
+                (resized_w - width) // 2,
+                height,
+                width,
+            ),
+            mean=(0.5, 0.5, 0.5),
+            std=(0.5, 0.5, 0.5),
+        )
+        processed.extend(output.permute(0, 3, 1, 2).unbind(0))
+    return processed
+
+
 class Cosmos3ImagePreprocessStage(PipelineStage):
     """Load, aspect-resize, and center-crop the conditioning input.
 
@@ -206,9 +307,6 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
 
     parallelism_type = StageParallelismType.REPLICATED
 
-    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        return VerificationResult()
-
     def _load_control_video(
         self,
         control_path: str,
@@ -217,7 +315,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         max_frames: int,
     ) -> torch.Tensor:
         """Load transfer media as CPU ``uint8 [1, 3, T, H, W]``."""
-        frames = load_video(control_path)
+        frames = load_video(control_path, max_frames=max_frames)
         if not frames:
             raise ValueError(f"No frames decoded from transfer video: {control_path!r}")
         frames = frames[:max_frames]
@@ -381,8 +479,24 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             tensors: list[torch.Tensor] = []
             for src in image_sources:
                 image = load_image(src)
-                image = _resize_crop_pil(image, target_w, target_h)
-                tensors.append(_pil_to_normalized_tensor(image))
+                scale = max(target_w / image.width, target_h / image.height)
+                width, height = (
+                    math.ceil(scale * image.width),
+                    math.ceil(scale * image.height),
+                )
+                tensors.append(
+                    preprocess_image(
+                        image,
+                        device=get_local_torch_device(),
+                        size=(width, height),
+                        crop=(
+                            (height - target_h) // 2,
+                            (width - target_w) // 2,
+                            target_h,
+                            target_w,
+                        ),
+                    )[0].contiguous()
+                )
             batch.preprocessed_image = torch.stack(tensors, dim=0).contiguous()
             self.log_info(
                 f"Preprocessed {len(tensors)} conditioning image(s) to "
@@ -391,10 +505,6 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             return batch
 
         if isinstance(video_path, str) and video_path:
-            frames = load_video(video_path)
-            if not frames:
-                raise ValueError(f"No frames decoded from video: {video_path!r}")
-
             keep = (
                 getattr(batch.sampling_params, "condition_video_keep", "first")
                 or "first"
@@ -411,27 +521,37 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             # to noise.
             num_source_frames = max(cond_indexes) * 4 + 1
             num_target_frames = batch.num_frames
-            if keep == "last":
-                frames = frames[-num_source_frames:]
-            else:
-                frames = frames[:num_source_frames]
-            if len(frames) < num_source_frames:
-                frames = frames + [frames[-1]] * (num_source_frames - len(frames))
-            if len(frames) < num_target_frames:
-                frames = frames + [frames[-1]] * (num_target_frames - len(frames))
+            force_cpu = (
+                not current_platform.is_cuda()
+                or envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+            )
+            with closing(
+                _iter_video_frames_pyav(video_path, num_source_frames, keep)
+            ) as frames:
+                if force_cpu:
+                    processed = [
+                        _pil_to_normalized_tensor(
+                            _resize_crop_pil(PIL.Image.fromarray(f), target_w, target_h)
+                        )
+                        for f in frames
+                    ]
+                else:
+                    processed = _preprocess_video_frames_gpu(frames, target_h, target_w)
+            if not processed:
+                raise ValueError(f"No frames decoded from video: {video_path!r}")
+            # Pad CUDA frames after conversion to the VAE dtype instead.
+            if force_cpu:
+                if len(processed) < num_source_frames:
+                    processed += [processed[-1]] * (num_source_frames - len(processed))
+                if len(processed) < num_target_frames:
+                    processed += [processed[-1]] * (num_target_frames - len(processed))
 
-            processed = [
-                _pil_to_normalized_tensor(
-                    _resize_crop_pil(f.convert("RGB"), target_w, target_h)
-                )
-                for f in frames
-            ]
             video_tensor = torch.stack(processed, dim=1).unsqueeze(0).contiguous()
             batch.preprocessed_video = video_tensor
             self.log_info(
                 f"Preprocessed conditioning video to "
                 f"{video_tensor.shape[2]}x{target_h}x{target_w} "
-                f"(keep={keep}, source frames={num_source_frames}, padded to {num_target_frames})"
+                f"(keep={keep}, source frames={num_source_frames}, target frames={num_target_frames})"
             )
 
         return batch
@@ -757,6 +877,13 @@ class Cosmos3LatentPreparationStage(PipelineStage):
                 pixel_input = batch.preprocessed_video.to(
                     device=device, dtype=vae_dtype
                 )
+                batch.preprocessed_video = None
+                if pixel_input.shape[2] < batch.num_frames:
+                    padding = pixel_input[:, :, -1:].expand(
+                        -1, -1, batch.num_frames - pixel_input.shape[2], -1, -1
+                    )
+                    pixel_input = torch.cat([pixel_input, padding], dim=2)
+                    del padding
                 cond_indexes = Cosmos3ImagePreprocessStage._resolve_condition_indexes(
                     batch
                 )
@@ -769,6 +896,11 @@ class Cosmos3LatentPreparationStage(PipelineStage):
             with self.use_declared_component(component_name="vae", module=self.vae):
                 with torch.no_grad():
                     cond_latent = self._vae_encode(pixel_input).to(dtype)
+
+            # Only the encoded latents are needed by the remaining stages.
+            batch.preprocessed_video = None
+            batch.preprocessed_image = None
+            del pixel_input
 
             max_idx = max(cond_indexes)
             if max_idx >= num_latent_frames:
@@ -1005,9 +1137,13 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
             return COSMOS3_T2I_FLOW_SHIFT
         if is_edge:
             return COSMOS3_EDGE_VIDEO_FLOW_SHIFT
-        if batch.preprocessed_image is not None:
+        if batch.preprocessed_image is not None or getattr(
+            batch.sampling_params, "image_path", None
+        ):
             return COSMOS3_I2V_FLOW_SHIFT
-        if batch.preprocessed_video is not None:
+        if batch.preprocessed_video is not None or getattr(
+            batch.sampling_params, "video_path", None
+        ):
             return COSMOS3_V2V_FLOW_SHIFT
         return COSMOS3_T2V_FLOW_SHIFT
 
@@ -1062,12 +1198,7 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         return batch
 
 
-class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        return num_inference_steps
-
+class Cosmos3DenoisingStage(PipelineStage):
     """Cosmos3 denoise loop, including CFG and the parallelism modes.
 
     The UND pathway runs once and its K/V is cached per cache_key (``cond`` /
@@ -1101,6 +1232,10 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.vae = vae
         self._logged_parallel_config = False
         self._logged_cfg_split = False
+        # Extra transformer kwargs a variant hands over per request through
+        # ``batch.extra["transformer_extra_kwargs"]`` (e.g. the Cosmos3
+        # multiview attention layout and temporal wrap period).
+        self._extra_transformer_kwargs: dict[str, Any] = {}
 
         # Apply torch.compile if enabled
         if server_args is not None:
@@ -1235,10 +1370,11 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 transfer_share_vision_temporal_positions=getattr(
                     self, "_share_vision_temporal_positions", True
                 ),
+                **self._extra_transformer_kwargs,
             )
 
     @staticmethod
-    def _cfg_active_at(t: torch.Tensor, interval: tuple[float, float] | None) -> bool:
+    def _cfg_active_at(t: float, interval: tuple[float, float] | None) -> bool:
         """Return True iff CFG should be applied at timestep ``t``.
 
         T2I uses a CFG window (e.g. ``[400, 1000]``) to skip guidance at low
@@ -1247,9 +1383,8 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """
         if interval is None:
             return True
-        t_scalar = float(t.item()) if torch.is_tensor(t) else float(t)
         lo, hi = interval
-        return lo <= t_scalar <= hi
+        return lo <= t <= hi
 
     def _normalize_transfer_video(
         self, video: torch.Tensor, device: torch.device, dtype: torch.dtype
@@ -1452,6 +1587,9 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 True,
             )
         )
+        self._extra_transformer_kwargs = dict(
+            batch.extra.get("transformer_extra_kwargs") or {}
+        )
         latents = batch.latents
         sound_latents = batch.audio_latents
         action_latents = getattr(batch, "action_latents", None)
@@ -1502,23 +1640,24 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 raise ValueError(
                     "Cosmos3 rollout does not support action/sound modalities."
                 )
-            self._maybe_prepare_rollout(batch)
-            self._maybe_init_denoising_env_collection(
-                batch=batch,
-                pipeline_config=server_args.pipeline_config,
-                image_kwargs={},
-                pos_cond_kwargs={
-                    "text_ids": cond_text_ids,
-                    "text_mask": cond_text_mask,
-                    "fps": fps,
-                },
-                neg_cond_kwargs={
-                    "text_ids": uncond_text_ids,
-                    "text_mask": uncond_text_mask,
-                    "fps": fps,
-                },
-                guidance=None,
-            )
+        prepare_rollout_if_enabled(
+            batch=batch, pipeline_config=server_args.pipeline_config
+        )
+        init_rollout_env_if_enabled(
+            batch=batch,
+            image_kwargs={},
+            pos_cond_kwargs={
+                "text_ids": cond_text_ids,
+                "text_mask": cond_text_mask,
+                "fps": fps,
+            },
+            neg_cond_kwargs={
+                "text_ids": uncond_text_ids,
+                "text_mask": uncond_text_mask,
+                "fps": fps,
+            },
+            guidance=None,
+        )
 
         do_cfg = guidance_scale > 1.0
         # Control-CFG runs even when text guidance is off (its own extra
@@ -1581,6 +1720,9 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             desc="Denoising",
             batch=batch,
         )
+        # host copy for the per-step CFG window checks: a device read per step
+        # would stall the host on every step's kernels
+        timestep_values = timesteps.tolist()
 
         for i, t in progress_bar:
             # Precision is chosen once per step, before any transformer call,
@@ -1591,7 +1733,9 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             # Outside the CFG window the effective scale collapses to 1.0,
             # which reduces CFG to the cond branch (cfg-parallel safe).
             effective_scale = (
-                guidance_scale if self._cfg_active_at(t, guidance_interval) else 1.0
+                guidance_scale
+                if self._cfg_active_at(timestep_values[i], guidance_interval)
+                else 1.0
             )
             # Transfer control-CFG: active only when a control video is present,
             # ``control_guidance != 1.0``, and the step is inside the (optional)
@@ -1600,7 +1744,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             control_cfg_active = (
                 control_latents is not None
                 and control_guidance != 1.0
-                and self._cfg_active_at(t, control_guidance_interval)
+                and self._cfg_active_at(timestep_values[i], control_guidance_interval)
             )
 
             if control_cfg_active:
@@ -1779,31 +1923,14 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if velocity_mask is not None:
                 noise_pred = noise_pred * velocity_mask
 
-            if batch.rollout:
-                # Capture the pre-step x_{t_i} before the scheduler advances it.
-                batch._rollout_loop_step_index = i
-                self._maybe_append_dit_trajectory_step(
-                    batch=batch,
-                    latents=latents,
-                    timestep_value=t,
-                    step_index=i,
-                )
-                latents = scheduler.step(
-                    noise_pred,
-                    t,
-                    latents,
-                    generator=batch.generator,
-                    batch=batch,
-                    return_dict=False,
-                )[0]
-            else:
-                latents = scheduler.step(
-                    noise_pred,
-                    t,
-                    latents,
-                    generator=generator,
-                    return_dict=False,
-                )[0]
+            latents = scheduler.step(
+                noise_pred,
+                t,
+                latents,
+                generator=generator,
+                **rollout_step_kwargs(batch),
+                return_dict=False,
+            )[0]
 
             if action_noise_pred is not None:
                 # Zero the velocity at conditioned (clean) action tokens and at
@@ -1852,14 +1979,13 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # next request's steps.
         self.transformer.reset_denoising_step()
 
-        if batch.rollout:
-            self._postprocess_rollout_outputs(
-                batch=batch,
-                latents=latents,
-                num_inference_steps=len(timesteps),
-                final_timestep=timesteps.new_zeros(()).cpu(),
-                server_args=server_args,
-            )
+        finalize_rollout_if_enabled(
+            batch=batch,
+            latents=latents,
+            num_inference_steps=len(timesteps),
+            final_timestep=timesteps.new_zeros(()),
+            pipeline_config=server_args.pipeline_config,
+        )
 
         batch.latents = latents
         if action_latents is not None:
@@ -2274,6 +2400,12 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         return uses
 
 
+def denormalize_vae_latents(
+    latents: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
+) -> torch.Tensor:
+    return latents.to(mean.dtype) * std + mean
+
+
 class Cosmos3DecodingStage(PipelineStage):
     """
     VAE decoding stage for Cosmos3.
@@ -2303,14 +2435,11 @@ class Cosmos3DecodingStage(PipelineStage):
         result.add_check("latents", batch.latents, V.is_tensor)
         return result
 
-    def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode latents to video frames. Returns tensor in [B, C, T, H, W] format."""
+    def _denormalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Undo the VAE latent normalization and cast to the VAE dtype."""
         device = latents.device
-        # Get VAE dtype from its parameters
         vae_dtype = next(self.vae.parameters()).dtype
         latents = latents.to(vae_dtype)
-
-        # Apply latent normalization if configured
         if hasattr(self.vae.config, "latents_mean") and hasattr(
             self.vae.config, "latents_std"
         ):
@@ -2325,13 +2454,19 @@ class Cosmos3DecodingStage(PipelineStage):
                     .view(1, -1, 1, 1, 1)
                     .to(device, vae_dtype)
                 )
-            latents = (latents * self._latents_std) + self._latents_mean
-        else:
-            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
-            latents = latents / scaling_factor
+            return denormalize_vae_latents(
+                latents, self._latents_mean, self._latents_std
+            )
+        scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
+        return latents / scaling_factor
+
+    def _decode_latents(self, latents: torch.Tensor, on_frames=None) -> torch.Tensor:
+        """Decode latents to video frames. Returns tensor in [B, C, T, H, W] format."""
+        latents = self._denormalize_latents(latents)
 
         # Decode - returns [B, C, T, H, W]
-        video = self.vae.decode(latents)
+        decode_kwargs = {} if on_frames is None else {"on_frames": on_frames}
+        video = self.vae.decode(latents, **decode_kwargs)
         # Handle both dict return and direct tensor return
         if hasattr(video, "sample"):
             video = video.sample
@@ -2343,6 +2478,27 @@ class Cosmos3DecodingStage(PipelineStage):
     @staticmethod
     def _postprocess_tensor(decoded: torch.Tensor) -> torch.Tensor:
         return decoded.mul_(0.5).add_(0.5).clamp_(0, 1).float()
+
+    def _encode_while_decoding(
+        self, batch: Req, server_args: ServerArgs
+    ) -> EncodeWhileDecoding | None:
+        """An encoder fed by the decode, if the plain video frames go straight to the MP4."""
+        if (
+            not self.vae.supports_decode_on_frames
+            or (self._guardrails and batch.use_guardrails is not False)
+            or (self.sound_tokenizer is not None and batch.audio_latents is not None)
+            or batch.action_latents is not None
+            or batch.extra.get("transfer_plan") is not None
+        ):
+            return None
+        save_file_path = streamed_video_output_path(
+            batch, server_args, int(batch.latents.shape[0])
+        )
+        if save_file_path is None:
+            return None
+        return EncodeWhileDecoding(
+            save_file_path, batch, finish_frames=self._postprocess_tensor
+        )
 
     @staticmethod
     def _postprocess_video_np(video: torch.Tensor, is_image_gen: bool) -> np.ndarray:
@@ -2445,9 +2601,32 @@ class Cosmos3DecodingStage(PipelineStage):
         device = batch.latents.device
         decoded = batch.extra.get("transfer_decoded_output")
         if decoded is None:
+            stream = self._encode_while_decoding(batch, server_args)
+            output_file_paths = None
             with self.use_declared_component(component_name="vae", module=self.vae):
-                with torch.no_grad():
-                    decoded = self._decode_latents(batch.latents)
+                with (
+                    torch.no_grad(),
+                    use_vae_fast_path(
+                        self.vae,
+                        quality_allows(batch.sampling_params.quality, "lossless"),
+                    ),
+                ):
+                    try:
+                        decoded = self._decode_latents(batch.latents, on_frames=stream)
+                        if stream is not None:
+                            output_file_paths = stream.finish()
+                    except BaseException:
+                        if stream is not None:
+                            stream.abort()
+                        raise
+            if output_file_paths is not None:
+                return OutputBatch(
+                    output=None,
+                    output_file_paths=output_file_paths,
+                    metrics=batch.metrics,
+                    rollout_trajectory_data=batch.rollout_trajectory_data,
+                    **action_metadata,
+                )
 
         self.log_debug("Decoded tensor shape: %s", decoded.shape)
         output = self._postprocess_tensor(decoded)

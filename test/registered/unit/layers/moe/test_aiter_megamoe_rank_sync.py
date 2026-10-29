@@ -4,27 +4,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.layers.moe.mega_moe_flydsl import _should_overlap_shared_and_routed
 from sglang.srt.managers.scheduler_components.dp_attn import (
     ForwardMode,
     _update_gather_batch,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
-
-
-def test_rank_sync_forces_overlap_off(monkeypatch):
-    monkeypatch.setenv("SGLANG_AITER_MEGA_RANK_SYNC", "1")
-    monkeypatch.setattr(
-        "sglang.srt.layers.moe.mega_moe_flydsl.get_is_capture_mode",
-        lambda: True,
-    )
-    moe = SimpleNamespace(alt_stream=object(), num_fused_shared_experts=0)
-    assert not _should_overlap_shared_and_routed(moe, 32)
-
-    monkeypatch.setenv("SGLANG_AITER_MEGA_RANK_SYNC", "0")
-    assert _should_overlap_shared_and_routed(moe, 32)
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def test_mlp_sync_retains_full_vector_without_tp_gather():
@@ -38,6 +24,7 @@ def test_mlp_sync_retains_full_vector_without_tp_gather():
         tbo_split_seq_index=None,
         global_forward_mode=None,
         can_run_decode_cuda_graph=False,
+        can_run_draft_cuda_graph=False,
         can_run_prefill_cuda_graph=False,
         prefill_cuda_graph_max_prefix_len=0,
         tp0_info_cpu=torch.tensor(

@@ -17,22 +17,20 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
-from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
-    MAMBA_STATE_PER_REQ_NO_CACHE,
-    MAMBA_STATE_PER_REQ_PREFIX_CACHE,
-    MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
     available_and_evictable_str,
     evict_from_tree_cache,
 )
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import attention_backends, get_parallel
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     next_power_of_2,
     support_triton,
 )
@@ -41,6 +39,7 @@ from sglang.srt.utils.common import is_pin_memory_available
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 _is_cpu = is_cpu()
 
 if _is_cpu:
@@ -48,8 +47,13 @@ if _is_cpu:
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.mem_cache.kv.state_storage import StateStorage
+    from sglang.srt.mem_cache.kv.storage import KVStorage
+    from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 
 logger = logging.getLogger(__name__)
+
+_EMPTY_PREFIX = torch.empty((0,), dtype=torch.int64)
 
 
 def write_cache_indices(
@@ -148,14 +152,45 @@ def get_last_loc_torch(
     )
 
 
+def _storage(
+    tree_cache: BasePrefixCache, batch: Optional[ScheduleBatch] = None
+) -> KVStorage | StaticKVStorage:
+    """The storage the tree's pools present to a request's lifecycle."""
+    return kv_storage_of(
+        tree_cache.req_to_token_pool,
+        tree_cache.token_to_kv_pool_allocator,
+        tree_cache=tree_cache,
+        batch=batch,
+    )
+
+
+def retire_window(
+    req: Req, frontier: int, tree_cache: BasePrefixCache, *, eviction_interval: int = 1
+) -> None:
+    """Retire the window rows of a running request behind ``frontier``,
+    keeping what the prefix tree still needs of the window."""
+    _storage(tree_cache).advance(
+        req,
+        frontier,
+        window=tree_cache.swa_retain_window,
+        retain_floor=tree_cache.swa_retain_floor(req),
+        shares_prefixes=tree_cache.supports_prefix_sharing(),
+        eviction_interval=eviction_interval,
+    )
+
+
+def _room_in(tree_cache: BasePrefixCache):
+    """Evict from the tree until a take of ``num_tokens`` can be served."""
+    return lambda num_tokens: evict_from_tree_cache(tree_cache, num_tokens)
+
+
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
 ):
-    allocator = tree_cache.token_to_kv_pool_allocator
-    evict_from_tree_cache(tree_cache, num_tokens)
-
-    out_cache_loc = allocator.alloc(num_tokens)
+    out_cache_loc = _storage(tree_cache).take_tokens(
+        num_tokens, make_room=_room_in(tree_cache)
+    )
 
     if out_cache_loc is None:
         error_msg = (
@@ -182,49 +217,16 @@ def alloc_paged_token_slots_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
 ):
-    # Over estimate the number of tokens: assume each request needs a new page
-    # (one page per CLASS per request under sharding — the min-class
-    # availability floor must cover every request's ceil(K_i/N) rounding,
-    # matching the N*ps per-request admission reserve).
-    allocator = tree_cache.token_to_kv_pool_allocator
-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * (
-        allocator.page_size * page_interleave_shard_size(allocator)
+    out_cache_loc = _storage(tree_cache, batch).take_extend(
+        rows=req_pool_indices,
+        prefix_lens=prefix_lens,
+        prefix_lens_cpu=prefix_lens_cpu,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        last_loc=last_loc,
+        num_tokens=extend_num_tokens,
+        make_room=_room_in(tree_cache),
     )
-    evict_from_tree_cache(tree_cache, num_tokens)
-
-    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
-    extra_alloc_kwargs = {}
-    kv_shard_rotation_bases = None
-    if page_interleave_shard_size(allocator) > 1:
-        kv_shard_rotation_bases = _kv_shard_rotation_bases(
-            tree_cache=tree_cache, batch=batch, prefix_lens_cpu=prefix_lens_cpu
-        )
-        extra_alloc_kwargs["rotation_bases"] = kv_shard_rotation_bases
-    if is_dsv4:
-        c128_num_pages = allocator.c128_num_pages_needed(prefix_lens_cpu, seq_lens_cpu)
-        allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
-        extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
-        # Per-call per-req table for the C128 KV last_loc lookup.
-        if batch is not None:
-            extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
-
-    out = allocator.alloc_extend(
-        prefix_lens,
-        prefix_lens_cpu,
-        seq_lens,
-        seq_lens_cpu,
-        last_loc,
-        extend_num_tokens,
-        **extra_alloc_kwargs,
-    )
-
-    if is_dsv4:
-        bundle = out
-        out_cache_loc = None if bundle is None else bundle.out_full_loc
-        if batch is not None:
-            batch.out_cache_loc_dsv4 = bundle
-    else:
-        out_cache_loc = out
 
     if out_cache_loc is None:
         error_msg = (
@@ -237,57 +239,42 @@ def alloc_paged_token_slots_extend(
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
-    if kv_shard_rotation_bases is not None:
-        # The allocator resolved None entries (new chains) in place from the
-        # least-full class at each request's turn; record the bases for the
-        # radix insert to stamp onto new tree nodes (UnifiedTreeNode.rotation_base).
-        for req, base in zip(batch.reqs, kv_shard_rotation_bases):
-            req.kv_rotation_base = base
-
     return out_cache_loc
 
 
-def _kv_shard_rotation_bases(
-    tree_cache: BasePrefixCache, batch: ScheduleBatch, prefix_lens_cpu: torch.Tensor
-) -> list:
-    """Per-request rotation bases ``b_i`` of the batch's chains, host-only.
+def ensure_mamba_capacity(
+    req_to_token_pool: ReqToTokenPool,
+    state: Optional[StateStorage],
+    reqs: list[Req],
+    tree_cache: BasePrefixCache | None,
+) -> bool:
+    """Reclaim the Mamba slots needed before binding any request rows."""
+    if not req_to_token_pool.holds_state_slots:
+        return True
 
-    The owner class of position-page P is ``(b_i + P) % shard_size``. Rules:
+    # Count the slots `acquire` will hand out for each request.
+    needed = 0
+    for req in reqs:
+        if not req.kv.holds_mamba:
+            needed += 1
 
-    - Read through ``req.last_node`` at alloc time, never a value cached on
-      the request: ``cache_unfinished_req`` can rebind a chunked request onto
-      another chain's canonical locs between chunks, changing the base. The
-      read goes through ``tree_cache.rotation_base_of`` because the node
-      handle is tree-specific (a NodeId on the unified tree).
-    - A request without a cached prefix starts a new chain: None here — the
-      allocator draws from the least-full class at that request's turn (so
-      the draw sees earlier requests' pops in the same batch) and resolves
-      the entry in place.
-    - ChunkCache has no tree nodes (``last_node`` is None); its chunked
-      continuations fall back to the base recorded on the request at the
-      previous chunk's alloc (no cross-request reuse, no rebind there).
-    """
-    assert batch is not None and len(batch.reqs) == len(prefix_lens_cpu)
-    bases = []
-    for i, req in enumerate(batch.reqs):
-        if int(prefix_lens_cpu[i]) == 0:
-            bases.append(None)
-            continue
-        node_base = tree_cache.rotation_base_of(req.last_node)
-        if node_base is not None:
-            bases.append(node_base)
-        else:
-            assert req.kv_rotation_base is not None, (
-                "sharded extend with a cached prefix but no rotation base: "
-                "req.last_node carries none and the request recorded none "
-                "at a previous alloc"
-            )
-            bases.append(req.kv_rotation_base)
-    return bases
+        if req.kv.mamba_ping_pong_track_buffer is None:
+            needed += req_to_token_pool.mamba_initial_tracking_slots
+
+    # Byte-coordinated for the shared allocator; plain free slots otherwise.
+    allocator = state.slots
+    supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
+    available = allocator.schedulable_available_size()
+    if available < needed and supports_mamba:
+        tree_cache.evict_for_alloc(
+            EvictParams(num_tokens=0, mamba_num=needed - available)
+        )
+    return allocator.schedulable_available_size() >= needed
 
 
 def alloc_req_slots(
-    req_to_token_pool: ReqToTokenPool,
+    storage: KVStorage | StaticKVStorage,
+    state: Optional[StateStorage],
     reqs: list[Req],
     tree_cache: BasePrefixCache | None,
 ) -> list[int]:
@@ -298,34 +285,15 @@ def alloc_req_slots(
     and should surface rather than be masked.
     """
     num_reqs = len(reqs)
-    if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        # Byte-coordinated for the shared allocator (accounts for the peer full
-        # sub-pool's bytes); plain slot free count for the non-shared one.
-        mamba_available_size = (
-            req_to_token_pool.mamba_allocator.schedulable_available_size()
-        )
-        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for chunk.
-        if tree_cache.supports_mamba():
-            factor = (
-                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-                if req_to_token_pool.enable_mamba_extra_buffer_lazy
-                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            )
-        else:
-            factor = MAMBA_STATE_PER_REQ_NO_CACHE
-        mamba_state_needed = num_reqs * factor
-        if mamba_available_size < mamba_state_needed:
-            if tree_cache is not None and tree_cache.supports_mamba():
-                mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict_for_alloc(
-                    EvictParams(num_tokens=0, mamba_num=mamba_num)
-                )
-    req_pool_indices = req_to_token_pool.alloc(reqs)
+    # Keep combined serving's existing behavior: try cache eviction, then let
+    # the pool allocate. A failed precheck need not mean allocation will fail.
+    ensure_mamba_capacity(storage.requests, state, reqs, tree_cache)
+    req_pool_indices = storage.acquire(reqs)
     if req_pool_indices is None:
         raise RuntimeError(
             "alloc_req_slots runs out of memory. "
             "Please set a smaller number for `--max-running-requests`. "
-            f"{req_to_token_pool.available_size()=}, {num_reqs=}, "
+            f"{storage.requests.available_size()=}, {num_reqs=}, "
         )
     return req_pool_indices
 
@@ -336,9 +304,20 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # the real allocator's page_size there. Elsewhere the two are equal --
     # including under KV sharding, which widens the index space but keeps the
     # allocator page at the physical page.
-    if (_is_hip or _is_cuda) and get_parallel().dcp_enabled:
+    if (_is_hip or _is_cuda or _is_xpu or _is_npu) and get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
+
+
+def _prefix_kv_indices(batch: ScheduleBatch, req: Req) -> torch.Tensor:
+    # A request holding its row (a later chunk, a borrowed session record)
+    # already has its prefix there; a new one reads its match off the tree.
+    if req.kv.holds_kv:
+        row = batch.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+        return row[: req.prefix_len].to(torch.int64)
+    if req.prefix_len == 0:
+        return _EMPTY_PREFIX
+    return batch.tree_cache.prefix_device_indices(req)
 
 
 def alloc_for_extend(
@@ -354,7 +333,7 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
-    prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    prefix_tensors = [_prefix_kv_indices(batch, r) for r in batch.reqs]
 
     reuse_kv = None
     if batch.is_dllm():
@@ -371,14 +350,28 @@ def alloc_for_extend(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
+    storage = kv_storage_of(
+        batch.req_to_token_pool,
+        batch.token_to_kv_pool_allocator,
+        tree_cache=batch.tree_cache,
+        batch=batch,
+    )
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, batch.reqs, batch.tree_cache
+        storage,
+        batch.token_to_kv_pool_allocator.state,
+        batch.reqs,
+        batch.tree_cache,
     )
     req_pool_indices_cpu = torch.tensor(
         req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
     )
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+
+    # Admission already charged HiSparse scratch; allocate it with the request
+    # slot so subsequent scheduling sees the remaining physical capacity.
+    if batch.hisparse_coordinator is not None:
+        batch.hisparse_coordinator.allocate_spec_scratch(req_pool_indices)
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)
@@ -386,6 +379,7 @@ def alloc_for_extend(
         out_cache_loc = _alloc_extend_loc_with_kv_reuse(
             batch,
             reuse_kv,
+            prefix_tensors,
             req_pool_indices_cpu,
             prefix_lens_cpu,
             extend_lens_cpu,
@@ -432,7 +426,7 @@ def alloc_for_extend(
             target_seq_lens_cpu=batch.seq_lens_cpu,
         )
     except Exception:
-        batch.tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
+        storage.free_tokens(out_cache_loc)
         raise
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
@@ -447,6 +441,7 @@ def alloc_for_extend(
     for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
         req.kv.kv_allocated_len = seq_len
         req.kv.kv_committed_len = seq_len
+        batch.tree_cache.maybe_hand_to_session(req)
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
@@ -454,6 +449,7 @@ def alloc_for_extend(
 def _alloc_extend_loc_with_kv_reuse(
     batch: ScheduleBatch,
     reuse_kv: list[bool],
+    prefix_tensors: list[torch.Tensor],
     req_pool_indices_cpu: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
     extend_lens_cpu: torch.Tensor,
@@ -497,7 +493,7 @@ def _alloc_extend_loc_with_kv_reuse(
             )
             last_loc = [
                 (t[-1:] if len(t) > 0 else torch.tensor([-1], device=device))
-                for t in (r.prefix_indices for r in batch.reqs)
+                for t in prefix_tensors
             ]
             fresh_slots = alloc_paged_token_slots_extend(
                 tree_cache=batch.tree_cache,
@@ -541,34 +537,13 @@ def alloc_paged_token_slots_decode(
     batch=None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
-    allocator = tree_cache.token_to_kv_pool_allocator
-    # Over estimate the number of tokens: assume each request needs a new page.
-    num_tokens = len(seq_lens) * allocator.page_size
-    evict_from_tree_cache(tree_cache, num_tokens)
-
-    # DSV4-NPU allocator also needs req_pool_indices for C128 KV allocation and
-    # returns a DSV4OutCacheLoc bundle; hasattr-gated so others stay unchanged.
-    is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
-    extra_alloc_kwargs = {}
-    if is_dsv4:
-        c128_num_pages = allocator.c128_num_pages_needed(
-            (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu
-        )
-        allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
-        extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
-        # Per-call per-req C128 table for the last_loc lookup.
-        if batch is not None:
-            extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
-
-    out = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs)
-
-    if is_dsv4:
-        bundle = out
-        out_cache_loc = None if bundle is None else bundle.out_full_loc
-        if batch is not None:
-            batch.out_cache_loc_dsv4 = bundle
-    else:
-        out_cache_loc = out
+    out_cache_loc = _storage(tree_cache, batch).take_decode(
+        rows=req_pool_indices,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        last_loc=last_loc,
+        make_room=_room_in(tree_cache),
+    )
 
     if out_cache_loc is None:
         error_msg = (
@@ -584,7 +559,7 @@ def alloc_paged_token_slots_decode(
     return out_cache_loc
 
 
-def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     Allocate KV cache for decode batch and write to req_to_token_pool.
 
@@ -630,6 +605,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     if _is_npu:
         maybe_write_dsv4_decode(
             batch,
+            batch.req_pool_indices_cpu,
             batch.seq_lens_cpu + token_per_req,
             token_per_req,
         )
@@ -640,7 +616,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             target_seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
         )
     except Exception:
-        batch.tree_cache.token_to_kv_pool_allocator.free(out_cache_loc)
+        _storage(batch.tree_cache, batch).free_tokens(out_cache_loc)
         raise
 
     for req in batch.reqs:
@@ -683,6 +659,17 @@ def assign_req_to_token_pool(
         tl.store(token_pool + save_offset, data, mask=mask)
         save_offset += BLOCK_SIZE
         load_offset += BLOCK_SIZE
+
+
+ALLOC_FOR_DECODE_FUNCS = defaultdict(lambda: alloc_for_decode_default)
+
+
+def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+    return ALLOC_FOR_DECODE_FUNCS[_device_type(batch)](batch, token_per_req)
+
+
+def _device_type(batch: ScheduleBatch) -> str:
+    return torch.device(batch.device).type
 
 
 def assign_req_to_token_pool_func(
@@ -748,20 +735,41 @@ def alloc_for_spec_decode(
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
             )
-            device_type = getattr(
-                batch.device, "type", str(batch.device).split(":", 1)[0]
-            )
-            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-                tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-                req_pool_indices=req_pool_indices,
-                batch=batch,
-            )
+            allocator = tree_cache.token_to_kv_pool_allocator
+            if batch is not None and batch.hisparse_coordinator is not None:
+                # Spec decode reserves logical target slots here. Target verify
+                # later binds those slots to HiSparse's extra page; allocating
+                # target physical pages first both wastes memory and breaks the
+                # physical paged allocator's last_loc chain after the reserve is
+                # released. Draft KV has its own logical GPU-page mapping.
+                evict_from_tree_cache(
+                    tree_cache,
+                    num_needed_tokens + len(nxt_kv_lens_cpu) * allocator.page_size,
+                )
+                out_cache_loc = allocator.alloc_logical_only(
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                )
+                if out_cache_loc is None:
+                    raise RuntimeError(
+                        "HiSparse spec decode failed to allocate logical KV slots."
+                    )
+            else:
+                out_cache_loc = ALLOC_EXTEND_FUNCS[_device_type(batch)](
+                    tree_cache,
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                    req_pool_indices=req_pool_indices,
+                    batch=batch,
+                )
         # Updating req_to_token is a write to a shared tensor: it must not overlap
         # with the previous batch's forward, which also reads req_to_token.
         assign_req_to_token_pool_func(
