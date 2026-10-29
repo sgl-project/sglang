@@ -249,6 +249,7 @@ OTHER_SUITES = {
 _SUITE_CHECKED_BACKENDS = {
     HWBackend.CUDA,
     HWBackend.CPU,
+    HWBackend.AMD,
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
@@ -275,7 +276,14 @@ def validate_all_suites(all_tests: List[CIRegistry]):
     for t in all_tests:
         if t.backend not in _SUITE_CHECKED_BACKENDS:
             continue
-        valid = valid_by_backend.get(t.backend, set())
+        # Legacy AMD nightly jobs also invoke files directly, so their suite
+        # inventory is not yet complete. PR registrations must name a real lane.
+        if t.backend == HWBackend.AMD:
+            if t.nightly:
+                continue
+            valid = set(PER_COMMIT_SUITES[HWBackend.AMD])
+        else:
+            valid = valid_by_backend.get(t.backend, set())
         if t.effective_suite not in valid:
             errors.append(
                 f"  {t.filename}: backend={t.backend.name}, suite='{t.effective_suite}'"

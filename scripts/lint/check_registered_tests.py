@@ -90,6 +90,26 @@ def taxonomy_errors(path: str, tree: ast.AST) -> list[str]:
     return []
 
 
+def declared_amd_pr_suites() -> set[str]:
+    """Read the dispatch catalog without importing the GPU test harness."""
+    with open("test/run_suite.py", encoding="utf-8") as source:
+        tree = ast.parse(source.read())
+    for stmt in tree.body:
+        if not (
+            isinstance(stmt, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "PER_COMMIT_SUITES"
+                for target in stmt.targets
+            )
+            and isinstance(stmt.value, ast.Dict)
+        ):
+            continue
+        for key, suites in zip(stmt.value.keys, stmt.value.values):
+            if isinstance(key, ast.Attribute) and key.attr == "AMD":
+                return set(ast.literal_eval(suites))
+    raise ValueError("PER_COMMIT_SUITES must declare AMD PR suites")
+
+
 def main() -> int:
     # Import ci_register directly to avoid pulling in all of sglang
     spec = importlib.util.spec_from_file_location(
@@ -99,6 +119,8 @@ def main() -> int:
     ci_register = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ci_register)
     cuda = ci_register.HWBackend.CUDA
+    amd = ci_register.HWBackend.AMD
+    amd_pr_suites = declared_amd_pr_suites()
 
     # Same exclusion as run_suite.py: pytest+package structure files.
     files = sorted(
@@ -114,6 +136,7 @@ def main() -> int:
     non_dispatchable = []  # (file, suite) -- legacy CUDA suite no workflow invokes
     dead_tests = []  # (file) -- TestCase classes that `python3 file.py` never runs
     taxonomy_violations = []
+    invalid_amd_pr = []
     for f in files:
         try:
             registries, _has_main_entry = ci_register.ut_parse_one_file(f)
@@ -130,6 +153,12 @@ def main() -> int:
         if _defines_testcase(tree) and not _main_runs_tests(tree):
             dead_tests.append(f)
         for r in registries:
+            if (
+                r.backend == amd
+                and not r.nightly
+                and r.effective_suite not in amd_pr_suites
+            ):
+                invalid_amd_pr.append((f, r.effective_suite))
             # Pure legacy form on a CUDA registry: suite set, stage/runner unset.
             if not (
                 r.backend == cuda
@@ -147,6 +176,12 @@ def main() -> int:
                 non_dispatchable.append((f, r.suite))
 
     exit_code = 0
+    if invalid_amd_pr:
+        print("ERROR: AMD PR registrations name undeclared suites:")
+        for f, suite in invalid_amd_pr:
+            print(f"  {f}: {suite}")
+        print("  Choose an AMD suite from PER_COMMIT_SUITES in test/run_suite.py.\n")
+        exit_code = 1
     if missing:
         print("ERROR: Files in test/registered/ missing CI registry call:")
         print("  Move manual-only tests to test/manual/.\n")
