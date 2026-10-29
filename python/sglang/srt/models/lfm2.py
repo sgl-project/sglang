@@ -252,6 +252,9 @@ def shortconv_target_verify(
         conv_state_indices=meta.cache_indices,
         intermediate_conv_window=meta.layer_cache.intermediate_conv_window[0],
         intermediate_state_indices=conv._intermediate_state_indices[:bs],
+        retrieve_next_token=meta.retrieve_next_token,
+        retrieve_next_sibling=meta.retrieve_next_sibling,
+        retrieve_parent_token=meta.retrieve_parent_token,
     )
     return conv_out.transpose(1, 2).reshape(bs * draft_token_num, -1)
 
