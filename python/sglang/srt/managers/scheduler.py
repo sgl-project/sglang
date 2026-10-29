@@ -924,6 +924,7 @@ class Scheduler(
         ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
+                import_processors("sglang.srt.multimodal.token_space_mm_process.models")
                 self._mm_processor = get_mm_processor(
                     self.model_config.hf_config,
                     server_args,
