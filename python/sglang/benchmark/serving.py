@@ -27,7 +27,6 @@ import traceback
 import uuid
 import warnings
 from argparse import ArgumentParser
-from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -428,16 +427,6 @@ async def async_request_openai_chat_completions(
         "OpenAI Chat Completions API URL must end with 'chat/completions'."
     )
 
-    # TODO put it to other functions when `pbar` logic is refactored
-    if getattr(args, "print_requests", False):
-        rid = str(uuid.uuid4())
-        input_partial = deepcopy(request_func_input)
-        input_partial.prompt = "..."
-        request_start_time = time.time()
-        print(
-            f'rid={rid} time={request_start_time} message="request start" request_func_input="{str(input_partial)}"'
-        )
-
     if isinstance(request_func_input.prompt, list):
         messages = request_func_input.prompt
     elif request_func_input.image_data:
@@ -594,15 +583,6 @@ async def async_request_openai_chat_completions(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
-
-    # TODO put it to other functions when `pbar` logic is refactored
-    if getattr(args, "print_requests", False):
-        curr_t = time.time()
-        output_partial = deepcopy(output)
-        output_partial.generated_text = "..."
-        print(
-            f'rid={rid} time={curr_t} time_delta={curr_t - request_start_time} message="request end" output="{str(output_partial)}"'
-        )
 
     if pbar:
         pbar.update(1)
@@ -1380,6 +1360,41 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
     return f
 
 
+def wrap_request_func_with_logging(request_func: Callable) -> Callable:
+    """Log one start/end pair per request, including all rounds of a conversation."""
+
+    async def f(request_func_input: RequestFuncInput, pbar: Optional[tqdm] = None):
+        rid = str(uuid.uuid4())
+        input_partial = replace(request_func_input, prompt="...")
+        request_start_time = time.time()
+        print(
+            f'rid={rid} time={request_start_time} message="request start" request_func_input="{input_partial}"'
+        )
+
+        output = None
+        try:
+            output = await request_func(request_func_input, pbar=pbar)
+            return output
+        finally:
+            # Preserve the result objects used for metrics and multi-turn replay.
+            # None means the request raised or was cancelled before returning.
+            if isinstance(output, list):
+                output_partial = [
+                    replace(item, generated_text="...", text_chunks=[])
+                    for item in output
+                ]
+            elif output is not None:
+                output_partial = replace(output, generated_text="...", text_chunks=[])
+            else:
+                output_partial = None
+            curr_t = time.time()
+            print(
+                f'rid={rid} time={curr_t} time_delta={curr_t - request_start_time} message="request end" output="{output_partial}"'
+            )
+
+    return f
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -1426,6 +1441,9 @@ async def benchmark(
         )
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
+
+    if getattr(args, "print_requests", False):
+        request_func = wrap_request_func_with_logging(request_func)
 
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
@@ -2045,9 +2063,6 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "goodput"):
         args.goodput = None
 
-    if getattr(args, "print_requests", False):
-        assert args.backend == "sglang-oai-chat"  # only support this now
-
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -2504,7 +2519,8 @@ def cli_main():
     parser.add_argument(
         "--print-requests",
         action="store_true",
-        help="Print requests immediately during benchmarking. Useful to quickly realize issues.",
+        help="Print one start/end pair per request in the Python benchmark client. "
+        "Multi-turn conversations share one request ID across all turns.",
     )
     parser.add_argument(
         "--disable-tqdm",
