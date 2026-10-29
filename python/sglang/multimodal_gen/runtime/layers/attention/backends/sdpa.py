@@ -19,6 +19,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 logger = init_logger(__name__)
 
@@ -343,12 +346,14 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
         if self._is_sm100:
             # B200/sm_100: cuDNN SDPA measured 1.25-1.5x faster than FA4 CuTe
             # for dense non-causal diffusion attention, both self-attn
-            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len). A side
-            # shorter than one 128-row tile while the other is not drops cuDNN to
-            # an sm80 kernel that FA4 beats 2-3x (B300, 126 x 1536 tokens:
-            # 24.9 vs 12.1 us)
+            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len).
+            # FA4's faster sub-tile kernel pays off in captured segments, but
+            # its host dispatch loses to cuDNN in eager (including BCG breaks).
+            # The BCG scope includes warmup, so FA4 is primed before capture.
             short_side, long_side = sorted((query.shape[1], key.shape[1]))
-            return short_side >= 128 or long_side < 128
+            return (
+                short_side >= 128 or long_side < 128 or not is_in_breakable_cuda_graph()
+            )
         if query.shape[1] != key.shape[1]:
             return False
         return query.shape[-1] == 64 and query.shape[1] == 1024 and query.shape[0] >= 4
