@@ -2357,10 +2357,11 @@ class CommonKVSender(BaseKVSender):
         # Hold Success until all staging chunks transferred. With deferred
         # allocation also wait for worker cleanup (the zero entry is only
         # removed after cleanup), before permitting the room to be reused.
-        if status == KVPoll.Success and (
+        if status in (KVPoll.Success, KVPoll.Failed) and (
             self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
             or (
-                self.kv_mgr.defer_decode_allocation
+                status == KVPoll.Success
+                and self.kv_mgr.defer_decode_allocation
                 and self.bootstrap_room in self.kv_mgr._staging_outstanding
             )
         ):
@@ -2463,7 +2464,7 @@ class CommonKVSender(BaseKVSender):
             "Aborted by AbortReq.",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        self.conclude_state = KVPoll.Failed
+        self.conclude_state = None
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 
