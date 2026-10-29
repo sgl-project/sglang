@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.minimax_sparse_ops.msa_plan import (
     MSAV1DecodeAttentionPlan,
     MSAV1DecodeIndexerPlan,
     MSAV1PrefillPlan,
+    msa_v1_qmul4_decode_capability,
 )
 from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
     MiniMaxM3Nvfp4IndexKPool,
@@ -236,6 +237,13 @@ def test_decode_indexer_and_attention_match(caches, fallback, query_length):
 @requires_msa
 @pytest.mark.parametrize("prefer_qmul4", [True, False])
 def test_prefill_indexer_and_attention_match(caches, prefer_qmul4):
+    if prefer_qmul4:
+        # The backend gates both plans on this probe. The QMUL4 prefill wrapper
+        # JIT-builds on first use and raises when a prerequisite is missing,
+        # where the decode plans fall back on their own.
+        available, reason = msa_v1_qmul4_decode_capability()
+        if not available:
+            pytest.skip(f"QMUL4 is unavailable: {reason}")
     gs = caches.main.global_scale
     q_lens = [37, 130]
     total_q = sum(q_lens)
