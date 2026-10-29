@@ -332,8 +332,9 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
-# uTLX: ROCm/triton#978 keeps libtriton's LLVM apart from the SDK's libLLVM.
-# UTLX_TRITON_ROCM selects uTLX's Triton release/3.8 code.
+# uTLX (see the uTLX step): ROCm/triton#983 versions libtriton's exported
+# symbols so they stay apart from the SDK's libLLVM. May be removed once the
+# SDK's Triton has it. UTLX_TRITON_ROCM selects uTLX's Triton release/3.8 code.
 ENV BUILD_UTLX="1"
 ENV UTLX_TRITON_PATCH="triton-ext-llvm-symbols-gfx950.patch"
 ENV UTLX_TRITON_ROCM="1"

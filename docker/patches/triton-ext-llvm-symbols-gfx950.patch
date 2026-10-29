@@ -1,48 +1,22 @@
-From ea2482df04a608156c5778db4adfd0942c66df1e Mon Sep 17 00:00:00 2001
-From: Xinyi Song <xinyisong0111@gmail.com>
-Date: Mon, 19 Oct 2026 13:49:36 -0700
-Subject: [PATCH] Fix LLVM symbol clash in TRITON_EXT_ENABLED builds (#978)
-
----
- CMakeLists.txt            |  3 +++
- lib/Tools/PluginUtils.cpp | 10 +++++-----
- 2 files changed, 8 insertions(+), 5 deletions(-)
-
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 3f066ea..2e1efe5 100644
+index 3f066ea91..08f1bbfbe 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -439,4 +439,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
+@@ -454,6 +454,17 @@ if(TRITON_BUILD_PYTHON_MODULE)
+     endif()
+     file(GENERATE OUTPUT "${TRITON_EXPORT_SYMBOLS_FILE}"
+       CONTENT "${TRITON_EXPORT_SYMBOLS_FILE_CONTENT}")
++  elseif(UNIX AND NOT APPLE)
++    # Extensions use the Triton and LLVM symbols libtriton exports. Put them all
++    # under a TRITON symbol version, so that neither libtriton nor an extension
++    # linked against it binds to another LLVM in the process, such as a
++    # libLLVM.so loaded RTLD_GLOBAL (ROCm's, which torch preloads, versions its
++    # symbols LLVM_<major>). Not available on macOS or Windows.
++    set(TRITON_EXPORT_SYMBOLS_FILE "${CMAKE_CURRENT_BINARY_DIR}/triton.exports")
++    file(GENERATE OUTPUT "${TRITON_EXPORT_SYMBOLS_FILE}"
++      CONTENT "TRITON {\n  global:\n    *;\n};\n")
++    target_link_options(triton PRIVATE
++      "LINKER:--version-script,${TRITON_EXPORT_SYMBOLS_FILE}")
    endif()
-   target_link_options(triton PRIVATE ${LLVM_LDFLAGS})
-+  if(TRITON_EXT_ENABLED AND UNIX AND NOT APPLE)
-+    target_link_options(triton PRIVATE "LINKER:-Bsymbolic")
-+  endif()
-
-   if(NOT TRITON_EXT_ENABLED)
-diff --git a/lib/Tools/PluginUtils.cpp b/lib/Tools/PluginUtils.cpp
-index 5dc41b2..be88e9e 100644
---- a/lib/Tools/PluginUtils.cpp
-+++ b/lib/Tools/PluginUtils.cpp
-@@ -3,4 +3,5 @@
- #include "llvm/Support/Debug.h"
- #include "llvm/Support/Error.h"
-+#include <dlfcn.h>
-
- #define DEBUG_TYPE "triton-plugins"
-@@ -30,11 +31,10 @@ static bool isTritonAndPluginsVersionsMatch(const std::string &pluginVersion) {
-
- llvm::Expected<TritonPlugin> TritonPlugin::load(const std::string &filename) {
--  std::string error;
--  auto library =
--      llvm::sys::DynamicLibrary::getPermanentLibrary(filename.c_str(), &error);
--  if (!library.isValid())
-+  void *handle = ::dlopen(filename.c_str(), RTLD_NOW | RTLD_LOCAL);
-+  if (!handle)
-     return llvm::make_error<llvm::StringError>(
--        Twine("Could not load library '") + filename + "': " + error,
-+        Twine("Could not load library '") + filename + "': " + ::dlerror(),
-         llvm::inconvertibleErrorCode());
-+  llvm::sys::DynamicLibrary library(handle);
-
-   TritonPlugin plugin{filename, library};
+ 
+   install(TARGETS triton

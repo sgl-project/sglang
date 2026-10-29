@@ -1,10 +1,3 @@
-From 4392079b32b64fa160428588daa55a3013a6ea6b Mon Sep 17 00:00:00 2001
-From: Xinyi Song <xinyisong0111@gmail.com>
-Subject: [PATCH] [AMD] Fix LLVM symbol clash in TRITON_EXT_ENABLED builds
-
-triton-lang/triton#12371, not merged yet: its two commits (7978c09, 4392079b)
-as one diff against its base 2122e24e.
-
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 6161d34..57e6c50 100644
 --- a/CMakeLists.txt
