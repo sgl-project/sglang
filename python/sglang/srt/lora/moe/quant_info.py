@@ -98,38 +98,65 @@ def _admit_fp8_block_weights(quant_info: MoeLoraFp8QuantInfo) -> None:
 StandardLayoutQuantInfo = MoeLoraBf16QuantInfo | MoeLoraFp8QuantInfo
 
 
-class MoeLoraNvFp4MarlinQuantInfo(msgspec.Struct, kw_only=True):
-    """Prepared Marlin W4A16 for BF16 activations and global scales."""
+class MoeLoraMarlinQuantInfo(msgspec.Struct, kw_only=True):
+    """Prepared Marlin W4A16 tiles for BF16 activations."""
 
     w13_qweight: torch.Tensor
     w2_qweight: torch.Tensor
     w13_scales: torch.Tensor
     w2_scales: torch.Tensor
-    w13_global_scale: torch.Tensor
-    w2_global_scale: torch.Tensor
     num_local_experts: int
     intermediate_size: int
     hidden_size: int
     gate_up_slices: int
 
-    @classmethod
-    def from_layer(cls, base_layer: FusedMoE) -> MoeLoraNvFp4MarlinQuantInfo:
+    @staticmethod
+    def _prepared_fields(base_layer: FusedMoE, scheme: str) -> dict:
         if base_layer.params_dtype != torch.bfloat16:
-            raise NotImplementedError("NVFP4 MoE LoRA requires BF16 activations.")
+            raise NotImplementedError(f"{scheme} MoE LoRA requires BF16 activations.")
         for name in ("w13_weight", "w2_weight"):
             if getattr(base_layer, name).dtype != torch.int32:
                 raise ValueError(
-                    f"NVFP4 MoE LoRA requires already-prepared Marlin {name}."
+                    f"{scheme} MoE LoRA requires already-prepared Marlin {name}."
                 )
-        return cls(
+        return dict(
             w13_qweight=base_layer.w13_weight,
             w2_qweight=base_layer.w2_weight,
             w13_scales=base_layer.w13_weight_scale,
             w2_scales=base_layer.w2_weight_scale,
-            w13_global_scale=base_layer.w13_weight_scale_2,
-            w2_global_scale=base_layer.w2_weight_scale_2,
             num_local_experts=int(base_layer.num_local_experts),
             intermediate_size=int(base_layer.intermediate_size_per_partition),
             hidden_size=int(base_layer.hidden_size),
             gate_up_slices=2 if base_layer.moe_runner_config.is_gated else 1,
         )
+
+
+class MoeLoraNvFp4MarlinQuantInfo(MoeLoraMarlinQuantInfo):
+    """Group-16 E4M3 scales under per-expert global scales."""
+
+    w13_global_scale: torch.Tensor
+    w2_global_scale: torch.Tensor
+
+    @classmethod
+    def from_layer(cls, base_layer: FusedMoE) -> MoeLoraNvFp4MarlinQuantInfo:
+        return cls(
+            w13_global_scale=base_layer.w13_weight_scale_2,
+            w2_global_scale=base_layer.w2_weight_scale_2,
+            **cls._prepared_fields(base_layer, "NVFP4"),
+        )
+
+
+class MoeLoraMxfp4MarlinQuantInfo(MoeLoraMarlinQuantInfo):
+    """Group-32 E8M0 scales without a global scale."""
+
+    @classmethod
+    def from_layer(cls, base_layer: FusedMoE) -> MoeLoraMxfp4MarlinQuantInfo:
+        quant_info = cls(**cls._prepared_fields(base_layer, "MXFP4"))
+        # The loader pads the hidden width to 256; the stages address real columns.
+        padded_hidden = quant_info.w13_qweight.shape[1] * 16
+        if padded_hidden != quant_info.hidden_size:
+            raise NotImplementedError(
+                "MXFP4 MoE LoRA requires hidden_size % 256 == 0, got "
+                f"{quant_info.hidden_size} (padded to {padded_hidden})"
+            )
+        return quant_info

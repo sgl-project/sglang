@@ -42,6 +42,91 @@ class TestNvFp4PreparedQuantInfo(CustomTestCase):
             self.assertIs(getattr(layer, name), value)
 
 
+class TestMxfp4PreparedQuantInfo(CustomTestCase):
+    @staticmethod
+    def _layer(**overrides):
+        def e8m0(*shape):
+            return torch.zeros(shape, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+
+        layer = SimpleNamespace(
+            params_dtype=torch.bfloat16,
+            w13_weight=torch.zeros((2, 16, 512), dtype=torch.int32),
+            w2_weight=torch.zeros((2, 8, 512), dtype=torch.int32),
+            w13_weight_scale=e8m0(2, 8, 256),
+            w2_weight_scale=e8m0(2, 4, 256),
+            moe_runner_config=SimpleNamespace(is_gated=True),
+            num_local_experts=2,
+            intermediate_size_per_partition=128,
+            hidden_size=256,
+        )
+        vars(layer).update(overrides)
+        return layer
+
+    def test_non_bf16_activations_fail_without_mutation(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraMxfp4MarlinQuantInfo
+
+        layer = self._layer(params_dtype=torch.float16)
+        original = vars(layer).copy()
+        with self.assertRaisesRegex(NotImplementedError, "BF16 activations"):
+            MoeLoraMxfp4MarlinQuantInfo.from_layer(layer)
+        for name, value in original.items():
+            self.assertIs(getattr(layer, name), value)
+
+    def test_binds_logical_sizes_from_prepared_tiles(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraMxfp4MarlinQuantInfo
+
+        quant_info = MoeLoraMxfp4MarlinQuantInfo.from_layer(self._layer())
+        self.assertEqual(
+            (
+                quant_info.hidden_size,
+                quant_info.intermediate_size,
+                quant_info.gate_up_slices,
+            ),
+            (256, 128, 2),
+        )
+
+    def test_loader_padded_hidden_width_is_rejected(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraMxfp4MarlinQuantInfo
+
+        # The loader rounds the hidden width to 256; stages address real columns.
+        with self.assertRaisesRegex(NotImplementedError, "hidden_size % 256"):
+            MoeLoraMxfp4MarlinQuantInfo.from_layer(self._layer(hidden_size=200))
+
+
+class TestVendorResolution(CustomTestCase):
+    def test_family_default_serves_vendors_except_marlin(self):
+        """The family default serves a vendor without a provider, except Marlin:
+        only lora_marlin prepares its tiles, so no other backend gets them."""
+        from sglang.srt.lora.moe.base_gemm_provider import resolve_vendor
+
+        self.assertEqual(resolve_vendor("mxfp4", "marlin"), "marlin")
+        self.assertEqual(resolve_vendor("bf16", "marlin"), "cutedsl")
+        self.assertEqual(resolve_vendor("bf16", "triton"), "triton")
+        with self.assertRaisesRegex(NotImplementedError, "use lora_marlin$"):
+            resolve_vendor("mxfp4", "cutedsl")
+
+    def test_lora_runners_never_fold_routed_scaling(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import (
+            _fuses_routed_scaling_factor_in_topk,
+        )
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+            Mxfp4MarlinMoEMethod,
+        )
+
+        # The method folds for its fused runner; the LoRA finalize owns it.
+        method = object.__new__(Mxfp4MarlinMoEMethod)
+        self.assertTrue(
+            _fuses_routed_scaling_factor_in_topk(method, MoeRunnerBackend.MARLIN)
+        )
+        for backend in (
+            MoeRunnerBackend.LORA_MARLIN,
+            MoeRunnerBackend.LORA_CUTEDSL,
+            MoeRunnerBackend.LORA_TRITON,
+        ):
+            self.assertFalse(_fuses_routed_scaling_factor_in_topk(method, backend))
+
+
 class TestProviderGeometry(CustomTestCase):
     def test_triton_fp8_k_tiles_stay_within_scale_groups(self):
         from sglang.srt.lora.moe.base_gemm_provider.triton_bf16 import (

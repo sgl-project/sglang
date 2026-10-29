@@ -207,7 +207,8 @@ def check_lora_moe_runner_args(server_args: Any):
     if cfg.quantization not in (None, "fp8", "modelopt_fp4"):
         raise ValueError(
             f"--moe-runner-backend {backend} supports unquantized BF16, 128-block "
-            f"FP8 and ModelOpt NVFP4 MoE, got --quantization {cfg.quantization}"
+            "FP8 (with BF16 or MXFP4 experts) and ModelOpt NVFP4 MoE, got "
+            f"--quantization {cfg.quantization}"
         )
     if cfg.quantization == "modelopt_fp4" and backend != "lora_marlin":
         raise ValueError(

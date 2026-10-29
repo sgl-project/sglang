@@ -518,11 +518,15 @@
       ]
     },
     {
-      "name": "decode.shared.nvfp4",
+      "name": "decode.shared.marlin",
       "layout": "shared",
       "phase": "decode",
       "quant": [
-        "nvfp4"
+        "nvfp4",
+        "mxfp4"
+      ],
+      "vendor": [
+        "marlin"
       ],
       "base_gemm_rows": "expert_major",
       "plan": {

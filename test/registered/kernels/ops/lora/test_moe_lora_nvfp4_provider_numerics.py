@@ -206,7 +206,7 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
                 activation="relu2",
             )
             # Padding must be cleared even when its reusable storage is poisoned.
-            state.padded_intermediate[:, intermediate:].fill_(float("nan"))
+            state.padded_act[:, intermediate:].fill_(float("nan"))
             provider.down(state, act, down)
             down_delta = delta(a2, b2, act_pairs.flatten(0, 1).float()).to(
                 torch.bfloat16
@@ -250,7 +250,7 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
 def test_nvfp4_shared_outer_decode_plan_matches_reference(
     monkeypatch: pytest.MonkeyPatch, slices: int
 ) -> None:
-    """Run the sm100 ``decode.shared.nvfp4`` row end to end: token_dense gate/up-A
+    """Run the sm100 ``decode.shared.marlin`` row end to end: token_dense gate/up-A
     planes selected by per_row B, Marlin base GEMMs, per_row down-A, and the
     shared one-pass finalize. Eager first, then a graph replayed with changed
     adapter slots, routing, and inputs.
@@ -259,7 +259,7 @@ def test_nvfp4_shared_outer_decode_plan_matches_reference(
     device = torch.device("cuda")
     major = torch.cuda.get_device_capability(device)[0]
     if major != 10:
-        pytest.skip("decode.shared.nvfp4 is an sm100 plan row")
+        pytest.skip("decode.shared.marlin is an sm100 plan row")
     monkeypatch.setattr(
         MoeLoraRunner, "_allocate_output", _standalone_output_allocation
     )
@@ -282,12 +282,13 @@ def test_nvfp4_shared_outer_decode_plan_matches_reference(
         hidden_size=_H,
         num_local_experts=_E,
         quant_family="nvfp4",
+        vendor="marlin",
     )[Phase.DECODE]
     assert (
         selected.name,
         selected.plan.gate_up_a.family,
         selected.plan.gate_up_b.family,
-    ) == ("decode.shared.nvfp4", AFamily.TOKEN_DENSE, BFamily.PER_ROW)
+    ) == ("decode.shared.marlin", AFamily.TOKEN_DENSE, BFamily.PER_ROW)
     provider = select_provider_cls(selected.base_gemm_rows, "nvfp4", "marlin")(
         quant_info
     )

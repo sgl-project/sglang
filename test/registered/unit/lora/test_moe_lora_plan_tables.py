@@ -47,7 +47,29 @@ def _resolve():
         activation=ActivationFn.SILU,
         hidden_size=4096,
         num_local_experts=256,
+        vendor="cutedsl",
     )
+
+
+def test_vendor_rows_serve_only_their_vendor():
+    """The Marlin decode row serves both FP4 families; other vendors skip it."""
+
+    def decode_row(quant_family, vendor):
+        return ep.resolve_plans(
+            quant_family=quant_family,
+            vendor=vendor,
+            architecture="sm100",
+            is_shared_outer=True,
+            physical_rank=16,
+            activation=ActivationFn.SILU,
+            hidden_size=4096,
+            num_local_experts=256,
+        )[ep.Phase.DECODE].name
+
+    assert decode_row("nvfp4", "marlin") == "decode.shared.marlin"
+    assert decode_row("mxfp4", "marlin") == "decode.shared.marlin"
+    assert decode_row("nvfp4", "cutedsl") == "decode.shared"
+    assert decode_row("bf16", "marlin") == "decode.shared"
 
 
 @pytest.mark.parametrize(
