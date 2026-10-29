@@ -1730,22 +1730,26 @@ def test_qwen21_bf16_mlp_packing_restore_and_lora(tokens):
         "fused_packed_silu_mul_bitexact",
         wraps=qwen_image21.fused_packed_silu_mul_bitexact,
     ) as fused:
-        torch.testing.assert_close(mlp(x, True), reference, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(
+            mlp(x, use_packed_bf16=True), reference, atol=2e-2, rtol=2e-2
+        )
         assert fused.call_count == 1
         assert torch.equal(mlp(x), reference)
         prefix = x[:, :33].contiguous()
-        assert torch.equal(mlp(prefix, True), mlp(prefix))
+        assert torch.equal(mlp(prefix, use_packed_bf16=True), mlp(prefix))
         assert fused.call_count == 1
 
         compiled = torch.compile(mlp, backend="eager", fullgraph=True)
-        assert torch.equal(compiled(x, True), reference)
+        assert torch.equal(compiled(x, use_packed_bf16=True), reference)
         assert fused.call_count == 1
 
         mlp.cpu().cuda()
-        torch.testing.assert_close(mlp(x, True), reference, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(
+            mlp(x, use_packed_bf16=True), reference, atol=2e-2, rtol=2e-2
+        )
         assert fused.call_count == 2
         mlp.proj.weight.data = mlp.proj.weight.data.clone()
-        assert torch.equal(mlp(x, True), reference)
+        assert torch.equal(mlp(x, use_packed_bf16=True), reference)
         assert fused.call_count == 2
         mlp.pack_gate_up_weights()
 
@@ -1758,7 +1762,7 @@ def test_qwen21_bf16_mlp_packing_restore_and_lora(tokens):
         mlp.gate_layer = wrapper
         adapted = mlp(x)
         assert not torch.equal(adapted, reference)
-        assert torch.equal(mlp(x, True), adapted)
+        assert torch.equal(mlp(x, use_packed_bf16=True), adapted)
         assert fused.call_count == 2
 
 

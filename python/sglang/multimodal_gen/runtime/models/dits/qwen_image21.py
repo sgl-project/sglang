@@ -441,11 +441,11 @@ class QwenImage21FeedForward(nn.Module):
         self.pack_gate_up_weights()
         return module
 
-    def forward(self, x, pack_bf16=False):
+    def forward(self, x, use_packed_bf16=False):
         # GEMM width can change rounding. Only use the measured target lengths;
         # exact/lossless and conditioning prefixes keep separate projections.
         if (
-            pack_bf16
+            use_packed_bf16
             and not torch.compiler.is_compiling()
             and x.dim() == 3
             and x.shape[0] == 1
@@ -913,7 +913,7 @@ class QwenImage21TransformerBlock(nn.Module):
         ropes,
         caches,
         prefix_pad,
-        pack_bf16_mlp=False,
+        use_packed_bf16_mlp=False,
     ):
         # Cache-DiT's UnifiedBlocks forwards the same args to every layer.
         # Slice here so prefix KV stays per-layer after that wrap.
@@ -940,7 +940,7 @@ class QwenImage21TransformerBlock(nn.Module):
             hidden_states,
             self.img_mlp(
                 apply_modulation(hidden_states, self.img_norm2, scale2),
-                pack_bf16=pack_bf16_mlp,
+                use_packed_bf16=use_packed_bf16_mlp,
             ),
             gate2,
         )
@@ -1094,7 +1094,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         **kwargs,
     ):
         forward_batch = get_forward_context().forward_batch
-        pack_bf16_mlp = forward_batch is not None and quality_allows(
+        use_packed_bf16_mlp = forward_batch is not None and quality_allows(
             forward_batch.sampling_params.quality, "high"
         )
         if isinstance(encoder_hidden_states, list):
@@ -1157,7 +1157,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 ropes,
                 prefix_caches,
                 prefix_pad,
-                pack_bf16_mlp,
+                use_packed_bf16_mlp=use_packed_bf16_mlp,
             )
         output = self.proj_out(self.norm_out(images, temb))
         if sp > 1:
