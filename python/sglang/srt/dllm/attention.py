@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.triton_backend import (
     ForwardMetadata,
     update_sliding_window_buffer,
 )
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,
@@ -206,7 +206,7 @@ class DllmFlashAttention:
             )
         metadata = self._prefill_graph_metadata[key]
         backend._fill_kv_indptr_and_indices(
-            batch.kv_loc_plan,
+            batch.iteration_ids,
             bs,
             batch.extend_prefix_lens,
             batch.req_pool_indices,
@@ -218,8 +218,8 @@ class DllmFlashAttention:
         if metadata.window_kv_indices is not None:
             _, _, _, offsets = update_sliding_window_buffer(
                 metadata.window_kv_indptr,
-                backend.kv_index_translator,
-                batch.kv_loc_plan,
+                backend.runner_ids,
+                batch.iteration_ids,
                 batch.req_pool_indices,
                 backend.sliding_window_size,
                 batch.extend_prefix_lens,
@@ -231,7 +231,7 @@ class DllmFlashAttention:
             metadata.window_kv_offsets.copy_(offsets)
         if metadata.swa_out_cache_loc is not None:
             metadata.swa_out_cache_loc.copy_(
-                backend.kv_index_translator.write_ids(batch, IdSpaceKind.SLIDING_WINDOW)
+                backend.runner_ids.write_ids(batch, IdSpaceKind.SLIDING_WINDOW)
             )
         backend.forward_metadata = metadata
 
@@ -257,11 +257,8 @@ class DllmFlashAttention:
 
     @cache
     def _supports_layer(self, layer, dtype):
-        pool = self.backend.token_to_kv_pool
-        buffers = (
-            pool.get_key_buffer(layer.layer_id),
-            pool.get_value_buffer(layer.layer_id),
-        )
+        kv = self.backend.kv_layers.read(layer.layer_id)
+        buffers = (kv.key(), kv.value())
         return (
             layer.qk_head_dim == layer.v_head_dim
             and layer.qk_head_dim in (256, 512)

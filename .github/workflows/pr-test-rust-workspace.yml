@@ -53,6 +53,11 @@ jobs:
           shared-key: "rust-workspace"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # openai_parity's DeepSeek cases and sglang-server's DeepSeek chat tests
+      # read the pinned checkpoints' tokenizer and config.
+      - name: Cache DeepSeek checkpoint files
+        run: sglang-processor/tests/scripts/cache_deepseek_files.sh
+
       - name: cargo test (workspace)
         run: cargo test --workspace
 

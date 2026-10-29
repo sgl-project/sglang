@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -140,7 +141,7 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         self._active_backend = backend
         self.token_to_kv_pool = backend.token_to_kv_pool
         self.req_to_token_pool = backend.req_to_token_pool
-        self.kv_index_translator = backend.kv_index_translator
+        self.runner_ids = backend.runner_ids
         self.needs_cpu_seq_lens = True
         self._prefill_metadata: DotsSWAMLAPrefillMetadata | None = None
         self._dp_rebuilt_batch_id: int | None = None
@@ -303,8 +304,8 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
             kv_lens.append(tail_len)
 
         full_kv_indices = torch.cat(sliced_indices)
-        kv_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-            full_kv_indices
+        kv_indices = self.runner_ids.ids_in(
+            IdSpaceKind.SLIDING_WINDOW, full_kv_indices
         ).to(torch.int32)
         lens_cpu = torch.tensor([0, *kv_lens], dtype=torch.int32, pin_memory=True)
         self._prefill_metadata = DotsSWAMLAPrefillMetadata(
@@ -323,9 +324,7 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         self, forward_batch: ForwardBatch, layer_id: int
     ):
         assert self._prefill_metadata is not None
-        return self.token_to_kv_pool.get_key_buffer(layer_id)[
-            self._prefill_metadata.kv_indices
-        ]
+        return self.kv_layers.read(layer_id).key()[self._prefill_metadata.kv_indices]
 
     def forward_swa_mla_expanded(self, q, k, v, layer, forward_batch=None):
         """Run dense SWA after Dots expands its compact MLA cache."""
@@ -383,7 +382,7 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
             bs,
         )
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.kv_layers.read(layer.layer_id).key()
         output = forward_dense_kvlora_swa_torch_fallback(
             reshape_q=reshape_q,
             k_cache=k_cache,
@@ -409,7 +408,7 @@ class DotsHybridAttnBackend(AttentionBackend):
         self.swa_backend = swa_backend
         self.token_to_kv_pool = swa_backend.token_to_kv_pool
         self.req_to_token_pool = swa_backend.req_to_token_pool
-        self.kv_index_translator = swa_backend.kv_index_translator
+        self.runner_ids = swa_backend.runner_ids
         # SWA latent expansion uses host sequence-length mirrors.
         self.needs_cpu_seq_lens = True
         self._dp_rebuilt_batch_id: int | None = None
