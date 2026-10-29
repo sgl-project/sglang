@@ -1043,6 +1043,7 @@ class CPUGraphRunner:
     prefill_graphs_bs1: dict = {}
     prefill_dynamic_graph: Optional[Callable] = None
     prefill_dynamic_graph_bs1: Optional[Callable] = None
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
 
     def __init__(self, model_runner: ModelRunner):
         # Parse args
@@ -1313,6 +1314,13 @@ class CPUGraphRunner:
         if forward_batch.forward_mode.is_extend():
             return self._can_run_prefill_graph(forward_batch)
 
+        if getattr(forward_batch, "return_hidden_states_before_norm", False):
+            return False
+        if self.capture_hidden_mode < getattr(
+            forward_batch, "capture_hidden_mode", CaptureHiddenMode.NULL
+        ):
+            return False
+
         skip_cross_attention = self._get_skip_cross_attention(forward_batch)
         graphs = self.graphs if skip_cross_attention else self.graphs_cross
         if forward_batch.batch_size in graphs:
@@ -1554,31 +1562,42 @@ class CPUGraphRunner:
         forward_batch: ForwardBatch,
         include_extend_metadata: bool,
     ) -> None:
-        metadata_fields = [
-            "encoder_lens_cpu",
-            "encoder_cached",
-        ]
+        dynamic_forward_batch.encoder_lens_cpu = copy.copy(
+            getattr(forward_batch, "encoder_lens_cpu", None)
+        )
+        dynamic_forward_batch.encoder_cached = copy.copy(
+            getattr(forward_batch, "encoder_cached", None)
+        )
         if include_extend_metadata:
-            metadata_fields.extend(
-                [
-                    "extend_num_tokens",
-                    "extend_seq_lens_cpu",
-                    "extend_prefix_lens_cpu",
-                    "extend_logprob_start_lens_cpu",
-                    "top_logprobs_nums",
-                    "token_ids_logprobs",
-                    "multi_item_delimiter_indices",
-                    "token_indices_to_pool",
-                    "mamba_prefill_track_mask_cpu",
-                    "mamba_track_seqlens_cpu",
-                ]
+            dynamic_forward_batch.extend_num_tokens = getattr(
+                forward_batch, "extend_num_tokens", None
             )
-        for name in metadata_fields:
-            value = getattr(forward_batch, name, None)
-            setattr(
-                dynamic_forward_batch,
-                name,
-                copy.copy(value) if value is not None else None,
+            dynamic_forward_batch.extend_seq_lens_cpu = copy.copy(
+                getattr(forward_batch, "extend_seq_lens_cpu", None)
+            )
+            dynamic_forward_batch.extend_prefix_lens_cpu = copy.copy(
+                getattr(forward_batch, "extend_prefix_lens_cpu", None)
+            )
+            dynamic_forward_batch.extend_logprob_start_lens_cpu = copy.copy(
+                getattr(forward_batch, "extend_logprob_start_lens_cpu", None)
+            )
+            dynamic_forward_batch.top_logprobs_nums = copy.copy(
+                getattr(forward_batch, "top_logprobs_nums", None)
+            )
+            dynamic_forward_batch.token_ids_logprobs = copy.copy(
+                getattr(forward_batch, "token_ids_logprobs", None)
+            )
+            dynamic_forward_batch.multi_item_delimiter_indices = copy.copy(
+                getattr(forward_batch, "multi_item_delimiter_indices", None)
+            )
+            dynamic_forward_batch.token_indices_to_pool = copy.copy(
+                getattr(forward_batch, "token_indices_to_pool", None)
+            )
+            dynamic_forward_batch.mamba_prefill_track_mask_cpu = copy.copy(
+                getattr(forward_batch, "mamba_prefill_track_mask_cpu", None)
+            )
+            dynamic_forward_batch.mamba_track_seqlens_cpu = copy.copy(
+                getattr(forward_batch, "mamba_track_seqlens_cpu", None)
             )
 
     def _compile_decode_dynamic_graph(self, skip_cross_attention: bool) -> Callable:
@@ -1631,6 +1650,10 @@ class CPUGraphRunner:
         dynamic_forward_batch.global_forward_mode = self.capture_forward_mode
         dynamic_forward_batch.batch_size = forward_batch.batch_size
         dynamic_forward_batch.seq_lens_sum = forward_batch.seq_lens_sum
+        dynamic_forward_batch.capture_hidden_mode = forward_batch.capture_hidden_mode
+        dynamic_forward_batch.return_hidden_states_before_norm = getattr(
+            forward_batch, "return_hidden_states_before_norm", False
+        )
         if (
             forward_batch.mm_inputs is not None
             and not forward_batch.contains_mm_inputs()
@@ -1943,7 +1966,7 @@ class CPUGraphRunner:
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=None,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=num_token_non_padded,
             global_forward_mode=ForwardMode.EXTEND,
         )
@@ -2150,6 +2173,10 @@ class CPUGraphRunner:
         dynamic_forward_batch.global_forward_mode = ForwardMode.EXTEND
         dynamic_forward_batch.batch_size = forward_batch.batch_size
         dynamic_forward_batch.seq_lens_sum = forward_batch.seq_lens_sum
+        dynamic_forward_batch.capture_hidden_mode = forward_batch.capture_hidden_mode
+        dynamic_forward_batch.return_hidden_states_before_norm = getattr(
+            forward_batch, "return_hidden_states_before_norm", False
+        )
         dynamic_forward_batch.mm_inputs = None
         self._refresh_dynamic_forward_batch_metadata(
             dynamic_forward_batch,
@@ -2293,6 +2320,12 @@ class CPUGraphRunner:
         if forward_batch.input_embeds is not None:
             return False
         if forward_batch.replace_embeds is not None:
+            return False
+        if getattr(forward_batch, "return_hidden_states_before_norm", False):
+            return False
+        if self.capture_hidden_mode < getattr(
+            forward_batch, "capture_hidden_mode", CaptureHiddenMode.NULL
+        ):
             return False
         if forward_batch.batch_size > self.prefill_max_bs:
             return False

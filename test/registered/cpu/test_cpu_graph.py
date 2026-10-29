@@ -28,7 +28,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     PhaseConfig,
     default_prefill_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
@@ -63,6 +67,7 @@ def _make_cpu_graph_runner():
     runner.prefill_dynamic_graph = None
     runner.prefill_dynamic_graph_bs1 = None
     runner.dynamic_prefill_max_tokens = 1024
+    runner.capture_hidden_mode = CaptureHiddenMode.NULL
     runner.enable_torch_compile = False
     return runner
 
@@ -78,10 +83,13 @@ def _make_cpu_prefill_forward_batch(num_tokens=6, batch_size=2):
         mrope_positions=torch.arange(3 * num_tokens, dtype=torch.int64).reshape(
             3, num_tokens
         ),
+        seq_lens_sum=num_tokens,
         mm_inputs=None,
         return_logprob=False,
         input_embeds=None,
         replace_embeds=None,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        return_hidden_states_before_norm=False,
         contains_mm_inputs=lambda: False,
     )
 
@@ -999,6 +1007,53 @@ class TestCPUGraph(CustomTestCase):
 
         mock_bucket.assert_not_called()
         self.assertEqual(mock_bs1.call_count, 2)
+
+    def test_dynamic_prefill_multi_request_preserves_capture_hidden_mode(self):
+        runner = _make_cpu_graph_runner()
+        runner.capture_hidden_mode = CaptureHiddenMode.FULL
+        runner.prefill_dynamic_graph = object()
+        runner.prefill_dynamic_batch_template = _make_cpu_prefill_forward_batch(
+            num_tokens=128, batch_size=2
+        )
+        runner.prefill_dynamic_batch_template.capture_hidden_mode = (
+            CaptureHiddenMode.NULL
+        )
+        runner.dynamic_prefill_max_tokens = 1024
+        runner.enable_torch_compile = False
+
+        forward_batch = _make_cpu_prefill_forward_batch(num_tokens=300, batch_size=2)
+        forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+
+        selected = []
+
+        def run_prefill_once(compiled_fn, batch):
+            selected.append((compiled_fn, batch))
+            return LogitsProcessorOutput(
+                next_token_logits=torch.zeros(2, 4),
+                hidden_states=torch.randn(300, 16),
+            )
+
+        with patch.object(runner, "_run_prefill_once", side_effect=run_prefill_once):
+            out = runner._execute_prefill_graph(forward_batch)
+
+        self.assertIs(selected[0][0], runner.prefill_dynamic_graph)
+        self.assertEqual(selected[0][1].capture_hidden_mode, CaptureHiddenMode.FULL)
+        self.assertEqual(out.hidden_states.shape, (300, 16))
+
+    def test_prefill_graph_rejects_unsupported_hidden_modes_and_norm_states(self):
+        runner = _make_cpu_graph_runner()
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+        runner.prefill_graphs = {128: object()}
+
+        # 1. capture_hidden_mode exceeds runner's capture mode
+        forward_batch = _make_cpu_prefill_forward_batch(num_tokens=128, batch_size=2)
+        forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        self.assertFalse(runner._can_run_prefill_graph(forward_batch))
+
+        # 2. return_hidden_states_before_norm is True
+        forward_batch2 = _make_cpu_prefill_forward_batch(num_tokens=128, batch_size=2)
+        forward_batch2.return_hidden_states_before_norm = True
+        self.assertFalse(runner._can_run_prefill_graph(forward_batch2))
 
     @intel_amx_benchmark(
         extra_args=[
