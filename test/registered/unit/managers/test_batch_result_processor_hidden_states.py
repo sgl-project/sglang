@@ -478,7 +478,9 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
         def result(hidden_states):
             return GenerationBatchResult(
                 logits_output=SimpleNamespace(
-                    hidden_states=hidden_states, sampling_mask_output=None
+                    hidden_states=hidden_states,
+                    customized_info=None,
+                    sampling_mask_output=None,
                 ),
                 speculative_num_draft_tokens=4,
             )

@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 import unittest
 from array import array
 from contextlib import contextmanager
@@ -301,9 +302,10 @@ def build_rust_customized_info_fixture() -> dict:
 
 
 @contextmanager
-def launch_context(server_cls):
+def launch_context(server_cls, cores=(None, None)):
     """Patch what `launch` reads so it runs as DP rank 1 of a two-rank node,
-    unpinned; yields the `_build_server_args` mock."""
+    with `cores` as the `(launch_cores, server_cores)` partition (unpinned by
+    default); yields the `_build_server_args` mock."""
     with (
         patch.object(
             server_module,
@@ -326,7 +328,7 @@ def launch_context(server_cls):
                 attn_cp_size=1,
             ),
         ),
-        patch.object(server_cls, "_partition_cores", return_value=(None, None)),
+        patch.object(server_cls, "_partition_cores", return_value=cores),
         patch.object(
             server_module,
             "get_mm",
@@ -597,6 +599,49 @@ class TestRustServerExtension(CustomTestCase):
         )
         self.assertIs(instance.mm_spec, sentinel.spec)
         self.assertTrue(instance._multimodal_enabled)
+
+    @unittest.skipUnless(
+        hasattr(os, "sched_getaffinity") and len(os.sched_getaffinity(0)) >= 2,
+        "needs two CPUs",
+    )
+    def test_launch_confines_mm_threads_but_leaves_the_scheduler_unpinned(self):
+        """MM threads are created on the server cores, and the scheduler
+        thread gets its full mask back: pinned to the few reserved cores, it
+        waits out whatever else runs there, and every TP rank waits on it."""
+        full_mask = os.sched_getaffinity(0)
+        launch_core, *server_cores = sorted(full_mask)
+        extension = ModuleType("model_server")
+        extension.Server = Mock()
+        masks = {}
+
+        class ModelServer(RustServer):
+            @classmethod
+            def _load_extension(cls):
+                return extension
+
+            @classmethod
+            def _resolve_multimodal(cls, scheduler):
+                return None
+
+            def _start_multimodal(self, scheduler):
+                masks["mm"] = os.sched_getaffinity(0)
+
+        def launch():
+            # Affinity is per thread: launch on a thread of its own, as the
+            # scheduler's launch thread, so the test runner keeps its mask.
+            scheduler = SimpleNamespace(
+                model_config=SimpleNamespace(is_multimodal=True)
+            )
+            with launch_context(ModelServer, cores=([launch_core], server_cores)):
+                ModelServer.launch(scheduler)
+            masks["scheduler"] = os.sched_getaffinity(0)
+
+        thread = threading.Thread(target=launch)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(masks["mm"], set(server_cores))
+        self.assertEqual(masks["scheduler"], full_mask)
 
 
 if __name__ == "__main__":
