@@ -983,6 +983,13 @@ class KVCacheConfigurator:
         decls = self._kv_layer_decls()
         has_window, has_state = self._unified_window_and_state()
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
+        if has_state and get_exec().mamba.enable_linear_lossless_verify:
+            # The unified state view keeps full per-draft snapshots; it has no
+            # (u, k, g) tuple ring for the lossless replay.
+            raise ValueError(
+                "--enable-linear-lossless-verify is not supported with "
+                "--enable-unified-memory"
+            )
         if has_state:
             fused_draft = self._fused_draft_for_mamba_factory()
             # A draft worker sizes its own pool by token count; only the
@@ -3052,21 +3059,20 @@ class KVCacheConfigurator:
             )
         return True
 
-    def _spec_intermediate_bytes(self, n_slots: int, pp_layer_scale: float) -> int:
+    def _spec_intermediate_bytes(
+        self, n_slots: int, stage_per_req: int, pp_layer_scale: float
+    ) -> int:
         """Target-verify scratch to reserve for ``n_slots`` request slots.
 
         The default verify keeps a full (conv + SSM) snapshot per draft token,
-        charged as ``mamba_cache_per_req * D``. The lossless tuple verify keeps
-        only (u, k, g) per draft token, ~K x less; charging it the snapshot cost
-        would park the difference as idle memory instead of KV cache, so ask
-        memory_pool, which owns the allocation, for the real size.
+        charged as ``stage_per_req * D`` (the priced state entry, including a
+        fused draft's widening). The lossless tuple verify keeps only (u, k, g)
+        per draft token, ~K x less; charging it the snapshot cost would park the
+        difference as idle memory instead of KV cache, so ask memory_pool, which
+        owns the allocation, for the real size.
         """
         if not self._linear_lossless_verify_enabled():
-            per_req = int(
-                self.mambaish_config.mamba2_cache_params.mamba_cache_per_req
-                * pp_layer_scale
-            )
-            return per_req * n_slots * get_spec().speculative_num_draft_tokens
+            return stage_per_req * n_slots * get_spec().speculative_num_draft_tokens
         per_req = spec_intermediate_bytes_per_req(
             self.mambaish_config.mamba2_cache_params,
             # Same draft count the pool is built with (adaptive-aware maximum).
@@ -3168,7 +3174,7 @@ class KVCacheConfigurator:
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = self._spec_intermediate_bytes(
-                    capped_reqs + 1, pp_layer_scale
+                    capped_reqs + 1, stage_per_req, pp_layer_scale
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -3186,7 +3192,9 @@ class KVCacheConfigurator:
             # pool's padding slot). Skipped under replayssm and on PD prefill.
             if reserves_spec_state:
                 intermediate_size = self._spec_intermediate_bytes(
-                    get_schedule().max_mamba_cache_size + 1, pp_layer_scale
+                    get_schedule().max_mamba_cache_size + 1,
+                    stage_per_req,
+                    pp_layer_scale,
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -3209,7 +3217,9 @@ class KVCacheConfigurator:
                 #   (K + 1) * per_req + (K / ratio + 1) * inter = budget,
                 # where `inter` is the real scratch of one request's D draft
                 # steps (not per_req * D, see _spec_intermediate_bytes).
-                inter_per_req = self._spec_intermediate_bytes(1, pp_layer_scale)
+                inter_per_req = self._spec_intermediate_bytes(
+                    1, per_req, pp_layer_scale
+                )
                 get_context().override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(

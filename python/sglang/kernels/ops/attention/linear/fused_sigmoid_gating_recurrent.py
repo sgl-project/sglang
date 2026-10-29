@@ -667,9 +667,7 @@ def fused_sigmoid_gating_delta_rule_update(
         is_kda,
         # The lossless tuple verify must tile exactly like the dense one it
         # replaces, so its outputs stay bit-identical on every arch.
-        target_verify=(
-            target_verify or u_states_buffer is not None
-        ),
+        target_verify=(target_verify or u_states_buffer is not None),
         cache_steps=cache_steps,
     )
     BK = triton.next_power_of_2(K)

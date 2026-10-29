@@ -12,7 +12,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.srt.configs.mamba_utils import (
@@ -151,19 +151,19 @@ def _commit(pool, last, track_idx, track_steps, req_pool_indices=None):
     slot_of_req = torch.full((64,), -1, dtype=torch.int64, device=DEVICE)
     if req_pool_indices is not None:
         slot_of_req[req_pool_indices] = slots
-    req_pool = types.SimpleNamespace(
+    req_pool = types.SimpleNamespace(get_mamba_indices=lambda r: slot_of_req[r])
+    state_pool = types.SimpleNamespace(
         get_speculative_mamba2_params_all_layers=lambda: pool.mamba_cache,
-        get_mamba_indices=lambda r: slot_of_req[r],
-        mamba_pool=types.SimpleNamespace(replayssm_is_kda=False),
-        short_conv_pool=types.SimpleNamespace(
-            conv_state=None, intermediate_conv_state=None
-        ),
-        ngram_pool=types.SimpleNamespace(context=None, intermediate_context=None),
+        replayssm_is_kda=False,
     )
+    # No PLE side-state parts are bound.
+    layer_router = types.SimpleNamespace(part_view=lambda part: None)
     linear = types.SimpleNamespace(
         _translate_mamba_indices=lambda x: x,
         forward_metadata=types.SimpleNamespace(mamba_cache_indices=slots),
         req_to_token_pool=req_pool,
+        state_pool=state_pool,
+        token_to_kv_pool=types.SimpleNamespace(layer_router=layer_router),
         accept_lens_pool=None,
         verify_intermediate_state_indices=torch.arange(
             N + 1, dtype=torch.int32, device=DEVICE
