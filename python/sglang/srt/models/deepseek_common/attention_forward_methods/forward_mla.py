@@ -47,6 +47,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
     _is_musa,
+    _is_sail,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
@@ -568,7 +569,7 @@ class DeepseekMLAForwardMixin:
                     expected_m,
                 )
                 q_nope_out = q_nope_out[:, :expected_m, :]
-            elif self.w_kc.dtype == torch.float8_e4m3fn:
+            elif self.w_kc.dtype == torch.float8_e4m3fn and not _is_sail:
                 if _is_cpu:
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
@@ -742,6 +743,16 @@ class DeepseekMLAForwardMixin:
                     is_neox=self.rotary_emb.is_neox_style,
                     llama_4_scaling=llama_4_scaling,
                 )
+            # SailFlashMLABackend consumes the split q/k and has no
+            # llama_4_scaling argument of its own, so scale both halves before
+            # dispatch. The concat branch below scales the joined q instead.
+            if (
+                llama_4_scaling is not None
+                and self.current_attention_backend == "flashmla"
+            ):
+                q_nope_out *= llama_4_scaling
+                if q_pe is not None:
+                    q_pe *= llama_4_scaling
             if fusion_plan is not None:
                 self._eager_bmm_attention(
                     fusion_plan.q_nope_t,
@@ -895,7 +906,7 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = (
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
-        elif self.w_vc.dtype == torch.float8_e4m3fn:
+        elif self.w_vc.dtype == torch.float8_e4m3fn and not _is_sail:
             if _is_cpu:
                 attn_bmm_output = torch.bmm(
                     attn_output.to(torch.bfloat16).transpose(0, 1),

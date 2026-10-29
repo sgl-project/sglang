@@ -61,6 +61,7 @@ from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_block_scale_fp8,
     _is_gfx95_supported,
+    _is_gfx1250_supported,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
@@ -186,6 +187,31 @@ def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
     }
 
 
+_use_gfx1250_absorb_bmm = _use_aiter and _is_gfx1250_supported
+if _use_gfx1250_absorb_bmm:
+    try:
+        from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
+    except ImportError:
+        logger.warning(
+            "aiter has no batched_gemm_bf16; the gfx1250 MLA absorb BMMs keep torch.bmm"
+        )
+        _use_gfx1250_absorb_bmm = False
+
+
+def _gfx1250_absorb_bmm_ok(*, x: torch.Tensor, w: torch.Tensor, w_scale) -> bool:
+    """aiter's bf16 batched GEMM beats torch.bmm on gfx1250 at decode rows only;
+    prefill rows stay on torch.bmm. Piecewise CUDA graphs also keep torch.bmm,
+    since dynamo does not trace the aiter launch."""
+    return (
+        x.dtype == torch.bfloat16
+        and w.dtype == torch.bfloat16
+        and isinstance(w_scale, (int, float))
+        and w_scale == 1.0
+        and x.shape[0] <= _ABSORB_BMM_DECODE_MAX_M
+        and not is_in_tc_piecewise_cuda_graph()
+    )
+
+
 def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
     """Dequantize an absorbed MLA weight, skipping the pass when it is a no-op."""
     if (
@@ -241,6 +267,14 @@ def rocm_absorb_q_bmm(
                         q_nope.shape[1], q_nope.shape[0], attn.w_kc.shape[2]
                     ),
                 )
+            )
+        elif _use_gfx1250_absorb_bmm and _gfx1250_absorb_bmm_ok(
+            x=q_nope, w=attn.w_kc, w_scale=attn.w_scale
+        ):
+            q_nope_out = batched_gemm_bf16(
+                XQ=q_nope.transpose(0, 1),
+                WQ=attn.w_kc.transpose(1, 2),
+                backend="gluon" if q_nope.shape[0] <= 4 else "triton",
             )
         else:
             q_nope_out = torch.bmm(
@@ -313,11 +347,21 @@ def rocm_absorb_v_bmm(
                 device=attn_output.device,
                 dtype=torch.bfloat16,
             )
-            torch.bmm(
-                attn_output.to(torch.bfloat16).transpose(0, 1),
-                _absorb_weight_bf16(attn.w_vc, attn.w_scale),
-                out=_bmm_buf.transpose(0, 1),
-            )
+            if _use_gfx1250_absorb_bmm and _gfx1250_absorb_bmm_ok(
+                x=attn_output, w=attn.w_vc, w_scale=attn.w_scale
+            ):
+                batched_gemm_bf16(
+                    XQ=attn_output.transpose(0, 1),
+                    WQ=attn.w_vc.transpose(1, 2),
+                    YQ=_bmm_buf.transpose(0, 1),
+                    backend="gluon",
+                )
+            else:
+                torch.bmm(
+                    attn_output.to(torch.bfloat16).transpose(0, 1),
+                    _absorb_weight_bf16(attn.w_vc, attn.w_scale),
+                    out=_bmm_buf.transpose(0, 1),
+                )
         else:
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
