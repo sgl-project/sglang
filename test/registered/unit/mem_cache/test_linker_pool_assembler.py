@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
     _build_deepseek_v4_device_pool_group,
+    _build_dsa_device_pool_group,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -619,6 +620,111 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         )
         with self.assertRaisesRegex(ValueError, "does not support HiSparse"):
             _build_deepseek_v4_device_pool_group(kvcache, 2)
+
+    def test_dsa_skips_empty_indexer_buffers_and_keeps_kv_layers(self):
+        kv_buffers = [
+            torch.zeros((128, width), dtype=torch.uint8) for width in (3, 5, 7)
+        ]
+        indexer_buffers = [
+            torch.zeros((2, 7), dtype=torch.uint8),
+            torch.zeros((0, 9), dtype=torch.uint8),
+            torch.zeros((2, 11), dtype=torch.uint8),
+        ]
+        kvcache = SimpleNamespace(
+            page_size=64,
+            layer_num=3,
+            kv_buffer=kv_buffers,
+            index_k_with_scale_buffer=indexer_buffers,
+        )
+
+        group = _build_dsa_device_pool_group(kvcache, page_size=64)
+        indexer_entry = group.entry_map[PoolName.INDEXER]
+        kv_entry = group.entry_map[PoolName.KV]
+        indices = torch.arange(64)
+
+        self.assertEqual(indexer_entry.prepare_locations(indices), [0])
+        pointers, sizes = indexer_entry.get_page_buffer_meta(indices)
+        self.assertEqual(
+            pointers,
+            [indexer_buffers[0][0].data_ptr(), indexer_buffers[2][0].data_ptr()],
+        )
+        self.assertEqual(sizes, [7, 11])
+        self.assertIsNone(indexer_entry.get_prepared_layer_range_meta([0], 1))
+        pointers, sizes, offsets = indexer_entry.get_prepared_layer_range_meta([0], 2)
+        self.assertEqual(pointers, [[indexer_buffers[2][0].data_ptr()]])
+        self.assertEqual(sizes, [[11]])
+        self.assertEqual(offsets, [[7]])
+
+        pointers, sizes, offsets = kv_entry.get_prepared_layer_range_meta([0], 1)
+        self.assertEqual(pointers, [[kv_buffers[1][0].data_ptr()]])
+        self.assertEqual(sizes, [[5 * 64]])
+        self.assertEqual(offsets, [[3 * 64]])
+
+    def test_dsa_compacts_indexer_buffers_before_mtp_drafts(self):
+        kv_buffers = [
+            torch.zeros((128, width), dtype=torch.uint8) for width in (3, 5, 7)
+        ]
+        indexer_buffers = [
+            torch.zeros((2, 7), dtype=torch.uint8),
+            torch.zeros((0, 9), dtype=torch.uint8),
+            torch.zeros((2, 11), dtype=torch.uint8),
+        ]
+        kvcache = SimpleNamespace(
+            page_size=64,
+            layer_num=3,
+            kv_buffer=kv_buffers,
+            index_k_with_scale_buffer=indexer_buffers,
+        )
+        draft_pools = tuple(
+            SimpleNamespace(
+                page_size=64,
+                kv_buffer=[torch.zeros((128, kv_width), dtype=torch.uint8)],
+                index_k_with_scale_buffer=[
+                    torch.zeros((2, index_width), dtype=torch.uint8)
+                ],
+            )
+            for kv_width, index_width in ((13, 17), (19, 23))
+        )
+
+        group = _build_dsa_device_pool_group(
+            kvcache, page_size=64, mtp_draft_device_pools=draft_pools
+        )
+        indexer_entry = group.entry_map[PoolName.INDEXER]
+        draft_indexer_buffers = [
+            pool.index_k_with_scale_buffer[0] for pool in draft_pools
+        ]
+
+        pointers, sizes, offsets = indexer_entry.get_prepared_layer_range_meta([0], 0)
+        self.assertEqual(
+            pointers,
+            [
+                [
+                    indexer_buffers[0][0].data_ptr(),
+                    draft_indexer_buffers[0][0].data_ptr(),
+                ]
+            ],
+        )
+        self.assertEqual(sizes, [[7, 17]])
+        self.assertEqual(offsets, [[0, 18]])
+
+        pointers, sizes, offsets = indexer_entry.get_prepared_layer_range_meta([0], 1)
+        self.assertEqual(pointers, [[draft_indexer_buffers[1][0].data_ptr()]])
+        self.assertEqual(sizes, [[23]])
+        self.assertEqual(offsets, [[35]])
+
+        pointers, sizes, offsets = indexer_entry.get_prepared_layer_range_meta([0], 2)
+        self.assertEqual(pointers, [[indexer_buffers[2][0].data_ptr()]])
+        self.assertEqual(sizes, [[11]])
+        self.assertEqual(offsets, [[7]])
+
+        kv_entry = group.entry_map[PoolName.KV]
+        pointers, sizes, offsets = kv_entry.get_prepared_layer_range_meta([0], 1)
+        self.assertEqual(
+            pointers,
+            [[kv_buffers[1][0].data_ptr(), draft_pools[1].kv_buffer[0][0].data_ptr()]],
+        )
+        self.assertEqual(sizes, [[5 * 64, 19 * 64]])
+        self.assertEqual(offsets, [[3 * 64, (3 + 5 + 7 + 13) * 64]])
 
     def test_dsa_uses_hybrid_assembler_strategy(self):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
