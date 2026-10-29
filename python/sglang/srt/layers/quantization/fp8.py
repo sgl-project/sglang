@@ -272,6 +272,7 @@ class Fp8Config(QuantizationConfig):
         is_fp4_experts: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
         scale_fmt: Optional[str] = None,
+        weight_scale_is_ue8m0: bool = False,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
@@ -299,6 +300,9 @@ class Fp8Config(QuantizationConfig):
         self.kv_cache_quant_algo = kv_cache_quant_algo
         # "ue8m0" checkpoints quantize activations with power-of-two scales.
         self.scale_fmt = scale_fmt
+        # Quark's block-FP8 weight scale is the raw E8M0 exponent byte, not the
+        # float32 value the block kernel expects; decode it after loading.
+        self.weight_scale_is_ue8m0 = weight_scale_is_ue8m0
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -741,6 +745,11 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if getattr(self.quant_config, "weight_scale_is_ue8m0", False):
+            # Quark stores the raw E8M0 exponent byte. The block kernel wants
+            # the decoded power-of-two scale, 2^(stored_byte - 127).
+            scale = layer.weight_scale_inv.data
+            layer.weight_scale_inv.data = torch.exp2(scale - 127)
         use_deepgemm_runner = (
             getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
             is deepgemm_w8a8_block_fp8_linear_with_fallback

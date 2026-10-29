@@ -454,6 +454,9 @@ class QuarkConfig(QuantizationConfig):
             activation_scheme="dynamic",
             weight_block_size=block_size,
             packed_modules_mapping=packed_modules_mapping,
+            # Quark's block-FP8 weight scale is the raw E8M0 exponent byte
+            # when scale_type is float8_e8m0fnu, not a plain float32 value.
+            weight_scale_is_ue8m0=weight_config.get("scale_type") == "float8_e8m0fnu",
         )
 
     def is_linear_unquantized(self, prefix: str) -> bool:
