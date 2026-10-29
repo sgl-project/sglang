@@ -2,7 +2,8 @@ name: Nightly Test (AMD)
 
 on:
   schedule:
-    - cron: '30 17 * * *'
+    # Off-peak for the AMD runners, and well after the 10:00/11:00 UTC image builds.
+    - cron: '0 23 * * *'
   push:
     branches:
       - main
