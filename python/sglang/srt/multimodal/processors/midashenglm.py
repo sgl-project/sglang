@@ -78,7 +78,7 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             **kwargs,
         )
 
-        if not self.use_cuda_ipc:
+        if not self._feature_transport.use_cuda_ipc:
             for feature_name in ["input_values"]:
                 if feature_name in result:
                     result[feature_name] = result[feature_name].cpu()
