@@ -914,7 +914,6 @@ def _static_state_entries(
                 c128_item_lens,
             )
 
-
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component
     # to avoid mixing them into the target's heterogeneous state layout, while
