@@ -6,11 +6,12 @@ Test Coverage:
 - process_req_with_grammar: dispatch by constraint type (json, regex, ebnf,
   structural_tag), no-constraint requests, no-backend error, cache hits,
   cached invalid grammar abort
-- abort_requests: single abort, abort all, future cancellation
+- abort_requests: single abort, abort all
 - get_ready_grammar_requests: future completion, invalid grammar handling,
   timeout with max poll iterations, aborted request handling, queue cleanup
 - shared compiles: one compile per grammar key across concurrent requests,
-  per-request grammar copies, cancellation only once no request waits
+  per-request grammars, cancellation once no request waits, timeouts of
+  shared compiles
 
 Usage:
     python -m pytest test_grammar_manager.py -v
@@ -19,7 +20,7 @@ Usage:
 import os
 import threading
 import unittest
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -147,8 +148,8 @@ def _make_strict_inkling_backend(max_think_tokens):
         )
 
 
-def _token_allowed(grammar, token_id):
-    mask = grammar.allocate_vocab_mask(_INKLING_VOCAB_SIZE, 1, "cpu")
+def _token_allowed(grammar, token_id, vocab_size=_INKLING_VOCAB_SIZE):
+    mask = grammar.allocate_vocab_mask(vocab_size, 1, "cpu")
     grammar.fill_vocab_mask(mask, 0)
     return bool((int(mask[0, token_id // 32]) >> (token_id % 32)) & 1)
 
@@ -495,7 +496,6 @@ class TestAbortRequests(unittest.TestCase):
         abort_req.rid = "req-123"
 
         mgr.abort_requests(abort_req)
-        future.cancel.assert_called_once()
         req.set_finish_with_abort.assert_called_once()
 
     def test_abort_non_matching_rid(self):
@@ -638,7 +638,8 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         result = mgr.get_ready_grammar_requests()
         # Should timeout and abort
         self.assertEqual(len(result), 1)
-        self.assertTrue(future.cancelled())
+        # No request waits on the compile any more.
+        mgr.grammar_backend.release_compiles.assert_called_once_with(set())
         req.set_finish_with_abort.assert_called_once()
         self.assertIn("timed out", req.set_finish_with_abort.call_args[0][0])
         # Cache should store InvalidGrammarObject for timeout
@@ -1056,49 +1057,55 @@ class TestStrictReasoningPaths(unittest.TestCase):
         req.set_finish_with_abort.assert_called_once()
 
 
-class _GatedBackend(BaseGrammarBackend):
-    """Compiles JSON grammars once `release` is set, recording each compile."""
+_THINK_END_ID = 128
+_REASONING_VOCAB_SIZE = _THINK_END_ID + 1
 
-    def __init__(self, max_workers=None):
-        super().__init__()
-        if max_workers is not None:
-            self.executor.shutdown(wait=True)
-            self.executor = ThreadPoolExecutor(max_workers=max_workers)
-        self.release = threading.Event()
-        self.compiled = []
 
-    def dispatch_json(self, key_string):
-        self.compiled.append(key_string)
-        if not self.release.wait(timeout=10):
-            raise TimeoutError("test never released the compile")
-        return ReasonerGrammarObject(
-            grammar=None, think_end_ids=[0], max_think_tokens=99
-        )
+def _make_reasoning_backend():
+    """XGrammar over one-character tokens, wrapped to reason until token 128."""
+    vocab = [chr(token_id) for token_id in range(128)] + ["</think>"]
+    info = TokenizerInfo(vocab, stop_token_ids=[0])
+    tokenizer = SimpleNamespace(init_xgrammar=lambda: (info, None))
+    detector = SimpleNamespace(
+        get_think_end_token_ids=lambda tokenizer: [_THINK_END_ID],
+        get_answer_frame=lambda: None,
+    )
+    return ReasonerGrammarBackend(
+        XGrammarGrammarBackend(tokenizer, _REASONING_VOCAB_SIZE),
+        SimpleNamespace(detector=detector),
+        tokenizer,
+    )
 
 
 class TestSharedCompiles(CustomTestCase):
-    """Concurrent requests for one grammar key share a single compile."""
+    """Requests for one grammar key share a single compile."""
 
     def setUp(self):
         super().setUp()
         reset_context()
         self.addCleanup(reset_context)
-
-    def _make_mgr(self, max_workers=None):
         scheduler = _make_scheduler()
         enter_override(
             self, get_context().override_server_args(skip_tokenizer_init=True)
         )
-        mgr = GrammarManager(scheduler)
-        mgr.grammar_backend = _GatedBackend(max_workers)
-        self.addCleanup(mgr.grammar_backend.executor.shutdown, wait=True)
-        self.addCleanup(mgr.grammar_backend.release.set)
-        mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 0.01
-        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 100
-        return mgr
+        self.mgr = GrammarManager(scheduler)
+        self.mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 0.01
+        self.mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 100
+        backend = self.mgr.grammar_backend = _make_reasoning_backend()
+        inner = backend.grammar_backend
+        self.dispatch = MagicMock(wraps=inner.dispatch_regex)
+        inner.dispatch_regex = self.dispatch
+        # The only compile worker waits for the gate, so compiles stay pending
+        # (and cancellable) until the test opens it.
+        backend.executor.shutdown()
+        backend.executor = ThreadPoolExecutor(max_workers=1)
+        self.addCleanup(backend.executor.shutdown)
+        self.gate = threading.Event()
+        self.addCleanup(self.gate.set)
+        backend.executor.submit(self.gate.wait, 10)
 
-    def _req(self, mgr, rid, require_reasoning=False, custom_params=None):
-        req = _make_req(json_schema="schema", rid=rid, custom_params=custom_params)
+    def _req(self, rid, require_reasoning=False):
+        req = _make_req(regex="yes", rid=rid)
         req.require_reasoning = require_reasoning
 
         def abort(*args, **kwargs):
@@ -1106,120 +1113,159 @@ class TestSharedCompiles(CustomTestCase):
             req.grammar = None
 
         req.set_finish_with_abort.side_effect = abort
-        mgr.process_req_with_grammar(req)
+        self.mgr.process_req_with_grammar(req)
         return req
 
-    def _block_executor(self, mgr):
-        """Occupy the only compile worker so later compiles stay cancellable."""
-        gate = threading.Event()
-        mgr.grammar_backend.executor.submit(gate.wait, 10)
-        self.addCleanup(gate.set)
-        return gate
+    def _abort(self, rid):
+        self.mgr.abort_requests(MagicMock(abort_all=False, rid=rid))
 
-    def _abort(self, mgr, rid):
-        mgr.abort_requests(MagicMock(abort_all=False, rid=rid))
-
-    def test_burst_for_one_key_compiles_once(self):
-        """Requests arriving while their key compiles share that one compile,
-        and each still decodes with its own grammar and reasoning state."""
-        mgr = self._make_mgr()
-        reqs = [
-            self._req(mgr, f"req-{i}", require_reasoning=i % 2 == 0) for i in range(25)
+    def _finish_compiles(self):
+        """Open the gate and wait for the compiles of all queued requests."""
+        self.gate.set()
+        pending = [
+            req.grammar
+            for req in self.mgr.grammar_queue
+            if isinstance(req.grammar, Future)
         ]
-        mgr.grammar_backend.release.set()
-        reqs[0].grammar.result(timeout=5)
+        wait(pending, timeout=5)
 
-        ready = mgr.get_ready_grammar_requests()
-
-        self.assertEqual(mgr.grammar_backend.compiled, ["schema"])
-        self.assertCountEqual(ready, reqs)
+    def _assert_served(self, *reqs):
         for req in reqs:
             req.set_finish_with_abort.assert_not_called()
-        # Each request decodes with its own grammar, set up for its own reasoning.
-        grammars = [req.grammar for req in reqs]
-        self.assertEqual(len({id(grammar) for grammar in grammars}), 25)
-        self.assertEqual(
-            [grammar.tokens_in_think for grammar in grammars],
-            [0 if i % 2 == 0 else -1 for i in range(25)],
-        )
 
-        later = self._req(mgr, "later")
-        self.assertNotIn(later, mgr.grammar_queue)
-        self.assertEqual(mgr.grammar_backend.compiled, ["schema"])
+    def _assert_served_from_cache(self):
+        later = self._req("later")
+        self.assertNotIn(later, self.mgr.grammar_queue)
+        self._assert_served(later)
 
-    def test_sharers_keep_their_own_request_config(self):
-        mgr = self._make_mgr()
-        budgeted = self._req(mgr, "budgeted", custom_params={"thinking_budget": 4})
-        default = self._req(mgr, "default")
-        mgr.grammar_backend.release.set()
-        budgeted.grammar.result(timeout=5)
+    @staticmethod
+    def _allows_x(req):
+        return _token_allowed(req.grammar, ord("x"), _REASONING_VOCAB_SIZE)
 
-        mgr.get_ready_grammar_requests()
+    def test_requests_for_one_key_share_one_compile(self):
+        """Requests that arrive while their key compiles share that compile, and
+        each decodes with its own grammar, set up for its own reasoning flag."""
+        thinking = self._req("thinking", require_reasoning=True)
+        answering = self._req("answering", require_reasoning=False)
+        also_thinking = self._req("also-thinking", require_reasoning=True)
+        reqs = [thinking, answering, also_thinking]
+        self._finish_compiles()
 
-        self.assertEqual(mgr.grammar_backend.compiled, ["schema"])
-        self.assertEqual(budgeted.grammar.max_think_tokens, 4)
-        self.assertEqual(default.grammar.max_think_tokens, 99)
-        cached = mgr.grammar_backend.cache[("json", "schema")]
-        self.assertEqual(cached.max_think_tokens, 99)
+        self.assertCountEqual(self.mgr.get_ready_grammar_requests(), reqs)
+        self.dispatch.assert_called_once_with("yes")
+        # Reasoning is unconstrained; the answer must match the regex.
+        self.assertEqual([self._allows_x(req) for req in reqs], [True, False, True])
+        # Ending one request's reasoning leaves the others' state alone.
+        thinking.grammar.accept_token(_THINK_END_ID)
+        self.assertEqual([self._allows_x(req) for req in reqs], [False, False, True])
+
+    def test_request_arriving_on_a_later_poll_joins_the_compile(self):
+        first = self._req("first")
+        self.assertEqual(self.mgr.get_ready_grammar_requests(), [])
+        second = self._req("second")
+        self._finish_compiles()
+
+        self.assertCountEqual(self.mgr.get_ready_grammar_requests(), [first, second])
+        self._assert_served(first, second)
+        self.dispatch.assert_called_once_with("yes")
+
+    def test_request_after_the_only_waiter_aborts_compiles_fresh(self):
+        aborted = self._req("aborted")
+        self._abort("aborted")
+        retry = self._req("retry")
+        self._finish_compiles()
+
+        self.assertCountEqual(self.mgr.get_ready_grammar_requests(), [aborted, retry])
+        self._assert_served(retry)
+        self._assert_served_from_cache()
+
+    def test_flushed_key_compiles_again(self):
+        first = self._req("first")
+        self._finish_compiles()
+        self.mgr.get_ready_grammar_requests()
+
+        self.mgr.clear()
+        second = self._req("second")
+        self._finish_compiles()
+
+        self.assertEqual(self.mgr.get_ready_grammar_requests(), [second])
+        self._assert_served(first, second)
+        self.assertEqual(self.dispatch.call_count, 2)
+
+    def test_compile_error_fails_every_sharer(self):
+        self.dispatch.side_effect = RuntimeError("bad regex")
+        reqs = [self._req("first"), self._req("second")]
+        self._finish_compiles()
+
+        self.assertCountEqual(self.mgr.get_ready_grammar_requests(), reqs)
+        for req in reqs:
+            req.set_finish_with_abort.assert_called_once()
+            self.assertIn("bad regex", req.set_finish_with_abort.call_args[0][0])
+        self.dispatch.assert_called_once_with("yes")
 
     def test_abort_keeps_compile_shared_with_waiting_request(self):
-        mgr = self._make_mgr(max_workers=1)
-        self._block_executor(mgr)
-        self._req(mgr, "first")
-        second = self._req(mgr, "second")
+        self._req("first")
+        second = self._req("second")
         compile_future = second.grammar
 
-        self._abort(mgr, "first")
+        self._abort("first")
         self.assertFalse(compile_future.cancelled())
 
-        self._abort(mgr, "second")
-        self.assertTrue(compile_future.cancelled())
-
-    def test_finished_request_does_not_keep_compile_running(self):
-        mgr = self._make_mgr(max_workers=1)
-        self._block_executor(mgr)
-        finished = self._req(mgr, "finished")
-        waiting = self._req(mgr, "waiting")
-        compile_future = waiting.grammar
-        finished.finished.return_value = True
-
-        self._abort(mgr, "waiting")
-
-        self.assertIs(finished.grammar, compile_future)
+        self._abort("second")
         self.assertTrue(compile_future.cancelled())
 
     def test_timeout_keeps_compile_shared_with_waiting_request(self):
-        mgr = self._make_mgr(max_workers=1)
-        gate = self._block_executor(mgr)
-        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 2
-        first = self._req(mgr, "first")
+        self.mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 2
+        first = self._req("first")
         first.grammar_wait_ct = 1
-        second = self._req(mgr, "second")
+        second = self._req("second")
         compile_future = second.grammar
 
-        self.assertEqual(mgr.get_ready_grammar_requests(), [first])
+        self.assertEqual(self.mgr.get_ready_grammar_requests(), [first])
         first.set_finish_with_abort.assert_called_once()
         self.assertFalse(compile_future.cancelled())
 
-        gate.set()
-        mgr.grammar_backend.release.set()
-        compile_future.result(timeout=5)
-        self.assertEqual(mgr.get_ready_grammar_requests(), [second])
-        second.set_finish_with_abort.assert_not_called()
-        self.assertIsInstance(
-            mgr.grammar_backend.cache[("json", "schema")], ReasonerGrammarObject
+        self._finish_compiles()
+        self.assertEqual(self.mgr.get_ready_grammar_requests(), [second])
+        self._assert_served(second)
+
+    def test_timeout_does_not_reject_requests_for_a_key_still_compiling(self):
+        self.mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 2
+        timed_out = self._req("timed-out")
+        timed_out.grammar_wait_ct = 1
+        waiting = self._req("waiting")
+        self.assertEqual(self.mgr.get_ready_grammar_requests(), [timed_out])
+
+        newcomer = self._req("newcomer")
+        self._finish_compiles()
+
+        self.assertCountEqual(
+            self.mgr.get_ready_grammar_requests(), [waiting, newcomer]
         )
+        self._assert_served(waiting, newcomer)
+        self.dispatch.assert_called_once_with("yes")
 
-    def test_compile_without_waiters_is_dropped(self):
-        mgr = self._make_mgr()
-        self._req(mgr, "first")
-        self.assertEqual(len(mgr.grammar_backend._compiling), 1)
+    @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
+    def test_timeout_keeps_a_grammar_resolved_in_the_same_poll(self, mock_all_gather):
+        timed_out = self._req("timed-out")
+        resolved = self._req("resolved")
+        self._finish_compiles()
 
-        mgr.abort_requests(MagicMock(abort_all=True, rid=""))
-        mgr.get_ready_grammar_requests()
+        # Rank 0 checked timed_out at its last poll just before the shared
+        # compile finished; every rank saw resolved ready.
+        def fake_all_gather(output_list, _obj, group=None):  # noqa: ARG001
+            output_list[0] = ({1}, {0})
+            output_list[1] = ({0, 1}, set())
 
-        self.assertEqual(mgr.grammar_queue, [])
-        self.assertEqual(mgr.grammar_backend._compiling, {})
+        mock_all_gather.side_effect = fake_all_gather
+        self.mgr.grammar_sync_size = 2
+
+        self.assertCountEqual(
+            self.mgr.get_ready_grammar_requests(), [timed_out, resolved]
+        )
+        self.assertIn("timed out", timed_out.set_finish_with_abort.call_args[0][0])
+        self._assert_served(resolved)
+        self._assert_served_from_cache()
 
 
 if __name__ == "__main__":

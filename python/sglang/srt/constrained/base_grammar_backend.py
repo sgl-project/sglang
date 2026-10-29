@@ -313,16 +313,18 @@ class BaseGrammarBackend:
             return copied_value, True
         # Requests for a key that is still compiling wait on that compile.
         future = self._compiling.get(key)
-        if future is None or future.cancelled():
+        if future is None:
             future = self.executor.submit(
                 self._init_value_dispatch, key, require_reasoning
             )
             self._compiling[key] = future
         return future, False
 
-    def drop_unawaited_compiles(self, awaited_keys: Set[Tuple[str, str]]) -> None:
-        for key in [key for key in self._compiling if key not in awaited_keys]:
-            del self._compiling[key]
+    def release_compiles(self, keep: Set[Tuple[str, str]]) -> None:
+        """Forget the in-flight compiles of keys not in ``keep``, cancelling
+        those that have not started."""
+        for key in self._compiling.keys() - keep:
+            self._compiling.pop(key).cancel()
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
         self.cache[key] = value
