@@ -166,7 +166,7 @@ metatags:
   <Card
     title="Mistral"
     mode="card"
-    href="/cookbook/autoregressive/Mistral/Ministral-3"
+    href="/cookbook/autoregressive/Mistral/Mistral-Large-4"
     img="/cards/logos/mistral.png"
   />
   <Card

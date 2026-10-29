@@ -110,6 +110,12 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
+from sglang.srt.observability import metrics_collector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_TOKENIZER,
+    resolve_collector_class,
+    tokenizer_metric_labels,
+)
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
@@ -1098,7 +1104,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
     @staticmethod
     def _set_startup_time(
-        tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter],
+        set_startup_time: Callable[[Dict[str, Any]], None],
         scheduler_init_result: SchedulerInitResult,
         startup_tic: float,
     ) -> None:
@@ -1109,7 +1115,7 @@ class Engine(EngineScoreMixin, EngineBase):
             ),
             tokenizer_e2e=time.perf_counter() - startup_tic,
         )
-        tokenizer_manager.set_startup_time(startup_time)
+        set_startup_time(startup_time)
         cuda_graph_timings = ", ".join(
             f"{phase}={duration:.2f}"
             for phase, duration in startup_time["cuda_graph"].items()
@@ -1123,6 +1129,17 @@ class Engine(EngineScoreMixin, EngineBase):
             startup_time["scheduler_e2e"],
             cuda_graph_timings,
             startup_time["tokenizer_e2e"],
+        )
+
+    @classmethod
+    def _handle_follower_sigterm(cls, signum, frame) -> None:
+        # Non-zero ranks cannot drain on their own: rank 0 stops every TP rank
+        # via the ShutdownReq broadcast, and the orchestrator's kill timeout is
+        # the backstop. Subclasses may override this to ask rank 0 to drain.
+        logger.warning(
+            f"SIGTERM received on node_rank {get_parallel().node_rank}; "
+            "waiting for the rank-0 ShutdownReq broadcast to stop "
+            "the schedulers."
         )
 
     @classmethod
@@ -1258,19 +1275,8 @@ class Engine(EngineScoreMixin, EngineBase):
                     weight_cache_daemon_procs,
                 )
 
-            # Non-zero ranks cannot drain on their own: rank 0 stops every TP rank
-            # via the ShutdownReq broadcast, and the orchestrator's kill timeout is
-            # the backstop.
             if threading.current_thread() is threading.main_thread():
-
-                def sigterm_handler(signum, frame):
-                    logger.warning(
-                        f"SIGTERM received on node_rank {get_parallel().node_rank}; "
-                        "waiting for the rank-0 ShutdownReq broadcast to stop "
-                        "the schedulers."
-                    )
-
-                signal.signal(signal.SIGTERM, sigterm_handler)
+                signal.signal(signal.SIGTERM, cls._handle_follower_sigterm)
 
             # A node-local Rust listener owns the health endpoints when present.
             rust_server_owns_base_port = (
@@ -1307,6 +1313,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 start_disagg_service_for_rust_server()
             )
             scheduler_init_result.wait_for_ready()
+            cls._set_startup_time(
+                _rust_server_startup_time_sink(), scheduler_init_result, startup_tic
+            )
             # Set up subprocess liveness watchdog to detect crashes
             processes = list(scheduler_procs or [])
             names = [f"scheduler_{i}" for i in range(len(processes))]
@@ -1349,7 +1358,9 @@ class Engine(EngineScoreMixin, EngineBase):
             # Wait for the model to finish loading
             scheduler_init_result.wait_for_ready()
 
-            cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
+            cls._set_startup_time(
+                tokenizer_manager.set_startup_time, scheduler_init_result, startup_tic
+            )
 
             # Get back some info from scheduler to tokenizer_manager
             tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
@@ -2075,6 +2086,20 @@ def _calculate_rank_ranges(node_rank: int) -> Tuple[range, range, int, int]:
     )
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def _rust_server_startup_time_sink() -> Callable[[Dict[str, Any]], None]:
+    """Where the startup phases go when the Rust server replaces the
+    TokenizerManager: this process records the startup-time metrics the
+    TokenizerManager would."""
+    if not get_observability().enable_metrics:
+        return lambda startup_time: None
+    # Read at call time: a plugin or model package may replace the module's
+    # collector class with its own subclass after this module is imported.
+    collector_cls = resolve_collector_class(
+        STAT_LOGGER_ROLE_TOKENIZER, metrics_collector.TokenizerMetricsCollector
+    )
+    return collector_cls(labels=tokenizer_metric_labels()).emit_startup_time
 
 
 def node_hosts_rust_server() -> bool:

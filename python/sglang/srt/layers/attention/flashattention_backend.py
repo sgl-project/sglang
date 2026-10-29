@@ -33,8 +33,15 @@ from sglang.srt.layers.attention.local_attention import (
     LocalAttentionMetadataBuilder,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.cp.base import (
+    CPAttentionBackendKind,
+    get_cp_strategy,
+    is_cp_sharded_padded,
+)
+from sglang.srt.layers.cp.utils import (
+    get_cp_sharded_padded_cache_transfer_indices,
+    is_cp_active,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view
@@ -49,7 +56,10 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
-from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    build_ragged_target_verify_geometry,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import get_compiler_backend
@@ -274,49 +284,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Select version
         self.fa_impl_ver = fa_impl_ver
         device_capability = get_device_capability()
-        if self.fa_impl_ver == 3:
-            from sgl_kernel.flash_attn import get_scheduler_metadata
-
-            from sglang.kernels.ops.attention.flash_attention_v3 import (
-                flash_attn_varlen_func,
-                flash_attn_with_kvcache,
-            )
-
-            self._get_scheduler_metadata = get_scheduler_metadata
-            self._get_fa_runtime_policy = None
-        elif self.fa_impl_ver == 4:
-            if device_capability[0] == 12:
-                from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
-                    flash_attn_varlen_func,
-                    flash_attn_with_kvcache,
-                    get_flash_attention_v4_sm120_runtime_policy,
-                )
-
-                self._get_fa_runtime_policy = (
-                    get_flash_attention_v4_sm120_runtime_policy
-                )
-            else:
-                from sglang.kernels.ops.attention.flash_attention_v4 import (
-                    flash_attn_varlen_func,
-                    flash_attn_with_kvcache,
-                )
-
-                self._get_fa_runtime_policy = None
-
-            self._get_scheduler_metadata = None
-            if get_exec().deterministic.enable_deterministic_inference:
-                # Must precede the first kernel compile.
-                from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
-                    set_batch_invariant,
-                )
-
-                set_batch_invariant(True)
-        else:
-            raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
-
-        # Every kernel call goes through these; a subclass swaps the FA build here.
-        self.flash_attn_varlen_func = flash_attn_varlen_func
-        self.flash_attn_with_kvcache = flash_attn_with_kvcache
+        self._init_flash_attention_functions(device_capability)
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
@@ -377,6 +345,51 @@ class FlashAttentionBackend(AttentionBackend):
         self._disable_scheduler_metadata_precompute = (
             _should_disable_scheduler_metadata_precompute()
         )
+
+    def _init_flash_attention_functions(self, device_capability):
+        if self.fa_impl_ver == 3:
+            from sgl_kernel.flash_attn import get_scheduler_metadata
+
+            from sglang.kernels.ops.attention.flash_attention_v3 import (
+                flash_attn_varlen_func,
+                flash_attn_with_kvcache,
+            )
+
+            self._get_scheduler_metadata = get_scheduler_metadata
+            self._get_fa_runtime_policy = None
+        elif self.fa_impl_ver == 4:
+            if device_capability[0] == 12:
+                from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
+                    flash_attn_varlen_func,
+                    flash_attn_with_kvcache,
+                    get_flash_attention_v4_sm120_runtime_policy,
+                )
+
+                self._get_fa_runtime_policy = (
+                    get_flash_attention_v4_sm120_runtime_policy
+                )
+            else:
+                from sglang.kernels.ops.attention.flash_attention_v4 import (
+                    flash_attn_varlen_func,
+                    flash_attn_with_kvcache,
+                )
+
+                self._get_fa_runtime_policy = None
+
+            self._get_scheduler_metadata = None
+            if get_exec().deterministic.enable_deterministic_inference:
+                # Must precede the first kernel compile.
+                from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+                    set_batch_invariant,
+                )
+
+                set_batch_invariant(True)
+        else:
+            raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
+
+        # Every kernel call goes through these; a subclass swaps the FA build here.
+        self.flash_attn_varlen_func = flash_attn_varlen_func
+        self.flash_attn_with_kvcache = flash_attn_with_kvcache
 
     def _maybe_init_local_attn_builder(
         self, model_runner: ModelRunner
@@ -470,7 +483,7 @@ class FlashAttentionBackend(AttentionBackend):
             and self.runner_ids.reads_are_translated
             and self.topk <= 1
             and forward_batch.encoder_lens is None
-            and getattr(forward_batch.spec_info, "ragged_verify_layout", None) is None
+            and forward_batch.ragged_verify_layout is None
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
@@ -681,6 +694,7 @@ class FlashAttentionBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
+                ragged_verify_layout=forward_batch.ragged_verify_layout,
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
             )
@@ -733,6 +747,7 @@ class FlashAttentionBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
+                ragged_verify_layout=forward_batch.ragged_verify_layout,
                 seq_lens_cpu=(
                     forward_batch.seq_lens_cpu if self.needs_cpu_seq_lens else None
                 ),
@@ -824,6 +839,11 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices[:bs, None],
                 self.full_cg_prefill_strided_indices[:max_seq_pages],
             ]
+            if is_cp_sharded_padded():
+                # Project cache rows to this rank's local rows; null rows stay.
+                page_indices = get_cp_sharded_padded_cache_transfer_indices(
+                    page_indices
+                )
             m.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             if self.use_sliding_window_kv_pool:
                 # SWA block table: translate the page-start full slots to their
@@ -1029,9 +1049,7 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
-                ragged_layout = getattr(
-                    forward_batch.spec_info, "ragged_verify_layout", None
-                )
+                ragged_layout = forward_batch.ragged_verify_layout
                 if ragged_layout is not None:
                     geometry = build_ragged_target_verify_geometry(
                         seq_lens=forward_batch.seq_lens, layout=ragged_layout
@@ -1184,6 +1202,11 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
+            if is_cp_sharded_padded():
+                # Project cache rows to this rank's local rows; null rows stay.
+                metadata.page_table = get_cp_sharded_padded_cache_transfer_indices(
+                    metadata.page_table
+                )
 
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # Fixed-q window (num_draft_tokens, widened by num_front_tokens
@@ -2984,6 +3007,7 @@ class FlashAttentionBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -3149,9 +3173,8 @@ class FlashAttentionBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
-                ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
-                if ragged_layout is not None:
-                    padded = ragged_layout.padded_to_bucket(padded_bs=bs)
+                if ragged_verify_layout is not None:
+                    padded = ragged_verify_layout.padded_to_bucket(padded_bs=bs)
                     geometry = build_ragged_target_verify_geometry(
                         seq_lens=seq_lens, layout=padded
                     )

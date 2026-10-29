@@ -169,6 +169,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                multimodal: false,
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::default(),
                 metrics: None,
