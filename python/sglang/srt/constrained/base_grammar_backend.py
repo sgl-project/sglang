@@ -15,10 +15,12 @@
 
 import json
 import logging
+import os
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -201,9 +203,24 @@ class InvalidGrammarObject(BaseGrammarObject):
 class BaseGrammarBackend:
     _enable_strict_thinking: bool = False
 
-    def __init__(self):
+    # Compiled grammars are kept in an LRU cache bounded by entry count. Each
+    # compiled grammar holds per-vocabulary token tables (hundreds of MB for a
+    # 150k vocabulary), so an unbounded cache leaks host memory whenever clients
+    # send a different json_schema / regex / EBNF per request. In-flight requests
+    # keep their own ``copy()`` of a grammar, so evicting an entry is safe.
+    DEFAULT_CACHE_MAX_ENTRIES = 64
+
+    def __init__(self, cache_max_entries: Optional[int] = None):
         self.executor = ThreadPoolExecutor()
-        self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
+        if cache_max_entries is None:
+            cache_max_entries = int(
+                os.environ.get(
+                    "SGLANG_GRAMMAR_CACHE_MAX_ENTRIES", self.DEFAULT_CACHE_MAX_ENTRIES
+                )
+            )
+        # <= 0 disables the bound (previous behaviour).
+        self.cache_max_entries = cache_max_entries
+        self.cache: OrderedDict[Tuple[str, str], BaseGrammarObject] = OrderedDict()
 
     def initialize_vocab_mask_buffer(
         self,
@@ -306,6 +323,7 @@ class BaseGrammarBackend:
     ) -> Tuple[BaseGrammarObject | Future[BaseGrammarObject], bool]:
         value = self.cache.get(key)
         if value:
+            self.cache.move_to_end(key)  # mark as most recently used
             copied_value = value.copy()
             copied_value.maybe_init_reasoning(require_reasoning)
             return copied_value, True
@@ -314,6 +332,15 @@ class BaseGrammarBackend:
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
         self.cache[key] = value
+        self.cache.move_to_end(key)
+        if self.cache_max_entries > 0:
+            while len(self.cache) > self.cache_max_entries:
+                evicted_key, _ = self.cache.popitem(last=False)
+                logger.debug(
+                    "Grammar cache full (%d entries); evicted %s grammar",
+                    self.cache_max_entries,
+                    evicted_key[0],
+                )
 
     def reset(self):
         self.cache.clear()
