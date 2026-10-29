@@ -145,7 +145,7 @@ def is_mla_cp_active(forward_batch) -> bool:
     return is_mla_cp_enabled() and is_cp_active(forward_batch)
 
 
-def prepare_cp_forward(forward_batch) -> None:
+def prepare_cp_forward(forward_batch, *, full_sequence: bool = False) -> None:
     """Build CP metadata for an active context-parallel prefill batch."""
     assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
@@ -168,8 +168,11 @@ def prepare_cp_forward(forward_batch) -> None:
 
     # Under CP-TP group sharing the model owns the CP row layout and gathers
     # full rows for its MLPs, so their buffers keep the full-batch length.
+    # Hybrid full-sequence CP models likewise keep full rows between layers
+    # and slice only for MLA.
     if (
         not get_parallel().enable_cp_tp_group_sharing
+        and not full_sequence
         and getattr(forward_batch, "global_num_tokens_cpu", None) is not None
     ):
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
