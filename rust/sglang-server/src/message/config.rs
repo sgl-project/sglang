@@ -94,9 +94,15 @@ pub struct ServerArgs {
     pub model_path: String,
     /// Model name reported by `/v1/models` and `/server_info`.
     pub served_model_name: String,
-    /// Tokenizer source (model dir / `tokenizer.json` / HF repo id). Empty only
-    /// in standalone (test) configs — then boot requires `skip_tokenizer_init`.
+    /// Tokenizer source this server loads (model dir / `tokenizer.json` / HF
+    /// repo id). A model package may point it at a process-local copy of
+    /// `--tokenizer-path`, which is why the info endpoints report
+    /// [`Self::public_tokenizer_path`] instead. Empty only in standalone (test)
+    /// configs — then boot requires `skip_tokenizer_init`.
     pub tokenizer_path: String,
+    /// `--tokenizer-path` as launched, reported by `/get_model_info` and
+    /// `/server_info`.
+    pub public_tokenizer_path: String,
     /// HF revision, used only when `tokenizer_path` is a repo id. `None` → main.
     pub revision: Option<String>,
     /// Weight format selected by `--load-format`, reported by `/get_model_info`.
@@ -226,6 +232,7 @@ impl ServerArgs {
         model_path,
         served_model_name,
         tokenizer_path,
+        public_tokenizer_path,
         revision,
         load_format,
         weight_version,
@@ -279,6 +286,7 @@ impl ServerArgs {
         model_path: String,
         served_model_name: String,
         tokenizer_path: String,
+        public_tokenizer_path: String,
         revision: Option<String>,
         load_format: Option<String>,
         weight_version: Option<String>,
@@ -330,6 +338,7 @@ impl ServerArgs {
             model_path,
             served_model_name,
             tokenizer_path,
+            public_tokenizer_path,
             revision,
             load_format,
             weight_version,
@@ -390,6 +399,7 @@ impl Default for ServerArgs {
             model_path: String::new(),
             served_model_name: String::new(),
             tokenizer_path: String::new(),
+            public_tokenizer_path: String::new(),
             revision: None,
             load_format: None,
             weight_version: None,
@@ -462,6 +472,14 @@ pub struct DeploymentInfo {
     pub hicache_write_policy: Option<String>,
     pub hicache_host_total_tokens: Option<u64>,
     pub kv_event_sources: Vec<KvEventSource>,
+    pub rust_server_endpoints: Vec<RustServerEndpoint>,
+}
+
+/// One DP rank's listener, as a base URL (`http://host:port`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RustServerEndpoint {
+    pub dp_rank: u32,
+    pub endpoint: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

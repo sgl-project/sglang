@@ -326,9 +326,15 @@ class MockLightningModelRunner(ModelRunner):
             enable_memory_saver=False,
             enable_alt_stream=False,
         )
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.req_to_token_pool.state.bind_routes(self.token_to_kv_pool.layer_router)
+        # A static allocator: ids index the pools as they are.
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
+        )
         self.is_draft_worker = False
-        self.init_kv_index_translator()
+        self.init_runner_ids()
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
@@ -524,7 +530,7 @@ def _make_forward_batch(
         positions=torch.tensor(positions, dtype=torch.int64, device=device),
     )
     # Production batches take their KV ids from a plan (`init_new`).
-    runner.kv_index_translator.bind_own_plan(batch)
+    runner.runner_ids.bind_own_plan(batch)
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
         extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)
@@ -645,7 +651,7 @@ def build_lightning_attention_fixture(
 
 
 def _ssm_states(fixture: LightningAttentionFixture) -> torch.Tensor:
-    return fixture.runner.req_to_token_pool.mamba2_layer_cache(0).temporal
+    return fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0).temporal
 
 
 def _populate_lightning_prefix_state(fixture: LightningAttentionFixture) -> None:
