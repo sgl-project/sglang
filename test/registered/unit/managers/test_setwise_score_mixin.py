@@ -621,16 +621,12 @@ class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
                     http_worker_ipc=None,
                     finished_reason=SimpleNamespace(to_json=lambda: {"type": "stop"}),
                     embedding=[[0.0, 0.0] for _ in range(phs.shape[0])],
-                    origin_input_ids=[1, 2, 3],
-                    cached_tokens=0,
-                    time_stats=SimpleNamespace(),
-                    retraction_count=0,
                     pooled_hidden_state=phs,
                 )
             )
 
         fake_self = SimpleNamespace(
-            get_cached_tokens_details=lambda req: None,
+            build_request_meta=lambda req: None,
             send_to_detokenizer=SimpleNamespace(
                 send_output=lambda obj: captured.append(obj)
             ),

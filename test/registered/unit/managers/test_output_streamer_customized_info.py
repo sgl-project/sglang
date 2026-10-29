@@ -21,6 +21,7 @@ from sglang.srt.managers.io_struct import (
     msgpack_encode,
     unwrap_from_pickle,
 )
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -28,8 +29,10 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import (
     WeightVersionSpan,
@@ -76,7 +79,11 @@ class _FakeReq:
         self.origin_input_ids = []
         self.reasoning_tokens = 0
         self.cached_tokens = 0
+        self.cached_tokens_device = 0
+        self.cached_tokens_host = 0
+        self.cached_tokens_storage = 0
         self.retraction_count = 0
+        self.request_meta_stale = True
         self.time_stats = None
         self.return_hidden_states = False
         self.return_routed_experts = False
@@ -108,7 +115,6 @@ def _accumulator(
     return_sampling_mask=False,
     request_level_keys=frozenset(),
     rust_server_mode=False,
-    enable_metrics=False,
 ):
     return _GenerationStreamAccumulator(
         return_logprob=False,
@@ -120,11 +126,10 @@ def _accumulator(
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
         default_force_stream_interval=1,
-        get_cached_tokens_details=lambda req: None,
+        build_request_meta=lambda req: None,
         is_request_level_customized_info_key=request_level_keys.__contains__,
         current_weight_version=current_weight_version,
         rust_server_mode=rust_server_mode,
-        enable_metrics=enable_metrics,
     )
 
 
@@ -579,29 +584,166 @@ class TestOutputStreamerDecodeLatency(unittest.TestCase):
         self.assertEqual(python_mode.decode_latencies, {})
 
 
-class TestOutputStreamerTimeStats(unittest.TestCase):
-    def test_rows_carry_time_stats_only_with_metrics_on(self):
-        """With metrics on every emitted row carries its request's time stats,
-        None for a request whose own metrics are off; with metrics off the
-        payload carries none at all."""
+def _metered_req():
+    sampling_params = SamplingParams()
+    sampling_params.normalize(None)
+    req = Req("r", "", array("q", [1, 2, 3]), sampling_params, stream=True)
+    req.time_stats.set_metrics_collector(Mock())
+    return req
+
+
+def _streamer(outputs):
+    return SchedulerOutputStreamer(
+        send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+        tree_cache=None,
+        server_args=SimpleNamespace(),
+        is_generation=True,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        disaggregation_mode=DisaggregationMode.NULL,
+        enable_hicache_storage=lambda: False,
+    )
+
+
+class TestOutputStreamerRequestMeta(unittest.TestCase):
+    def setUp(self):
+        _enter_streamer_scope(self)
+
+    def _set_metrics(self, enabled):
+        observability = patch(
+            "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
+            return_value=SimpleNamespace(
+                enable_metrics=enabled, enable_request_time_stats_logging=False
+            ),
+        )
+        observability.start()
+        self.addCleanup(observability.stop)
+
+    def test_meta_carries_time_stats_only_with_metrics_on(self):
+        """With metrics on a request's metadata carries its time stats, None for
+        a request whose own metrics are off; with metrics off it carries none."""
         timed = SchedulerReqTimeStats(enable_metrics=True)
         timed.queue_duration_s = 0.25
 
-        def req(rid, time_stats):
-            req = _FakeReq(rid, [1])
-            req.time_stats = time_stats
-            return req
+        def time_stats(enable_metrics, req_time_stats):
+            self._set_metrics(enable_metrics)
+            req = _FakeReq("r", [1])
+            req.time_stats = req_time_stats
+            return _streamer([]).build_request_meta(req).time_stats
 
-        for enable_metrics, expected in (
-            (True, [timed.to_output_time_stats(), None]),
-            (False, None),
-        ):
-            with self.subTest(enable_metrics=enable_metrics):
-                accumulator = _accumulator(enable_metrics=enable_metrics)
-                accumulator.accept(req=req("timed", timed))
-                accumulator.accept(req=req("untimed", SchedulerReqTimeStats()))
-                payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
-                self.assertEqual(payload.time_stats, expected)
+        self.assertEqual(time_stats(True, timed), timed.to_output_time_stats())
+        self.assertIsNone(time_stats(True, SchedulerReqTimeStats()))
+        self.assertIsNone(time_stats(False, timed))
+
+    def test_output_after_reprefill_carries_current_meta(self):
+        """A request's metadata goes out with its first output, and again with
+        the first output after each prefill result or retraction, so the output
+        after a re-prefill carries the new retraction count and queue time even
+        when an output went out between the retraction and the re-prefill."""
+        self._set_metrics(True)
+        outputs = []
+        streamer = _streamer(outputs)
+        processor = SchedulerBatchResultProcessor(
+            **{
+                **{
+                    f.name: None
+                    for f in dataclasses.fields(SchedulerBatchResultProcessor)
+                },
+                "is_generation": True,
+                "model_config": SimpleNamespace(self_opened_think_start_ids=None),
+                "token_to_kv_pool_allocator": Mock(),
+                "output_streamer": streamer,
+            }
+        )
+        req = _metered_req()
+        req.cached_tokens = 2
+
+        def prefill_result():
+            batch = SimpleNamespace(
+                reqs=[req],
+                decoding_reqs=None,
+                return_logprob=False,
+                return_hidden_states=False,
+                return_hidden_states_mode=CaptureHiddenMode.NULL,
+                spec_info=None,
+                prefill_stats=None,
+            )
+            result = SimpleNamespace(
+                copy_done=None,
+                auxiliary_host_output=None,
+                routed_experts_output=None,
+                indexer_topk_output=None,
+                logits_output=SimpleNamespace(
+                    customized_info=None, sampling_mask_output=None
+                ),
+                next_token_ids=torch.tensor([7]),
+                extend_input_len_per_req=None,
+                extend_logprob_start_len_per_req=None,
+                skipped_output_comm=False,
+                can_run_cuda_graph=False,
+            )
+            with (
+                patch(
+                    "sglang.srt.managers.scheduler_components."
+                    "batch_result_processor.checkpoint_kv_cache"
+                ),
+                patch(
+                    "sglang.srt.managers.scheduler_components."
+                    "batch_result_processor.get_memory",
+                    return_value=SimpleNamespace(enable_hisparse=False),
+                ),
+            ):
+                processor.process_batch_result_prefill(batch, result)
+            return outputs[-1].request_metas
+
+        def decode_result():
+            req.output_ids.append(8)
+            streamer.stream_output([req], False)
+            return outputs[-1].request_metas
+
+        [first] = prefill_result()
+        self.assertEqual(
+            (first.prompt_tokens, first.cached_tokens, first.retraction_count),
+            (3, 2, 0),
+        )
+        self.assertIsNone(decode_result())
+
+        req.reset_for_retract()
+        # The overlap schedule outputs the retracted request's last decode step.
+        [retracted] = decode_result()
+        self.assertEqual(retracted.retraction_count, 1)
+        # Re-admission adds the second wait to the queue time, and the re-prefill
+        # clears the retracted mark (prepare_for_extend).
+        req.time_stats.queue_duration_s += 0.5
+        req.is_retracted = False
+        [reprefilled] = prefill_result()
+        self.assertEqual(reprefilled.retraction_count, 1)
+        self.assertEqual(reprefilled.time_stats.queue_time, 0.5)
+        self.assertIsNone(decode_result())
+
+    def test_finished_output_carries_current_meta(self):
+        """A finished output carries the request's current metadata even with no
+        prefill since the last one: a retracted request aborted while blocked on
+        a storage prefetch reports no prefetch wait yet."""
+        self._set_metrics(True)
+        outputs = []
+        streamer = _streamer(outputs)
+        req = _metered_req()
+        req.time_stats.set_wait_queue_entry_time()
+        req.output_ids.append(7)
+        streamer.stream_output([req], False)
+        req.reset_for_retract()
+        # The overlap schedule outputs the retracted request's last decode step.
+        streamer.stream_output([req], False)
+        self.assertEqual(
+            outputs[-1].request_metas[0].time_stats.storage_prefetch_wait, 0.0
+        )
+
+        req.time_stats.observe_storage_prefetch_ready(False)
+        req.to_finish = FINISH_ABORT("aborted")
+        req.update_finish_state()
+        streamer.stream_output([req], False)
+        [aborted] = outputs[-1].request_metas
+        self.assertIsNone(aborted.time_stats.storage_prefetch_wait)
 
 
 class TestOutputStreamerStreamInterval(unittest.TestCase):

@@ -1394,6 +1394,10 @@ class Req(ReqDllmMixin):
         self.retraction_count = 0
         self.retraction_mb_id = None
 
+        # Set when the output metadata (RequestOutputMeta) may have changed
+        # since the last output: at creation, retraction and each prefill result.
+        self.request_meta_stale = True
+
         # For observability
         self.metrics_collector = metrics_collector
         if time_stats is not None:
@@ -2062,6 +2066,7 @@ class Req(ReqDllmMixin):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
+        self.request_meta_stale = True
 
         self.prefix_len = 0
         self.routed_experts = None

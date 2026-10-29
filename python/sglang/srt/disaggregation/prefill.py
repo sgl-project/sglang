@@ -978,6 +978,7 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
+                req.request_meta_stale = True
 
                 # Its KV never landed: abort instead of sending it to decode.
                 if req.discard_output_reason is not None:

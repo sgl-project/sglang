@@ -104,6 +104,8 @@ class SchedulerDllmMixin:
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx in range(batch.batch_size()):
                 req = batch.reqs[idx]
+                # Each block is an extend that can update cached_tokens.
+                req.request_meta_stale = True
 
                 if not fdfo_mode:
                     next_token_ids = result.next_token_ids[idx].tolist()
