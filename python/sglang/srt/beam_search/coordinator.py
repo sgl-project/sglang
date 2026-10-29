@@ -487,9 +487,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         top = group.final_results[0]
         leader = group.leader
         if top.matched_token is not None:
-            leader.finished_reason = FINISH_MATCHED_TOKEN(matched=top.matched_token)
+            leader.finish_outside_step(FINISH_MATCHED_TOKEN(matched=top.matched_token))
         else:
-            leader.finished_reason = FINISH_LENGTH(length=group.num_committed)
+            leader.finish_outside_step(FINISH_LENGTH(length=group.num_committed))
         self._free_member_rows(group)
         self._retire_group(group)
 
@@ -497,8 +497,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         group.state = BeamGroupState.FINISHED
         group.final_results = []
         leader = group.leader
-        leader.finished_reason = leader.to_finish or FINISH_ABORT("Beam group aborted.")
-        leader.to_finish = None
+        leader.finish_outside_step(
+            leader.to_finish or FINISH_ABORT("Beam group aborted.")
+        )
+        leader.clear_requested_finish()
         self._free_member_rows(group)
         self._retire_group(group)
 

@@ -3904,7 +3904,7 @@ class Scheduler(
         reason = req.discard_output_reason or FINISH_ABORT("Aborted")
         prepare_abort(req, reason.message, reason.status_code)
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
-        req.to_finish = None
+        req.clear_requested_finish()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
@@ -5852,7 +5852,7 @@ class Scheduler(
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 if req.finished_reason is None:
-                    req.finished_reason = FINISH_ABORT()
+                    req.finish_outside_step(FINISH_ABORT())
                 release_kv_cache(req, self.tree_cache, checkpoint=True)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
@@ -5943,17 +5943,19 @@ class Scheduler(
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
-                # Abort method 3: set `to_finish`
+                # Abort method 3: `request_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 if recv_req.abort_message:
                     # Timeout aborts carry an SLA message + 503 for the client.
-                    req.to_finish = FINISH_ABORT(
-                        recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                    req.request_finish(
+                        FINISH_ABORT(
+                            recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                        )
                     )
                 else:
-                    req.to_finish = FINISH_ABORT()
+                    req.request_finish(FINISH_ABORT())
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
