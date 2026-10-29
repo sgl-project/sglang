@@ -540,7 +540,7 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
 class TestStoredRequestMeta(CustomTestCase):
     def test_rows_without_meta_read_the_latest_meta(self):
         """The scheduler sends a request's metadata only when it changes; a row
-        without one reports the latest received, and a row before any is an error."""
+        without one reports the latest received, and a row before any is dropped."""
         tm = _make_tokenizer_manager(self)
         rid = "meta_rid"
         state = _make_req_state(rid)
@@ -566,11 +566,13 @@ class TestStoredRequestMeta(CustomTestCase):
             [(5, 2, 0), (5, 2, 0), (5, 3, 1), (5, 3, 1)],
         )
 
-        tm.rid_to_state[rid] = _make_req_state(rid)
+        # A late row of an aborted request whose rid a new request reused.
+        reused = tm.rid_to_state[rid] = _make_req_state(rid)
         batch_output = _make_batch_str_output(rid, _NOT_FINISHED)
         batch_output.request_metas = None
-        with self.assertRaises(RuntimeError):
-            asyncio.run(tm._handle_batch_output(batch_output))
+        asyncio.run(tm._handle_batch_output(batch_output))
+        self.assertEqual(reused.out_list, [])
+        self.assertIs(tm.rid_to_state[rid], reused)
 
 
 class TestRequestTpotGating(CustomTestCase):

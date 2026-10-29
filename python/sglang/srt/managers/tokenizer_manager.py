@@ -2522,9 +2522,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.request_meta = new_request_meta
             request_meta = state.request_meta
             if request_meta is None:
-                raise RuntimeError(
+                # A late row of an aborted request whose rid was reused.
+                logger.warning(
                     f"Received output for {rid=} before its request metadata."
                 )
+                continue
 
             # Build meta_info and return value
             meta_info = {
