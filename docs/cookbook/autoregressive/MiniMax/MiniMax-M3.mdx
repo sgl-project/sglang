@@ -34,14 +34,14 @@ Then run the **Python** output of the command panel below in that environment. T
 <Tab title="Docker">
 
 ```bash Command
-# Pull the M3 image the command panel selects for your platform, e.g.:
-docker pull lmsysorg/sglang:dev-cu13-minimax-m3
+# Pull the image the command panel selects for your platform, e.g.:
+docker pull lmsysorg/sglang:v0.5.22-cu130
 ```
 
-The command panel below fills in the right tag per platform: `dev-cu13-minimax-m3` (CUDA 13 — B300, GB200, GB300), `dev-cu12-minimax-m3` (CUDA 12 — Hopper H200; final build, the CUDA 12 lane is retired), or `dev-minimax-m3` (default). On AMD Instinct it uses the matching ROCm image (MI300X/MI325X → `aigmkt/minimax-m3-sglang-rocm700-mi30x`, MI350X/MI355X → `aigmkt/minimax-m3-sglang-rocm720-mi35x`). For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator produces.
+The command panel below fills in the right tag per platform: on NVIDIA (Hopper and Blackwell, x86_64 and aarch64/Grace) it uses the versioned CUDA-13 release image `lmsysorg/sglang:v0.5.22-cu130` — MiniMax-M3 is fully supported in tagged releases since v0.5.22, which replaces the retired M3 dev images (`dev-minimax-m3` / `dev-cu13-minimax-m3` / `dev-cu12-minimax-m3`, last pushed 2026-06). On AMD Instinct it uses the matching ROCm image (MI300X/MI325X → `aigmkt/minimax-m3-sglang-rocm700-mi30x`, MI350X/MI355X → `aigmkt/minimax-m3-sglang-rocm720-mi35x`). For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker), substituting the inner `sglang serve ...` with what the command generator produces.
 
 <Note>
-These M3 dev images now **bundle MiniMax's MSA sparse-attention kernel** (`fmha_sm100`), so Blackwell users get the recommended fast path automatically — no manual install needed (see **§2.1**). On a custom image without it, the same recipe still serves on the built-in Triton sparse path.
+Unlike the retired M3 dev images, the release image does **not** bundle MiniMax's MSA sparse-attention kernel (`fmha_sm100`). For the recommended Blackwell fast path, install it per **§2.1** (one pip install; the kernels JIT-compile on first use). Without it, the same recipe serves on the built-in Triton sparse path.
 </Note>
 
 </Tab>
@@ -86,7 +86,7 @@ Key characteristics as served by SGLang:
 
 ### 2.1 MSA sparse-attention fast path (recommended for Blackwell users)
 
-[MiniMax MSA](https://github.com/MiniMax-AI/MSA) (`fmha_sm100`, MIT-licensed) is the recommended Blackwell kernel for M3's main sparse-attention step — faster and more memory-efficient than the built-in Triton fallback. **It ships pre-installed in the M3 dev image** (`lmsysorg/sglang:dev-minimax-m3`, also published under the `dev-cu13-minimax-m3` tag), so the Blackwell recipe above engages it automatically with no extra setup — `import fmha_sm100` works out of the box and the kernels JIT-compile on first use. It is otherwise purely additive: on a custom image, install it (below) and the recipe engages it automatically; without it the same recipe still serves on the built-in Triton path. The swap is numerically equivalent (cosine ≥ 0.99999 vs Triton), decode stays CUDA-graph-capturable, prefill TTFT drops ~9–12% at 8K–64K context, and the MSA path survives memory configurations where the Triton path OOMs.
+[MiniMax MSA](https://github.com/MiniMax-AI/MSA) (`fmha_sm100`, MIT-licensed) is the recommended Blackwell kernel for M3's main sparse-attention step — faster and more memory-efficient than the built-in Triton fallback. The release image (`v0.5.22-cu130`) does **not** bundle it, so install it (below) for the fast path — one pip install, and the recipe engages it automatically (the retired M3 dev images shipped it pre-installed). It is purely additive: without it the same recipe still serves on the built-in Triton path. The swap is numerically equivalent (cosine ≥ 0.99999 vs Triton), decode stays CUDA-graph-capturable, prefill TTFT drops ~9–12% at 8K–64K context, and the MSA path survives memory configurations where the Triton path OOMs.
 
 **Requirements** (from the [MSA README](https://github.com/MiniMax-AI/MSA#requirements)):
 
@@ -96,7 +96,7 @@ Key characteristics as served by SGLang:
 
 <Accordion title="Install MSA (only on a custom image) & verify the gate (Python)">
 
-The M3 Blackwell dev images above already bundle MSA, so you can skip straight to the gate check. The `git clone` / `pip install` steps are only needed on a custom image that doesn't have `fmha_sm100`.
+On the release image (and any custom image without `fmha_sm100`), run the `git clone` / `pip install` steps below, then the gate check. (The retired M3 dev images bundled MSA, so only the gate check was needed there.)
 
 ```bash Command
 # Only on a custom image: --recursive pulls the CUTLASS submodule required for JIT compilation
@@ -119,7 +119,7 @@ The first import JIT-compiles the kernels, which can take 30 s to a few minutes 
 The gate requires `--attention-backend fa4` (MSA's sparse blocks are 128 tokens, so the page size must be 128). SGLang auto-forces `page_size` to 128 for the `fa4` backend — including the combined `--attention-backend fa4` the M3 recipe uses (#28976) — so `--page-size 128` is omitted from the Blackwell cells below. Force the Triton path at any time with the env var `SGLANG_DISABLE_MSA=1`. MSA is a Blackwell (SM100) kernel and does not apply to the AMD ROCm paths.
 
 <Note>
-**GB300: per-phase attention split.** The GB300 cell adds `--decode-attention-backend trtllm_mha`: decode runs on FlashInfer's trtllm-gen paged decode (~2x faster than fa4 on M3's full-attention decode shapes at this TP4 geometry; +11–15% median per-user interactivity in 900 s serving replays at concurrency 1–60), while `--attention-backend fa4` stays — it serves prefill (where fa4 remains the faster backend) and keys the page-128 auto-force MSA requires. The MSA sparse layers are unaffected in both phases. `trtllm_mha` accepts page 128 through trtllm-gen's dynamic tokens-per-page kernels (FlashInfer ≥ 0.6.12; allowed in-tree on current `main`), so the split needs a build from current `main` — the pre-built dev image (last pushed 2026-06) predates that support and clamps `trtllm_mha` to page 64, which MSA rejects. B200 (TP8, different shard geometry) and GB200 are not benchmarked with the split and keep fa4-only.
+**GB300: per-phase attention split.** The GB300 cell adds `--decode-attention-backend trtllm_mha`: decode runs on FlashInfer's trtllm-gen paged decode (~2x faster than fa4 on M3's full-attention decode shapes at this TP4 geometry; +11–15% median per-user interactivity in 900 s serving replays at concurrency 1–60), while `--attention-backend fa4` stays — it serves prefill (where fa4 remains the faster backend) and keys the page-128 auto-force MSA requires. The MSA sparse layers are unaffected in both phases. `trtllm_mha` accepts page 128 through trtllm-gen's dynamic tokens-per-page kernels (FlashInfer ≥ 0.6.12; allowed in-tree since sglang v0.5.22) — the recipe image above satisfies this, and the split was smoke-verified on `v0.5.22-cu130` (serve healthy, decode on trtllm-gen with fa4 prefill, page 128 kept). B200 (TP8, different shard geometry) and GB200 are not benchmarked with the split and keep fa4-only.
 </Note>
 
 <Note>

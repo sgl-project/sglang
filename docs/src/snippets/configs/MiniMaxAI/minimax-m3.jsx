@@ -92,16 +92,18 @@ sgl-eval run mmmu_pro \\
   ],
 
   dockerImages: {
-    // M3-specific dev images (multi-arch amd64+arm64). cu13 carries the sm_103
-    // (B300/GB300) + Grace arm64 builds; cu12 is the final Hopper/CUDA-12 build
-    // (that lane is retired, so it no longer rebuilds); dev-minimax-m3 is the
-    // rolling default. M3 model support is not yet in a tagged release, so
-    // :latest cannot serve it.
-    b200: "lmsysorg/sglang:dev-minimax-m3",
-    b300: "lmsysorg/sglang:dev-cu13-minimax-m3",
-    gb200: "lmsysorg/sglang:dev-cu13-minimax-m3",
-    gb300: "lmsysorg/sglang:dev-cu13-minimax-m3",
-    h200: "lmsysorg/sglang:dev-cu12-minimax-m3",
+    // NVIDIA: the versioned CUDA-13 release image (multi-arch amd64+arm64,
+    // covers Hopper + all Blackwell incl. sm_103 B300/GB300 and Grace). M3 is
+    // fully supported in tagged releases since v0.5.22, which also carries the
+    // page-128 trtllm_mha support the GB300 cell's decode split needs. Unlike
+    // the retired M3 dev images, the release image does NOT bundle MiniMax's
+    // MSA kernel — install it per the page's MSA section for the fast path;
+    // without it the same recipe serves on the built-in Triton sparse path.
+    b200: "lmsysorg/sglang:v0.5.22-cu130",
+    b300: "lmsysorg/sglang:v0.5.22-cu130",
+    gb200: "lmsysorg/sglang:v0.5.22-cu130",
+    gb300: "lmsysorg/sglang:v0.5.22-cu130",
+    h200: "lmsysorg/sglang:v0.5.22-cu130",
     // AMD ROCm images — published M3 builds, by arch (gfx942 -> mi30x, gfx950 -> mi35x).
     mi300x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",
     mi325x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",
@@ -201,7 +203,7 @@ sgl-eval run mmmu_pro \\
   // B300 / GB200 / GB300, tp8 on B200. fa4 + page 128 + deep_gemm are the M3
   // SM100 auto-defaults on current main, so this is also the bare-launch
   // behavior; they engage MiniMax's MSA sparse-attention kernel (fmha_sm100,
-  // pre-installed in the dev-minimax-m3 images; see Configuration Tips), Triton
+  // installed per the MSA section — not bundled in the release image), Triton
   // fallback otherwise.
   // AMD: tp8. MI350X/MI355X (gfx950) serve MXFP8 natively (backends auto). MI300X/
   // MI325X (gfx942) need --attention-backend aiter + --moe-runner-backend triton,
@@ -269,9 +271,9 @@ sgl-eval run mmmu_pro \\
       // per-phase note). --attention-backend fa4 still serves prefill (fa4
       // wins there) and keys the page-128 auto-force MSA needs; trtllm_mha
       // accepts page 128 via trtllm-gen's dynamic tokens-per-page kernels
-      // (flashinfer >= 0.6.12), so this needs a build from current main —
-      // the 2026-06 dev image predates that support. B200/GB200 (different
-      // or unbenchmarked shard geometry) intentionally keep fa4-only.
+      // (flashinfer >= 0.6.12), allowed in-tree since sglang v0.5.22 — the
+      // recipe image above satisfies this. B200/GB200 (different or
+      // unbenchmarked shard geometry) intentionally keep fa4-only.
       match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
