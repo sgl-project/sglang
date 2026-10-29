@@ -52,7 +52,7 @@ def _floor_terms(geometry):
 def _budget_at_floor(geometry, floor: int) -> int:
     """The full budget includes the fixed allocations outside the shared arena."""
     setup_allocator_context()
-    bundle = build_unified_bundle(geometry)
+    bundle = build_unified_bundle(msgspec.structs.replace(geometry, max_num_reqs=1))
     return floor + bundle.storage.sized.fixed_bytes
 
 
