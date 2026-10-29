@@ -367,11 +367,12 @@ def test_capture_replays_and_records():
 @pytest.mark.parametrize(
     "name", ["rmsnorm_scale", "head_gate_audio", "rmsnorm_modulate_audio"]
 )
-def test_compile_traces_the_wrapper(monkeypatch, name):
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+def test_compile_traces_the_wrapper(monkeypatch, name, backend):
     fn, args = WRAPPERS[name]()
     expected = _normal_path(monkeypatch, fn, args)
     fn(*args)  # recorded; tracing must still run the wrapper
-    compiled = torch.compile(fn, fullgraph=True, backend="eager")
+    compiled = torch.compile(fn, fullgraph=True, backend=backend)
     assert torch.equal(compiled(*args), expected)
 
 
