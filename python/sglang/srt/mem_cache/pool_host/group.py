@@ -75,6 +75,10 @@ class HostPoolGroup:
         self.entry_map[entry.name] = entry
         self._refresh_transfer_capabilities()
 
+    def prepare_io_backend(self, io_backend: str) -> None:
+        for entry in self.entries:
+            entry.host_pool.prepare_io_backend(io_backend)
+
     def get_entry(self, name: PoolName | None = None) -> PoolEntry:
         return self.anchor_entry if name is None else self.entry_map[name]
 

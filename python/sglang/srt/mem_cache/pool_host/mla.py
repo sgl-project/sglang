@@ -25,6 +25,12 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla_page_unified_lf as jit_transfer_hicache_one_layer_mla_page_unified_lf,
 )
+from sglang.kernels.ops.kvcache.hicache_direct import (
+    HiCacheDirectTables,
+    hicache_direct_kernel_unavailable_reason,
+    make_hicache_direct_tables,
+    transfer_hicache_direct,
+)
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -245,6 +251,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             host_token_capacity=host_token_capacity,
             is_dummy=self._is_dummy,
         )
+        # Built by prepare_io_backend("direct_kernel").
+        self._direct_kernel_tables: Optional[HiCacheDirectTables] = None
+        self._direct_kernel_layer_tables: tuple[HiCacheDirectTables, ...] = ()
         if self._is_dummy:
             self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
             self.layout_dim = self.token_stride_size * self.layer_num
@@ -509,6 +518,43 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dtype=self.dtype,
             device=self._transfer_device,
         )
+
+    def prepare_io_backend(self, io_backend: str) -> None:
+        if io_backend != "direct_kernel":
+            return
+        if self._is_dummy:
+            return
+        reason = None
+        if not _is_cuda:
+            reason = "it is CUDA-only"
+        elif self.layout != "page_first_direct":
+            reason = f"it needs the page_first_direct layout, got {self.layout}"
+        elif not self.device_rows_packed:
+            reason = "the device KV rows are strided"
+        elif self.dcp_size != 1:
+            reason = "decode context parallelism is not supported"
+        elif self._layer_shard_enabled:
+            reason = "layer-sharded device pools are not supported"
+        elif self._buffer_index_by_layer != self._host_layer_by_controller:
+            reason = "device buffers are not in host layer order"
+        elif (
+            unavailable := hicache_direct_kernel_unavailable_reason(
+                page_bytes=self._direct_kernel_page_bytes
+            )
+        ) is not None:
+            reason = unavailable
+        if reason is not None:
+            raise ValueError(
+                f"MLATokenToKVPoolHost cannot use HiCache IO backend 'direct_kernel': {reason}"
+            )
+        self._direct_kernel_tables = make_hicache_direct_tables(
+            self.kv_buffer, self.device_data_ptrs
+        )
+        self._direct_kernel_layer_tables = self._direct_kernel_tables.split_layers()
+
+    @property
+    def _direct_kernel_page_bytes(self) -> int:
+        return self.page_size * self.token_stride_size
 
     def _indexer_slot_range_for_layer(self, buffers, device_layer_id):
         if not buffers.index_layer_indices or self.index_k_buffer is None:
@@ -819,6 +865,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct_kernel":
+            transfer_hicache_direct(
+                self._direct_kernel_layer_tables[host_layer_id],
+                host_indices,
+                device_indices,
+                page_size=self.page_size,
+                load=True,
+            )
         elif io_backend == "kernel_ascend":
             info_index = layer_id - self._device_layer_num + 1 if is_draft else 0
             native = self._native_infos[info_index].native_buffers()
@@ -1148,6 +1202,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct_kernel":
+            transfer_hicache_direct(
+                self._direct_kernel_tables,
+                host_indices,
+                device_indices,
+                page_size=self.page_size,
+                load=False,
+            )
         elif io_backend == "kernel_ascend":
             native = self._native_infos[0].native_buffers()
             if self.layout == "page_first_kv_split":
