@@ -133,6 +133,7 @@ class TestDPSpecPrefillCoordinationPlan(CustomTestCase):
                     num_tokens_for_logprob=32,
                     global_num_tokens=[32, 7],
                     global_num_tokens_for_logprob=[32, 7],
+                    global_decoder_trim_rows=[0, 0],
                     tp0_info_cpu=torch.tensor([[32, 32, 1, 0], [7, 7, 1, 0]]),
                     is_extend_in_batch=False,
                     tbo_split_seq_index=None,
