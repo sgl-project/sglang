@@ -299,6 +299,14 @@ _AITER_PARTITION_SIZE_ROCM = 256
 _PREFILL_TILE_Q = 256
 
 
+def _zero_pad_heads(x: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """Append zero heads to x [tokens, heads, dim] up to num_heads."""
+    out = x.new_empty((x.shape[0], num_heads, *x.shape[2:]))
+    out[:, : x.shape[1]].copy_(x)
+    out[:, x.shape[1] :].zero_()
+    return out
+
+
 _DCP_VERIFY_TABLE_COLS_PER_BLOCK = 128
 
 
@@ -465,7 +473,7 @@ class AiterAttnBackend(AttentionBackend):
 
         # The asm fp8 prefill reduces through mla_reduce_v1, which only has
         # instantiations for the head shapes in _MLA_REDUCE_V1_HEADS; anything
-        # else is tiled up to one it does carry, or falls back to
+        # else is zero-padded up to one it does carry, or falls back to
         # flash_attn_varlen_func when the table has nothing to reach.
         self.fp8_prefill_num_head = (
             self.check_fp8_prefill_num_head(
@@ -1929,13 +1937,12 @@ class AiterAttnBackend(AttentionBackend):
         nhead = layer.tp_q_head_num
         v_head_dim = layer.v_head_dim
         # mla_reduce_v1 dispatches on the head count, so a model it has no
-        # instantiation for runs on the next one up, with the query heads tiled
-        # to fill and the extra output columns sliced back off.
+        # instantiation for runs on the next one up, with zero heads sliced back off.
         head_pad = self.fp8_prefill_num_head - nhead
         if head_pad:
-            q = self.pad_heads(q, self.fp8_prefill_num_head)
-            k = self.pad_heads(k, self.fp8_prefill_num_head)
-            v = self.pad_heads(v, self.fp8_prefill_num_head)
+            q = _zero_pad_heads(q, num_heads=self.fp8_prefill_num_head)
+            k = _zero_pad_heads(k, num_heads=self.fp8_prefill_num_head)
+            v = _zero_pad_heads(v, num_heads=self.fp8_prefill_num_head)
             nhead = self.fp8_prefill_num_head
 
         if q.dtype != fp8_dtype:
