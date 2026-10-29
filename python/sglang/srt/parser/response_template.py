@@ -50,6 +50,7 @@ from sglang.srt.parser.chat_parsing.response_templates import (
     ResponseTemplateField,
     load_response_template,
 )
+from sglang.srt.parser.marker_token_ids import marker_token_ids
 
 logger = logging.getLogger(__name__)
 
@@ -640,7 +641,7 @@ class ResponseTemplateReasoningDetector:
         )
 
     def get_think_end_token_ids(self, tokenizer) -> list[int]:
-        return tokenizer.encode(self.think_end_token, add_special_tokens=False)
+        return marker_token_ids(tokenizer=tokenizer, marker=self.think_end_token)
 
     def get_self_opened_think_start_token_ids(self, tokenizer) -> list[int] | None:
         return None
