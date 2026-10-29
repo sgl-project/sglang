@@ -13,7 +13,9 @@ use crate::message::response::ResponseItem;
 use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission};
 use crate::utils::error::Error;
 
-use super::handle::{CoreHandle, ExpectedResponse, RuntimeCall, translate_runtime_error};
+use super::handle::{
+    CoreHandle, ExpectedResponse, LastOutput, RuntimeCall, translate_runtime_error,
+};
 use crate::api_server::core::{CoreError, CoreEvent, RequestMetrics, prefetch};
 
 impl CoreHandle {
@@ -29,7 +31,13 @@ impl CoreHandle {
             .register(request.rid.clone(), self.inner.abort_tx.clone());
         tokio::select! {
             biased;
-            _ = generation.cancelled() => return Err(CoreError::Cancelled("request aborted".into())),
+            cancellation = generation.cancelled() => {
+                if cancellation == Cancellation::Error {
+                    return Err(CoreError::Cancelled("request aborted".into()));
+                }
+                // Submission observes the same cancellation and ends the call
+                // on its abort output without starting the request.
+            }
             result = self.prepare_generations(std::slice::from_mut(&mut request)) => result?,
         }
         let metrics = self.request_metrics(&request, created_at);
@@ -114,11 +122,14 @@ impl CoreHandle {
         Ok(calls)
     }
 
-    /// Cancel active generations by public ID, or all active generations.
-    /// The admission gate and internal IDs keep cancellation safe across
-    /// preprocessing, queueing, duplicate public IDs, and ID reuse.
-    pub(crate) fn abort(&self, rid: Option<&str>) -> bool {
-        self.inner.generations.abort(rid, &self.inner.abort_tx)
+    /// Cancel active generations by public ID, or all active generations,
+    /// ending each call as `ending` says. The admission gate and internal IDs
+    /// keep cancellation safe across preprocessing, queueing, duplicate public
+    /// IDs, and ID reuse.
+    pub(crate) fn abort(&self, rid: Option<&str>, ending: AbortEnding) -> bool {
+        self.inner
+            .generations
+            .abort(rid, ending, &self.inner.abort_tx)
     }
 
     async fn submit_generation(
@@ -218,6 +229,8 @@ impl CoreCall {
                 expected_response: ExpectedResponse::Generate,
                 in_flight: false,
                 generation: None,
+                last_output: LastOutput::default(),
+                abort_deadline: None,
             },
             None,
             None,
@@ -288,6 +301,8 @@ impl CoreCall {
                 expected_response: ExpectedResponse::Generate,
                 in_flight: true,
                 generation: None,
+                last_output: LastOutput::default(),
+                abort_deadline: None,
             },
             None,
             None,
@@ -357,6 +372,29 @@ fn generation_event(item: ResponseItem) -> CoreEvent {
 
 type Entries = HashMap<String, HashMap<Rid, Entry>>;
 
+/// How an explicit cancellation ends the calls it selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AbortEnding {
+    /// A cancelled error, as the gRPC `Abort` RPC reports it.
+    CancelledError,
+    /// A terminal output whose finish reason is the abort, as Python's
+    /// `/abort_request` ends a request.
+    AbortFinishReason,
+}
+
+/// How a call learns to end from an explicit cancellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Cancellation {
+    /// End now with a cancelled error; the runtime is told to drop the request.
+    Error,
+    /// End now on a frontend abort output: Intake never claimed the request.
+    Unstarted,
+    /// The scheduler was asked to abort the request and keeps its response
+    /// sink: end on the scheduler's terminal output, partial generation
+    /// included, or on a frontend abort output if it never comes.
+    Scheduler,
+}
+
 /// Public-ID lookup for explicit cancellation. Internal IDs remain unique;
 /// this index never replaces the runtime's request identity or admission gate.
 #[derive(Clone, Default)]
@@ -364,7 +402,7 @@ pub(super) struct Generations(Arc<Mutex<Entries>>);
 
 struct Entry {
     admission: RequestAdmission,
-    cancelled: oneshot::Sender<()>,
+    cancelled: oneshot::Sender<Cancellation>,
 }
 
 impl Generations {
@@ -388,12 +426,18 @@ impl Generations {
             rid,
             admission,
             cancellation,
+            observed: None,
             abort_tx,
             armed: true,
         }
     }
 
-    fn abort(&self, rid: Option<&str>, abort_tx: &flume::Sender<AbortSource>) -> bool {
+    fn abort(
+        &self,
+        rid: Option<&str>,
+        ending: AbortEnding,
+        abort_tx: &flume::Sender<AbortSource>,
+    ) -> bool {
         // Detach a snapshot under the lock, then notify outside it. Completion
         // and a new request reusing the same public ID cannot remove each other.
         let selected = {
@@ -410,10 +454,27 @@ impl Generations {
                 // Stop backend work immediately, even if the client is not
                 // polling its response stream. The same admission gate also
                 // prevents a queued request from starting after cancellation.
-                if entry.admission.cancel_requires_abort() {
-                    let _ = abort_tx.send(AbortSource::Guard(rid));
+                match ending {
+                    AbortEnding::CancelledError => {
+                        // Cancel admission before notifying, so a racing
+                        // terminal cannot complete the request and skip the
+                        // abort, and notify before the abort can tear down
+                        // the response sink the call may be polling.
+                        let requires_abort = entry.admission.cancel_requires_abort();
+                        let _ = entry.cancelled.send(Cancellation::Error);
+                        if requires_abort {
+                            let _ = abort_tx.send(AbortSource::Guard(rid));
+                        }
+                    }
+                    AbortEnding::AbortFinishReason => {
+                        if entry.admission.cancel_if_pending() {
+                            let _ = entry.cancelled.send(Cancellation::Unstarted);
+                        } else if entry.admission.is_accepted() {
+                            let _ = entry.cancelled.send(Cancellation::Scheduler);
+                            let _ = abort_tx.send(AbortSource::Request(rid));
+                        }
+                    }
                 }
-                let _ = entry.cancelled.send(());
             }
         }
         matched
@@ -436,22 +497,37 @@ pub(super) struct Generation {
     registry: Generations,
     rid: Rid,
     pub(super) admission: RequestAdmission,
-    cancellation: oneshot::Receiver<()>,
+    cancellation: oneshot::Receiver<Cancellation>,
+    /// The cancellation once observed. Preparation, submission and the
+    /// response stream may each observe it, and a oneshot receiver must not
+    /// be polled again after consuming its notification.
+    observed: Option<Cancellation>,
     abort_tx: flume::Sender<AbortSource>,
     armed: bool,
 }
 
 impl Generation {
-    pub(super) async fn cancelled(&mut self) {
-        // Preparation and submission may both observe the same cancellation;
-        // do not poll a oneshot receiver again after consuming its notification.
-        if !self.is_cancelled() {
-            let _ = (&mut self.cancellation).await;
+    pub(super) async fn cancelled(&mut self) -> Cancellation {
+        match self.observed {
+            Some(cancellation) => cancellation,
+            None => *self.observed.insert(
+                (&mut self.cancellation)
+                    .await
+                    .unwrap_or(Cancellation::Error),
+            ),
         }
     }
 
-    pub(super) fn is_cancelled(&self) -> bool {
-        self.admission.is_cancelled()
+    /// The cancellation, if it has already happened.
+    pub(super) fn try_cancelled(&mut self) -> Option<Cancellation> {
+        if self.observed.is_none() {
+            self.observed = match self.cancellation.try_recv() {
+                Ok(cancellation) => Some(cancellation),
+                Err(oneshot::error::TryRecvError::Closed) => Some(Cancellation::Error),
+                Err(oneshot::error::TryRecvError::Empty) => None,
+            };
+        }
+        self.observed
     }
 
     pub(super) fn complete(&mut self) {
@@ -475,6 +551,7 @@ impl Drop for Generation {
 #[cfg(test)]
 mod tests {
     use super::super::handle::{CoreConfig, CoreMetadata};
+    use super::AbortEnding::{AbortFinishReason, CancelledError};
     use super::*;
     use crate::api_server::core::FrontendMetrics;
     use crate::api_server::core::{CoreErrorKind, CoreOutput};
@@ -482,7 +559,7 @@ mod tests {
     use crate::message::config::DisaggregationMode;
     use crate::message::multimodal::MmItem;
     use crate::message::request::MmData;
-    use crate::message::response::ChunkEvent;
+    use crate::message::response::{CachedTokensDetails, ChunkEvent, ChunkExtras};
     use crate::multi_modality::worker::MediaError;
     use crate::tokenizer_manager::wiring::TmEvent;
     use bytes::Bytes;
@@ -832,7 +909,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(harness.intake_rx.try_recv().is_err());
-            assert!(harness.handle.abort(Some(aborted)));
+            assert!(harness.handle.abort(Some(aborted), CancelledError));
             let mut calls = tokio::time::timeout(Duration::from_secs(5), batch)
                 .await
                 .expect("cancelled media must not hold up its sibling")
@@ -863,7 +940,7 @@ mod tests {
                 }
                 assert!(call.recv().await.is_none());
             }
-            assert!(!harness.handle.abort(None));
+            assert!(!harness.handle.abort(None, CancelledError));
             assert!(harness.abort_rx.try_recv().is_err());
         }
     }
@@ -882,7 +959,7 @@ mod tests {
 
         // A is accepted; B is blocked on intake; C has not been submitted yet.
         assert!(futures::poll!(batch.as_mut()).is_pending());
-        assert!(handle.abort(Some("B")));
+        assert!(handle.abort(Some("B"), CancelledError));
         assert!(futures::poll!(batch.as_mut()).is_pending());
         let last = accept_intake(intake_rx.recv_async().await.unwrap());
         assert_eq!(last.rid.client_facing(), "C");
@@ -912,7 +989,7 @@ mod tests {
             }
             assert!(call.recv().await.is_none());
         }
-        assert!(!handle.abort(None));
+        assert!(!handle.abort(None, CancelledError));
         assert!(abort_rx.try_recv().is_err());
     }
 
@@ -931,8 +1008,8 @@ mod tests {
             .unwrap();
         let old_a = accept_intake(harness.intake_rx.recv().unwrap());
         let old_b = accept_intake(harness.intake_rx.recv().unwrap());
-        assert!(harness.handle.abort(Some("same")));
-        assert!(!harness.handle.abort(Some("same")));
+        assert!(harness.handle.abort(Some("same"), CancelledError));
+        assert!(!harness.handle.abort(Some("same"), CancelledError));
         // Backend cancellation does not depend on polling either response.
         let aborted: std::collections::HashSet<_> = (0..2)
             .map(|_| harness.abort_rx.try_recv().unwrap().rid().clone())
@@ -954,7 +1031,7 @@ mod tests {
         }
         drop((first, second));
         assert!(harness.abort_rx.try_recv().is_err());
-        assert!(harness.handle.abort(Some("same")));
+        assert!(harness.handle.abort(Some("same"), CancelledError));
         assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &new_request.rid);
         drop(new);
         assert!(harness.abort_rx.try_recv().is_err());
@@ -968,7 +1045,7 @@ mod tests {
             .generate(public_request("queued"))
             .await
             .unwrap();
-        assert!(harness.handle.abort(Some("queued")));
+        assert!(harness.handle.abort(Some("queued"), CancelledError));
         let TmEvent::Intake { admission, .. } = harness.intake_rx.recv().unwrap() else {
             panic!("expected intake");
         };
@@ -981,19 +1058,182 @@ mod tests {
         assert!(harness.abort_rx.try_recv().is_err());
     }
 
+    /// A submission blocked on admission wakes on an explicit abort without
+    /// starting the request: the gRPC ending fails it, the `/abort_request`
+    /// ending returns a call that finishes on the abort.
     #[tokio::test]
     async fn explicit_abort_wakes_a_submission_blocked_on_admission() {
-        let (intake_tx, intake_rx) = flume::bounded(0);
-        let (abort_tx, abort_rx) = flume::unbounded();
+        for ending in [CancelledError, AbortFinishReason] {
+            let (intake_tx, intake_rx) = flume::bounded(0);
+            let (abort_tx, abort_rx) = flume::unbounded();
+            let handle = test_handle(intake_tx, abort_tx, 8);
+            let mut submit = Box::pin(handle.generate(public_request("blocked")));
+            assert!(futures::poll!(submit.as_mut()).is_pending());
+            assert!(handle.abort(Some("blocked"), ending));
+            match (ending, submit.await) {
+                (CancelledError, Err(CoreError::Cancelled(_))) => {}
+                (AbortFinishReason, Ok(mut call)) => {
+                    let Some(CoreEvent::Finished(output)) = call.recv().await else {
+                        panic!("the call finishes on the abort");
+                    };
+                    let reason = output.finish_reason.unwrap();
+                    assert_eq!(reason.kind_name(), Some("abort"));
+                    assert_eq!(reason.abort_status(), None, "a plain abort");
+                    assert!(call.recv().await.is_none());
+                }
+                (ending, result) => panic!("{ending:?}: unexpected {:?}", result.err()),
+            }
+            if let Ok(TmEvent::Intake { admission, .. }) = intake_rx.try_recv() {
+                assert!(!admission.try_accept());
+            }
+            assert!(abort_rx.try_recv().is_err());
+        }
+    }
+
+    /// An explicit cancellation is published before its backend abort, which
+    /// lets Intake tear down the response sink. A call that then finds its
+    /// sink closed ends on the cancellation, not as a truncated response.
+    /// The abort lane here is a rendezvous, so the abort is held handing over
+    /// its backend abort while the sink is dropped.
+    #[tokio::test]
+    async fn explicit_abort_ends_the_call_before_its_sink_closes() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, abort_rx) = flume::bounded(0);
         let handle = test_handle(intake_tx, abort_tx, 8);
+        let mut call = handle.generate(public_request("raced")).await.unwrap();
+        let TmEvent::Intake { request, admission } = intake_rx.recv().unwrap() else {
+            panic!("expected intake");
+        };
+        assert!(admission.try_accept());
+        let aborter = {
+            let handle = handle.clone();
+            std::thread::spawn(move || handle.abort(Some("raced"), CancelledError))
+        };
+        while admission.is_accepted() {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        drop(request);
+        assert!(matches!(
+            call.recv().await,
+            Some(CoreEvent::Failed(CoreError::Cancelled(message))) if message == "client disconnected"
+        ));
+        assert!(
+            matches!(abort_rx.recv().unwrap(), AbortSource::Guard(rid) if rid.client_facing() == "raced")
+        );
+        assert!(aborter.join().unwrap());
+    }
+
+    /// An `/abort_request` that ends a call before Intake claims it records
+    /// no finished request: the request never ran, as for an abort the
+    /// scheduler answers from its queue.
+    #[tokio::test]
+    async fn unstarted_abort_request_records_no_finished_request() {
+        let dir = std::env::temp_dir().join(format!("core-unstarted-abort-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::message::config::MetricsConfig::for_dir(&dir);
+        let metrics = Arc::new(FrontendMetrics::new(&config, DisaggregationMode::Null).unwrap());
+        let (intake_tx, _intake_rx) = flume::bounded(0);
+        let handle = CoreHandle::new(
+            intake_tx,
+            flume::unbounded().0,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Vec::new(),
+                multimodal: false,
+                peer_endpoints: Vec::new(),
+                metadata: CoreMetadata::default(),
+                metrics: Some(metrics.clone()),
+            },
+        );
         let mut submit = Box::pin(handle.generate(public_request("blocked")));
         assert!(futures::poll!(submit.as_mut()).is_pending());
-        assert!(handle.abort(Some("blocked")));
-        assert!(matches!(submit.await, Err(CoreError::Cancelled(_))));
-        if let Ok(TmEvent::Intake { admission, .. }) = intake_rx.try_recv() {
-            assert!(!admission.try_accept());
+        assert!(handle.abort(Some("blocked"), AbortFinishReason));
+        let mut call = submit.await.unwrap();
+        assert!(matches!(call.recv().await, Some(CoreEvent::Finished(_))));
+        drop(call);
+
+        metrics.flush().unwrap();
+        let files = crate::utils::prometheus::read_dir_files(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let text = crate::utils::prometheus::render(&crate::utils::prometheus::merge(
+            files
+                .iter()
+                .map(|(name, data)| (name.as_str(), data.as_slice())),
+        ));
+        assert!(
+            text.contains(r#"sglang:num_requests_total{is_streaming="false"} 0.0"#),
+            "{text}"
+        );
+    }
+
+    /// A call handed to the scheduler by `/abort_request` ends on a frontend
+    /// abort output when the scheduler's answer cannot come: its sink closed
+    /// (Intake fell back to dropping it), or the deadline passed, which also
+    /// stops the scheduler as a dropped call does. The output repeats what the
+    /// request last reported, its cache split included.
+    #[tokio::test(start_paused = true)]
+    async fn scheduler_abort_without_an_answer_ends_on_a_frontend_abort_output() {
+        for sink_closes in [true, false] {
+            let harness = Harness::unbounded(8);
+            let mut call = harness
+                .handle
+                .generate(public_request("held"))
+                .await
+                .unwrap();
+            let request = accept_intake(harness.intake_rx.recv().unwrap());
+            let details = CachedTokensDetails {
+                device: 1,
+                host: 2,
+                storage: None,
+                storage_backend: None,
+            };
+            request
+                .sink
+                .try_send(ResponseItem::Frame(ChunkEvent {
+                    rid: request.rid.clone(),
+                    token_ids: vec![7],
+                    prompt_tokens: 5,
+                    cached_tokens: 3,
+                    completion_tokens: 1,
+                    extras: Some(Box::new(ChunkExtras {
+                        cached_tokens_details: Some(details.clone()),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }))
+                .unwrap();
+            assert!(matches!(call.recv().await, Some(CoreEvent::Delta(_))));
+            assert!(harness.handle.abort(Some("held"), AbortFinishReason));
+            assert!(matches!(
+                harness.abort_rx.try_recv(),
+                Ok(AbortSource::Request(rid)) if rid == request.rid
+            ));
+            let rid = request.rid.clone();
+            if sink_closes {
+                drop(request);
+            }
+
+            let Some(CoreEvent::Finished(output)) = call.recv().await else {
+                panic!("sink_closes={sink_closes}: the call finishes on an abort output");
+            };
+            assert_eq!(output.finish_reason.unwrap().kind_name(), Some("abort"));
+            assert_eq!((output.prompt_tokens, output.cached_tokens), (5, 3));
+            let extras = output.extras.unwrap();
+            assert!(extras.abort_output);
+            assert_eq!(extras.cached_tokens_details, Some(details));
+            if sink_closes {
+                assert!(harness.abort_rx.try_recv().is_err());
+            } else {
+                assert!(matches!(
+                    harness.abort_rx.try_recv(),
+                    Ok(AbortSource::Guard(aborted)) if aborted == rid
+                ));
+            }
         }
-        assert!(abort_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1010,7 +1250,7 @@ mod tests {
             .try_send(ResponseItem::Done(ChunkEvent::default()))
             .unwrap();
         assert!(matches!(call.recv().await, Some(CoreEvent::Finished(_))));
-        assert!(!harness.handle.abort(Some("done")));
+        assert!(!harness.handle.abort(Some("done"), CancelledError));
         drop(call);
         assert!(harness.abort_rx.try_recv().is_err());
 
@@ -1022,8 +1262,8 @@ mod tests {
         let request = accept_intake(harness.intake_rx.recv().unwrap());
         drop(call);
         assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &request.rid);
-        assert!(!harness.handle.abort(Some("dropped")));
-        assert!(!harness.handle.abort(None));
+        assert!(!harness.handle.abort(Some("dropped"), CancelledError));
+        assert!(!harness.handle.abort(None, CancelledError));
     }
 
     #[tokio::test]
@@ -1036,7 +1276,7 @@ mod tests {
         let b = harness.handle.generate(public_request("b")).await.unwrap();
         let req_a = accept_intake(harness.intake_rx.recv().unwrap());
         let req_b = accept_intake(harness.intake_rx.recv().unwrap());
-        assert!(harness.handle.abort(None));
+        assert!(harness.handle.abort(None, CancelledError));
         let aborted: std::collections::HashSet<_> = (0..2)
             .map(|_| harness.abort_rx.try_recv().unwrap().rid().clone())
             .collect();
@@ -1048,7 +1288,7 @@ mod tests {
         assert_eq!(decode.await.unwrap(), "text");
         drop((a, b));
         assert!(harness.abort_rx.try_recv().is_err());
-        assert!(!harness.handle.abort(None));
+        assert!(!harness.handle.abort(None, CancelledError));
         let future = harness
             .handle
             .generate(public_request("future"))
@@ -1072,7 +1312,7 @@ mod tests {
             .sink
             .try_send(ResponseItem::Frame(ChunkEvent::default()))
             .unwrap();
-        assert!(harness.handle.abort(Some("buffered")));
+        assert!(harness.handle.abort(Some("buffered"), CancelledError));
         let mut events = Vec::new();
         call.drain_ready(&mut events);
         assert!(matches!(

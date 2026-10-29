@@ -100,6 +100,7 @@ impl CoreHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_server::handlers::AbortEnding::CancelledError;
     use crate::api_server::handlers::test_utils::*;
     use crate::message::request::RequestKind;
     use crate::message::response::{ChunkEvent, ResponseItem, frame_health_ack};
@@ -140,7 +141,7 @@ mod tests {
         let rid = request.rid.clone();
         assert!(rid.as_str().starts_with("HEALTH_CHECK_"));
         assert!(
-            !handle.abort(None),
+            !handle.abort(None, CancelledError),
             "internal probes must not enter the public abort-all registry"
         );
         assert!(from_scheduler_tx.push(frame_health_ack()));
@@ -209,7 +210,7 @@ mod tests {
         assert_eq!(warmup.sampling_params.max_new_tokens, Some(8));
         assert_eq!(warmup.bootstrap_host, None);
         assert!(
-            !harness.handle.abort(None),
+            !harness.handle.abort(None, CancelledError),
             "startup warmup must not enter the public abort-all registry"
         );
         request
