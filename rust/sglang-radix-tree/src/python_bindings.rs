@@ -555,6 +555,7 @@ pub struct InsertParamsBinding {
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
     pub swa_branching_seqlen: Option<usize>,
+    pub swa_prompt_tail: bool,
     pub inserted_len: usize,
     pub priority: i64,
     pub track_adopted_ranges: bool,
@@ -563,7 +564,7 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, session_id = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, swa_branching_seqlen = None, inserted_len = 0, priority = 0, mamba_value = None, track_adopted_ranges = false, rotation_base = None, swa_prompt_tail = false))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
@@ -579,6 +580,7 @@ impl InsertParamsBinding {
         mamba_value: Option<Py<PyAny>>,
         track_adopted_ranges: bool,
         rotation_base: Option<i64>,
+        swa_prompt_tail: bool,
     ) -> PyResult<Self> {
         Ok(InsertParamsBinding {
             rotation_base,
@@ -591,6 +593,7 @@ impl InsertParamsBinding {
             prev_prefix_len,
             swa_evicted_seqlen,
             swa_branching_seqlen,
+            swa_prompt_tail,
             inserted_len,
             priority,
             track_adopted_ranges,
@@ -1153,6 +1156,7 @@ macro_rules! tree_core_methods {
                     prev_prefix_len: params.prev_prefix_len,
                     swa_evicted_seqlen: params.swa_evicted_seqlen,
                     swa_branching_seqlen: params.swa_branching_seqlen,
+                    swa_prompt_tail: params.swa_prompt_tail,
                     inserted_len: params.inserted_len,
                     priority: params.priority,
                     track_adopted_ranges: params.track_adopted_ranges,
@@ -1191,6 +1195,7 @@ macro_rules! tree_core_methods {
                     prev_prefix_len: params.prev_prefix_len,
                     swa_evicted_seqlen: params.swa_evicted_seqlen,
                     swa_branching_seqlen: params.swa_branching_seqlen,
+                    swa_prompt_tail: params.swa_prompt_tail,
                     inserted_len: params.inserted_len,
                     priority: params.priority,
                     track_adopted_ranges: params.track_adopted_ranges,

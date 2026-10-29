@@ -187,6 +187,59 @@ impl SwaComponent {
         }
         unbacked
     }
+
+    /// Whether a branch ends or forks less than one window below `node_id`,
+    /// so tombstoning it leaves that match boundary without a full window.
+    fn is_in_branch_tail_<K: ChildKeyType>(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> bool {
+        let mut node = tree_core.arena.node(node_id);
+        let mut tokens_below = 0;
+        while node.children.len() == 1 {
+            node = tree_core
+                .arena
+                .node(*node.children.values().next().unwrap());
+            if !node.has_device_value(SWA) && !node.has_host_value(SWA) {
+                return false;
+            }
+            tokens_below += node.key.atom_len();
+            if tokens_below >= self.sliding_window_size {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Move the cursor past branch tails and prompt-end windows; reclaim them
+    /// once nothing else is left.
+    fn skip_branch_tails_<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        mut cursor: Option<NodeIdx_>,
+    ) -> Option<NodeIdx_> {
+        while tree_core.component_state(SWA).evict_device_spares_tails {
+            let Some(x) = cursor else {
+                let state = tree_core.component_state_mut(SWA);
+                state.evict_device_spares_tails = false;
+                if state.evict_device_spared_tail {
+                    cursor = tree_core
+                        .device_lru_list(SWA)
+                        .get_lru_no_lock(&tree_core.arena);
+                }
+                break;
+            };
+            if !tree_core.arena.node(x).swa_prompt_tail && !self.is_in_branch_tail_(tree_core, x) {
+                break;
+            }
+            tree_core.component_state_mut(SWA).evict_device_spared_tail = true;
+            cursor = tree_core
+                .device_lru_list(SWA)
+                .get_prev_no_lock(x, &tree_core.arena);
+        }
+        cursor
+    }
 }
 
 impl SwaComponent {
@@ -588,6 +641,11 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         }
 
         if !is_new_leaf {
+            // An earlier checkpoint may have built the prompt-end window already.
+            let node = tree_core.arena.node_mut(node_id);
+            if params.swa_prompt_tail && !node.is_root() && node.has_device_value(SWA) {
+                node.swa_prompt_tail = true;
+            }
             return;
         }
 
@@ -627,6 +685,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             node_id: tree_core.arena.node(node_id).id,
             source_value: tree_core.arena.device_value(node_id, FULL).shallow_clone(),
         }));
+        tree_core.arena.node_mut(node_id).swa_prompt_tail = params.swa_prompt_tail;
     }
 
     fn redistribute_on_node_split(
@@ -669,6 +728,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         tree_core.arena.node_mut(new_parent_id).swa_uuid = swa_uuid;
         let swa_host_uuid = tree_core.arena.node_mut(child_id).swa_host_uuid.take();
         tree_core.arena.node_mut(new_parent_id).swa_host_uuid = swa_host_uuid;
+        // Both halves keep the bit, so a split leaves the protected span as it was.
+        tree_core.arena.node_mut(new_parent_id).swa_prompt_tail =
+            tree_core.arena.node(child_id).swa_prompt_tail;
     }
 
     fn evict_component(
@@ -696,6 +758,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 .push(node.device_value(FULL).shallow_clone());
             freed = tree_core.component_reclaimable_value_len_(node_id, SWA);
             let _ = tree_core.arena.node_mut(node_id).take_device_value(SWA);
+            // SWA is rebuilt only on a tombstone or a new leaf, so a window
+            // stays protected only if a prompt-end insert built it.
+            tree_core.arena.node_mut(node_id).swa_prompt_tail = false;
             tree_core.dec_evictable_size(SWA, freed);
         }
 
@@ -773,12 +838,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             if tracker[&ct] >= tree_core.component_state(SWA).evict_device_request_cnt {
                 break 'step None;
             }
+            cursor = self.skip_branch_tails_(tree_core, cursor);
             let Some(x) = cursor else {
                 break 'step None;
             };
-            if !tree_core.device_lru_list(SWA).in_list(Some(x)) {
-                break 'step None;
-            }
             assert!(
                 tree_core.arena.has_device_value(x, SWA),
                 "Swa eviction cursor on a valueless node {x}"
