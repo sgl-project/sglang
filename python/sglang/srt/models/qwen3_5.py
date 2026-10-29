@@ -1121,44 +1121,47 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return output
 
 
-class _PrefillMboStages:
-    """Prefill microbatch stages of a dense Qwen3.5 layer (see
-    batch_overlap/prefill_mbo.py). Each stage joins the sum it reads, which ran
-    on the side stream while the other microbatch computed, and leaves its own
-    sum running there."""
-
-    def op_mbo_attn(self, state, hidden_states, positions, forward_batch, **kwargs):
-        hidden_states = residual_batch.stream_of(forward_batch).complete(hidden_states)
-        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self._mbo_mixer(positions, hidden_states, forward_batch)
-        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        prefill_mbo.start_pending_sum(residual_batch.stream_of(forward_batch))
-        return dict(
-            hidden_states=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            **kwargs,
-        )
-
-    def op_mbo_ffn(self, state, hidden_states, forward_batch, **kwargs):
-        stream = residual_batch.stream_of(forward_batch)
-        hidden_states = stream.complete(hidden_states)
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self.mlp(hidden_states)
-        # The dense MLP leaves its whole sum (reduce_results=False); under the
-        # model gate that sum is over the TP group.
-        produced = self.ffn_boundary.plan.path_for(forward_batch).output
-        hidden_states = residual_batch.stream_of(forward_batch).record(
-            hidden_states, produced.update, declared_sum=produced.group
-        )
-        prefill_mbo.start_pending_sum(residual_batch.stream_of(forward_batch))
-        return dict(hidden_states=hidden_states, forward_batch=forward_batch, **kwargs)
+# Prefill microbatch stages of a dense Qwen3.5 layer (see
+# batch_overlap/prefill_mbo.py), bound as methods of both decoder layer types.
+# Each stage joins the sum it reads, which ran on the side stream while the
+# other microbatch computed, and leaves its own sum running there.
+def _qwen3_5_op_mbo_attn(
+    layer, state, hidden_states, positions, forward_batch, **kwargs
+):
+    hidden_states = residual_batch.stream_of(forward_batch).complete(hidden_states)
+    hidden_states = layer.attn_boundary.prepare(hidden_states, forward_batch)
+    hidden_states = layer._mbo_mixer(positions, hidden_states, forward_batch)
+    hidden_states = layer.attn_boundary.finish(hidden_states, forward_batch)
+    prefill_mbo.start_pending_sum(residual_batch.stream_of(forward_batch))
+    return dict(
+        hidden_states=hidden_states,
+        positions=positions,
+        forward_batch=forward_batch,
+        **kwargs,
+    )
 
 
-class Qwen3_5LinearDecoderLayer(_PrefillMboStages, nn.Module):
+def _qwen3_5_op_mbo_ffn(layer, state, hidden_states, forward_batch, **kwargs):
+    stream = residual_batch.stream_of(forward_batch)
+    hidden_states = stream.complete(hidden_states)
+    hidden_states = layer.ffn_boundary.prepare(hidden_states, forward_batch)
+    hidden_states = layer.mlp(hidden_states)
+    # The dense MLP leaves its whole sum (reduce_results=False); under the
+    # model gate that sum is over the TP group.
+    produced = layer.ffn_boundary.plan.path_for(forward_batch).output
+    hidden_states = residual_batch.stream_of(forward_batch).record(
+        hidden_states, produced.update, declared_sum=produced.group
+    )
+    prefill_mbo.start_pending_sum(residual_batch.stream_of(forward_batch))
+    return dict(hidden_states=hidden_states, forward_batch=forward_batch, **kwargs)
+
+
+class Qwen3_5LinearDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
 
     stage_facts = staticmethod(_qwen3_5_stage_facts)
+    op_mbo_attn = _qwen3_5_op_mbo_attn
+    op_mbo_ffn = _qwen3_5_op_mbo_ffn
 
     def __init__(
         self,
@@ -1298,10 +1301,12 @@ def _refreshes_rope_cos_sin(
     return owned_by_stage and first_in_stage
 
 
-class Qwen3_5AttentionDecoderLayer(_PrefillMboStages, nn.Module):
+class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
     stage_facts = staticmethod(_qwen3_5_stage_facts)
+    op_mbo_attn = _qwen3_5_op_mbo_attn
+    op_mbo_ffn = _qwen3_5_op_mbo_ffn
 
     def __init__(
         self,
