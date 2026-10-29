@@ -596,6 +596,26 @@ class TestMooncakeEarlySend(CustomTestCase):
         MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
         manager.send_kvcache.assert_called_once()
 
+    def test_worker_waits_before_the_staging_gather(self):
+        """The staged path gathers the pages into the staging buffer before the
+        RDMA post, so a wait covering only the post ships partially written KV."""
+        order = []
+        manager, queue = self._worker(
+            SimpleNamespace(synchronize=lambda: order.append("wait"))
+        )
+        manager.enable_staging = True
+
+        def stop_at_strategy(_staging_buffer):
+            order.append("gather")
+            raise SystemExit
+
+        manager._try_create_staging_strategy = stop_at_strategy
+        with self.assertRaises(SystemExit):
+            MooncakeKVManager.transfer_worker(
+                manager, queue, MagicMock(), staging_buffer=object()
+            )
+        self.assertEqual(order, ["wait", "gather"])
+
 
 class TestMooncakeStagingDeviceType(unittest.TestCase):
     """Staging init must receive the runtime's device, not a hardcoded "cuda".

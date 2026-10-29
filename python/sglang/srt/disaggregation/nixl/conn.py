@@ -1552,6 +1552,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # see kv_buffer_tensors (set by ModelRunner after engine init).
         # Never cache on self -- multiple workers would race the ring.
         staging_strategy = None
+        # The early-send wait is this thread's first device call; with no device
+        # bound it opens a context on device 0 on every rank not on GPU 0.
+        device_bound = False
 
         while True:
             kv_chunk: TransferKVChunk = queue.get()
@@ -1578,6 +1581,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if not kv_chunk.staging_counted:
                     self._staging_outstanding[room] += 1
                     kv_chunk.staging_counted = True
+
+                # Same wait as mooncake's worker: before reading source KV, skipped
+                # for a failed room, cleared so a deferred re-enqueue does not wait.
+                if kv_chunk.wait_event is not None:
+                    if self.check_status(room) != KVPoll.Failed:
+                        if not device_bound:
+                            torch.get_device_module(get_device().device).set_device(
+                                self.kv_args.gpu_id
+                            )
+                            device_bound = True
+                        kv_chunk.wait_event.synchronize()
+                    kv_chunk.wait_event = None
 
                 if self.check_status(room) == KVPoll.Failed:
                     self._staging_outstanding.pop(room, None)
@@ -3185,6 +3200,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                wait_event=wait_event,
             )
         )
         return None
