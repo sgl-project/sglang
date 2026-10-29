@@ -33,13 +33,10 @@ import torch
 
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedMLATokenToKVPool,
-)
 from sglang.srt.runtime_context import get_parallel
 
 _DEV = "cpu"
@@ -176,10 +173,10 @@ class TestUnifiedKVPoolMLA(unittest.TestCase):
         self.assertEqual(views[0].stride(0) * _ITEM, full.entry_bytes())
 
 
-class TestUnifiedMLATokenToKVPool(unittest.TestCase):
+class TestMLAView(unittest.TestCase):
     def _make(self, ps=1):
         pool, full, mamba = _make_unified(page_size=ps)
-        kv_pool = UnifiedMLATokenToKVPool(
+        kv_pool = MLAView(
             arena=pool,
             spec=pool.spec("full"),
             kv_cache_dtype=_DTYPE,

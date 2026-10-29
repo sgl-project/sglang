@@ -18,8 +18,9 @@ from sglang.srt.mem_cache.kv.decl import (
     StateLifetime,
     WindowLifetime,
 )
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
-from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
+from sglang.srt.mem_cache.kv.layout.state import StateView
 from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena, plan_bands
 from sglang.srt.mem_cache.kv.plan import (
     KVStoragePlan,
@@ -39,9 +40,6 @@ from sglang.srt.mem_cache.kv.storage import KVStorage
 from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedMambaPool,
-    UnifiedMHATokenToKVPool,
-    UnifiedMLATokenToKVPool,
     _wire_mamba_slot_allocator,
 )
 
@@ -60,8 +58,7 @@ class UnifiedBuildContext(msgspec.Struct, frozen=True, kw_only=True):
     forward_stream: Optional[Any] = None  # torch.cuda.Stream
     post_capture_active: bool = False
     is_draft_worker: bool = False
-    # The model's per-rank KV head count and head dim, recorded on the
-    # full+state facade even when its full side is an MLA latent.
+    # Per-rank model KV geometry, including when the owner stores MLA latents.
     head_num: Optional[int] = None
     head_dim: Optional[int] = None
     # The request table (every plan) and the state storage (a plan with state).
@@ -131,7 +128,7 @@ def _build_state_storage(
     )
     return StateStorage(
         sub_pool=state.name,
-        pool=UnifiedMambaPool(
+        pool=StateView(
             arena=arena,
             spec=state.spec,
             spec_state_size=ctx.max_num_reqs,  # outer dim of spec-decode intermediates
@@ -161,16 +158,17 @@ def _build_token_view(
     """A token sub-pool's view in its layout."""
     if isinstance(sub_pool.spec, MLASubPoolSpec):
         # Addressed by the 0..N-1 index of its layers, so start_layer stays 0.
-        return UnifiedMLATokenToKVPool(
+        return MLAView(
             arena=arena,
             spec=sub_pool.spec,
             kv_cache_dtype=sub_pool.geometry.kv_cache_dtype,
             page_size=plan.page_size,
         )
-    return UnifiedMHATokenToKVPool(
+    return MHAView(
         arena=arena,
         spec=sub_pool.spec,
         page_size=plan.page_size,
+        model_layer_ids=tuple(sub_pool.layer_ids),
         start_layer=ctx.start_layer,
         end_layer=ctx.end_layer,
     )
@@ -182,10 +180,7 @@ def build_kv_storage(
     sizing: KVSizingInputs,
     ctx: UnifiedBuildContext,
 ) -> KVStorage:
-    """The plan's KV storage: one arena for its sub-pools, a view per token
-    sub-pool, the routed KV cache over them, the chain allocator handing out
-    their ids and the request table holding them. A plan with state also gets
-    its state storage."""
+    """Construct the arena, views, allocator and request storage for ``plan``."""
     assert not ctx.is_draft_worker, (
         "a draft worker binds views over the target's buffer instead of "
         "building one of its own"
@@ -216,13 +211,8 @@ def build_kv_storage(
     )
     token_sub_pools = [s for s in plan.owner_first() if s is not state]
     views = {s.name: _build_token_view(s, arena, plan, ctx) for s in token_sub_pools}
-    for s in token_sub_pools:
-        # Only the pool routing a layer knows its model id.
-        if isinstance(views[s.name], UnifiedMHATokenToKVPool):
-            views[s.name].model_layer_ids = tuple(s.layer_ids)
-    # Today's token capacity of the pool: the owner's configured cap where
-    # the owner is the only token sub-pool, else its slots (until sizing
-    # follows one rule for every chain).
+    # Without a window, capacity uses the configured cap;
+    # window chains use the owner's current arena slots.
     kv_size = (
         sizing.full_tokens if window is None else arena.num_entries(owner.name) - 1
     )

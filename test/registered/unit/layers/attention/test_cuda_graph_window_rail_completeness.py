@@ -42,7 +42,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -140,7 +140,7 @@ class TestDraftStepWriteColumns(CustomTestCase):
 
     def _batch(self, *, bs, topk, num_steps, window_cols):
         reader = _Reader()
-        plan = KVLocPlan(
+        plan = IterationIds(
             source=reader,
             req_pool_indices=torch.arange(bs),
             seq_lens=torch.ones(bs, dtype=torch.int64),
@@ -153,8 +153,8 @@ class TestDraftStepWriteColumns(CustomTestCase):
         cols = None if window_cols == num_steps else slice(0, num_steps)
         batch = SimpleNamespace(
             batch_size=bs,
-            kv_loc_plan=plan,
-            kv_loc_cols=cols,
+            iteration_ids=plan,
+            iteration_cols=cols,
             out_cache_loc=plan.write_ids(reader, cols=cols),
         )
         swa = plan.write_ids(reader, kind=IdSpaceKind.SLIDING_WINDOW, cols=cols)
@@ -187,13 +187,13 @@ class TestDraftStepWriteColumns(CustomTestCase):
                         ids = plan.write_ids(
                             reader,
                             kind=IdSpaceKind.SLIDING_WINDOW,
-                            cols=batch.kv_loc_cols,
+                            cols=batch.iteration_cols,
                         )
                         torch.testing.assert_close(ids, per_step[step], rtol=0, atol=0)
                         torch.testing.assert_close(
                             batch.out_cache_loc * 10, ids, rtol=0, atol=0
                         )
-                    self.assertIs(batch.kv_loc_cols, cols)
+                    self.assertIs(batch.iteration_cols, cols)
 
     def test_trtllm_steps_init_from_their_own_columns(self):
         from sglang.srt.layers.attention.trtllm_mha_backend import (
@@ -210,7 +210,7 @@ class TestDraftStepWriteColumns(CustomTestCase):
             def init(fb):
                 seen.append(
                     plan.write_ids(
-                        reader, kind=IdSpaceKind.SLIDING_WINDOW, cols=fb.kv_loc_cols
+                        reader, kind=IdSpaceKind.SLIDING_WINDOW, cols=fb.iteration_cols
                     )
                 )
 
@@ -228,7 +228,7 @@ class TestDraftStepWriteColumns(CustomTestCase):
         self.assertEqual(len(seen), num_steps - 1)
         for step, ids in enumerate(seen):
             torch.testing.assert_close(ids, per_step[step], rtol=0, atol=0)
-        self.assertIs(batch.kv_loc_cols, cols)
+        self.assertIs(batch.iteration_cols, cols)
 
     def test_trtllm_steps_capture_their_own_contiguous_writes(self):
         """BUG REGRESSION. Under CUDA graphs a static window pool's per-step
@@ -248,8 +248,8 @@ class TestDraftStepWriteColumns(CustomTestCase):
             with self.subTest(bs=bs, topk=topk, num_steps=num_steps):
                 batch = SimpleNamespace(
                     batch_size=bs,
-                    kv_loc_plan=None,
-                    kv_loc_cols=None,
+                    iteration_ids=None,
+                    iteration_cols=None,
                     out_cache_loc=torch.arange(1, bs * topk * num_steps + 1),
                     spec_info=SimpleNamespace(is_draft_input=lambda: True),
                     encoder_lens=None,

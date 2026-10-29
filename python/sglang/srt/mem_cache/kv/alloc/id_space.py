@@ -190,9 +190,7 @@ class UnitIds:
         out: Optional[torch.Tensor] = None,
         out_width: Optional[int] = None,
     ) -> torch.Tensor:
-        """One launch for the read and write conversions alike; see
-        `translate_token_ids`, which owns the `out=` dtype and shape contract
-        for both."""
+        """Share ``translate_token_ids``'s output dtype and shape contract."""
         return translate_token_ids(
             loc=loc,
             v2p=self.virtual_to_physical,
@@ -228,3 +226,95 @@ class UnitIds:
             read_v2p=table,
             table=table,
         )
+
+
+class WindowRead(msgspec.Struct, frozen=True, kw_only=True):
+    """What a sliding-window layer reads of each request, and how its kernel
+    masks the read to each query's window. Every attention mode (extend,
+    target verify, draft extend; eager or replayed from a graph) takes its
+    window read from `window_read`, so the read range and the mask never
+    disagree."""
+
+    # Position of the first token read, per request.
+    start: torch.Tensor
+    # Tokens read from ``start`` on, per request.
+    lens: torch.Tensor
+    # The layer's window: a query at position p sees keys from p - window on.
+    window: int
+    # The window the kernel is planned with, or -1 when the read is a prefix
+    # that the caller masks itself (a ragged extend's paged pass).
+    window_left: int
+
+    def tree_mask(
+        self, mask: torch.Tensor, *, width: int, read_lens_sum: int
+    ) -> torch.Tensor:
+        """A verify tree's mask, laid out over this read.
+
+        ``mask`` is laid out over each request's whole sequence: ``width``
+        rows of ``seq_len + width`` columns, the tree's own in the last
+        ``width``. A tree row's query sits at its depth in the tree, not at
+        its row index, so a kernel's row-indexed window would misplace it;
+        the window is folded into the mask instead, and the kernel is planned
+        without one. Each row sees only the prefix columns and tree ancestors
+        inside its own window. ``read_lens_sum`` is ``lens.sum()``,
+        known on the host."""
+        device = mask.device
+        lens = self.lens.to(torch.int64)
+        seq_lens = self.start.to(torch.int64) + lens
+        bs = lens.numel()
+        ar = torch.arange(width, device=device)
+        # The tree block of each request, [bs, width, width]. Rows a graph
+        # replay pads past the live batch may index past the mask: clamp.
+        full_row = seq_lens + width
+        full_base = torch.cumsum(full_row * width, 0) - full_row * width
+        tree_idx = (
+            full_base[:, None, None]
+            + ar[None, :, None] * full_row[:, None, None]
+            + seq_lens[:, None, None]
+            + ar[None, None, :]
+        )
+        tree = mask[tree_idx.clamp(max=mask.numel() - 1)].to(torch.bool)
+        # Each row sees itself and its ancestors: its depth is one less.
+        depth = tree.sum(-1) - 1
+        tree = tree & (depth[:, :, None] - depth[:, None, :] <= self.window)
+        read_row = lens + width
+        read_end = torch.cumsum(read_row * width, 0)
+        total = read_lens_sum * width + width * width * bs
+        t = torch.arange(total, device=device)
+        req = torch.searchsorted(read_end, t, right=True).clamp(max=bs - 1)
+        local = t - (read_end - read_row * width)[req]
+        row = local // read_row[req]
+        col = local % read_row[req]
+        prefix = col < lens[req]
+        tree_col = (col - lens[req]).clamp(min=0, max=width - 1)
+        return torch.where(
+            prefix,
+            col >= lens[req] + depth[req, row] - self.window,
+            tree[req, row, tree_col],
+        )
+
+
+def window_read(
+    *,
+    seq_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    window: int,
+    prefix_only: bool,
+) -> WindowRead:
+    """The window read of a batch whose requests hold ``seq_lens`` tokens, of
+    which ``prefix_lens`` are cached before this forward's queries.
+
+    ``prefix_only``: the read covers the cached prefix alone (the queries' own
+    keys arrive another way, as in a ragged extend); it keeps the prefix's last
+    ``window`` tokens. Otherwise the read covers the cached prefix and the
+    queries' keys: the last ``window`` tokens before the first query, through
+    the last token, and the kernel masks each query to its own window."""
+    if prefix_only:
+        start = torch.clamp(prefix_lens - window, min=0)
+        return WindowRead(
+            start=start, lens=prefix_lens - start, window=window, window_left=-1
+        )
+    lens = torch.minimum(seq_lens, window + seq_lens - prefix_lens)
+    return WindowRead(
+        start=seq_lens - lens, lens=lens, window=window, window_left=window
+    )

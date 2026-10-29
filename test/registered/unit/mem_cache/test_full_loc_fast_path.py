@@ -295,7 +295,7 @@ class TestHybridLinearMLARouting(CustomTestCase):
 
     def test_set_mla_kv_buffer_door_never_translates(self):
         """The translate happens exactly once, in the iteration's plan
-        (`KVLocPlan`); a door that translated again would double-translate
+        (`IterationIds`); a door that translated again would double-translate
         every unified MLA write."""
         pool = self._make_bare_pool()
         loc = torch.tensor([107, 108, 109], dtype=torch.int64)

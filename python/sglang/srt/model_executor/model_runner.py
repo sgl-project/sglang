@@ -99,11 +99,11 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -152,6 +152,7 @@ from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     AttentionAndMoeLayers,
     ModelLayerInfo,
+    check_layer_types_hybrid_swa_split,
     compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
@@ -743,6 +744,10 @@ class ModelRunner:
         self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
+        if self.model_config.is_layer_types_hybrid_swa:
+            check_layer_types_hybrid_swa_split(
+                model=self.model, model_config=self.model_config
+            )
         prepare_moe_topk(model=self.model, model_config=self.model_config)
 
         self.maybe_init_dwdp()
@@ -977,11 +982,11 @@ class ModelRunner:
             return
         self.pre_model_load_memory += preloaded_weights_bytes / (1 << 30)
 
-    def init_kv_index_translator(self):
+    def init_runner_ids(self):
         """The one object that converts KV ids for this runner: attention
         backends build their read indices from the table it hands them instead
         of probing the pool's id spaces themselves."""
-        self.kv_index_translator = KVIndexTranslator(
+        self.runner_ids = RunnerIds(
             req_to_token=self.req_to_token_pool.req_to_token,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -1027,7 +1032,7 @@ class ModelRunner:
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks
         that build bespoke memory pools can reuse it after allocating them."""
-        self.init_kv_index_translator()
+        self.init_runner_ids()
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
@@ -1151,7 +1156,7 @@ class ModelRunner:
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
-        self.kv_index_translator.bind_and_verify_backends(
+        self.runner_ids.bind_and_verify_backends(
             [self.attn_backend, self.decode_attn_backend]
         )
 
@@ -1258,7 +1263,7 @@ class ModelRunner:
             RoutedExpertsCapturer.create(
                 model=self.model,
                 model_config=self.model_config,
-                num_tokens=self.kv_index_translator.capture_token_capacity(
+                num_tokens=self.runner_ids.capture_token_capacity(
                     self.max_token_pool_size
                 ),
                 max_running_requests=self.max_running_requests,
@@ -1270,7 +1275,7 @@ class ModelRunner:
         set_global_indexer_capturer(
             create_indexer_capturer(
                 model_config=self.model_config,
-                num_tokens=self.kv_index_translator.capture_token_capacity(
+                num_tokens=self.runner_ids.capture_token_capacity(
                     self.max_token_pool_size
                 ),
                 max_running_requests=self.max_running_requests,
@@ -1965,7 +1970,7 @@ class ModelRunner:
             # mamba_pool is a pure PHYSICAL store; translate before zeroing or
             # clear_slots zeroes the wrong physical slots.
             self.token_to_kv_pool_allocator.state.pool.clear_slots(
-                self.kv_index_translator.state_ids(pool.state_sub_pool).ids(
+                self.runner_ids.state_ids(pool.state_sub_pool).ids(
                     forward_batch.mamba_clear_indices
                 )
             )
@@ -1983,7 +1988,7 @@ class ModelRunner:
                 )
             else:
                 # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
-                state_ids = self.kv_index_translator.state_ids(pool.state_sub_pool)
+                state_ids = self.runner_ids.state_ids(pool.state_sub_pool)
                 # The copy reads every state layer of the source slot.
                 self.token_to_kv_pool.layer_router.wait_for_part(STATE_PART)
                 state.copy(

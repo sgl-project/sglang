@@ -14,7 +14,7 @@
 """`--enable-unified-memory` speculative-decoding gates.
 
 The target verifies on whatever backend the layout gates admit: every
-backend reads the unified pool through the KV-index translator. What is
+backend reads the unified pool through the KV-index runner_ids. What is
 still gated here is the fused EAGLE draft's backend, DCP's verify on
 flashinfer, and the algorithms and tree shapes the pool cannot serve.
 

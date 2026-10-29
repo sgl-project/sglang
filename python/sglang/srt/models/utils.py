@@ -35,7 +35,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_kv_layers,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec
@@ -324,9 +327,8 @@ def create_fused_set_kv_buffer_arg(
 ):
     layer_id = layer.layer_id
     token_to_kv_pool = get_token_to_kv_pool()
-
-    k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
-    v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+    kv = get_kv_layers().read(layer_id)
+    k_buffer, v_buffer = kv.key(), kv.value()
 
     if not _is_hip:
         # CUDA path.

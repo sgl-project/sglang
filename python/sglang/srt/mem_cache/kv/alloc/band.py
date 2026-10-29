@@ -304,7 +304,7 @@ class Band:
         # Two page sizes, equal unless decode context parallelism is on:
         # `page_size` is VIRTUAL (the scheduler, the tree cache and the alloc/free
         # surface), `pool_page_size` is the PHYSICAL rows one page occupies here.
-        # `KVIndexTranslator.translate_dcp_read_ids` collapses `loc // dcp_size`
+        # `RunnerIds.translate_dcp_read_ids` collapses `loc // dcp_size`
         # before reaching `UnitIds.translate`, so everything at or below the v2p
         # table -- byte budget, compaction moves, translate -- stays on
         # `pool_page_size`.

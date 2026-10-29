@@ -22,8 +22,8 @@ from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
     GDNPrefillGraphMetadata,
 )
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase

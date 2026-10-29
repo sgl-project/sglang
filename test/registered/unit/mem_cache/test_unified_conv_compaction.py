@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.kv.layout.state import StateView
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
@@ -63,7 +64,8 @@ class TestConvCompaction(CustomTestCase):
         state = composite.state.pool
         alloc = composite.mamba_allocator
         self.assertEqual(state.mamba_cache.temporal.numel(), 0)
-        self.assertFalse(state._should_fuse_slot_ops())
+        # Clears and copies act on whole entries; no fused slot kernel.
+        self.assertIsInstance(state, StateView)
         self.assertIs(alloc.high_peer, composite.swa_attn_allocator)
         self.assertIs(
             composite.swa_attn_allocator.high_peer, composite.full_attn_allocator

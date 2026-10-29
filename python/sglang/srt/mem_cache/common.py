@@ -427,10 +427,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         )
         # TODO (csy, hanming): clean up this early allocation logic
         if req.kv.holds_mamba:
-            tree_cache.token_to_kv_pool_allocator.state_slots.free(
-                req.kv.mamba_pool_idx.unsqueeze(-1)
-            )
-            req.kv.mamba_pool_idx = None
+            kv_storage_of(
+                tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+            ).release_state_slot(req)
         return
     if tree_cache.claim_kv_row(req):
         # A streaming session detached the kv record to keep the row.

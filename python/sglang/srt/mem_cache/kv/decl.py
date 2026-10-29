@@ -22,8 +22,8 @@ class FullLifetime(msgspec.Struct, frozen=True, tag="full"):
 
 
 class WindowLifetime(msgspec.Struct, frozen=True, tag="window"):
-    """Kept for the last ``window`` tokens of a request; ``None`` when the
-    model does not state its window."""
+    """Kept for the last ``window`` tokens of a request: the window its layers
+    attend over; ``None`` when the model does not state its window."""
 
     window: Optional[int] = None
     rank: ClassVar[int] = 1
@@ -33,8 +33,11 @@ class WindowLifetime(msgspec.Struct, frozen=True, tag="window"):
 
 
 class StateLifetime(msgspec.Struct, frozen=True, tag="state"):
-    """One fixed-size slot per request, overwritten as the request advances."""
+    """One fixed-size slot per request, overwritten as the request advances.
+    A copy of it is valid only after a multiple of ``checkpoint_interval``
+    tokens (the state kernel's chunk); ``None`` when no prefix is cached."""
 
+    checkpoint_interval: Optional[int] = None
     rank: ClassVar[int] = 0
 
     def retention(self) -> Tuple[int, float]:
@@ -122,6 +125,7 @@ def kv_layer_decls(
     window: Optional[int] = None,
     state_layer_ids: Sequence[int] = (),
     state_geometry: Optional[StateGeometry] = None,
+    checkpoint_interval: Optional[int] = None,
 ) -> Tuple[KVLayerDecl, ...]:
     """One declaration per layer that stores anything, in layer order. A layer
     may hold an attention part and a state part at once."""
@@ -141,7 +145,10 @@ def kv_layer_decls(
             parts.setdefault(layer_id, []).append(part)
     if state_layer_ids:
         assert state_geometry is not None, "state layers need their geometry"
-        part = KVPartDecl(lifetime=StateLifetime(), geometry=state_geometry)
+        part = KVPartDecl(
+            lifetime=StateLifetime(checkpoint_interval=checkpoint_interval),
+            geometry=state_geometry,
+        )
         for layer_id in state_layer_ids:
             parts.setdefault(layer_id, []).append(part)
     return tuple(

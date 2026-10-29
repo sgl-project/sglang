@@ -105,6 +105,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    mamba_cache_chunk_size,
     max_speculative_num_draft_tokens,
     pre_capture_activation_reserve_mb,
 )
@@ -939,7 +940,8 @@ class KVCacheConfigurator:
                     v_head_dim=geometry.swa_v_head_dim,
                     kv_cache_dtype=self.kv_cache_dtype,
                 ),
-                window=self.model_config.sliding_window_size,
+                # The window the layers attend over, as the runner resolved it.
+                window=self.sliding_window_size,
             )
         state = {}
         if has_state:
@@ -947,6 +949,7 @@ class KVCacheConfigurator:
             state = dict(
                 state_layer_ids=[i for i in cache_params.layers if start <= i < end],
                 state_geometry=StateGeometry.of(cache_params),
+                checkpoint_interval=mamba_cache_chunk_size(),
             )
         if has_window and has_state:
             n_local_layers = end - start
@@ -1014,6 +1017,9 @@ class KVCacheConfigurator:
                 # bs=1 feasibility floor input: it bounds the window and state
                 # terms only; the full-attention side is not charged.
                 context_len=self.model_config.context_len,
+                floor_window=(
+                    self.model_config.sliding_window_size if has_window else None
+                ),
             ),
             ctx=UnifiedBuildContext(
                 device=self.device,
@@ -1154,7 +1160,7 @@ class KVCacheConfigurator:
             draft_backend = get_spec().speculative_draft_attention_backend
         # Under DCP each rank's host rows hold only its share of the widened
         # id space, while the draft never joins the DCP group and needs every
-        # token; its translator also leaves the read ids widened for a DCP
+        # token; its `RunnerIds` also leaves the read ids widened for a DCP
         # index kernel that a draft's backend never runs.
         if get_parallel().attn_dcp_size > 1:
             return FusedDraftDecision(

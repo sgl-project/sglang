@@ -49,6 +49,7 @@ from sglang.srt.speculative.base_spec_worker import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
@@ -205,10 +206,13 @@ class TestDecodeRetractionBackup(CustomTestCase):
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             is_eagle=draft_pool is not None,
-            tree_components=(
-                (ComponentType.FULL, ComponentType.SWA)
-                if hybrid_swa
-                else (ComponentType.FULL,)
+            tree_slots=tree_slots_of(
+                (
+                    (ComponentType.FULL, ComponentType.SWA)
+                    if hybrid_swa
+                    else (ComponentType.FULL,)
+                ),
+                window=8 if hybrid_swa else None,
             ),
             sliding_window_size=8 if hybrid_swa else None,
             mtp_draft_device_pools=(

@@ -1,11 +1,8 @@
-"""Today's capacity policy of each unified chain shape, kept as data.
+"""Capacity policies selected from unified chain geometry.
 
-`ChainAllocator` owns the bands and every lifecycle fan-out; what still
-differs between the chains it serves (joint pricing, admission hooks, reclaim
-and the per-side capacity views) lives here, one policy per chain shape, chosen
-from the band geometry alone. Each policy reproduces the decisions of the
-allocator that served that shape before, so a replaced chain keeps its
-admission, reclaim and compaction outcomes.
+`ChainAllocator` owns the bands and lifecycle operations. Each policy supplies
+joint pricing, admission hooks, reclaim and per-side capacity views for one
+chain shape.
 """
 
 from __future__ import annotations
@@ -727,7 +724,7 @@ class _TokenEndsPolicy(_WindowPolicy):
             (sa, self._size_swa),
         ):
             pool = c.views[allocator.sub_pool_name]
-            pool._num_pages = allocator.num_pages
+            pool.num_pages = allocator.num_pages
             pool.size = allocator.num_pages * c.page_size - c.page_size
             pool.host_capacity_tokens = host_capacity
             pool.host_capacity_bytes = host_capacity * allocator.entry_bytes

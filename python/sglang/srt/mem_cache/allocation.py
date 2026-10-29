@@ -164,6 +164,21 @@ def _storage(
     )
 
 
+def retire_window(
+    req: Req, frontier: int, tree_cache: BasePrefixCache, *, eviction_interval: int = 1
+) -> None:
+    """Retire the window rows of a running request behind ``frontier``,
+    keeping what the prefix tree still needs of the window."""
+    _storage(tree_cache).advance(
+        req,
+        frontier,
+        window=tree_cache.swa_retain_window,
+        retain_floor=tree_cache.swa_retain_floor(req),
+        shares_prefixes=tree_cache.supports_prefix_sharing(),
+        eviction_interval=eviction_interval,
+    )
+
+
 def _room_in(tree_cache: BasePrefixCache):
     """Evict from the tree until a take of ``num_tokens`` can be served."""
     return lambda num_tokens: evict_from_tree_cache(tree_cache, num_tokens)

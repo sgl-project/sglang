@@ -31,11 +31,104 @@ class PartRoute(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
+    """Reads use ``KVLayerRouter.read`` to wait for layer-wise load-back;
+    writes use ``KVLayerRouter.layer`` without waiting."""
+
     route: PartRoute
     view: Any  # a type from kv.memory.views for the layouts that have one
     # The id the view's per-layer methods take, exactly as the view's callers
     # pass it today: a composite's local index, or a plain pool's model layer id.
     view_layer_id: int
+    # Whether the layer's sub-pool is the router's owner, whose write ids are the
+    # request's token ids; another token sub-pool writes at the batch's `swa_loc`.
+    owner: bool = True
+    # A plain pool's own layer: the view is the pool, which takes the write loc
+    # as the backend hands it and resolves it itself.
+    plain: bool = False
+
+    def key(self, scale: Optional[float] = None):
+        if scale is None:
+            return self.view.get_key_buffer(self.view_layer_id)
+        return self.view.get_key_buffer(self.view_layer_id, scale)
+
+    def value(self, scale: Optional[float] = None):
+        if scale is None:
+            return self.view.get_value_buffer(self.view_layer_id)
+        return self.view.get_value_buffer(self.view_layer_id, scale)
+
+    def kv(self):
+        return self.view.get_kv_buffer(self.view_layer_id)
+
+    def kv_scales(self):
+        return self.view.get_kv_scale_buffer(self.view_layer_id)
+
+    def store(self, layer, loc_info, cache_k, cache_v, *args, **kwargs) -> None:
+        """Writes the layer's K and V at the ids of its sub-pool: the owner's
+        (`full_loc`, else `loc`) or the window's (`swa_loc`), as the attention
+        backend bound them for the batch."""
+        if self.plain:
+            self.view.set_kv_buffer(layer, loc_info, cache_k, cache_v, *args, **kwargs)
+            return
+        from sglang.srt.mem_cache.kv.memory.views import MLAKVView
+
+        write_loc = self._write_loc(layer, loc_info)
+        if isinstance(self.view, MLAKVView):
+            self.view.set_kv_buffer(
+                layer,
+                write_loc,
+                cache_k,
+                cache_v,
+                layer_id_override=self.view_layer_id,
+            )
+            return
+        self.view.set_kv_buffer(
+            layer,
+            write_loc,
+            cache_k,
+            cache_v,
+            *args,
+            layer_id_override=self.view_layer_id,
+            **kwargs,
+        )
+
+    def store_mla(self, layer, loc_info, cache_k_nope, cache_k_rope) -> None:
+        if self.plain:
+            self.view.set_mla_kv_buffer(layer, loc_info, cache_k_nope, cache_k_rope)
+            return
+        self.view.set_mla_kv_buffer(
+            layer,
+            self._write_loc(layer, loc_info),
+            cache_k_nope,
+            cache_k_rope,
+            layer_id_override=self.view_layer_id,
+        )
+
+    def _write_loc(self, layer, loc_info):
+        # Imported here: memory_pool imports this module for its routers.
+        from sglang.srt.mem_cache.memory_pool import (
+            KVWriteLoc,
+            unwrap_write_loc,
+            write_loc_is_physical,
+        )
+
+        loc, window_loc, owner_loc = unwrap_write_loc(loc_info)
+        if self.owner:
+            ids = owner_loc if owner_loc is not None else loc
+        else:
+            assert window_loc is not None, (
+                f"layer {layer.layer_id} writes sub-pool {self.route.sub_pool!r}, "
+                "but the attention backend bundled no swa_loc for it"
+            )
+            ids = window_loc
+        return KVWriteLoc(ids, physical=write_loc_is_physical(loc_info))
+
+    def read_mla(self, layer, loc, dst_dtype=None):
+        """Read ids arrive translated at their production site."""
+        if self.plain:
+            return self.view.get_mla_kv_buffer(layer, loc, dst_dtype)
+        return self.view.get_mla_kv_buffer(
+            layer, loc, dst_dtype, layer_id_override=self.view_layer_id
+        )
 
 
 class PublicSubPool(msgspec.Struct, frozen=True, kw_only=True):
@@ -73,11 +166,18 @@ class KVLayerRouter:
 
     @classmethod
     def from_layer_maps(
-        cls, pool, layer_maps: Sequence[Tuple[str, Any, Dict[int, int]]]
+        cls,
+        pool,
+        layer_maps: Sequence[Tuple[str, Any, Dict[int, int]]],
+        *,
+        owner: Optional[str] = None,
     ) -> KVLayerRouter:
         """A composite's router: per sub-pool, in plan order, its name, its
         view, and each routed model layer's index in that view, which is also
-        the id the composite passes the view today."""
+        the id the composite passes the view today. ``owner`` names the
+        sub-pool whose write ids are the request's token ids (default: the
+        first)."""
+        owner = layer_maps[0][0] if owner is None else owner
         layers: Dict[int, KVLayer] = {}
         for name, view, indices in layer_maps:
             for layer_id, index in indices.items():
@@ -85,6 +185,7 @@ class KVLayerRouter:
                     route=PartRoute(sub_pool=name, part=KV_PART, index=index),
                     view=view,
                     view_layer_id=index,
+                    owner=name == owner,
                 )
         return cls(
             pool,
@@ -199,9 +300,8 @@ class KVLayerRouter:
 
 
 class PlainPoolRouter(KVLayerRouter):
-    """A plain pool's router: one sub-pool whose view is the pool itself, which
-    takes model layer ids and does its own ``start_layer`` arithmetic. Routes
-    are built on first use, so the router needs no layer count."""
+    """Lazily route model layer ids without requiring a layer count;
+    the pool applies its own ``start_layer`` offset."""
 
     def __init__(self, pool, name: str):
         super().__init__(pool, sub_pools=(), views={name: pool}, layers={})
@@ -220,6 +320,7 @@ class PlainPoolRouter(KVLayerRouter):
                 ),
                 view=self._pool,
                 view_layer_id=layer_id,
+                plain=True,
             )
         return kv
 

@@ -36,6 +36,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.mem_cache_utils import finish_req
+from sglang.test.tree_slots import FAMILY_OF, tree_slots_of
 
 
 def session_radix_cache_test_values() -> tuple[bool, ...]:
@@ -98,7 +99,7 @@ class PagedFullComponent(FullComponent):
 
 
 def component_with_cache(component_type, cache):
-    component = object.__new__(COMPONENT_REGISTRY[component_type])
+    component = object.__new__(COMPONENT_REGISTRY[FAMILY_OF[component_type]])
     component.cache = cache
     component.tree_core = cache.tree_core
     return component
@@ -116,8 +117,10 @@ class DisabledUnifiedRadixCacheFixtures:
             token_to_kv_pool_allocator=None,
             page_size=1,
             disable=disable,
-            tree_components=(ComponentType.FULL,),
-            component_registry_override={ComponentType.FULL: FakeFullComponent},
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: FakeFullComponent
+            },
             enable_kv_cache_events=True,
             eviction_policy="lru",
             eviction_policy_config={"not_an_lru_option": 1},

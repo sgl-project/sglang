@@ -18,9 +18,9 @@ from sglang.srt.layers.attention import trtllm_mha_backend as tm
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.layout.fused_draft import (
     LAYER_FULL,
     LAYER_WINDOW,
@@ -32,9 +32,6 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_draft_pool import bind_fused_draft
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedMHATokenToKVPool,
-)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
@@ -97,8 +94,13 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             fused_draft=placement,
         )
         views = {
-            name: UnifiedMHATokenToKVPool(arena=buffer, spec=buffer.spec(name))
-            for name in ("full", "swa")
+            name: MHAView(
+                arena=buffer,
+                spec=buffer.spec(name),
+                page_size=1,
+                model_layer_ids=(layer_id,),
+            )
+            for name, layer_id in (("full", 0), ("swa", 1))
         }
         target_pool = RoutedKVCache(
             arena=buffer,
@@ -145,7 +147,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             req_to_token_pool=req,
             page_size=1,
         )
-        reader = KVIndexTranslator(
+        reader = RunnerIds(
             req_to_token=req.req_to_token,
             token_to_kv_pool_allocator=allocator,
             token_to_kv_pool=bound.token_to_kv_pool,
@@ -159,7 +161,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             model_config=SimpleNamespace(get_max_num_attention_heads=lambda: 1),
             server_args=self.args,
             sliding_window_size=window,
-            kv_index_translator=reader,
+            runner_ids=reader,
             token_to_kv_pool=bound.token_to_kv_pool,
             page_size=1,
         )
@@ -187,6 +189,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                     with patch.object(tm, "TRTLLMHAAttnBackend", side_effect=step):
                         backend = tm.TRTLLMHAAttnMultiStepDraftBackend(runner, 1, 3)
         self.bound_pool = bound.token_to_kv_pool
+        self.runner, self.layer = runner, layer
         self.allocator, self.virtual, self.reader = allocator, virtual, reader
         rows = torch.zeros(1, dtype=torch.int64, device="cuda")
         seq_lens = torch.tensor([300], dtype=torch.int32, device="cuda")
@@ -204,7 +207,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             seq_lens_cpu=None,
             req_pool_indices=rows,
             positions=seq_lens.to(torch.int64),
-            kv_loc_plan=plan,
+            iteration_ids=plan,
             spec_info=SimpleNamespace(
                 window_kv_indices=None,
                 window_kv_indptr=None,
@@ -283,7 +286,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         updater.data_type = updater.q_data_type = torch.bfloat16
         updater.sliding_window_size = window
         updater.attn_backend = SimpleNamespace(
-            kv_index_translator=reader, dq_paged_kernel_lens=None
+            runner_ids=reader, dq_paged_kernel_lens=None
         )
         updater.kv_indptr = [
             torch.zeros(2, dtype=torch.int32, device="cuda") for _ in range(2)
@@ -343,10 +346,9 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         ``window + accepted`` tokens, here evicted window pages, where the
         eager extend reads its last ones. Both now read the window.
 
-        The eager window wrapper is planned with the layer's window, which
-        selects the kernel with the per-query window mask; the graph replay's
-        is planned without it, which is why FlashInfer does not declare a
-        window draft extend under CUDA graphs on translated storage."""
+        BUG REGRESSION. The graph replay planned its window wrapper without
+        the layer's window, so its kernel had no per-query window mask; both
+        now plan with it."""
         window, seq_len, accept = 64, 300, 2
         self._fixture(window, target_window=128)
         # The window side no longer holds the prefix before the window.
@@ -372,7 +374,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             torch.testing.assert_close(graph_plan.ids, eager_plan.ids)
         # Window wrapper, then full wrapper.
         self.assertEqual([p.window_left for p in eager], [window, -1])
-        self.assertEqual([p.window_left for p in graph], [-1, -1])
+        self.assertEqual([p.window_left for p in graph], [window, -1])
 
     def test_flashinfer_window_reads_take_their_own_rail(self):
         """BUG REGRESSION. A flashinfer multi-step draft of a window model
@@ -447,6 +449,61 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                         step.kwargs["kv_indptr_buf"].data_ptr(),
                         backend.kv_indptr[i].data_ptr(),
                     )
+
+    def test_trtllm_window_draft_extend_reads_the_window_ids(self):
+        """A trtllm_mha draft extend on translated storage reads a window layer
+        through the plan's window page table, refreshed on every replay, as its
+        target verify does, and its spec-decode kernel masks each query to the
+        layer's window. Checked on the replay prep: the window table's live
+        window holds the window sub-pool's ids of the request's tokens, not the
+        owner's."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        window, seq_len = 64, 300
+        self._fixture(window, 128)
+        reader, virtual = self.reader, self.virtual
+        rows = torch.zeros(1, dtype=torch.int64, device="cuda")
+        seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+        plan = reader.plan(
+            req_pool_indices=rows,
+            seq_lens=seq_lens,
+            seq_lens_cpu=None,
+            write_virtual=None,
+            read_extent=0,
+        )
+        backend = object.__new__(tm.TRTLLMHAAttnBackend)
+        backend.runner_ids = reader
+        backend.use_sliding_window_kv_pool = False
+        metadata = SimpleNamespace(
+            page_table=torch.full((1, 512), -1, dtype=torch.int32, device="cuda"),
+            swa_page_table=torch.full((1, 512), -1, dtype=torch.int32, device="cuda"),
+        )
+        backend.draft_extend_metadata = {1: metadata}
+        batch = SimpleNamespace(
+            batch_size=1,
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            spec_info=None,
+            iteration_ids=plan,
+            out_cache_loc=None,
+        )
+        backend.init_forward_metadata_out_graph(batch, in_capture=False)
+        self.assertIs(backend.forward_metadata, metadata)
+        window_ids = reader.space(IdSpaceKind.SLIDING_WINDOW).ids(virtual)
+        owner_ids = self.allocator.translate_kv_loc(virtual)
+        live = slice(seq_len - window, seq_len)
+        self.assertTrue(
+            torch.equal(
+                metadata.swa_page_table[0, live].to(torch.int64),
+                window_ids[live].to(torch.int64),
+            )
+        )
+        self.assertFalse(torch.equal(window_ids[live], owner_ids[live]))
+        self.assertTrue(
+            torch.equal(
+                metadata.page_table[0, :seq_len].to(torch.int64),
+                owner_ids[:seq_len].to(torch.int64),
+            )
+        )
 
     def test_a_trtllm_step_hands_its_window_rail_to_its_wrappers(self):
         """The trtllm_mha step backend passes the window indptr to the
@@ -532,8 +589,13 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             fused_draft=placement,
         )
         views = {
-            name: UnifiedMHATokenToKVPool(arena=buffer, spec=buffer.spec(name))
-            for name in ("full", "swa")
+            name: MHAView(
+                arena=buffer,
+                spec=buffer.spec(name),
+                page_size=1,
+                model_layer_ids=(layer_id,),
+            )
+            for name, layer_id in (("full", 0), ("swa", 1))
         }
         target_pool = RoutedKVCache(
             arena=buffer,

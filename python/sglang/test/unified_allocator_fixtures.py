@@ -23,7 +23,7 @@ from sglang.srt.mem_cache.kv.decl import (
     StateGeometry,
     kv_layer_decls,
 )
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.arena import ArenaBand, KVArena
@@ -32,10 +32,10 @@ from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedMHATokenToKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.test.tree_slots import tree_slots_of
 
 
 def chain_snapshot(allocator) -> ChainSnapshot:
@@ -327,7 +327,10 @@ def build_swa_cache(
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             sliding_window_size=128 * page_size if window is None else window,
-            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            tree_slots=tree_slots_of(
+                (ComponentType.FULL, ComponentType.SWA),
+                window=128 * page_size if window is None else window,
+            ),
         )
     )
     slots = allocator.alloc(occupancy * page_size)
@@ -361,10 +364,13 @@ def build_tri_cache(
             token_to_kv_pool_allocator=a,
             page_size=page_size,
             sliding_window_size=128 * page_size,
-            tree_components=(
-                (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
-                if state_cache
-                else (ComponentType.FULL, ComponentType.SWA)
+            tree_slots=tree_slots_of(
+                (
+                    (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
+                    if state_cache
+                    else (ComponentType.FULL, ComponentType.SWA)
+                ),
+                window=128 * page_size,
             ),
             enable_session_radix_cache=sessions,
         )
@@ -524,6 +530,7 @@ def build_test_unified_pools(
         window_tokens=swa_max_total_num_tokens,
         state_slots=max_mamba_cache_size,
         context_len=model_context_len,
+        floor_window=sliding_window_size,
     )
     ctx = UnifiedBuildContext(
         device=device,
@@ -603,6 +610,7 @@ def build_unified_bundle(geometry: UnifiedGeometry):
         window_tokens=g.swa_tokens if by_tokens and g.swa_layer_ids else None,
         state_slots=g.state_slots if g.state_layer_ids else 0,
         context_len=g.context_len,
+        floor_window=g.window if g.swa_layer_ids else None,
     )
     ctx = UnifiedBuildContext(
         device=g.device,
@@ -659,7 +667,7 @@ def build_mamba_cache(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
             req_to_token_pool=bundle.req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
-            tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
         )
     )
     return bundle, allocator, cache
@@ -776,7 +784,7 @@ def _pool_summary(pool, raw_base: int) -> dict:
         ),
         "host_capacity": (pool.host_capacity_tokens, pool.host_capacity_bytes),
     }
-    if isinstance(pool, UnifiedMHATokenToKVPool):
+    if isinstance(pool, MHAView):
         out["page_envelope"] = tuple(pool.get_page_envelope_buffer().shape)
     return out
 

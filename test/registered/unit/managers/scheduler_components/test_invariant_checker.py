@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, StaticPoolSh
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.session.streaming_session import SessionSlot
+from sglang.test.tree_slots import tree_slots_of
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -174,7 +175,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                     req_to_token_pool=req_pool,
                     token_to_kv_pool_allocator=self.allocator,
                     page_size=self.PAGE_SIZE,
-                    tree_components=(ComponentType.FULL,),
+                    tree_slots=tree_slots_of((ComponentType.FULL,)),
                 )
             )
         self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)

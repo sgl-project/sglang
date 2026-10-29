@@ -51,6 +51,7 @@ from sglang.srt.utils import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 logger = logging.getLogger(__name__)
 _validate_mamba_replay_state_indices = (
@@ -88,8 +89,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        # The state sub-pool's storage and each state layer's index in it, as
-        # the KV pool's router binds them.
+        # State views and local layer indices come from the same router binding.
         router = self.token_to_kv_pool.layer_router
         self.state_pool = router.part_view(STATE_PART)
         self.state_layer_indices = router.part_indices(STATE_PART)
@@ -103,9 +103,7 @@ class MambaAttnBackendBase(AttentionBackend):
         # The request table's slot ids as the state pool indexes them: the
         # identity or one gather through the id space's table, both of which
         # `fused_replay_state_indices` reproduces in its own launch.
-        self._state_ids = model_runner.kv_index_translator.state_ids(
-            pool.state_sub_pool
-        )
+        self._state_ids = model_runner.runner_ids.state_ids(pool.state_sub_pool)
         self._fused_state_indices_ok = (
             torch.device(self.device).type == "cuda" and pool.holds_state_slots
         )
@@ -304,7 +302,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 # full-attention layers.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
-                ragged_layout = forward_batch.spec_info.ragged_verify_layout
+                ragged_layout = forward_batch.ragged_verify_layout
                 if ragged_layout is not None:
                     # Compact ragged verify: variable per-request verify lens.
                     query_start_loc = ragged_layout.qo_indptr_device
@@ -403,6 +401,7 @@ class MambaAttnBackendBase(AttentionBackend):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            ragged_verify_layout=forward_batch.ragged_verify_layout,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -716,16 +715,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
-            ragged_layout = (
-                spec_info.ragged_verify_layout if spec_info is not None else None
+            self.query_start_loc_list[bs - 1].copy_(
+                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
             )
-            if ragged_layout is not None:
-                # Ragged capture: qsl from the runner's synthetic layout.
-                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
-            else:
-                self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
-                )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -776,6 +768,7 @@ class MambaAttnBackendBase(AttentionBackend):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
     ):
         if num_padding is None:
             if seq_lens_cpu is None:
@@ -906,18 +899,17 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            ragged_layout = (
-                spec_info.ragged_verify_layout if spec_info is not None else None
-            )
-            if ragged_layout is not None:
+            if ragged_verify_layout is not None:
                 # Mamba kernels index dense [bs, N] scratch, so they need the
                 # capped variant (see padded_to_bucket). Padding rows carry
                 # mamba slot -1 and are skipped.
-                if ragged_layout.bs != bs or ragged_layout.cap is None:
-                    ragged_layout = ragged_layout.padded_to_bucket(
+                if ragged_verify_layout.bs != bs or ragged_verify_layout.cap is None:
+                    ragged_verify_layout = ragged_verify_layout.padded_to_bucket(
                         padded_bs=bs, cap=spec_info.draft_token_num
                     )
-                self.query_start_loc_list[bs - 1].copy_(ragged_layout.qo_indptr_device)
+                self.query_start_loc_list[bs - 1].copy_(
+                    ragged_verify_layout.qo_indptr_device
+                )
             elif num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
@@ -1118,6 +1110,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            ragged_verify_layout=forward_batch.ragged_verify_layout,
         )
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
@@ -1216,7 +1209,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
-        self.kv_index_translator = full_attn_backend.kv_index_translator
+        self.runner_ids = full_attn_backend.runner_ids
         self.max_context_len = getattr(full_attn_backend, "max_context_len", None)
         self.needs_cpu_seq_lens = (
             full_attn_backend.needs_cpu_seq_lens

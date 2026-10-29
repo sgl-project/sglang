@@ -4374,10 +4374,9 @@ class Scheduler(
                     req.kv.mamba_cow_src_index = None
                     req.kv.mamba_needs_clear = False
                     if req.kv.holds_mamba and not getattr(req, "session", None):
-                        self.token_to_kv_pool_allocator.state_slots.free(
-                            req.kv.mamba_pool_idx.unsqueeze(-1)
-                        )
-                        req.kv.mamba_pool_idx = None
+                        kv_storage_of(
+                            self.req_to_token_pool, self.token_to_kv_pool_allocator
+                        ).release_state_slot(req)
                 break
 
         if mamba_allocator is not None:

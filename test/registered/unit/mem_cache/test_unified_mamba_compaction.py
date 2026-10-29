@@ -8,7 +8,7 @@ import torch
 from test_unified_mamba_views import _make_pool
 
 from sglang.srt.mem_cache.kv.alloc.band import Band
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
+from sglang.srt.mem_cache.kv.layout.state import StateView
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -28,7 +28,7 @@ class TestMambaCompaction(CustomTestCase):
             device=device,
             grow_direction=direction,
         )
-        kv = UnifiedMambaPool(
+        kv = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
             spec_state_size=0,
