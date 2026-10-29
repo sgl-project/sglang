@@ -591,6 +591,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
+    tbo_disable_reason: str = "none"
 
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
@@ -1092,6 +1093,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            tbo_disable_reason=getattr(batch, "tbo_disable_reason", "none"),
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,

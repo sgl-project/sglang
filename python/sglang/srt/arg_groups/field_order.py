@@ -552,5 +552,9 @@ POSITIONAL_FIELD_ORDER = (
     "enable_return_aux_hidden_states",
     "aux_hidden_state_capture",
     "return_aux_hidden_state_layer_ids",
+    "tbo_admission_policy",
+    "tbo_prefill_token_threshold",
+    "tbo_decode_token_threshold",
+    "tbo_min_child_tokens",
 )
 # fmt: on

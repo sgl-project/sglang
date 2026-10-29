@@ -1051,6 +1051,22 @@ class ExecOverlap(msgspec.Struct):
     enable_single_batch_overlap: A[
         bool, "Let computation and communication overlap within one micro batch."
     ] = False
+    tbo_admission_policy: A[
+        Literal["always", "threshold"],
+        "Per-step TBO admission policy. `always` preserves current behavior.",
+    ] = "always"
+    tbo_prefill_token_threshold: A[
+        int,
+        "Minimum prefill tokens for threshold-based TBO admission.",
+    ] = 0
+    tbo_decode_token_threshold: A[
+        int,
+        "Minimum decode or verify tokens for threshold-based TBO admission.",
+    ] = 0
+    tbo_min_child_tokens: A[
+        int,
+        "Minimum real tokens required in each TBO child.",
+    ] = 0
     tbo_token_distribution_threshold: A[
         float,
         "The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
