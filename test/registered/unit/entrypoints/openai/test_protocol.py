@@ -68,10 +68,23 @@ class TestCompletionRequest(unittest.TestCase):
 class TestChatCompletionRequest(unittest.TestCase):
     """Test ChatCompletionRequest protocol model"""
 
-    def test_full_assistant_ebnf_preserves_explicit_output_constraints(self):
+    def test_full_assistant_ebnf_with_explicit_output_constraints_conflicts(self):
+        """Without an explicit output constraint the full-assistant EBNF is
+        installed; an explicit ebnf/response_format conflicts with it and is
+        refused. Previously the tool-call EBNF was dropped with only a
+        warning, so the model was constrained to a shape that can never
+        contain a tool call (issue #47167)."""
         constraint = ("full_assistant_ebnf", 'root ::= "generated"')
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "Hi"}],
+            tool_choice="required",
+        )
+        params = request.to_sampling_params([], {}, constraint)
+        self.assertTrue(params.get("ebnf_full_assistant"))
+        self.assertEqual(params["ebnf"], constraint[1])
+
         for explicit in (
-            {},
             {"ebnf": 'root ::= "OK"'},
             {"response_format": {"type": "json_object"}},
         ):
@@ -82,16 +95,12 @@ class TestChatCompletionRequest(unittest.TestCase):
                     tool_choice="required",
                     **explicit,
                 )
-                params = request.to_sampling_params([], {}, constraint)
-                self.assertEqual(params.get("ebnf_full_assistant", False), not explicit)
-                if "ebnf" in explicit:
-                    self.assertEqual(params["ebnf"], explicit["ebnf"])
-                elif "response_format" in explicit:
-                    self.assertEqual(
-                        json.loads(params["json_schema"]), {"type": "object"}
-                    )
-                else:
-                    self.assertEqual(params["ebnf"], constraint[1])
+                with self.assertRaises(ValueError) as ctx:
+                    request.to_sampling_params([], {}, constraint)
+                self.assertIn(
+                    "Cannot combine tool calls with constrained decoding",
+                    str(ctx.exception),
+                )
 
     def test_json_schema_strict_requires_json_boolean(self):
         base_request = {

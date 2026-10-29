@@ -1202,18 +1202,28 @@ class ChatCompletionRequest(PDRoutingFields):
             or sampling_params.get("json_schema")
         )
 
-        if tool_call_constraint and has_existing_constraints:
-            if tool_call_constraint[0] != "full_assistant_ebnf" and (
-                self.tool_choice == "required"
-                or isinstance(self.tool_choice, ToolChoice)
-            ):
-                raise ValueError(
-                    "tool_choice 'required' or a named tool cannot be combined with "
-                    "response_format, regex, or ebnf: the tool-call constraint and the "
-                    "output constraint cannot both be honored."
-                )
-            logger.warning("Constrained decoding is not compatible with tool calls.")
-        elif tool_call_constraint:
+        # OpenAI semantics keep tools callable under tool_choice "auto" and
+        # constrain only the final assistant message. SGLang cannot express
+        # that combination yet (see #47167): an explicit output constraint
+        # covers the whole answer, so the model could never emit a tool call
+        # and silently answers in the requested shape instead. Refuse
+        # consistently — whether or not the tool-call parser installs its
+        # own grammar — instead of dropping the tool-call constraint with a
+        # warning. tool_choice "none" keeps the request satisfiable: the
+        # tools are not callable, so the constraint may apply to the answer.
+        if (
+            has_existing_constraints
+            and self.tool_choice != "none"
+            and (self.tools or tool_call_constraint is not None)
+        ):
+            raise ValueError(
+                "Cannot combine tool calls with constrained decoding "
+                "(response_format / regex / ebnf / structural_tag / "
+                "json_schema) while tool_choice allows calling a tool. "
+                'Remove one, or set tool_choice to "none".'
+            )
+
+        if tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
@@ -2099,18 +2109,25 @@ class ResponsesRequest(PDRoutingFields):
             or params.get("structural_tag")
             or params.get("json_schema")
         )
-        if tool_call_constraint and has_existing_constraints:
-            if tool_call_constraint[0] == "full_assistant_ebnf":
-                # Explicit output constraints take precedence over the default EBNF.
-                logger.warning(
-                    "Constrained decoding is not compatible with tool calls."
-                )
-                return params
-            # Refuse rather than silently drop the tool-call grammar.
+        # Same rationale as the Chat Completions path above (see #47167):
+        # a whole-output constraint makes tool calls impossible, so refuse
+        # rather than drop the tool-call grammar with a warning. Only
+        # function-style tools go through the tool-call parser; hosted tools
+        # (web_search, ...) are unaffected. tool_choice "none" keeps the
+        # request satisfiable.
+        function_tools_present = any(
+            tool.type in ("function", "custom") for tool in self.tools
+        )
+        if (
+            has_existing_constraints
+            and self.tool_choice != "none"
+            and (function_tools_present or tool_call_constraint is not None)
+        ):
             raise ValueError(
                 "Cannot combine tool calls with constrained decoding "
-                "(text.format / regex / ebnf / structural_tag / json_schema). "
-                "Remove one."
+                "(text.format / regex / ebnf / structural_tag / json_schema) "
+                "while tool_choice allows calling a tool. Remove one, or set "
+                'tool_choice to "none".'
             )
         if tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint

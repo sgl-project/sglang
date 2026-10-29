@@ -12,7 +12,11 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
+from openai.types.responses import (
+    ResponseTextConfig,
+)
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from openai_harmony import Conversation, Message, Role, ToolNamespaceConfig
 from utils import (
     MockTemplateManager,
@@ -1778,6 +1782,120 @@ def test_pd_tool_continuation_stops_before_side_effect(response_serving):
         asyncio.run(run())
     context.call_tool.assert_not_awaited()
     assert serving.tokenizer_manager.generate_request.call_count == 1
+
+
+class ResponsesToolConstraintConflictTest(CustomTestCase):
+    """Responses-path counterpart of the Chat Completions tool/format
+    conflict tests: tools that remain callable cannot be combined with a
+    whole-output constraint (issue #47167)."""
+
+    ERROR_SNIPPET = "Cannot combine tool calls with constrained decoding"
+
+    @staticmethod
+    def _make_request(tool_choice="auto", tools=None, with_format=True):
+        text = None
+        if with_format:
+            text = ResponseTextConfig(
+                format=ResponseFormatJSONObject(type="json_object")
+            )
+        return ResponsesRequest(
+            model="x",
+            input="hi",
+            tools=tools,
+            tool_choice=tool_choice,
+            text=text,
+            store=False,
+        )
+
+    def _function_tools(self):
+        return [
+            {
+                "type": "function",
+                "name": "shell",
+                "description": "run a shell command",
+                "parameters": {"type": "object"},
+            }
+        ]
+
+    def test_auto_function_tools_with_format_refuse_with_or_without_grammar(self):
+        """Kimi-style structural_tag requests already refused; the fix also
+        refuses full_assistant_ebnf (glm47) and parser-grammars-less
+        (DeepSeek-style) requests instead of dropping the tools silently."""
+        for constraint in (
+            ("structural_tag", None),
+            ("full_assistant_ebnf", "ebnf-body"),
+            None,
+        ):
+            with self.subTest(constraint=constraint):
+                request = self._make_request(
+                    tool_choice="auto",
+                    tools=self._function_tools(),
+                    with_format=True,
+                )
+                with self.assertRaises(ValueError) as ctx:
+                    request.to_sampling_params(
+                        default_max_tokens=64,
+                        default_params={},
+                        stop=[],
+                        tool_call_constraint=constraint,
+                    )
+                self.assertIn(self.ERROR_SNIPPET, str(ctx.exception))
+
+    def test_required_function_tools_with_format_refuse(self):
+        request = self._make_request(
+            tool_choice="required", tools=self._function_tools()
+        )
+        with self.assertRaises(ValueError) as ctx:
+            request.to_sampling_params(
+                default_max_tokens=64,
+                default_params={},
+                stop=[],
+                tool_call_constraint=("structural_tag", None),
+            )
+        self.assertIn(self.ERROR_SNIPPET, str(ctx.exception))
+
+    def test_tool_choice_none_with_format_stays_satisfiable(self):
+        for constraint in (("full_assistant_ebnf", "ebnf-body"), None):
+            with self.subTest(constraint=constraint):
+                request = self._make_request(
+                    tool_choice="none", tools=self._function_tools()
+                )
+                params = request.to_sampling_params(
+                    default_max_tokens=64,
+                    default_params={},
+                    stop=[],
+                    tool_call_constraint=constraint,
+                )
+                self.assertEqual(params["json_schema"], '{"type": "object"}')
+
+    def test_hosted_tools_with_format_are_unaffected(self):
+        """Hosted tools (web_search, ...) bypass the tool-call parser, so a
+        text.format request is not a function-tool conflict."""
+        request = self._make_request(
+            tool_choice="auto",
+            tools=[{"type": "web_search"}],
+            with_format=True,
+        )
+        params = request.to_sampling_params(
+            default_max_tokens=64,
+            default_params={},
+            stop=[],
+            tool_call_constraint=None,
+        )
+        self.assertEqual(params["json_schema"], '{"type": "object"}')
+
+    def test_function_tools_without_format_install_tool_grammar(self):
+        request = self._make_request(
+            tool_choice="auto", tools=self._function_tools(), with_format=False
+        )
+        params = request.to_sampling_params(
+            default_max_tokens=64,
+            default_params={},
+            stop=[],
+            tool_call_constraint=("full_assistant_ebnf", "ebnf-body"),
+        )
+        self.assertEqual(params["ebnf"], "ebnf-body")
+        self.assertNotIn("json_schema", params)
 
 
 if __name__ == "__main__":

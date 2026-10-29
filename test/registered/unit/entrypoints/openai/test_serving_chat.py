@@ -2645,6 +2645,7 @@ class ServingChatTestCase(CustomTestCase):
         ]
         for tool_choice in (
             "required",
+            "auto",
             ToolChoice(function=ToolChoiceFuncName(name="get_weather")),
         ):
             for response_format in conflicting:
@@ -2662,11 +2663,19 @@ class ServingChatTestCase(CustomTestCase):
                             model_generation_config={},
                             tool_call_constraint=constraint,
                         )
-                    self.assertIn("cannot be combined", str(ctx.exception))
+                    self.assertIn(
+                        "Cannot combine tool calls with constrained decoding",
+                        str(ctx.exception),
+                    )
 
-    def test_auto_tool_choice_keeps_response_format_without_raising(self):
-        """ "auto" means the model need not call a tool, so dropping the
-        tool-call constraint still leaves a satisfiable request."""
+    def test_tools_with_output_constraint_refuse_even_without_parser_grammar(
+        self,
+    ):
+        """tool_choice "auto" + response_format must refuse even when the
+        tool-call parser installs no grammar of its own (e.g. the DeepSeek
+        detectors): the schema would otherwise cover the whole answer and the
+        model would answer in the requested shape without ever calling the
+        tool (issue #47167)."""
         request = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "hi"}],
@@ -2674,12 +2683,53 @@ class ServingChatTestCase(CustomTestCase):
             tool_choice="auto",
             response_format={"type": "json_object"},
         )
+        with self.assertRaises(ValueError) as ctx:
+            request.to_sampling_params(
+                stop=[],
+                model_generation_config={},
+                tool_call_constraint=None,
+            )
+        self.assertIn(
+            "Cannot combine tool calls with constrained decoding",
+            str(ctx.exception),
+        )
+
+    def test_tool_choice_none_keeps_response_format(self):
+        """tool_choice "none" keeps the request satisfiable: the tools are not
+        callable, so the output constraint may apply to the whole answer."""
+        constraint = ("full_assistant_ebnf", "ebnf-body")
+        for passed_constraint in (constraint, None):
+            with self.subTest(constraint=passed_constraint):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[{"type": "function", "function": {"name": "get_weather"}}],
+                    tool_choice="none",
+                    response_format={"type": "json_object"},
+                )
+                sampling_params = request.to_sampling_params(
+                    stop=[],
+                    model_generation_config={},
+                    tool_call_constraint=passed_constraint,
+                )
+                self.assertEqual(sampling_params["json_schema"], '{"type": "object"}')
+
+    def test_tools_without_output_constraint_keep_tool_call_grammar(self):
+        """Tools without an explicit output constraint keep working: the
+        tool-call grammar is installed and no json_schema is set."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            tool_choice="auto",
+        )
         sampling_params = request.to_sampling_params(
             stop=[],
             model_generation_config={},
-            tool_call_constraint=("structural_tag", None),
+            tool_call_constraint=("full_assistant_ebnf", "ebnf-body"),
         )
-        self.assertEqual(sampling_params["json_schema"], '{"type": "object"}')
+        self.assertEqual(sampling_params["ebnf"], "ebnf-body")
+        self.assertNotIn("json_schema", sampling_params)
 
     def test_kimi_k2_streaming_tool_call_id_with_history(self):
         """Ensure streaming first chunk tool_call.id increase with tool calls history for kimi_k2 parser."""
