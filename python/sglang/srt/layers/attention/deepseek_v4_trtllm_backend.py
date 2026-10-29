@@ -277,9 +277,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         self._tail_refresh_layers = _tail_refresh_layers(
             cfg.compress_ratios, cfg.index_source_layer_ids
         )
-        # The indexer writes its top-k into the table tail when every top-k kernel it
-        # may run takes a row stride: c4 topk_v2; on V4.1 bf16 logits, DeepSelect,
-        # topk_bf16_small or torch.
+        # The indexer writes top-k into the table tail if every top-k kernel it may run
+        # takes a row stride: c4 topk_v2; V4.1 bf16: DeepSelect, topk_bf16_small, torch.
         if self.low_ratios:
             writes = not self.has_c4 and index_logits_dtype() == torch.bfloat16
         else:
@@ -608,9 +607,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sum_q = sum(int(x) for x in extend_seq_lens_cpu)
             # q may be padded past the real extend tokens; pad rows sit at the end.
             assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
-            # SWA columns are bounded by causal lengths, not -1 sentinels; tail and
-            # request-window rows use their floored SWA counts, since window KV below
-            # the floor is unwritten.
+            # SWA rows end at causal lengths (no -1 sentinels); tail and request-window
+            # rows use floored SWA counts, since window KV below the floor is unwritten.
             floored = tail is not None or core.request_window_layout is not None
             seq_lens_i32 = (core.swa_topk_lengths if floored else core.seq_lens_casual)[
                 :sum_q

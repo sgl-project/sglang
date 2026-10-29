@@ -572,9 +572,8 @@ class DSV4AttnMetadata:
         return ceil_align(self.index_topk, PAGE_INDEX_ALIGNED_SIZE)
 
     def _c4_topk_writes_table(self) -> bool:
-        # topk_v2 aliases the table tail unless a raw-indices channel exists;
-        # that reroutes the indexer to the stride-unaware v1 kernel. Without c4
-        # (V4.1) the flag covers only the ratio-1/2 decode writers.
+        # topk_v2 aliases the table tail unless raw indices reroute the indexer to the
+        # stride-unaware v1 kernel; without c4 (V4.1) only ratio-1/2 decode writes.
         return (
             self.has_c4
             and self.trtllm_topk_writes_table

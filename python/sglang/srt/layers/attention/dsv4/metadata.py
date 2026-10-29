@@ -139,7 +139,8 @@ def copy_metadata(
         assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
         if isinstance(dst_val, torch.Tensor) and isinstance(src_val, torch.Tensor):
             copy_unless_aliased(dst_val, src_val)
-        elif hasattr(dst_val, "copy_"):
+            continue
+        if hasattr(dst_val, "copy_"):
             dst_val.copy_(src_val)
         else:
             warnings.warn(
@@ -383,11 +384,8 @@ class PagedIndexerMetadata:
 
 
 def copy_unless_aliased(dst: torch.Tensor, src: torch.Tensor) -> None:
-    """``dst.copy_(src)`` unless both already name the same storage.
-
-    Fields backed by persistent backend-owned storage (the trtllm
-    TrtllmSparseTablePool) hand out the same view in producer and consumer;
-    the content is already in place, so the self-copy is skipped."""
+    """``dst.copy_(src)``, skipped when both are the same view of persistent storage
+    (TrtllmSparseTablePool hands producer and consumer the same view)."""
     if (
         dst.data_ptr() == src.data_ptr()
         and dst.shape == src.shape

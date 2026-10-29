@@ -155,9 +155,8 @@ class TestDSV4TrtllmCounterBuffer(CustomTestCase):
             get_trtllm_gen_multi_ctas_kv_counter_bytes,
         )
 
-        # 16384 rows x 128 heads, above the helper's 8192-row and 64-head floors:
-        # from the query-row capacity, or from 2048 request slots x a max draft
-        # of 8 (adaptive spec; the active width may be smaller).
+        # 16384 rows x 128 heads (above the helper's 8192-row, 64-head floors): from the
+        # query-row capacity, or 2048 request slots x max draft 8 (adaptive spec).
         need = get_trtllm_gen_multi_ctas_kv_counter_bytes(
             16384, 128, get_device_sm_count(torch.device("cuda"))
         )
