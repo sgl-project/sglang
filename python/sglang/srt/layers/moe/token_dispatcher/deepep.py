@@ -181,14 +181,19 @@ class DeepEPDispatchMode(IntEnum):
 
 class DeepEPBuffer:
     """Managing facade for the process-wide DeepEP comm buffer; the state
-    itself lives on ``ctx.resources`` (one entry per process)."""
+    itself lives on ``ctx.resources`` (one entry per process *per slot*).
+
+    ``slot`` exists so that two-batch-overlap can give each sub-batch its own
+    normal-mode buffer, mirroring what the mori backend already does with
+    ``instance_id``. ``slot=0`` is the only slot used when TBO is off."""
 
     @classmethod
-    def _state(cls):
+    def _state(cls, slot: int = 0):
         from types import SimpleNamespace
 
         buffers = get_resources().buffers
-        state = buffers.get("deepep_ep_state")
+        key = f"deepep_ep_state_{slot}"
+        state = buffers.get(key)
         if state is None:
             state = SimpleNamespace(
                 buffer=None,
@@ -197,8 +202,16 @@ class DeepEPBuffer:
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
             )
-            buffers["deepep_ep_state"] = state
+            buffers[key] = state
         return state
+
+    @classmethod
+    def _all_states(cls):
+        return [
+            v
+            for k, v in get_resources().buffers.items()
+            if isinstance(k, str) and k.startswith("deepep_ep_state_")
+        ]
 
     @classmethod
     def get_deepep_buffer(
@@ -209,8 +222,9 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
+        slot: int = 0,
     ):
-        state = cls._state()
+        state = cls._state(slot)
         if state.buffer is not None:
             return state.buffer
 
@@ -306,25 +320,29 @@ class DeepEPBuffer:
 
     @classmethod
     def clean_buffer(cls):
-        state = cls._state()
-        if not state.buffer.low_latency_mode:
-            return
-        state.buffer.clean_low_latency_buffer(
-            state.num_max_dispatch_tokens_per_rank,
-            state.hidden_size,
-            state.num_experts,
-        )
+        for state in cls._all_states():
+            if state.buffer is None or not state.buffer.low_latency_mode:
+                continue
+            state.buffer.clean_low_latency_buffer(
+                state.num_max_dispatch_tokens_per_rank,
+                state.hidden_size,
+                state.num_experts,
+            )
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
-        cls._state().dispatch_mode = DeepEPDispatchMode.NORMAL
+        for state in cls._all_states():
+            state.dispatch_mode = DeepEPDispatchMode.NORMAL
 
     @classmethod
     def set_dispatch_mode_as_low_latency(cls):
-        state = cls._state()
-        if state.dispatch_mode == DeepEPDispatchMode.NORMAL:
+        if any(
+            state.dispatch_mode == DeepEPDispatchMode.NORMAL
+            for state in cls._all_states()
+        ):
             cls.clean_buffer()
-        state.dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
+        for state in cls._all_states():
+            state.dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
     @classmethod
     def set_dispatch_mode(cls, mode: DeepEPMode):
@@ -377,6 +395,7 @@ class _DeepEPDispatcherImplBase:
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
         runner_backend=None,
+        buffer_slot: int = 0,
     ):
         if not use_deepep:
             raise ImportError(
@@ -398,6 +417,7 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
+        self.buffer_slot = buffer_slot
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
@@ -740,6 +760,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            slot=self.buffer_slot,
         )
 
 
@@ -994,6 +1015,7 @@ class DeepEPDispatcher(BaseDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
         runner_backend=None,
+        buffer_slot: int = 0,
     ):
         super().__init__()
 
@@ -1009,6 +1031,7 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            buffer_slot=buffer_slot,
         )
 
         if self.deepep_mode.enable_low_latency():

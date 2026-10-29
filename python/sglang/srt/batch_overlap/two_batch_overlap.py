@@ -1162,9 +1162,12 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         super().__init__()
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
         if get_moe_a2a_backend().is_deepep():
+            # Mirror the mori branch below: each sub-batch gets its own buffer,
+            # so two in-flight dispatch->combine transactions cannot clobber
+            # each other's layout state.
             self._inners = [
-                DeepEPDispatcher(runner_backend=runner_backend, **kwargs)
-                for _ in range(num_inner_dispatchers)
+                DeepEPDispatcher(runner_backend=runner_backend, buffer_slot=i, **kwargs)
+                for i in range(num_inner_dispatchers)
             ]
         elif get_moe_a2a_backend().is_mooncake():
             self._inners = [
