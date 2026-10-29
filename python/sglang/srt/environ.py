@@ -2418,6 +2418,9 @@ def third_party_cache_defaults() -> Dict[str, str]:
         # default the burst is invisible to anyone warming, mounting or baking
         # SGLANG_CACHE_DIR, and gets paid again on every cold container.
         "TILELANG_CACHE_DIR": os.path.join(base, "tilelang"),
+        # Humming also stores generated modules and locks in its tmp directory.
+        "HUMMING_CACHE_DIR": os.path.join(base, "humming", "cache"),
+        "HUMMING_TMP_DIR": os.path.join(base, "humming", "tmp"),
         # FlashInfer appends ".cache/flashinfer" to this base itself, so this
         # is the base dir rather than the final cache dir.
         "FLASHINFER_WORKSPACE_BASE": base,
