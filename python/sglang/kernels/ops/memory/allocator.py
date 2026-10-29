@@ -135,8 +135,8 @@ def alloc_extend_kernel(
     pid = tl.program_id(0)
 
     load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
-    pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid)
+    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
+    pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
     extend_lens = seq_lens - pre_lens
 
     seq_len = tl.load(seq_lens_ptr + pid)
@@ -221,7 +221,7 @@ def alloc_decode_kernel(
     pid = tl.program_id(0)
 
     load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
+    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
     pre_lens = tl.where(load_offset <= pid, seq_lens - 1, seq_lens)
 
     seq_len = tl.load(seq_lens_ptr + pid)
