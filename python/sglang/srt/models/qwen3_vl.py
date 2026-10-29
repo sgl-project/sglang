@@ -395,7 +395,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             else vision_config.out_hidden_size
         )
         self.out_hidden_size = merger_out_dim * (1 + len(self.deepstack_visual_indexes))
-        self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
+        # The GEMM replacement can round differently from cuDNN convolution.
+        self.patch_embed = Qwen3VLVisionPatchEmbed(
+            config=vision_config,
+            disable_linear=get_exec().deterministic.rl_on_policy_target is not None,
+        )
         if self.pp_group.is_first_rank:
             self.pos_embed = VocabParallelEmbedding(
                 self.num_position_embeddings,
