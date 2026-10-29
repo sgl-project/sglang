@@ -108,6 +108,8 @@ print_highlight(response.text)
 ## Health Check
 - `/health`: Check the health of the server.
 - `/health_generate`: Check the health of the server by generating one token.
+- `/ready`: Returns 200 when the server accepts new requests; 503 while starting, paused, unhealthy, or shutting down.
+- `/ping`: SageMaker health check. Returns 200 once the server is up; 503 while starting, unhealthy, or shutting down. Stays 200 while generation is paused. A failed `/health` or `/health_generate` probe marks the server unhealthy until a later probe succeeds.
 
 ```python Example
 url = f"http://localhost:{port}/health_generate"
@@ -465,3 +467,5 @@ except Exception as e:
 ```python Example
 terminate_process(tokenizer_free_server_process)
 ```
+
+`/tokenize` also accepts chat `messages` (with optional `tools` and `chat_template_kwargs`) in place of `prompt`. By default they are rendered as for a chat completion: a final assistant message becomes a user turn and the generation prompt is always added. To format messages exactly as given, pass `add_generation_prompt` (`true` or `false`); the request may then also set `add_special_tokens`, which defaults to `false` because the chat template writes its own special tokens. These options need a Jinja chat template; other templates return HTTP 400.

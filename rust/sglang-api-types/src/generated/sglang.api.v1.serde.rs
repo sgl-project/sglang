@@ -115,25 +115,30 @@ impl<'de> ::serde::Deserialize<'de> for StringListOrList {
                         value: Some(string_list_or_list::Value::One(StringList::default())),
                     });
                 };
-                let is_number = first.is_string();
+                if first.is_string() {
+                    let first =
+                        <::prost::alloc::string::String as ::serde::Deserialize>::deserialize(
+                            first,
+                        )
+                        .map_err(::serde::de::Error::custom)?;
+                    let mut items = vec![first];
+                    while let Some(v) = seq.next_element::<::prost::alloc::string::String>()? {
+                        items.push(v);
+                    }
+                    return Ok(StringListOrList {
+                        value: Some(string_list_or_list::Value::One(StringList { items })),
+                    });
+                }
                 let mut rest = vec![first];
                 while let Some(v) = seq.next_element::<::serde_json::Value>()? {
                     rest.push(v);
                 }
-                let reparse = ::serde_json::Value::Array(rest);
-                if is_number {
-                    let one: StringList =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(StringListOrList {
-                        value: Some(string_list_or_list::Value::One(one)),
-                    })
-                } else {
-                    let many: StringListList =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(StringListOrList {
-                        value: Some(string_list_or_list::Value::Many(many)),
-                    })
-                }
+                let many: StringListList =
+                    ::serde_json::from_value(::serde_json::Value::Array(rest))
+                        .map_err(::serde::de::Error::custom)?;
+                Ok(StringListOrList {
+                    value: Some(string_list_or_list::Value::Many(many)),
+                })
             }
         }
         deserializer.deserialize_any(V)
@@ -311,25 +316,26 @@ impl<'de> ::serde::Deserialize<'de> for TokenIdsOrList {
                         value: Some(token_ids_or_list::Value::One(TokenIds::default())),
                     });
                 };
-                let is_number = first.is_number();
+                if first.is_number() {
+                    let first = <i64 as ::serde::Deserialize>::deserialize(first)
+                        .map_err(::serde::de::Error::custom)?;
+                    let mut ids = vec![first];
+                    while let Some(v) = seq.next_element::<i64>()? {
+                        ids.push(v);
+                    }
+                    return Ok(TokenIdsOrList {
+                        value: Some(token_ids_or_list::Value::One(TokenIds { ids })),
+                    });
+                }
                 let mut rest = vec![first];
                 while let Some(v) = seq.next_element::<::serde_json::Value>()? {
                     rest.push(v);
                 }
-                let reparse = ::serde_json::Value::Array(rest);
-                if is_number {
-                    let one: TokenIds =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(TokenIdsOrList {
-                        value: Some(token_ids_or_list::Value::One(one)),
-                    })
-                } else {
-                    let many: TokenIdsList =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(TokenIdsOrList {
-                        value: Some(token_ids_or_list::Value::Many(many)),
-                    })
-                }
+                let many: TokenIdsList = ::serde_json::from_value(::serde_json::Value::Array(rest))
+                    .map_err(::serde::de::Error::custom)?;
+                Ok(TokenIdsOrList {
+                    value: Some(token_ids_or_list::Value::Many(many)),
+                })
             }
         }
         deserializer.deserialize_any(V)
@@ -1637,6 +1643,38 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.max_thinking_tokens {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_thinking_tokens", v)?;
         }
+        if let Some(v) = &self.session_id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "session_id", v)?;
+        }
+        if let Some(v) = &self.custom_logit_processor {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "custom_logit_processor", v)?;
+        }
+        if !self.custom_labels.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "custom_labels",
+                &self.custom_labels,
+            )?;
+        }
+        if let Some(v) = &self.images_config {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "images_config", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "return_prompt_token_ids",
+            &self.return_prompt_token_ids,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "routed_experts_start_len",
+            &self.routed_experts_start_len,
+        )?;
+        if let Some(v) = &self.return_sampling_mask {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "return_sampling_mask", v)?;
+        }
+        if let Some(v) = &self.modalities {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "modalities", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1684,6 +1722,14 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_kv_hints = None;
                 let mut f_routing_key = None;
                 let mut f_max_thinking_tokens = None;
+                let mut f_session_id = None;
+                let mut f_custom_logit_processor = None;
+                let mut f_custom_labels = None;
+                let mut f_images_config = None;
+                let mut f_return_prompt_token_ids = None;
+                let mut f_routed_experts_start_len = None;
+                let mut f_return_sampling_mask = None;
+                let mut f_modalities = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -1902,6 +1948,72 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_max_thinking_tokens = Some(map.next_value::<Option<u64>>()?);
                         }
+                        "session_id" => {
+                            if f_session_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("session_id"));
+                            }
+                            f_session_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "custom_logit_processor" => {
+                            if f_custom_logit_processor.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "custom_logit_processor",
+                                ));
+                            }
+                            f_custom_logit_processor =
+                                Some(map.next_value::<Option<OptionalStringOrList>>()?);
+                        }
+                        "custom_labels" => {
+                            if f_custom_labels.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("custom_labels"));
+                            }
+                            f_custom_labels = Some(
+                                map.next_value::<Option<
+                                    ::std::collections::HashMap<
+                                        String,
+                                        ::prost::alloc::string::String,
+                                    >,
+                                >>()?
+                                .unwrap_or_default(),
+                            );
+                        }
+                        "images_config" => {
+                            if f_images_config.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("images_config"));
+                            }
+                            f_images_config = Some(map.next_value::<Option<ImagesConfig>>()?);
+                        }
+                        "return_prompt_token_ids" => {
+                            if f_return_prompt_token_ids.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "return_prompt_token_ids",
+                                ));
+                            }
+                            f_return_prompt_token_ids = Some(map.next_value::<bool>()?);
+                        }
+                        "routed_experts_start_len" => {
+                            if f_routed_experts_start_len.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "routed_experts_start_len",
+                                ));
+                            }
+                            f_routed_experts_start_len = Some(map.next_value::<i64>()?);
+                        }
+                        "return_sampling_mask" => {
+                            if f_return_sampling_mask.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "return_sampling_mask",
+                                ));
+                            }
+                            f_return_sampling_mask = Some(map.next_value::<Option<BoolOrList>>()?);
+                        }
+                        "modalities" => {
+                            if f_modalities.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("modalities"));
+                            }
+                            f_modalities = Some(map.next_value::<Option<OptionalStringList>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -1939,6 +2051,69 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     kv_hints: f_kv_hints.flatten(),
                     routing_key: f_routing_key.flatten(),
                     max_thinking_tokens: f_max_thinking_tokens.flatten(),
+                    session_id: f_session_id.flatten(),
+                    custom_logit_processor: f_custom_logit_processor.flatten(),
+                    custom_labels: f_custom_labels.unwrap_or_default(),
+                    images_config: f_images_config.flatten(),
+                    return_prompt_token_ids: f_return_prompt_token_ids.unwrap_or_default(),
+                    routed_experts_start_len: f_routed_experts_start_len.unwrap_or_default(),
+                    return_sampling_mask: f_return_sampling_mask.flatten(),
+                    modalities: f_modalities.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ImagesConfig {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.image_mode {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "image_mode", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "prefix", &self.prefix)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ImagesConfig {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ImagesConfig;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ImagesConfig")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_image_mode = None;
+                let mut f_prefix = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "image_mode" => {
+                            if f_image_mode.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("image_mode"));
+                            }
+                            f_image_mode =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "prefix" => {
+                            if f_prefix.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("prefix"));
+                            }
+                            f_prefix = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ImagesConfig {
+                    image_mode: f_image_mode.flatten(),
+                    prefix: f_prefix.unwrap_or_default(),
                 })
             }
         }
@@ -2432,6 +2607,32 @@ impl ::serde::Serialize for GenerateMetaInfo {
             "reasoning_tokens",
             &self.reasoning_tokens,
         )?;
+        if let Some(v) = &self.output_token_logprobs_length {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "output_token_logprobs_length",
+                v,
+            )?;
+        }
+        if let Some(v) = &self.weight_version {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "weight_version", v)?;
+        }
+        if !self.weight_versions.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "weight_versions",
+                &self.weight_versions,
+            )?;
+        }
+        if let Some(v) = &self.image_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "image_tokens", v)?;
+        }
+        if let Some(v) = &self.audio_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "audio_tokens", v)?;
+        }
+        if let Some(v) = &self.video_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "video_tokens", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2462,6 +2663,12 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                 let mut f_e2e_latency = None;
                 let mut f_cached_tokens = None;
                 let mut f_reasoning_tokens = None;
+                let mut f_output_token_logprobs_length = None;
+                let mut f_weight_version = None;
+                let mut f_weight_versions = None;
+                let mut f_image_tokens = None;
+                let mut f_audio_tokens = None;
+                let mut f_video_tokens = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "id" => {
@@ -2581,6 +2788,48 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                             }
                             f_reasoning_tokens = Some(map.next_value::<u64>()?);
                         }
+                        "output_token_logprobs_length" => {
+                            if f_output_token_logprobs_length.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "output_token_logprobs_length",
+                                ));
+                            }
+                            f_output_token_logprobs_length = Some(map.next_value::<Option<u64>>()?);
+                        }
+                        "weight_version" => {
+                            if f_weight_version.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("weight_version"));
+                            }
+                            f_weight_version =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "weight_versions" => {
+                            if f_weight_versions.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("weight_versions"));
+                            }
+                            f_weight_versions = Some(
+                                map.next_value::<Option<Vec<WeightVersionSpan>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "image_tokens" => {
+                            if f_image_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("image_tokens"));
+                            }
+                            f_image_tokens = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "audio_tokens" => {
+                            if f_audio_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("audio_tokens"));
+                            }
+                            f_audio_tokens = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "video_tokens" => {
+                            if f_video_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("video_tokens"));
+                            }
+                            f_video_tokens = Some(map.next_value::<Option<u32>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2601,6 +2850,73 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                     e2e_latency: f_e2e_latency.flatten(),
                     cached_tokens: f_cached_tokens.unwrap_or_default(),
                     reasoning_tokens: f_reasoning_tokens.unwrap_or_default(),
+                    output_token_logprobs_length: f_output_token_logprobs_length.flatten(),
+                    weight_version: f_weight_version.flatten(),
+                    weight_versions: f_weight_versions.unwrap_or_default(),
+                    image_tokens: f_image_tokens.flatten(),
+                    audio_tokens: f_audio_tokens.flatten(),
+                    video_tokens: f_video_tokens.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for WeightVersionSpan {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "version", &self.version)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "start", &self.start)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "end", &self.end)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for WeightVersionSpan {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = WeightVersionSpan;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct WeightVersionSpan")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_version = None;
+                let mut f_start = None;
+                let mut f_end = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "version" => {
+                            if f_version.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("version"));
+                            }
+                            f_version = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "start" => {
+                            if f_start.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("start"));
+                            }
+                            f_start = Some(map.next_value::<i64>()?);
+                        }
+                        "end" => {
+                            if f_end.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("end"));
+                            }
+                            f_end = Some(map.next_value::<i64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(WeightVersionSpan {
+                    version: f_version.unwrap_or_default(),
+                    start: f_start.unwrap_or_default(),
+                    end: f_end.unwrap_or_default(),
                 })
             }
         }
@@ -2620,6 +2936,9 @@ impl ::serde::Serialize for GenerateResponse {
         }
         if let Some(v) = &self.index {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "index", v)?;
+        }
+        if let Some(v) = &self.prompt_token_ids {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "prompt_token_ids", v)?;
         }
         ::serde::ser::SerializeMap::end(map)
     }
@@ -2641,6 +2960,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateResponse {
                 let mut f_meta_info = None;
                 let mut f_output_ids = None;
                 let mut f_index = None;
+                let mut f_prompt_token_ids = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "text" => {
@@ -2667,6 +2987,14 @@ impl<'de> ::serde::Deserialize<'de> for GenerateResponse {
                             }
                             f_index = Some(map.next_value::<Option<u32>>()?);
                         }
+                        "prompt_token_ids" => {
+                            if f_prompt_token_ids.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "prompt_token_ids",
+                                ));
+                            }
+                            f_prompt_token_ids = Some(map.next_value::<Option<TokenIds>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2677,6 +3005,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateResponse {
                     meta_info: f_meta_info.flatten(),
                     output_ids: f_output_ids.flatten(),
                     index: f_index.flatten(),
+                    prompt_token_ids: f_prompt_token_ids.flatten(),
                 })
             }
         }

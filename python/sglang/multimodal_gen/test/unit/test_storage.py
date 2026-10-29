@@ -7,9 +7,16 @@ Tests verify file upload, cleanup, URL generation, and error handling.
 import asyncio
 import os
 import sys
+import threading
+from contextlib import suppress
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
+import pytest
+
 import sglang.multimodal_gen.runtime.entrypoints.openai.storage as storage_mod
+from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import CloudStorage
 
 
@@ -228,3 +235,80 @@ def test_env_configured_storage_uploads_and_cleans_up(tmp_path, monkeypatch):
             {"ExtraArgs": {"ContentType": "image/png"}},
         )
     ]
+
+
+@pytest.mark.parametrize("kind", ["single", "images", "videos"])
+@pytest.mark.parametrize("upload_fails", [False, True])
+def test_cancelled_upload_finishes_reading_before_request_cleanup(
+    tmp_path, monkeypatch, kind, upload_fails
+):
+    """Cancellation must not delete files still read by one or more SDK threads."""
+    monkeypatch.delenv("SGLANG_CLOUD_STORAGE_TYPE", raising=False)
+    storage = CloudStorage()
+    storage.enabled = True
+    storage.bucket_name = "test"
+    storage.endpoint_url = "https://s3.example.com"
+    storage.region_name = None
+    monkeypatch.setattr(image_api, "cloud_storage", storage)
+    monkeypatch.setattr(video_api, "cloud_storage", storage)
+    count = 1 if kind == "single" else 2
+    release = [threading.Event() for _ in range(count)]
+    read = []
+
+    async def run_test():
+        loop = asyncio.get_running_loop()
+        started = [asyncio.Event() for _ in range(count)]
+        finished = [asyncio.Event() for _ in range(count)]
+
+        def upload(local_path, bucket, key, **kwargs):
+            index = int(Path(local_path).stem)
+            loop.call_soon_threadsafe(started[index].set)
+            assert release[index].wait(10)
+            try:
+                read.append(Path(local_path).read_bytes())
+                if upload_fails:
+                    raise OSError("storage unavailable")
+            finally:
+                loop.call_soon_threadsafe(finished[index].set)
+
+        storage.client = SimpleNamespace(upload_file=upload)
+
+        async def request():
+            with TemporaryDirectory(dir=tmp_path) as directory:
+                paths = [Path(directory) / f"{i}.mp4" for i in range(count)]
+                for path in paths:
+                    path.write_bytes(b"media")
+                paths = [str(path) for path in paths]
+                if kind == "single":
+                    await storage.upload_and_cleanup(paths[0])
+                elif kind == "images":
+                    await image_api._upload_and_cleanup_images(paths)
+                else:
+                    await video_api._upload_and_cleanup_videos(paths)
+
+        task = asyncio.create_task(request())
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(event.wait() for event in started)), timeout=10
+            )
+            for _ in range(2):
+                task.cancel()
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                assert not task.done(), "cleanup raced with the active upload"
+            if count > 1:
+                release[0].set()
+                await asyncio.wait_for(finished[0].wait(), timeout=10)
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                assert not task.done(), "cleanup did not wait for every output"
+        finally:
+            for event in release:
+                event.set()
+            with suppress(asyncio.CancelledError):
+                await task
+        assert task.cancelled()
+        assert read == [b"media"] * count
+        assert not list(tmp_path.iterdir())
+
+    asyncio.run(run_test())
