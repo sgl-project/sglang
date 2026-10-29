@@ -310,6 +310,18 @@ class ReqState:
             self.text_chunks.clear()
         return self.text
 
+    def update_request_stats(
+        self, request_stats: Optional[List[Optional[RequestOutputStats]]], i: int
+    ) -> Optional[RequestOutputStats]:
+        """Store row i's new request stats, if any; return the latest received,
+        None before any."""
+        if (
+            request_stats is not None
+            and (new_request_stats := request_stats[i]) is not None
+        ):
+            self.request_stats = new_request_stats
+        return self.request_stats
+
     @property
     def scheduler_time_stats(self) -> SchedulerOutputTimeStats:
         # Embedding requests, and requests whose own metrics are off, carry none.
@@ -2515,12 +2527,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 continue
 
-            if (
-                recv_obj.request_stats is not None
-                and (new_request_stats := recv_obj.request_stats[i]) is not None
-            ):
-                state.request_stats = new_request_stats
-            request_stats = state.request_stats
+            request_stats = state.update_request_stats(recv_obj.request_stats, i)
             if request_stats is None:
                 # A late row of an aborted request whose rid was reused.
                 logger.warning(f"Received output for {rid=} before its request stats.")

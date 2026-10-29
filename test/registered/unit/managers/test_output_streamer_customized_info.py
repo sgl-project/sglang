@@ -100,6 +100,8 @@ class _FakeReq:
     def finished(self):
         return self._finished
 
+    take_request_stats_due = Req.take_request_stats_due
+
     def get_mm_token_counts(self):
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
 

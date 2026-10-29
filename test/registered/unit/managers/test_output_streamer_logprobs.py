@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_streamer import (
     _GenerationStreamAccumulator,
 )
@@ -59,6 +60,8 @@ class _FakeReq:
 
     def finished(self):
         return False
+
+    take_request_stats_due = Req.take_request_stats_due
 
     def get_mm_token_counts(self):
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens

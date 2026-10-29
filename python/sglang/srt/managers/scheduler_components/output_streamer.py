@@ -550,16 +550,9 @@ class _GenerationStreamAccumulator:
                 else len(output_ids_)
             )
 
-            # The tokenizer keeps each request's latest stats. They go out with the
-            # first output, the first output after each retraction, and the
-            # finished row, so the final output reports the final values.
-            if (
-                req.request_stats_retraction_count != req.retraction_count
-                or req.finished()
-            ):
+            if req.take_request_stats_due():
                 self.request_stats.append(self.build_request_stats(req))
                 self.has_request_stats = True
-                req.request_stats_retraction_count = req.retraction_count
             else:
                 self.request_stats.append(None)
 
