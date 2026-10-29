@@ -1110,7 +1110,6 @@ class VisionAttention(nn.Module):
         workspace_buffer: Optional[torch.Tensor] = None,
         use_sink: bool = False,
         window_size: Tuple[int, int] = (-1, -1),
-        use_eager_rope: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -1124,7 +1123,6 @@ class VisionAttention(nn.Module):
         self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
         self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.dropout = dropout
-        self.use_eager_rope = use_eager_rope
         num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_size = head_dim if head_dim is not None else embed_dim // num_heads
         self.softmax_scale = softmax_scale
@@ -1489,10 +1487,10 @@ class VisionAttention(nn.Module):
             # is being captured, which makes Inductor attempt an illegal
             # CPU-to-CUDA copy. The eager version is captured as part of the
             # graph, so its pointwise work is still replayed without launch
-            # overhead. Models may also request eager evaluation to preserve HF rounding.
+            # overhead.
             rotary_fn = (
                 apply_rotary_pos_emb_native_eager
-                if (envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() or self.use_eager_rope)
+                if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
                 else apply_rotary_pos_emb
             )
             q, k = rotary_fn(q, k, cos, sin)

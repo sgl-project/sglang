@@ -209,8 +209,6 @@ class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
 
 
 class SenseNovaLoopForConditionalGeneration(qwen3_5.Qwen3_5ForConditionalGeneration):
-    preserve_hf_vision_numerics = True
-
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__(
             config=config,
@@ -218,6 +216,8 @@ class SenseNovaLoopForConditionalGeneration(qwen3_5.Qwen3_5ForConditionalGenerat
             prefix=prefix,
             language_model_cls=SenseNovaLoopModel,
         )
+        if not self.language_model_only:
+            self.visual.use_fp32_pos_embed_interpolation = True
 
     def set_dflash_layers_to_capture(self, layer_ids):
         raise NotImplementedError(

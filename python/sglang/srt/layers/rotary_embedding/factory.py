@@ -132,12 +132,7 @@ def get_rope(
     dtype: Optional[torch.dtype] = None,
     partial_rotary_factor: float = 1.0,
     dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
-    init_inv_freq_on_cpu: bool = False,
 ) -> RotaryEmbedding:
-    if init_inv_freq_on_cpu and (
-        rope_scaling is not None or dual_chunk_attention_config is not None
-    ):
-        raise ValueError("CPU inverse-frequency initialization requires unscaled RoPE")
     if dtype is None:
         dtype = torch.get_default_dtype()
     if rope_scaling is not None:
@@ -170,8 +165,6 @@ def get_rope(
         dual_chunk_attention_args,
         dtype,
     )
-    if init_inv_freq_on_cpu:
-        key += ("init_inv_freq_on_cpu", True)
     cached = _get_live_rope_cache_entry(key)
     if cached is not None:
         return cached
@@ -193,13 +186,7 @@ def get_rope(
         )
     elif rope_scaling is None:
         rotary_emb = RotaryEmbedding(
-            head_size,
-            rotary_dim,
-            max_position,
-            base,
-            is_neox_style,
-            dtype,
-            init_inv_freq_on_cpu=init_inv_freq_on_cpu,
+            head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
     else:
         if "rope_type" in rope_scaling:

@@ -70,7 +70,7 @@ class TestViTPosEmbedInterpolate(CustomTestCase):
             for dtype in (torch.bfloat16, torch.float32):
                 stub = SimpleNamespace(
                     num_grid_per_side=int(NUM_POS**0.5),
-                    preserve_hf_numerics=False,
+                    use_fp32_pos_embed_interpolation=False,
                     spatial_merge_size=MERGE,
                     num_position_embeddings=NUM_POS,
                     pos_embed=nn.Embedding(NUM_POS, HIDDEN).to(
@@ -102,7 +102,7 @@ class TestViTPosEmbedInterpolate(CustomTestCase):
                     )
                     stub = SimpleNamespace(
                         num_grid_per_side=2,
-                        preserve_hf_numerics=True,
+                        use_fp32_pos_embed_interpolation=True,
                         spatial_merge_size=2,
                         pos_embed=embedding,
                         dtype=dtype,
@@ -192,7 +192,7 @@ class TestViTPosEmbedInterpolate(CustomTestCase):
                     stub = SimpleNamespace(
                         num_grid_per_side=2,
                         spatial_merge_size=2,
-                        preserve_hf_numerics=False,
+                        use_fp32_pos_embed_interpolation=False,
                         pos_embed=embedding,
                         dtype=dtype,
                         device=device,
