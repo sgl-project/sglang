@@ -2080,6 +2080,13 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        # Embedding results need no sampling for the next batch, so when the last
+        # batch's copy to the host has already finished, process it before
+        # scheduling the next one rather than a full pass later.
+        # Single TP rank only: the copy event is rank-local, and TP ranks must
+        # build the same batches.
+        early_results = not self.is_generation and self.tp_size == 1
+
         while True:
             if self.gracefully_exit:
                 break
@@ -2089,6 +2096,13 @@ class Scheduler(
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+
+            processed_early = False
+            if early_results and self.last_batch and self.result_queue:
+                copy_done = getattr(self.result_queue[0][1], "copy_done", None)
+                if copy_done is not None and copy_done.query():
+                    pop_and_process()
+                    processed_early = True
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
@@ -2103,7 +2117,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch:
+            if disable_overlap_for_batch and not processed_early:
                 pop_and_process()
                 # Opportunistic flush at the disable_overlap sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
@@ -2126,7 +2140,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not processed_early:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
