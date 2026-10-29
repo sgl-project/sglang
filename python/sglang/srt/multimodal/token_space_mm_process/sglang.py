@@ -219,11 +219,10 @@ class TokenSpaceSGLangProcessor:
         mm_items = self._feature_transport.prepare_mm_items_for_transport(mm_items)
         input_ids_list = input_ids.tolist()
         params = self._core.strategy.mm_token_expansion_params
+        # No padded_input_ids: caller mm_hashes may still replace the item hashes,
+        # so the scheduler pads with the final pad values.
         return MultimodalProcessorOutput(
             input_ids=input_ids_list,
-            padded_input_ids=MultimodalProcessorOutput.build_padded_input_ids(
-                input_ids_list, mm_items
-            ),
             mm_items=mm_items,
             **{
                 field: params.get(param)
