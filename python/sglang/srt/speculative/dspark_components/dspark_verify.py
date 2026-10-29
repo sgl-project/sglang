@@ -199,15 +199,11 @@ class TargetVerifyExecutor:
             self.verify_epilogue.note_static_verify(bs)
             return self.verify_epilogue.read_accept(bs)
 
-        simulate = self._simulated_correct_len is not None
-        # Simulated acceptance overwrites correct_len below, so a sampling accept
-        # (draft/target softmax + rejection) would be computed only to be discarded.
-        accept_sampling_info = None if simulate else sampling_info
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
             draft_block=draft_block,
-            sampling_info=accept_sampling_info,
+            sampling_info=sampling_info,
             draft_input=draft_input,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
@@ -217,7 +213,7 @@ class TargetVerifyExecutor:
             rejection_noise=self._rejection_noise,
         )
         greedy_bonus = simulate_bonus_sampling_info is None and (
-            accept_sampling_info is None or accept_sampling_info.is_all_greedy
+            sampling_info is None or sampling_info.is_all_greedy
         )
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
@@ -320,7 +316,7 @@ class TargetVerifyExecutor:
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             live_seq_lens_cpu=batch.seq_lens_cpu,
-            kv_loc_plan=verify_window.kv_loc_plan,
+            iteration_ids=verify_window.iteration_ids,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -397,7 +393,7 @@ class TargetVerifyExecutor:
                 hidden_strided=hidden_strided,
                 commit_lens=commit_lens,
                 bs=bs,
-                kv_loc_plan=verify_window.kv_loc_plan,
+                iteration_ids=verify_window.iteration_ids,
             )
             return
         hidden = logits_output.hidden_states
@@ -414,7 +410,7 @@ class TargetVerifyExecutor:
             state_slot = (
                 batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
             )
-        cache_loc = self.kv_injector.ids_for(verify_window.kv_loc_plan)
+        cache_loc = self.kv_injector.ids_for(verify_window.iteration_ids)
         self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
@@ -431,7 +427,7 @@ class TargetVerifyExecutor:
         layout: RaggedVerifyLayout,
         ragged_window: RaggedVerifyWindow,
         sampling_info,
-        kv_loc_plan,
+        iteration_ids,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
             draft_token=ragged_window.verify_ids,
@@ -442,8 +438,8 @@ class TargetVerifyExecutor:
             ragged_verify_layout=layout,
             live_seq_lens_cpu=batch.seq_lens_cpu,
             # The packed rows are a selection of the planned verify window.
-            kv_loc_plan=kv_loc_plan,
-            kv_loc_cols=ragged_window.window_index,
+            iteration_ids=iteration_ids,
+            iteration_cols=ragged_window.window_index,
         )
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -496,7 +492,7 @@ class TargetVerifyExecutor:
             layout=layout,
             ragged_window=ragged_window,
             sampling_info=sampling_info,
-            kv_loc_plan=verify_window.kv_loc_plan,
+            iteration_ids=verify_window.iteration_ids,
         )
         logits_output = target_verify.logits_output
 
@@ -642,18 +638,13 @@ class DsparkVerifyEpilogue:
         self.out_tokens_buf = torch.zeros(
             (self.max_bs, self.stride), dtype=torch.int64, device=device
         )
-        # Under the accept-site broadcast the fused tail serves only simulate_fold,
-        # whose broadcast inputs (length, draw) the kernel can take.
-        self._tail_broadcasts = bool(fused_accept_tail) and tp_sync.enabled(
+        # The accept-site broadcast runs between the separate ops, so it keeps them.
+        self._fused_accept_tail = bool(fused_accept_tail) and not tp_sync.enabled(
             SpecTpSyncSite.DSPARK_ACCEPT_GRAPH
-        )
-        self._fused_accept_tail = bool(fused_accept_tail) and (
-            self.simulate_fold or not self._tail_broadcasts
         )
         if fused_accept_tail and not self._fused_accept_tail:
             logger.info(
-                "DSpark fused accept tail off: the accept-site TP broadcast is "
-                "selected without SGLANG_DSPARK_SIMULATE_FOLD."
+                "DSpark fused accept tail off: the accept-site TP broadcast is selected."
             )
         self._accept_tail_bs = (int(accept_tail_min_bs), int(accept_tail_max_bs))
         self._accept_tail_logged: set[int] = set()
@@ -843,24 +834,17 @@ class DsparkVerifyEpilogue:
         self, *, candidates, logits, seq_lens, verify_lens, gated: bool
     ) -> Optional[torch.Tensor]:
         """The greedy ``_accept`` and gated commit lengths in one launch; under
-        simulate_fold the argmax is skipped and the bonus select runs in the tail."""
+        simulate_fold the bonus select runs in the tail."""
         bs = candidates.shape[0]
-        target_predict = bonus_in = bonus_parts = None
-        if not self.simulate_fold:
-            target_predict = _row_argmax(logits, fused=self._fused_argmax).view(-1)
-        elif self._tail_broadcasts:
-            bonus_in = self.sim_bonus(logits, bs)
-            # Rank 0's length and draw, as build_accept_outs broadcasts them.
-            self._tp_sync.sync(
-                SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, self.simulated_correct_len
-            )
-            self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus_in)
-        else:
+        # Under simulate_fold the tail does not read the argmax; it still runs as served.
+        target_predict = _row_argmax(logits, fused=self._fused_argmax).view(-1)
+        bonus_parts = None
+        if self.simulate_fold:
             bonus_parts = (
                 *simulated_bonus_partials_graph(**self._sim_bonus_args(logits, bs)),
                 logits.shape[1],
             )
-        self._log_accept_tail(bs, bonus_in=bonus_in)
+        self._log_accept_tail(bs)
         static_accept_tail(
             candidates=candidates,
             target_predict=target_predict,
@@ -874,7 +858,6 @@ class DsparkVerifyEpilogue:
             new_seq_lens_out=self.new_seq_lens_buf,
             out_tokens_out=self.out_tokens_buf,
             simulated_correct_len=self.simulated_correct_len,
-            bonus_in=bonus_in,
             bonus_parts=bonus_parts,
             gated_commit_lens_out=self.gated_commit_lens_buf if gated else None,
         )
@@ -895,7 +878,7 @@ class DsparkVerifyEpilogue:
         """The simulated row's bonus from the buffers begin_sim_bonus staged; graph-safe."""
         return simulated_bonus_sample_graph(**self._sim_bonus_args(logits, bs))
 
-    def _log_accept_tail(self, bs: int, *, bonus_in) -> None:
+    def _log_accept_tail(self, bs: int) -> None:
         """Once per captured batch size, from the branch that launches the kernel."""
         if (
             bs in self._accept_tail_logged
@@ -905,10 +888,9 @@ class DsparkVerifyEpilogue:
             return
         self._accept_tail_logged.add(bs)
         logger.info(
-            "DSpark verify graph bs=%d: fused accept tail (bonus=%s, tp-broadcast=%s)",
+            "DSpark verify graph bs=%d: fused accept tail (bonus=%s)",
             bs,
             "sim-fold" if self.simulate_fold else "argmax",
-            "inputs" if bonus_in is not None else "off",
         )
 
     def note_static_verify(self, bs: int) -> None:

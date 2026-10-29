@@ -1310,7 +1310,7 @@ class MiniMaxM3Attention(nn.Module):
             return None
 
         layer_id = self.attn.layer_id
-        k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
+        k_cache, v_cache = kv_pool.layer_router.read(layer_id).kv()
         idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
         page_size = int(kv_pool.page_size)
         if (
@@ -1416,7 +1416,7 @@ class MiniMaxM3Attention(nn.Module):
         )
         if can_use_cache_fusion and kv_pool is not None:
             layer_id = self.attn.layer_id
-            k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
+            k_cache, v_cache = kv_pool.layer_router.read(layer_id).kv()
             idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
             q, k, idx_q, idx_k = sparse_qk_index_gemma_rmsnorm_rope_cache(
                 q,

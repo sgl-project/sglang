@@ -109,6 +109,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     _symmetric_scratch_layout,
     _symmetric_scratch_supported,
 )
+from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
@@ -123,6 +124,7 @@ from sglang.srt.utils import ceil_div
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase, enter_scope
+from sglang.test.tree_slots import tree_slots_of
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -1023,7 +1025,7 @@ def _unified_tree(page_size=4, pool_size=256, disable=False):
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             eviction_policy="lru",
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
         )
     )
 
@@ -1071,7 +1073,7 @@ class TestShardedAllocationEviction(CustomTestCase):
                 ),
                 token_to_kv_pool_allocator=allocator,
                 page_size=PS,
-                tree_components=(ComponentType.FULL,),
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
                 tree_core_backend="python",
             )
         )
@@ -1204,7 +1206,7 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
             token_to_kv_pool_allocator=_make_allocator(pages_per_rank=8),
             page_size=PS,
             eviction_policy="lru",
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
         )
         with unittest.mock.patch.object(
             type(tree.tree_core), "supports_rotation_base", False
@@ -1222,7 +1224,7 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
             token_to_kv_pool_allocator=tree.token_to_kv_pool_allocator,
             page_size=4,
             eviction_policy="lru",
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
         )
         with unittest.mock.patch.object(
             type(tree.tree_core), "supports_rotation_base", False
@@ -2052,8 +2054,11 @@ class TestOwnedRows(CustomTestCase):
         host = pool.alloc(6 * PS, start_owner=0)
         controller = HybridCacheController.__new__(HybridCacheController)
         controller.is_kv_sharded = True
-        entry = SimpleNamespace(host_pool=pool, device_pool=object(), layer_mapper=None)
-        indexer = SimpleNamespace(
+        entry = PoolEntry(
+            name=PoolName.KV, host_pool=pool, device_pool=object(), layer_mapper=None
+        )
+        indexer = PoolEntry(
+            name=PoolName.INDEXER,
             host_pool=SimpleNamespace(can_use_write_back_jit=False),
             device_pool=object(),
             layer_mapper=None,
