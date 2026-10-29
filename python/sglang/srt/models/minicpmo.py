@@ -1420,8 +1420,6 @@ class MultiModalProjector(nn.Module):
 
 
 class MiniCPMO(MiniCPMBaseModel):
-    supports_batched_image_encoding = True
-
     def __init__(
         self,
         config: PretrainedConfig,

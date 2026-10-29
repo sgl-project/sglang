@@ -1520,11 +1520,6 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
-    # NPU ViT input patches, before spatial merging. For Qwen3-VL merge_size=2,
-    # 16384 patches correspond to 4096 output visual tokens. Nonpositive values
-    # disable NPU cross-request batching. Oversized/unknown-size images run
-    # alone; this is not a strict memory limit.
-    SGLANG_NPU_VIT_MAX_BATCH_PATCHES = EnvInt(0)
 
     # ===================================================================
     # Multimodal CUDA IPC transport

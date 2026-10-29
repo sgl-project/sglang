@@ -564,8 +564,6 @@ class Glm4vVisionModel(nn.Module):
 
 
 class Glm4vForConditionalGeneration(nn.Module):
-    supports_batched_image_encoding = True
-
     def __init__(
         self,
         config: Glm4vConfig,

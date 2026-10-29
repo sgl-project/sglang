@@ -1,4 +1,4 @@
-"""Single-NPU image association and cache regression for Qwen3-VL batching."""
+"""Single-NPU image association and cache regression for graph-backed batching."""
 
 import base64
 import io
@@ -52,8 +52,7 @@ class TestNpuViTBatching(CustomTestCase):
                 ],
                 env={
                     "ASCEND_USE_FIA": "1",
-                    "SGLANG_VIT_ENABLE_CUDA_GRAPH": "0",
-                    "SGLANG_NPU_VIT_MAX_BATCH_PATCHES": "2048",
+                    "SGLANG_VIT_ENABLE_CUDA_GRAPH": "1",
                 },
             )
 

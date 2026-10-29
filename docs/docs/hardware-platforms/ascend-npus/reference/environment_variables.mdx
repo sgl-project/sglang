@@ -18,11 +18,6 @@ This document provides a list of commonly used environment variables and aims to
   </thead>
   <tbody>
     <tr>
-      <td><code>SGLANG_NPU_VIT_MAX_BATCH_PATCHES</code></td>
-      <td>Opt-in input patch budget per cross-request ViT batch for NPU VLMs that declare <code>supports_batched_image_encoding</code>. Set a positive value to enable; nonpositive values disable NPU cross-request batching. On NPU, cross-request batching is used only when <code>SGLANG_VIT_ENABLE_CUDA_GRAPH=0</code>; with ViT graph enabled or without the required model capability, encoding remains per request. Counts patches before spatial merging, not output visual tokens: for example, 16384 patches correspond to 4096 visual tokens with merge size 2. Oversized or unknown-size images run alone, so this is not a strict memory limit. Benchmark your workload before enabling: small-image TTFT improvements do not guarantee better throughput for large images or long outputs. Does not change CUDA batching.</td>
-      <td><code>0</code></td>
-    </tr>
-    <tr>
       <td><code>SGLANG_NPU_USE_MLAPO</code></td>
       <td>Adopts the <code>MLAPO</code> fusion operator in the attention <br/> preprocessing stage of the MLA model.</td>
       <td><code>false</code></td>

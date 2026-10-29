@@ -41,6 +41,9 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
     """
 
     _graph_memory_pool = None
+    # Packed image layouts vary with each scheduling round. Keep capturing
+    # repeated layouts useful without retaining a graph for every combination.
+    _MAX_CACHED_GRAPHS = 32
 
     def __init__(
         self,
@@ -67,64 +70,62 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
     ):
 
         graph = torch_npu.npu.NPUGraph()
-        vit = self.vit
-
-        backend = self._attn_backend
         with torch_npu.npu.graph(graph, pool=ViTNpuGraphRunner._graph_memory_pool):
-            y = None
-            deepstack_outs: List[torch.Tensor] = []
-            deepstack_capture_idx = 0
-
-            for layer_num, blk in enumerate(vit.blocks):
-                if backend == "ascend_attn":
-                    cu_seq_lens = self.cu_seq_lens[graph_key]
-                else:
-                    raise RuntimeError(
-                        f"ViT NPU graph does not support attention backend: {backend}"
-                    )
-
-                if layer_num == 0:
-                    y = blk(
-                        self.block_input[graph_key],
-                        cu_seqlens=cu_seq_lens,
-                        rotary_pos_emb_cos=self.sin_cos_ws[graph_key][0],
-                        rotary_pos_emb_sin=self.sin_cos_ws[graph_key][1],
-                        output_ws=self.block_ws[graph_key],
-                    )
-                else:
-                    y = blk(
-                        y,
-                        cu_seqlens=cu_seq_lens,
-                        rotary_pos_emb_cos=self.sin_cos_ws[graph_key][0],
-                        rotary_pos_emb_sin=self.sin_cos_ws[graph_key][1],
-                        output_ws=self.block_ws[graph_key],
-                    )
-
-                # Optional deepstack support (Qwen3-VL)
-                if (
-                    self._deepstack_visual_indexes
-                    and layer_num in self._deepstack_visual_indexes
-                ):
-                    if self._deepstack_merger_list is None:
-                        raise RuntimeError(
-                            "deepstack_visual_indexes exists but deepstack_merger_list is missing."
-                        )
-                    deepstack_out = self._deepstack_merger_list[deepstack_capture_idx](
-                        y
-                    )
-                    deepstack_outs.append(deepstack_out)
-                    deepstack_capture_idx += 1
-
-            main_out = vit.merger(y)
-
-            if deepstack_outs:
-                self.block_output[graph_key] = torch.cat(
-                    [main_out] + deepstack_outs, dim=1
-                )
-            else:
-                self.block_output[graph_key] = main_out
+            self.block_output[graph_key] = self._forward_blocks(
+                self.block_input[graph_key],
+                self.cu_seq_lens[graph_key],
+                *self.sin_cos_ws[graph_key],
+                output_ws=self.block_ws[graph_key],
+            )
 
         self.block_graphs[graph_key] = graph
+
+    def _forward_blocks(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        output_ws: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Share the captured computation with the uncached-layout fallback."""
+        if self._attn_backend != "ascend_attn":
+            raise RuntimeError(
+                f"ViT NPU graph does not support attention backend: {self._attn_backend}"
+            )
+        if output_ws is None:
+            # Ascend attention still uses its graph-mode calling convention
+            # while an uncached layout runs eagerly: it needs an output tensor
+            # and cumulative seqlens without the leading zero.
+            attn = self.vit.blocks[0].attn
+            output_ws = torch.empty(
+                x.shape[0],
+                attn.num_attention_heads_per_partition,
+                attn.head_size,
+                device=self.device,
+                dtype=self.dtype,
+            )
+        deepstack_outs: List[torch.Tensor] = []
+        for layer_num, blk in enumerate(self.vit.blocks):
+            x = blk(
+                x,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+                output_ws=output_ws,
+            )
+            if layer_num in self._deepstack_visual_indexes:
+                if self._deepstack_merger_list is None:
+                    raise RuntimeError(
+                        "deepstack_visual_indexes exists but deepstack_merger_list is missing."
+                    )
+                deepstack_outs.append(
+                    self._deepstack_merger_list[len(deepstack_outs)](x)
+                )
+        main_out = self.vit.merger(x)
+        if deepstack_outs:
+            return torch.cat([main_out] + deepstack_outs, dim=1)
+        return main_out
 
     def create_graph(
         self,
@@ -160,7 +161,9 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
 
         if graph_key not in self.block_output:
             self.block_output[graph_key] = x_3d
-            self.block_input[graph_key] = x_3d
+            # Vision blocks update their input in place. Capture must not
+            # modify the caller's tensor before the first replay copies it.
+            self.block_input[graph_key] = x_3d.clone()
             self.block_ws[graph_key] = torch.empty(
                 seq_len,
                 num_heads,
@@ -208,7 +211,9 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
         if output_indices is not None:
             out = out.index_select(0, output_indices)
 
-        return out
+        # Cache entries and split views outlive this invocation. Graph replay
+        # (including another graph using the shared pool) may overwrite out.
+        return out.clone() if output_indices is None else out
 
     def run(
         self,
@@ -228,6 +233,16 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
             attention_layout_key,
         )
         if graph_key not in self.block_graphs:
+            if len(self.block_graphs) >= self._MAX_CACHED_GRAPHS:
+                out = self._forward_blocks(
+                    x_3d,
+                    cu_seqlens[1:].to("cpu", dtype=torch.int32),
+                    rotary_pos_emb_cos,
+                    rotary_pos_emb_sin,
+                )
+                if output_indices is not None:
+                    out = out.index_select(0, output_indices)
+                return out
             self.create_graph(
                 x_3d=x_3d,
                 cu_seqlens=cu_seqlens,
