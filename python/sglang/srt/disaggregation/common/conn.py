@@ -1353,7 +1353,8 @@ class CommonKVManager(BaseKVManager):
             raise RuntimeError(
                 f"KV layout mismatch: prefill server has kv_layout={info.kv_layout}, "
                 f"but decode server has kv_layout={self.kv_layout}. Both servers "
-                f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
+                f"must use the same --dsv4-attn-backend, SGLANG_DSV4_KV_LAYOUT and "
+                f"SGLANG_HIP_DSV41_INDEX_K_PAGE8 (with an AITER that has its kernel)."
             )
 
         local_layout = self.dsv41_spec_layout

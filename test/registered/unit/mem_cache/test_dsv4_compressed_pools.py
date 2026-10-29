@@ -384,6 +384,16 @@ class TestV41KVPoolLayouts(CustomTestCase):
         self.assertNotEqual(names[KVLayout.V41], names[KVLayout.V41_NEW])
         self.assertIn("v41_fp4_new", names[KVLayout.V41_NEW])
 
+    def test_pd_layout_names_the_page8_index_k_pools(self):
+        """The page-8 index-K pools have the same size as page-64 ones, so the PD
+        handshake must refuse a pair that differs only there."""
+        page64 = self.make_pool([0, 0, 2, 1, 1], [2, 3], KVLayout.V41)
+        page8 = self.make_pool([0, 0, 2, 1, 1], [2, 3], KVLayout.V41)
+        page8.index_pools[1].index_k_page8 = True
+        self.assertEqual(page8.low_ratio_index_k_page8_ratios(), frozenset({1}))
+        self.assertNotIn("page8", page64.pd_kv_layout())
+        self.assertEqual(page8.pd_kv_layout(), page64.pd_kv_layout() + ",idx1:page8")
+
     def test_pd_entries_cover_the_c4_kv_page_count(self):
         """The PD transfer walks every registered entry with the c4 KV pool's
         page count, so the c4 indexer must reserve the same FULL logical page."""
