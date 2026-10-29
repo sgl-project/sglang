@@ -625,6 +625,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 raise RuntimeError("HiCache controller is not attached.")
             self.cache_controller.register_host_pool_entry(entry)
         self.sidecar_pool_specs.append(spec)
+        backend = getattr(self.cache_controller, "storage_backend", None)
+        if hasattr(backend, "describe_sidecar"):
+            backend.describe_sidecar(spec)
 
     def release_host_resources(self) -> None:
         if self.linker is not None:
@@ -2114,6 +2117,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
+
+    def get_hash_values(self, node_id: NodeId) -> list[str]:
+        return self.tree_core.get_hash_values(node_id)
 
     def rotation_base_of(self, node_id: Optional[NodeId]) -> Optional[int]:
         if node_id is None:

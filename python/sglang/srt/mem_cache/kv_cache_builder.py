@@ -514,6 +514,10 @@ def build_kv_cache(
                 tree_cache=tree_cache,
                 draft_plan=hicache_draft_plan,
             )
+        controller = getattr(tree_cache, "cache_controller", None)
+        backend = getattr(controller, "storage_backend", None)
+        if hasattr(backend, "connect"):
+            backend.connect()
 
     if retraction_backup == "host_pool":
         if not isinstance(tree_cache, UnifiedRadixCache):

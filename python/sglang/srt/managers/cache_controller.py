@@ -434,6 +434,12 @@ class HiCacheController:
             )
         return groups
 
+    def _storage_read_barrier(self, go: bool) -> bool:
+        backend = self.storage_backend
+        if getattr(backend, "shard_collective", False) is not True:
+            return go
+        return backend.read_barrier(go)
+
     def _destroy_sync_groups(
         self, groups: List[torch.distributed.ProcessGroup]
     ) -> None:
@@ -674,6 +680,7 @@ class HiCacheController:
                     "mori",
                     "tensorcast",
                     "seaweedfs",
+                    "radixshmem",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"
@@ -759,6 +766,9 @@ class HiCacheController:
 
     @property
     def backup_skip(self) -> bool:
+        backend = getattr(self, "storage_backend", None)
+        if getattr(backend, "shard_collective", False) is True:
+            return False
         return not self.storage_config.is_storage_writer
 
     def _generate_storage_config(
@@ -1251,6 +1261,9 @@ class HiCacheController:
     def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
+        trimmed = getattr(operation, "prefetch_kv_page_offset", 0)
+        if prefix_keys is not None and trimmed:
+            prefix_keys = prefix_keys + operation.sidecar_hash_values[:trimmed]
         kv_derived_transfers = [
             transfer
             for transfer in getattr(operation, "pool_transfers", None) or []
@@ -1264,6 +1277,7 @@ class HiCacheController:
             # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
             if all_success and operation.is_terminated():
                 all_success = False
+            all_success = self._storage_read_barrier(all_success)
             if all_success:
                 batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
                 batch_host_indices = operation.host_indices[
