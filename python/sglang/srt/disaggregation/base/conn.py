@@ -118,6 +118,8 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    # Proven contiguous NHD geometry; optional MoRI registration frame.
+    mori_pack_layout: Optional[dict] = None
 
 
 class KVPoll:

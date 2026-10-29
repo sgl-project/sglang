@@ -925,6 +925,10 @@ class Envs:
     SGLANG_DEEPEP_V2_FORCE_MAX_LEN = EnvBool(False)
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
     SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
+    # Sender-side page packing for schema-proven P-TP < D-TP NHD KV.
+    SGLANG_MORI_KV_PACKING = EnvBool(False)
+    # One registered buffer per transfer worker, reused across peers.
+    SGLANG_MORI_KV_PACK_BUFFER_SIZE_MB = EnvInt(64)
     # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
     # values can increase parallelism and bandwidth utilization.
     SGLANG_MORI_QP_PER_TRANSFER = EnvInt(4)

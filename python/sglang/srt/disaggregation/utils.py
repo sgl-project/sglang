@@ -1483,7 +1483,14 @@ def setup_state_kv_args(
     kv_args.state_layer_ids = []
     kv_args.state_conv_shard_groups = []
     kv_args.swa_kv_cache_layout = None
+    kv_args.mori_pack_layout = None
     owner_view = storage.view(storage.owner)
+    # Use the storage API's actual registerable owner/state regions. Unified,
+    # page-major, quantized-sidecar and draft layouts conservatively fall back.
+    if draft_token_to_kv_pool is None:
+        from sglang.srt.disaggregation.packed_layout import describe_packable_storage
+
+        kv_args.mori_pack_layout = describe_packable_storage(storage)
     # V4's KVCache is organized by compression-ratio buckets rather than by layer.
     kv_args.mla_compression_ratios = (
         list(owner_view.compression_ratios)
