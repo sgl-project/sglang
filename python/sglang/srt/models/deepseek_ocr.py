@@ -402,6 +402,11 @@ class MLPBlock(nn.Module):
 _REL_POS_CACHE: dict = {}
 
 
+def clear_sam_rel_pos_cache() -> None:
+    # sampled tables contain weight values, so in-place checkpoint reloads invalidate them
+    _REL_POS_CACHE.clear()
+
+
 def _cached_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor:
     """Cache immutable relative-position tables by storage and geometry."""
     key = (rel_pos.data_ptr(), tuple(rel_pos.shape), rel_pos.dtype, q_size, k_size)
@@ -1852,6 +1857,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        clear_sam_rel_pos_cache()
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),

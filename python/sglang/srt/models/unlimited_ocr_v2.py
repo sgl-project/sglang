@@ -32,6 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekMLP, DeepseekMoE
+from sglang.srt.models.deepseek_ocr import clear_sam_rel_pos_cache
 from sglang.srt.models.unlimited_ocr import UnlimitedOCRForCausalLM
 from sglang.srt.models.unlimited_ocr_crop_transfer import UnlimitedOcrCropTransfer
 from sglang.srt.multimodal.modality import Modality
@@ -535,6 +536,7 @@ class UnlimitedOCRV2ForCausalLM(UnlimitedOCRForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Remap checkpoint keys (see ``_rewrite_v2_names``) and load all params."""
+        clear_sam_rel_pos_cache()
         # Only the MLP is fused; attention keeps separate q/k/v (see __init__).
         stacked_params_mapping = [
             (".gate_up_proj", ".gate_proj", 0),

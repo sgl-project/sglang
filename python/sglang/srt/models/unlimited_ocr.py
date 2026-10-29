@@ -21,6 +21,7 @@ from sglang.srt.models.deepseek_ocr import (
     MlpProjector,
     build_clip_l,
     build_sam_vit_b,
+    clear_sam_rel_pos_cache,
     merge_multimodal_embeddings,
 )
 from sglang.srt.models.transformers import maybe_prefix
@@ -360,6 +361,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load and remap checkpoint weights into the model parameters."""
+        clear_sam_rel_pos_cache()
         stacked_params_mapping = [
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),

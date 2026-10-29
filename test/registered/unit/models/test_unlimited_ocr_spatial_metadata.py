@@ -6,6 +6,13 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.models.deepseek_ocr import (
+    _REL_POS_CACHE,
+    DeepseekOCRForCausalLM,
+    _cached_rel_pos,
+    get_rel_pos,
+)
+from sglang.srt.models.unlimited_ocr import UnlimitedOCRForCausalLM
 from sglang.srt.models.unlimited_ocr_crop_transfer import (
     RetiredTransfer,
     UnlimitedOcrCropTransfer,
@@ -20,6 +27,39 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestSAMRelPosReload(CustomTestCase):
+    def test_checkpoint_reload_invalidates_sampled_tables_for_each_ocr_family(self):
+        """In-place weight reloads keep data_ptr stable but must change the sampled bias."""
+        self.addCleanup(_REL_POS_CACHE.clear)
+        for cls in (
+            DeepseekOCRForCausalLM,
+            UnlimitedOCRForCausalLM,
+            UnlimitedOCRV2ForCausalLM,
+        ):
+            with self.subTest(model=cls.__name__):
+                _REL_POS_CACHE.clear()
+                model = object.__new__(cls)
+                torch.nn.Module.__init__(model)
+                model.config = SimpleNamespace(num_hidden_layers=0)
+                model.sam_model = torch.nn.Module()
+                model.sam_model.rel_pos_h = torch.nn.Parameter(torch.ones(7, 8))
+                weight = model.sam_model.rel_pos_h
+                before = _cached_rel_pos(4, 4, weight)
+                ptr = weight.data_ptr()
+
+                model.load_weights(
+                    [("model.sam_model.rel_pos_h", torch.full((7, 8), 2.0))]
+                )
+
+                self.assertEqual(weight.data_ptr(), ptr)
+                actual = _cached_rel_pos(4, 4, weight)
+                torch.testing.assert_close(
+                    actual, get_rel_pos(4, 4, weight), rtol=0, atol=0
+                )
+                self.assertFalse(torch.equal(before, actual))
+                self.assertIs(_cached_rel_pos(4, 4, weight), actual)
 
 
 class TestUnlimitedOCRRouterTP(CustomTestCase):
