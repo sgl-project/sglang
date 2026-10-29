@@ -43,6 +43,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.parser.response_template import tool_close_token_ids
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_device,
@@ -76,17 +77,14 @@ DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 <
 class DecodeStatus:
     """Store the status of incremental decoding."""
 
-    decoded_text: str
     decode_ids: List[int]
     surr_offset: int
     read_offset: int
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
-    decoded_text_len: int = dataclasses.field(init=False)
+    decoded_text: str = ""
+    decoded_text_len: int = dataclasses.field(default=0, init=False)
     decoded_text_chunks: List[str] = dataclasses.field(default_factory=list)
-
-    def __post_init__(self):
-        self.decoded_text_len = len(self.decoded_text)
 
     def append_decoded_text(self, text: str):
         if text:
@@ -156,6 +154,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             get_serving().disable_tokenizer_batch_decode
         )
         self.is_tool_call_parser_gpt_oss = get_serving().tool_call_parser == "gpt-oss"
+        self.tool_close_token_ids = tool_close_token_ids(
+            get_serving().tool_call_parser, self.tokenizer
+        )
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -213,6 +214,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 return output
             # 200012 <|call|> is the tool call token and one of eos tokens for gpt-oss model
             if output[-1] == 200012 and self.is_tool_call_parser_gpt_oss:
+                return output
+            if output[-1] in self.tool_close_token_ids:
                 return output
             assert len(output) > 0
             # NOTE: We can always assume the last token is the matched stop token
@@ -311,7 +314,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
                 s = DecodeStatus(
-                    decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=self._clamp_decode_ids(
                         recv_obj.decode_ids[i], vocab_size
                     ),
@@ -465,14 +467,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
             output_ids=recv_obj.output_ids,
-            prompt_tokens=recv_obj.prompt_tokens,
             reasoning_tokens=recv_obj.reasoning_tokens,
             completion_tokens=recv_obj.completion_tokens,
-            cached_tokens=recv_obj.cached_tokens,
-            cached_tokens_details=recv_obj.cached_tokens_details,
-            image_tokens=recv_obj.image_tokens,
-            audio_tokens=recv_obj.audio_tokens,
-            video_tokens=recv_obj.video_tokens,
+            request_stats=recv_obj.request_stats,
             spec_verify_ct=recv_obj.spec_verify_ct,
             spec_num_correct_drafts=recv_obj.spec_num_correct_drafts,
             spec_num_block_accept_tokens=recv_obj.spec_num_block_accept_tokens,
@@ -502,12 +499,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
-            retraction_counts=recv_obj.retraction_counts,
             weight_versions=recv_obj.weight_versions,
             token_steps=recv_obj.token_steps,
             beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,
-            time_stats=recv_obj.time_stats,
         )
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):

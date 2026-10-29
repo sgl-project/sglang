@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.kvcache import dsa_index_k_cache
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
@@ -113,7 +113,7 @@ class IndexKeyCache:
         max_seq_len: int,
     ):
         buf = self.get_buffer(layer_id)
-        return index_buf_accessor.GetKAndS.execute(
+        return dsa_index_k_cache.GetKAndS.execute(
             self.pool,
             buf,
             page_indices=page_indices,
@@ -130,7 +130,7 @@ class IndexKeyCache:
         index_k_scale: torch.Tensor,
     ) -> None:
         buf = self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
-        index_buf_accessor.SetKAndS.execute(
+        dsa_index_k_cache.SetKAndS.execute(
             pool=self.pool,
             buf=buf,
             loc=loc,

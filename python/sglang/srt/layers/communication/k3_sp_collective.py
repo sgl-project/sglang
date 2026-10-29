@@ -98,8 +98,7 @@ def _init_state() -> Optional[_State]:
         (logger.warning if explicit else logger.info)(message)
         return None
 
-    from sglang.kernels.ops.attention import attn_res
-    from sglang.kernels.ops.communication import sp_collective
+    from sglang.kernels.ops.communication import attn_res_collective, sp_collective
 
     # Refuse to enable without a checked-in table for this exact device.
     if (
@@ -119,7 +118,7 @@ def _init_state() -> Optional[_State]:
         return None
 
     sp_collective.register_comm(comm.obj)
-    attn_res.register_comm(comm.obj)
+    attn_res_collective.register_comm(comm.obj)
     _STATE = _State(group, comm)
     logger.info(
         "K3 SP collective enabled (TP%d, fused RS residual + AG)",
@@ -318,8 +317,7 @@ def reduce_scatter_attn_res(
         or ow.shape != (_HIDDEN_SIZE,)
     ):
         return None
-    from sglang.kernels.ops.attention import attn_res
-    from sglang.kernels.ops.communication import sp_collective
+    from sglang.kernels.ops.communication import attn_res_collective, sp_collective
 
     dispatch = sp_collective.get_fusion_dispatch(
         "reduce_scatter_attn_res",
@@ -338,7 +336,7 @@ def reduce_scatter_attn_res(
         (local_tokens, tensor.shape[1]), dtype=tensor.dtype, device=tensor.device
     )
     prefix = torch.empty_like(normed)
-    attn_res.attn_res_fused_pull_rs(
+    attn_res_collective.attn_res_fused_pull_rs(
         state.group.world_size,
         tensor,
         residual,
@@ -433,8 +431,7 @@ def attn_res_all_gather(
         or ow.shape != (_HIDDEN_SIZE,)
     ):
         return None
-    from sglang.kernels.ops.attention import attn_res
-    from sglang.kernels.ops.communication import sp_collective
+    from sglang.kernels.ops.communication import attn_res_collective, sp_collective
 
     global_tokens = prefix.shape[0] * state.group.world_size
     dispatch = sp_collective.get_fusion_dispatch(
@@ -449,7 +446,7 @@ def attn_res_all_gather(
     output = _symm_buffer(
         state, _ATTN_RES_AG, global_tokens, prefix.shape[1], prefix.dtype
     )
-    attn_res.attn_res_fused_direct_ag(
+    attn_res_collective.attn_res_fused_direct_ag(
         state.group.world_size,
         prefix,
         bank,
