@@ -661,6 +661,7 @@ class SchedulerDisaggregationPrefillMixin:
             should_retry_storage_prefetch=should_retry_storage_prefetch
         )
 
+        schedule_start = time.monotonic()
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
         running_batch.batch_is_full = False
@@ -682,6 +683,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         if batch:
             set_schedule_time_batch(batch)
+            batch.fpm_start_time = schedule_start
 
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
