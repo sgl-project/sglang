@@ -9,7 +9,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use tokio::sync::{Notify, mpsc::Receiver, watch};
 use tokio::time::{Duration, timeout};
 use tokio_stream::Stream;
-use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status};
 
 use crate::bridge::{PyBridge, ResponseChunk, TerminalError};
@@ -1148,6 +1148,19 @@ pub async fn run_grpc_server(
     result
 }
 
+/// Wraps the gRPC listener so every accepted connection gets `TCP_NODELAY`.
+///
+/// Streamed responses are one small frame per token, all flowing server -> client with
+/// almost nothing coming back. With Nagle enabled, the kernel holds each frame until the
+/// previous one is acknowledged, and the client's delayed ACK stretches that wait to tens of
+/// milliseconds: the Dynamo sidecar saw ITL p99 pinned at 40 ms and +25 ms TTFT on an idle
+/// server, both gone with `TCP_NODELAY`. tonic only applies its own `tcp_nodelay` setting to
+/// listeners it binds itself, not to a caller-supplied incoming stream, so set it here. This
+/// matches the HTTP/gRPC listeners of `sglang-server` (`utils/sock.rs`).
+fn grpc_incoming(listener: tokio::net::TcpListener) -> TcpIncoming {
+    TcpIncoming::from(listener).with_nodelay(Some(true))
+}
+
 async fn serve_grpc(
     listener: std::net::TcpListener,
     service: impl proto::sglang_service_server::SglangService,
@@ -1165,7 +1178,7 @@ async fn serve_grpc(
 
     let result = tonic::transport::Server::builder()
         .add_service(svc)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+        .serve_with_incoming_shutdown(grpc_incoming(listener), async move {
             shutdown.notified().await;
             if let Some(stream_shutdown) = stream_shutdown {
                 stream_shutdown.send_replace(true);
