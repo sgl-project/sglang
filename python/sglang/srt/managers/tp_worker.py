@@ -628,7 +628,8 @@ class TpModelWorker(BaseTpWorker):
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
-        return_kv_loc_plan: bool = False,
+        pp_loras: Optional[set[Optional[str]]] = None,
+        return_iteration_ids: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         folded = None
@@ -655,6 +656,7 @@ class TpModelWorker(BaseTpWorker):
                 self.model_runner,
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
+                pp_loras=pp_loras,
             )
             if folded is not None:
                 apply_folded_extend(folded, forward_batch)
@@ -698,14 +700,14 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
-                kv_loc_plan=(
+                iteration_ids=(
                     None
-                    if not return_kv_loc_plan
+                    if not return_iteration_ids
                     # A folded forward also wrote the replay rows; the caller's
                     # plan covers the batch it scheduled.
-                    else forward_batch.kv_loc_plan
+                    else forward_batch.iteration_ids
                     if folded is None
-                    else self.model_runner.kv_index_translator.own_plan(batch)
+                    else self.model_runner.runner_ids.own_plan(batch)
                 ),
             )
             if (
