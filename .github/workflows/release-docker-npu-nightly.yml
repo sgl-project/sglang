@@ -14,6 +14,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.sha }}
   cancel-in-progress: true
 
+  
+
 jobs:
   build:
     name: build ${{ matrix.platform }}-${{ matrix.device_type }}
@@ -83,7 +85,7 @@ jobs:
           provenance: false
           sbom: false
           build-args: |
-            SGLANG_KERNEL_NPU_TAG=2026.9.0.post10
+            SGLANG_KERNEL_NPU_TAG=2026.9.0.post12
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
 
