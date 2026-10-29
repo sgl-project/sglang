@@ -69,6 +69,10 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kv_canary.canary_info.tokenizer_manager_hook import (
+    CanaryInfoTokenizerManagerHook,
+    ReqStateCanaryInfo,
+)
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
     parse_decision_layout,
@@ -318,6 +322,7 @@ class ReqState:
     # For incremental state update.
     # TODO(lianmin): do not initialize some lists if not needed.
     output_ids: List[int] = dataclasses.field(default_factory=list)
+    canary_info: Optional[ReqStateCanaryInfo] = None
     input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
     input_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
     output_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
@@ -476,6 +481,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     tokenized_generate_req_type = TokenizedGenerateReqInput
     batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
+    canary_info_hook: Optional[CanaryInfoTokenizerManagerHook] = None
 
     # Set by whoever owns the event loop, and left None for Engine and grpc,
     # which own no server. Class-level to leave the frozen __init__ alone.
@@ -590,6 +596,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
+        self.init_canary_info_hook()
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -873,6 +880,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
+
+    def init_canary_info_hook(self):
+        self.canary_info_hook = CanaryInfoTokenizerManagerHook.maybe_create()
 
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
@@ -1798,6 +1808,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (tokenized_obj,)
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
+            if (hook := self.canary_info_hook) is not None:
+                hook.on_request_dispatched(
+                    rid_to_state=self.rid_to_state, tokenized_obj=tokenized_obj
+                )
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
@@ -1845,6 +1859,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
+            if (hook := self.canary_info_hook) is not None:
+                for tokenized_obj in tokenized_objs:
+                    hook.on_request_dispatched(
+                        rid_to_state=self.rid_to_state, tokenized_obj=tokenized_obj
+                    )
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
             for tokenized_obj in tokenized_objs:
                 tokenized_obj.wrap_pickle_fields()
@@ -2516,6 +2535,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
                 continue
+
+            if (hook := self.canary_info_hook) is not None and isinstance(
+                recv_obj, (BatchStrOutput, BatchTokenIDOutput)
+            ):
+                hook.on_batch_output(
+                    state=state,
+                    recv_obj=recv_obj,
+                    customized_info=customized_info,
+                    index=i,
+                )
 
             # Build meta_info and return value
             meta_info = {

@@ -8,12 +8,14 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.kv_canary.verify import RealKvSource
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.perturb.config import PerturbConfig, TargetGroupKind
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -198,3 +200,17 @@ def flip_first_byte_in_source(
     original_byte = int(flat[row, col].item())
     flat[row, col] = original_byte ^ 0xFF
     return row, col, original_byte
+
+
+def is_health_check_rid(rid: object) -> bool:
+    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+
+
+def advance_delivered_counts(
+    counts: dict[str, int], recv_obj: BatchTokenIDOutput
+) -> None:
+    for index, rid in enumerate(recv_obj.rids):
+        if recv_obj.finished_reasons[index] is not None:
+            counts.pop(rid, None)
+        elif recv_obj.output_ids is not None:
+            counts[rid] = counts.get(rid, 0) + len(recv_obj.output_ids[index])

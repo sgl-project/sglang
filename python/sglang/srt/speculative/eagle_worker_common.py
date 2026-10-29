@@ -681,6 +681,14 @@ def run_eagle_verify(
     )
     if post is not None:
         predict, accept_lens, accept_index, new_seq_lens, bonus_tokens = post[:5]
+        if (c := target_worker.model_runner.canary_manager) is not None:
+            c.on_verify_accept(
+                logits_output=logits_output,
+                verify_forward_batch=verify_forward_batch,
+                predict=predict,
+                accept_lens=accept_lens,
+                num_draft_tokens=num_draft_tokens,
+            )
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch, logits_output, predict, accept_index=accept_index
@@ -819,6 +827,15 @@ def run_eagle_verify(
             logits_output,
             bs,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            num_draft_tokens=num_draft_tokens,
+        )
+
+    if (c := target_worker.model_runner.canary_manager) is not None:
+        c.on_verify_accept(
+            logits_output=logits_output,
+            verify_forward_batch=verify_forward_batch,
+            predict=predict,
+            accept_lens=accept_lens,
             num_draft_tokens=num_draft_tokens,
         )
 

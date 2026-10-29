@@ -1040,7 +1040,6 @@ class ModelRunner:
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
         self.canary_manager = install_canary(
-            server_args=self.server_args,
             model_runner=self,
             token_oracle_manager=self._token_oracle_manager,
         )
@@ -2223,6 +2222,12 @@ class ModelRunner:
             logits_output.auxiliary_device_output = observer.after_sample(
                 observer_state,
                 next_token_ids,
+            )
+        if (c := self.canary_manager) is not None:
+            c.on_sampled(
+                logits_output=logits_output,
+                forward_batch=forward_batch,
+                next_token_ids=next_token_ids,
             )
         self.ngram_embedding_manager.update_after_decode(
             next_token_ids=next_token_ids,
