@@ -1199,11 +1199,14 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         controller = cache.cache_controller
         source = controller.mem_pool_host.entry_map[ExtraPoolFullComponent.EXTRA_POOL]
         sidecar_host = MHATokenToKVPoolHost(
-            source.device_pool,
+            buffer_info=source.device_pool.get_device_pool_infos()[0].buffer_info,
             host_to_device_ratio=source.host_pool.size / source.device_pool.size,
             host_size=0,
             page_size=self.cfg.page_size,
             layout=source.host_pool.layout,
+            device_capacity_tokens=source.device_pool.size,
+            start_layer=source.device_pool.start_layer,
+            end_layer=source.device_pool.end_layer,
         )
         controller.register_host_pool_entry(
             PoolEntry(
