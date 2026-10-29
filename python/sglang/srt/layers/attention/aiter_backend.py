@@ -6,6 +6,7 @@ from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 end to end attention solution with aiter kernels
 """
 
+import functools
 import logging
 import os
 from dataclasses import dataclass
@@ -148,6 +149,27 @@ _MLA_REDUCE_V1_HEADS = {
     128: frozenset({1, 2, 4, 8, 10, 16, 32, 40, 64, 128}),
     512: frozenset({8, 16, 32, 48, 64, 80, 96, 112, 128}),
 }
+
+# Instances newer than the pinned AITER (ROCm/aiter#7087 adds nh12_hd128);
+# fold them into the table above once docker/rocm.Dockerfile pins an AITER with them.
+_MLA_REDUCE_V1_OPTIONAL_HEADS = {128: frozenset({12})}
+
+
+@functools.lru_cache(maxsize=None)
+def _aiter_has_mla_reduce_v1_instance(num_head: int, head_dim: int) -> bool:
+    # mla_reduce_v1 aborts the process on a shape it has no instance for,
+    # so probe the source it is built from: one reduce_instances/nh<H>_hd<D>.cu per shape.
+    try:
+        from aiter.jit.core import AITER_CSRC_DIR
+    except ImportError:
+        return False
+    return os.path.isfile(
+        os.path.join(
+            AITER_CSRC_DIR,
+            "kernels/mla/reduce_instances",
+            f"nh{num_head}_hd{head_dim}.cu",
+        )
+    )
 
 
 # Persist
@@ -749,7 +771,11 @@ class AiterAttnBackend(AttentionBackend):
         mla prefill, return None if it is invalid so we will fall it back to
         aiter fa implementation.
         """
-        supported = _MLA_REDUCE_V1_HEADS.get(v_head_dim, frozenset())
+        supported = _MLA_REDUCE_V1_HEADS.get(v_head_dim, frozenset()) | {
+            h
+            for h in _MLA_REDUCE_V1_OPTIONAL_HEADS.get(v_head_dim, ())
+            if _aiter_has_mla_reduce_v1_instance(num_head=h, head_dim=v_head_dim)
+        }
         if num_head in supported:
             return num_head
         if num_head != num_kv_head:
