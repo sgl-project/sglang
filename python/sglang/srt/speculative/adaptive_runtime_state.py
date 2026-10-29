@@ -1,18 +1,10 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
-
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
     from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
-    from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
-        EAGLEDraftCudaGraphRunner,
-    )
-    from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
-        EAGLEDraftExtendCudaGraphRunner,
-    )
 
 
 @dataclass
@@ -20,10 +12,9 @@ class SpecRuntimeState:
     """A complete set of runtime resources bound to a specific speculative
     decoding configuration.
 
-    Each decode round runs three stages — draft, verify, extend — and every
-    stage has shape-dependent resources (attention backends and CUDA graphs)
-    that must match the current configuration.  Switching adaptive steps
-    means swapping the entire state atomically.
+    The draft and verify resources are required by adaptive workers. Algorithms
+    with a draft-extend stage can also populate its optional resources.
+    Switching adaptive steps swaps the entire state atomically.
     """
 
     # -- Configuration (determines shapes for all stages) --
@@ -32,7 +23,7 @@ class SpecRuntimeState:
 
     # -- Draft stage: draft model multi-step autoregressive generation --
     draft_attn_backend: "AttentionBackend | None"
-    cuda_graph_runner: "EAGLEDraftCudaGraphRunner | None"
+    cuda_graph_runner: "DecodeCudaGraphRunner | None"
 
     # -- Verify stage: target model one-pass tree verification --
     target_attn_backend: "AttentionBackend"
@@ -40,7 +31,7 @@ class SpecRuntimeState:
 
     # -- Extend stage: draft model KV cache catch-up after verify --
     draft_extend_attn_backend: "AttentionBackend | None"
-    cuda_graph_runner_for_draft_extend: "EAGLEDraftExtendCudaGraphRunner | None"
+    cuda_graph_runner_for_draft_extend: "DecodeCudaGraphRunner | None"
 
 
 class AdaptiveSpecWorker(Protocol):
@@ -58,6 +49,23 @@ class AdaptiveSpecWorker(Protocol):
     def apply_runtime_state(self, state: SpecRuntimeState) -> None: ...
 
 
+class AdaptiveSpecPolicy(Protocol):
+    """Policy interface used by AdaptiveController to select runtime states."""
+
+    @property
+    def candidate_steps(self) -> list[int]: ...
+
+    def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None: ...
+
+    def get_steps_for_batch(self, batch_size: int) -> int: ...
+
+    def on_verify_complete(
+        self, num_correct_drafts_per_req: list[int], batch_size: int
+    ) -> int | None: ...
+
+    def cuda_graph_bs_for_step(self, step: int) -> list[int] | None: ...
+
+
 class AdaptiveController:
     """Facade that owns adaptive decision-making and runtime state switching.
 
@@ -71,12 +79,13 @@ class AdaptiveController:
       2. Call on_verify_complete(num_correct_drafts_per_req) after each decode verify.
     """
 
-    def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
+    def __init__(
+        self,
+        worker: AdaptiveSpecWorker,
+        policy: AdaptiveSpecPolicy,
+    ):
         self.worker = worker
-        self.params = AdaptiveSpeculativeParams(
-            initial_steps=worker.speculative_num_steps,
-            cfg_path=config_path,
-        )
+        self.params: AdaptiveSpecPolicy = policy
         self._states: dict[int, SpecRuntimeState] = {}
 
     @property
@@ -118,7 +127,7 @@ class AdaptiveController:
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> None:
-        """Feed verify results; switch runtime state if EMA warrants it."""
+        """Feed verify results; switch runtime state if the policy requests it."""
         new_step = self.params.on_verify_complete(
             num_correct_drafts_per_req, batch_size
         )

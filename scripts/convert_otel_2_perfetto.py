@@ -237,7 +237,7 @@ def generate_perfetto_span(engine_root_spans, smg_otel_spans, thread_meta_data):
         for thread_span in root_span["child"]:
             pid = int(thread_span["attributes"]["pid"])
             host_id = thread_span["attributes"]["host_id"]
-            thread_name = f'{thread_span["attributes"]["host_id"][:8]}:{thread_span["attributes"]["thread_label"]}'
+            thread_name = f"{thread_span['attributes']['host_id'][:8]}:{thread_span['attributes']['thread_label']}"
             if "pp_rank" in thread_span["attributes"]:
                 thread_name += f"-PP{thread_span['attributes']['pp_rank']}"
             if "dp_rank" in thread_span["attributes"]:

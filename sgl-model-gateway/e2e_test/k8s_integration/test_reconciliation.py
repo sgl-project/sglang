@@ -377,9 +377,9 @@ class TestReconciliationMetrics:
                 {"source": "kubernetes", "result": "success"},
             )
             logger.info("Registration success metric: %s", reg_value)
-            assert (
-                reg_value is not None and reg_value >= 1
-            ), f"Expected at least 1 registration, got {reg_value}"
+            assert reg_value is not None and reg_value >= 1, (
+                f"Expected at least 1 registration, got {reg_value}"
+            )
 
             gauge_value = _parse_metric_value(
                 metrics_text,
@@ -387,9 +387,9 @@ class TestReconciliationMetrics:
                 {"source": "kubernetes"},
             )
             logger.info("Workers discovered gauge: %s", gauge_value)
-            assert (
-                gauge_value is not None and gauge_value >= 1
-            ), f"Expected workers_discovered >= 1, got {gauge_value}"
+            assert gauge_value is not None and gauge_value >= 1, (
+                f"Expected workers_discovered >= 1, got {gauge_value}"
+            )
 
         finally:
             _safe_delete_worker_pod(pod_name)
@@ -497,9 +497,9 @@ class TestReconciliationConsistency:
 
             logger.info("Worker count samples over time: %s", samples)
 
-            assert all(
-                s == stable_count for s in samples
-            ), f"Worker count fluctuated: {samples} (expected stable at {stable_count})"
+            assert all(s == stable_count for s in samples), (
+                f"Worker count fluctuated: {samples} (expected stable at {stable_count})"
+            )
 
         finally:
             for name in pod_names:

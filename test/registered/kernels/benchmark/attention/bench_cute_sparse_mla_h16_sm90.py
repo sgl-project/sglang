@@ -130,7 +130,9 @@ def bench_cute_sparse_mla_h16_sm90(tq: int, skv: int, topk: int, provider: str):
     sm_scale = D_QK**-0.5
 
     if provider == "flashmla_h64":
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        from sglang.kernels.ops.attention.flash_mla_interface import (
+            flash_mla_sparse_fwd,
+        )
 
         def fn():
             return flash_mla_sparse_fwd(

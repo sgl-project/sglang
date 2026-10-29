@@ -72,7 +72,7 @@ class EVSProcessor:
             return
         evs_config = evs_model.create_evs_config(hf_config)
         logger.info(
-            f"""[EVS] {evs_config} {'enabled' if evs_config.video_pruning_rate > 0.0 else 'disabled'} for model={evs_model.__name__}; model_config={config_name}"""
+            f"""[EVS] {evs_config} {"enabled" if evs_config.video_pruning_rate > 0.0 else "disabled"} for model={evs_model.__name__}; model_config={config_name}"""
         )
         if evs_config.video_pruning_rate > 0.0:
             self.evs_config = evs_config

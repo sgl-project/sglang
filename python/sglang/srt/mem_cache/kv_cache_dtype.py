@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,8 @@ def configure_kv_cache_dtype(
         else:
             kv_cache_dtype = model_dtype
     elif server_args_kv_cache_dtype == "fp8_e5m2":
+        if current_platform.is_cpu():
+            raise ValueError("--kv-cache-dtype fp8_e5m2 is not supported on CPU.")
         if _is_hip:  # Using natively supported format
             kv_cache_dtype = fp8_dtype
         else:
@@ -59,11 +62,6 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
-    elif server_args_kv_cache_dtype == "fp4_e2m1":
-        raise ValueError(
-            "--kv-cache-dtype=fp4_e2m1 is deprecated. "
-            "Use --kv-cache-dtype=fp4_mx_block16."
-        )
     elif server_args_kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
         if hasattr(torch, "float4_e2m1fn_x2"):
             kv_cache_dtype = torch.float4_e2m1fn_x2

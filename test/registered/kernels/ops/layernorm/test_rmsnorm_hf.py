@@ -98,9 +98,9 @@ def test_rmsnorm_hf_matches_hf_not_sgl(dtype: torch.dtype) -> None:
     assert (sgl_ref - hf_ref).abs().max() > 0, "inputs don't exercise the difference"
     diff_hf = (out - hf_ref).abs().max().item()
     diff_sgl = (out - sgl_ref).abs().max().item()
-    assert (
-        diff_hf < diff_sgl
-    ), f"kernel closer to SGL than HF (hf={diff_hf}, sgl={diff_sgl})"
+    assert diff_hf < diff_sgl, (
+        f"kernel closer to SGL than HF (hf={diff_hf}, sgl={diff_sgl})"
+    )
 
 
 def test_rmsnorm_hf_empty_input() -> None:

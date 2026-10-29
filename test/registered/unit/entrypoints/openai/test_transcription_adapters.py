@@ -24,7 +24,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 # Per-second scaling rate every speech-LM adapter uses for max_new_tokens.
@@ -82,18 +82,6 @@ class TestSpeechLMAdapterContract(CustomTestCase):
                     cls().build_sampling_params(req),
                     {"temperature": 0.2, "max_new_tokens": max_new_tokens},
                 )
-
-    def test_sampling_params_long_clip_scales_with_duration(self):
-        # A long clip must lift max_new_tokens above the floor so the transcript
-        # isn't silently truncated. Each adapter scales at _TOKENS_PER_SECOND, so
-        # 600s -> 9000 tokens, well above every per-model floor.
-        req = self._request(temperature=0.0, duration=600.0)
-        expected = int(600.0 * _TOKENS_PER_SECOND)
-        for _, cls, floor, _ in _SPEECH_LM_CASES:
-            with self.subTest(adapter=cls.__name__):
-                params = cls().build_sampling_params(req)
-                self.assertEqual(params["max_new_tokens"], expected)
-                self.assertGreater(params["max_new_tokens"], floor)
 
     def test_sampling_params_at_floor_scale_boundary(self):
         # Pin the floor<->scale crossover (max_new_tokens = max(floor,

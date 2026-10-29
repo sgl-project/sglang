@@ -11,6 +11,7 @@ import concurrent.futures
 import functools
 import logging
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -25,6 +26,18 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderMediaProcessorConfig,
     EncoderPreprocessOutput,
     invoke_encoder_preprocessor,
+)
+from sglang.srt.multimodal.processors.glm4v import (
+    _glm_effective_presize_budget,
+    _merge_glm_video_configs,
+    glm_budget_kwargs,
+    glm_decode_frames_at,
+    glm_max_image_tokens_from_configs,
+    glm_processor_video_config,
+    glm_sample_and_decode_sync,
+    glm_sample_frame_indices,
+    preprocess_video_frames_sync,
+    split_glm_video_items,
 )
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.runtime_context import (
@@ -127,7 +140,7 @@ class EncoderPreprocessor:
         use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
         self.use_image_processor_gpu = (
             use_image_processor_gpu
-            and resolve_image_processor_backend(server_args) != "pil"
+            and resolve_image_processor_backend(get_mm()) != "pil"
         )
 
         self._load_mm_processor(server_args)
@@ -158,7 +171,7 @@ class EncoderPreprocessor:
     def _load_mm_processor(self, server_args: ServerArgs):
         from transformers import AutoImageProcessor, AutoVideoProcessor
 
-        image_processor_backend = resolve_image_processor_backend(server_args)
+        image_processor_backend = resolve_image_processor_backend(get_mm())
         image_processor_kwargs = (
             {}
             if image_processor_backend == "auto"
@@ -167,8 +180,8 @@ class EncoderPreprocessor:
         try:
             self.image_processor = AutoImageProcessor.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
+                trust_remote_code=get_model().trust_remote_code,
+                revision=get_model().revision,
                 **image_processor_kwargs,
             )
         except Exception as e:
@@ -178,8 +191,8 @@ class EncoderPreprocessor:
         try:
             self.video_processor = AutoVideoProcessor.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
+                trust_remote_code=get_model().trust_remote_code,
+                revision=get_model().revision,
             )
         except Exception as e:
             logger.warning(f"Failed to load video processor: {e}")
@@ -188,8 +201,8 @@ class EncoderPreprocessor:
         try:
             _audio_proc = AutoProcessor.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
+                trust_remote_code=get_model().trust_remote_code,
+                revision=get_model().revision,
             )
             if not hasattr(_audio_proc, "feature_extractor"):
                 logger.warning(
@@ -220,9 +233,12 @@ class EncoderPreprocessor:
                 self.vision_config[modality_str]["device"] = self.device
 
             if modality_str == "video":
-                video_defaults = {"fps": 2.0, "max_frames": 768, "min_frames": 4}
-                for k, v in video_defaults.items():
-                    self.vision_config["video"].setdefault(k, v)
+                # GLM reads its own defaults from the HF video processor
+                # (max_frames=2048); applying the Qwen values here would clobber them.
+                if "glm" not in self.model_type:
+                    video_defaults = {"fps": 2.0, "max_frames": 768, "min_frames": 4}
+                    for k, v in video_defaults.items():
+                        self.vision_config["video"].setdefault(k, v)
 
             if modality_str == "audio":
                 if "return_attention_mask" not in self.vision_config["audio"]:
@@ -253,6 +269,8 @@ class EncoderPreprocessor:
                 return obj.get(attr)
             return getattr(obj, attr, None)
 
+        if self.encoder_media_processor_config.audio_sample_rate is not None:
+            return self.encoder_media_processor_config.audio_sample_rate
         audio_cfg = self.vision_config.get("audio", {})
         sr = audio_cfg.get("audio_sampling_rate")
         if sr:
@@ -334,7 +352,17 @@ class EncoderPreprocessor:
                     }
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
+                vid = load_video(data, frame_count_limit)
+                if (
+                    media_metadata
+                    and self.encoder_media_processor_config.preserve_media_metadata
+                ):
+                    return {
+                        "type": "video",
+                        "video": vid,
+                        **media_metadata,
+                    }
+                return vid
             elif modality == Modality.AUDIO:
                 return load_audio(data, self.model_audio_sr)
 
@@ -399,9 +427,110 @@ class EncoderPreprocessor:
     async def _flatten_and_load_images(self, mm_items):
         return await self._flatten_and_load_data_by_modality(mm_items, Modality.IMAGE)
 
+    @staticmethod
+    def _close_video_decoders(video_items) -> None:
+        for video in video_items or []:
+            close = getattr(video, "close", None)
+            if callable(close):
+                close()
+
+    async def _dp_sharded_decode_single_video(
+        self,
+        vr,
+        video_config,
+        *,
+        video_processor_kwargs: dict,
+        precomputed_indices: Optional[List[int]] = None,
+    ):
+        parallel = get_parallel()
+        tp_rank, tp_size = parallel.attn_tp_rank, parallel.attn_tp_size
+        video_config = video_config or {}
+        video_fps = vr.avg_fps
+        duration = len(vr) / video_fps if video_fps else 0
+        global_indices = precomputed_indices or glm_sample_frame_indices(
+            len(vr),
+            video_fps,
+            duration,
+            target_fps=video_config.get("fps"),
+            max_frame_count=video_config.get("max_frames"),
+        )
+        n_units = len(global_indices) // 2
+        base, remainder = divmod(n_units, tp_size)
+        gpu_sample_counts = [
+            base + (1 if rank < remainder else 0) for rank in range(tp_size)
+        ]
+        start = sum(gpu_sample_counts[:tp_rank])
+        count = gpu_sample_counts[tp_rank]
+        local_indices = global_indices[2 * start : 2 * (start + count)]
+
+        local_error = None
+        frames = None
+        try:
+            frames = await asyncio.get_running_loop().run_in_executor(
+                self.io_executor,
+                functools.partial(
+                    glm_decode_frames_at,
+                    # Full-clip count. local_indices is this rank's shard.
+                    budget_frame_count=len(global_indices),
+                ),
+                vr,
+                local_indices,
+                video_config,
+            )
+        except Exception as exc:
+            local_error = exc
+
+        # All ranks must either enter the later ViT all-gather or fail before
+        # it.  A rank-local decoder error must therefore be agreed globally.
+        ok = torch.tensor([0 if local_error else 1], dtype=torch.int32)
+        if tp_size > 1:
+            torch.distributed.all_reduce(
+                ok,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_parallel().attn_tp_group.cpu_group,
+            )
+        if not int(ok.item()):
+            if local_error is not None:
+                raise local_error
+            from sglang.srt.disaggregation.encoder.server import MMError
+
+            raise MMError(
+                "peer encoder rank failed during sharded video decode",
+                code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        if frames is None:
+            height, width = vr.frame_shape
+            frames = np.zeros((0, height, width, 3), dtype=np.uint8)
+
+        video_processor_kwargs["do_sample_frames"] = False
+        video_processor_kwargs["return_metadata"] = True
+        # Preserve the same per-frame spatial budget as the unsharded request.
+        if global_indices and local_indices:
+            budget = video_config.get("max_image_tokens")
+            if budget is None:
+                budget = getattr(self.video_processor, "max_image_tokens", None)
+            if budget is not None:
+                video_processor_kwargs["max_image_tokens"] = max(
+                    1, int(int(budget) * len(local_indices) / len(global_indices))
+                )
+        video_processor_kwargs["_dp_meta"] = {
+            "global_indices": list(global_indices),
+            "fps": video_fps,
+            "n_units": n_units,
+            "gpu_sample_counts": gpu_sample_counts,
+        }
+        return [frames], video_processor_kwargs
+
     async def _flatten_and_load_videos(self, mm_items):
         if not isinstance(mm_items, (list, tuple)):
             mm_items = [mm_items]
+
+        video_configs = [{} for _ in mm_items]
+        if "glm" in self.model_type:
+            mm_items, video_configs = split_glm_video_items(mm_items)
+            defaults = glm_processor_video_config(self.video_processor)
+            defaults.update(self.vision_config.get("video", {}))
+            video_configs = _merge_glm_video_configs(defaults, video_configs)
 
         futures, _ = self._submit_data_loading_tasks(
             mm_items, [Modality.VIDEO] * len(mm_items)
@@ -422,10 +551,85 @@ class EncoderPreprocessor:
             if video_metadata:
                 video_processor_kwargs["video_metadata"] = video_metadata
             return videos, video_processor_kwargs
-        else:
-            raise NotImplementedError(
-                f"Video processing is not supported for {self.model_type} model."
+
+        if "glm" in self.model_type:
+            budget_kwargs = glm_budget_kwargs(
+                self.video_processor,
+                user_max_image_tokens=glm_max_image_tokens_from_configs(video_configs),
+                count=len(video_items),
+                split=True,
             )
+            if budget_kwargs is not None:
+                video_processor_kwargs.update(budget_kwargs)
+                video_configs = [
+                    _glm_effective_presize_budget(
+                        config, budget_kwargs.get("max_image_tokens")
+                    )
+                    for config in video_configs
+                ]
+
+            framed = any(isinstance(video, list) for video in video_items)
+            if framed:
+                processed = await asyncio.gather(
+                    *[
+                        asyncio.get_running_loop().run_in_executor(
+                            self.io_executor, preprocess_video_frames_sync, video
+                        )
+                        for video in video_items
+                    ]
+                )
+            else:
+                parallel = get_parallel()
+                tp_size = parallel.attn_tp_size
+                sampled = None
+                if len(video_items) == 1:
+                    vr = video_items[0]
+                    config = video_configs[0]
+                    sampled = glm_sample_frame_indices(
+                        len(vr),
+                        vr.avg_fps,
+                        len(vr) / vr.avg_fps if vr.avg_fps else 0,
+                        target_fps=config.get("fps"),
+                        max_frame_count=config.get("max_frames"),
+                    )
+                if (
+                    self.server_args.mm_enable_dp_encoder
+                    and tp_size > 1
+                    and sampled is not None
+                    and len(sampled) >= max(32, tp_size * 2)
+                ):
+                    result = await self._dp_sharded_decode_single_video(
+                        video_items[0],
+                        video_configs[0],
+                        video_processor_kwargs=video_processor_kwargs,
+                        precomputed_indices=sampled,
+                    )
+                    self._close_video_decoders(video_items)
+                    return result
+
+                processed = await asyncio.gather(
+                    *[
+                        asyncio.get_running_loop().run_in_executor(
+                            self.io_executor,
+                            glm_sample_and_decode_sync,
+                            video,
+                            video_configs[index],
+                        )
+                        for index, video in enumerate(video_items)
+                    ]
+                )
+            videos, video_metadata = map(list, zip(*processed))
+            video_processor_kwargs["do_sample_frames"] = False
+            video_processor_kwargs["return_metadata"] = True
+            if video_metadata:
+                video_processor_kwargs["video_metadata"] = video_metadata
+            self._close_video_decoders(video_items)
+            return videos, video_processor_kwargs
+
+        self._close_video_decoders(video_items)
+        raise NotImplementedError(
+            f"Video processing is not supported for {self.model_type} model."
+        )
 
     async def _flatten_and_load_audios(self, mm_items):
         return await self._flatten_and_load_data_by_modality(mm_items, Modality.AUDIO)
@@ -499,13 +703,21 @@ class EncoderPreprocessor:
             images = self._normalize_kimi_encoder_images(images)
         original_image_sizes = [_get_original_image_size(item) for item in images]
         if model_preprocessor:
-            processor_output = invoke_encoder_preprocessor(
+            invoke = functools.partial(
+                invoke_encoder_preprocessor,
                 model_preprocessor,
                 images,
                 Modality.IMAGE,
                 self.vision_config,
                 image_processor=self.image_processor,
                 use_gpu_preprocessing=self.use_image_processor_gpu,
+            )
+            processor_output = (
+                await asyncio.get_running_loop().run_in_executor(
+                    self.preproc_executor, invoke
+                )
+                if self.encoder_media_processor_config.preprocess_off_event_loop
+                else invoke()
             )
             if (
                 isinstance(processor_output, EncoderPreprocessOutput)
@@ -530,7 +742,21 @@ class EncoderPreprocessor:
 
     async def _process_video_items(self, mm_items, model_preprocessor):
         if model_preprocessor:
-            return model_preprocessor(mm_items, Modality.VIDEO, self.vision_config)
+            if not self.encoder_media_processor_config.preprocess_off_event_loop:
+                return model_preprocessor(mm_items, Modality.VIDEO, self.vision_config)
+            videos = await self._flatten_and_load_data_by_modality(
+                mm_items, Modality.VIDEO
+            )
+            try:
+                return await asyncio.get_running_loop().run_in_executor(
+                    self.preproc_executor,
+                    model_preprocessor,
+                    videos,
+                    Modality.VIDEO,
+                    self.vision_config,
+                )
+            finally:
+                self._close_video_decoders(videos)
         if not self.video_processor:
             raise ValueError("No video processor available")
 
@@ -550,6 +776,7 @@ class EncoderPreprocessor:
                 "qwen3_5",
                 "qwen3_5_moe",
                 "intern_s2_preview",
+                "cosmos3_omni",
             ]
             and video_processor_kwargs.get("video_metadata", None) is not None
         ):
@@ -593,6 +820,14 @@ class EncoderPreprocessor:
         audios = await self._flatten_and_load_audios(mm_items)
 
         if model_preprocessor:
+            if self.encoder_media_processor_config.preprocess_off_event_loop:
+                return await asyncio.get_running_loop().run_in_executor(
+                    self.preproc_executor,
+                    model_preprocessor,
+                    audios,
+                    Modality.AUDIO,
+                    self.vision_config,
+                )
             return model_preprocessor(audios, Modality.AUDIO, self.vision_config)
 
         if not self.audio_processor:
@@ -700,6 +935,13 @@ class EncoderPreprocessor:
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
     ) -> int:
         """Compatibility helper for callers that still provide patch grids."""
+        if self.model_type == "muse_spark":
+            # Muse's hook returns output grids, after spatial/temporal merging.
+            return (
+                int(grid)
+                if modality == Modality.AUDIO
+                else int(grid[0] * grid[1] * grid[2])
+            )
         if modality == Modality.AUDIO:
             input_length = self.get_num_patches(grid, modality)
             return self._get_feat_extract_output_lengths(input_length)

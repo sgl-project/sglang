@@ -40,6 +40,7 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
         )
         piecewise_context = SimpleNamespace(full_graph=True) if in_full_graph else None
         with (
+            mock.patch.object(deepseek_v4_backend, "_is_cuda", False),
             mock.patch.object(
                 deepseek_v4_backend,
                 "is_in_breakable_cuda_graph",
@@ -101,6 +102,11 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
             with (
                 self.subTest(platform=platform_name),
                 mock.patch.multiple(attention_registry, **flags),
+                mock.patch.object(
+                    attention_registry,
+                    "get_exec",
+                    return_value=SimpleNamespace(kernel=runner.server_args),
+                ),
                 self.assertRaisesRegex(ValueError, f"CUDA SM90.*{platform_name}"),
             ):
                 attention_registry.create_dsv4_backend(runner)
@@ -191,6 +197,7 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
         from sglang.srt.layers.attention import deepseek_v4_backend
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
             SPARSE_PREFILL_TOPK_ALIGNMENT,
+            CompressedGather,
             SparsePrefillChunkCache,
         )
 
@@ -233,22 +240,33 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
 
         cache = object.__new__(SparsePrefillChunkCache)
         cache.num_qo_tokens = 2
-        cache.c128_combined_indices = torch.arange(
+        indices = torch.arange(
             2 * 384,
             dtype=torch.int32,
         ).reshape(2, 384)
-        cache.c128_combined_lens = torch.tensor([321, 384], dtype=torch.int32)
+        lengths = torch.tensor([321, 384], dtype=torch.int32)
+        cache.compressed = {
+            128: CompressedGather(
+                flat_token_ids=torch.empty(0, dtype=torch.int32),
+                compressed_base=torch.empty(0, dtype=torch.int32),
+                swa_base=torch.empty(0, dtype=torch.int32),
+                combined_indices=indices,
+                combined_lens=lengths,
+            )
+        }
         cache.c128_padded_combined_indices = {}
 
         base_indices, base_lens = cache.get_c128_combined()
-        self.assertIs(base_indices, cache.c128_combined_indices)
-        self.assertIs(base_lens, cache.c128_combined_lens)
+        self.assertIs(base_indices, cache.compressed[128].combined_indices)
+        self.assertIs(base_lens, cache.compressed[128].combined_lens)
 
         padded, padded_lens = cache.get_c128_combined(512)
         self.assertEqual(tuple(padded.shape), (2, 512))
-        torch.testing.assert_close(padded[:, :384], cache.c128_combined_indices)
+        torch.testing.assert_close(
+            padded[:, :384], cache.compressed[128].combined_indices
+        )
         self.assertTrue(torch.all(padded[:, 384:] == -1))
-        self.assertIs(padded_lens, cache.c128_combined_lens)
+        self.assertIs(padded_lens, cache.compressed[128].combined_lens)
         cached_again, _ = cache.get_c128_combined(512)
         self.assertIs(cached_again, padded)
 
@@ -260,6 +278,7 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
     def test_unbound_c128_sparse_prefill_uses_fixed_cached_bucket(self):
         from sglang.srt.layers.attention import deepseek_v4_backend
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+            CompressedGather,
             SparsePrefillChunkCache,
         )
 
@@ -286,37 +305,44 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
         cache.num_qo_tokens = num_queries
         cache.swa_token_ids = torch.arange(num_swa_tokens, dtype=torch.int32)
         cache.swa_page_size = 256
-        cache.c128_flat_token_ids = torch.arange(
-            num_compressed_tokens,
-            dtype=torch.int32,
-        )
-        cache.c128_combined_indices = live_indices
-        cache.c128_combined_lens = lengths
+        cache.compressed = {
+            128: CompressedGather(
+                flat_token_ids=torch.arange(num_compressed_tokens, dtype=torch.int32),
+                compressed_base=torch.zeros(1, dtype=torch.int32),
+                swa_base=torch.full((1,), num_compressed_tokens, dtype=torch.int32),
+                combined_indices=live_indices,
+                combined_lens=lengths,
+            )
+        }
         cache.c128_padded_combined_indices = {}
 
-        workspace_get = mock.Mock(return_value=workspace)
-        extra_buffer = object()
+        workspace_get = mock.Mock(side_effect=[(workspace, False), (workspace, True)])
+        extra_buffer = torch.empty(1)
         swa_buffer = object()
         token_to_kv_pool = SimpleNamespace(
             get_extra_key_page_size=mock.Mock(return_value=16),
             get_extra_key_buffer=mock.Mock(return_value=extra_buffer),
             get_swa_key_buffer_radix=mock.Mock(return_value=swa_buffer),
+            get_extra_key_layout=mock.Mock(return_value="compressed_layout"),
+            get_swa_key_layout=mock.Mock(return_value="swa_layout"),
         )
         backend = SimpleNamespace(
             forward_metadata=SimpleNamespace(sparse_prefill_cache=cache),
-            sparse_prefill_workspace=SimpleNamespace(get=workspace_get),
+            sparse_prefill_kv_buffer=SimpleNamespace(get_with_head=workspace_get),
             softmax_scale=512**-0.5,
             _cutedsl_h16_c128_combined_topk=512,
             _cutedsl_h16_prefill_log_emitted=True,
         )
         core_attn_metadata = SimpleNamespace(
-            c128_page_indices=torch.zeros((num_queries, 1), dtype=torch.int32),
+            sparse_page_indices=mock.Mock(
+                return_value=torch.zeros((num_queries, 1), dtype=torch.int32)
+            ),
         )
 
         with (
             mock.patch.object(
                 deepseek_v4_backend,
-                "dequantize_k_cache_paged",
+                "dequantize_k_cache_paged_dsv4",
             ) as dequantize,
             mock.patch.object(
                 deepseek_v4_backend,
@@ -351,8 +377,19 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
 
         self.assertIs(first, expected)
         self.assertIs(second, expected)
-        workspace_get.assert_has_calls([mock.call(5), mock.call(5)])
-        self.assertEqual(dequantize.call_count, 4)
+        head_source = (
+            extra_buffer.data_ptr(),
+            cache.compressed[128].flat_token_ids.data_ptr(),
+            3,
+        )
+        workspace_get.assert_has_calls(
+            [
+                mock.call(5, head_source=head_source),
+                mock.call(5, head_source=head_source),
+            ]
+        )
+        # A shared compressed KV source is dequantized once; SWA stays per-layer.
+        self.assertEqual(dequantize.call_count, 3)
         self.assertEqual(tuple(first_indices.shape), (num_queries, 512))
         torch.testing.assert_close(first_indices[:, :384], live_indices)
         self.assertTrue(torch.all(first_indices[:, 384:] == -1))
@@ -371,8 +408,10 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
 
         compressed_call, swa_call = dequantize.call_args_list[:2]
         self.assertIs(compressed_call.args[0], extra_buffer)
-        self.assertIs(compressed_call.args[1], cache.c128_flat_token_ids)
+        self.assertIs(compressed_call.args[1], cache.compressed[128].flat_token_ids)
         self.assertEqual(compressed_call.kwargs["page_size"], 16)
+        self.assertEqual(compressed_call.kwargs["layout"], "compressed_layout")
+        self.assertEqual(swa_call.kwargs["layout"], "swa_layout")
         self.assertEqual(
             tuple(compressed_call.kwargs["out"].shape),
             (num_compressed_tokens, 1, 512),
@@ -416,18 +455,19 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
         get_swa_buffer = mock.Mock(return_value=swa_buffer)
         backend = SimpleNamespace(
             forward_metadata=SimpleNamespace(sparse_prefill_cache=cache),
-            sparse_prefill_workspace=SimpleNamespace(get=workspace_get),
+            sparse_prefill_kv_buffer=SimpleNamespace(get=workspace_get),
             softmax_scale=512**-0.5,
             _cutedsl_h16_prefill_log_emitted=True,
         )
         token_to_kv_pool = SimpleNamespace(
             get_swa_key_buffer_radix=get_swa_buffer,
+            get_swa_key_layout=mock.Mock(return_value="swa_layout"),
         )
 
         with (
             mock.patch.object(
                 deepseek_v4_backend,
-                "dequantize_k_cache_paged",
+                "dequantize_k_cache_paged_dsv4",
             ) as dequantize,
             mock.patch.object(
                 deepseek_v4_backend,
@@ -456,6 +496,7 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
             cache.swa_token_ids,
             page_size=256,
             out=workspace,
+            layout="swa_layout",
         )
         kwargs = run_cutedsl.call_args.kwargs
         self.assertEqual(tuple(kwargs["q"].shape), (num_queries, 64, 512))
@@ -467,6 +508,94 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
         self.assertIs(kwargs["topk_length"], lengths)
         self.assertIs(kwargs["attn_sink"], sink)
         self.assertEqual(kwargs["sm_scale"], 512**-0.5)
+
+    def test_shared_sparse_gate_preserves_current_main_exclusions(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as backend_module
+
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            _original_forward_mode=None,
+            tbo_parent_token_range=None,
+        )
+        backend = SimpleNamespace(
+            trtllm_attn=False,
+            dsv4_prefill_backend="cutedsl_h16",
+            forward_metadata=SimpleNamespace(late_layer_tail=None),
+        )
+
+        def selected():
+            return backend_module.DeepseekV4AttnBackend._use_sparse_prefill(
+                backend, batch, num_qo_tokens=1
+            )
+
+        with (
+            mock.patch.object(backend_module, "_is_cuda", False),
+            mock.patch.object(backend_module, "is_cp_active", return_value=False) as cp,
+            mock.patch.object(
+                backend_module,
+                "get_platform",
+                return_value=SimpleNamespace(is_sm120=False),
+            ),
+            mock.patch.object(
+                backend_module, "is_in_breakable_cuda_graph", return_value=False
+            ) as graph,
+            mock.patch.object(
+                backend_module, "is_in_tc_piecewise_cuda_graph", return_value=False
+            ),
+            mock.patch.object(
+                backend_module, "get_tc_piecewise_forward_context", return_value=None
+            ),
+            mock.patch.object(
+                backend_module.envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL,
+                "get",
+                return_value=False,
+            ),
+        ):
+            self.assertTrue(selected())
+            backend.dsv4_prefill_backend = "auto"
+            self.assertFalse(selected())
+            backend.dsv4_prefill_backend = "cutedsl_h16"
+            cp.return_value = True
+            self.assertFalse(selected())
+            cp.return_value = False
+            backend.forward_metadata.late_layer_tail = object()
+            self.assertFalse(selected())
+            backend.forward_metadata.late_layer_tail = None
+            backend.trtllm_attn = True
+            self.assertFalse(selected())
+            backend.trtllm_attn = False
+            graph.return_value = True
+            self.assertFalse(selected())
+            graph.return_value = False
+            batch.tbo_parent_token_range = (0, 1)
+            self.assertFalse(selected())
+
+    def test_raw_cuda_capture_does_not_force_sparse_snapshot(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as backend_module
+
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            _original_forward_mode=None,
+            tbo_parent_token_range=None,
+        )
+        with (
+            mock.patch.object(backend_module, "_is_cuda", True),
+            mock.patch.object(
+                backend_module, "is_in_breakable_cuda_graph", return_value=False
+            ),
+            mock.patch.object(
+                backend_module, "is_in_tc_piecewise_cuda_graph", return_value=False
+            ),
+            mock.patch.object(
+                backend_module, "get_tc_piecewise_forward_context", return_value=None
+            ),
+            mock.patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ),
+        ):
+            self.assertFalse(
+                backend_module._use_dsv4_cutedsl_h16_forward("cutedsl_h16", batch)
+            )
 
 
 if __name__ == "__main__":

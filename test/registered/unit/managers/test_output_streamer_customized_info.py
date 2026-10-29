@@ -1,17 +1,44 @@
+import dataclasses
+import pickle
+import time
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import unwrap_from_pickle
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskOutput,
+    SamplingMaskStatus,
+)
+from sglang.srt.managers import io_struct
+from sglang.srt.managers.io_struct import (
+    msgpack_decode,
+    msgpack_encode,
+    unwrap_from_pickle,
+)
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
+from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
+from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.weight_versions import (
+    WeightVersionSpan,
+    record_weight_version_events,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import enter_scope, published_topology
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeReq:
@@ -22,6 +49,7 @@ class _FakeReq:
         customized_info=None,
         *,
         finished=False,
+        sampling_mask_rows=None,
     ):
         self.rid = rid
         self.http_worker_ipc = None
@@ -31,6 +59,7 @@ class _FakeReq:
         )
         self.finished_output = False
         self.finished_len = None
+        self.beam_group = None
         self.stream = False
         self.sampling_params = SimpleNamespace(
             stream_interval=None,
@@ -52,15 +81,20 @@ class _FakeReq:
         self.return_hidden_states = False
         self.return_routed_experts = False
         self.return_indexer_topk = False
-        self.return_sampling_mask = False
+        self.return_sampling_mask = sampling_mask_rows is not None
+        self.sampling_mask_rows = sampling_mask_rows
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
         self.mm_video_tokens = 0
         self.multimodal_inputs = None
         self.customized_info = customized_info
+        self.weight_version_events = []
 
     def finished(self):
         return self._finished
+
+    def get_mm_token_counts(self):
+        return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
 
     def init_incremental_detokenize(self):
         return self.output_ids_through_stop, 0
@@ -69,37 +103,56 @@ class _FakeReq:
         return False
 
 
+def _accumulator(
+    current_weight_version="default",
+    return_sampling_mask=False,
+    request_level_keys=frozenset(),
+    rust_server_mode=False,
+    enable_metrics=False,
+):
+    return _GenerationStreamAccumulator(
+        return_logprob=False,
+        return_hidden_states=False,
+        return_routed_experts=False,
+        return_indexer_topk=False,
+        return_sampling_mask=return_sampling_mask,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        disaggregation_mode=DisaggregationMode.NULL,
+        default_stream_interval=1,
+        default_force_stream_interval=1,
+        get_cached_tokens_details=lambda req: None,
+        is_request_level_customized_info_key=request_level_keys.__contains__,
+        current_weight_version=current_weight_version,
+        rust_server_mode=rust_server_mode,
+        enable_metrics=enable_metrics,
+    )
+
+
+def _enter_streamer_scope(test):
+    """Patch what `SchedulerOutputStreamer` reads per call, for `test`."""
+    serving_patch = patch(
+        "sglang.srt.managers.scheduler_components.output_streamer.get_serving",
+        return_value=SimpleNamespace(stream_interval=1, weight_version="default"),
+    )
+    observability_patch = patch(
+        "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
+        return_value=SimpleNamespace(
+            enable_metrics=False, enable_request_time_stats_logging=False
+        ),
+    )
+    serving_patch.start()
+    observability_patch.start()
+    enter_scope(test, published_topology(ranks={"dp_rank": 0}))
+    test.addCleanup(serving_patch.stop)
+    test.addCleanup(observability_patch.stop)
+
+
 class TestOutputStreamerCustomizedInfo(unittest.TestCase):
     def setUp(self):
-        serving_patch = patch(
-            "sglang.srt.managers.scheduler_components.output_streamer.get_serving",
-            return_value=SimpleNamespace(stream_interval=1),
-        )
-        observability_patch = patch(
-            "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
-            return_value=SimpleNamespace(enable_request_time_stats_logging=False),
-        )
-        serving_patch.start()
-        observability_patch.start()
-        self.addCleanup(serving_patch.stop)
-        self.addCleanup(observability_patch.stop)
-
-    @staticmethod
-    def _accumulator():
-        return _GenerationStreamAccumulator(
-            return_logprob=False,
-            return_hidden_states=False,
-            return_routed_experts=False,
-            return_indexer_topk=False,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
-            default_stream_interval=1,
-            default_force_stream_interval=1,
-            get_cached_tokens_details=lambda req: None,
-        )
+        _enter_streamer_scope(self)
 
     def test_customized_info_is_padded_for_mixed_batches(self):
-        accumulator = self._accumulator()
+        accumulator = _accumulator()
 
         accumulator.accept(req=_FakeReq("r0", [10, 11]))
         accumulator.accept(
@@ -124,6 +177,120 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             [[None, None], [None, None, None], [300]],
         )
 
+    def test_request_level_value_is_preserved_for_finished_zero_token_request(self):
+        """A request that finishes with no output tokens still ships its value.
+
+        Token-sliced keys yield ``req_values[0:0]`` here, so without the
+        request-level path the one value a prefill-only request produced
+        would arrive as an empty list.
+        """
+        key = "prompt_score"
+        accumulator = _accumulator(request_level_keys=frozenset({key}))
+
+        accumulator.accept(
+            req=_FakeReq(
+                "prefill-only",
+                [],
+                customized_info={key: [386.25]},
+                finished=True,
+            )
+        )
+
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(
+            unwrap_from_pickle(payload.customized_info),
+            {key: [[386.25]]},
+        )
+
+    def test_request_level_customized_info_is_emitted_only_once(self):
+        """Streaming emits a request-level value with the first chunk only.
+
+        A later chunk that re-sends it would be appended by the receiver and
+        the client would read the same value twice.
+        """
+        key = "request_score"
+        req = _FakeReq("streaming", [10], customized_info={key: [386.25]})
+        req.stream = True
+
+        first = _accumulator(request_level_keys=frozenset({key}))
+        first.accept(req=req)
+        self.assertEqual(
+            unwrap_from_pickle(
+                first.to_payload(dp_rank=0, is_idle_batch=False).customized_info
+            ),
+            {key: [[386.25]]},
+        )
+
+        req.output_ids.append(11)
+        second = _accumulator(request_level_keys=frozenset({key}))
+        second.accept(req=req)
+        self.assertIsNone(
+            second.to_payload(dp_rank=0, is_idle_batch=False).customized_info
+        )
+
+    def test_nonstreaming_request_level_customized_info_waits_for_finish(self):
+        """Non-streaming requests emit the value with the terminal output only.
+
+        Intermediate outputs of a non-streaming request are coalesced on the
+        receiver, so emitting earlier would duplicate the value as well.
+        """
+        key = "request_score"
+        req = _FakeReq("nonstreaming", [10], customized_info={key: [386.25]})
+
+        intermediate = _accumulator(request_level_keys=frozenset({key}))
+        intermediate.accept(req=req)
+        self.assertIsNone(
+            intermediate.to_payload(dp_rank=0, is_idle_batch=False).customized_info
+        )
+
+        req.output_ids.append(11)
+        req._finished = True
+        terminal = _accumulator(request_level_keys=frozenset({key}))
+        terminal.accept(req=req)
+        self.assertEqual(
+            unwrap_from_pickle(
+                terminal.to_payload(dp_rank=0, is_idle_batch=False).customized_info
+            ),
+            {key: [[386.25]]},
+        )
+
+    def test_request_level_customized_info_uses_empty_list_for_missing_request(self):
+        """Requests without the key take an empty slot, not a ``None`` per token.
+
+        The per-request lists stay aligned with ``output_ids`` while the
+        receiver never sees token-shaped padding for a request-level key.
+        """
+        key = "request_score"
+        accumulator = _accumulator(request_level_keys=frozenset({key}))
+
+        without_score = _FakeReq("without-score", [10, 11])
+        without_score.stream = True
+        with_score = _FakeReq("with-score", [20], customized_info={key: [386.25]})
+        with_score.stream = True
+        accumulator.accept(req=without_score)
+        accumulator.accept(req=with_score)
+
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(
+            unwrap_from_pickle(payload.customized_info),
+            {key: [[], [386.25]]},
+        )
+
+    def test_rust_egress_takes_each_steps_values_unpickled(self):
+        """Each step sends the values for its new tokens; the Rust egress
+        encodes the lists itself."""
+        probed = _FakeReq("r0", [20, 21], customized_info={"probe": [200, 201]})
+        steps = []
+        for _ in range(2):
+            accumulator = _accumulator(rust_server_mode=True)
+            accumulator.accept(req=probed)
+            payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+            steps.append(payload.customized_info)
+            probed.output_ids.append(22)
+            probed.customized_info["probe"].append(202)
+
+        self.assertEqual(steps, [{"probe": [[200, 201]]}, {"probe": [[202]]}])
+
     def test_additional_customized_info_uses_the_existing_payload(self):
         class Streamer(SchedulerOutputStreamer):
             has_additional_customized_info = True
@@ -138,7 +305,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -171,7 +337,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -184,6 +349,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         quiet = _FakeReq("quiet", [10, 11])
         quiet.stream = True
         quiet.sampling_params.stream_interval = 2
+        quiet.send_token_offset = 1
         terminal = _FakeReq("terminal", [20], finished=True)
 
         streamer._stream_output_generation([quiet, terminal], False)
@@ -208,7 +374,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -222,6 +387,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         quiet = _FakeReq("quiet", [10, 11])
         quiet.stream = True
         quiet.sampling_params.stream_interval = 2
+        quiet.send_token_offset = 1
 
         streamer._stream_output_generation([terminal, quiet], False)
 
@@ -248,7 +414,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -276,7 +441,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -302,7 +466,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -320,11 +483,10 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         class Streamer(SchedulerOutputStreamer):
             has_additional_customized_info = True
 
-        with self.assertRaisesRegex(ValueError, "Rust egress"):
+        with self.assertRaisesRegex(ValueError, "Rust frontend does not run"):
             Streamer(
                 send_to_detokenizer=SimpleNamespace(),
                 tree_cache=None,
-                ps=SimpleNamespace(),
                 server_args=SimpleNamespace(),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -332,6 +494,290 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
                 enable_hicache_storage=lambda: False,
                 rust_server=object(),
             )
+
+
+class TestOutputStreamerWeightVersions(unittest.TestCase):
+    def test_payload_carries_spans_for_finished_requests(self):
+        """Finished requests report their spans; still-generating ones report nothing."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        finished_req = _FakeReq("r1", [20, 21, 22], finished=True)
+        record_weight_version_events([finished_req], old_version="v1")
+        finished_req.output_ids.extend([23, 24])
+
+        accumulator = _accumulator(current_weight_version="v2")
+        accumulator.accept(req=streaming_req)
+        accumulator.accept(req=finished_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertEqual(
+            payload.weight_versions,
+            [
+                None,
+                [
+                    WeightVersionSpan(version="v1", start=0, end=3),
+                    WeightVersionSpan(version="v2", start=3, end=5),
+                ],
+            ],
+        )
+
+    def test_payload_omits_spans_while_all_requests_stream(self):
+        """A batch of unfinished requests puts nothing on the wire."""
+        accumulator = _accumulator(current_weight_version="v2")
+        accumulator.accept(req=_FakeReq("r0", [10]))
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.weight_versions)
+
+
+class TestOutputStreamerDecodeLatency(unittest.TestCase):
+    def setUp(self):
+        _enter_streamer_scope(self)
+
+    def test_rust_mode_times_finished_non_streaming_requests(self):
+        """In Rust mode a finished non-streaming request's decode latency runs
+        from the prefill stamp, which Python's TokenizerManager reads only with
+        metrics on, and the scheduler hands it to the Rust frontend by payload
+        row with the batch; other requests, and Python mode, record none."""
+        stamp = time.perf_counter() - 0.5
+
+        def req(rid, *, stream=False, finished=True, metrics=True, stamp=stamp):
+            req = _FakeReq(rid, [1], finished=finished)
+            req.stream = stream
+            req.time_stats = SimpleNamespace(
+                enable_metrics=metrics, prefill_finished_time=stamp
+            )
+            return req
+
+        rust_server = Mock()
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=None,
+            tree_cache=None,
+            server_args=SimpleNamespace(),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            enable_hicache_storage=lambda: False,
+            rust_server=rust_server,
+        )
+        streamer._stream_output_generation(
+            [
+                req("streaming", stream=True),
+                req("timed"),
+                req("running", finished=False),
+                req("no_metrics", metrics=False),
+                req("no_stamp", stamp=0.0),
+            ],
+            False,
+        )
+        payload, decode_latencies = rust_server.push_generation.call_args.args
+        self.assertEqual(payload.rids[1], "timed")
+        self.assertEqual(list(decode_latencies), [1])
+        self.assertGreaterEqual(decode_latencies[1], 0.5)
+
+        python_mode = _accumulator()
+        python_mode.accept(req=req("timed"))
+        self.assertEqual(python_mode.decode_latencies, {})
+
+
+class TestOutputStreamerTimeStats(unittest.TestCase):
+    def test_rows_carry_time_stats_only_with_metrics_on(self):
+        """With metrics on every emitted row carries its request's time stats,
+        None for a request whose own metrics are off; with metrics off the
+        payload carries none at all."""
+        timed = SchedulerReqTimeStats(enable_metrics=True)
+        timed.queue_duration_s = 0.25
+
+        def req(rid, time_stats):
+            req = _FakeReq(rid, [1])
+            req.time_stats = time_stats
+            return req
+
+        for enable_metrics, expected in (
+            (True, [timed.to_output_time_stats(), None]),
+            (False, None),
+        ):
+            with self.subTest(enable_metrics=enable_metrics):
+                accumulator = _accumulator(enable_metrics=enable_metrics)
+                accumulator.accept(req=req("timed", timed))
+                accumulator.accept(req=req("untimed", SchedulerReqTimeStats()))
+                payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+                self.assertEqual(payload.time_stats, expected)
+
+
+class TestOutputStreamerStreamInterval(unittest.TestCase):
+    def test_sends_once_interval_tokens_are_unsent(self):
+        """With stream_interval=4, the first token goes out at once, then a chunk
+        whenever 4 or more tokens are unsent, however many each step appends."""
+        cases = {
+            # One token per step keeps the cadence of sending at 1, 5, 9, ...
+            "single_token_steps": ([1] * 9, (), [1, 0, 0, 0, 4, 0, 0, 0, 4]),
+            # Speculative steps pass multiples of 4 without landing on them.
+            "multi_token_steps": ([1, 3, 3, 3, 3], (), [1, 0, 6, 0, 6]),
+            # A chunk held for a possible stop string goes out on the next step.
+            "held_for_stop_str": ([1] * 6, (4,), [1, 0, 0, 0, 0, 5]),
+        }
+        for name, (steps, held_steps, expected) in cases.items():
+            with self.subTest(name):
+                req = _FakeReq("r0", [])
+                req.stream = True
+                req.sampling_params.stream_interval = 4
+                sent = []
+                for step, num_tokens in enumerate(steps):
+                    req.check_match_stop_str_prefix = lambda: step in held_steps
+                    req.output_ids.extend(range(num_tokens))
+                    accumulator = _accumulator()
+                    accumulator.accept(req=req)
+                    sent.append(sum(map(len, accumulator.output_ids)))
+                self.assertEqual(sent, expected)
+
+
+_IPC_ROUND_TRIPS = {
+    "pickle": lambda payload: pickle.loads(
+        pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+    ),
+    "msgpack": lambda payload: msgpack_decode(msgpack_encode(payload)),
+}
+
+
+class TestOutputStreamerSamplingMasks(unittest.TestCase):
+    def test_rows_stream_once_and_expand_to_response_lists(self):
+        """Queued rows cross either IPC codec once, in batch order, as per-token lists;
+        rows queued later never overwrite a chunk that is still referenced."""
+        for codec, round_trip in _IPC_ROUND_TRIPS.items():
+            with (
+                self.subTest(codec=codec),
+                patch.object(io_struct, "_USE_PICKLE_IPC", codec == "pickle"),
+            ):
+                selected_rows = SamplingMaskRows()
+                selected_rows.append(
+                    np.array([5, 3], np.int32), np.array([-0.5], np.float32)
+                )
+                selected_rows.append(
+                    np.array([7], np.int32), np.array([0.0], np.float32)
+                )
+                support_rows = SamplingMaskRows()
+                support_rows.append(
+                    np.array([9, 8], np.int32), np.array([-0.25, -1.5], np.float32)
+                )
+                support_rows.append(
+                    np.array([6], np.int32), np.array([0.0], np.float32)
+                )
+                selected = _FakeReq(
+                    "selected", array("q", [5, 7]), sampling_mask_rows=selected_rows
+                )
+                support = _FakeReq(
+                    "support", array("q", [9, 6]), sampling_mask_rows=support_rows
+                )
+                accumulator = _accumulator(return_sampling_mask=True)
+                for req in (selected, _FakeReq("plain", array("q", [1])), support):
+                    accumulator.accept(req=req)
+                payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+                masks = round_trip(payload).output_token_sampling_mask
+                self.assertEqual(
+                    masks[0].to_lists(support_logprobs=False),
+                    ([[5, 3], [7]], [-0.5, 0.0]),
+                )
+                self.assertIsNone(masks[1])
+                self.assertEqual(
+                    masks[2].to_lists(support_logprobs=True),
+                    ([[9, 8], [6]], [[-0.25, -1.5], [0.0]]),
+                )
+
+                selected.output_ids.append(4)
+                selected.sampling_mask_rows.append(
+                    np.array([4], np.int32), np.array([-2.0], np.float32)
+                )
+                self.assertEqual(
+                    payload.output_token_sampling_mask[0].to_lists(
+                        support_logprobs=False
+                    ),
+                    ([[5, 3], [7]], [-0.5, 0.0]),
+                )
+                accumulator = _accumulator(return_sampling_mask=True)
+                accumulator.accept(req=selected)
+                masks = round_trip(
+                    accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+                ).output_token_sampling_mask
+                self.assertEqual(
+                    masks[0].to_lists(support_logprobs=False), ([[4]], [-2.0])
+                )
+
+    def test_clients_receive_the_sampler_rows_unchanged(self):
+        """Across decode steps, stream emissions and either IPC codec, each request gets
+        the sampler's rows exactly as the tensor-to-list conversion defines them."""
+        processor = SchedulerBatchResultProcessor(
+            **{f.name: None for f in dataclasses.fields(SchedulerBatchResultProcessor)}
+        )
+        modes = ["selected", "support", None, "support", "selected"]
+        mask_reqs = [i for i, mode in enumerate(modes) if mode is not None]
+        support_reqs = [i for i in mask_reqs if modes[i] == "support"]
+        for codec, round_trip in _IPC_ROUND_TRIPS.items():
+            with (
+                self.subTest(codec=codec),
+                patch.object(io_struct, "_USE_PICKLE_IPC", codec == "pickle"),
+            ):
+                generator = torch.Generator().manual_seed(0)
+                reqs = []
+                for i, mode in enumerate(modes):
+                    rows = None if mode is None else SamplingMaskRows()
+                    req = _FakeReq(f"r{i}", array("q"), sampling_mask_rows=rows)
+                    req.sampling_logprobs_mode = mode
+                    reqs.append(req)
+                expected = [([], []) for _ in modes]
+                received = [([], []) for _ in modes]
+                for step in range(12):
+                    width = (1, 7, 64)[step % 3]
+                    lengths = torch.randint(
+                        1, width + 1, (len(mask_reqs),), generator=generator
+                    )
+                    token_ids = torch.randint(
+                        0, 1 << 20, (len(mask_reqs), width), generator=generator
+                    ).int()
+                    selected = torch.randn(len(mask_reqs), generator=generator)
+                    support = torch.randn(len(support_reqs), width, generator=generator)
+                    output = LogitsProcessorOutput(
+                        next_token_logits=None,
+                        sampling_mask_output=SamplingMaskOutput(
+                            token_ids=token_ids,
+                            lengths=lengths,
+                            selected_logprobs=selected,
+                            support_logprobs=support,
+                            statuses=torch.full(
+                                (len(mask_reqs),), SamplingMaskStatus.OK
+                            ),
+                        ),
+                    )
+                    SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+                        reqs, output
+                    )
+                    for row, i in enumerate(mask_reqs):
+                        processor.add_sampling_mask_return_values(i, reqs[i], output)
+                        length = int(lengths[row])
+                        expected[i][0].append(token_ids[row, :length].tolist())
+                        if modes[i] == "support":
+                            support_row = support_reqs.index(i)
+                            expected[i][1].append(
+                                support[support_row, :length].tolist()
+                            )
+                        else:
+                            expected[i][1].append(float(selected[row]))
+                    if step in (0, 1, 5, 6, 11):
+                        accumulator = _accumulator(return_sampling_mask=True)
+                        for req in reqs:
+                            accumulator.accept(req=req)
+                        chunks = round_trip(
+                            accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+                        ).output_token_sampling_mask
+                        for i, chunk in enumerate(chunks):
+                            if modes[i] is None:
+                                self.assertIsNone(chunk)
+                                continue
+                            masks, logprobs = chunk.to_lists(
+                                support_logprobs=modes[i] == "support"
+                            )
+                            received[i][0].extend(masks)
+                            received[i][1].extend(logprobs)
+                self.assertEqual(received, expected)
 
 
 if __name__ == "__main__":

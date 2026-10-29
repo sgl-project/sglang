@@ -49,7 +49,7 @@ def _load_implementations():
     cute_h16 = importlib.import_module(
         "sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16"
     )
-    from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+    from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_sparse_fwd
 
     return cute_h16, flash_mla_sparse_fwd
 

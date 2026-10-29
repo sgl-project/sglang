@@ -75,7 +75,7 @@ def rank_consensus(func=None, *, same_params=None, same_results=None, **kwargs):
     """
     if kwargs:
         raise TypeError(
-            f"rank_consensus() got unexpected keyword argument(s): " f"{list(kwargs)}"
+            f"rank_consensus() got unexpected keyword argument(s): {list(kwargs)}"
         )
 
     params_selector = _normalize_selector(same_params, "same_params")

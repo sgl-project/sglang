@@ -16,6 +16,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion import (
+    HELIOS_GATED_RESIDUAL,
+    fused_inplace_helios_qk_rope,
+    try_gated_residual,
+)
 from sglang.multimodal_gen.configs.models.dits.helios import HeliosConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
@@ -52,7 +57,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+_is_cuda = current_platform.is_cuda()
 
 logger = init_logger(__name__)
 
@@ -285,6 +293,20 @@ class HeliosSelfAttention(nn.Module):
             self.history_scale_mode = history_scale_mode
             self.max_scale = 10.0
 
+    def _apply_rotary_qk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        rotary_emb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.tp_rmsnorm and _is_cuda and q.is_cuda:
+            fused_inplace_helios_qk_rope(q, k, rotary_emb)
+            return q, k
+        return (
+            apply_rotary_emb_transposed(q, rotary_emb),
+            apply_rotary_emb_transposed(k, rotary_emb),
+        )
+
     def forward(self, hidden_states, rotary_emb=None, original_context_length=None):
         q, _ = self.to_q(hidden_states)
         k, _ = self.to_k(hidden_states)
@@ -302,8 +324,7 @@ class HeliosSelfAttention(nn.Module):
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
         if rotary_emb is not None:
-            q = apply_rotary_emb_transposed(q, rotary_emb)
-            k = apply_rotary_emb_transposed(k, rotary_emb)
+            q, k = self._apply_rotary_qk(q, k, rotary_emb)
 
         history_seq_len = (
             hidden_states.shape[1] - original_context_length
@@ -476,6 +497,8 @@ class HeliosTransformerBlock(nn.Module):
         # 4. Guidance cross-attention flag
         self.guidance_cross_attn = guidance_cross_attn
 
+        HELIOS_GATED_RESIDUAL.mark(self)
+
     def forward(
         self,
         hidden_states,
@@ -505,8 +528,13 @@ class HeliosTransformerBlock(nn.Module):
         attn_output = self.attn1(
             norm_hidden_states, rotary_emb, original_context_length
         )
-        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(
-            hidden_states
+        fused = try_gated_residual(
+            HELIOS_GATED_RESIDUAL, self, hidden_states, attn_output, gate_msa
+        )
+        hidden_states = (
+            fused
+            if fused is not None
+            else (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
         )
 
         # 2. Cross-attention
@@ -541,9 +569,16 @@ class HeliosTransformerBlock(nn.Module):
         # 3. Feed-forward
         norm_hidden_states = self.norm3(hidden_states, c_shift_msa, c_scale_msa)
         ff_output = self.ffn(norm_hidden_states)
+        fused = try_gated_residual(
+            HELIOS_GATED_RESIDUAL, self, hidden_states, ff_output, c_gate_msa
+        )
         hidden_states = (
-            hidden_states.float() + ff_output.float() * c_gate_msa
-        ).type_as(hidden_states)
+            fused
+            if fused is not None
+            else (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(
+                hidden_states
+            )
+        )
 
         return hidden_states
 
@@ -893,6 +928,7 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
             timestep_proj_t0 = (
                 timestep_proj_t0.unflatten(-1, (6, -1))
+                .float()
                 .view(1, 6, 1, -1)
                 .expand(batch_size, -1, history_context_length, -1)
             )
@@ -906,7 +942,8 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         cross_attn_key_values = self._get_cross_attn_key_values(
             encoder_hidden_states, forward_batch
         )
-        timestep_proj = timestep_proj.unflatten(-1, (6, -1))
+        # cast the compact rows to fp32 once; the blocks' .float() is then a no-op
+        timestep_proj = timestep_proj.unflatten(-1, (6, -1)).float()
 
         if indices_hidden_states is not None and not self.zero_history_timestep:
             main_repeat_size = hidden_states.shape[1]

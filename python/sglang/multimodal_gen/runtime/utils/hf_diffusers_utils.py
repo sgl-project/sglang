@@ -18,11 +18,11 @@
 # ==============================================================================
 """Utilities for Huggingface Transformers."""
 
-import contextlib
 import glob
 import json
 import os
 import shutil
+import tempfile
 import time
 from functools import reduce
 from pathlib import Path
@@ -149,13 +149,12 @@ def _is_weight_bearing_diffusers_component(key: str, value: Any) -> bool:
 
 
 def _get_declared_weight_component_dirs(model_path: str) -> list[str]:
-    model_index_path = os.path.join(model_path, "model_index.json")
+    model_index_path = _local_model_index_path(model_path)
     if not os.path.exists(model_index_path):
         return []
 
     try:
-        with open(model_index_path) as f:
-            model_index = json.load(f)
+        model_index = _read_model_index(model_index_path)
     except Exception as exc:
         logger.warning(
             "Failed to read model_index.json at %s: %s", model_index_path, exc
@@ -374,13 +373,12 @@ def _ci_validate_diffusers_model(model_path: str) -> tuple[bool, bool]:
 
 def _verify_diffusers_model_complete(path: str) -> bool:
     """Check if a diffusers model directory has all required component subdirectories."""
-    config_path = os.path.join(path, "model_index.json")
+    config_path = _local_model_index_path(path)
     if not os.path.exists(config_path):
         return False
 
     try:
-        with open(config_path) as config_file:
-            model_index = json.load(config_file)
+        model_index = _read_model_index(config_path)
     except Exception as exc:
         logger.warning("Failed to read model_index.json at %s: %s", config_path, exc)
         return False
@@ -388,7 +386,8 @@ def _verify_diffusers_model_complete(path: str) -> bool:
     component_keys = [
         key
         for key, value in model_index.items()
-        if _is_diffusers_component_entry(value)
+        if not key.startswith("_")
+        and _is_diffusers_component_entry(value)
         and any(item is not None for item in value)
     ]
     if component_keys:
@@ -399,25 +398,6 @@ def _verify_diffusers_model_complete(path: str) -> bool:
     return os.path.exists(os.path.join(path, "transformer")) and os.path.exists(
         os.path.join(path, "vae")
     )
-
-
-_CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
-    # ChatGLMConfig.model_type: ChatGLMConfig,
-    # DbrxConfig.model_type: DbrxConfig,
-    # ExaoneConfig.model_type: ExaoneConfig,
-    # Qwen2_5_VLConfig.model_type: Qwen2_5_VLConfig,
-}
-
-for name, cls in _CONFIG_REGISTRY.items():
-    with contextlib.suppress(ValueError):
-        AutoConfig.register(name, cls)
-
-
-def download_from_hf(model_path: str):
-    if os.path.exists(model_path):
-        return model_path
-
-    return snapshot_download(model_path, allow_patterns=["*.json", "*.bin", "*.model"])
 
 
 def get_hf_config(
@@ -436,27 +416,10 @@ def get_hf_config(
         revision=revision,
         **kwargs,
     )
-    if config.model_type in _CONFIG_REGISTRY:
-        config_class = _CONFIG_REGISTRY[config.model_type]
-        config = config_class.from_pretrained(component_model_path, revision=revision)
-        # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
-        config._name_or_path = component_model_path
     if model_override_args:
         config.update(model_override_args)
 
     return config
-
-
-def get_config(
-    model: str,
-    trust_remote_code: bool,
-    revision: Optional[str] = None,
-    model_override_args: Optional[dict] = None,
-    **kwargs,
-):
-    return AutoConfig.from_pretrained(
-        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
 
 
 def load_dict(file_path):
@@ -520,9 +483,19 @@ def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
 
         config["quantization_config"] = normalized_quant_config
         try:
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2, sort_keys=True)
-                f.write("\n")
+            # HF snapshot files are symlinks to shared blobs: replace, don't write through.
+            fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(config_path), suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=2, sort_keys=True)
+                    f.write("\n")
+                shutil.copymode(config_path, tmp_path)
+                os.replace(tmp_path, config_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
         except OSError as exc:
             logger.warning(
                 "Could not persist normalized ModelOpt config at %s (%s); "
@@ -550,7 +523,7 @@ def get_diffusers_component_config(
 
     config_names = ["generation_config.json"]
     # By default, we load config.json, but scheduler_config.json for scheduler
-    if "scheduler" in component_path:
+    if "scheduler" in os.path.basename(os.path.normpath(component_path)):
         config_names.append("scheduler_config.json")
     else:
         config_names.append("config.json")
@@ -563,6 +536,35 @@ def get_diffusers_component_config(
         lambda acc, path: acc | load_dict(path), config_file_paths, {}
     )
 
+    if "_class_name" not in combined_config:
+        # Some checkpoints (e.g. real Kandinsky6 exports, which declare
+        # "uses_patched_diffusers": true) omit "_class_name" from a
+        # component's own config.json, relying on the parent
+        # model_index.json's [library, class_name] entry for that component
+        # subfolder instead. Fall back to that so component loaders (which
+        # unconditionally pop "_class_name") still resolve the right class.
+        model_index_path = os.path.join(
+            os.path.dirname(os.path.normpath(component_path)), "model_index.json"
+        )
+        component_key = os.path.basename(os.path.normpath(component_path))
+        if os.path.exists(model_index_path):
+            try:
+                with open(model_index_path) as f:
+                    model_index = json.load(f)
+                entry = model_index.get(component_key)
+                class_name = (
+                    entry[-1] if isinstance(entry, (list, tuple)) and entry else entry
+                )
+                if class_name:
+                    combined_config["_class_name"] = str(class_name)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to backfill _class_name for %s from %s: %s",
+                    component_path,
+                    model_index_path,
+                    exc,
+                )
+
     quant_config = combined_config.get("quantization_config")
     if quant_config is not None:
         combined_config["quantization_config"] = normalize_flat_modelopt_quant_config(
@@ -574,29 +576,6 @@ def get_diffusers_component_config(
     logger.debug("HF model config: %s", combined_config)
 
     return combined_config
-
-
-# Models don't use the same configuration key for determining the maximum
-# context length.  Store them here so we can sanely check them.
-# NOTE: The ordering here is important. Some models have two of these and we
-# have a preference for which value gets used.
-CONTEXT_LENGTH_KEYS = [
-    "max_sequence_length",
-    "seq_length",
-    "max_seq_len",
-    "model_max_length",
-    "max_position_embeddings",
-]
-
-
-def attach_additional_stop_token_ids(tokenizer):
-    # Special handling for stop token <|eom_id|> generated by llama 3 tool use.
-    if "<|eom_id|>" in tokenizer.get_added_vocab():
-        tokenizer.additional_stop_token_ids = {
-            tokenizer.get_added_vocab()["<|eom_id|>"]
-        }
-    else:
-        tokenizer.additional_stop_token_ids = None
 
 
 def maybe_download_lora(
@@ -645,6 +624,10 @@ def maybe_download_lora(
             guessed = _best_guess_weight_name(
                 model_name_or_path, file_extension=".safetensors"
             )
+        if guessed is None:
+            raise FileNotFoundError(
+                f"No .safetensors LoRA weights found in {local_path}"
+            )
         return os.path.join(local_path, guessed)
 
     resolved_weight = resolve_weight(model_name_or_path, weight_name=weight_name)
@@ -663,12 +646,16 @@ def maybe_download_lora(
         return os.path.join(source.local_path, selected_file)
 
     assert source.repo_id is not None
+    allow_patterns = ["*.json", selected_file]
+    selected_parent = os.path.dirname(selected_file)
+    if selected_parent:
+        allow_patterns.insert(1, f"{selected_parent}/*.json")
     local_path = maybe_download_model(
         source.repo_id,
         local_dir,
         download,
         is_lora=True,
-        allow_patterns=["*.json", selected_file],
+        allow_patterns=allow_patterns,
         revision=resolved_weight.inventory.resolved_revision or source.revision,
     )
     target = os.path.join(local_path, selected_file)
@@ -677,6 +664,29 @@ def maybe_download_lora(
             f"Resolved LoRA weight {selected_file!r} was not downloaded to {local_path}"
         )
     return target
+
+
+def _local_model_index_path(model_path: str) -> str:
+    standard = os.path.join(model_path, "model_index.json")
+    if os.path.isfile(standard):
+        return standard
+    return os.path.join(model_path, "modular_model_index.json")
+
+
+def _read_model_index(path: str) -> dict[str, Any]:
+    with open(path) as f:
+        config = json.load(f)
+    if os.path.basename(path) == "modular_model_index.json":
+        config.pop("_blocks_class_name", None)
+        for name, spec in config.items():
+            if isinstance(spec, list) and len(spec) == 3 and isinstance(spec[2], dict):
+                # native loaders consume the component directories in this snapshot
+                if spec[2].get("subfolder", name) != name:
+                    raise ValueError(
+                        f"Modular component {name!r} must use its own subfolder"
+                    )
+                config[name] = spec[:2]
+    return config
 
 
 def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
@@ -691,16 +701,16 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
     """
 
     # Check for model_index.json which is required for diffusers models
-    config_path = os.path.join(model_path, "model_index.json")
+    config_path = _local_model_index_path(model_path)
     if not os.path.exists(config_path):
         raise ValueError(
-            f"Model directory {model_path} does not contain model_index.json. "
+            f"Model directory {model_path} does not contain model_index.json "
+            "or modular_model_index.json. "
             "Only HuggingFace diffusers format is supported."
         )
 
     # Load the config
-    with open(config_path) as f:
-        config = json.load(f)
+    config = _read_model_index(config_path)
 
     # Verify diffusers version exists
     if "_diffusers_version" not in config:
@@ -711,7 +721,8 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
     component_keys = [
         key
         for key, value in config.items()
-        if isinstance(value, (list, tuple))
+        if not key.startswith("_")
+        and isinstance(value, (list, tuple))
         and len(value) == 2
         and all(isinstance(item, str) for item in value)
     ]
@@ -741,26 +752,40 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
     return cast(dict[str, Any], config)
 
 
-def _resolve_remote_repo_model_index_path(model_name_or_path: str) -> str:
+def _resolve_remote_repo_model_index_path(
+    model_name_or_path: str, filename: str = "model_index.json"
+) -> str:
     """Return a local path to a remote repo's ``model_index.json``"""
     try:
         # Cache-aware: no local_dir, so the selected Hub reuses its cache and
         # revalidates the remote file when online.
-        return hf_hub_download(repo_id=model_name_or_path, filename="model_index.json")
-    except EntryNotFoundError:
-        # Repo exists but has no model_index.json (single-model repo); let the
-        # caller fall through to the single-model path.
-        raise
+        return hf_hub_download(repo_id=model_name_or_path, filename=filename)
     except Exception as online_err:
+        # LocalEntryNotFoundError (Hub unreachable) subclasses EntryNotFoundError.
+        if isinstance(online_err, EntryNotFoundError) and not isinstance(
+            online_err, LocalEntryNotFoundError
+        ):
+            if filename == "model_index.json":
+                return _resolve_remote_repo_model_index_path(
+                    model_name_or_path, "modular_model_index.json"
+                )
+            raise
         cached_path = None
         if not envs.SGLANG_USE_MODELSCOPE.get():
             from huggingface_hub import try_to_load_from_cache
 
-            cached = try_to_load_from_cache(
-                repo_id=model_name_or_path, filename="model_index.json"
+            filenames = (
+                (filename, "modular_model_index.json")
+                if filename == "model_index.json"
+                else (filename,)
             )
-            if isinstance(cached, str) and os.path.exists(cached):
-                cached_path = cached
+            for candidate in filenames:
+                cached = try_to_load_from_cache(
+                    repo_id=model_name_or_path, filename=candidate
+                )
+                if isinstance(cached, str) and os.path.exists(cached):
+                    cached_path = cached
+                    break
         if cached_path is not None:
             logger.warning(
                 "Could not fetch model_index.json for '%s' from the Hugging Face "
@@ -773,6 +798,29 @@ def _resolve_remote_repo_model_index_path(model_name_or_path: str) -> str:
             )
             return cached_path
         raise
+
+
+def _download_overlay_manifest(repo_id: str, filename: str) -> str:
+    """``hf_hub_download`` for the overlay manifest that most repos lack.
+
+    For a file the repo never had, ``hf_hub_download`` waits out each Hub rate
+    limit before giving up, which can stall the startup of a fully cached
+    checkpoint for minutes. Overlay repos hold only metadata, so a complete
+    cached snapshot without the manifest is a regular checkpoint, which
+    maybe_download_model serves from the cache, and needs no Hub request.
+    Offline, ``hf_hub_download`` already answers from the cache without waiting.
+    """
+    from huggingface_hub import is_offline_mode, try_to_load_from_cache
+
+    if not envs.SGLANG_USE_MODELSCOPE.get() and not is_offline_mode():
+        cached_index = try_to_load_from_cache(repo_id, "model_index.json")
+        if isinstance(cached_index, str):
+            snapshot = os.path.dirname(cached_index)
+            if not os.path.exists(
+                os.path.join(snapshot, filename)
+            ) and _verify_diffusers_model_complete(snapshot):
+                raise EntryNotFoundError(f"{filename} not found in {repo_id}")
+    return hf_hub_download(repo_id=repo_id, filename=filename)
 
 
 def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
@@ -788,7 +836,7 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     overlay_config = maybe_load_overlay_model_index(
         model_name_or_path,
         snapshot_download_fn=snapshot_download,
-        hf_hub_download_fn=hf_hub_download,
+        hf_hub_download_fn=_download_overlay_manifest,
     )
     if overlay_config is not None:
         return overlay_config
@@ -811,8 +859,7 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
         model_index_path = _resolve_remote_repo_model_index_path(model_name_or_path)
 
         # Load the model_index.json
-        with open(model_index_path) as f:
-            config: dict[str, Any] = json.load(f)
+        config = _read_model_index(model_index_path)
 
         # Verify it has the required fields
         if "_class_name" not in config:
@@ -834,12 +881,16 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
             config["_class_name"],
         )
         return config
-    except EntryNotFoundError:
+    except EntryNotFoundError as e:
         logger.debug(
             "model_index.json not found for %s. Assuming it is a single model and downloading it.",
             model_name_or_path,
         )
-        local_path = maybe_download_model(model_name_or_path)
+        # Hub unreachable: use only the cache.
+        offline = isinstance(e, LocalEntryNotFoundError)
+        local_path = maybe_download_model(
+            model_name_or_path, download=not offline, skip_overlay_resolution=offline
+        )
         config_path = os.path.join(local_path, "config.json")
         if not os.path.exists(config_path):
             raise ValueError(
@@ -886,7 +937,7 @@ def maybe_download_model(
             download=download,
             allow_patterns=allow_patterns,
             snapshot_download_fn=snapshot_download,
-            hf_hub_download_fn=hf_hub_download,
+            hf_hub_download_fn=_download_overlay_manifest,
             verify_diffusers_model_complete_fn=_verify_diffusers_model_complete,
             base_model_download_fn=maybe_download_model,
         )
@@ -952,7 +1003,28 @@ def maybe_download_model(
                 f"Cached ref for {model_name_or_path} is corrupt: resolved to the "
                 f"snapshots parent {local_path!r} instead of a revision directory."
             )
-        if not force_diffusers_model:
+        required_files = [
+            pattern for pattern in allow_patterns or () if not glob.has_magic(pattern)
+        ]
+        missing_required_files = [
+            path
+            for path in required_files
+            if not os.path.isfile(os.path.join(local_path, path))
+        ]
+        if missing_required_files:
+            if not download:
+                raise ValueError(
+                    f"Model {model_name_or_path} is cached but is missing requested "
+                    f"files: {missing_required_files}."
+                )
+            logger.info(
+                "Cached snapshot for %s is missing requested files %s; "
+                "will download them from %s",
+                model_name_or_path,
+                missing_required_files,
+                _model_hub_name(),
+            )
+        elif not force_diffusers_model:
             # maybe_download_model_index's model_index.json fetch materializes a full
             # cache entry, so this resolve reports that stub as a hit; returning it
             # would skip the download. LoRA repos declare no components.
@@ -1068,8 +1140,7 @@ def maybe_download_model(
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(local_path)
                 if not is_valid:
-                    # In CI, if validation fails after download, we have a serious issue
-                    # If cleanup was performed, the next retry should get a fresh download
+                    # Not retried: the handler below re-raises it as a ValueError.
                     raise ValueError(
                         f"CI validation failed for downloaded model at {local_path}. "
                         f"Some safetensors shards are missing. Cleanup performed: {cleanup_performed}."

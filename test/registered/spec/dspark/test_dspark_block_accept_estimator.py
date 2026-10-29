@@ -37,7 +37,6 @@ def _make_recorder(tmp_dir: str) -> tuple[BlockAcceptEstimateRecorder, Path]:
 
 
 class _FakeDelayed:
-
     def __init__(self):
         self._pending = None
 

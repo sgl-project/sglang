@@ -8,13 +8,13 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization import QuantizationConfig
@@ -55,12 +55,11 @@ from sglang.srt.model_loader.weight_utils import (
 # limitations under the License.
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/solar.py
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 class SolarMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -87,8 +86,7 @@ class SolarMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -100,7 +98,6 @@ class SolarMLP(nn.Module):
 
 
 class SolarAttention(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -186,7 +183,6 @@ class SolarAttention(nn.Module):
 
 
 class SolarDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -262,8 +258,30 @@ class SolarDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class SolarModel(nn.Module):
+def _check_skips_stay_in_stage(config, start_layer: int, end_layer: int) -> None:
+    """Reject a pipeline split that cuts a backbone skip connection.
 
+    A layer in ``bskcn_3`` / ``bskcn_4`` mixes in the hidden states saved at the
+    latest ``bskcn_1`` / ``bskcn_2`` layer before it, which must run on the same
+    stage.
+    """
+    for uses, saves in (
+        (config.bskcn_3, config.bskcn_1),
+        (config.bskcn_4, config.bskcn_2),
+    ):
+        for layer in uses:
+            if start_layer <= layer < end_layer and not any(
+                start_layer <= saved < layer for saved in saves
+            ):
+                raise ValueError(
+                    f"Solar layer {layer} reads a backbone skip connection saved "
+                    f"before this pipeline stage (layers [{start_layer}, "
+                    f"{end_layer})); choose a --pp-size or SGLANG_PP_LAYER_PARTITION "
+                    "that keeps each skip connection within one stage."
+                )
+
+
+class SolarModel(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -275,7 +293,8 @@ class SolarModel(nn.Module):
 
         self.vocab_size = config.vocab_size
         self.org_vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
+        self._kv_cache_parallel_layout = resolve_linear_parallel_group("tp")
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -285,7 +304,7 @@ class SolarModel(nn.Module):
             )
         else:
             self.embed_tokens = PPMissingLayer()
-        self.start_layer, self.end_layer, self.layers = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: SolarDecoderLayer(
                 config=config,
@@ -295,7 +314,8 @@ class SolarModel(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-        if get_pp_group().is_last_rank:
+        _check_skips_stay_in_stage(config, self.start_layer, self.end_layer)
+        if get_parallel().pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -311,7 +331,7 @@ class SolarModel(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
-        if self.pp_group().is_first_rank:
+        if self.pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -354,7 +374,7 @@ class SolarModel(nn.Module):
                 residual=residual,
             )
 
-        if not self.pp_group().is_last_rank:
+        if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
@@ -363,8 +383,7 @@ class SolarModel(nn.Module):
         return hidden_states
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_parallel().tp_size
-        tp_rank = get_parallel().tp_rank
+        tp_rank, tp_size = self._kv_cache_parallel_layout
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,
@@ -380,12 +399,11 @@ class SolarModel(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 
 class SolarForCausalLM(nn.Module):
-
     packed_modules_mapping = {
         "qkv_proj": [
             ("q_proj", "q"),
@@ -423,7 +441,7 @@ class SolarForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = SolarModel(
@@ -440,13 +458,13 @@ class SolarForCausalLM(nn.Module):
                 org_num_embeddings=config.vocab_size,
                 padding_size=DEFAULT_VOCAB_PADDING_SIZE,
                 quant_config=quant_config,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
             if config.tie_word_embeddings and self.pp_group.is_first_rank:
                 self.lm_head.weight = self.model.embed_tokens.weight
 
-            logit_scale = getattr(config, "logit_scale", 1.0)
             self.logits_processor = LogitsProcessor(
-                self.unpadded_vocab_size, config.vocab_size, logit_scale
+                config, logit_scale=getattr(config, "logit_scale", None)
             )
         else:
             self.lm_head = PPMissingLayer()
@@ -457,16 +475,20 @@ class SolarForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, LogitsProcessorOutput]:
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, LogitsProcessorOutput, PPProxyTensors]:
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
             inputs_embeds=inputs_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if self.pp_group().is_last_rank:
-            logits = self.logits_processor(self.lm_head, hidden_states, forward_batch)
+        if self.pp_group.is_last_rank:
+            logits = self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
             return logits
 
         return hidden_states
@@ -475,12 +497,10 @@ class SolarForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-
             is_packed = False
             for packed_name, sources in self.packed_modules_mapping.items():
                 for src_name, shard_id in sources:
                     if src_name in name:
-
                         model_param_name = name.replace(src_name, packed_name)
 
                         if model_param_name in params_dict:

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.utils import (
     log_debug_on_rank0,
+    round_up,
 )
 
 logger = logging.getLogger(__name__)
@@ -20,12 +21,18 @@ def may_get_weight_block_size(model_config, load_config):
     from sglang.srt.model_loader.loader import _get_quantization_config
 
     quant_config = _get_quantization_config(model_config, load_config)
+    if quant_config is None:
+        return None
 
-    if quant_config is not None and hasattr(quant_config, "weight_block_size"):
-        return getattr(quant_config, "weight_block_size")
+    # Configs such as AutoRound declare weight_block_size=None alongside a real
+    # group_size, so test the value rather than the attribute.
+    weight_block_size = getattr(quant_config, "weight_block_size", None)
+    if weight_block_size is not None:
+        return weight_block_size
 
-    if quant_config is not None and hasattr(quant_config, "group_size"):
-        return [getattr(quant_config, "group_size")]
+    group_size = getattr(quant_config, "group_size", None)
+    if group_size is not None and group_size > 0:
+        return [group_size]
 
     return None
 
@@ -38,9 +45,9 @@ def get_moe_padding_size(weight_block_size):
             2,
         ], "Only len(weight_block_size) in [1, 2] is supported"
         if len(weight_block_size) == 2:
-            assert (
-                weight_block_size[0] == weight_block_size[1]
-            ), "Only weight_block_size[0] == weight_block_size[1] is supported"
+            assert weight_block_size[0] == weight_block_size[1], (
+                "Only weight_block_size[0] == weight_block_size[1] is supported"
+            )
         return weight_block_size[0]
 
     return DEFAULT_MOE_PADDING_SIZE
@@ -238,7 +245,6 @@ def adjust_config_with_unaligned_cpu_tp(
         model_config.num_attention_heads % tp_size != 0
         or model_config.get_total_num_kv_heads() % tp_size != 0
     ):
-
         if hasattr(model_config.hf_config, "qk_nope_head_dim") and hasattr(
             model_config.hf_config, "qk_rope_head_dim"
         ):
@@ -297,6 +303,17 @@ def adjust_config_with_unaligned_cpu_tp(
             model_config, moe_intermediate_attr, intermediate_padding_size
         )
 
+    if model_config.hf_config.model_type == "muse_glimmer":
+        projector_hidden_size = model_config.hf_config.projector_hidden_size
+        padded_projector_hidden_size = projector_hidden_size
+        if projector_hidden_size % tp_size != 0:
+            padded_projector_hidden_size = round_up(projector_hidden_size, tp_size * 32)
+        update_config(
+            model_config.hf_config,
+            "padded_projector_hidden_size",
+            padded_projector_hidden_size,
+        )
+
     multimodal_config = [
         [
             model_config.hf_config,
@@ -309,7 +326,14 @@ def adjust_config_with_unaligned_cpu_tp(
         [model_config.hf_config, "vision_config", "qwen3_vl", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_5_moe", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_5", "num_heads"],
+        [model_config.hf_config, "vision_config", "qwen4_exp", "num_heads"],
         [model_config.hf_config, "vision_config", "mllama", "attention_heads"],
+        [
+            model_config.hf_config,
+            "vision_config",
+            "muse_glimmer_vision",
+            "num_attention_heads",
+        ],
         [
             model_config.hf_config,
             "vision_config",
@@ -341,7 +365,9 @@ def adjust_config_with_unaligned_cpu_tp(
             and getattr(m_config, config_name) is not None
             and (
                 m_config.model_type == model_type
-                or getattr(m_config, config_name).model_type == model_type
+                # Not every sub-config declares model_type.
+                or getattr(getattr(m_config, config_name), "model_type", None)
+                == model_type
             )
         ):
             num_heads = getattr(getattr(m_config, config_name), num_head_str)

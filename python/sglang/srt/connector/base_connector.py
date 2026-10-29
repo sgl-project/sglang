@@ -73,7 +73,6 @@ class BaseConnector(ABC):
 
 
 class BaseKVConnector(BaseConnector):
-
     @abstractmethod
     def get(self, key: str) -> Optional[torch.Tensor]:
         raise NotImplementedError()

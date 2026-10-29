@@ -380,14 +380,14 @@ def test_plan_then_io_cuda_graph_replay() -> None:
         graph.replay()
         torch.cuda.synchronize()
         # Anchor slot table matches the synchronous layer-0 result.
-        assert torch.equal(
-            out.cpu(), ref_slots[s][0].cpu()
-        ), f"slots differ at step {s}"
+        assert torch.equal(out.cpu(), ref_slots[s][0].cpu()), (
+            f"slots differ at step {s}"
+        )
         # Every layer's device buffer stays bit-identical to synchronous swap-in.
         for layer in range(_PIO_LAYERS):
-            assert torch.equal(
-                buf[layer].cpu(), ref_snap[s][layer].cpu()
-            ), f"buffer differs at step {s}, layer {layer}"
+            assert torch.equal(buf[layer].cpu(), ref_snap[s][layer].cpu()), (
+                f"buffer differs at step {s}, layer {layer}"
+            )
 
 
 if __name__ == "__main__":

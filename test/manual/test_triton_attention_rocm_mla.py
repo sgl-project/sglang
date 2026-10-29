@@ -14,7 +14,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestTritonAttentionMLA(CustomTestCase):
-
     def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
         random.seed(seed)

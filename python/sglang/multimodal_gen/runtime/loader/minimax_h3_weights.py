@@ -5,10 +5,16 @@ from typing import Any
 
 from safetensors import safe_open
 
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+)
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    build_nvfp4_config_from_safetensors_list,
     inspect_comfy_quant_markers,
     resolve_comfy_checkpoint_quantization,
 )
@@ -23,13 +29,20 @@ def inspect_minimax_h3_safetensors(
 ) -> tuple[tuple[int, int] | None, dict[str, dict[str, Any]]]:
     """Read H3 architecture metadata and Comfy per-layer format markers."""
     adaln_curve_shape = None
-    layer_markers = inspect_comfy_quant_markers(safetensors_list)
+    mapping = get_param_names_mapping(MiniMaxH3DiTArchConfig().param_names_mapping)
+    layer_markers = inspect_comfy_quant_markers(
+        safetensors_list,
+        param_name_mapper=lambda prefix: mapping(f"{prefix}.weight")[0].removesuffix(
+            ".weight"
+        ),
+    )
 
     for path in safetensors_list:
         with safe_open(path, framework="pt", device="cpu") as checkpoint:
-            keys = checkpoint.keys()
-            if "adaln_t_table" in keys:
-                shape = tuple(checkpoint.get_slice("adaln_t_table").get_shape())
+            for key in checkpoint.keys():
+                if mapping(key)[0] != "adaln_t_table":
+                    continue
+                shape = tuple(checkpoint.get_slice(key).get_shape())
                 if len(shape) != 2 or shape[0] < 2:
                     raise ValueError(
                         "MiniMax-H3 adaln_t_table must have shape [N, D] with "
@@ -47,21 +60,51 @@ def inspect_minimax_h3_safetensors(
 
 def resolve_minimax_h3_checkpoint_quantization(
     layer_markers: dict[str, dict[str, Any]],
+    safetensors_list: list[str] | None = None,
+    param_names_mapping: dict | None = None,
+    reverse_param_names_mapping: dict | None = None,
 ) -> QuantizationConfig | None:
+    formats = {str(marker.get("format")) for marker in layer_markers.values()}
+    if "nvfp4" in formats:
+        unsupported = formats - {"nvfp4", "int8_tensorwise", "float8_e4m3fn"}
+        if unsupported:
+            raise NotImplementedError(
+                "Unsupported Comfy NVFP4 companion format(s): "
+                + ", ".join(sorted(unsupported))
+            )
+        if safetensors_list is None:
+            raise ValueError("MiniMax-H3 NVFP4 metadata requires checkpoint files")
+        config = build_nvfp4_config_from_safetensors_list(
+            safetensors_list,
+            param_names_mapping,
+            reverse_param_names_mapping,
+        )
+        if not isinstance(config, ModelOptFp4Config):
+            raise ValueError("Could not resolve MiniMax-H3 NVFP4 checkpoint layout")
+        config.set_comfy_layer_markers(layer_markers)
+        config.checkpoint_uses_comfy_quantization = True
+        config.checkpoint_uses_native_qkv_layout = True
+        config.checkpoint_weight_scale_layout = "swizzled"
+        config.swap_weight_nibbles = True
+        return config
     return resolve_comfy_checkpoint_quantization(layer_markers)
 
 
 def validate_minimax_h3_checkpoint_variant(
     checkpoint_paths: list[str], selected_variant: str
 ) -> None:
+    # hybrid is an explicit cross-partition override, not a filename heuristic
+    if selected_variant.strip().lower() == "hybrid":
+        return
     names = " ".join(path.lower() for path in checkpoint_paths)
-    checkpoint_variant = next(
-        (variant for variant in ("fl2va", "ref2va") if variant in names), None
-    )
+    checkpoint_variants = {
+        variant for variant in ("fl2va", "ref2va") if variant in names
+    }
     if (
-        checkpoint_variant is not None
-        and checkpoint_variant != selected_variant.lower()
+        len(checkpoint_variants) == 1
+        and selected_variant.lower() not in checkpoint_variants
     ):
+        (checkpoint_variant,) = checkpoint_variants
         raise ValueError(
             f"MiniMax-H3 checkpoint variant {checkpoint_variant!r} does not match "
             f"--model-variant {selected_variant!r}"
