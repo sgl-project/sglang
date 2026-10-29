@@ -1608,3 +1608,159 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 bench_env = None
             metrics = run_bench_serving(**bench_params, env=bench_env)
             assert_metrics(self, metrics)
+
+
+class TestNpuPerformanceTestCaseBaseV2(TestNpuPerformanceTestCaseBase):
+    """Extensible single-node base shared by the V2 multi-node classes."""
+
+    pass
+
+
+class TestNpuPerfMultiNodePdMixTestCaseBaseV2(TestNpuPerformanceTestCaseBaseV2):
+    model_config = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.local_ip = "127.0.0.1"
+        cls.host = os.getenv("POD_IP")
+        cls.port = SERVICE_PORT
+        cls.base_url = f"http://{cls.host}:{cls.port}"
+        cls.hostname = os.getenv("HOSTNAME")
+        cls.role = "master" if cls.hostname.endswith("sglang-node-0") else "worker"
+        logger.info(f"Init {cls.host} {cls.role=}!")
+
+        cls.model = cls.model_config.get("model_path")
+        other_args = cls.model_config.get("other_args")
+        cls.other_args = list(other_args) if other_args is not None else None
+
+        cls.start_pd_mix_master_node()
+        cls.start_pd_mix_worker_node()
+
+    @classmethod
+    def tearDownClass(cls):
+        pass
+
+    @classmethod
+    @check_role(allowed_roles=["master"])
+    def start_pd_mix_master_node(cls):
+        sglang_thread = threading.Thread(
+            target=launch_pd_mix_node, args=(cls.model_config,)
+        )
+        sglang_thread.start()
+
+        wait_server_ready(f"{cls.base_url}/health")
+
+        logger.info(
+            f"Wait {SERVER_INITIALIZATION_DELAY}s, starting run benchmark ......"
+        )
+        time.sleep(SERVER_INITIALIZATION_DELAY)
+
+    @classmethod
+    @check_role(allowed_roles=["worker"])
+    def start_pd_mix_worker_node(cls):
+        sglang_thread = threading.Thread(
+            target=launch_pd_mix_node, args=(cls.model_config,)
+        )
+        sglang_thread.start()
+
+        logger.info(
+            f"{cls.role} node started, keeping test alive for {MAX_SERVER_KEEP_ALIVE_TIME} seconds"
+        )
+        time.sleep(MAX_SERVER_KEEP_ALIVE_TIME)
+
+    @check_role(allowed_roles=["master", "worker"])
+    def run_throughput(self):
+        return super().run_throughput()
+
+
+class TestNpuPerfMultiNodePdSepTestCaseBaseV2(TestNpuPerformanceTestCaseBaseV2):
+    model_config = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.process = None
+        cls.local_ip = "127.0.0.1"
+        cls.host = os.getenv("POD_IP")
+        cls.port = SERVICE_PORT
+        cls.base_url = f"http://{cls.host}:{cls.port}"
+        cls.hostname = os.getenv("HOSTNAME")
+        cls.role = (
+            "router"
+            if "router" in cls.hostname
+            else "prefill"
+            if "prefill" in cls.hostname
+            else "decode"
+        )
+        logger.info(f"Init {cls.host} {cls.role=}!")
+
+        cls.model = cls.model_config.get("model_path")
+        decode_args = cls.model_config.get("decode_args")
+        cls.other_args = list(decode_args) if decode_args is not None else None
+
+        cls.start_pd_server()
+        cls.start_router_server()
+
+    @classmethod
+    def tearDownClass(cls):
+        logger.info("Start exec tearDownClass")
+        if cls.process:
+            try:
+                kill_process_tree(cls.process.pid)
+                for _ in range(60):
+                    if cls.process.poll() is not None:
+                        logger.info("Process fully exited")
+                        break
+                    time.sleep(1)
+                else:
+                    logger.warning("Process did NOT exit in time")
+            except Exception as e:
+                logger.error(f"Error during tearDown: {e}")
+        logger.info("tearDownClass finished")
+
+    @classmethod
+    @check_role(allowed_roles=["router"])
+    def start_router_server(cls):
+        wait_for_prefill_decode_exit(key=ACTIVE_TEST_CLASS, value=cls.__name__)
+        logger.info(f"Starting router in thread...")
+        sglang_thread = threading.Thread(target=launch_router, args=(cls.model_config,))
+        sglang_thread.daemon = True
+        sglang_thread.start()
+
+        health_check_url = f"{cls.base_url}/health"
+        logger.info(f"Waiting for router to be ready at {health_check_url}")
+        wait_server_ready(health_check_url)
+
+        logger.info(
+            f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
+        )
+        time.sleep(SERVER_INITIALIZATION_DELAY)
+
+    @classmethod
+    @check_role(allowed_roles=["prefill", "decode"])
+    def start_pd_server(cls):
+        logger.info(f"Starting pd separation node...")
+        cls.process = launch_pd_separation_node(cls.model_config)
+        logger.info(f"Pd separation node started with PID: {cls.process.pid}")
+
+        # Loop to check if the process is still running
+        while True:
+            configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
+            if configmap and configmap.data:
+                executing_class = configmap.data.get(ACTIVE_TEST_CLASS)
+                if executing_class and executing_class != cls.__name__:
+                    logger.info(f"Retrieved ConfigMap data: {configmap.data}")
+                    logger.info(f"[{cls.__name__}] exec completed, exiting waiter.")
+                    return
+            if cls.process.poll() is None:
+                # Process is still running
+                time.sleep(30)
+            else:
+                # Process has exited
+                exit_code = cls.process.poll()
+                raise Exception(
+                    f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
+                )
+
+    @check_role(allowed_roles=["router"])
+    def run_throughput(self):
+        return super().run_throughput()
