@@ -38,7 +38,8 @@ def _pin_until_freed(shape, dtype: torch.dtype) -> torch.Tensor:
             f"Paged experts: cudaHostRegister of {nbytes} bytes failed (error {rc})"
         )
     weakref.finalize(storage, _unregister, storage.data_ptr())
-    return torch.empty(0, dtype=dtype).set_(storage, 0, tuple(shape))
+    # On the CPU, as its storage, also under a default CUDA device (model construction).
+    return torch.empty(0, dtype=dtype, device="cpu").set_(storage, 0, tuple(shape))
 
 
 def _unregister(data_ptr: int) -> None:

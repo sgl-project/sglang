@@ -145,6 +145,21 @@ class TestPagedExpertsKernels(CustomTestCase):
         self.assertTrue(torch.equal(gpu[2].cpu(), host[5]))
         self.assertTrue(torch.equal(gpu[0].cpu(), host[63]))
 
+    def test_store_is_on_the_host_under_a_default_cuda_device(self):
+        """Models are constructed under ``torch.device("cuda")``; a store created there (by
+        a format that pages its loaded rows as they are) is still pinned host memory."""
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
+        with torch.device("cuda"):
+            host = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E).host[
+                "w"
+            ]
+        self.assertEqual(host.device.type, "cpu")
+        self.assertTrue(host.is_pinned())
+
     def test_store_unregisters_its_pages_once_the_last_tensor_is_freed(self):
         """The pinned pages stay registered while any tensor on them lives (here a slice that
         outlives the store and its tensor), and are unregistered once the last one is freed."""
