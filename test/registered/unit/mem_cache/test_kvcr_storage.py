@@ -43,10 +43,7 @@ from sglang.srt.mem_cache.storage.kvcr.host_layout import (
     resume_boundaries,
     storage_namespace,
 )
-from sglang.srt.mem_cache.storage.kvcr.kvcr_store import (
-    KVCRStore,
-    _allocate_dram_pool,
-)
+from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore, _allocate_dram_pool
 from sglang.srt.mem_cache.storage_key_binding import storage_key_to_event_hashes
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
@@ -145,7 +142,12 @@ class _CopyTransport:
         ]
 
     def submit_hint(self, hint, request_id=None):
-        self.hints[request_id] = hint
+        # KVCR's public API requires typed envelopes and typed actions.
+        if not isinstance(hint, msgspec.Struct) or not all(
+            isinstance(action, msgspec.Struct) for action in hint.actions
+        ):
+            raise ValueError("invalid router hint")
+        self.hints[request_id] = msgspec.to_builtins(hint)
 
     def discard_hint(self, request_id):
         del self.hints[request_id]
@@ -1244,18 +1246,18 @@ class TestKVCRStorage(CustomTestCase):
 
                     modules = {
                         "kvcr": SimpleNamespace(
-                            KVCR=construct, KVCRBindings=SimpleNamespace
+                            KVCR=construct,
+                            KVCRBindings=SimpleNamespace,
+                            ZmqPeerControlChannel=lambda **kwargs: SimpleNamespace(
+                                endpoint="tcp://127.0.0.1:32100", close=lambda: None
+                            ),
                         ),
                         "kvcr.config": SimpleNamespace(
                             KVCRBackendConfigs=SimpleNamespace,
                             KVCRConfig=SimpleNamespace,
                             LocalDramOptions=SimpleNamespace,
                         ),
-                        "kvcr.control_channels": SimpleNamespace(
-                            ZmqPeerControlChannel=lambda **kwargs: SimpleNamespace(
-                                endpoint="tcp://127.0.0.1:32100", close=lambda: None
-                            )
-                        ),
+                        "kvcr.control_channels": None,
                         "kvcr.types": SimpleNamespace(
                             KVCRStartupError=StartupError,
                             RegionDescriptor=SimpleNamespace,
