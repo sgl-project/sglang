@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import cache_once, device_guard, load_jit, make_cpp_args
 from sglang.kernels.ops.diffusion.rope.complex_rope_triton import _fuse_real_sin
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -75,7 +75,7 @@ def qknorm_complex_rope_cuda(
     """``rope(rmsnorm(x))`` for one ``[B, S, H, 128]`` tensor with packed head rows, out of place."""
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     module = _jit_module(_fuse_real_sin(x.device), False)
-    with torch.cuda.device(x.device):
+    with device_guard(x):
         module.norm_rope(x, out, weight, _rope_real(rope), float(eps))
     return out
 
@@ -107,7 +107,7 @@ def qknorm_complex_rope_pack_(
     token_rows = k_out[:, prefix:]
     copy_v = v_src is not None
     module = _jit_module(_fuse_real_sin(q.device), copy_v)
-    with torch.cuda.device(q.device):
+    with device_guard(q):
         module.norm_rope_pack(
             q,
             q_weight,

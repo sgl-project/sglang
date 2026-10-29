@@ -128,10 +128,15 @@ def _resolve_default_warmup_resolution(
     width = sampling_defaults.width
     height = sampling_defaults.height
     is_image_gen = server_args.pipeline_config.task_type.is_image_gen()
+    # graphs replay only the captured shape, so BCG skips the video area cap
     if (
         width is not None
         and height is not None
-        and (not server_based_warmup or is_image_gen)
+        and (
+            not server_based_warmup
+            or is_image_gen
+            or server_args.enable_breakable_cuda_graph is True
+        )
     ):
         return width, height
 
@@ -629,7 +634,14 @@ def build_warmup_reqs(
             num_inference_steps=sampling_defaults.num_inference_steps,
             num_frames=num_frames,
         )
-        if include_warmup_image:
+        if (
+            server_args.enable_breakable_cuda_graph is True
+            and sampling_defaults.image_path
+        ):
+            # Optional image conditioning changes the captured signature. Use
+            # the configured references rather than capturing text-only inputs.
+            req_kwargs["image_path"] = sampling_defaults.image_path
+        elif include_warmup_image:
             if warmup_input_path is None:
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"

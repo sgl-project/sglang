@@ -24,7 +24,7 @@ from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestBaseReasoningFormatDetector(CustomTestCase):
@@ -245,74 +245,6 @@ class TestDeepSeekV4Detector(CustomTestCase):
         self.assertEqual(detector.reasoning_default, "explicit_thinking")
         self.assertTrue(detector.thinks_internally)
 
-    def test_dsml_block_is_routed_out_of_reasoning(self):
-        """A DSML block that starts a line inside reasoning is routed to
-        normal_text so the tool call detector sees it, even without </think>."""
-        detector = ReasoningParser(model_type="deepseek-v4").detector
-        self.assertEqual(detector.tool_start_token, "<｜DSML｜tool_calls>")
-        self.assertTrue(detector.tool_start_at_line_start)
-
-        result = detector.parse_streaming_increment(
-            '<think>pick a tool\n\n<｜DSML｜tool_calls><｜DSML｜invoke name="s">'
-        )
-        self.assertEqual(result.reasoning_text, "pick a tool\n\n")
-        self.assertTrue(result.normal_text.startswith("<｜DSML｜tool_calls>"))
-
-    def test_dsml_mention_mid_sentence_stays_in_reasoning(self):
-        """The system prompt shows the model the DSML tag, so it may talk about
-        it while thinking. A mid-sentence mention must not end the block."""
-        detector = ReasoningParser(model_type="deepseek-v4").detector
-
-        result = detector.parse_streaming_increment(
-            "<think>I'll output a <｜DSML｜tool_calls> block with JSON.</think>done"
-        )
-        self.assertEqual(
-            result.reasoning_text, "I'll output a <｜DSML｜tool_calls> block with JSON."
-        )
-        self.assertEqual(result.normal_text, "done")
-
-    def test_truncated_calls_opener_is_not_flushed_into_reasoning(self):
-        """A generation cut off mid-calls-opener (e.g. max_tokens before `>`)
-        must not surface the partial tag in reasoning_content."""
-        for model, partial in (
-            ("deepseek-v4", "<｜DSML｜tool_calls"),
-            ("deepseek-v41", "<｜DSML｜ calls"),
-        ):
-            with self.subTest(model=model):
-                text = "Choosing a tool\n\n" + partial
-                detector = ReasoningParser(
-                    model_type=model, force_reasoning=True
-                ).detector
-                streamed = detector.parse_streaming_increment(text)
-                flushed = detector.finish()
-                reasoning = (streamed.reasoning_text or "") + (
-                    flushed.reasoning_text or ""
-                )
-                normal = (streamed.normal_text or "") + (flushed.normal_text or "")
-                self.assertEqual(reasoning, "Choosing a tool\n\n")
-                self.assertEqual(normal, "")
-
-                result = ReasoningParser(
-                    model_type=model, force_reasoning=True
-                ).detector.detect_and_parse(text)
-                self.assertEqual(result.reasoning_text, "Choosing a tool\n\n")
-                self.assertFalse(result.normal_text)
-
-    def test_mid_sentence_partial_calls_opener_stays_in_reasoning(self):
-        """A partial calls opener that does not begin a line is a mention,
-        not a call, and must survive the EOS flush."""
-        detector = ReasoningParser(
-            model_type="deepseek-v4", force_reasoning=True
-        ).detector
-        text = "mentioning <｜DSML｜tool"
-
-        streamed = detector.parse_streaming_increment(text)
-        flushed = detector.finish()
-
-        self.assertEqual(
-            (streamed.reasoning_text or "") + (flushed.reasoning_text or ""), text
-        )
-
 
 class TestInklingDetector(CustomTestCase):
     def test_streaming_routes_blocks_across_all_string_boundaries(self):
@@ -438,21 +370,6 @@ class TestKimiDetector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
 
 
-class TestKimiK2Detector(CustomTestCase):
-    """Test cases for KimiK2 detector with tool interruption support."""
-
-    def setUp(self):
-        self.detector = KimiK2Detector()
-
-    def test_init(self):
-        """Test KimiK2Detector initialization."""
-        self.assertEqual(self.detector.think_start_token, "<think>")
-        self.assertEqual(self.detector.think_end_token, "</think>")
-        self.assertEqual(self.detector.tool_start_token, "<|tool_calls_section_begin|>")
-        self.assertFalse(self.detector._in_reasoning)
-        self.assertTrue(self.detector.stream_reasoning)
-
-
 class TestGlm45Detector(CustomTestCase):
     """Test cases for GLM45 detector with tool interruption support."""
 
@@ -528,13 +445,6 @@ class TestGlm45Detector(CustomTestCase):
 class TestLing3Detector(CustomTestCase):
     def setUp(self):
         self.detector = Ling3Detector()
-
-    def test_init(self):
-        self.assertEqual(self.detector.tool_start_token, "<tool_call>")
-        self.assertEqual(self.detector.reasoning_default, "enable_thinking")
-        self.assertTrue(self.detector.thinks_internally)
-        self.assertTrue(self.detector._force_nonempty_content)
-        self.assertFalse(self.detector._in_reasoning)
 
     def test_tool_interrupt(self):
         text = "<think>I need a tool<tool_call>get_weather</tool_call>"
@@ -1199,74 +1109,6 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
             (one_shot.reasoning_text, one_shot.normal_text), ("lead<think>r", "tail")
         )
 
-    def test_dsv4_reasoning_quoting_dsml_is_chunk_invariant(self):
-        """A mid-sentence mention of the DSML tag stays in reasoning at every
-        chunk width and in one-shot parsing. Reachable because the DSV4 system
-        prompt shows that marker to the model."""
-        text = f"<think>format is <{self.DSML}tool_calls></think>answer"
-        self._assert_invariant(
-            DeepSeekV4Detector, text, (f"format is <{self.DSML}tool_calls>", "answer")
-        )
-
-    def test_dsv4_reasoning_mentioning_dsml_then_real_block(self):
-        """Mention inside reasoning, then a real block after </think>: the
-        mention stays in reasoning and the block reaches normal_text intact."""
-        tool_call = (
-            f"<{self.DSML}tool_calls>\n"
-            f'<{self.DSML}invoke name="s"></{self.DSML}invoke>\n'
-            f"</{self.DSML}tool_calls>"
-        )
-        text = (
-            f"<think>I'll use a <{self.DSML}tool_calls> block.</think>\n\n{tool_call}"
-        )
-        self._assert_invariant(
-            DeepSeekV4Detector,
-            text,
-            (f"I'll use a <{self.DSML}tool_calls> block.", f"\n\n{tool_call}"),
-        )
-
-    def test_dsv4_tool_block_after_think_end(self):
-        tool_call = (
-            f"<{self.DSML}tool_calls>"
-            f'<{self.DSML}invoke name="s"></{self.DSML}invoke>'
-            f"</{self.DSML}tool_calls>"
-        )
-        self._assert_invariant(
-            DeepSeekV4Detector,
-            f"<think>my reasoning</think>{tool_call}",
-            ("my reasoning", tool_call),
-        )
-
-    def test_dsv4_tool_block_without_think_end(self):
-        """A DSML block starting a line directly after reasoning must still be
-        routed to normal_text so the tool call detector can see it, including
-        when the preceding newline streamed out in an earlier chunk."""
-        tool_call = (
-            f"<{self.DSML}tool_calls>"
-            f'<{self.DSML}invoke name="s"></{self.DSML}invoke>'
-            f"</{self.DSML}tool_calls>"
-        )
-        for chunk_size in self.CHUNK_SIZES:
-            with self.subTest(chunk_size=chunk_size):
-                self.assertEqual(
-                    self._feed(
-                        DeepSeekV4Detector(),
-                        f"<think>my reasoning\n\n{tool_call}",
-                        chunk_size,
-                    ),
-                    ("my reasoning\n\n", tool_call),
-                )
-
-    def test_dsv4_tool_block_mid_line_without_think_end_stays_in_reasoning(self):
-        """Accepted tradeoff: a block that neither follows </think> nor starts a
-        line is indistinguishable from a mention, so it is left in reasoning."""
-        tool_call = f"<{self.DSML}tool_calls></{self.DSML}tool_calls>"
-        self._assert_invariant(
-            DeepSeekV4Detector,
-            f"<think>my reasoning {tool_call}",
-            (f"my reasoning {tool_call}", ""),
-        )
-
 
 class TestGptOssDetector(CustomTestCase):
     """Test cases for GptOssDetector which delegates to HarmonyParser."""
@@ -1341,6 +1183,18 @@ class TestMiniMaxM3Detector(CustomTestCase):
     def test_plain_reply_untouched(self):
         result = self._detector().detect_and_parse("Just a normal answer.")
         self.assertEqual(result.normal_text, "Just a normal answer.")
+
+    def test_only_m3_declares_a_self_opened_think_start(self):
+        tokenizer = type(
+            "Tok", (), {"encode": lambda self, text, add_special_tokens: [len(text)]}
+        )()
+        self.assertEqual(
+            self._detector().get_self_opened_think_start_token_ids(tokenizer),
+            [len("<mm:think>")],
+        )
+        self.assertIsNone(
+            Qwen3Detector().get_self_opened_think_start_token_ids(tokenizer)
+        )
 
     def test_real_reasoning_block_non_stream(self):
         result = self._detector().detect_and_parse(
@@ -1798,6 +1652,69 @@ class TestGraniteThinkingDetector(CustomTestCase):
         reasoning, normal = parser.parse_non_stream("<think>truncated")
         self.assertEqual(reasoning, "")
         self.assertEqual(normal, "truncated")
+
+
+class TestMuseSparkReasoningParser(CustomTestCase):
+    # Contract: meta-models/Muse-Spark-open-816B-A42B-NVFP4 at
+    # 7ea492f704b13336c1f7dab909c70d9e4a8beabc, tokenizer_config.json's
+    # response_template and chat_template.jinja. Expectations are literal.
+    def _assert_parses(self, text, expected):
+        self.assertEqual(ReasoningParser("muse").parse_non_stream(text), expected)
+        for size in (1, 7, len(text)):
+            with self.subTest(chunk_size=size):
+                parser = ReasoningParser("muse")
+                reasoning, content = "", ""
+                for i in range(0, len(text), size):
+                    thought, normal = parser.parse_stream_chunk(text[i : i + size])
+                    reasoning += thought
+                    content += normal
+                thought, normal = parser.parse_stream_end()
+                self.assertEqual((reasoning + thought, content + normal), expected)
+                self.assertEqual(parser.parse_stream_end(), ("", ""))
+
+    def test_self_channel_is_reasoning_and_user_channel_is_content(self):
+        # Generation starts after the template's <|start|>assistant prefix.
+        for prefix in ("", "<|start|>assistant"):
+            with self.subTest(prefix=prefix):
+                self._assert_parses(
+                    prefix + " to=self<|message|>Let me think.<|eom|>"
+                    "<|start|>assistant to=user<|message|>42.<|eot|>",
+                    ("Let me think.", "42."),
+                )
+
+    def test_user_and_commentary_join_without_protocol_tokens(self):
+        self._assert_parses(
+            " to=commentary<|message|>First update.<|eom|>"
+            "<|start|>assistant to=commentary<|message|>Second update.<|eom|>"
+            "<|start|>assistant to=user<|message|>Final answer.<|eot|>",
+            ("", "First update.Second update.Final answer."),
+        )
+
+    def test_content_accepts_both_message_and_turn_terminators(self):
+        for recipient in ("user", "commentary"):
+            for terminator in ("<|eom|>", "<|eot|>"):
+                with self.subTest(recipient=recipient, terminator=terminator):
+                    self._assert_parses(
+                        f" to={recipient}<|message|>  answer\n{terminator}",
+                        ("", "  answer\n"),
+                    )
+
+    def test_truncated_body_stays_in_its_channel(self):
+        for recipient, expected in (
+            ("self", ("unfinished", "")),
+            ("user", ("", "unfinished")),
+            ("commentary", ("", "unfinished")),
+        ):
+            with self.subTest(recipient=recipient):
+                self._assert_parses(f" to={recipient}<|message|>unfinished", expected)
+
+    def test_atem_example_in_reasoning_is_not_visible_content(self):
+        quoted = '<atem:invoke name="report"></atem:invoke>'
+        self._assert_parses(
+            f" to=self<|message|>Consider {quoted}.<|eom|>"
+            "<|start|>assistant to=user<|message|>No tool needed.<|eot|>",
+            (f"Consider {quoted}.", "No tool needed."),
+        )
 
 
 class TestReasoningParserNames(CustomTestCase):

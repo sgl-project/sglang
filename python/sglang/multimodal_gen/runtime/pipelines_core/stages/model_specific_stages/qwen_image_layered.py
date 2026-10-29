@@ -122,6 +122,8 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.vl_processor = processor
         self.tokenizer_max_length = 1024
         self.latent_channels = self.vae.z_dim if getattr(self, "vae", None) else 16
+        # (dtype, device) -> latent mean/std, uploaded once
+        self.latent_stats = {}
 
         self.prompt_template_encode = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
         self.prompt_template_encode_start_idx = 34
@@ -140,7 +142,6 @@ colors, textures, atmosphere, and so on\n - Identify the text clearly visible in
 explanation, and highlight it in the caption with quotation marks\n3. Maintain authenticity and accuracy:\n - Avoid
 generalizations\n - Describe all visible information in the image, while do not add information not explicitly shown in
 the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"""
-        self.default_sample_size = 128
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -320,16 +321,18 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
                 image_latents = retrieve_latents(
                     self.vae.encode(image), generator=generator, sample_mode="argmax"
                 )
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.latent_channels, 1, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std)
-            .view(1, self.latent_channels, 1, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
-        )
+        stats_key = (image_latents.dtype, image_latents.device)
+        if stats_key not in self.latent_stats:
+            self.latent_stats[stats_key] = tuple(
+                torch.tensor(values)
+                .view(1, self.latent_channels, 1, 1, 1)
+                .to(image_latents.device, image_latents.dtype)
+                for values in (
+                    self.vae.config.latents_mean,
+                    self.vae.config.latents_std,
+                )
+            )
+        latents_mean, latents_std = self.latent_stats[stats_key]
         image_latents = (image_latents - latents_mean) / latents_std
         return image_latents
 

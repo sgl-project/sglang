@@ -34,7 +34,10 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
 # Configs
-from sglang.srt.configs.model_config import load_decision_config
+from sglang.srt.configs.model_config import (
+    load_decision_config,
+    load_joint_head_config,
+)
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -42,6 +45,7 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
+from sglang.srt.distributed import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -54,6 +58,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
+from sglang.srt.layers.joint_schema_head import JointSchemaHead, JointSchemaPooler
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -65,6 +70,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 
 # Layers - Others
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    NORM_QUANT_READOUT,
     Fp8Input,
     NormQuantReadout,
 )
@@ -178,6 +184,11 @@ _qknorm_use_alt_stream = _is_cuda or (
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
+_gdn_online_mxfp4 = (
+    ("in_proj_qkvz", "out_proj")
+    if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
+    else ()
+)
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
@@ -246,6 +257,27 @@ def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
 
         return CuteDSLFusion()
     return None
+
+
+def _qwen3_5_is_moe(config: Qwen3_5TextConfig) -> bool:
+    """Whether the model's layers run sparse MoE blocks rather than dense MLPs:
+    every layer of either kind alike."""
+    return config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES
+
+
+def _qwen3_5_stage_facts(
+    config: Qwen3_5TextConfig, layer_id: int, *, attn_read=NORM_QUANT_READOUT
+):
+    """The attention and FFN stages a Qwen3.5 layer of either kind declares:
+    the model's shared declaration function (see make_layers), which the
+    layer declares itself with. ``attn_read`` is the layer's own attention
+    read, which declares what the plain one does and also hands on the
+    quantized input its projection takes."""
+    sparse = _qwen3_5_is_moe(config)
+    return (
+        declare_attn(read=attn_read),
+        declare_ffn(sparse=sparse, next_layer_sparse=sparse),
+    )
 
 
 if _is_cuda:
@@ -320,6 +352,9 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 
 
 if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_mrope import (
+        triton_split_qkv_rmsnorm_mrope,
+    )
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
     )
@@ -497,6 +532,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
+
+        if _gdn_online_mxfp4 and config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+            from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+                AiterMxfp4OnlineLinearMethod,
+            )
+
+            # The loader quantizes these in process_weights_after_loading.
+            # gemm_a4w4 needs N, K % 256 == 0; other shapes stay BF16.
+            for name in _gdn_online_mxfp4:
+                proj = getattr(self, name)
+                if (
+                    isinstance(proj.quant_method, UnquantizedLinearMethod)
+                    and proj.weight.dtype == torch.bfloat16
+                    and all(d % 256 == 0 for d in proj.weight.shape)
+                ):
+                    proj.quant_method = AiterMxfp4OnlineLinearMethod()
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -972,16 +1023,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
 
         use_strided_prefill_z = False
-        use_fused_decode_proj_conv = (
+        packed_verify = False
+        if forward_batch.forward_mode.is_target_verify():
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            backend = get_attn_backend()
+            backend = getattr(backend, "linear_attn_backend", backend)
+            packed_verify = getattr(backend, "supports_packed_verify", False)
+        use_fused_proj_conv = (
             _gdn_decode_fused_proj_conv
-            and forward_batch.forward_mode.is_decode()
+            and (forward_batch.forward_mode.is_decode() or packed_verify)
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)
         )
         use_fused_contiguous_unpack = (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
         )
-        if use_fused_decode_proj_conv:
+        if use_fused_proj_conv:
             # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
             # it replaces these temporary B/A placeholders before recurrence.
             mixed_qkv = (projected_states_qkvz, projected_states_ba)
@@ -995,8 +1053,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+            # The strided views feed only prefill GDN; DP-relabeled decode rows
+            # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
+                _is_cuda
+                and forward_batch.logical_forward_mode.is_extend_without_speculative()
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
@@ -1029,11 +1090,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             a=a,
             b=b,
         )
-        if use_fused_decode_proj_conv:
+        if use_fused_proj_conv:
             if not isinstance(attn_result, tuple) or len(attn_result) != 2:
                 raise RuntimeError(
-                    "Fused GDN decode projection/Conv1D backend must return "
-                    "(core_attn_out, z)"
+                    "Fused GDN projection/Conv1D backend must return (core_attn_out, z)"
                 )
             core_attn_out, z = attn_result
         else:
@@ -1083,6 +1143,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 class Qwen3_5LinearDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
 
+    stage_facts = staticmethod(_qwen3_5_stage_facts)
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1103,7 +1165,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # NOTE: Determine the MLP type based on the model type
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
-        if config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
+        if _qwen3_5_is_moe(config):
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -1119,8 +1181,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
-            is_layer_sparse = True
-            is_next_layer_sparse = True
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -1132,8 +1192,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 reduce_results=False,
             )
             _maybe_enable_silu_fp4_quant_fusion(self.mlp)
-            is_layer_sparse = False
-            is_next_layer_sparse = False
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
@@ -1148,28 +1206,16 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         boundary_fusions = _layer_fusions(config, is_nextn)
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
+            attn, ffn = self.stage_facts(
+                config,
+                layer_id,
+                attn_read=NormQuantReadout(
+                    fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
+                ),
+            )
             self.attn_boundary, self.ffn_boundary = append_stages(
-                (
-                    declare_attn(
-                        read=NormQuantReadout(
-                            fp8_input=Fp8Input.TUPLE_AND_BF16
-                            if accepts_fp8_input
-                            else None
-                        )
-                    ),
-                    self.input_layernorm,
-                    {
-                        "fusions": boundary_fusions,
-                    },
-                ),
-                (
-                    declare_ffn(
-                        sparse=is_layer_sparse,
-                        next_layer_sparse=is_next_layer_sparse,
-                    ),
-                    self.post_attention_layernorm,
-                    {"fusions": boundary_fusions},
-                ),
+                (attn, self.input_layernorm, {"fusions": boundary_fusions}),
+                (ffn, self.post_attention_layernorm, {"fusions": boundary_fusions}),
             )
 
     def forward(
@@ -1209,8 +1255,35 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return ffn_exit.finish(hidden_states)
 
 
+def _refreshes_rope_cos_sin(
+    config: Qwen3_5TextConfig, layer_id: int, is_nextn: bool
+) -> bool:
+    """rotary_emb is shared by all layers, so its per-forward cos/sin is refreshed
+    once, at the first full-attention layer this PP stage owns.
+
+    layer_id must be a full-attention layer; linear-attention layers near the
+    stage start would also pass the check below. Only Qwen3_5AttentionDecoderLayer
+    calls this, and it is built only for "attention" entries of layers_block_type.
+    """
+    # Drafts keep the unsplit numbering.
+    stage_start = 0
+    if not is_nextn:
+        stage_start, _ = get_pp_indices(
+            config.num_hidden_layers,
+            get_parallel().pp_rank,
+            get_parallel().pp_size,
+        )
+    owned_by_stage = layer_id >= stage_start
+    # Full-attention layers are interval apart, so only the stage's first one
+    # lies within interval of its start.
+    first_in_stage = layer_id < stage_start + config.full_attention_interval
+    return owned_by_stage and first_in_stage
+
+
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
+
+    stage_facts = staticmethod(_qwen3_5_stage_facts)
 
     def __init__(
         self,
@@ -1227,6 +1300,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
+        self.refreshes_rope_cos_sin = _refreshes_rope_cos_sin(
+            config, layer_id, is_nextn
+        )
         # A Qwen3.5 draft is rewritten to the MTP arch (model_config._config_draft_model),
         # so is_nextn marks it. Drafts are TP-sharded and do not replicate KV under DCP.
         dcp_size = 1 if is_nextn else get_parallel().attn_dcp_size
@@ -1323,9 +1399,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
-            is_layer_sparse = False
-            is_next_layer_sparse = False
-        elif config.model_type in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
+        elif _qwen3_5_is_moe(config):
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -1341,8 +1415,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
-            is_layer_sparse = True
-            is_next_layer_sparse = True
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
@@ -1360,26 +1432,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         boundary_fusions = _layer_fusions(config, is_nextn)
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
+            attn, ffn = self.stage_facts(
+                config,
+                layer_id,
+                attn_read=NormQuantReadout(
+                    fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
+                ),
+            )
             self.attn_boundary, self.ffn_boundary = append_stages(
-                (
-                    declare_attn(
-                        read=NormQuantReadout(
-                            fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
-                        )
-                    ),
-                    self.input_layernorm,
-                    {
-                        "fusions": boundary_fusions,
-                    },
-                ),
-                (
-                    declare_ffn(
-                        sparse=is_layer_sparse,
-                        next_layer_sparse=is_next_layer_sparse,
-                    ),
-                    self.post_attention_layernorm,
-                    {"fusions": boundary_fusions},
-                ),
+                (attn, self.input_layernorm, {"fusions": boundary_fusions}),
+                (ffn, self.post_attention_layernorm, {"fusions": boundary_fusions}),
             )
 
         self.alt_stream = alt_stream
@@ -1503,10 +1565,34 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
+    def forward_prepare_npu_prefill(self, positions, hidden_states):
+        rotary_emb = self.rotary_emb
+        if not getattr(rotary_emb, "mrope_section", None):
+            return self.forward_prepare_native(positions, hidden_states)
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        if positions.ndim == 1:
+            positions = positions.expand(3, -1)
+        cos_sin = rotary_emb.cos_sin_cache[positions].to(qkv)
+        q, k, v, gate = triton_split_qkv_rmsnorm_mrope(
+            qkv=qkv,
+            q_weight=self.q_norm.gemma_weight,
+            k_weight=self.k_norm.gemma_weight,
+            cos_sin=cos_sin,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            mrope_section=rotary_emb.mrope_section,
+            is_interleaved=rotary_emb.mrope_interleaved,
+            rope_dim=rotary_emb.rotary_dim,
+            has_gate=self.attn_output_gate,
+        )
+        return q, k, v, gate if self.attn_output_gate else None
+
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-        # Calculate first full attention layer ID based on config
-        if self.attn.layer_id == (self.config.full_attention_interval - 1):
+        if self.refreshes_rope_cos_sin:
             self.rotary_emb.get_cos_sin_with_position(positions)
 
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
@@ -1539,11 +1625,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        if (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or not self.attn_output_gate
-        ):
+        if _is_npu and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            return self.forward_prepare_npu_prefill(positions, hidden_states)
+        if not _is_npu or not self.attn_output_gate:
             return self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1748,6 +1832,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             config.num_hidden_layers,
             get_layer,
             prefix=f"{prefix}.layers",
+            # The layer type chosen for each index declares its stages.
+            stage_facts=lambda idx: self.decoder_layer_types[
+                config.layers_block_type[idx]
+            ].stage_facts(config, idx),
         )
 
         self.flashinfer_mnnvl_cutedsl_fusion = None
@@ -1811,13 +1899,24 @@ class Qwen3_5ForCausalLM(nn.Module):
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
         if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
             packed = 0
+            mxfp4 = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
+                    mxfp4 += sum(
+                        hasattr(getattr(module, name, None), "mxfp4_preshuffle_tuned")
+                        for name in _gdn_online_mxfp4
+                    )
                     module.finalize_fused_in_proj()
                     packed += int(module._fused_in_proj_weight is not None)
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
+            if _gdn_online_mxfp4:
+                logger.info(
+                    "Online MXFP4 GDN %s: %d projections",
+                    ",".join(_gdn_online_mxfp4),
+                    mxfp4,
+                )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
@@ -2330,6 +2429,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
 
+        if config.architectures == ["Qwen3_5ForConditionalGeneration"]:
+            model = get_model()
+            joint_head_config = load_joint_head_config(model.model_path, model.revision)
+            if joint_head_config is not None:
+                # A Clef checkpoint, whose joint schema head scores every option
+                # of every question from the final hidden states and LM head rows.
+                self.pooler = JointSchemaPooler(
+                    JointSchemaHead(**joint_head_config), lambda: self.lm_head.weight
+                )
+
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
@@ -2470,7 +2579,22 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if bare_backbone and self.pp_group.is_last_rank:
             self._load_decision_readout()
             loaded_params.add("lm_head.weight")
+        if isinstance(self.pooler, JointSchemaPooler):
+            self._load_joint_head()
+            loaded_params.update(
+                f"pooler.head.{name}" for name, _ in self.pooler.head.named_parameters()
+            )
         return loaded_params
+
+    def _load_joint_head(self) -> None:
+        """Load joint_head.safetensors, which the checkpoint index leaves out."""
+        model = get_model()
+        state_dict = load_file(
+            cached_file(
+                model.model_path, "joint_head.safetensors", revision=model.revision
+            )
+        )
+        self.pooler.head.load_state_dict(state_dict, strict=True)
 
     def _load_decision_readout(self) -> None:
         """Place the checkpoint's decision readout in the LM head rows of its codes."""
