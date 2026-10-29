@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -44,6 +45,10 @@ class _FakeKVPool:
     def __init__(self, k_cache, v_cache):
         self.k_cache = k_cache
         self.v_cache = v_cache
+        self.start_layer = 0
+        self.layer_num = 1
+        self.layer_transfer_counter = None
+        self.layer_router = PlainPoolRouter(self, "full")
 
     def get_kv_buffer(self, _layer_id):
         return self.k_cache, self.v_cache
