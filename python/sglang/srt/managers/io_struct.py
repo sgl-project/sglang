@@ -1999,6 +1999,17 @@ class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     num_paused_requests: int = 0
 
 
+class UpdateWeightsFromModelExpressReqInput(BaseReq, kw_only=True):
+    weight_version: str
+    flush_cache: bool = True
+    torch_empty_cache: bool = False
+
+
+class ModelExpressWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+
+
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     names: List[str]
     dtypes: List[str]
