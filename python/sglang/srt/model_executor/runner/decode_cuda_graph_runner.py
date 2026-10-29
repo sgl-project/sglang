@@ -1655,6 +1655,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return dataclasses.replace(
                 output,
                 next_token_logits=next_token_logits,
+                deferred_verify_logits=(
+                    output.deferred_verify_logits[: self.raw_num_token]
+                    if output.deferred_verify_logits is not None
+                    else None
+                ),
                 full_logits=full_logits,
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]

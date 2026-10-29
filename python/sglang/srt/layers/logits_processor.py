@@ -281,6 +281,12 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
+    # Frozen-KV XPU verification can finalize BF16 logits after graph replay.
+    # Request-dependent penalties/logprobs determine whether to reduce directly
+    # or materialize the ordinary FP32 logits. These are never sampler logits.
+    deferred_verify_logits: Optional[torch.Tensor] = None
+    deferred_verify_softcap: Optional[float] = None
+
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
             return
@@ -450,9 +456,11 @@ class LogitsProcessor(nn.Module):
         skip_all_gather: bool = False,
         logit_scale: Optional[float] = None,
         return_full_logits: bool = False,
+        defer_xpu_verify_logits: bool = False,
     ):
         super().__init__()
         self.config = config
+        self.defer_xpu_verify_logits = defer_xpu_verify_logits
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
@@ -517,6 +525,22 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[AuxHiddenStates] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
+        # Capture eligibility is static. Request-dependent eligibility is checked
+        # after replay, so a graph cannot retain an earlier request's policy.
+        defer_verify = (
+            self.defer_xpu_verify_logits
+            and hidden_states.device.type == "xpu"
+            and hidden_states.dtype == torch.bfloat16
+            and isinstance(logits_metadata, ForwardBatch)
+            and logits_metadata.forward_mode.is_target_verify()
+            and logits_metadata.spec_algorithm is not None
+            and logits_metadata.spec_algorithm.is_frozen_kv_mtp()
+            and not self.do_tensor_parallel_all_gather
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and not self.return_full_logits
+            and not self.use_fp32_lm_head
+            and self.rl_on_policy_target is None
+        )
         # Extract MIS / setwise indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
         token_indices_to_pool = None
@@ -595,14 +619,24 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            logits = self._get_logits(
+                pruned_states,
+                lm_head,
+                logits_metadata,
+                defer_cast_softcap=defer_verify,
+            )
+            deferred = defer_verify and logits.dtype == torch.bfloat16
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
 
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
-                next_token_logits=sampled_logits,
+                next_token_logits=None if deferred else sampled_logits,
+                deferred_verify_logits=sampled_logits if deferred else None,
+                deferred_verify_softcap=self.final_logit_softcapping
+                if deferred
+                else None,
                 hidden_states=hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
@@ -872,6 +906,7 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
         use_logits_buffer: bool = True,
+        defer_cast_softcap: bool = False,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -944,6 +979,9 @@ class LogitsProcessor(nn.Module):
             _trace_e2e_logits(
                 "dp_logits_scatter_returned", logits_shape=tuple(logits.shape)
             )
+
+        if defer_cast_softcap and logits.dtype == torch.bfloat16:
+            return logits[:, : self.vocab_size]
 
         fuse_cast_softcap = (
             self.final_logit_softcapping

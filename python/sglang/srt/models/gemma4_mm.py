@@ -272,7 +272,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             self.lm_head = PPMissingLayer()
 
         # Create logits processor for the multimodal model
-        self.logits_processor = LogitsProcessor(config.text_config)
+        self.logits_processor = LogitsProcessor(
+            config.text_config, defer_xpu_verify_logits=True
+        )
         self.capture_aux_hidden_states = False
 
         self.post_init()
