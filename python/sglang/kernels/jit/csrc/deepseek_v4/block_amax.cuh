@@ -1,5 +1,6 @@
 #pragma once
 
+#include <sgl_kernel/once.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -130,16 +131,15 @@ template <bool kPDL, typename InT, typename OutT>
 struct BlockAmaxKernel {
   static uint32_t max_grid_y(int device_id, uint32_t rows) {
     using C = BlockAmaxConfig<InT, OutT>;
-    static uint32_t resident_ctas[64] = {};
-    if (resident_ctas[device_id] == 0) {
+    if (rows == 0) return 1;
+    const uint32_t resident_ctas = host::init_once(device_id, [device_id] {
       int sms = 0, ctas_per_sm = 0;
       host::RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device_id));
       host::RuntimeDeviceCheck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
           &ctas_per_sm, amax8_varlen_kernel<kPDL, InT, OutT>, C::kBlockSize, 0));
-      resident_ctas[device_id] = static_cast<uint32_t>(sms * ctas_per_sm);
-    }
-    const auto resident = resident_ctas[device_id] * C::kWaves;
-    return std::max(1u, (resident + rows - 1) / std::max(rows, 1u));
+      return static_cast<uint32_t>(sms * ctas_per_sm);
+    });
+    return std::max(1u, host::div_ceil(resident_ctas * C::kWaves, rows));
   }
 
   static void amax8_varlen(

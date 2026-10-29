@@ -91,5 +91,59 @@ def test_empty_mhc_view_clears_idle_dispatch() -> None:
     torch.testing.assert_close(buf_weights, torch.zeros_like(buf_weights))
 
 
+def _reference_mxfp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    groups = x.float().unflatten(-1, (-1, 32))
+    absmax = groups.abs().amax(-1).clamp_min(1e-10)
+    bits = (absmax / 448.0).view(torch.int32)
+    ue8m0 = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    inv_scale = ((254 - ue8m0) << 23).view(torch.float32)
+    q = (groups * inv_scale[..., None]).clamp(-448.0, 448.0).flatten(-2)
+    return q.to(torch.float8_e4m3fn), ue8m0.to(torch.uint8)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="Requires Blackwell GPU (sm_100+)",
+)
+@pytest.mark.parametrize("top_k", [6, 384])
+def test_hidden_5120_matches_reference(top_k: int) -> None:
+    """hidden 5120 runs two chunks per thread on 1024-thread SMs unless top_k needs a full block."""
+    torch.manual_seed(0)
+    num_tokens, padded_max, hidden = 198, 512, 5120
+    num_groups = hidden // 32
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16) * 3
+    topk_idx = torch.randint(
+        0, 384, (num_tokens, top_k), device="cuda", dtype=torch.int32
+    )
+    topk_weights = torch.rand(num_tokens, top_k, device="cuda", dtype=torch.float32)
+    buf_x = torch.empty(padded_max, hidden, device="cuda", dtype=torch.float8_e4m3fn)
+    buf_x_sf = torch.empty(
+        padded_max, num_groups // 4, device="cuda", dtype=torch.int32
+    )
+    buf_topk_idx = torch.empty(padded_max, top_k, device="cuda", dtype=torch.int64)
+    buf_topk_weights = torch.empty(
+        padded_max, top_k, device="cuda", dtype=torch.float32
+    )
+
+    mega_moe_pre_dispatch(
+        x,
+        topk_idx,
+        topk_weights,
+        buf_x,
+        buf_x_sf,
+        buf_topk_idx,
+        buf_topk_weights,
+    )
+    torch.cuda.synchronize()
+
+    ref_q, ref_sf = _reference_mxfp8(x)
+    assert torch.equal(buf_x[:num_tokens].view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(buf_x_sf[:num_tokens].view(torch.uint8), ref_sf)
+    assert torch.equal(buf_topk_idx[:num_tokens], topk_idx.to(torch.int64))
+    assert torch.equal(buf_topk_weights[:num_tokens], topk_weights)
+    assert torch.all(buf_topk_idx[num_tokens:] == -1)
+    assert torch.all(buf_topk_weights[num_tokens:] == 0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

@@ -1,3 +1,4 @@
+#include <sgl_kernel/once.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -184,12 +185,11 @@ struct MegaMoEPreDispatchKernel {
       mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true, 1, kWriteSharedSF, kCopyTopk>;
 
   static int max_threads_per_sm(int device_id) {
-    static int cached[64] = {};
-    if (cached[device_id] == 0) {
-      host::RuntimeDeviceCheck(
-          cudaDeviceGetAttribute(&cached[device_id], cudaDevAttrMaxThreadsPerMultiProcessor, device_id));
-    }
-    return cached[device_id];
+    return host::init_once(device_id, [device_id] {
+      int threads = 0;
+      host::RuntimeDeviceCheck(cudaDeviceGetAttribute(&threads, cudaDevAttrMaxThreadsPerMultiProcessor, device_id));
+      return threads;
+    });
   }
 
   static void
@@ -269,7 +269,7 @@ struct MegaMoEPreDispatchKernel {
     const auto num_chunks = hidden / 8u;
     const bool one_chunk_per_thread = num_chunks <= kMaxBlockThreads;
     const bool two_chunks_per_thread =
-        one_chunk_per_thread && num_chunks % (2u * device::kWarpThreads) == 0 &&
+        one_chunk_per_thread && num_chunks % (2u * device::kWarpThreads) == 0 && top_k <= num_chunks / 2u &&
         2u * num_chunks > static_cast<uint32_t>(max_threads_per_sm(device.unwrap().device_id));
     const uint32_t chunks_per_thread = two_chunks_per_thread ? 2u : 1u;
     const auto block_size = std::min(num_chunks, kMaxBlockThreads) / chunks_per_thread;
@@ -297,8 +297,7 @@ struct MegaMoEPreDispatchKernel {
 
     const auto pad_slots = kCopyTopk ? (padded_max - num_tokens) * top_k : 0u;
     const uint32_t pad_slots_per_block = block_size * chunks_per_thread;
-    const uint32_t num_pad_blocks =
-        pad_slots == 0 ? 0u : ((pad_slots + pad_slots_per_block - 1u) / pad_slots_per_block);
+    const uint32_t num_pad_blocks = div_ceil(pad_slots, pad_slots_per_block);
     const auto num_total_blocks = num_tokens + num_pad_blocks;
 
     const auto params = MegaMoEPreDispatchParams{
@@ -321,16 +320,10 @@ struct MegaMoEPreDispatchKernel {
     };
 
     if (num_total_blocks == 0) return;
-    if (two_chunks_per_thread) {
-      LaunchKernel(num_total_blocks, block_size, device.unwrap())  //
-          .enable_pdl(kUsePDL)(kernel_two_chunks, params);
-    } else if (one_chunk_per_thread) {
-      LaunchKernel(num_total_blocks, block_size, device.unwrap())  //
-          .enable_pdl(kUsePDL)(kernel_one_chunk, params);
-    } else {
-      LaunchKernel(num_total_blocks, block_size, device.unwrap())  //
-          .enable_pdl(kUsePDL)(kernel_multi_chunk, params);
-    }
+    const auto kernel = two_chunks_per_thread  ? kernel_two_chunks
+                        : one_chunk_per_thread ? kernel_one_chunk
+                                               : kernel_multi_chunk;
+    LaunchKernel(num_total_blocks, block_size, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 
