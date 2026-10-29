@@ -143,9 +143,10 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
 
 
 class VocabShard(msgspec.Struct, frozen=True):
-    """Where a rank's vocab slice starts, and the gather over its group."""
+    """A rank's vocab slice [start, start + width), and the gather over its group."""
 
     start: int
+    width: int
     gather: VocabGather
 
 
@@ -233,7 +234,7 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         )
         if group.rank_in_group == 0:
             logger.info(f"DSpark markov_w2 vocab gather: {type(gather).__name__}")
-        self.vocab_shard = VocabShard(start=start, gather=gather)
+        self.vocab_shard = VocabShard(start=start, width=end - start, gather=gather)
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -771,8 +772,8 @@ class DSparkDraftMixin:
                 return None
             if attn.k_norm.variance_epsilon != eps:
                 return None
-            k_buf = pool.get_key_buffer(attn.attn.layer_id)
-            v_buf = pool.get_value_buffer(attn.attn.layer_id)
+            k_buf = pool.layer_router.read(attn.attn.layer_id).key()
+            v_buf = pool.layer_router.read(attn.attn.layer_id).value()
             nh = kv_size // head_dim
             # A bf16 pool stores K/V unscaled (set_kv_buffer applies k/v scales
             # only when quantizing), so layer scales do not gate the fused write.
@@ -928,7 +929,7 @@ class DSparkDraftMixin:
             else:
                 # `cache_loc` comes from `TargetHiddenKvInjector.ids_for`,
                 # already in the ids the draft pool indexes.
-                pool.set_kv_buffer(
+                pool.layer_router.layer(attn.attn.layer_id).store(
                     attn.attn,
                     KVWriteLoc(cache_loc, physical=True),
                     k,
