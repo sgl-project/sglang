@@ -277,49 +277,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Select version
         self.fa_impl_ver = fa_impl_ver
         device_capability = get_device_capability()
-        if self.fa_impl_ver == 3:
-            from sgl_kernel.flash_attn import get_scheduler_metadata
-
-            from sglang.kernels.ops.attention.flash_attention_v3 import (
-                flash_attn_varlen_func,
-                flash_attn_with_kvcache,
-            )
-
-            self._get_scheduler_metadata = get_scheduler_metadata
-            self._get_fa_runtime_policy = None
-        elif self.fa_impl_ver == 4:
-            if device_capability[0] == 12:
-                from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
-                    flash_attn_varlen_func,
-                    flash_attn_with_kvcache,
-                    get_flash_attention_v4_sm120_runtime_policy,
-                )
-
-                self._get_fa_runtime_policy = (
-                    get_flash_attention_v4_sm120_runtime_policy
-                )
-            else:
-                from sglang.kernels.ops.attention.flash_attention_v4 import (
-                    flash_attn_varlen_func,
-                    flash_attn_with_kvcache,
-                )
-
-                self._get_fa_runtime_policy = None
-
-            self._get_scheduler_metadata = None
-            if get_exec().deterministic.enable_deterministic_inference:
-                # Must precede the first kernel compile.
-                from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
-                    set_batch_invariant,
-                )
-
-                set_batch_invariant(True)
-        else:
-            raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
-
-        # Every kernel call goes through these; a subclass swaps the FA build here.
-        self.flash_attn_varlen_func = flash_attn_varlen_func
-        self.flash_attn_with_kvcache = flash_attn_with_kvcache
+        self._init_flash_attention_functions(device_capability)
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
@@ -380,6 +338,51 @@ class FlashAttentionBackend(AttentionBackend):
         self._disable_scheduler_metadata_precompute = (
             _should_disable_scheduler_metadata_precompute()
         )
+
+    def _init_flash_attention_functions(self, device_capability):
+        if self.fa_impl_ver == 3:
+            from sgl_kernel.flash_attn import get_scheduler_metadata
+
+            from sglang.kernels.ops.attention.flash_attention_v3 import (
+                flash_attn_varlen_func,
+                flash_attn_with_kvcache,
+            )
+
+            self._get_scheduler_metadata = get_scheduler_metadata
+            self._get_fa_runtime_policy = None
+        elif self.fa_impl_ver == 4:
+            if device_capability[0] == 12:
+                from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
+                    flash_attn_varlen_func,
+                    flash_attn_with_kvcache,
+                    get_flash_attention_v4_sm120_runtime_policy,
+                )
+
+                self._get_fa_runtime_policy = (
+                    get_flash_attention_v4_sm120_runtime_policy
+                )
+            else:
+                from sglang.kernels.ops.attention.flash_attention_v4 import (
+                    flash_attn_varlen_func,
+                    flash_attn_with_kvcache,
+                )
+
+                self._get_fa_runtime_policy = None
+
+            self._get_scheduler_metadata = None
+            if get_exec().deterministic.enable_deterministic_inference:
+                # Must precede the first kernel compile.
+                from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+                    set_batch_invariant,
+                )
+
+                set_batch_invariant(True)
+        else:
+            raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
+
+        # Every kernel call goes through these; a subclass swaps the FA build here.
+        self.flash_attn_varlen_func = flash_attn_varlen_func
+        self.flash_attn_with_kvcache = flash_attn_with_kvcache
 
     def _maybe_init_local_attn_builder(
         self, model_runner: ModelRunner
