@@ -11,11 +11,18 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import filter_dcp_local_chunk_kv_indices
+from sglang.srt.model_executor.forward_batch_deepseek_mha_rocm import (
+    get_num_packed_prefix_chunks,
+    get_packed_prefix_chunk_seq_lens,
+)
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 
 class ForwardBatchDeepSeekMHAMixin:
@@ -211,17 +218,26 @@ class ForwardBatchDeepSeekMHAMixin:
         self.num_prefix_chunks = (
             max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
         ) // self.prefix_chunk_len
+        compute_prefix_chunk_seq_lens = self.get_prefix_chunk_seq_lens
+        if _is_hip and not single_chunk:
+            # ROCm lays all prefixes end to end and fills each chunk to capacity.
+            self.prefix_chunk_len = chunk_capacity
+            self.num_prefix_chunks = get_num_packed_prefix_chunks(
+                prefix_lens_cpu=self.extend_prefix_lens_cpu,
+                chunk_capacity=chunk_capacity,
+            )
+            compute_prefix_chunk_seq_lens = get_packed_prefix_chunk_seq_lens
 
         # Here we compute chunk lens twice to avoid stream sync, once on gpu and once on cpu.
         prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cuda = (
-            self.get_prefix_chunk_seq_lens(
+            compute_prefix_chunk_seq_lens(
                 self.extend_prefix_lens,
                 self.num_prefix_chunks,
                 self.prefix_chunk_len,
             )
         )
         prefix_chunk_starts_cpu, prefix_chunk_seq_lens_cpu = (
-            self.get_prefix_chunk_seq_lens(
+            compute_prefix_chunk_seq_lens(
                 torch.tensor(self.extend_prefix_lens_cpu),
                 self.num_prefix_chunks,
                 self.prefix_chunk_len,
