@@ -986,6 +986,34 @@ def fp4_index_logits_candidates(
     ratio: int,
     blocks: torch.Tensor,
 ) -> torch.Tensor:
+    """Score compact candidates with CUDA on SM90, otherwise with Triton.
+
+    The CUDA scorer uses natural D128 accumulation; scores can differ from
+    the parity-split Triton scorer at BF16 rounding boundaries.
+    """
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_cuda import (
+        fp4_index_logits_candidates_cuda,
+        is_fp4_index_logits_candidates_cuda_supported,
+    )
+
+    args = (q, weights, req, req_table, lens, table, page_size, max_len, ratio, blocks)
+    if is_fp4_index_logits_candidates_cuda_supported(*args):
+        return fp4_index_logits_candidates_cuda(*args)
+    return fp4_index_logits_candidates_triton(*args)
+
+
+def fp4_index_logits_candidates_triton(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    req: torch.Tensor,
+    req_table: torch.Tensor,
+    lens: torch.Tensor,
+    table: torch.Tensor,
+    page_size: int,
+    max_len: int,
+    ratio: int,
+    blocks: torch.Tensor,
+) -> torch.Tensor:
     """Paged FP4 scores in candidate order, [rows, blocks_per_row * 8].
 
     Read the request table directly, as in the dense paged scorer. Padding and

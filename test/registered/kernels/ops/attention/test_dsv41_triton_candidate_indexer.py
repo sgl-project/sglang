@@ -225,7 +225,7 @@ def test_prefill_protocol_matches_torch(ratio, tail, budget, write_pages, cp):
 def test_compact_paged_scores_and_finalize_replay(ratio, block_count):
     from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
         finish_paged_indexer_topk,
-        fp4_index_logits_candidates,
+        fp4_index_logits_candidates_triton,
         fp4_index_logits_paged,
     )
     from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (
@@ -258,7 +258,7 @@ def test_compact_paged_scores_and_finalize_replay(ratio, block_count):
     k = min(width, 16)
 
     def run():
-        scores = fp4_index_logits_candidates(
+        scores = fp4_index_logits_candidates_triton(
             q, weights, req, req_table, lens, cache, page_size, capacity, ratio, blocks
         )
         indices = scores.topk(k, sorted=False).indices.int()
