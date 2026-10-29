@@ -126,8 +126,8 @@ class MiniMaxIndexerCP:
         probe = torch.zeros((1, 128), dtype=torch.bfloat16, device=self.group.device)
         output = torch.empty((4, 128), dtype=probe.dtype, device=probe.device)
         self.group.all_gather_into_tensor(output, probe)
-        comm = self.group.pynccl_comm
-        if comm is not None and comm.available:
+        comm = self.group.get_available_pynccl_comm()
+        if comm is not None:
             # The ordinary eager fallback can use torch.distributed, whereas
             # graph replay uses PyNCCL. Warm the latter explicitly as well.
             with comm.change_state(enable=True):
@@ -162,6 +162,7 @@ class MiniMaxIndexerCP:
         sm_scale=None,
         q_scale=None,
         k_scale=None,
+        packed_queries=1,
     ):
         from sglang.kernels.ops.attention.minimax_sparse.decode.indexer_cp import (
             merge_candidates,
@@ -189,6 +190,7 @@ class MiniMaxIndexerCP:
             local_blocks,
             sm_scale,
             1.0 if k_scale is None else k_scale,
+            packed_queries=packed_queries,
         )
         keys = select_local_candidates(scores, seq_lens, self.rank, max_seqlen)
         received = torch.empty((4, 4, batch, 16), dtype=torch.int64, device=q.device)

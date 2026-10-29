@@ -29,6 +29,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.schedulers.kandinsky6_piflow import (
+    PiflowScheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6.image_encoding import (
@@ -48,17 +51,8 @@ from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYP
 class Kandinsky6DenoisingStage(DenoisingStage):
     """Run the Kandinsky6 joint video+audio denoising loop."""
 
-    def __init__(self, transformer, scheduler, pipeline=None) -> None:
-        super().__init__(
-            transformer=transformer, scheduler=scheduler, pipeline=pipeline
-        )
-
     def _owns_compile_warmup_lifecycle(self) -> bool:
-        # forward() overrides DenoisingStage.forward (the joint video+audio
-        # loop cannot reuse the parent's single-tensor _denoise()), but it
-        # still wraps the loop in `_offload_for_torch_compile_warmup` itself
-        # below -- same opt-in as MiniMaxH3DenoisingStage, the codebase's
-        # other joint-modality denoising stage.
+        # forward wraps the joint loop in the shared compile warmup lifecycle
         return True
 
     def component_uses(
@@ -155,7 +149,6 @@ class Kandinsky6DenoisingStage(DenoisingStage):
         t_expand: torch.Tensor,
         visual_rope_pos: list[torch.Tensor],
         scale_factor: tuple[float, ...],
-        sparse_params: dict[str, Any] | None,
         visual_token_type_ids: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run sequential or distributed CFG branches and combine video/audio velocity."""
@@ -172,7 +165,6 @@ class Kandinsky6DenoisingStage(DenoisingStage):
                     timestep=t_expand,
                     visual_rope_pos=visual_rope_pos,
                     scale_factor=scale_factor,
-                    sparse_params=sparse_params,
                     visual_token_type_ids=visual_token_type_ids,
                     # BCG clones tuple leaves so the next CFG replay cannot
                     # overwrite the previous branch's predictions
@@ -227,7 +219,7 @@ class Kandinsky6DenoisingStage(DenoisingStage):
         scheduler = batch.scheduler
         if scheduler is None:
             raise ValueError("scheduler must be set for Kandinsky6 denoising.")
-        use_piflow = bool(getattr(scheduler, "is_piflow", False))
+        use_piflow = isinstance(scheduler, PiflowScheduler)
         if use_piflow and (
             not math.isfinite(batch.guidance_scale)
             or abs(batch.guidance_scale - 1.0) > 1e-6
@@ -237,30 +229,10 @@ class Kandinsky6DenoisingStage(DenoisingStage):
 
         pipeline_config = server_args.pipeline_config
         arch = pipeline_config.dit_config.arch_config
-        # The runtime transformer already rejects attention_engine="nabla"
-        # at construction time (NABLA sparse attention is not yet ported),
-        # so sparse_params stays None on every currently-reachable
-        # configuration. A future NABLA-capable DiT would fill this in.
-        if arch.attention_engine == "nabla":
-            raise NotImplementedError(
-                "Kandinsky6 NABLA sparse-attention metadata construction is not implemented; "
-                "the runtime transformer also rejects attention_engine='nabla' at construction "
-                "time. Use attention_engine='auto' or 'sdpa'."
-            )
-        sparse_params = None
-
         device = get_local_torch_device()
         target_dtype = PRECISION_TO_TYPE[pipeline_config.dit_precision]
 
-        # .clone(): batch.latents was created by Kandinsky6LatentPreparationStage
-        # under an active torch.inference_mode() context further up the
-        # pipeline, which marks it as an "inference tensor" -- such tensors
-        # can only be mutated in place while still inside an inference_mode
-        # context. This stage runs under plain @torch.no_grad() instead, and
-        # mutates `video` in place every denoising step (video[..., :num_channels]
-        # = ...), so clone once here to get an ordinary, freely-mutable tensor
-        # before the loop starts. audio is never mutated in place (only
-        # reassigned via out-of-place `+`), so it needs no clone.
+        # clone inference tensors before the in-place video updates under no_grad
         video = batch.latents.clone()
         audio = batch.audio_latents
         num_channels = int(arch.in_visual_dim)
@@ -295,40 +267,25 @@ class Kandinsky6DenoisingStage(DenoisingStage):
         spatial_ratio = pipeline_config.vae_config.arch_config.spatial_compression_ratio
         patch_size = arch.patch_size
 
-        # Constant per-request geometry -- computed once outside the loop,
-        # not per-step.
+        # geometry is constant across steps
         num_video_frames = video.shape[1] - (1 if tail_cond else 0)
         t_positions = torch.arange(num_video_frames, device=device)
         if tail_cond:
-            # The appended reference frame reuses T-position 0's rope row
-            # (RoPE3D is a pure position -> table lookup, so duplicating the
-            # first row is equivalent to the diffusers reference's
-            # ``torch.cat([rope, rope[:1]])``).
+            # the reference frame reuses time position zero
             t_positions = torch.cat([t_positions, t_positions.new_zeros(1)])
         visual_rope_pos = [
             t_positions,
             torch.arange(height // spatial_ratio // patch_size[1], device=device),
             torch.arange(width // spatial_ratio // patch_size[2], device=device),
         ]
-        # Fixed per-checkpoint RoPE frequency scaling read from the DiT's
-        # arch config (transformer/config.json's "scale_factor", both real
-        # Pro checkpoints ship [1.0, 2.0, 2.0]) -- matches the diffusers
-        # reference, which resolves this once in
-        # ``Kandinsky6TI2VAPipeline.__init__`` and reuses it for every
-        # request regardless of the request's own height/width. NOT a
-        # function of the request's resolution.
+        # RoPE scaling comes from the checkpoint, not the request resolution
         scale_factor = arch.scale_factor
         image_latent = batch.image_latent
 
         total_steps = int(batch.timesteps.shape[0])
         self._maybe_enable_cache_dit_and_torch_compile(total_steps, batch)
 
-        # PiFlow's noisy video state is tracked in fp32 across steps here,
-        # separately from the `video` buffer's bf16 storage dtype -- see the
-        # module docstring. Always a Tensor (not `Tensor | None`) even on the
-        # flow-Euler path, where it is simply unused: the initial cast is one
-        # cheap op, and keeping it non-Optional avoids re-narrowing it after
-        # every `if use_piflow:` branch re-entry in the loop below.
+        # pi-Flow retains fp32 state between bf16 DiT calls
         video_state = video[..., :num_channels].to(torch.float32)
 
         with self.use_declared_component(
@@ -371,7 +328,6 @@ class Kandinsky6DenoisingStage(DenoisingStage):
                         t_expand=t_expand,
                         visual_rope_pos=visual_rope_pos,
                         scale_factor=scale_factor,
-                        sparse_params=sparse_params,
                         visual_token_type_ids=visual_token_type_ids,
                     )
 
@@ -397,9 +353,7 @@ class Kandinsky6DenoisingStage(DenoisingStage):
                         if use_piflow:
                             video_state[:, -1:] = ref_frame.to(torch.float32)
 
-                    # Manual Euler update for audio, using the SAME per-step
-                    # sigma delta the scheduler.step() call above just
-                    # consumed for video.
+                    # Euler audio reuses the video's sigma delta without advancing it
                     if use_piflow:
                         audio = audio_scheduler.step(
                             audio_vel, timestep, audio, return_dict=False

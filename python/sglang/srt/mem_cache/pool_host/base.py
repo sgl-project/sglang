@@ -11,12 +11,15 @@ from typing import Optional, TypeGuard
 
 import torch
 
+from sglang.kernels.ops.kvcache.hicache import (
+    can_use_page_unified_write_back_jit_kernel,
+)
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
-from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
+from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -29,6 +32,44 @@ _is_hip = is_hip()
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+
+def prepare_page_unified_write_back_staging(
+    geometry: PageUnifiedLayout,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    page_capacity: int = _WRITE_BACK_STAGING_PAGE_CHUNK,
+    staging: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Prepare scratch before KV sizing, or reuse it when the host pool is built."""
+    if not (
+        (_is_cuda or _is_hip)
+        and can_use_page_unified_write_back_jit_kernel(
+            group_bytes=geometry.group_bytes, is_mla=geometry.is_mla
+        )
+    ):
+        row_kind = "latent" if geometry.is_mla else "head-group"
+        raise ValueError(
+            "the 'page_unified' host layout requires the staged "
+            "write-back JIT kernel, which could not be built for a "
+            f"{geometry.group_bytes}-byte {row_kind} row."
+        )
+    shape = geometry.page_dims(min(page_capacity, _WRITE_BACK_STAGING_PAGE_CHUNK))
+    if staging is None:
+        return torch.empty(shape, dtype=dtype, device=device)
+    if (
+        not isinstance(staging, torch.Tensor)
+        or staging.dtype != dtype
+        or staging.device != torch.device(device)
+        or not staging.is_contiguous()
+        or tuple(staging.shape[1:]) != shape[1:]
+        or staging.shape[0] < shape[0]
+    ):
+        raise ValueError(
+            "HiCache page_unified staging geometry changed after preparation"
+        )
+    return staging
 
 
 _host_memory_budget: ContextVar[Optional[int]] = ContextVar(
@@ -171,7 +212,12 @@ class HostKVCache(abc.ABC):
 
     def __init__(
         self,
-        device_pool: KVCache,
+        *,
+        dtype: torch.dtype,
+        device_capacity_tokens: int,
+        size_per_token: int,
+        start_layer: int,
+        end_layer: int,
         host_to_device_ratio: float,
         host_size: int,
         page_size: int,
@@ -181,10 +227,11 @@ class HostKVCache(abc.ABC):
         allocator_type: str = "default",
         dcp_size: int = 1,
         dcp_rank: int = 0,
-        *,
         pool_label: str = "kv",
+        is_dummy: bool = False,
+        host_token_capacity: int | None = None,
     ):
-        self.device_pool = device_pool
+        """Allocate host pages from geometry prepared by the concrete host pool."""
         self.pool_label = pool_label
         # page_size arrives widened (x dcp_size); size/page_size/page_num are physical.
         self.dcp_size = dcp_size
@@ -201,33 +248,43 @@ class HostKVCache(abc.ABC):
         self.allocator = get_allocator_from_storage(allocator_type)
         self.can_use_write_back_jit = False
 
-        self.dtype = device_pool.store_dtype
-        self.size_per_token = self.get_size_per_token()
-        # Unified pools report token capacity separately from their buffer-row count.
-        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
-        if device_capacity is None:
-            device_capacity = device_pool.size
-        self.device_capacity_tokens = device_capacity
-        if host_size > 0:
-            self.size = sync_fixed_hicache_size(
-                int(host_size * 1e9 // self.size_per_token), host_size
-            )
+        self.dtype = dtype
+        self.size_per_token = size_per_token
+        self.device_capacity_tokens = device_capacity_tokens
+        if host_token_capacity is not None:
+            if host_token_capacity <= 0 or host_token_capacity % self.page_size:
+                raise ValueError(
+                    "Host token capacity must be positive and page-aligned, got "
+                    f"{host_token_capacity} for page_size={self.page_size}"
+                )
+            self.size = host_token_capacity
+            self.page_num = self.size // self.page_size
         else:
-            self.size = int(device_capacity * host_to_device_ratio)
-        # Align up the host memory pool size to the page size
-        self.page_num = self.size // self.page_size + 1
-        self.size = self.page_num * self.page_size
-        self.start_layer = device_pool.start_layer
-        self.end_layer = device_pool.end_layer
+            if host_size > 0:
+                self.size = sync_fixed_hicache_size(
+                    int(host_size * 1e9 // self.size_per_token), host_size
+                )
+            else:
+                self.size = int(device_capacity_tokens * host_to_device_ratio)
+            # Reserve the padding page only when sizing an independent pool.
+            self.page_num = self.size // self.page_size + 1
+            self.size = self.page_num * self.page_size
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+        if not is_dummy:
+            self._allocate_host_buffer()
+        self.lock = threading.RLock()
+        self.clear()
 
-        if self.size <= device_capacity:
+    def _allocate_host_buffer(self) -> None:
+        if self.size <= self.device_capacity_tokens:
             logger.warning(
                 "HiCache %s host pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
-                pool_label,
+                self.pool_label,
                 self.size,
-                device_capacity,
+                self.device_capacity_tokens,
             )
 
         # Verify there is enough available host memory.
@@ -247,7 +304,7 @@ class HostKVCache(abc.ABC):
                     "Allocating %s hierarchical KV host pool: %d tokens, "
                     "%.2f GB host memory, packed MTP KV layers: "
                     "target_layers=%d, draft_layers=%d, total_layers=%d.",
-                    pool_label,
+                    self.pool_label,
                     self.size,
                     requested_bytes / 1e9,
                     self.target_layer_num,
@@ -257,17 +314,13 @@ class HostKVCache(abc.ABC):
             else:
                 logger.info(
                     "Allocating %s hierarchical KV host pool: %d tokens, %.2f GB host memory.",
-                    pool_label,
+                    self.pool_label,
                     self.size,
                     requested_bytes / 1e9,
                 )
 
         self.kv_buffer = self.init_kv_buffer()
         self.fd = getattr(self.allocator, "fd", None)
-
-        # A lock for synchronized operations on memory allocation and state transitions.
-        self.lock = threading.RLock()
-        self.clear()
 
     def destroy(self):
         """Unregister pinned host buffers in userspace before process exit.
@@ -336,6 +389,32 @@ class HostKVCache(abc.ABC):
                 f"{self.device_row_stride_bytes} B apart. Use the JIT HiCache "
                 "kernels with a layer_first or page_first host layout."
             )
+
+    def _page_ids(self, token_indices: torch.Tensor) -> torch.Tensor:
+        """Page ids of a page-aligned transfer's token runs.
+
+        The page-unified write-back addresses whole pages. Write-back is only
+        ever issued for complete pages, so taking every page_size-th token is
+        the page list, not a subsample.
+        """
+        return token_indices[:: self.page_size] // self.page_size
+
+    def _init_page_unified_staging(self, staging: torch.Tensor | None = None) -> None:
+        """Device-side scratch the write-back relayouts into before the D2H.
+
+        Sized in whole pages: the copy that follows moves one contiguous page
+        block per page, which is what keeps it on the copy engine.
+        """
+        self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        self.staging_token_capacity = self.staging_page_capacity * self.page_size
+        self.staging_buffer = prepare_page_unified_write_back_staging(
+            self.page_unified_layout,
+            dtype=self.dtype,
+            device=self._transfer_device,
+            page_capacity=self.staging_page_capacity,
+            staging=staging,
+        )[: self.staging_page_capacity]
+        self.can_use_write_back_jit = True
 
     @abc.abstractmethod
     def get_size_per_token(self):

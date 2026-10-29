@@ -14,8 +14,10 @@ from sglang.srt.arg_groups.overrides import (
     _cutedsl_prefill_backend_fill,
     _deterministic_allreduce_fusion_disable,
     _deterministic_attention_backend,
+    _deterministic_rocm_rccl_check,
     _deterministic_sampling_backend,
     _fa4_page_constraint,
+    _hybrid_swa_memory_backend_disable,
     _intel_xpu_page_constraint,
     _mla_backend_page_constraints,
     _mla_kv_cache_dtype_checks,
@@ -26,6 +28,10 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
     run_post_process_pass,
+    use_mla_backend,
+)
+from sglang.srt.arg_groups.platform_hook import (
+    handle_sail_attention_backend_compatibility,
 )
 from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
@@ -40,6 +46,71 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+# Largest GQA group DISPATCH_DECODE instantiates in sgl-kernel-xpu flash_attention.cpp.
+XPU_DECODE_MAX_Q_GROUP_SIZE = 16
+
+
+def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
+    from sglang.srt.configs.model_config import is_qwen3_5
+
+    view = resolved_view(server_args)
+    tp_size, dcp_size = view.tp_size, view.dcp_size
+    if set(attention_backends_of(view)) != {"intel_xpu"}:
+        raise ValueError(
+            "--dcp-size > 1 on Intel XPU needs --attention-backend intel_xpu."
+        )
+    if use_mla_backend(server_args):
+        raise ValueError("--dcp-size > 1 is not supported for MLA models on Intel XPU.")
+    # Other ranks' rows are written at -1, which only store_cache_xpu skips; unequal
+    # K/V widths fall back to an indexed write that would hit the last slot.
+    if model_config.v_head_dim != model_config.head_dim:
+        raise ValueError("--dcp-size > 1 on Intel XPU needs equal K and V head dims.")
+    if tp_size % dcp_size != 0:
+        raise ValueError(f"--dcp-size {dcp_size} must divide --tp-size {tp_size}.")
+    # Every rank of a DCP group must hold the same KV heads: qwen3_5 shards qkv that
+    # way, other models only when kv_heads <= tp / dcp. Otherwise KV silently corrupts.
+    kv_head_layout_supported = is_qwen3_5(model_config.hf_config) or (
+        model_config.get_num_kv_heads(tp_size, dcp_size)
+        == model_config.get_num_kv_heads(tp_size)
+    )
+    if not kv_head_layout_supported:
+        raise ValueError(
+            f"--dcp-size {dcp_size} at --tp-size {tp_size} needs each rank to hold "
+            f"its DCP group's KV heads, which "
+            f"{model_config.hf_config.architectures[0]} does not. Use a smaller "
+            "--dcp-size."
+        )
+
+    attn_tp_size = (
+        tp_size
+        // (view.dp_size if view.enable_dp_attention else 1)
+        // view.attn_cp_size
+    )
+    q_heads = max(1, model_config.get_max_num_attention_heads() // attn_tp_size)
+    kv_heads = max(1, model_config.get_num_kv_heads(attn_tp_size, dcp_size))
+    q_group = q_heads * dcp_size // kv_heads
+    if q_group > XPU_DECODE_MAX_Q_GROUP_SIZE:
+        raise ValueError(
+            f"--dcp-size {dcp_size} gives the intel_xpu decode kernel a GQA group of "
+            f"{q_group}, above the {XPU_DECODE_MAX_Q_GROUP_SIZE} it is built for. Use "
+            "a smaller --dcp-size or a larger --tp-size."
+        )
+
+    if view.speculative_algorithm is not None:
+        raise ValueError(
+            "--dcp-size > 1 with speculative decoding is not supported on Intel XPU."
+        )
+    if model_config.attention_chunk_size is not None:
+        raise ValueError(
+            "--dcp-size > 1 is not supported on Intel XPU for models with chunked "
+            "local attention."
+        )
+    if model_config.is_encoder_decoder:
+        raise ValueError(
+            "--dcp-size > 1 is not supported on Intel XPU for encoder-decoder models."
+        )
+
+
 def handle_attention_backend_compatibility(server_args: Any):
 
     cfg = resolving_view(server_args)
@@ -51,6 +122,8 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     # Split-backend override + default fill.
     run_post_process_pass(server_args, _attention_backend_default)
+
+    handle_sail_attention_backend_compatibility(server_args)
 
     # Torch native and flex attention backends
     attention_backend = resolved_view(server_args).attention_backend
@@ -116,7 +189,7 @@ def handle_attention_backend_compatibility(server_args: Any):
     # fallback stay below.
     run_post_process_pass(server_args, _mla_backend_page_constraints)
 
-    # The TRT-LLM / tokenspeed MLA kv-dtype validations moved to the
+    # The TRT-LLM MLA kv-dtype validations moved to the
     # resolution pipeline (arg_groups/overrides.py:
     # _mla_kv_cache_dtype_checks), invoked here at their legacy slot.
 
@@ -204,7 +277,13 @@ def handle_attention_backend_compatibility(server_args: Any):
     # Other platforms backends
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
 
+    # Needs the final prefill and decode backends.
+    run_post_process_pass(server_args, _hybrid_swa_memory_backend_disable)
+
     # XPU platforms backends
+    if cfg.dcp_size > 1 and get_platform().is_xpu:
+        _check_xpu_dcp(server_args, model_config)
+
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
 
 
@@ -599,6 +678,7 @@ def handle_deterministic_inference(server_args: Any):
             if get_platform().is_hip:
                 # AMD: use 1-stage all-reduce kernel which is inherently deterministic
                 # (each GPU reads all data from all GPUs, reduces locally in fixed order)
+                run_post_process_pass(server_args, _deterministic_rocm_rccl_check)
                 logger.info("AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)")
             else:
                 # CUDA: use NCCL tree algorithm

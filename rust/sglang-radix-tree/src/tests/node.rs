@@ -54,8 +54,8 @@ impl ChildKeyType for CountedKey {
         Cow::Owned(Self::from(token_ids.into_owned()))
     }
 
-    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u32> {
-        std::iter::once(*atom as u32)
+    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u64> {
+        std::iter::once(*atom as u64)
     }
 
     fn raw_token_ids(atoms: &[Self::Atom]) -> Cow<'_, [i64]> {
@@ -67,6 +67,7 @@ impl ChildKeyType for CountedKey {
 fn evicted_only_for_attached_nodes_without_full_device_value() {
     let mut parent: Node<Vec<i64>> = Node::new_root(/* id = */ 0);
     assert!(!parent.evicted());
+    assert_eq!(parent.device_reclaimable_value_len(FULL), 0);
     let mut child = Node::new_child(
         /* id = */ 1,
         /* key = */ vec![7],
@@ -78,8 +79,12 @@ fn evicted_only_for_attached_nodes_without_full_device_value() {
         .attach_child(&mut child, /* page_size = */ 1)
         .unwrap();
     assert!(child.evicted());
+    assert_eq!(child.device_reclaimable_value_len(FULL), 0);
     child.set_device_value(FULL, Tensor::from_slice(&[1i64]));
     assert!(!child.evicted());
+    assert_eq!(child.device_reclaimable_value_len(FULL), 1);
+    let _ = child.take_device_value(FULL);
+    assert_eq!(child.device_reclaimable_value_len(FULL), 0);
 }
 
 #[test]
@@ -470,6 +475,10 @@ fn present_but_empty_tensor_has_value_true_len_zero() {
     node.state_mut_(ValueSlotIdx::device(FULL)).value = Some(Tensor::from_slice(&empty));
     assert!(node.has_device_value(FULL));
     assert_eq!(node.device_value_len(FULL), 0);
+    assert_eq!(node.device_reclaimable_value_len(FULL), 0);
+    node.state_mut_(ValueSlotIdx::device(FULL)).value = Some(Tensor::from_slice(&[1i64]));
+    assert_eq!(node.device_value_len(FULL), 1);
+    assert_eq!(node.device_reclaimable_value_len(FULL), 0);
 }
 
 #[test]
@@ -880,13 +889,15 @@ fn empty_key_yields_no_pages() {
 }
 
 #[test]
-#[should_panic(expected = "token id does not fit in uint32")]
-fn oversized_token_id_is_rejected() {
-    get_hash_str::<Vec<i64>>(&[1 << 33], None, 2);
+fn wide_token_ids_keep_their_high_bits() {
+    assert_ne!(
+        get_hash_str::<Vec<i64>>(&[1 << 33], None, 2),
+        get_hash_str::<Vec<i64>>(&[0], None, 2)
+    );
 }
 
 #[test]
-#[should_panic(expected = "token id does not fit in uint32")]
+#[should_panic(expected = "token id must be a non-negative int64")]
 fn negative_token_id_is_rejected() {
     get_hash_str::<Vec<i64>>(&[-1], None, 2);
 }
