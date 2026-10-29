@@ -22,6 +22,17 @@ from sglang.kernels.ops.moe.inkling_gate_topk_renorm import (
     inkling_gate_topk_renorm_v2,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_xpu
+
+_is_xpu = is_xpu()
+if _is_xpu:
+    import sgl_kernel
+
+    # None when the installed sgl-kernel-xpu predates the op; the Triton kernel
+    # below is the fallback.
+    _xpu_inkling_gate_topk_renorm = getattr(
+        sgl_kernel, "inkling_gate_topk_renorm", None
+    )
 
 
 @triton.jit
@@ -179,13 +190,15 @@ def sigmoid_gate_topk_renorm(
     A = k + n_shared_experts
     assert bias.numel() == N and bias.stride(-1) == 1, f"{bias.shape=} expected [{N}]"
 
-    # The production shape uses the specialized CUDA JIT kernel.
+    # The production shape uses the specialized CUDA JIT kernel. XPU also
+    # satisfies `torch.version.hip is None`, so gate on `.is_cuda` as well.
     if (
         k == 6
         and n_shared_experts == 2
         and G == 258
         and logits.stride(0) % 8 == 0
         and logits.data_ptr() % 32 == 0
+        and logits.is_cuda
         and torch.version.hip is None
         and envs.SGLANG_OPT_USE_GATE_TOPK_JIT.get()
     ):
@@ -196,6 +209,17 @@ def sigmoid_gate_topk_renorm(
             route_scale,
             return_packed=return_packed_topk,
             enable_pdl=is_arch_support_pdl(),
+        )
+
+    if _is_xpu and _xpu_inkling_gate_topk_renorm is not None and n_shared_experts > 0:
+        return _xpu_inkling_gate_topk_renorm(
+            logits,
+            k,
+            n_shared_experts,
+            route_scale,
+            global_scale,
+            bias,
+            return_packed_topk=return_packed_topk,
         )
 
     shared_w = torch.empty(
