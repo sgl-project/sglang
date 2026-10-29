@@ -324,13 +324,21 @@ def init_mooncake_transfer_engine(
             TentTransferEngine,
         )
 
-        _mooncake_transfer_engine = TentTransferEngine(
-            hostname=hostname,
-            ib_device=get_ib_devices_for_gpu(
-                ib_device, gpu_id if gpu_id is not None else 0
-            ),
-            gpu_id=gpu_id,
-        )
+        try:
+            _mooncake_transfer_engine = TentTransferEngine(
+                hostname=hostname,
+                ib_device=get_ib_devices_for_gpu(
+                    ib_device, gpu_id if gpu_id is not None else 0
+                ),
+                gpu_id=gpu_id,
+            )
+        except ImportError as e:
+            raise ImportError(
+                "SGLANG_MOONCAKE_TRANSFER_ENGINE=tent needs the native `tent` "
+                "module. Please install mooncake-transfer-engine>=0.3.14, or "
+                "build Mooncake with -DUSE_TENT=ON and put tent.*.so on "
+                "PYTHONPATH."
+            ) from e
     else:
         raise ValueError(
             f"SGLANG_MOONCAKE_TRANSFER_ENGINE must be 'te' or 'tent', got {backend!r}"

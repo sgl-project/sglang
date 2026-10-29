@@ -379,6 +379,22 @@ class TestTransferEngineSelector(CustomTestCase):
                 with self.assertRaises(ValueError):
                     mte.init_mooncake_transfer_engine(hostname="10.0.0.1")
 
+    def test_missing_tent_module_names_the_mooncake_version(self):
+        from sglang.srt.distributed.device_communicators import (
+            mooncake_transfer_engine as mte,
+        )
+
+        with (
+            patch.object(mte, "_mooncake_transfer_engine", None),
+            patch.dict(sys.modules, {"tent": None}),
+        ):
+            with envs.SGLANG_MOONCAKE_TRANSFER_ENGINE.override("tent"):
+                with self.assertRaisesRegex(
+                    ImportError, r"mooncake-transfer-engine>=0\.3\.14"
+                ):
+                    mte.init_mooncake_transfer_engine(hostname="10.0.0.1")
+            self.assertIsNone(mte._mooncake_transfer_engine)
+
     def test_tent_backend_receives_gpu_id(self):
         from sglang.srt.distributed.device_communicators import (
             mooncake_transfer_engine as mte,

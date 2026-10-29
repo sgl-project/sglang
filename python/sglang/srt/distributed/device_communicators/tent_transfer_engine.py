@@ -146,13 +146,9 @@ class TentTransferEngine(KVTransferEngine):
     def __init__(
         self, hostname: str, ib_device: Optional[str], gpu_id: Optional[int] = None
     ):
-        try:
-            import tent
-        except ImportError as e:
-            raise ImportError(
-                "SGLANG_MOONCAKE_TRANSFER_ENGINE=tent needs the native `tent` module; "
-                "build Mooncake with -DUSE_TENT=ON and put tent.*.so on PYTHONPATH."
-            ) from e
+        # init_mooncake_transfer_engine turns an ImportError into an install hint.
+        import tent
+
         self._tent = tent
         # The intent only tags requests with a priority and intent type. Traffic
         # is isolated only if SGLANG_TENT_CONFIG_OVERRIDE configures separate
