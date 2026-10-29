@@ -342,7 +342,6 @@ class TestFusedStateHost(unittest.TestCase):
         host = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
-            spec_state_size=2,
             mamba_layer_ids=[0, 1],
         )
         draft_conv, _ = pool.spec("mamba").draft_views(pool)
@@ -385,7 +384,6 @@ class TestFusedStateHost(unittest.TestCase):
         host = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
-            spec_state_size=2,
             mamba_layer_ids=[0, 1],
         )
         draft_conv, draft_temporal = pool.spec("mamba").draft_views(pool)

@@ -9,7 +9,6 @@ import logging
 from typing import Any, Optional, Sequence
 
 import msgspec
-import torch
 
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
@@ -20,25 +19,24 @@ from sglang.srt.mem_cache.kv.decl import (
 )
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
-from sglang.srt.mem_cache.kv.layout.state import StateView
+from sglang.srt.mem_cache.kv.layout.state import NGramView, ShortConvView, StateView
 from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena, plan_bands
+from sglang.srt.mem_cache.kv.memory.fixed import FixedMemory
 from sglang.srt.mem_cache.kv.plan import (
     KVStoragePlan,
     PlannedSubPool,
     plan_kv_storage,
-    resized_after_capture,
 )
 from sglang.srt.mem_cache.kv.requests import RequestTable, StateTracking
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
 from sglang.srt.mem_cache.kv.sizing import (
     KVSizingInputs,
     SizedKVStorage,
-    size_kv_storage,
+    size_plan,
 )
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.kv.storage import KVStorage
 from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
-from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 from sglang.srt.mem_cache.unified_memory_pool import (
     _wire_mamba_slot_allocator,
 )
@@ -83,13 +81,16 @@ def _log_banner(*lines) -> None:
     logger.info(rule)
 
 
-def _build_request_table(plan: KVStoragePlan, ctx: UnifiedBuildContext) -> RequestTable:
+def _build_request_table(
+    plan: KVStoragePlan, ctx: UnifiedBuildContext, reserved_rows: int
+) -> RequestTable:
     """The request table: a row per running request (and per preallocated
     transfer), with the state slot columns when the plan has a state sub-pool."""
     state = plan.of_lifetime(StateLifetime)
     overlap = not ctx.disable_overlap_schedule
     return RequestTable(
         size=ctx.max_num_reqs,
+        reserved_rows=reserved_rows,
         pre_alloc_size=ctx.decode_pre_alloc_size,
         max_context_len=ctx.model_context_len + ctx.extra_max_context_len,
         state_sub_pool=None if state is None else state.name,
@@ -115,37 +116,54 @@ def _build_request_table(plan: KVStoragePlan, ctx: UnifiedBuildContext) -> Reque
 
 
 def _build_state_storage(
-    plan: KVStoragePlan, arena: KVArena, ctx: UnifiedBuildContext
+    plan: KVStoragePlan,
+    arena: KVArena,
+    ctx: UnifiedBuildContext,
+    scratch: FixedMemory,
+    request_memory: FixedMemory,
 ) -> StateStorage:
     """The state sub-pool's storage, without its slots: those come from the
-    chain allocator's state band (`_wire_mamba_slot_allocator`). The PLE side
-    states are built disabled; unified memory refuses them."""
+    chain allocator's state band (`_wire_mamba_slot_allocator`)."""
     state = plan.of_lifetime(StateLifetime)
     layer_ids = list(state.layer_ids)
     assert len(ctx.state_cache_params.layers) >= len(layer_ids), (
         f"cache_params.layers ({len(ctx.state_cache_params.layers)}) cannot supply "
         f"{len(layer_ids)} mamba layer ids"
     )
+    pool = StateView(
+        arena=arena,
+        spec=state.spec,
+        mamba_layer_ids=layer_ids,
+        enable_memory_saver=ctx.enable_memory_saver,
+        request_parts={
+            name.removeprefix(f"{state.name}."): tensor
+            for name, tensor in request_memory.tensors.items()
+            if name.startswith(f"{state.name}.")
+        },
+        intermediate_ssm=scratch.tensors.get(f"{state.name}.intermediate_ssm"),
+        intermediate_conv_window=(
+            [
+                scratch.tensors[f"{state.name}.intermediate_conv_window.{i}"]
+                for i in range(len(state.spec.conv_state_shapes))
+            ]
+            if ctx.speculative_num_draft_tokens is not None
+            else None
+        ),
+    )
+    part_scratch = {
+        name.removeprefix(f"{state.name}."): tensor
+        for name, tensor in scratch.tensors.items()
+        if name.startswith(f"{state.name}.")
+    }
     return StateStorage(
         sub_pool=state.name,
-        pool=StateView(
-            arena=arena,
-            spec=state.spec,
-            spec_state_size=ctx.max_num_reqs,  # outer dim of spec-decode intermediates
-            mamba_layer_ids=layer_ids,
-            enable_memory_saver=ctx.enable_memory_saver,
-            speculative_num_draft_tokens=ctx.speculative_num_draft_tokens,
-        ),
+        pool=pool,
         slots=None,
         layer_map={layer_id: i for i, layer_id in enumerate(layer_ids)},
-        short_conv_pool=ShortConvPool(
-            size=0,
-            state_shape=None,
-            layer_ids=[],
-            dtype=torch.bfloat16,
-            device=ctx.device,
+        short_conv_pool=ShortConvView(
+            state.spec.extra_parts, pool.extra_views, part_scratch
         ),
-        ngram_pool=NGramPool(size=0, context_len=0, eos_token_id=0, device=ctx.device),
+        ngram_pool=NGramView(state.spec.extra_parts, pool.extra_views, part_scratch),
     )
 
 
@@ -163,21 +181,21 @@ def _build_token_view(
             spec=sub_pool.spec,
             kv_cache_dtype=sub_pool.geometry.kv_cache_dtype,
             page_size=plan.page_size,
+            model_layer_ids=tuple(sub_pool.layer_ids),
         )
     return MHAView(
         arena=arena,
         spec=sub_pool.spec,
         page_size=plan.page_size,
         model_layer_ids=tuple(sub_pool.layer_ids),
-        start_layer=ctx.start_layer,
-        end_layer=ctx.end_layer,
+        start_layer=0,
+        end_layer=len(sub_pool.layer_ids) - 1,
     )
 
 
 def build_kv_storage(
     plan: KVStoragePlan,
     sized: SizedKVStorage,
-    sizing: KVSizingInputs,
     ctx: UnifiedBuildContext,
 ) -> KVStorage:
     """Construct the arena, views, allocator and request storage for ``plan``."""
@@ -205,17 +223,34 @@ def build_kv_storage(
         sink_bytes=plan.sink_bytes(),
         device=ctx.device,
         enable_memory_saver=ctx.enable_memory_saver,
-        backed_after_capture=(
-            ctx.post_capture_active and resized_after_capture(plan.lifetime_types())
-        ),
+        backed_after_capture=ctx.post_capture_active,
     )
+    scratch = FixedMemory(
+        [d.part for d in plan.scratch],
+        rows=sized.scratch_rows,
+        device=ctx.device,
+        enable_memory_saver=ctx.enable_memory_saver,
+    )
+    request_memory = FixedMemory(
+        [d.part for d in plan.request_parts],
+        rows=sized.request_rows,
+        device=ctx.device,
+        enable_memory_saver=ctx.enable_memory_saver,
+    )
+    for sub_pool in plan.sub_pools:
+        parts = [d.part for d in plan.derived_parts if d.sub_pool == sub_pool.name]
+        if parts:
+            arena.page_parts[sub_pool.name] = FixedMemory(
+                parts,
+                rows=arena.extent_entries(sub_pool.name) // sub_pool.unit,
+                device=ctx.device,
+                enable_memory_saver=ctx.enable_memory_saver,
+            )
     token_sub_pools = [s for s in plan.owner_first() if s is not state]
     views = {s.name: _build_token_view(s, arena, plan, ctx) for s in token_sub_pools}
     # Without a window, capacity uses the configured cap;
     # window chains use the owner's current arena slots.
-    kv_size = (
-        sizing.full_tokens if window is None else arena.num_entries(owner.name) - 1
-    )
+    kv_size = sized.full_tokens if window is None else arena.num_entries(owner.name) - 1
     owner_spec = owner.spec
     owner_is_mha = isinstance(owner_spec, MHASubPoolSpec)
     token_to_kv_pool = RoutedKVCache(
@@ -238,16 +273,16 @@ def build_kv_storage(
         head_dim=owner_spec.head_dim if owner_is_mha else ctx.head_dim,
         bs1_floor_terms=sized.bs1_floor_terms,
     )
-    req_to_token_pool = _build_request_table(plan, ctx)
+    req_to_token_pool = _build_request_table(plan, ctx, sized.request_rows)
     state_storage = None
     if state is not None:
-        state_storage = _build_state_storage(plan, arena, ctx)
+        state_storage = _build_state_storage(plan, arena, ctx, scratch, request_memory)
         views[state.name] = state_storage.pool
     legacy_capacities = {}
-    if window is not None and (sizing.token_budget_bytes is None or state is not None):
+    if window is not None:
         legacy_capacities = {
-            "full_max_total_num_tokens": sizing.full_tokens,
-            "swa_max_total_num_tokens": sizing.window_tokens,
+            "full_max_total_num_tokens": sized.full_tokens,
+            "swa_max_total_num_tokens": sized.window_tokens,
         }
     allocator = ChainAllocator(
         arena=arena,
@@ -265,13 +300,19 @@ def build_kv_storage(
         lazy_compaction=ctx.lazy_compaction,
         **legacy_capacities,
     )
+    owner_band = allocator.full_attn_allocator
+    owner_band.max_live_tokens = (
+        None
+        if sized.full_cap_tokens is None
+        else sized.full_cap_tokens * (owner_band.page_size // owner_band.pool_page_size)
+    )
     if window is None:
         # Host storage is sized from the configured token cap, not the
         # buffer's dynamic share.
         owner_view = views[owner.name]
-        owner_view.host_capacity_tokens = sizing.full_tokens
+        owner_view.host_capacity_tokens = sized.full_tokens
         owner_view.host_capacity_bytes = (
-            sizing.full_tokens * allocator.full_attn_allocator.entry_bytes
+            sized.full_tokens * allocator.full_attn_allocator.entry_bytes
         )
     if state is not None:
         _wire_mamba_slot_allocator(
@@ -283,10 +324,13 @@ def build_kv_storage(
         allocator.state = state_storage
     allocator.storage = KVStorage(
         plan=plan,
+        sized=sized,
         router=token_to_kv_pool.layer_router,
         allocator=allocator,
         start_layer=ctx.start_layer,
         requests=req_to_token_pool,
+        scratch=scratch,
+        request_memory=request_memory,
     )
     _log_banner(
         "UNIFIED MEMORY POOL ENABLED -- sub-pools %s"
@@ -324,6 +368,22 @@ def build_unified_pools(
     fused_draft: Optional[FusedDraftPlacement] = None,
 ) -> KVStorage:
     """Declarations -> plan -> sizing -> the unified KV storage."""
-    plan = plan_kv_storage(decls, page_size=page_size, fused_draft=fused_draft)
-    sized = size_kv_storage(plan, sizing)
-    return build_kv_storage(plan, sized, sizing, ctx)
+    plan = plan_kv_storage(
+        decls,
+        page_size=page_size,
+        fused_draft=fused_draft,
+        speculative_num_draft_tokens=ctx.speculative_num_draft_tokens,
+    )
+    sizing = msgspec.structs.replace(
+        sizing,
+        max_running_requests=ctx.max_num_reqs,
+        pre_alloc_rows=ctx.decode_pre_alloc_size,
+        extra_context_len=ctx.extra_max_context_len,
+        tracking_slots=get_mamba_tracking_slots(
+            extra_buffer=True, overlap=not ctx.disable_overlap_schedule
+        )
+        if ctx.enable_mamba_extra_buffer
+        else 0,
+    )
+    sized = size_plan(plan, sizing)
+    return build_kv_storage(plan, sized, ctx)

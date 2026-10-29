@@ -29,8 +29,13 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.unified_allocator_fixtures import build_test_unified_pools
+from sglang.test.unified_allocator_fixtures import (
+    build_test_unified_pools,
+    setup_allocator_context,
+)
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
@@ -39,7 +44,9 @@ _FINAL_BYTES = 16 << 20
 _PAGE_SIZE = 4
 
 
-def _bundle(*, total_bytes: int, post_capture_active: bool):
+def _bundle(*, total_bytes: int, post_capture_active: bool, chain="swa"):
+    has_state = chain in ("state", "tri")
+    has_window = chain in ("swa", "tri")
     return build_test_unified_pools(
         device="cuda",
         kv_cache_dtype=torch.float16,
@@ -52,7 +59,17 @@ def _bundle(*, total_bytes: int, post_capture_active: bool):
         page_size=_PAGE_SIZE,
         start_layer=0,
         end_layer=4,
-        swa_attention_layer_ids=[1, 3],
+        swa_attention_layer_ids=[1, 3] if has_window else [],
+        mamba_layer_ids=[1, 3] if has_state else [],
+        mamba2_cache_params=SimpleNamespace(
+            layers=[1, 3],
+            shape=SimpleNamespace(conv=[(3, 8)], temporal=(1, 4, 8)),
+            dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.float32),
+        )
+        if has_state
+        else None,
+        max_mamba_cache_size=16 if has_state else 0,
+        speculative_num_draft_tokens=2 if has_state else None,
         full_attention_layer_ids=[0, 2],
         total_bytes=total_bytes,
         enable_memory_saver=False,
@@ -60,6 +77,27 @@ def _bundle(*, total_bytes: int, post_capture_active: bool):
         need_sort=False,
         model_context_len=256,
         sliding_window_size=64,
+    )
+
+
+def _final_config(bundle):
+    storage = bundle.token_to_kv_pool_allocator.storage
+    sized = size_plan(
+        storage.plan,
+        KVSizingInputs(
+            budget_bytes=_FINAL_BYTES,
+            context_len=256,
+            floor_window=64,
+            max_running_requests=1,
+            state_slots=16,
+            alignment=1,
+        ),
+        frozen=storage.sized,
+    )
+    return SimpleNamespace(
+        unified_memory_pool_bytes=sized.total_bytes,
+        full_max_total_num_tokens=sized.full_tokens,
+        swa_max_total_num_tokens=sized.window_tokens,
     )
 
 
@@ -95,6 +133,9 @@ def _capacities(bundle) -> dict:
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestUnifiedPostCaptureSizing(unittest.TestCase):
+    def setUp(self):
+        setup_allocator_context()
+
     def _post_capture_bundle(self, total_bytes=_RESERVED_BYTES):
         return _bundle(total_bytes=total_bytes, post_capture_active=True)
 
@@ -104,7 +145,11 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
         bundle = self._post_capture_bundle()
         shared = bundle.arena
         self.assertTrue(bundle.token_to_kv_pool.post_capture_active)
-        self.assertEqual(shared.total_bytes, _RESERVED_BYTES)
+        self.assertEqual(
+            shared.total_bytes
+            + bundle.token_to_kv_pool_allocator.storage.sized.fixed_bytes,
+            _RESERVED_BYTES,
+        )
         self.assertGreater(shared.accessible_bytes, 0)
         self.assertLessEqual(shared.accessible_bytes, shared.backed_bytes)
         self.assertLess(shared.backed_bytes, _RESERVED_BYTES)
@@ -123,7 +168,7 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
         ]
         table_ptrs = [table.data_ptr() for table in tables]
 
-        config = SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
+        config = _final_config(bundle)
         bundle.token_to_kv_pool.finalize_backing(config)
         allocator.resize(config)
 
@@ -147,6 +192,57 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
         self.assertIsNotNone(allocator.alloc(n))
         self.assertEqual(allocator.available_size(), 0)
 
+    def test_every_chain_retains_captured_and_fixed_addresses(self):
+        for chain, dcp in (
+            ("swa", 1),
+            ("state", 1),
+            ("tri", 1),
+            ("state", 2),
+            ("state", 4),
+        ):
+            with (
+                self.subTest(chain=chain, dcp=dcp),
+                get_parallel().override(attn_dcp_size=dcp),
+            ):
+                bundle = _bundle(
+                    total_bytes=_RESERVED_BYTES, post_capture_active=True, chain=chain
+                )
+                allocator = bundle.token_to_kv_pool_allocator
+                storage = allocator.storage
+                tensors = [bundle.arena.raw, storage.requests.req_to_token]
+                tensors.extend(storage.scratch.tensors.values())
+                for band in allocator.members:
+                    tensors.extend(
+                        (band.ids.virtual_to_physical, band.ids.physical_to_virtual)
+                    )
+                pointers = [t.data_ptr() for t in tensors]
+                shapes = [tuple(t.shape) for t in tensors]
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    bundle.arena.raw[:1].fill_(9)
+                config = _final_config(bundle)
+                bundle.token_to_kv_pool.finalize_backing(config)
+                allocator.resize(config)
+                graph.replay()
+                torch.cuda.synchronize()
+                self.assertEqual(bundle.arena.raw[0].item(), 9)
+                self.assertEqual([t.data_ptr() for t in tensors], pointers)
+                self.assertEqual([tuple(t.shape) for t in tensors], shapes)
+                eager = _bundle(
+                    total_bytes=_FINAL_BYTES, post_capture_active=False, chain=chain
+                )
+                self.assertEqual(
+                    allocator.available_size(),
+                    eager.token_to_kv_pool_allocator.available_size(),
+                )
+                self.assertEqual(allocator.verify_byte_accounting(), [])
+                for band in allocator.members:
+                    self.assertEqual(
+                        band.max_slots, bundle.arena.num_entries(band.sub_pool_name)
+                    )
+                    view = allocator.views[band.sub_pool_name]
+                    self.assertEqual(view.size, band.max_slots - band.pool_page_size)
+
     def test_sizing_contract_is_enforced(self):
         bundle = self._post_capture_bundle()
         kvcache = bundle.token_to_kv_pool
@@ -155,9 +251,7 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
             with self.assertRaisesRegex(
                 RuntimeError, "must be backed before allocator.resize"
             ):
-                allocator.resize(
-                    SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
-                )
+                allocator.resize(_final_config(bundle))
         with self.subTest("budget without a byte count"):
             with self.assertRaises(ValueError):
                 kvcache.finalize_backing(
@@ -174,18 +268,14 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
                     SimpleNamespace(unified_memory_pool_bytes=4096)
                 )
         with self.subTest("resize with live allocations"):
-            kvcache.finalize_backing(
-                SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
-            )
+            kvcache.finalize_backing(_final_config(bundle))
             # Move the grow-down allocator's frontier into the backed range
             # before allocating; it still reflects the larger reservation.
-            allocator.resize(SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES))
+            allocator.resize(_final_config(bundle))
             handed = allocator.alloc(_PAGE_SIZE)
             self.assertIsNotNone(handed)
             with self.assertRaisesRegex(RuntimeError, "non-empty"):
-                allocator.resize(
-                    SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
-                )
+                allocator.resize(_final_config(bundle))
             allocator.free(handed)
 
         eager = _bundle(total_bytes=_FINAL_BYTES, post_capture_active=False)

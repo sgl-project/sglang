@@ -4,7 +4,7 @@ from typing import Optional, Sequence, Tuple
 
 import msgspec
 
-from sglang.srt.mem_cache.kv.decl import FullLifetime, StateLifetime, WindowLifetime
+from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.plan import KVStoragePlan
 
 # One running request holds 1 active state slot plus 2 radix checkpoints; a
@@ -32,77 +32,285 @@ def check_bs1_floor(
 
 
 class KVSizingInputs(msgspec.Struct, frozen=True, kw_only=True):
-    # Bytes for the token sub-pools; the state slots ride on top. None sizes the
-    # token side from the token capacities instead.
-    token_budget_bytes: Optional[int] = None
+    budget_bytes: Optional[int] = None
+    # Explicit capacities are useful to construct deterministic small pools.
     full_tokens: Optional[int] = None
     window_tokens: Optional[int] = None
-    state_slots: int = 0
-    # None skips the bs=1 floor check.
+    state_slots: Optional[int] = None
+    state_share: float = 0.1
+    slots_per_request: int = 1
+    radix_cache: bool = True
     context_len: Optional[int] = None
-    # The window the bs=1 floor charges: the model config's window, which some
-    # models state one token above the window their layers attend over (the
-    # plan's). Required when the plan has a window and the floor is checked.
     floor_window: Optional[int] = None
+    window_ratio: float = 1.0
+    window_request_cap: bool = False
+    max_running_requests: Optional[int] = None
+    max_total_tokens: Optional[int] = None
+    pre_alloc_rows: int = 0
+    extra_context_len: int = 0
+    tracking_slots: int = 0
+    alignment: int = 4096
+
+
+class FixedAllocation(msgspec.Struct, frozen=True, kw_only=True):
+    name: str
+    bytes: int
 
 
 class SizedKVStorage(msgspec.Struct, frozen=True, kw_only=True):
     total_bytes: int
+    budget_bytes: int
+    full_tokens: int
+    window_tokens: int
+    state_units: Tuple[Tuple[str, int], ...]
+    max_running_requests: int
+    scratch_rows: int
+    request_rows: int
+    fixed: Tuple[FixedAllocation, ...]
+    full_cap_tokens: Optional[int] = None
     bs1_floor_terms: Tuple[Tuple[str, int], ...] = ()
 
+    @property
+    def fixed_bytes(self):
+        return sum(term.bytes for term in self.fixed)
 
-def _token_side_bytes(plan: KVStoragePlan, inputs: KVSizingInputs) -> int:
-    if inputs.token_budget_bytes is not None:
-        return inputs.token_budget_bytes
-    full = plan.of_lifetime(FullLifetime)
-    window = plan.of_lifetime(WindowLifetime)
-    if inputs.full_tokens is None or (
-        window is not None and inputs.window_tokens is None
-    ):
-        raise ValueError(
-            "a token byte budget or the token capacity of every token sub-pool "
-            "must be provided"
+    def units(self, name):
+        return dict(self.state_units)[name]
+
+
+def _request_estimate(plan, inp):
+    if inp.max_running_requests is not None:
+        return inp.max_running_requests
+    if inp.full_tokens is not None:
+        tokens = inp.full_tokens
+    else:
+        tokens = inp.budget_bytes // plan.owner().spec.entry_bytes()
+    return max(
+        1,
+        min(
+            tokens // 2,
+            max(2048, min(4096, tokens * 512 // max(1, inp.context_len or 1))),
+        ),
+    )
+
+
+def _fixed_terms(plan, inp, running):
+    scratch_rows = running + 1
+    request_rows = scratch_rows + inp.pre_alloc_rows
+    row_bytes = 4 * ((inp.context_len or 0) + inp.extra_context_len)
+    row_bytes += sum(
+        4 + 8 * inp.tracking_slots
+        for s in plan.sub_pools
+        if isinstance(s.lifetime, StateLifetime)
+    )
+    terms = [FixedAllocation(name="request_table", bytes=row_bytes * request_rows)]
+    terms.extend(
+        FixedAllocation(name=d.part.name, bytes=d.part.row_bytes * scratch_rows)
+        for d in plan.scratch
+    )
+    terms.extend(
+        FixedAllocation(name=d.part.name, bytes=d.part.row_bytes * request_rows)
+        for d in plan.request_parts
+    )
+    return tuple(terms)
+
+
+def _derived_terms(plan, chain_bytes):
+    return tuple(
+        FixedAllocation(
+            name=f"{d.sub_pool}.{d.part.name}",
+            bytes=(
+                chain_bytes
+                // (
+                    plan.sub_pool(d.sub_pool).unit
+                    * plan.sub_pool(d.sub_pool).spec.entry_bytes()
+                )
+            )
+            * d.part.row_bytes,
         )
-    total = inputs.full_tokens * full.spec.entry_bytes()
-    if window is not None:
-        total += inputs.window_tokens * window.spec.entry_bytes()
-    return total
+        for d in plan.derived_parts
+    )
 
 
-def _bs1_floor_terms(
-    plan: KVStoragePlan, context_len: int, floor_window: Optional[int]
-) -> Tuple[Tuple[str, int], ...]:
-    """The bytes ONE worst-case request needs alone: one window of window KV (plus
-    a page of slack for the page-granular walk, clamped to the context), the
-    state slots it locks, and the slot-0 sink. The full side is not charged:
-    `max_req_len` already clamps it to the pool."""
+def _chain_budget(plan, budget, fixed, alignment):
+    # Page-indexed storage spans every physical page of the reserved arena.
+    low, high = 0, max(0, budget - sum(t.bytes for t in fixed)) // alignment
+    while low < high:
+        mid = (low + high + 1) // 2
+        chain = mid * alignment
+        if (
+            chain
+            + sum(t.bytes for t in _derived_terms(plan, chain))
+            + sum(t.bytes for t in fixed)
+            <= budget
+        ):
+            low = mid
+        else:
+            high = mid - 1
+    return low * alignment
+
+
+def _window_units(sub_pool, full, inp, running, page):
+    if inp.window_request_cap:
+        window = sub_pool.lifetime.window
+        return (
+            running
+            * -(
+                -(
+                    min(inp.context_len, window + page)
+                    if window is not None
+                    else inp.context_len
+                )
+                // page
+            )
+            * page
+        )
+    if inp.window_tokens is not None and inp.full_tokens is not None:
+        return int(full * inp.window_tokens / max(1, inp.full_tokens)) // page * page
+    return int(full * inp.window_ratio) // page * page
+
+
+def _bs1_floor_terms(plan, context_len, floor_window):
     terms = []
-    window = plan.of_lifetime(WindowLifetime)
-    if window is not None:
-        size = floor_window
-        tokens = (
-            min(context_len, size + plan.page_size) if size is not None else context_len
-        )
-        terms.append(("swa_window_kv", tokens * window.spec.entry_bytes()))
-    state = plan.of_lifetime(StateLifetime)
-    if state is not None:
-        terms.append(("bs1_state_slots", _BS1_STATE_SLOTS * state.spec.entry_bytes()))
+    for sub_pool in plan.sub_pools:
+        if isinstance(sub_pool.lifetime, WindowLifetime):
+            window = (
+                floor_window if floor_window is not None else sub_pool.lifetime.window
+            )
+            tokens = (
+                context_len
+                if window is None
+                else min(context_len, window + sub_pool.unit)
+            )
+            tokens = -(-tokens // sub_pool.unit) * sub_pool.unit
+            terms.append(
+                (f"{sub_pool.name}_window_kv", tokens * sub_pool.spec.entry_bytes())
+            )
+        elif isinstance(sub_pool.lifetime, StateLifetime):
+            terms.append(
+                (
+                    f"{sub_pool.name}_bs1_state_slots",
+                    _BS1_STATE_SLOTS * sub_pool.spec.entry_bytes(),
+                )
+            )
     terms.append(("sink", plan.sink_bytes()))
     return tuple(terms)
 
 
-def size_kv_storage(plan: KVStoragePlan, inputs: KVSizingInputs) -> SizedKVStorage:
-    """Total buffer bytes for a plan; refuses a budget below the bs=1 floor."""
-    total_bytes = _token_side_bytes(plan, inputs)
-    state = plan.of_lifetime(StateLifetime)
-    if state is not None:
-        total_bytes += inputs.state_slots * state.spec.entry_bytes()
-    terms: Tuple[Tuple[str, int], ...] = ()
-    if inputs.context_len is not None:
-        terms = _bs1_floor_terms(plan, inputs.context_len, inputs.floor_window)
-        check_bs1_floor(
-            total_bytes=total_bytes, floor_terms=terms, where="build_unified_pools"
+def _state_targets(plan, inp, chain, running, states, frozen):
+    units = {}
+    state_budget = int(max(0, chain - plan.sink_bytes()) * inp.state_share)
+    for sub_pool in states:
+        count = inp.state_slots
+        if count is None:
+            count = (
+                running
+                if not inp.radix_cache
+                else state_budget // sub_pool.spec.entry_bytes()
+            )
+        if frozen is not None:
+            count = min(count, frozen.units(sub_pool.name))
+        units[sub_pool.name] = count
+    return units
+
+
+def _token_targets(plan, inp, chain, running, states, windows, units, frozen):
+    tokens_budget = (
+        chain
+        - plan.sink_bytes()
+        - sum(units[s.name] * s.spec.entry_bytes() for s in states)
+    )
+    owner = plan.owner()
+    page = plan.page_size
+    low, high = 0, max(0, tokens_budget) // (page * owner.spec.entry_bytes())
+    while low < high:
+        mid = (low + high + 1) // 2
+        full = mid * page
+        cost = full * owner.spec.entry_bytes() + sum(
+            _window_units(s, full, inp, running, page) * s.spec.entry_bytes()
+            for s in windows
         )
-    if total_bytes <= 0:
-        raise ValueError(f"total_bytes must be positive, got {total_bytes}")
-    return SizedKVStorage(total_bytes=total_bytes, bs1_floor_terms=terms)
+        if cost <= tokens_budget:
+            low = mid
+        else:
+            high = mid - 1
+    full = low * page
+    caps = [
+        x
+        for x in (
+            inp.max_total_tokens,
+            inp.full_tokens,
+            frozen.full_tokens if frozen else None,
+        )
+        if x is not None
+    ]
+    if caps:
+        full = min(full, *caps) // page * page
+    window = max(
+        (_window_units(s, full, inp, running, page) for s in windows), default=0
+    )
+    return full, window
+
+
+def size_plan(
+    plan: KVStoragePlan, inp: KVSizingInputs, *, frozen: Optional[SizedKVStorage] = None
+) -> SizedKVStorage:
+    """Solve all declared storage against one unsubtracted byte budget.
+
+    State units are boot targets. The arena may give state more slots at runtime;
+    only the explicit FULL limit caps allocation. Captured fixed extents never grow.
+    """
+    if inp.alignment <= 0 or not 0 <= inp.state_share < 1:
+        raise ValueError("invalid sizing alignment or state share")
+    running = _request_estimate(plan, inp)
+    fixed = _fixed_terms(plan, inp, running)
+    states = [s for s in plan.sub_pools if isinstance(s.lifetime, StateLifetime)]
+    windows = [s for s in plan.sub_pools if isinstance(s.lifetime, WindowLifetime)]
+    budget = inp.budget_bytes
+    if budget is None:
+        if inp.full_tokens is None:
+            raise ValueError("sizing needs the total byte budget")
+        chain = inp.full_tokens * plan.owner().spec.entry_bytes() + plan.sink_bytes()
+        chain += sum((inp.window_tokens or 0) * s.spec.entry_bytes() for s in windows)
+        chain += sum((inp.state_slots or 0) * s.spec.entry_bytes() for s in states)
+        budget = chain + sum(t.bytes for t in (*fixed, *_derived_terms(plan, chain)))
+    if frozen is None:
+        chain = _chain_budget(plan, budget, fixed, inp.alignment)
+        fixed += _derived_terms(plan, chain)
+        scratch_rows, request_rows = running + 1, running + inp.pre_alloc_rows + 1
+    else:
+        fixed = frozen.fixed
+        chain = min(
+            frozen.total_bytes,
+            max(0, budget - frozen.fixed_bytes) // inp.alignment * inp.alignment,
+        )
+        scratch_rows, request_rows = frozen.scratch_rows, frozen.request_rows
+        running = min(running, frozen.max_running_requests)
+    units = _state_targets(plan, inp, chain, running, states, frozen)
+    full, window = _token_targets(
+        plan, inp, chain, running, states, windows, units, frozen
+    )
+    running = min(
+        running, full // 2, *(units[s.name] // inp.slots_per_request for s in states)
+    )
+    terms = (
+        ()
+        if inp.context_len is None
+        else _bs1_floor_terms(plan, inp.context_len, inp.floor_window)
+    )
+    check_bs1_floor(total_bytes=chain, floor_terms=terms, where="size_plan")
+    if full <= 0 or running <= 0:
+        raise RuntimeError("the declared storage budget cannot serve one request")
+    return SizedKVStorage(
+        total_bytes=chain,
+        budget_bytes=budget,
+        full_tokens=full,
+        window_tokens=window,
+        state_units=tuple(units.items()),
+        max_running_requests=running,
+        scratch_rows=scratch_rows,
+        request_rows=request_rows,
+        fixed=fixed,
+        full_cap_tokens=inp.max_total_tokens,
+        bs1_floor_terms=terms,
+    )

@@ -1369,6 +1369,10 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
             with (
                 self.subTest(full_indices=full_indices),
                 patch(_ASSEMBLER + "get_memory", return_value=_unified_memory(None)),
+                patch(
+                    _ASSEMBLER + "get_parallel",
+                    return_value=SimpleNamespace(dcp_enabled=False),
+                ),
                 patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
                 patch.object(
                     MHAHostLayout,
@@ -1527,6 +1531,10 @@ class TestUnifiedPageEnvelopeSelection(CustomTestCase):
             with (
                 self.subTest(backend=backend),
                 patch(_ASSEMBLER + "get_memory", return_value=_unified_memory(backend)),
+                patch(
+                    _ASSEMBLER + "get_parallel",
+                    return_value=SimpleNamespace(dcp_enabled=False),
+                ),
                 patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
                 patch.object(
                     MHAHostLayout,

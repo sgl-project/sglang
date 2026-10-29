@@ -298,11 +298,14 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             return []
         return [f"[chain] stale pricing snapshot: {self._snapshot_memo} != {fresh}"]
 
+    def _cap_full_available(self, tokens):
+        return self.full_attn_allocator.cap_available(tokens)
+
     def available_size(self) -> int:
-        return self._policy.available_size(self)
+        return self._cap_full_available(self._policy.available_size(self))
 
     def full_available_size(self) -> int:
-        return self._policy.full_available_size(self)
+        return self._cap_full_available(self._policy.full_available_size(self))
 
     def swa_available_size(self) -> int:
         return self._policy.swa_available_size(self)
@@ -342,9 +345,21 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         return (owner.max_slots - 1) * dcp_size
 
     def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool:
+        if full_tokens > self._cap_full_available(full_tokens):
+            return False
         return self._policy.ensure_capacity(self, full_tokens, swa_tokens)
 
     def can_reserve(self, full_tokens, swa_tokens, **kwargs) -> bool:
+        owner = self.full_attn_allocator
+        if owner.max_live_tokens is not None:
+            cap = owner.max_live_tokens
+            if not kwargs.get("empty_pool", False):
+                cap -= max(
+                    0,
+                    owner.allocated_count() - kwargs.get("full_evictable_tokens", 0),
+                )
+            if full_tokens > cap:
+                return False
         return self._policy.can_reserve(self, full_tokens, swa_tokens, **kwargs)
 
     def reclaim_plan(self, full_tokens, swa_tokens, **kwargs):
@@ -404,7 +419,47 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         return self._policy.evict_to_free_tokens(self, tree_cache, num_tokens, **kwargs)
 
     def resize(self, config) -> None:
-        self._policy.resize(self, config)
+        if (
+            not self.arena.backed_after_capture
+            or config.unified_memory_pool_bytes != self.arena.total_bytes
+        ):
+            raise RuntimeError("the arena must be backed before allocator.resize")
+        for band in self.members:
+            if band.allocated_count() or band._pending_reuse:
+                raise RuntimeError(
+                    f"cannot resize non-empty band {band.sub_pool_name!r}"
+                )
+        owner = self.full_attn_allocator
+        for band in self.members:
+            band._set_capacity(
+                self.arena.num_entries(band.sub_pool_name),
+                virtual_num_pages=None
+                if band.is_id_owner
+                else owner.ids.num_virtual_ids,
+            )
+        self._policy = interim_policy_for(
+            self,
+            full_max_total_num_tokens=config.full_max_total_num_tokens,
+            swa_max_total_num_tokens=config.swa_max_total_num_tokens,
+        )
+        self.get_kvcache().size = (
+            config.full_max_total_num_tokens
+            if self.swa_attn_allocator is None
+            else owner.max_slots - 1
+        )
+        for band in self.members:
+            view = self.views[band.sub_pool_name]
+            view.size = band.max_slots - band.pool_page_size
+            if band.sub_pool_name != self.roles.state:
+                view.num_pages = band.num_pages
+        if self.swa_attn_allocator is not None:
+            self._size_window_host_pools()
+        else:
+            view = self.views[owner.sub_pool_name]
+            view.host_capacity_tokens = config.full_max_total_num_tokens
+            view.host_capacity_bytes = (
+                config.full_max_total_num_tokens * owner.entry_bytes
+            )
 
     def _flush_targets(self):
         return self._policy.flush_targets(self)

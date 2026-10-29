@@ -383,7 +383,7 @@ class UnifiedGeometry(msgspec.Struct, frozen=True, kw_only=True):
 
     ``chain`` names its kinds: "swa" (full + window), "mamba" (full + state) or
     "tri" (full + window + state); the layer ids given per kind must match.
-    ``byte_budget`` is the token side's byte budget (state slots ride on top);
+    ``byte_budget`` is the complete device-storage budget;
     without it the token capacities size the buffer.
     """
 
@@ -469,7 +469,7 @@ def build_test_unified_pools(
     unified_total_bytes=None,
     model_context_len=None,
     extra_max_context_len=0,
-    max_num_reqs=0,
+    max_num_reqs=1,
     enable_memory_saver=False,
     post_capture_active=False,
     need_sort=False,
@@ -519,9 +519,7 @@ def build_test_unified_pools(
         ),
     )
     sizing = KVSizingInputs(
-        token_budget_bytes=total_bytes
-        if total_bytes is not None
-        else unified_total_bytes,
+        budget_bytes=total_bytes if total_bytes is not None else unified_total_bytes,
         full_tokens=(
             full_max_total_num_tokens
             if full_max_total_num_tokens is not None
@@ -531,6 +529,7 @@ def build_test_unified_pools(
         state_slots=max_mamba_cache_size,
         context_len=model_context_len,
         floor_window=sliding_window_size,
+        alignment=1,
     )
     ctx = UnifiedBuildContext(
         device=device,
@@ -605,12 +604,13 @@ def build_unified_bundle(geometry: UnifiedGeometry):
     )
     by_tokens = g.byte_budget is None or bool(g.state_layer_ids)
     sizing = KVSizingInputs(
-        token_budget_bytes=g.byte_budget,
+        budget_bytes=g.byte_budget,
         full_tokens=g.full_tokens if by_tokens else None,
         window_tokens=g.swa_tokens if by_tokens and g.swa_layer_ids else None,
         state_slots=g.state_slots if g.state_layer_ids else 0,
         context_len=g.context_len,
         floor_window=g.window if g.swa_layer_ids else None,
+        alignment=1,
     )
     ctx = UnifiedBuildContext(
         device=g.device,

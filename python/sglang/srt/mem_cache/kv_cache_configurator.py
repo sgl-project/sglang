@@ -367,6 +367,8 @@ class KVCacheConfigurator:
     kv_shard_group: Optional[GroupCoordinator] = field(init=False)
     draft_owns_its_depth: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    _unified_plan: Any = field(init=False, default=None)
+    _unified_sized: Any = field(init=False, default=None)
 
     @property
     def draft_attn_tp_size(self) -> int:
@@ -945,10 +947,48 @@ class KVCacheConfigurator:
             )
         state = {}
         if has_state:
+            from sglang.srt.mem_cache.kv.decl import (
+                StateReplay,
+                with_state_ple,
+                with_state_replay,
+            )
+
             cache_params = self.mambaish_config.mamba2_cache_params
+            layer_ids = tuple(i for i in cache_params.layers if start <= i < end)
+            geometry = StateGeometry.of(cache_params)
+            mamba = get_exec().mamba
+            geometry = with_state_replay(
+                geometry,
+                StateReplay(
+                    decode=mamba.enable_linear_replayssm,
+                    speculative=mamba.enable_linear_replayssm_spec
+                    and (
+                        self.hybrid_gdn_config is not None
+                        or self.hybrid_kda_config is not None
+                    ),
+                    is_kda=cache_params.is_kda,
+                    cache_len=mamba.linear_replayssm_cache_len,
+                    key_heads=cache_params.shape.num_k_heads_per_tp,
+                ),
+                layer_ids=layer_ids,
+                speculative_num_draft_tokens=(
+                    None
+                    if _pd_prefill_skips_mamba_spec_state()
+                    else max_speculative_num_draft_tokens()
+                ),
+            )
+            geometry = with_state_ple(
+                geometry,
+                **self._get_ple_req_pool_kwargs(),
+                speculative_num_draft_tokens=(
+                    None
+                    if _pd_prefill_skips_mamba_spec_state()
+                    else max_speculative_num_draft_tokens()
+                ),
+            )
             state = dict(
-                state_layer_ids=[i for i in cache_params.layers if start <= i < end],
-                state_geometry=StateGeometry.of(cache_params),
+                state_layer_ids=layer_ids,
+                state_geometry=geometry,
                 checkpoint_interval=mamba_cache_chunk_size(),
             )
         if has_window and has_state:
@@ -973,54 +1013,17 @@ class KVCacheConfigurator:
     def _init_unified_pools(self, *, sizes: _PoolSizes) -> KVStorage:
         """Build the unified pool stack: one byte buffer shared by every sub-pool
         this runner's layers declare, with virtual ids above the allocator."""
-        from sglang.srt.mem_cache.kv.build import (
-            UnifiedBuildContext,
-            build_unified_pools,
-        )
-        from sglang.srt.mem_cache.kv.sizing import KVSizingInputs
+        from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 
-        decls = self._kv_layer_decls()
         has_window, has_state = self._unified_window_and_state()
-        assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        if has_state:
-            fused_draft = self._fused_draft_for_mamba_factory()
-            # A draft worker sizes its own pool by token count; only the
-            # target's unified buffer takes the profiled byte budget.
-            token_budget_bytes = (
-                None if self.is_draft_worker else sizes.unified_total_bytes
-            )
-            full_tokens = (
-                sizes.full_max_total_num_tokens
-                if has_window
-                else sizes.max_total_num_tokens
-            )
-        else:
-            fused_draft = self._fused_draft_for_swa_factory()
-            # An uncapped, draft-free pool owns the profiled budget, including bytes
-            # left over after rounding the FULL/SWA boot capacities to pages.
-            token_budget_bytes = sizes.unified_memory_pool_bytes
-            if sizes.unified_total_bytes is not None and self.spec_algorithm.is_none():
-                token_budget_bytes = sizes.unified_total_bytes
-            full_tokens = sizes.full_max_total_num_tokens
+        if self._unified_sized is None:
+            raise RuntimeError("unified storage must be sized before construction")
         extra_max_context_len, decode_pre_alloc_size = self._unified_request_rows(
             has_state=has_state
         )
-        storage = build_unified_pools(
-            decls=decls,
-            page_size=self.page_size,
-            fused_draft=fused_draft,
-            sizing=KVSizingInputs(
-                token_budget_bytes=token_budget_bytes,
-                full_tokens=full_tokens,
-                window_tokens=sizes.swa_max_total_num_tokens if has_window else None,
-                state_slots=get_schedule().max_mamba_cache_size if has_state else 0,
-                # bs=1 feasibility floor input: it bounds the window and state
-                # terms only; the full-attention side is not charged.
-                context_len=self.model_config.context_len,
-                floor_window=(
-                    self.model_config.sliding_window_size if has_window else None
-                ),
-            ),
+        storage = build_kv_storage(
+            self._unified_plan,
+            self._unified_sized,
             ctx=UnifiedBuildContext(
                 device=self.device,
                 start_layer=self.layer_info.start_layer,
@@ -1047,7 +1050,11 @@ class KVCacheConfigurator:
                 ),
                 enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
                 enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
-                speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+                speculative_num_draft_tokens=(
+                    None
+                    if _pd_prefill_skips_mamba_spec_state()
+                    else max_speculative_num_draft_tokens()
+                ),
                 disable_overlap_schedule=get_schedule().disable_overlap_schedule,
                 decode_pre_alloc_size=decode_pre_alloc_size,
                 mamba_full_memory_ratio=get_schedule().mamba_full_memory_ratio,
@@ -1062,8 +1069,9 @@ class KVCacheConfigurator:
         disagg = get_disagg()
         if has_state:
             extra_max_context_len = 4
-            if get_spec().speculative_num_draft_tokens is not None:
-                extra_max_context_len += get_spec().speculative_num_draft_tokens
+            draft_tokens = max_speculative_num_draft_tokens()
+            if draft_tokens is not None:
+                extra_max_context_len += draft_tokens
             pre_alloc_size = (
                 disagg.disaggregation_decode_extra_slots
                 if disagg.disaggregation_mode == "decode"
@@ -2848,7 +2856,7 @@ class KVCacheConfigurator:
             mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
-        if self.mambaish_config is not None:
+        if self.mambaish_config is not None and not get_memory().enable_unified_memory:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
         # Loaded weights (target + draft) can exceed the static budget
@@ -2931,6 +2939,8 @@ class KVCacheConfigurator:
     def resolve_max_num_reqs(self, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
+        if get_memory().enable_unified_memory and self._unified_sized is not None:
+            return min(self._unified_sized.max_running_requests, token_capacity // 2)
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
         estimated = int(token_capacity / self.model_config.context_len * 512)
         estimated = max(min(estimated, 4096), 2048)
@@ -2993,6 +3003,9 @@ class KVCacheConfigurator:
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self.config_from_budget(available_bytes)
+        if get_memory().enable_unified_memory and not self.is_draft_worker:
+            config.mem_fraction_static = get_schedule().mem_fraction_static
+            return config
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
@@ -3007,6 +3020,8 @@ class KVCacheConfigurator:
         """Turn a KV byte budget into a pool config via the configurator, re-applying
         the external token constraints (user cap, page alignment, PP sync) and the
         optional ``cap_tokens`` clamp."""
+        if get_memory().enable_unified_memory and not self.is_draft_worker:
+            return self._unified_config_from_budget(budget_bytes, cap_tokens=cap_tokens)
         # Local import avoids a pool_configurator import cycle.
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
@@ -3037,6 +3052,75 @@ class KVCacheConfigurator:
                 max_tokens, get_schedule().page_size
             )
         return config
+
+    def _unified_config_from_budget(self, budget_bytes, *, cap_tokens=None):
+        from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+        from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+
+        schedule = get_schedule()
+        has_window, has_state = self._unified_window_and_state()
+        if self._unified_plan is None:
+            self._unified_plan = plan_kv_storage(
+                self._kv_layer_decls(),
+                page_size=self.page_size,
+                fused_draft=self._fused_draft_for_mamba_factory()
+                if has_state
+                else self._fused_draft_for_swa_factory(),
+                speculative_num_draft_tokens=None
+                if _pd_prefill_skips_mamba_spec_state()
+                else max_speculative_num_draft_tokens(),
+            )
+        extra_context, pre_alloc = self._unified_request_rows(has_state=has_state)
+        ratio = schedule.mamba_full_memory_ratio
+        requested = schedule.max_running_requests
+        inp = KVSizingInputs(
+            budget_bytes=budget_bytes,
+            context_len=self.model_config.context_len,
+            extra_context_len=extra_context,
+            pre_alloc_rows=pre_alloc,
+            max_running_requests=None
+            if requested is None
+            else max(1, requested // self.attn_dp_size),
+            max_total_tokens=schedule.max_total_tokens,
+            state_slots=None
+            if schedule.max_mamba_cache_size is None
+            else schedule.max_mamba_cache_size // self.attn_dp_size,
+            state_share=ratio / (1 + ratio),
+            slots_per_request=self._calculate_mamba_ratio() if has_state else 1,
+            radix_cache=not get_memory().disable_radix_cache,
+            window_ratio=schedule.swa_full_tokens_ratio,
+            floor_window=self.model_config.sliding_window_size if has_window else None,
+            tracking_slots=get_mamba_tracking_slots(
+                extra_buffer=True, overlap=not schedule.disable_overlap_schedule
+            )
+            if get_exec().mamba.enable_mamba_extra_buffer
+            else 0,
+        )
+        frozen = self._unified_sized if cap_tokens is not None else None
+        if frozen is not None:
+            # Fixed allocations are already resident when free memory is measured.
+            inp = msgspec.structs.replace(
+                inp, budget_bytes=budget_bytes + frozen.fixed_bytes
+            )
+        sized = size_plan(self._unified_plan, inp, frozen=frozen)
+        full = self._apply_token_constraints(sized.full_tokens)
+        if cap_tokens is not None:
+            full = min(full, cap_tokens)
+        if full != sized.full_tokens:
+            sized = size_plan(
+                self._unified_plan,
+                msgspec.structs.replace(inp, max_total_tokens=full),
+                frozen=frozen,
+            )
+        self._unified_sized = sized
+        return MemoryPoolConfig(
+            max_total_num_tokens=sized.full_tokens,
+            max_running_requests=sized.max_running_requests,
+            full_max_total_num_tokens=sized.full_tokens,
+            swa_max_total_num_tokens=sized.window_tokens if has_window else None,
+            unified_memory_pool_bytes=sized.total_bytes,
+            unified_total_bytes=sized.total_bytes,
+        )
 
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config

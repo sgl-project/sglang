@@ -2,10 +2,10 @@
 
 PD prefill and decode peers address each other's page envelopes by physical
 page id, and HiCache copies whole envelopes and state entries, so the values
-pinned here are a wire format: chain order, entry bytes, part offsets, view
-strides, the slot-0 sink, slot bounds and the empty-pool capacities. A changed
-literal is a change of the PD/HiCache byte layout; the PR that changes one must
-say so and why. Nothing is recomputed from the implementation at test time:
+pinned here include the wire format (chain order, entry bytes, part offsets,
+view strides and the slot-0 sink) and capacity results (slot bounds and empty
+pool capacity). Total-budget sizing charges the sink once and fixed request
+storage outside the arena; capacity literals include that accounting. Nothing is recomputed from the implementation at test time:
 the literals were produced once and are compared as data.
 """
 
@@ -80,8 +80,8 @@ def _tri(**kw) -> UnifiedGeometry:
 
 
 _CONFIGS = {
-    # Entries align32(2 x (16 B K + 16 B V)) = 64 B; total 64 x 64 + 64 x 64 = 8192;
-    # the sink is one 64 B entry, so min_slot_index 1 and max_slots 8192 // 64 = 128.
+    # Entries align32(2 x (16 B K + 16 B V)) = 64 B. The arena contains
+    # 64 full + 64 window entries and one shared 64 B sink.
     "swa_p1": _swa(page_size=1),
     "swa_p16": _swa(page_size=16, full_tokens=64 * 16, swa_tokens=64 * 16),
     "swa_p64": _swa(page_size=64, full_tokens=64 * 64, swa_tokens=64 * 64),
@@ -118,7 +118,7 @@ _CONFIGS = {
     ),
     "swa_p16_bytes": _swa(page_size=16, byte_budget=1 << 20),
     # The state entry stays unaligned: 2 x (3 x 8 bf16 + 1 x 4 x 8 fp32) = 352 B;
-    # total 64 x 64 + 8 x 352 = 6912; the 352 B sink puts full's first slot at 6.
+    # The 352 B sink is charged once and puts full's first slot at 6.
     "mamba_p1": _mamba(page_size=1),
     "mamba_p16": _mamba(page_size=16, full_tokens=64 * 16),
     "mamba_p64": _mamba(page_size=64, full_tokens=64 * 64),
@@ -138,7 +138,7 @@ _CONFIGS = {
     "mla_p16_draft_full": _mamba(
         page_size=16, mla=True, fused_draft=_draft("full"), full_tokens=64 * 16
     ),
-    # Total 64 x 64 + 64 x 64 + 8 x 352 = 11008; window and full max_slots 172.
+    # Full, window and state share one sink, sized to their largest unit.
     "tri_p1": _tri(page_size=1),
     "tri_p16": _tri(page_size=16, full_tokens=64 * 16, swa_tokens=64 * 16),
     "tri_p64": _tri(page_size=64, full_tokens=64 * 64, swa_tokens=64 * 64),
@@ -213,9 +213,10 @@ class TestUnifiedLayoutGolden(CustomTestCase):
                 summary = unified_layout_summary(build_unified_bundle(geometry))
                 self.assertEqual(json.loads(json.dumps(summary)), layouts[name])
 
-    def test_bs1_floor_refuses_one_byte_below_and_builds_at_it(self):
-        """The retract loop's last-request guarantee: a buffer one byte short of
-        the itemized floor fails at boot, naming every term; at the floor it builds."""
+    def test_retention_floor_and_minimum_usable_budget(self):
+        """Retention must fit, and the boot targets must leave a usable FULL page.
+        A retention floor alone can leave zero FULL pages after reserving STATE.
+        """
         self.assertEqual(set(self.golden["bs1_floors"]), set(_FLOOR_CONFIGS))
         for name, floor in self.golden["bs1_floors"].items():
             geometry = _FLOOR_CONFIGS[name]
@@ -227,8 +228,16 @@ class TestUnifiedLayoutGolden(CustomTestCase):
                     )
                 for term, nbytes in floor["terms"]:
                     self.assertRegex(str(ctx.exception), re.escape(f"{term}={nbytes}"))
+                minimum = floor["minimum_usable_budget"]
+                if minimum > budget:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "cannot serve one request"
+                    ):
+                        build_unified_bundle(
+                            msgspec.structs.replace(geometry, byte_budget=minimum - 1)
+                        )
                 build_unified_bundle(
-                    msgspec.structs.replace(geometry, byte_budget=budget)
+                    msgspec.structs.replace(geometry, byte_budget=minimum)
                 )
 
     def test_physical_ids_stay_within_int32(self):

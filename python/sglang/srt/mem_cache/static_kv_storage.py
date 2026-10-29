@@ -17,6 +17,7 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
 from sglang.srt.mem_cache.kv.plan import (
     TREE_STATE,
     TREE_TOKEN,
@@ -25,7 +26,7 @@ from sglang.srt.mem_cache.kv.plan import (
     WireEntry,
 )
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
-from sglang.srt.mem_cache.kv.storage import Region, SubPoolUsage
+from sglang.srt.mem_cache.kv.storage import Region, ResumeUnits, SubPoolUsage
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -134,6 +135,60 @@ class StaticKVStorage:
         self._num_hidden_layers = num_hidden_layers
         self._owner_region: Optional[Region] = None
         self._state_entries: Optional[_StaticStateEntries] = None
+
+    def resume_units(
+        self,
+        sub_pool: str,
+        req: Req,
+        *,
+        token_start: int,
+        token_boundary: int,
+        window: Optional[int] = None,
+    ) -> ResumeUnits:
+        if not 0 <= token_start <= token_boundary:
+            raise ValueError("invalid continuation token span")
+        allocator = self._allocator
+        state = allocator.state
+        if state is not None and sub_pool == state.sub_pool:
+            slots = self.requests.req_index_to_mamba_index_mapping[
+                req.kv.req_pool_idx
+            ].reshape(-1)
+            return ResumeUnits(
+                unit_ids=allocator.state_ids(sub_pool).ids(slots),
+                token_start=token_boundary,
+                token_boundary=token_boundary,
+            )
+        if sub_pool not in (self.owner, "swa"):
+            raise KeyError(sub_pool)
+        page_size = allocator.page_size
+        pool = allocator.get_kvcache()
+        request_window = pool.request_window if sub_pool == "swa" else None
+        begin = token_start
+        if sub_pool == "swa":
+            retained = pool.sliding_window if request_window is not None else window
+            if retained is None:
+                raise ValueError("window handoff requires its retention length")
+            begin = max(begin, token_boundary - retained)
+        begin = begin // page_size * page_size
+        if request_window is not None:
+            units = torch.as_tensor(
+                request_window.page_indices(
+                    int(req.kv.req_pool_idx), begin, token_boundary
+                )
+            )
+        else:
+            tokens = self.requests.req_to_token[
+                req.kv.req_pool_idx, begin:token_boundary
+            ]
+            physical = (
+                allocator.translate_swa_indices_for_transfer(tokens)
+                if sub_pool == "swa"
+                else allocator.translate_kv_indices_for_transfer(tokens)
+            )
+            units = physical[::page_size] // page_size
+        return ResumeUnits(
+            unit_ids=units, token_start=begin, token_boundary=token_boundary
+        )
 
     def acquire(self, reqs: List[Req]) -> Optional[List[int]]:
         return acquire_rows(self.requests, self._allocator.state, reqs)
@@ -273,13 +328,21 @@ class StaticKVStorage:
     def advance(
         self,
         req: Req,
-        frontier: int,
+        frontier: Optional[int] = None,
         *,
-        window: int,
-        retain_floor: Optional[int],
-        shares_prefixes: bool,
+        window: Optional[int] = None,
+        retain_floor: Optional[int] = None,
+        shares_prefixes: bool = False,
         eviction_interval: int = 1,
+        tracking: Optional[TrackingAdvance] = None,
     ) -> None:
+        if tracking is not None:
+            advance_tracking(self, req, tracking)
+        if window is None:
+            return
+        if frontier is None:
+            raise ValueError("window retirement needs a token frontier")
+
         from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 
         free_swa_out_of_window_slots(

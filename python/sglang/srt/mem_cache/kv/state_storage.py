@@ -97,7 +97,13 @@ class StateStorage:
     # -- slot lifecycle --
 
     def acquire(
-        self, table, reqs: List[Req], rows: List[int], fresh_rows: List[bool]
+        self,
+        table,
+        reqs: List[Req],
+        rows: List[int],
+        fresh_rows: List[bool],
+        *,
+        reset_request_parts: bool = True,
     ) -> None:
         """Gives each request of newly bound ``rows`` its state slot and, with
         the extra buffer, its ping-pong tracking slots, and writes them into
@@ -105,7 +111,7 @@ class StateStorage:
         a continuing chunk) keeps it. ``fresh_rows`` marks rows the requests
         did not hold before: their speculative ReplaySSM cursors restart."""
         spec_write_pos = self.pool.replayssm_spec_write_pos
-        if spec_write_pos is not None:
+        if spec_write_pos is not None and reset_request_parts:
             fresh_indices = [idx for idx, fresh in zip(rows, fresh_rows) if fresh]
             if fresh_indices:
                 fresh = async_h2d(fresh_indices, dtype=torch.int64, device=table.device)
@@ -134,7 +140,9 @@ class StateStorage:
                 # A zero write_pos empties the ReplaySSM ring;
                 # decode then reads only the checkpoint written by prefill.
                 if self.pool.replayssm_write_pos is not None:
-                    self.pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
+                    self.pool.replayssm_write_pos.index_fill_(
+                        0, self.slots.translate(mid).to(torch.int64), 0
+                    )
             mamba_indices.append(req.kv.mamba_pool_idx)
             if table.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:

@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence,
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
+from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.host import page_envelope_pair
@@ -66,6 +68,18 @@ class Region(msgspec.Struct, frozen=True, kw_only=True):
     kv_layout: Optional[str] = None
 
 
+class ResumeUnits(msgspec.Struct, frozen=True, kw_only=True):
+    """Physical units and the exact token span they restore on a peer.
+
+    ``token_boundary`` is the continuation point, including for a state
+    checkpoint. It comes from the handoff, not from the request's later length.
+    """
+
+    unit_ids: torch.Tensor
+    token_start: int
+    token_boundary: int
+
+
 class KVStorage:
     """The plan's sub-pools over one unified buffer, their views and the chain
     allocator that hands out their ids. Token KV views and layer indices come
@@ -75,16 +89,22 @@ class KVStorage:
         self,
         *,
         plan: KVStoragePlan,
+        sized=None,
         router: KVLayerRouter,
         allocator,
         start_layer: int,
         requests=None,
+        scratch=None,
+        request_memory=None,
     ):
         self._plan = plan
+        self.sized = sized
         self._allocator = allocator
         self.start_layer = start_layer
         # The request table: rows and the ids they hold.
         self.requests = requests
+        self.scratch = scratch
+        self._request_memory = request_memory
         state = allocator.state
         self._views: Dict[str, Any] = {}
         sub_pools = []
@@ -135,10 +155,16 @@ class KVStorage:
         state = self._allocator.state
         fresh_rows = [req.kv.req_pool_idx is None for req in reqs]
         rows = table.alloc(reqs)
-        if rows is None or state is None:
+        if rows is None:
+            return None
+        if self._request_memory is not None:
+            self._request_memory.reset_rows(
+                [row for row, fresh in zip(rows, fresh_rows) if fresh]
+            )
+        if state is None:
             return rows
         try:
-            state.acquire(table, reqs, rows, fresh_rows)
+            state.acquire(table, reqs, rows, fresh_rows, reset_request_parts=False)
         except StateSlotsExhausted:
             for req, fresh in zip(reqs, fresh_rows):
                 if fresh:
@@ -216,17 +242,26 @@ class KVStorage:
     def advance(
         self,
         req: Req,
-        frontier: int,
+        frontier: Optional[int] = None,
         *,
-        window: int,
-        retain_floor: Optional[int],
-        shares_prefixes: bool,
+        window: Optional[int] = None,
+        retain_floor: Optional[int] = None,
+        shares_prefixes: bool = False,
         eviction_interval: int = 1,
+        tracking: Optional[TrackingAdvance] = None,
     ) -> None:
-        """Retire the window rows a running request no longer reads: those more
-        than ``window`` tokens behind ``frontier``, at most up to
-        ``retain_floor``, once ``eviction_interval`` of them have piled up. A
-        prefix tree that shares prefixes keeps a whole window of pages."""
+        """Apply checkpoint tracking and retire rows outside the read window.
+
+        Tracking carries the completed forward's boundary. Window retirement
+        uses ``frontier`` and is clamped by the prefix tree's retention floor.
+        """
+        if tracking is not None:
+            advance_tracking(self, req, tracking)
+        if window is None:
+            return
+        if frontier is None:
+            raise ValueError("window retirement needs a token frontier")
+
         from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 
         free_swa_out_of_window_slots(
@@ -248,7 +283,10 @@ class KVStorage:
     def take_rows(self, num_rows: int) -> Optional[List[int]]:
         """Rows bound to no request (beam search members); None when too few
         are free."""
-        return self.requests.alloc_rows(num_rows)
+        rows = self.requests.alloc_rows(num_rows)
+        if rows is not None and self._request_memory is not None:
+            self._request_memory.reset_rows(rows)
+        return rows
 
     def release_rows(self, rows: List[int]) -> None:
         """Give back rows `take_rows` handed out; their ids went back before."""
@@ -489,6 +527,54 @@ class KVStorage:
 
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         return self._plan.wire_entries()
+
+    def resume_units(
+        self,
+        sub_pool: str,
+        req: Req,
+        *,
+        token_start: int,
+        token_boundary: int,
+        window: Optional[int] = None,
+    ) -> ResumeUnits:
+        if not 0 <= token_start <= token_boundary:
+            raise ValueError("invalid continuation token span")
+        planned = self._plan.sub_pool(sub_pool)
+        if isinstance(planned.lifetime, StateLifetime):
+            grid = planned.lifetime.checkpoint_interval
+            if grid is not None and token_boundary % grid:
+                raise ValueError(
+                    "state handoff must name an explicit checkpoint boundary"
+                )
+            ids = self.requests.req_index_to_mamba_index_mapping[
+                req.kv.req_pool_idx
+            ].reshape(-1)
+            physical = self._allocator.state_id_spaces()[sub_pool].ids(ids)
+            return ResumeUnits(
+                unit_ids=physical,
+                token_start=token_boundary,
+                token_boundary=token_boundary,
+            )
+        begin = token_start
+        if isinstance(planned.lifetime, WindowLifetime):
+            retained = planned.lifetime.window
+            if retained is None:
+                retained = window
+            if retained is None:
+                raise ValueError("window handoff requires its retention length")
+            begin = max(begin, token_boundary - retained)
+        begin = begin // planned.unit * planned.unit
+        tokens = self.requests.req_to_token[req.kv.req_pool_idx, begin:token_boundary]
+        physical = (
+            self._allocator.translate_kv_indices_for_transfer(tokens)
+            if sub_pool == self.owner
+            else self._allocator.id_spaces()[sub_pool].ids(tokens.to(torch.int64))
+        )
+        return ResumeUnits(
+            unit_ids=physical[:: planned.unit] // planned.unit,
+            token_start=begin,
+            token_boundary=token_boundary,
+        )
 
     def regions(self, sub_pool: str) -> Region:
         view = self._views[sub_pool]

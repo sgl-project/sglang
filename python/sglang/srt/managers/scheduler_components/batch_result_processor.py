@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -1400,11 +1401,16 @@ class SchedulerBatchResultProcessor:
                 known_mamba_boundary = bool(batch.mamba_track_mask_next_cpu[i])
 
             if completed_mamba_boundary and not lazy:
-                req.kv.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
-                # The slot that stops being the latest still holds its
-                # checkpoint; name it so a short key can fall back to it.
-                req.kv.mamba_prev_track_seqlen = req.kv.mamba_last_track_seqlen
-                req.kv.mamba_last_track_seqlen = req.kv.kv_committed_len - lookahead
+                kv_storage_of(
+                    batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+                ).advance(
+                    req,
+                    tracking=TrackingAdvance(
+                        boundary=req.kv.kv_committed_len - lookahead,
+                        last_position=batch.mamba_track_buffer_indices[i],
+                        preserve_previous=True,
+                    ),
+                )
             elif (
                 req.finished()
                 and lazy
@@ -1562,19 +1568,30 @@ class SchedulerBatchResultProcessor:
         track_idx = req.kv.mamba_next_track_idx
         if not known_boundary and batch.mamba_track_buffer_indices is not None:
             track_idx = batch.mamba_track_buffer_indices[i]
-        previous_track_seqlen = req.kv.mamba_last_track_seqlen
-        if not known_boundary:
-            req.kv.mamba_last_track_seqlen = track_seqlen
+        storage = kv_storage_of(
+            batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+        )
         if lazy:
-            # Lazy frees the slot it stops tracking, so nothing names the
-            # previous checkpoint there; mamba_prev_track_seqlen stays None.
+            if not known_boundary:
+                storage.advance(req, tracking=TrackingAdvance(boundary=track_seqlen))
             self.mamba_lazy_post_decode_at_boundary(req, batch, track_idx)
         else:
             if not known_boundary:
-                req.kv.mamba_last_track_idx = track_idx
-                req.kv.mamba_prev_track_seqlen = previous_track_seqlen
-            req.kv.mamba_next_track_idx = (
-                batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
+                storage.advance(
+                    req,
+                    tracking=TrackingAdvance(
+                        boundary=track_seqlen,
+                        last_position=track_idx,
+                        preserve_previous=True,
+                    ),
+                )
+            storage.advance(
+                req,
+                tracking=TrackingAdvance(
+                    next_position=batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        track_idx
+                    )
+                ),
             )
 
     def _mamba_lazy_spec_update(
@@ -1621,16 +1638,20 @@ class SchedulerBatchResultProcessor:
 
         if not crossed or planned_pos is None:
             return
-        if planned_pos != req.kv.mamba_next_track_idx:
-            # Promote pending -> keep: free the old checkpoint, repoint.
-            kv_storage_of(
-                batch.req_to_token_pool, batch.token_to_kv_pool_allocator
-            ).release_tracking_slot(req, req.kv.mamba_next_track_idx)
-            req.kv.mamba_next_track_idx = planned_pos
-        # else: in-place fallback, or promoted by an earlier confirmation —
-        # keep holds the track_seqlen state either way.
-        req.kv.mamba_last_track_idx = planned_pos
-        req.kv.mamba_last_track_seqlen = track_seqlen
+        old_position = req.kv.mamba_next_track_idx
+        kv_storage_of(
+            batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+        ).advance(
+            req,
+            tracking=TrackingAdvance(
+                boundary=track_seqlen,
+                last_position=planned_pos,
+                next_position=planned_pos,
+                release_positions=(old_position,)
+                if planned_pos != old_position
+                else (),
+            ),
+        )
 
     @staticmethod
     def _mamba_assert_committed_len_lookahead(req: Req) -> None:
@@ -1686,10 +1707,13 @@ class SchedulerBatchResultProcessor:
         self, req: Req, batch: ScheduleBatch, track_idx: int
     ):
         """Commit a completed lazy-mode boundary and free its old slot."""
-        req.kv.mamba_last_track_idx = track_idx
-        req.kv.mamba_next_track_idx = track_idx
-        other_idx = 1 - track_idx
-        if not req.kv.mamba_ping_pong_empty[other_idx]:
-            kv_storage_of(
-                batch.req_to_token_pool, batch.token_to_kv_pool_allocator
-            ).release_tracking_slot(req, other_idx)
+        kv_storage_of(
+            batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+        ).advance(
+            req,
+            tracking=TrackingAdvance(
+                last_position=track_idx,
+                next_position=track_idx,
+                release_positions=(1 - track_idx,),
+            ),
+        )

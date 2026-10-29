@@ -191,21 +191,26 @@ class TestUnifiedMambaViews(unittest.TestCase):
                     f"(envelope regions overlap)",
                 )
 
-    def test_alignment_guard_fires_on_misaligned_spec(self):
-        """A per-slot entry that is not a multiple of the temporal itemsize would
-        mis-offset the view and must trip the alignment assert; either guard can
-        fire first, so match on the shared "misaligned" wording."""
+    def test_typed_parts_align_without_overlapping_adjacent_slots(self):
         pool, spec = _make_pool(
-            mamba_layer_num=1,  # entry = 2 B conv + 4 B temporal = 6 B, not %4
+            mamba_layer_num=1,
             conv_state_shapes=[(1, 1)],
             conv_dtype=torch.bfloat16,
             temporal_state_shape=(1,),
             temporal_dtype=torch.float32,
             want_slots=4,
         )
-        with self.assertRaises(AssertionError) as cm:
-            spec.views(pool)
-        self.assertIn("misalign", str(cm.exception).lower())
+        conv, temporal = spec.views(pool)
+        self.assertEqual(spec.entry_bytes(), 8)
+        conv[0][0, 1].fill_(3)
+        temporal[0, 1].fill_(5)
+        conv[0][0, 2].fill_(7)
+        temporal[0, 2].fill_(11)
+        self.assertEqual(float(conv[0][0, 1].item()), 3)
+        self.assertEqual(float(temporal[0, 1].item()), 5)
+        self.assertEqual(float(conv[0][0, 2].item()), 7)
+        self.assertEqual(float(temporal[0, 2].item()), 11)
+        self.assertEqual(temporal.data_ptr() % 4, 0)
 
 
 def _k3_kda_mamba_geometry(heads_per_rank: int) -> dict:

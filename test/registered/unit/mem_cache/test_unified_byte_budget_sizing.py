@@ -11,19 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Byte-budget buffer sizing for the unified 2-pool factories.
+"""A total device budget includes the chain, its sink and declared fixed storage.
 
-The SWA factory's ``total_bytes`` sets the exact buffer size. The Mamba pair's
-``unified_total_bytes`` adds state bytes because its budget excludes that carve-out.
-Without an explicit budget, sizing falls back to the token-count re-sum.
-Sizing from the ratio-derived token counts instead would re-introduce the
-configurator's rounding, which floors by the cell size and then page-aligns
-EACH side, losing up to about a page of tokens per side.
-
-The bs=1 feasibility floor raises at BOOT, before any pool construction: a
-budget that cannot fit ONE worst-case request (full KV at max context, plus
-one SWA window / the state slots a running request locks) is a retract
-LIVELOCK at runtime, not a perf bug.
+The bs=1 floor rejects budgets that cannot hold the state slots and window of
+one request, before constructing any arena.
 """
 
 import unittest
@@ -82,8 +73,8 @@ def _entry_bytes():
 
 class TestBudgetSizing(unittest.TestCase):
     def test_swa_factory_honors_the_budget_exactly(self):
-        """The buffer IS the budget, including values the token-count re-sum
-        cannot represent (not a whole-token multiple per side)."""
+        """Arena and fixed storage partition the complete budget, including
+        bytes that a whole-token capacity cannot represent."""
         e = _entry_bytes()
         for budget in (
             96 * e + 512,  # deliberately NOT a token-count multiple
@@ -91,12 +82,16 @@ class TestBudgetSizing(unittest.TestCase):
         ):
             with self.subTest(budget=budget):
                 bundle = _swa_factory(total_bytes=budget)
-                self.assertEqual(bundle.arena.total_bytes, budget)
+                self.assertEqual(
+                    bundle.arena.total_bytes + bundle.storage.sized.fixed_bytes, budget
+                )
 
     def test_fallback_is_the_token_count_resum(self):
         e = _entry_bytes()
         bundle = _swa_factory()
-        self.assertEqual(bundle.arena.total_bytes, (64 + 32) * e)
+        self.assertEqual(
+            bundle.arena.total_bytes, (64 + 32) * e + bundle.storage.plan.sink_bytes()
+        )
 
 
 class TestReservedFloorIsOneSourceOfTruth(unittest.TestCase):
@@ -201,12 +196,18 @@ class TestBs1FeasibilityFloor(unittest.TestCase):
             ("window_larger_than_context", 64, 10_000),
         ):
             with self.subTest(case=case):
+                # The request table is fixed storage even when context is much
+                # longer than the KV capacity; reserve its two rows explicitly.
+                table_bytes = 2 * 4 * model_context_len
                 bundle = _swa_factory(
-                    total_bytes=200 * e,
+                    total_bytes=200 * e + table_bytes,
                     model_context_len=model_context_len,
                     sliding_window_size=sliding_window_size,
                 )
-                self.assertEqual(bundle.arena.total_bytes, 200 * e)
+                self.assertEqual(
+                    bundle.arena.total_bytes + bundle.storage.sized.fixed_bytes,
+                    200 * e + table_bytes,
+                )
 
     def test_exact_floor_passes(self):
         """Boundary: total == floor must NOT raise (>= is the contract)."""

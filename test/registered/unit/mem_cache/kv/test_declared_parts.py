@@ -1,0 +1,475 @@
+"""Declared payloads preserve identity through reset, relocation and checkpointing."""
+
+import unittest
+from types import SimpleNamespace
+
+import msgspec
+import torch
+
+from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
+from sglang.srt.mem_cache.kv.decl import (
+    DerivedPartDecl,
+    MHAGeometry,
+    RequestPartDecl,
+    StateGeometry,
+    StateReplay,
+    TensorPartDecl,
+    kv_layer_decls,
+    with_state_ple,
+    with_state_replay,
+)
+from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+from sglang.srt.runtime_context import get_parallel
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+
+class _RequestKV:
+    def __init__(self):
+        self.req_pool_idx = None
+        self.kv_allocated_len = 1
+
+    @property
+    def holds_kv(self):
+        return self.req_pool_idx is not None
+
+
+def _build(
+    *,
+    extra=(),
+    requests=(),
+    derived=(),
+    state=False,
+    gamma=None,
+    replay=None,
+    ple=False,
+):
+    setup_allocator_context()
+    dense = MHAGeometry(
+        head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16
+    )
+    geometry = StateGeometry(
+        conv_state_shapes=((3, 8),),
+        conv_dtype=torch.bfloat16,
+        temporal_state_shape=(1, 4, 8),
+        temporal_dtype=torch.float32,
+        extra_parts=extra,
+    )
+    if replay is not None:
+        geometry = with_state_replay(
+            geometry, replay, layer_ids=(1, 2), speculative_num_draft_tokens=gamma
+        )
+    if ple:
+        geometry = with_state_ple(
+            geometry,
+            short_conv_layer_ids=(1, 2),
+            short_conv_state_shape=(3, 4),
+            ngram_context_len=3,
+            ngram_eos_token_id=17,
+            speculative_num_draft_tokens=gamma,
+        )
+    decls = kv_layer_decls(
+        full_layer_ids=(0,),
+        full_geometry=dense,
+        window_layer_ids=() if state else (1,),
+        window_geometry=dense,
+        window=16,
+        state_layer_ids=(1, 2) if state else (),
+        state_geometry=geometry if state else None,
+    )
+    plan = plan_kv_storage(
+        decls,
+        page_size=4,
+        speculative_num_draft_tokens=gamma,
+        request_parts=requests,
+        derived_parts=derived,
+    )
+    inputs = KVSizingInputs(
+        full_tokens=256,
+        window_tokens=128,
+        state_slots=16,
+        max_running_requests=3,
+        context_len=64,
+        alignment=1,
+    )
+    sized = size_plan(plan, inputs)
+    ctx = UnifiedBuildContext(
+        device="cpu",
+        start_layer=0,
+        end_layer=3 if state else 2,
+        enable_memory_saver=False,
+        need_sort=False,
+        max_num_reqs=3,
+        model_context_len=64,
+        state_cache_params=SimpleNamespace(layers=(1, 2)),
+        speculative_num_draft_tokens=gamma,
+    )
+    return build_kv_storage(plan, sized, ctx), plan, sized
+
+
+class TestDeclaredParts(CustomTestCase):
+    def test_each_request_part_resets_only_on_fresh_acquisition(self):
+        declarations = tuple(
+            RequestPartDecl(part=p)
+            for p in (
+                TensorPartDecl(name="cursor", shape=(), dtype=torch.int32),
+                TensorPartDecl(
+                    name="ring", shape=(4, 8), dtype=torch.float32, layer_ids=(1, 3)
+                ),
+                TensorPartDecl(
+                    name="context", shape=(3,), dtype=torch.int64, reset_value=7
+                ),
+            )
+        )
+        storage, _, sized = _build(requests=declarations)
+        memory = storage._request_memory
+        self.assertEqual(
+            memory.nbytes,
+            sum(t.bytes for t in sized.fixed if t.name != "request_table"),
+        )
+        req = SimpleNamespace(kv=_RequestKV())
+        row = storage.acquire([req])[0]
+        addresses = {n: t.data_ptr() for n, t in memory.tensors.items()}
+        for part in memory.parts:
+            tensor = memory.tensors[part.name].select(part.row_axis, row)
+            self.assertTrue(torch.all(tensor == part.reset_value))
+            tensor.fill_(19)
+        self.assertEqual(storage.acquire([req]), [row])
+        for part in memory.parts:
+            self.assertTrue(
+                torch.all(memory.tensors[part.name].select(part.row_axis, row) == 19)
+            )
+        storage.release_row(req)
+        other = SimpleNamespace(kv=_RequestKV())
+        self.assertEqual(storage.acquire([other]), [row])
+        for part in memory.parts:
+            self.assertTrue(
+                torch.all(
+                    memory.tensors[part.name].select(part.row_axis, row)
+                    == part.reset_value
+                )
+            )
+        self.assertEqual(
+            addresses, {n: t.data_ptr() for n, t in memory.tensors.items()}
+        )
+
+    def test_total_budget_charges_fixed_storage_once(self):
+        storage, plan, _ = _build(state=True, gamma=3)
+        inp = KVSizingInputs(
+            budget_bytes=1 << 20,
+            context_len=64,
+            max_running_requests=3,
+            state_share=0.2,
+            alignment=256,
+        )
+        sized = size_plan(plan, inp)
+        self.assertLessEqual(sized.total_bytes + sized.fixed_bytes, inp.budget_bytes)
+        self.assertLess(inp.budget_bytes - sized.total_bytes - sized.fixed_bytes, 256)
+        expected_table = sized.request_rows * (64 * 4 + 4)
+        self.assertEqual(sized.fixed[0].bytes, expected_table)
+        self.assertEqual(
+            sized.units("mamba"),
+            int((sized.total_bytes - plan.sink_bytes()) * 0.2)
+            // plan.sub_pool("mamba").spec.entry_bytes(),
+        )
+        smaller = size_plan(
+            plan, msgspec.structs.replace(inp, budget_bytes=700000), frozen=sized
+        )
+        self.assertEqual(smaller.fixed, sized.fixed)
+        self.assertEqual(smaller.request_rows, sized.request_rows)
+        self.assertLess(smaller.total_bytes, sized.total_bytes)
+        self.assertLessEqual(smaller.full_tokens, sized.full_tokens)
+        self.assertLessEqual(smaller.max_running_requests, sized.max_running_requests)
+
+    def test_derived_extent_is_in_the_total_budget(self):
+        _, plan, _ = _build(
+            derived=(
+                DerivedPartDecl(
+                    sub_pool="full",
+                    part=TensorPartDecl(
+                        name="compressed", shape=(32, 8), dtype=torch.float32
+                    ),
+                ),
+            )
+        )
+        inp = KVSizingInputs(
+            budget_bytes=1 << 20, context_len=64, max_running_requests=3, alignment=256
+        )
+        sized = size_plan(plan, inp)
+        self.assertLessEqual(sized.total_bytes + sized.fixed_bytes, inp.budget_bytes)
+        page_bytes = plan.owner().unit * plan.owner().spec.entry_bytes()
+        blob = plan.derived_parts[0].part.row_bytes
+        self.assertEqual(sized.fixed[-1].bytes, sized.total_bytes // page_bytes * blob)
+        next_cost = (
+            sized.total_bytes
+            + 256
+            + sized.fixed[0].bytes
+            + (sized.total_bytes + 256) // page_bytes * blob
+        )
+        self.assertGreater(next_cost, inp.budget_bytes)
+
+    def test_state_target_does_not_cap_the_state_band(self):
+        storage, _, sized = _build(state=True)
+        count = sized.units("mamba") + 1
+        slots = storage.allocator.alloc_state_slots(count)
+        self.assertIsNotNone(slots)
+        self.assertEqual(slots.numel(), count)
+
+    def test_full_cap_is_enforced_on_live_allocations(self):
+        storage, _, _ = _build()
+        owner = storage.allocator.full_attn_allocator
+        owner.max_live_tokens = 16
+        first = storage.allocator.alloc(12)
+        self.assertIsNotNone(first)
+        self.assertIsNone(storage.allocator.alloc(8))
+        self.assertEqual(owner.allocated_count(), 12)
+        self.assertIsNotNone(storage.allocator.alloc(4))
+        self.assertIsNone(storage.allocator.alloc(4))
+
+    def test_ple_views_reset_and_checkpoint_the_same_entry(self):
+        storage, plan, _ = _build(state=True, gamma=3, ple=True)
+        state = storage.allocator.state
+        conv, ngram = state.short_conv_pool, state.ngram_pool
+        self.assertTrue(conv.enabled and ngram.enabled)
+        self.assertIs(conv.conv_state, state.pool.extra_views["short_conv"])
+        self.assertIs(ngram.context, state.pool.extra_views["ngram"])
+        ids = torch.tensor([3, 5])
+        state.pool.clear_slots(ids)
+        self.assertTrue(torch.all(ngram.get_context(ids) == 17))
+        conv.layer_cache(2)[3].fill_(29)
+        ngram.set_context(torch.tensor([3]), torch.tensor([[1, 2, 3]]))
+        state.pool.copy_from(torch.tensor([3]), torch.tensor([7]))
+        saved = state.pool.get_cpu_copy(torch.tensor([7]))
+        state.pool.clear_slots(torch.tensor([7]))
+        state.pool.load_cpu_copy(saved, torch.tensor([7]))
+        self.assertTrue(torch.all(conv.layer_cache(2)[7] == 29))
+        torch.testing.assert_close(
+            ngram.get_context(torch.tensor([7])), torch.tensor([[1, 2, 3]])
+        )
+        self.assertEqual(conv.layer_intermediate_cache(2).shape, (4, 3, 3, 4))
+        self.assertTrue(torch.all(ngram.intermediate_context == 17))
+        self.assertEqual(len(plan.scratch), 4)
+
+    def test_gdn_replay_request_parts_reset_on_row_reuse(self):
+        storage, plan, _ = _build(
+            state=True,
+            gamma=3,
+            replay=StateReplay(
+                decode=False,
+                speculative=True,
+                is_kda=False,
+                cache_len=8,
+                key_heads=1,
+            ),
+        )
+        view = storage.view("mamba")
+        self.assertIsNone(view.mamba_cache.intermediate_ssm)
+        self.assertEqual(len(plan.request_parts), 8)
+        row = storage.take_rows(1)[0]
+        for part in storage._request_memory.parts:
+            with self.subTest(part=part.name):
+                storage._request_memory.tensors[part.name].select(
+                    part.row_axis, row
+                ).fill_(23)
+        storage.release_rows([row])
+        self.assertEqual(storage.take_rows(1), [row])
+        for part in storage._request_memory.parts:
+            with self.subTest(part=part.name):
+                self.assertTrue(
+                    torch.all(
+                        storage._request_memory.tensors[part.name].select(
+                            part.row_axis, row
+                        )
+                        == part.reset_value
+                    )
+                )
+        self.assertIs(
+            view.replayssm_spec_write_pos,
+            storage._request_memory.tensors["mamba.replayssm_spec_write_pos"],
+        )
+        self.assertEqual(view._checkpoint_extra_buffers, ())
+
+    def test_replay_state_records_and_cursor_move_together(self):
+        for speculative in (False, True):
+            with self.subTest(speculative=speculative):
+                storage, plan, _ = _build(
+                    state=True,
+                    gamma=3 if speculative else None,
+                    replay=StateReplay(
+                        decode=True,
+                        speculative=speculative,
+                        is_kda=speculative,
+                        cache_len=8,
+                        key_heads=1,
+                    ),
+                )
+                view = storage.view("mamba")
+                self.assertFalse(plan.request_parts)
+                self.assertEqual(len(view.extra_parts), 7 if speculative else 4)
+                for part in view.extra_parts:
+                    view.extra_views[part.name].select(part.row_axis, 3).fill_(5)
+                view.copy_from(torch.tensor([3]), torch.tensor([7]))
+                saved = view.get_cpu_copy(torch.tensor([7]))
+                view.clear_slots(torch.tensor([7]))
+                view.load_cpu_copy(saved, torch.tensor([7]))
+                for part in view.extra_parts:
+                    self.assertTrue(
+                        torch.all(
+                            view.extra_views[part.name].select(part.row_axis, 7) == 5
+                        )
+                    )
+                self.assertIs(
+                    view.replayssm_write_pos, view.extra_views["replayssm_write_pos"]
+                )
+
+    def test_window_resume_keeps_the_handoff_boundary(self):
+        storage, _, _ = _build()
+        req = SimpleNamespace(kv=_RequestKV())
+        row = storage.acquire([req])[0]
+        tokens = storage.allocator.alloc(24)
+        storage.requests.req_to_token[row, :24] = tokens.to(torch.int32)
+        expected = (
+            storage.allocator.translate_swa_indices_for_transfer(tokens[4:23])[::4] // 4
+        )
+        resume = storage.resume_units("swa", req, token_start=0, token_boundary=23)
+        self.assertEqual((resume.token_start, resume.token_boundary), (4, 23))
+        torch.testing.assert_close(resume.unit_ids, expected)
+        resumed = storage.resume_units("swa", req, token_start=12, token_boundary=23)
+        self.assertEqual((resumed.token_start, resumed.token_boundary), (12, 23))
+        torch.testing.assert_close(resumed.unit_ids, expected[2:])
+
+    def test_scratch_is_allocated_and_priced_from_the_plan(self):
+        storage, plan, sized = _build(state=True, gamma=3)
+        state = storage.view("mamba")
+        scratch = storage.scratch
+        self.assertEqual(
+            scratch.nbytes,
+            sum(t.bytes for t in sized.fixed if t.name != "request_table"),
+        )
+        self.assertEqual(set(scratch.tensors), {d.part.name for d in plan.scratch})
+        self.assertIs(
+            state.mamba_cache.intermediate_ssm,
+            scratch.tensors["mamba.intermediate_ssm"],
+        )
+        self.assertEqual(state.mamba_cache.intermediate_ssm.shape, (2, 4, 3, 1, 4, 8))
+        self.assertIs(
+            state.mamba_cache.intermediate_conv_window[0],
+            scratch.tensors["mamba.intermediate_conv_window.0"],
+        )
+        self.assertEqual(
+            state.get_device_pool_infos()[0].buffer_info.extra_checkpoint_buffers, ()
+        )
+
+    def test_full_cap_uses_widened_dcp_units(self):
+        _, plan, _ = _build(state=True)
+        sized = size_plan(
+            plan,
+            KVSizingInputs(
+                budget_bytes=65536,
+                state_slots=16,
+                max_running_requests=3,
+                context_len=64,
+                max_total_tokens=32,
+                alignment=1,
+            ),
+        )
+        for dcp in (2, 4):
+            with self.subTest(dcp=dcp), get_parallel().override(attn_dcp_size=dcp):
+                storage = build_kv_storage(
+                    plan,
+                    sized,
+                    UnifiedBuildContext(
+                        device="cpu",
+                        start_layer=0,
+                        end_layer=3,
+                        enable_memory_saver=False,
+                        need_sort=False,
+                        max_num_reqs=3,
+                        model_context_len=64,
+                        state_cache_params=SimpleNamespace(layers=(1, 2)),
+                    ),
+                )
+                alloc = storage.allocator
+                self.assertEqual(alloc.available_size(), 32 * dcp)
+                first = alloc.alloc(16 * dcp)
+                self.assertIsNotNone(first)
+                self.assertEqual(alloc.available_size(), 16 * dcp)
+                self.assertFalse(alloc.can_reserve(20 * dcp, 0))
+                second = alloc.alloc(16 * dcp)
+                self.assertIsNotNone(second)
+                self.assertIsNone(alloc.alloc(4 * dcp))
+                alloc.free(first)
+                self.assertEqual(alloc.available_size(), 16 * dcp)
+                alloc.free(second)
+                self.assertEqual(alloc.verify_byte_accounting(), [])
+
+    def test_entry_parts_follow_copy_move_and_nonzero_reset(self):
+        parts = (
+            TensorPartDecl(name="cursor", shape=(), dtype=torch.int32),
+            TensorPartDecl(
+                name="ring", shape=(4, 8), dtype=torch.bfloat16, layer_ids=(1, 2)
+            ),
+            TensorPartDecl(name="ngram", shape=(3,), dtype=torch.int64, reset_value=17),
+        )
+        storage, plan, _ = _build(state=True, extra=parts)
+        view = storage.view("mamba")
+        for p in parts:
+            view.extra_views[p.name].select(p.row_axis, 3).fill_(23)
+        view.copy_from(torch.tensor([3]), torch.tensor([5]))
+        view._arena.move_units("mamba", torch.tensor([7]), torch.tensor([5]))
+        for p in parts:
+            self.assertTrue(
+                torch.all(view.extra_views[p.name].select(p.row_axis, 7) == 23)
+            )
+        saved = view.get_cpu_copy(torch.tensor([7]))
+        view.clear_slots(torch.tensor([7]))
+        for p in parts:
+            self.assertTrue(
+                torch.all(
+                    view.extra_views[p.name].select(p.row_axis, 7) == p.reset_value
+                )
+            )
+        view.load_cpu_copy(saved, torch.tensor([7]))
+        for p in parts:
+            self.assertTrue(
+                torch.all(view.extra_views[p.name].select(p.row_axis, 7) == 23)
+            )
+        info = view.get_device_pool_infos()[0].buffer_info
+        self.assertEqual(len(info.extra_checkpoint_buffers), len(parts))
+        info.validate(layer_ids=tuple(view.mamba_layer_ids))
+        for part, tensor in zip(parts, info.extra_checkpoint_buffers):
+            self.assertEqual(
+                tensor.stride(0) * tensor.itemsize,
+                plan.sub_pool("mamba").spec.entry_bytes(),
+            )
+
+    def test_derived_page_blobs_move_with_physical_pages(self):
+        part = TensorPartDecl(
+            name="compressed_k", shape=(2, 8), dtype=torch.float32, layer_ids=(0,)
+        )
+        storage, plan, sized = _build(
+            derived=(DerivedPartDecl(sub_pool="full", part=part),)
+        )
+        arena = storage.allocator.arena
+        memory = arena.page_parts["full"]
+        blob = memory.tensors[part.name]
+        self.assertEqual(blob[0, 0].stride(), (8, 1))
+        self.assertEqual(memory.rows, arena.extent_entries("full") // plan.page_size)
+        self.assertEqual(
+            memory.nbytes,
+            sum(t.bytes for t in sized.fixed if t.name != "request_table"),
+        )
+        blob[:, 3].fill_(29)
+        arena.move_units("full", torch.tensor([7]), torch.tensor([3]))
+        self.assertTrue(torch.all(blob[:, 7] == 29))
+        arena.zero_units("full", torch.tensor([7]))
+        self.assertTrue(torch.all(blob[:, 7] == 0))
+        self.assertTrue(torch.all(blob[:, 3] == 29))
+
+
+if __name__ == "__main__":
+    unittest.main()
