@@ -85,6 +85,13 @@ def handle_ssl_validation(server_args: Any):
             "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
             "to be specified."
         )
+    if cfg.enable_http_worker_reuseport and (
+        cfg.tokenizer_worker_num == 1 or cfg.enable_http2
+    ):
+        raise ValueError(
+            "--enable-http-worker-reuseport requires --tokenizer-worker-num > 1 "
+            "and has no effect with --enable-http2."
+        )
 
     if cfg.enable_http2:
         if not 0 < cfg.http2_max_concurrent_streams < 2**32:
@@ -402,11 +409,6 @@ def handle_deprecated_args(server_args: Any):
             )
         if cfg.grpc_port is None:
             raise ValueError("--sidecar requires --grpc-port or SGLANG_GRPC_PORT.")
-        if envs.SGLANG_RUST_SERVER.get():
-            raise ValueError(
-                "--sidecar is not yet supported with SGLANG_RUST_SERVER: "
-                "Rust-server mode does not run the Python sidecar lifecycle."
-            )
     if native_grpc:
         if cfg.use_ray:
             raise ValueError(
@@ -714,7 +716,7 @@ def handle_return_hidden_states_mode(server_args: Any):
             "return_hidden_states_mode must be one of: None, 'last', or 'full'."
         )
     if cfg.return_hidden_states_mode is None:
-        if cfg.enable_return_hidden_states:
+        if cfg.enable_return_hidden_states or cfg.enable_return_aux_hidden_states:
             declare_resolution(
                 server_args,
                 "_handle_return_hidden_states_mode",

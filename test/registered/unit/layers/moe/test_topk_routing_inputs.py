@@ -1,7 +1,10 @@
 """Routing follows the owning layer and active batch across target/draft and TBO."""
 
+import inspect
+import sys
 import unittest
-from types import SimpleNamespace
+from enum import IntEnum
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -401,6 +404,371 @@ class TestTopKRoutingInputs(CustomTestCase):
         ):
             piecewise = FusedMoE.forward(layer, self.hidden, output)
         torch.testing.assert_close(piecewise.topk_ids, materialized.topk_ids)
+
+    def test_piecewise_lazy_routing_keeps_a_bound_without_placement(self):
+        """A logits-only opaque op must not drop a row bound on graph entry."""
+        router = self._router(output_format=TopKOutputFormat.BYPASSED)
+        with get_exec().moe.override(ep_dispatch_algorithm=None):
+            output = router.forward_cuda(
+                self.hidden, self.logits, num_token_non_padded=torch.tensor(2)
+            )
+        self.assertIsNone(output.expert_location_dispatch_info)
+        layer = SimpleNamespace(
+            _use_ascend_fuseep=False,
+            forward_impl=lambda hidden, routes, **kwargs: routes.to_standard(),
+        )
+        with patch(
+            "sglang.srt.layers.moe.fused_moe_triton.layer.is_in_tc_piecewise_cuda_graph",
+            return_value=True,
+        ):
+            materialized = FusedMoE.forward(layer, self.hidden, output)
+        self.assertEqual(
+            materialized.topk_ids.tolist(), [[0, 1], [0, 1], [-1, -1], [-1, -1]]
+        )
+
+    def test_fp8_consumers_keep_lazy_padding_and_placement(self):
+        """Both FP8 formats consume physical IDs and ignore poisoned inactive scores."""
+        from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatchOutput,
+        )
+        from sglang.srt.layers.moe.utils import RoutingMethodType
+
+        provider = ModuleType("flashinfer.fused_moe")
+        provider.Fp8QuantizationType = IntEnum(
+            "Fp8QuantizationType", {"DeepSeekFp8": 0, "MxFp8": 1}
+        )
+
+        def score_router(**kwargs):
+            weights, ids = fused_topk_torch_native(**kwargs)
+            return weights.to(score_dtype), ids
+
+        def routed_kernel(*, topk_ids, output, routing_method_type, **kwargs):
+            ids, weights = topk_ids
+            self.assertEqual(routing_method_type, RoutingMethodType.TopK)
+            self.assertEqual(kwargs["top_k"], ids.shape[1])
+            self.assertEqual(
+                weights.dtype,
+                torch.float32 if score_dtype == torch.float16 else score_dtype,
+            )
+            self.assertTrue(ids.is_contiguous() and weights.is_contiguous())
+            self.assertTrue(bool((ids[real:] == -1).all()))
+            self.assertEqual(ids[:real].tolist(), [expected_ids] * real)
+            values = (ids.float() + 1) * torch.where(ids >= 0, weights, 0)
+            output.copy_(values.sum(-1, keepdim=True).expand_as(output))
+
+        provider.trtllm_fp8_block_scale_routed_moe = routed_kernel
+        provider.trtllm_fp8_per_tensor_scale_routed_moe = routed_kernel
+
+        def logits_kernel(*, routing_logits, output=None, **kwargs):
+            weights, ids = routing_logits.float().softmax(-1).topk(2)
+            weights = weights / weights.sum(-1, keepdim=True) * 2.5
+            values = ((ids.float() + 1) * weights).sum(-1, keepdim=True)
+            result = values.expand_as(self.hidden)
+            if output is None:
+                return result.to(torch.bfloat16)
+            output.copy_(result)
+            return output
+
+        provider.trtllm_fp8_block_scale_moe = logits_kernel
+        provider.trtllm_fp8_per_tensor_scale_moe = logits_kernel
+        for block_quant in (True, False):
+            quant_info = flashinfer_trtllm.FlashInferTrtllmFp8MoeQuantInfo(
+                w13_weight=torch.empty((4, 4, 2)),
+                w2_weight=torch.empty((4, 2, 2)),
+                global_num_experts=4,
+                local_expert_offset=0,
+                local_num_experts=4,
+                intermediate_size=2,
+                routing_method_type=RoutingMethodType.RenormalizeNaive,
+                block_quant=block_quant,
+                weight_block_k=128,
+                w13_weight_scale_inv=torch.ones((4, 1, 1)),
+                w2_weight_scale_inv=torch.ones((4, 1, 1)),
+                w13_input_scale=torch.ones(1),
+                output1_scales_scalar=torch.ones(4),
+                output1_scales_gate_scalar=torch.ones(4),
+                output2_scales_scalar=torch.ones(4),
+            )
+            for score_dtype in (torch.float16, torch.bfloat16, torch.float32):
+                for placement in (False, True):
+                    expected_ids = [2, 0] if placement else [0, 1]
+                    for real in (3, 1, 0, 4):
+                        with self.subTest(
+                            block_quant=block_quant,
+                            score_dtype=score_dtype,
+                            placement=placement,
+                            real=real,
+                        ):
+                            hidden = self.hidden.clone()
+                            hidden[real:] = float("nan")
+                            logits = self.logits.clone()
+                            logits[real:] = float("nan")
+                            router = self._router(
+                                output_format=TopKOutputFormat.BYPASSED,
+                                routed_scaling_factor=2.5,
+                                apply_routed_scaling_factor_on_output=True,
+                            )
+                            router.topk_config.custom_routing_function = score_router
+                            with get_exec().moe.override(
+                                ep_dispatch_algorithm="static" if placement else None
+                            ):
+                                lazy = router.forward_cuda(
+                                    hidden,
+                                    logits,
+                                    num_token_non_padded=torch.tensor(real),
+                                )
+                            with (
+                                get_parallel().override(tp_group=None),
+                                patch.dict(
+                                    sys.modules, {"flashinfer.fused_moe": provider}
+                                ),
+                                patch.object(
+                                    flashinfer_trtllm,
+                                    "trtllm_fp8_block_scale_moe_out_wrapper",
+                                    inspect.unwrap(
+                                        flashinfer_trtllm.trtllm_fp8_block_scale_moe_out_wrapper
+                                    ),
+                                ),
+                                patch.object(
+                                    flashinfer_trtllm,
+                                    "trtllm_fp8_per_tensor_scale_moe_wrapper",
+                                    inspect.unwrap(
+                                        flashinfer_trtllm.trtllm_fp8_per_tensor_scale_moe_wrapper
+                                    ),
+                                ),
+                                patch.object(
+                                    flashinfer_trtllm,
+                                    "trtllm_fp8_block_scale_routed_moe_out_wrapper",
+                                    inspect.unwrap(
+                                        flashinfer_trtllm.trtllm_fp8_block_scale_routed_moe_out_wrapper
+                                    ),
+                                ),
+                                patch.object(
+                                    flashinfer_trtllm,
+                                    "trtllm_fp8_per_tensor_scale_routed_moe_out_wrapper",
+                                    inspect.unwrap(
+                                        flashinfer_trtllm.trtllm_fp8_per_tensor_scale_routed_moe_out_wrapper
+                                    ),
+                                ),
+                                patch.object(
+                                    flashinfer_trtllm,
+                                    "per_token_group_quant_fp8",
+                                    return_value=(hidden, torch.ones((1, 1))),
+                                ),
+                                patch.object(
+                                    flashinfer_trtllm,
+                                    "scaled_fp8_quant",
+                                    return_value=(hidden, torch.ones(1)),
+                                ),
+                            ):
+                                result = flashinfer_trtllm.fused_experts_none_to_flashinfer_trtllm_fp8(
+                                    StandardDispatchOutput(hidden, None, lazy),
+                                    quant_info,
+                                    MoeRunnerConfig(
+                                        activation="silu",
+                                        routed_scaling_factor=2.5,
+                                    ),
+                                ).hidden_states
+                            scores = self.logits[:, :2].softmax(-1).to(score_dtype)
+                            scores *= 2.5
+                            expected = (
+                                (scores * (torch.tensor(expected_ids).float() + 1))
+                                .sum(-1, keepdim=True)
+                                .expand_as(result)
+                                .clone()
+                            )
+                            expected[real:] = 0
+                            torch.testing.assert_close(
+                                result.float(), expected, rtol=0.005, atol=0.005
+                            )
+                            self.assertTrue(bool(torch.isfinite(result).all()))
+
+    def test_fp8_route_scores_preserve_values_and_supported_storage(self):
+        """FP16 external scores widen exactly; native BF16/FP32 scores keep storage."""
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        class ObserveScoreCopies(TorchDispatchMode):
+            def __init__(self):
+                self.copies = []
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func in (
+                    torch.ops.aten._to_copy.default,
+                    torch.ops.aten.clone.default,
+                ):
+                    self.copies.append(func)
+                return func(*args, **(kwargs or {}))
+
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            for strided in (False, True):
+                with self.subTest(dtype=dtype, strided=strided):
+                    # Values expose FP16-to-BF16 double rounding and preserve the
+                    # payload of dropped routes for the consumer to ignore.
+                    storage = torch.tensor(
+                        [
+                            [0.333251953125, 9.0, 2.0**-20, 9.0],
+                            [float("nan"), 9.0, float("inf"), 9.0],
+                        ],
+                        dtype=dtype,
+                    )
+                    weights = (
+                        storage[:, ::2] if strided else storage[:, ::2].contiguous()
+                    )
+                    ids = torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32)
+                    original = weights.clone()
+                    with ObserveScoreCopies() as observed:
+                        routing = flashinfer_trtllm._get_routing_for_flashinfer_routed(
+                            StandardTopKOutput(weights, ids, self.logits[:2]),
+                            promote_half_scores=True,
+                        )
+                    if dtype == torch.float16:
+                        self.assertEqual(
+                            observed.copies, [torch.ops.aten._to_copy.default]
+                        )
+                    else:
+                        self.assertEqual(len(observed.copies), int(strided))
+                    actual_ids, actual_weights = routing
+                    self.assertIs(actual_ids, ids)
+                    expected_dtype = torch.float32 if dtype == torch.float16 else dtype
+                    self.assertEqual(actual_weights.dtype, expected_dtype)
+                    self.assertTrue(actual_weights.is_contiguous())
+                    torch.testing.assert_close(
+                        actual_weights.float(),
+                        original.float(),
+                        rtol=0,
+                        atol=0,
+                        equal_nan=True,
+                    )
+                    torch.testing.assert_close(
+                        weights, original, rtol=0, atol=0, equal_nan=True
+                    )
+                    if dtype != torch.float16 and not strided:
+                        self.assertIs(actual_weights, weights)
+
+    def test_fp8_deferred_finalize_keeps_materialized_routes(self):
+        """Padding and placement retain the deferred GEMM2/score/permutation ABI."""
+        from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatchOutput,
+        )
+        from sglang.srt.layers.moe.utils import RoutingMethodType
+
+        provider = ModuleType("flashinfer.fused_moe")
+        provider.Fp8QuantizationType = IntEnum(
+            "Fp8QuantizationType", {"DeepSeekFp8": 0, "MxFp8": 1}
+        )
+        returned = []
+
+        def deferred_result(ids, weights, kwargs):
+            self.assertFalse(kwargs["do_finalize"])
+            self.assertNotIn("output", kwargs)
+            self.assertEqual(kwargs["top_k"], ids.shape[1])
+            self.assertEqual(weights.dtype, torch.float32)
+            indices = torch.arange(ids.numel(), dtype=torch.int32).reshape_as(ids)
+            indices[ids < 0] = -1
+            gemm2 = (ids.clamp_min(0).reshape(-1, 1) + 1).to(torch.bfloat16)
+            gemm2 = gemm2.expand(-1, self.hidden.shape[1]).contiguous()
+            returned[:] = [gemm2, weights, indices]
+            return returned
+
+        def routed_kernel(*, topk_ids, **kwargs):
+            ids, weights = topk_ids
+            expected_ids = [2, 0] if placement else [0, 1]
+            self.assertEqual(ids[:real].tolist(), [expected_ids] * real)
+            self.assertTrue(bool((ids[real:] == -1).all()))
+            self.assertEqual(kwargs["routing_method_type"], RoutingMethodType.TopK)
+            return deferred_result(ids, weights, kwargs)
+
+        def logits_kernel(*, routing_logits, **kwargs):
+            self.assertIs(routing_logits, logits)
+            self.assertEqual(
+                kwargs["routing_method_type"], RoutingMethodType.RenormalizeNaive
+            )
+            weights, ids = routing_logits.softmax(-1).topk(2)
+            weights = weights / weights.sum(-1, keepdim=True) * 2.5
+            return deferred_result(ids, weights, kwargs)
+
+        provider.trtllm_fp8_block_scale_routed_moe = routed_kernel
+        provider.trtllm_fp8_block_scale_moe = logits_kernel
+        quant_info = flashinfer_trtllm.FlashInferTrtllmFp8MoeQuantInfo(
+            w13_weight=torch.empty((4, 4, 2)),
+            w2_weight=torch.empty((4, 2, 2)),
+            global_num_experts=4,
+            local_expert_offset=0,
+            local_num_experts=4,
+            intermediate_size=2,
+            routing_method_type=RoutingMethodType.RenormalizeNaive,
+            block_quant=True,
+            weight_block_k=128,
+            w13_weight_scale_inv=torch.ones((4, 1, 1)),
+            w2_weight_scale_inv=torch.ones((4, 1, 1)),
+        )
+        for bound, placement in ((None, False), (2, False), (2, True), (0, True)):
+            real = 4 if bound is None else bound
+            with self.subTest(bound=bound, placement=placement):
+                hidden, logits = self.hidden.clone(), self.logits.clone()
+                hidden[real:] = logits[real:] = float("nan")
+                router = self._router(
+                    output_format=TopKOutputFormat.BYPASSED,
+                    routed_scaling_factor=2.5,
+                    apply_routed_scaling_factor_on_output=True,
+                )
+                with get_exec().moe.override(
+                    ep_dispatch_algorithm="static" if placement else None
+                ):
+                    lazy = router.forward_cuda(
+                        hidden,
+                        logits,
+                        num_token_non_padded=(
+                            None if bound is None else torch.tensor(bound)
+                        ),
+                    )
+                with (
+                    patch.dict(sys.modules, {"flashinfer.fused_moe": provider}),
+                    patch.object(
+                        flashinfer_trtllm,
+                        "per_token_group_quant_fp8",
+                        return_value=(hidden, torch.ones((1, 1))),
+                    ),
+                    patch.object(
+                        flashinfer_trtllm, "use_symmetric_memory"
+                    ) as allocation,
+                    flashinfer_trtllm.flashinfer_trtllm_deferred_finalize_context(),
+                ):
+                    result = (
+                        flashinfer_trtllm.fused_experts_none_to_flashinfer_trtllm_fp8(
+                            StandardDispatchOutput(hidden, None, lazy),
+                            quant_info,
+                            MoeRunnerConfig(
+                                activation="silu",
+                                routed_scaling_factor=2.5,
+                            ),
+                        ).hidden_states
+                    )
+                    allocation.assert_not_called()
+                self.assertIsInstance(
+                    result, flashinfer_trtllm.FlashInferTrtllmDeferredFinalizeOutput
+                )
+                self.assertIs(result.gemm2_out, returned[0])
+                self.assertIs(result.expert_weights, returned[1])
+                self.assertIs(result.expanded_idx_to_permuted_idx, returned[2])
+                self.assertEqual(result.top_k, 2)
+                self.assertTrue(bool((returned[2][real:] == -1).all()))
+                self.assertEqual(result.expert_weights.dtype, torch.float32)
+                self.assertTrue(
+                    bool(torch.isfinite(result.expert_weights[:real]).all())
+                )
+                # Dropped permutation entries exclude these still-poisoned scores.
+                self.assertTrue(bool(torch.isnan(result.expert_weights[real:]).all()))
+                torch.testing.assert_close(
+                    result.expert_weights[:real].sum(-1), torch.full((real,), 2.5)
+                )
 
     def test_in_range_draft_loads_experts_in_its_routing_order(self):
         """Draft expert weights stay in logical order despite a permuted target map."""

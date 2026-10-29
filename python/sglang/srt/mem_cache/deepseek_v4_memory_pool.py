@@ -189,12 +189,10 @@ def resolve_compressed_kv_layout(
     if kv_layout is KVLayout.V4:
         assert option in (None, "fp8"), "the V4 main cache only pairs with V4 caches"
         return KVLayout.V4
-    assert kv_layout is KVLayout.V41, f"{kv_layout} is not a main-cache layout"
-    if option == "fp8":
-        return KVLayout.V41
-    if option == "fp4":
-        return KVLayout.V41_FP4
-    return KVLayout.V41_FP4 if compress_ratio in (1, 2) else KVLayout.V41
+    assert kv_layout.encoding is KVLayout.V41, f"{kv_layout} is not a main-cache layout"
+    use_fp4 = option == "fp4" or (option is None and compress_ratio in (1, 2))
+    encoding = KVLayout.V41_FP4 if use_fp4 else KVLayout.V41
+    return encoding.with_interleaved(kv_layout.is_interleaved)
 
 
 def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
@@ -203,7 +201,7 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     AITER attention."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
-    if get_exec().kernel.dsv4_attn_backend == "flashmla_mega":
+    if get_exec().kernel.dsv4_attn_backend == "flashmla_mega" and mode != "v41_new":
         mode = "v41"
     if get_exec().kernel.dsv4_attn_backend == "trtllm":
         assert mode in ("auto", "v4") and option in ("auto", "fp8"), (
@@ -212,7 +210,7 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         return KVLayout.V4, None
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
-    assert mode in ("v41", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
+    assert mode in ("v41", "v41_new", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
     is_sm100 = (
         torch.cuda.is_available()
         and torch.version.cuda is not None
@@ -224,15 +222,16 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         )
         if mode == "auto" and not supported:
             return KVLayout.V4, None
-        if not supported:
+        if not supported or mode == "v41_new":
             raise ValueError(
-                "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention"
+                "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention, "
+                "which reads the block-split v41 layout"
             )
         return KVLayout.V41, option
     if mode == "auto" and not is_sm100:
         return KVLayout.V4, None
     assert is_sm100, "the V4.1 KV cache layouts need an SM100 / SM103 GPU"
-    return KVLayout.V41, option
+    return (KVLayout.V41_NEW if mode == "v41_new" else KVLayout.V41), option
 
 
 class DeepSeekV4SingleKVPool(KVCache):
@@ -995,6 +994,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.kv_layout in (
             KVLayout.V4,
             KVLayout.V41,
+            KVLayout.V41_NEW,
         ), f"{self.kv_layout} is only valid for a compressed (extra) cache"
         self.compressed_kv_layout_option = compressed_kv_layout
         c4_logical_size = c128_size * 32
@@ -2265,7 +2265,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         if freqs_cis is not None:
-            assert compress_kv_pool.kv_layout is KVLayout.V41_FP4, (
+            assert compress_kv_pool.kv_layout.is_fp4, (
                 "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
             )
         return compress_kv_pool.set_key_buffer_fused(

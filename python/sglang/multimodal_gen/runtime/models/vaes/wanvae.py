@@ -28,6 +28,7 @@ from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
+    is_auto_parallel_decode_mode,
     should_use_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
@@ -45,10 +46,10 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelConv2d,
     SpatialParallelZeroPad2d,
     causal_conv3d_cat_pad,
-    chunk_height_for_parallel_decode,
     disable_spatial_parallel_decode,
     gather_and_trim_height,
     gather_height_for_global_op,
+    spatial_parallel_decode_disabled,
     split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import (
@@ -59,8 +60,13 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
 from sglang.multimodal_gen.runtime.models.vaes.resample import AvgDown3D
 from sglang.multimodal_gen.runtime.models.vaes.resample import DupUp3D as DupUp3DBase
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.utils import is_gfx1250_supported
 
-if current_platform.is_cuda() or current_platform.is_xpu():
+if (
+    current_platform.is_cuda()
+    or current_platform.is_xpu()
+    or (current_platform.is_rocm() and is_gfx1250_supported())
+):
     try:
         from sglang.kernels.ops.diffusion import (
             can_use_conv_bias_epilogue,
@@ -119,6 +125,9 @@ def _fused_conv_cache_supported(conv: nn.Module, x: torch.Tensor) -> bool:
     return (
         cat_pad_channels_last_3d is not None
         and type(conv) is WanCausalConv3d
+        # ROCm's batched-Conv2D replacement patches ``forward``; the fused
+        # path would call the unpatched conv epilogue instead.
+        and not hasattr(conv, "_weight_2d")
         and x.dim() == 5
         and x.device.type in ("cuda", "xpu")
         and current_platform.is_amp_supported()
@@ -189,6 +198,77 @@ class DupUp3D(DupUp3DBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _first_chunk = first_chunk.get() if first_chunk is not None else None
         return super().forward(x, first_chunk=_first_chunk)
+
+    def can_fuse_add(
+        self, x_main: torch.Tensor, x: torch.Tensor, first_chunk: bool
+    ) -> bool:
+        """Return whether `add_into_` can replace `x_main + self(x)`."""
+        if x.ndim != 5 or x_main.ndim != 5:
+            return False
+        if torch.is_grad_enabled() and (x.requires_grad or x_main.requires_grad):
+            return False
+        if self.repeats <= 0 or self.factor % self.repeats != 0:
+            return False
+        if x.shape[1] != self.in_channels:
+            return False
+
+        batch, _, frames, height, width = x.shape
+        output_frames = frames * self.factor_t
+        if first_chunk:
+            output_frames -= self.factor_t - 1
+
+        return (
+            x_main.dtype == x.dtype
+            and x_main.device == x.device
+            and tuple(x_main.shape)
+            == (
+                batch,
+                self.out_channels,
+                output_frames,
+                height * self.factor_s,
+                width * self.factor_s,
+            )
+        )
+
+    def add_into_(
+        self, x_main: torch.Tensor, x: torch.Tensor, first_chunk: bool = False
+    ) -> torch.Tensor:
+        """Add the duplicated shortcut directly into `x_main`.
+
+        `forward` only copies input values into an expanded tensor. This
+        method adds those values to their strided destinations instead, avoiding
+        the expanded shortcut allocation and its layout conversion.
+        """
+        temporal_factor = self.factor_t
+        spatial_factor = self.factor_s
+        input_channel_stride = self.factor // self.repeats
+        dropped_frames = temporal_factor - 1 if first_chunk else 0
+
+        for temporal_offset in range(temporal_factor):
+            input_frame_start = 1 if temporal_offset < dropped_frames else 0
+            output_frame_start = (
+                input_frame_start * temporal_factor + temporal_offset - dropped_frames
+            )
+            for height_offset in range(spatial_factor):
+                for width_offset in range(spatial_factor):
+                    flattened_offset = (
+                        temporal_offset * spatial_factor + height_offset
+                    ) * spatial_factor + width_offset
+                    input_channel_start = flattened_offset // self.repeats
+                    x_main[
+                        :,
+                        :,
+                        output_frame_start::temporal_factor,
+                        height_offset::spatial_factor,
+                        width_offset::spatial_factor,
+                    ].add_(
+                        x[
+                            :,
+                            input_channel_start::input_channel_stride,
+                            input_frame_start:,
+                        ]
+                    )
+        return x_main
 
 
 class WanCausalConv3d(nn.Conv3d):
@@ -460,7 +540,9 @@ def residual_block_forward(self, x):
     return x
 
 
-def attention_block_forward(self, x):
+def attention_block_forward(self, x, rows: tuple[int, int] | None = None):
+    """``rows`` = (first, count) attends only those rows of the height as
+    queries (keys and values keep every row) and returns just them."""
     identity = x
     batch_size, channels, num_frames, height, width = x.size()
     x = x.permute(0, 2, 1, 3, 4).reshape(
@@ -473,8 +555,20 @@ def attention_block_forward(self, x):
     qkv = qkv.reshape(batch_size * num_frames, 1, channels * 3, -1)
     qkv = qkv.permute(0, 1, 3, 2).contiguous()
     q, k, v = qkv.chunk(3, dim=-1)
+    if rows is not None:
+        first, height = rows
+        q = q[:, :, first * width : (first + height) * width]
+        identity = identity[..., first : first + height, :]
 
-    x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    if getattr(self, "_sgl_math_sdpa", False) and q.dtype == torch.float32:
+        # The math SDPA backend's ops minus ``_safe_softmax``'s fully-masked-row
+        # fixup (no mask here, so bit-identical), which on gfx1250 is a slow
+        # broadcast ``where`` over the [HW, HW] scores.
+        s = (q.size(-1) ** -0.5) ** 0.5
+        attn = torch.matmul(q * s, k.transpose(-2, -1) * s)
+        x = torch.matmul(torch.softmax(attn, dim=-1), v)
+    else:
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
     x = (
         x.squeeze(1)
@@ -536,6 +630,7 @@ def residual_up_block_forward(self, x):
 
     if self.avg_shortcut is not None:
         shortcut = self.avg_shortcut
+        is_first_chunk = bool(first_chunk.get())
         if (
             dup_up3d_add is not None
             and type(shortcut) is DupUp3D
@@ -552,11 +647,14 @@ def residual_up_block_forward(self, x):
                 shortcut.factor_t,
                 shortcut.factor_s,
                 shortcut.repeats,
-                bool(first_chunk.get()),
+                is_first_chunk,
             )
             if fused is not None:
                 return fused
-        x = x + shortcut(x_copy)
+        if shortcut.can_fuse_add(x, x_copy, is_first_chunk):
+            x = shortcut.add_into_(x, x_copy, is_first_chunk)
+        else:
+            x = x + shortcut(x_copy)
 
     return x
 
@@ -763,14 +861,21 @@ class WanAttentionBlock(nn.Module):
         self.proj = nn.Conv2d(dim, dim, 1)
 
     def forward(self, x):
-        if self.world_size > 1:
-            x = gather_height_for_global_op(
-                x, parallel_group=self.parallel_group
-            ).contiguous()
-        x = attention_block_forward(self, x)
-        if self.world_size > 1:
-            x = chunk_height_for_parallel_decode(x, parallel_group=self.parallel_group)
-        return x
+        if self.world_size == 1 or spatial_parallel_decode_disabled():
+            return attention_block_forward(self, x)
+        x = gather_height_for_global_op(
+            x, parallel_group=self.parallel_group
+        ).contiguous()
+        # each rank attends only its own height shard's rows (the tensor_split
+        # chunk the full-frame output was cut to) over the whole frame
+        rank = (
+            self.parallel_group.rank_in_group
+            if self.parallel_group is not None
+            else get_decode_parallel_rank()
+        )
+        rows = torch.tensor_split(torch.arange(x.shape[-2]), self.world_size)[rank]
+        first = int(rows[0]) if rows.numel() else 0
+        return attention_block_forward(self, x, rows=(first, rows.numel())).contiguous()
 
 
 class WanMidBlock(nn.Module):
@@ -1509,7 +1614,12 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self.latents_std = list(config.latents_std)
         self.shift_factor = config.shift_factor
         self.use_parallel_encode = getattr(config, "use_parallel_encode", False)
-        self.use_parallel_decode = getattr(config, "use_parallel_decode", False)
+        # When auto declines spatial-shard (gfx1250), decode is single-rank and
+        # DecodingStage runs it on the main rank alone under cfg-parallel.
+        self.use_parallel_decode = config.use_parallel_decode and (
+            not is_auto_parallel_decode_mode(config.parallel_decode_mode)
+            or should_use_spatial_shard_parallel_decode(config)
+        )
 
         if config.load_encoder:
             self.encoder = WanEncoder3d(

@@ -16,11 +16,14 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Hashable, Protocol
+from typing import TYPE_CHECKING, Dict, Hashable, Optional, Protocol
 
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
+    from sglang.srt.mem_cache.kv.state_storage import StateStorage
+    from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
@@ -39,6 +42,20 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # Ids handed out index a virtual space the allocator translates to physical
+    # rows (a unified pool's chain), not the pool's rows themselves.
+    hands_out_virtual_ids = False
+    # A request's recurrent state and its slots, when the model has them; the
+    # KV cache configurator binds the request table's.
+    state: Optional[StateStorage] = None
+    # A unified pool's sub-pools as host and peer transfers read them.
+    storage: Optional[KVStorage] = None
+
+    @property
+    def state_slots(self):
+        """The state slot allocator, or None without recurrent state."""
+        return None if self.state is None else self.state.slots
+
     @abc.abstractmethod
     def __init__(
         self,
@@ -65,9 +82,29 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def size_full(self):
         return self.size
 
+    @property
+    def has_window_pool(self) -> bool:
+        """Whether a sliding-window pool sits beside the full-attention one,
+        with the window allocation surface (`free_swa`, `swa_available_size`, ...)."""
+        return False
+
+    def state_id_spaces(self) -> Dict[str, IdSpace]:
+        """The id space of each recurrent-state sub-pool whose slots this
+        allocator hands out, keyed by sub-pool name. Empty when the slot ids the
+        request table holds index the state pool as they are."""
+        return {}
+
+    def state_ids(self, sub_pool: str) -> IdSpace:
+        """How the state sub-pool ``sub_pool`` indexes the slot ids the request
+        table holds, for a consumer outside a forward (the tree, PD transfers)."""
+        from sglang.srt.mem_cache.kv.alloc.id_space import state_id_space
+
+        return state_id_space(self.state_id_spaces(), sub_pool)
+
     # -- scheduler-facing capacity hooks --
     # The scheduler calls these unconditionally, with no allocator-type branches
-    # on its side; byte-accounted composites override the token-count defaults.
+    # on its side; the byte-accounted chain allocator overrides the token-count
+    # defaults.
 
     def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
         from sglang.srt.mem_cache.prefill_budget import PrefillBudget
@@ -201,6 +238,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def get_kvcache(self):
         return self._kvcache
+
+    @property
+    def cpu_copy_carries_mamba(self) -> bool:
+        """Whether `get_cpu_copy` carries a request's recurrent state; else the
+        scheduler backs the state up on its own."""
+        return self._kvcache.cpu_copy_carries_mamba
 
     def get_all_free_pages(self):
         # Debug / invariant census; None when the pool has no page free list.

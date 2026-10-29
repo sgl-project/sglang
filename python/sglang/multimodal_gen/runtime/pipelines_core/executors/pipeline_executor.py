@@ -16,7 +16,15 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
     ConditioningCache,
     conditioning_cache_group,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
+from sglang.multimodal_gen.runtime.managers.progress_reporter import (
+    get_progress_reporter,
+)
+from sglang.multimodal_gen.runtime.managers.request_cancel import (
+    RequestCancelledError,
+    raise_if_cancelled,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -94,6 +102,17 @@ class PipelineExecutor(ABC):
         payload: Any,
         server_args: ServerArgs,
     ):
+        requests = payload if isinstance(payload, list) else [payload]
+        if get_progress_reporter() is not None and any(
+            req.report_progress and not req.is_warmup for req in requests
+        ):
+            # partition denoising progress across all passes, including refinement
+            denoisers = [s for s in stages if s.role_affinity == RoleType.DENOISER]
+            for index, stage in enumerate(denoisers):
+                stage._progress_range = (
+                    index / len(denoisers),
+                    (index + 1) / len(denoisers),
+                )
         self.begin_component_residency_request(stages, payload, server_args)
         try:
             with self.conditioning_cache.scope(
@@ -277,7 +296,15 @@ class PipelineExecutor(ABC):
                         time.monotonic() - sequential_start_time,
                     )
                 try:
+                    # each rank yields the same outputs, so the check stays a
+                    # collective; after a cancel, each later output stops here
+                    raise_if_cancelled([batch])
                     output = self.execute(remaining_stages, batch, server_args)
+                except RequestCancelledError as e:
+                    logger.info("Stopped request %s: %s", batch.request_id, e)
+                    output = OutputBatch(
+                        error=str(e), cancelled=True, metrics=batch.metrics
+                    )
                 except Exception as e:
                     logger.error(
                         "Sequential DiT/VAE inference failed for request %s: %s",

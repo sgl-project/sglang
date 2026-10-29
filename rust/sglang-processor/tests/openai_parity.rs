@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
 use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
 use sglang_processor::openai::{
     ChatModel, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Responder, TokenPieces, lower_chat,
@@ -61,16 +62,22 @@ impl Checkpoint {
         }
     }
 
-    /// The prompt ids SGLang encodes: the rendered prompt, then the
-    /// `continue_final_message` prefix without its BOS.
+    /// The prompt ids SGLang encodes: the formatter's own ids when it encodes
+    /// requests, else the rendered prompt, then the `continue_final_message`
+    /// prefix without its BOS.
     fn render(&self, request: &Value, settings: &OpenAiSettings) -> Option<Vec<u32>> {
-        let defaults = settings
+        let defaults: HashMap<String, Value> = settings
             .default_chat_template_kwargs
             .clone()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if let Some(ids) = self.formatter.encode_request(request.clone(), &defaults) {
+            return ids.ok();
+        }
         let (prompt, prefix) = self
             .formatter
-            .render_request(request.clone(), &defaults.into_iter().collect())
+            .render_request(request.clone(), &defaults)
             .ok()?;
         let ids = |text: &str| self.tokenizer.encode(text).unwrap().token_ids().to_vec();
         let bos = ids("").first().copied();
@@ -96,7 +103,11 @@ fn fixtures_match_sglang() {
         let checkpoint = resolve_model_file(model, fixture["revision"].as_str(), "tokenizer.json")
             .map(|path| Checkpoint::load(&path));
         let settings: OpenAiSettings = serde_json::from_value(fixture["settings"].clone()).unwrap();
-        let chat_model: ChatModel = serde_json::from_value(fixture["chat_model"].clone()).unwrap();
+        let mut chat_model: ChatModel =
+            serde_json::from_value(fixture["chat_model"].clone()).unwrap();
+        if let Some(checkpoint) = &checkpoint {
+            chat_model.deepseek = ChatModel::for_formatter(&checkpoint.formatter).deepseek;
+        }
         let mut skipped = 0;
         for case in fixture["cases"].as_array().unwrap() {
             match check_case(case, &fixture, &settings, &chat_model, checkpoint.as_ref()) {
@@ -148,8 +159,13 @@ fn check_case(
         (Err(reason), _) => return Err(format!("unsupported: {reason:?}")),
         (Ok(lowered), _) => lowered,
     };
-    let generate = without_defaults(generate, fixture, &case["endpoint"]);
-    if generate != case["generate"] {
+    let generate = without_defaults(
+        serde_json::to_value(generate).unwrap(),
+        fixture,
+        &case["endpoint"],
+    );
+    let expected = without_defaults(case["generate"].clone(), fixture, &case["endpoint"]);
+    if generate != expected {
         return Err(format!("/generate body differs:\n{generate:#}"));
     }
     if case["lower_only"].as_bool() == Some(true) {
@@ -162,12 +178,12 @@ fn check_case(
         Some(frames) => {
             let mut events = Vec::new();
             let mut reply = None;
-            for frame in stream_frames(frames)
-                .iter()
-                .map(|f| f.to_string())
-                .chain(["[DONE]".into()])
-            {
-                match responder.stream_data(frame.as_bytes()) {
+            for frame in stream_frames(frames).into_iter().map(Some).chain([None]) {
+                let result = match frame {
+                    Some(frame) => responder.stream_data(generate_result(frame)),
+                    None => Ok(responder.stream_end()),
+                };
+                match result {
                     Ok(more) => events.extend(more),
                     Err(error) => {
                         reply = Some(error);
@@ -187,10 +203,17 @@ fn check_case(
             }
         }
         None => {
-            let body = engine["body"].to_string();
             let reply = match case["request"]["stream"] == true || status != 200 {
-                true => Responder::rejected(body.as_bytes()),
-                false => responder.unary(body.as_bytes()),
+                true => generate_result(engine["body"].clone())
+                    .err()
+                    .map(Responder::rejected),
+                false => {
+                    let output = match engine["body"].clone() {
+                        Value::Array(items) => items,
+                        item => vec![item],
+                    };
+                    responder.unary(output.into_iter().map(generate_result).collect())
+                }
             };
             let reply = reply.ok_or("no reply")?;
             (
@@ -216,6 +239,14 @@ const GROWING: [&str; 4] = [
     "output_token_logprobs",
     "output_top_logprobs",
 ];
+
+fn generate_result(value: Value) -> Result<GenerateResponse, GenerateStreamError> {
+    if value.get("error").is_some() {
+        Err(serde_json::from_value(value).unwrap())
+    } else {
+        Ok(serde_json::from_value(value).unwrap())
+    }
+}
 
 /// The frames as the engine sent them, each choice's rebuilt from its stored deltas.
 fn stream_frames(deltas: &[Value]) -> Vec<Value> {
@@ -256,6 +287,19 @@ fn without_defaults(body: Value, fixture: &Value, endpoint: &Value) -> Value {
         unreachable!()
     };
     fields.retain(|name, value| fixture["generate_defaults"].get(name) != Some(value));
+    // Text-only chat lowering can omit these values: Python normalizes them
+    // to the same behavior. Keep nondefault values visible to the comparison.
+    if endpoint == "chat" {
+        for (name, default) in [
+            ("logprob_start_len", json!(-1)),
+            ("return_sampling_mask", json!(false)),
+            ("modalities", json!([])),
+        ] {
+            if fields.get(name) == Some(&default) {
+                fields.remove(name);
+            }
+        }
+    }
     let sampling_defaults = &fixture["sampling_defaults"][endpoint.as_str().unwrap()];
     if let Some(Value::Object(params)) = fields.get_mut("sampling_params") {
         params.retain(|name, value| sampling_defaults.get(name) != Some(value));
