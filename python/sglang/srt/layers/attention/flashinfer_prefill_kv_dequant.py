@@ -4,16 +4,20 @@ The persistent KV pool remains FP8. This changes the attention kernel's KV
 dtype, so exact conversion does not imply identical FP8-kernel outputs.
 """
 
-from dataclasses import dataclass
 from typing import Any, Optional
 
+import msgspec
 import torch
+
+from sglang.kernels.ops.attention.gather_dequant_kv import (
+    gather_dequant_kv,
+    page_contiguous,
+)
 
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
-@dataclass
-class PrefillKVDequantPlan:
+class PrefillKVDequantPlan(msgspec.Struct, frozen=True):
     wrapper: Any
     pages: torch.Tensor
     page_size: int
@@ -21,11 +25,6 @@ class PrefillKVDequantPlan:
     def gather(self, kv_cache):
         if torch.cuda.is_current_stream_capturing():
             return None
-        from sglang.kernels.ops.attention.gather_dequant_kv import (
-            _page_contiguous,
-            gather_dequant_kv,
-        )
-
         if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) != 2:
             return None
         k, v = kv_cache
@@ -41,8 +40,8 @@ class PrefillKVDequantPlan:
             and k.shape == v.shape
             and k.ndim == 4
             and k.shape[1] == self.page_size
-            and _page_contiguous(k)
-            and _page_contiguous(v)
+            and page_contiguous(k)
+            and page_contiguous(v)
         ):
             return None
         return gather_dequant_kv(k, v, self.pages)

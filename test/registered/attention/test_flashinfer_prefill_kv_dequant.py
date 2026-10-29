@@ -8,6 +8,7 @@ from sglang.srt.layers.attention.flashinfer_prefill_kv_dequant import (
 )
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 
@@ -16,15 +17,16 @@ register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
     torch.cuda.is_available() and is_flashinfer_available(),
     "CUDA and FlashInfer required",
 )
-class TestFlashInferPrefillKVDequant(unittest.TestCase):
+class TestFlashInferPrefillKVDequant(CustomTestCase):
     def test_paged_attention_matches_bf16_pool(self):
         from flashinfer import BatchPrefillWithPagedKVCacheWrapper
 
         torch.manual_seed(42)
         workspace = torch.empty(128 << 20, dtype=torch.uint8, device="cuda")
-        factory = lambda: BatchPrefillWithPagedKVCacheWrapper(
-            workspace, "NHD", backend="fa2"
-        )
+
+        def factory():
+            return BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD", backend="fa2")
+
         for dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
             for page_size in [1, 16, 256]:
                 with self.subTest(dtype=dtype, page_size=page_size):

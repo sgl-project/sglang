@@ -8,11 +8,12 @@ from sglang.srt.layers.attention.flashinfer_prefill_kv_dequant import (
     FlashInferPrefillKVDequant,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestPrefillKVDequantPolicy(unittest.TestCase):
+class TestPrefillKVDequantPolicy(CustomTestCase):
     def setUp(self):
         self.capture = patch(
             "torch.cuda.is_current_stream_capturing", return_value=False

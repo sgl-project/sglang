@@ -31,7 +31,7 @@ def _gather_dequant_kv(
             tl.store(v_dst + dst, v.to(tl.bfloat16), mask=cols < ROW)
 
 
-def _page_contiguous(x: torch.Tensor) -> bool:
+def page_contiguous(x: torch.Tensor) -> bool:
     if x.ndim != 4:
         return False
     _, page_size, heads, dim = x.shape
@@ -57,8 +57,8 @@ def gather_dequant_kv(k: torch.Tensor, v: torch.Tensor, pages: torch.Tensor):
         and k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         and v.dtype == k.dtype
         and v.shape == k.shape
-        and _page_contiguous(k)
-        and _page_contiguous(v)
+        and page_contiguous(k)
+        and page_contiguous(v)
         and pages.ndim == 1
         and pages.is_contiguous()
         and pages.dtype in (torch.int32, torch.int64)
