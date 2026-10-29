@@ -358,7 +358,7 @@ struct Sm120Nvfp4MoeMtpMma {
     using namespace host;
     using namespace device;
     auto dev = SymbolicDevice{};
-    dev.set_options<kDLGPU>();
+    dev.set_options<kDLCUDA>();
     auto rows = SymbolicSize{"token_rows"};
     TensorMatcher({rows, K1}).with_dtype<bf16_t>().with_device(dev).verify(x);
     CHECK_HOST(rows.unwrap() >= 1 && rows.unwrap() <= 4) << "Expected 1 <= M <= 4";

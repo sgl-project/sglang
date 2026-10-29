@@ -96,7 +96,7 @@ This is the **primary validation API** for all kernel launchers. Use it to valid
 
 - **`host::SymbolicSize{"name"}`** — A named symbolic dimension. Call `.set_value(n)` to pin it, `.unwrap()` to extract after verification.
 - **`host::SymbolicDType`** — Symbolic dtype. Use `.set_options<Ts...>()` to restrict allowed types.
-- **`host::SymbolicDevice`** — Symbolic device. Use `.set_options<kDLGPU>()` to restrict to the GPU (`kDLGPU` / `kDLGPUHost` from `sgl_kernel/utils.cuh` resolve to the CUDA or ROCm device type). Options set on the symbol stay in force when it is later passed to `.with_device(device_sym)` without a type list.
+- **`host::SymbolicDevice`** — Symbolic device. Use `.set_options<kDLGPU>()` to restrict to the GPU (`kDLGPU` / `kDLGPUHost` from `sgl_kernel/utils.cuh` resolve to the CUDA or ROCm device type). Options set on the symbol stay in force when it is later passed to `.with_device(device_sym)` without a type list. Keep `kDLCUDA` only in kernels that cannot build on ROCm (inline PTX, cute/cutlass, flashinfer).
 - **`host::TensorMatcher({dims...})`** — Fluent builder for tensor validation:
   - `.with_dtype<T>()` — require a specific C++ type (e.g. `fp16_t`)
   - `.with_dtype<T1, T2, ...>()` — allow a set of types

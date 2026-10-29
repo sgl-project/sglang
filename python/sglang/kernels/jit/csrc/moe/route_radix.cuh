@@ -602,7 +602,7 @@ struct RouteRadixKernel {
     auto N_ = SymbolicSize{"num_experts"};
     auto K_ = SymbolicSize{"topk"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
 
     auto score_dtype = SymbolicDType{};
     TensorMatcher({M_, N_})
@@ -673,7 +673,7 @@ struct FusedFrontEpilogueKernel {
     auto E_ = SymbolicSize{"num_experts"};
     auto K_ = SymbolicSize{"topk"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
 
     TensorMatcher({M_, W_}).with_dtype<fp32_t>().with_device(device).with_strides({-1, 1}).verify(merged);
     TensorMatcher({E_}).with_dtype<fp32_t>().with_device(device).verify(bias);

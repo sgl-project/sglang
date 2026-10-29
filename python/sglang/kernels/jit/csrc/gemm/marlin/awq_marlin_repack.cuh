@@ -203,7 +203,7 @@ void awq_marlin_repack(
 
   // Validate tensors
   SymbolicDevice cuda_device;
-  cuda_device.set_options<kDLGPU>();
+  cuda_device.set_options<kDLCUDA>();
 
   TensorMatcher({size_k, size_n / pack_factor}).with_dtype<int32_t>().with_device(cuda_device).verify(b_q_weight);
 

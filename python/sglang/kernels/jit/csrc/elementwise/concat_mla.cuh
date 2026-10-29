@@ -149,7 +149,7 @@ struct ConcatMlaKKernel {
     TensorMatcher({N, H, D})
         .with_strides({S0_k, S1_k, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLGPU>(device)
+        .with_device<kDLCUDA>(device)
         .ensure_alignment(kAlignNope)
         .verify(k);
 
@@ -157,7 +157,7 @@ struct ConcatMlaKKernel {
     TensorMatcher({N, H, D_nope})
         .with_strides({S0_k_nope, S1_k_nope, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLGPU>(device)
+        .with_device<kDLCUDA>(device)
         .ensure_alignment(kAlignNope)
         .verify(k_nope);
 
@@ -165,7 +165,7 @@ struct ConcatMlaKKernel {
     TensorMatcher({N, 1, D_rope})
         .with_strides({S0_k_rope, -1, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLGPU>(device)
+        .with_device<kDLCUDA>(device)
         .ensure_alignment(kAlignRope)
         .verify(k_rope);
 
@@ -271,7 +271,7 @@ struct ConcatMlaAbsorbQKernel {
     TensorMatcher({N0_a, N1_a, D_a})
         .with_strides({S0_a, S1_a, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLGPU>(device)
+        .with_device<kDLCUDA>(device)
         .ensure_alignment(kAlignA)
         .verify(a);
 
@@ -279,7 +279,7 @@ struct ConcatMlaAbsorbQKernel {
     TensorMatcher({N0_b, N1_b, D_b})
         .with_strides({S0_b, S1_b, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLGPU>(device)
+        .with_device<kDLCUDA>(device)
         .ensure_alignment(kAlignB)
         .verify(b);
 
@@ -287,7 +287,7 @@ struct ConcatMlaAbsorbQKernel {
     TensorMatcher({N0_out, N1_out, D_out})
         .with_strides({S0_out, S1_out, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLGPU>(device)
+        .with_device<kDLCUDA>(device)
         .ensure_alignment(kAlignOut)
         .verify(out);
 

@@ -294,7 +294,7 @@ struct MuseSparkNormFp4Quant {
     K.set_value(kHidden);
     K2.set_value(kHidden / 2);
     K16.set_value(kHidden / 16);
-    device_.set_options<kDLGPU>();
+    device_.set_options<kDLCUDA>();
 
     TensorMatcher({M, K}).with_dtype<bf16_t>().with_device(device_).verify(x);
     if (weight.has_value()) {

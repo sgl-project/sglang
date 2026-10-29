@@ -158,7 +158,7 @@ struct MhcPostCombineNormPrefill {
     using namespace host;
     auto m = SymbolicSize{"num_tokens"};
     auto dev = SymbolicDevice{};
-    dev.set_options<kDLGPU>();
+    dev.set_options<kDLCUDA>();
     TensorMatcher({m, 5120}).with_dtype<bf16_t>().with_device(dev).verify(x).verify(output);
     TensorMatcher({m, 4, 5120}).with_dtype<bf16_t>().with_device(dev).verify(residual).verify(residual_out);
     TensorMatcher({m, 4}).with_dtype<float>().with_device(dev).verify(post).verify(pre);

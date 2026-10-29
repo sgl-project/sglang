@@ -632,7 +632,7 @@ struct LTX2QKNormSplitRopeKernel {
     auto device = SymbolicDevice{};
     heads.set_value(num_heads);
     half_dim.set_value(head_dim / 2);
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
 
     TensorMatcher({batch, q_seq_len, hidden_size}).with_dtype<bf16_t>().with_device(device).verify(q).verify(q_out);
     TensorMatcher({batch, k_seq_len, hidden_size}).with_dtype<bf16_t>().with_device(device).verify(k).verify(k_out);

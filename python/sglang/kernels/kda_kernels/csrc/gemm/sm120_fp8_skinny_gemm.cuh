@@ -435,12 +435,12 @@ struct KdaSm120Fp8SkinnyGemm {
     auto K = SymbolicSize{"K"};
     auto N = SymbolicSize{"N"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
 
-    TensorMatcher({M, K}).with_dtype<fp8_e4m3_t>().with_device<kDLGPU>(device).verify(input);
-    TensorMatcher({K, N}).with_strides({1, K}).with_dtype<fp8_e4m3_t>().with_device<kDLGPU>(device).verify(weight);
-    TensorMatcher({}).with_dtype<fp32_t>().with_device<kDLGPU>(device).verify(output_scale);
-    TensorMatcher({M, N}).with_dtype<bf16_t>().with_device<kDLGPU>(device).verify(output);
+    TensorMatcher({M, K}).with_dtype<fp8_e4m3_t>().with_device<kDLCUDA>(device).verify(input);
+    TensorMatcher({K, N}).with_strides({1, K}).with_dtype<fp8_e4m3_t>().with_device<kDLCUDA>(device).verify(weight);
+    TensorMatcher({}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(output_scale);
+    TensorMatcher({M, N}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(output);
 
     const int m = static_cast<int>(M.unwrap());
     const int k = static_cast<int>(K.unwrap());

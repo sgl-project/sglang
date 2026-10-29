@@ -191,7 +191,7 @@ void awq_dequantize(
 
   // Validate tensors
   SymbolicDevice cuda_device;
-  cuda_device.set_options<kDLGPU>();
+  cuda_device.set_options<kDLCUDA>();
 
   TensorMatcher({qweight_rows, qweight_cols}).with_dtype<int32_t>().with_device(cuda_device).verify(qweight);
   TensorMatcher({scales_rows, qweight_cols * 8}).with_dtype<OutputT>().with_device(cuda_device).verify(scales);

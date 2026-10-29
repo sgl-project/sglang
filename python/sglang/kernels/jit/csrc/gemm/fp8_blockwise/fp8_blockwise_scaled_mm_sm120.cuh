@@ -488,8 +488,8 @@ inline void fp8_blockwise_scaled_mm_sm120(
     tvm::ffi::TensorView mat_b,
     tvm::ffi::TensorView scales_a,
     tvm::ffi::TensorView scales_b) {
-  RuntimeCheck(mat_a.device().device_type == kDLGPU, "mat_a must be a CUDA tensor");
-  RuntimeCheck(mat_b.device().device_type == kDLGPU, "mat_b must be a CUDA tensor");
+  RuntimeCheck(mat_a.device().device_type == kDLCUDA, "mat_a must be a CUDA tensor");
+  RuntimeCheck(mat_b.device().device_type == kDLCUDA, "mat_b must be a CUDA tensor");
 
   RuntimeCheck(mat_a.dim() == 2, "mat_a must be a 2D tensor");
   RuntimeCheck(mat_b.dim() == 2, "mat_b must be a 2D tensor");

@@ -46,7 +46,7 @@ inline void spin_wait(
     int64_t budget_ns) {
   using namespace host;
   auto device = SymbolicDevice{};
-  device.set_options<kDLGPU>();
+  device.set_options<kDLCUDA>();
   TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(flag).verify(target).verify(timed_out).verify(
       peer_timed_out);
   LaunchKernel(1, 1, device.unwrap())(
@@ -61,7 +61,7 @@ inline void spin_wait(
 inline void bump_signal(tvm::ffi::TensorView seq, tvm::ffi::TensorView peer_flag) {
   using namespace host;
   auto device = SymbolicDevice{};
-  device.set_options<kDLGPU>();
+  device.set_options<kDLCUDA>();
   TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(seq).verify(peer_flag);
   LaunchKernel(1, 1, device.unwrap())(
       bump_signal_kernel, static_cast<int*>(seq.data_ptr()), static_cast<int*>(peer_flag.data_ptr()));

@@ -131,7 +131,7 @@ struct HopperBf16GemvKernel {
     using namespace host;
 
     auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
     TensorMatcher({1, K}).with_dtype<bf16_t>().with_device(device).verify(x);
     TensorMatcher({N, K}).with_dtype<bf16_t>().with_device(device).verify(w);
     TensorMatcher({1, N}).with_dtype<bf16_t>().with_device(device).verify(out);

@@ -167,7 +167,7 @@ struct EsSm100MXFP8BlockscaledMoeGroupGemm {
     auto M_SF = SymbolicSize{"M_SF"};
     auto K_SF = SymbolicSize{"K_SF"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
 
     TensorMatcher({num_experts, M, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(a);
     TensorMatcher({num_tokens, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(b);

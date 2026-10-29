@@ -692,7 +692,7 @@ struct AttnResFusedTmaKernel {
     auto H_ = SymbolicSize{"hidden_size"};
     auto NB_ = SymbolicSize{"num_bank_slots"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
 
     TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(prefix_sum).verify(out);
     TensorMatcher({T_, NB_, H_}).with_dtype<bf16_t>().with_device(device).verify(bank);
@@ -771,7 +771,7 @@ struct AttnResFusedTmaKernel {
     auto H_ = SymbolicSize{"hidden_size"};
     auto NB_ = SymbolicSize{"num_bank_slots"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
 
     TensorMatcher({GT_, H_}).with_dtype<bf16_t>().with_device(device).verify(input);
     TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(out).verify(prefix_out);
@@ -851,7 +851,7 @@ struct AttnResFusedTmaKernel {
     auto H_ = SymbolicSize{"hidden_size"};
     auto NB_ = SymbolicSize{"num_bank_slots"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
 
     TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(prefix_sum);
     TensorMatcher({T_, NB_, H_}).with_dtype<bf16_t>().with_device(device).verify(bank);

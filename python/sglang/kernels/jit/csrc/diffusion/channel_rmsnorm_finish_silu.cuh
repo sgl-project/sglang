@@ -98,7 +98,7 @@ struct Kernel {
     auto C = SymbolicSize{"channels"};
     auto S = SymbolicSize{"spatial"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
     TensorMatcher({N, C, S}).with_dtype<bf16_t>().with_device(device).ensure_alignment(16).verify(out).verify(x);
     TensorMatcher({N, S}).with_dtype<fp32_t>().with_device(device).ensure_alignment(16).verify(norm);
     TensorMatcher({C}).with_dtype<bf16_t>().with_device(device).verify(gamma);

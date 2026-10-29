@@ -461,7 +461,7 @@ void validate(tvm::ffi::TensorView buf, int64_t peer_ptrs_dev, int64_t rank, int
   using Trait = InklingAllReduceTrait<DType, kNumGPU>;
   n = static_cast<uint32_t>(num_items);
   RuntimeCheck(buf.IsContiguous(), "buffer must be contiguous");
-  RuntimeCheck(buf.device().device_type == kDLGPU, "buffer must be on a CUDA device");
+  RuntimeCheck(buf.device().device_type == kDLCUDA, "buffer must be on a CUDA device");
   RuntimeCheck(is_type<DType>(buf.dtype()), "buffer dtype mismatch");
   RuntimeCheck(static_cast<int64_t>(n) == num_items, "num_items exceeds 4G");
   RuntimeCheck(buf.numel() >= num_items, "buffer smaller than num_items");

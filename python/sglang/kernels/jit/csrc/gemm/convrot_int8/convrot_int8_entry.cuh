@@ -820,16 +820,16 @@ void verify_weight(
     SymbolicSize& N,
     SymbolicSize& K,
     SymbolicDevice& device) {
-  TensorMatcher({N, K}).with_dtype<int8_t>().with_device<kDLGPU>(device).ensure_alignment(16).verify(weight_q);
+  TensorMatcher({N, K}).with_dtype<int8_t>().with_device<kDLCUDA>(device).ensure_alignment(16).verify(weight_q);
   // Every GEMM path stores the BF16 output 8 elements at a time.
   CHECK_HOST(N.unwrap() % 8 == 0) << "convrot_int8: N (weight rows) must be a multiple of 8, got " << N.unwrap();
   if (weight_scale.dim() == 2) {
-    TensorMatcher({N, 1}).with_dtype<fp32_t>().with_device<kDLGPU>(device).verify(weight_scale);
+    TensorMatcher({N, 1}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(weight_scale);
   } else {
-    TensorMatcher({N}).with_dtype<fp32_t>().with_device<kDLGPU>(device).verify(weight_scale);
+    TensorMatcher({N}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(weight_scale);
   }
   if (bias.has_value()) {
-    TensorMatcher({N}).with_dtype<bf16_t>().with_device<kDLGPU>(device).verify(bias.value());
+    TensorMatcher({N}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(bias.value());
   }
 }
 
@@ -840,7 +840,7 @@ void verify_weight(
 template <class T>
 void verify_activation(
     TensorView view, const char* name, SymbolicSize& M, SymbolicSize& K, SymbolicDevice& device, int64_t group_size) {
-  TensorMatcher({M, K}).template with_dtype<T>().template with_device<kDLGPU>(device).verify(view);
+  TensorMatcher({M, K}).template with_dtype<T>().template with_device<kDLCUDA>(device).verify(view);
   check_group_size(K.unwrap(), group_size);
   CHECK_HOST((reinterpret_cast<uintptr_t>(view.data_ptr()) & 15) == 0)
       << "convrot_int8: " << name << " must be 16-byte aligned";
@@ -877,10 +877,10 @@ void convrot_rotate_quantize_activation(
   using namespace convrot_int8;
   SymbolicSize M{"M"}, K{"K"};
   SymbolicDevice device;
-  device.set_options<kDLGPU>();
+  device.set_options<kDLCUDA>();
   verify_activation<bf16_t>(x, "x", M, K, device, group_size);
   verify_activation<int8_t>(x_q, "x_q", M, K, device, group_size);
-  TensorMatcher({M}).with_dtype<fp32_t>().with_device<kDLGPU>(device).verify(x_scale);
+  TensorMatcher({M}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(x_scale);
   if (M.unwrap() == 0) return;
   const DLDevice dev = device.unwrap();
   // Launches and CUTLASS setup run on the tensors' device, not on whatever
@@ -928,10 +928,10 @@ void convrot_int8_fused_linear(
   using namespace convrot_int8;
   SymbolicSize M{"M"}, K{"K"}, N{"N"};
   SymbolicDevice device;
-  device.set_options<kDLGPU>();
+  device.set_options<kDLCUDA>();
   verify_activation<bf16_t>(x, "x", M, K, device, group_size);
   verify_weight(weight_q, weight_scale, bias, N, K, device);
-  TensorMatcher({M, N}).with_dtype<bf16_t>().with_device<kDLGPU>(device).ensure_alignment(16).verify(out);
+  TensorMatcher({M, N}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).ensure_alignment(16).verify(out);
   if (M.unwrap() == 0) return;
 
   const DLDevice dev = device.unwrap();
@@ -994,11 +994,11 @@ void convrot_int8_linear_prequant(
   using namespace convrot_int8;
   SymbolicSize M{"M"}, K{"K"}, N{"N"};
   SymbolicDevice device;
-  device.set_options<kDLGPU>();
+  device.set_options<kDLCUDA>();
   verify_activation<int8_t>(xq, "xq", M, K, device, group_size);
-  TensorMatcher({M}).with_dtype<fp32_t>().with_device<kDLGPU>(device).verify(xs);
+  TensorMatcher({M}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(xs);
   verify_weight(weight_q, weight_scale, bias, N, K, device);
-  TensorMatcher({M, N}).with_dtype<bf16_t>().with_device<kDLGPU>(device).ensure_alignment(16).verify(out);
+  TensorMatcher({M, N}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).ensure_alignment(16).verify(out);
   if (M.unwrap() == 0) return;
 
   const DLDevice dev = device.unwrap();

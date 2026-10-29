@@ -140,7 +140,7 @@ struct Sm120Fp8GemvKernel {
     using namespace host;
 
     auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
     TensorMatcher({1, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(x);
     TensorMatcher({N, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(w);
     TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(alpha);

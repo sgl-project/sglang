@@ -40,7 +40,7 @@ struct VsaBlockSparseSm100Kernel {
     auto N = SymbolicSize{"num_blocks"};
     auto MAXKV = SymbolicSize{"max_kv"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
 
     TensorMatcher({B, H, S, HEAD_DIM})
         .with_dtype<bf16_t>()

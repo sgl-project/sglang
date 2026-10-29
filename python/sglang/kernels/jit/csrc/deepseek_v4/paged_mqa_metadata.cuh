@@ -310,7 +310,7 @@ struct IndexerMetadataKernel {
     auto M = SymbolicSize{"num_sm"};
     auto W = SymbolicSize{"workspace"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
+    device.set_options<kDLCUDA>();
     TensorMatcher({N})  //
         .with_dtype<int32_t>()
         .with_device(device)

@@ -37,7 +37,7 @@ struct Nvfp4WeightTranspose {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView y) {
     using namespace host;
     auto dev = SymbolicDevice{};
-    dev.set_options<kDLGPU>();
+    dev.set_options<kDLCUDA>();
     TensorMatcher({512, Rows, Cols}).with_dtype<uint8_t>().with_device(dev).verify(x);
     TensorMatcher({512, Cols, Rows}).with_dtype<uint8_t>().with_device(dev).verify(y);
     LaunchKernel({(Cols + 127) / 128, (Rows + 127) / 128, 512}, 256, dev.unwrap())(
