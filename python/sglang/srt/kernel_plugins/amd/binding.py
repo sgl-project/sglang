@@ -501,7 +501,10 @@ class _CaptureCheck:
     runner).
 
     Logs the steps that run the monokernels, captured and eager, and refuses a
-    runner none of whose graphs run them.
+    runner none of whose graphs run them. A runner whose graphs are of no forward
+    mode the spec serves is not the spec's to check: a draft spec that wraps the
+    model's forward (no step modes) serves the verify key, and its draft runners
+    keep running.
     """
 
     def __init__(self, *, spec: MonoSpec, isa: str, served: frozenset):
@@ -525,6 +528,11 @@ class _CaptureCheck:
         if not set(runner.capture_bs) <= set(captured):
             return
         self.done.add(name)
+        modes = {k.forward_mode for k in self.served}
+        if not any(
+            k is not None and k.forward_mode in modes for k in captured.values()
+        ):
+            return
         routed = [k for k in captured.values() if k in self.served]
         if not routed:
             raise ValueError(

@@ -548,6 +548,25 @@ class TestMonokernelFramework(CustomTestCase):
             check(decode, None, batch("decode", 2, 2), 2)
         self.assertEqual(check.done, {"DraftDecodeRunner", "DraftExtendRunner"})
 
+    def test_draft_runners_of_a_spec_without_step_modes_are_not_checked(self):
+        # a draft spec that wraps the model's forward serves the server's verify key;
+        # the draft decode and draft extend runners capture keys of other modes
+        served = binding._served_keys(mode="target_verify", widths=(4, 8), tokens=4)
+        check = binding._CaptureCheck(spec=SPEC, isa="gfx950", served=served)
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            check(DraftDecodeRunner(capture_bs=[1]), None, batch("decode", 1, 1), 1)
+            check(
+                DraftExtendRunner(capture_bs=[1]),
+                None,
+                batch("draft_extend_v2", 1, 4),
+                4,
+            )
+            self.assertEqual(check.done, {"DraftDecodeRunner", "DraftExtendRunner"})
+            # a runner of a served mode still has to run them: a verify graph the
+            # spec does not route refuses
+            with self.assertRaisesRegex(ValueError, "none of the 1 graphs"):
+                check(runner(capture_bs=[3]), None, batch("target_verify", 3, 12), 12)
+
     def test_a_draft_spec_serves_its_own_step_modes(self):
         registry.register(
             backend=BACKEND, architecture="Draft", path=f"{__name__}:EAGLE_DRAFT"
