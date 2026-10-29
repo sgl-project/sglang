@@ -18,13 +18,13 @@ from sglang.srt.mem_cache.pool_host.common import (
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cuda_ci(est_time=37, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=12, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
@@ -50,15 +50,15 @@ STAGED_WRITE_BACK_PAGE_COUNTS = [1, 63, 64, 65, 67, 128, 129]
 @pytest.mark.skipif(not is_cuda(), reason="Uses a delayed CUDA producer stream")
 def test_unified_l2_waits_for_index_producer(direction, backend):
     publish(ServerArgs(model_path="dummy"), role="tokenizer")
-    bundle = init_unified_swa_pools(
+    bundle = build_test_unified_pools(
         device=DEVICE,
         kv_cache_dtype=torch.float16,
         head_num=1,
-        head_dim=4,
-        v_head_dim=4,
+        head_dim=8,
+        v_head_dim=8,
         swa_head_num=1,
-        swa_head_dim=4,
-        swa_v_head_dim=4,
+        swa_head_dim=8,
+        swa_v_head_dim=8,
         page_size=1,
         start_layer=0,
         end_layer=2,
@@ -69,7 +69,7 @@ def test_unified_l2_waits_for_index_producer(direction, backend):
         need_sort=False,
         lazy_compaction=True,
     )
-    device_pool = bundle.token_to_kv_pool.full_kv_pool
+    device_pool = bundle.token_to_kv_pool.layer_router.view("full")
     host_pool = UnifiedPageEnvelopeHostPool(
         device_pool,
         1.0,
@@ -85,7 +85,13 @@ def test_unified_l2_waits_for_index_producer(direction, backend):
     virtual_indices = allocator.alloc(5)
     device_indices = virtual_indices[:1].clone()
     host_indices = host_pool.alloc(1)
-    transfer = L2Transfer(host_pool, device_pool, host_indices, device_indices)
+    transfer = L2Transfer(
+        host_pool,
+        device_pool,
+        host_indices,
+        device_indices,
+        device_translate=allocator.storage.host_ids("full"),
+    )
     device_pages = device_pool.get_page_envelope_buffer()
     try:
         # Warm both copy paths before creating the delayed producer dependency.
@@ -141,6 +147,17 @@ def _token_indices_for_pages(
 
 
 def _pinned_host_pool(host_pool_cls, **kwargs):
+    if "device_pool" in kwargs:
+        pool = kwargs.pop("device_pool")
+        kwargs.update(
+            buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size
+            if pool.host_capacity_tokens is None
+            else pool.host_capacity_tokens,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
+        )
     original_alloc = ALLOC_MEMORY_FUNCS[DEVICE]
     ALLOC_MEMORY_FUNCS[DEVICE] = alloc_with_pin_memory
     try:
@@ -182,7 +199,13 @@ def _run_transfer_roundtrip_mha(layout: str, element_dim: int) -> None:
     )
     host_pool = _pinned_host_pool(
         MHATokenToKVPoolHost,
-        device_pool=device_pool,
+        buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+        device_capacity_tokens=device_pool.size
+        if device_pool.host_capacity_tokens is None
+        else device_pool.host_capacity_tokens,
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        write_back_staging=device_pool.hicache_write_back_staging,
         layout=layout,
     )
     assert host_pool.can_use_jit, (
@@ -359,7 +382,13 @@ def _run_page_first_staged_write_back_mha(
     )
     host_pool = _pinned_host_pool(
         MHATokenToKVPoolHost,
-        device_pool=device_pool,
+        buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+        device_capacity_tokens=device_pool.size
+        if device_pool.host_capacity_tokens is None
+        else device_pool.host_capacity_tokens,
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        write_back_staging=device_pool.hicache_write_back_staging,
         layout=layout,
     )
     assert can_use_write_back_jit_kernel(

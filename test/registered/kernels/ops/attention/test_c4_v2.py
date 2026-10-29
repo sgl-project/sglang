@@ -10,7 +10,6 @@ import triton
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
-    compress_forward,
 )
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -20,6 +19,8 @@ from sglang.test.kernels.deepseek_v4.common import (
     make_legacy_context,
     make_paged_context,
     make_state_pool,
+    run_compress_decode,
+    run_compress_prefill,
     to_seq_extend,
 )
 
@@ -70,44 +71,6 @@ def _gt_compress(
 # -----------------------------------------------------------------------------
 # Driver
 # -----------------------------------------------------------------------------
-
-
-def _run_prefill(
-    ctx: Context,
-    pool: torch.Tensor,
-    kv_score_input: torch.Tensor,
-    ape: torch.Tensor,
-    seq_lens_cpu: torch.Tensor,
-    extend_lens_cpu: torch.Tensor,
-) -> torch.Tensor:
-    num_q = int(extend_lens_cpu.sum().item())
-    plan = ctx.make_prefill_plan(seq_lens_cpu, extend_lens_cpu, num_q)
-    return compress_forward(
-        pool,
-        kv_score_input,
-        ape,
-        plan,
-        head_dim=ctx.head_dim,
-        compress_ratio=RATIO,
-    )
-
-
-def _run_decode(
-    ctx: Context,
-    pool: torch.Tensor,
-    kv_score_input: torch.Tensor,
-    ape: torch.Tensor,
-    seq_lens_gpu: torch.Tensor,
-) -> torch.Tensor:
-    plan = ctx.make_decode_plan(seq_lens_gpu)
-    return compress_forward(
-        pool,
-        kv_score_input,
-        ape,
-        plan,
-        head_dim=ctx.head_dim,
-        compress_ratio=RATIO,
-    )
 
 
 def _make_inputs(
@@ -226,7 +189,7 @@ def test_prefill_no_context(mode: str, seq_len: int) -> None:
     kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=seq_len)
 
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
-    out = _run_prefill(
+    out = run_compress_prefill(
         ctx,
         pool,
         kv_in_cpu.to(get_device()),
@@ -269,7 +232,7 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
 
     # Prefill the prefix.
     seq_lens_cpu, extend_lens_cpu, _ = to_seq_extend([(prefix_len, prefix_len)])
-    _run_prefill(
+    run_compress_prefill(
         ctx,
         pool,
         kv_full_cpu[:prefix_len].to(get_device()),
@@ -286,7 +249,9 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
             [cur_seq_len], dtype=torch.int64, device=get_device()
         )
         kv_step = kv_full_cpu[prefix_len + k : prefix_len + k + 1].to(get_device())
-        out = _run_decode(ctx, pool, kv_step, ape_cpu.to(get_device()), seq_lens_gpu)
+        out = run_compress_decode(
+            ctx, pool, kv_step, ape_cpu.to(get_device()), seq_lens_gpu
+        )
         if cur_seq_len % RATIO == 0:
             final_out = out
 
@@ -322,7 +287,7 @@ def test_prefill_then_extend(mode: str, prefix_len: int, extend_len: int) -> Non
 
     # First prefill: seq=prefix, ext=prefix.
     seq_lens_cpu, extend_lens_cpu, _ = to_seq_extend([(prefix_len, prefix_len)])
-    _run_prefill(
+    run_compress_prefill(
         ctx,
         pool,
         kv_full_cpu[:prefix_len].to(get_device()),
@@ -333,7 +298,7 @@ def test_prefill_then_extend(mode: str, prefix_len: int, extend_len: int) -> Non
 
     # Second prefill: seq=prefix+extend, ext=extend, prefix=prefix_len.
     seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend([(seq_len, extend_len)])
-    out = _run_prefill(
+    out = run_compress_prefill(
         ctx,
         pool,
         kv_full_cpu[prefix_len:].to(get_device()),
@@ -371,7 +336,7 @@ def test_paged_buffer_intermediate() -> None:
     kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=42)
 
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
-    _run_prefill(
+    run_compress_prefill(
         ctx,
         pool,
         kv_in_cpu.to(get_device()),
@@ -417,7 +382,7 @@ def test_prefill_multibatch(mode: str) -> None:
     seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend(seq_extend)
     kv_in_cpu, ape_cpu = _make_inputs(num_q, ctx.head_dim, seed=99)
     pool = make_state_pool(ctx.num_pages, RATIO, ctx.head_dim)
-    out = _run_prefill(
+    out = run_compress_prefill(
         ctx,
         pool,
         kv_in_cpu.to(get_device()),

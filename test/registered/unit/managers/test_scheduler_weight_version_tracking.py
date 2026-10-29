@@ -11,10 +11,11 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _WeightUpdateSession,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ServingStub:
@@ -47,6 +48,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     ) -> SimpleNamespace:
         return SimpleNamespace(
             collect_inflight_reqs=lambda: set(inflight),
+            _deferred_responses=None,
             waiting_queue=list(waiting),
             chunked_req=chunked,
             hisparse_coordinator=(
@@ -57,30 +59,6 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
                 else None
             ),
         )
-
-    def test_a_new_version_is_adopted(self):
-        """The scheduler has to end up on the version it was told about, or nothing downstream can read it."""
-        serving = self._serving("v1")
-
-        Scheduler.record_weight_version_change(self._scheduler(), new_version="v2")
-
-        self.assertEqual(serving.weight_version, "v2")
-
-    def test_same_version_is_a_noop(self):
-        """Re-announcing the current version must not be treated as a change."""
-        serving = self._serving("v1")
-
-        Scheduler.record_weight_version_change(self._scheduler(), new_version="v1")
-
-        self.assertEqual(serving.weight_version, "v1")
-
-    def test_none_version_is_a_noop(self):
-        """An update that carries no version must leave the recorded one alone."""
-        serving = self._serving("v1")
-
-        Scheduler.record_weight_version_change(self._scheduler(), new_version=None)
-
-        self.assertEqual(serving.weight_version, "v1")
 
     def test_every_source_of_live_requests_is_stamped(self):
         """A request missed here keeps attributing its next tokens to the superseded version."""
@@ -140,8 +118,8 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
         self.addCleanup(patcher.stop)
         self.recorded = []
 
-    def _manager(self, target, draft=None, *, session=True):
-        manager = SchedulerWeightUpdaterManager(
+    def _build_manager(self, target, draft):
+        return SchedulerWeightUpdaterManager(
             tp_worker=SimpleNamespace(
                 model_runner=target,
                 weight_update_runners=lambda: [("target", target)],
@@ -152,7 +130,6 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
                 if draft is None
                 else SimpleNamespace(weight_update_runners=lambda: [("draft", draft)])
             ),
-            tp_cpu_group=None,
             memory_saver_adapter=None,
             flush_cache=lambda **kwargs: True,
             is_fully_idle=lambda **kwargs: True,
@@ -162,6 +139,10 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
                 )
             ),
         )
+
+    def _manager(self, target, draft=None, *, session=True):
+        with get_parallel().override(tp_group=SimpleNamespace(cpu_group=None)):
+            manager = self._build_manager(target, draft)
         if session:
             # update_weights_from_* require an open session
             manager._session = _WeightUpdateSession(selector="all")

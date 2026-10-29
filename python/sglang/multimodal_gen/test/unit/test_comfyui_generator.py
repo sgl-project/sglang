@@ -1,10 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Process-wide SGLD worker ownership for ComfyUI loaders."""
 
+import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
     SGLDiffusionGenerator,
+    _apply_cache_mode,
+)
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.options import (
+    PLUGIN_KEYS,
+    SGLDOptions,
 )
 
 
@@ -33,6 +43,7 @@ def test_ensure_rebuilds_when_another_model_owns_the_worker() -> None:
     stale = object()
     fresh = object()
     loads = []
+    sampler_runs = []
     executor = SimpleNamespace(
         generator=stale,
         _sgld_reload={
@@ -41,6 +52,7 @@ def test_ensure_rebuilds_when_another_model_owns_the_worker() -> None:
             "sgld_options": {},
         },
         _lora_input=None,
+        begin_sampler_run=lambda: sampler_runs.append(True),
     )
 
     def fake_load(**kwargs):
@@ -52,6 +64,7 @@ def test_ensure_rebuilds_when_another_model_owns_the_worker() -> None:
     runtime.ensure_executor(executor)
     assert loads == [executor._sgld_reload]
     assert executor.generator is fresh
+    assert sampler_runs == [True]
 
 
 def test_ensure_is_noop_when_executor_still_owns_live_worker() -> None:
@@ -83,3 +96,499 @@ def test_kill_generator_only_touches_owned_workers() -> None:
     runtime.kill_generator()
     assert owned.terminated is True
     assert owned.killed is False
+
+
+def _load_with_blocked_import(relpath, module_name, blocked):
+    """Import a private copy of a plugin module while ``blocked`` fails to import."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+    from unittest import mock
+
+    import sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion as plugin
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
+        _ADAPTERS,
+    )
+
+    path = Path(plugin.__file__).parent / relpath
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    # Private adapter classes register themselves while the module executes.
+    # Keep the real registry intact for subsequent tests.
+    with mock.patch.dict(_ADAPTERS), mock.patch.dict(sys.modules, {blocked: None}):
+        spec.loader.exec_module(module)
+    return module
+
+
+def test_executor_reports_real_runtime_import_error(capsys) -> None:
+    import pytest
+    import torch
+
+    blocked = "sglang.multimodal_gen.runtime.entrypoints.utils"
+    base = _load_with_blocked_import("executors/base.py", "_sgld_base_blocked", blocked)
+    printed = capsys.readouterr().out
+    assert blocked in printed
+    assert "is not installed" not in printed
+
+    class _Executor(base.SGLDiffusionExecutor):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+
+    with pytest.raises(RuntimeError, match="failed to import") as err:
+        _Executor()._execute_packed(None, None, None)
+    assert isinstance(err.value.__cause__, ImportError)
+    assert blocked in str(err.value.__cause__)
+
+
+def test_generator_reports_real_runtime_import_error(caplog) -> None:
+    import pytest
+
+    blocked = "sglang.multimodal_gen"
+    module = _load_with_blocked_import(
+        "core/generator.py",
+        "sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core._generator_blocked",
+        blocked,
+    )
+    assert any(blocked in record.getMessage() for record in caplog.records)
+    with pytest.raises(RuntimeError, match="failed to import") as err:
+        module.SGLDiffusionGenerator().init_generator("flux", "FluxPipeline", {})
+    assert isinstance(err.value.__cause__, ImportError)
+
+
+def test_h3_executor_import_survives_a_missing_runtime() -> None:
+    """generator.py imports minimax_h3 unconditionally, so an unguarded runtime
+    import there hid every node, Flux and Z-Image included."""
+    blocked = "sglang.multimodal_gen.configs.sample.minimax_h3"
+    module = _load_with_blocked_import(
+        "executors/minimax_h3.py",
+        "sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors._h3_blocked",
+        blocked,
+    )
+    with pytest.raises(RuntimeError, match="failed to import") as err:
+        module.MiniMaxH3Executor()
+    assert isinstance(err.value.__cause__, ImportError)
+
+
+def test_plugin_logs_why_nodes_failed_to_register(caplog) -> None:
+    module = _load_with_blocked_import(
+        "__init__.py", "_sgld_init_blocked", "_sgld_init_blocked.nodes"
+    )
+    assert module.NODE_CLASS_MAPPINGS == {}
+    assert any("failed to register nodes" in r.getMessage() for r in caplog.records)
+
+
+def test_undetectable_checkpoint_raises_instead_of_returning_none(
+    monkeypatch,
+) -> None:
+    """A bare None return surfaced as 'cannot unpack non-iterable NoneType'."""
+    import sys
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+
+    detection = SimpleNamespace(
+        unet_prefix_from_state_dict=lambda sd: "",
+        detect_unet_config=lambda sd, prefix: {"image_model": "flux"},
+        model_config_from_unet=lambda sd, prefix: None,
+        convert_diffusers_mmdit=lambda sd, prefix: None,
+        model_config_from_diffusers_unet=lambda sd: None,
+    )
+    management = SimpleNamespace(get_torch_device=lambda: "cpu")
+    utils = SimpleNamespace(
+        calculate_parameters=lambda sd: 0,
+        state_dict_prefix_replace=lambda sd, *a, **k: sd,
+        unet_to_diffusers=None,
+    )
+    comfy = SimpleNamespace(model_detection=detection, model_management=management)
+    monkeypatch.setitem(sys.modules, "comfy", comfy)
+    monkeypatch.setitem(sys.modules, "comfy.utils", utils)
+    monkeypatch.setattr(generator, "_load_state_dict_for_detection", lambda p: {})
+    runtime = SGLDiffusionGenerator()
+    runtime.pipeline_class_dict = {"flux": "FluxPipeline"}
+    with pytest.raises(ValueError, match="No ComfyUI model config"):
+        runtime.get_comfyui_model("/models/dit.safetensors")
+
+
+def _runtime_that_must_reject() -> SGLDiffusionGenerator:
+    """A loader whose model build fails loudly, so a check that should reject
+    first is caught if it lets the options through."""
+    runtime = SGLDiffusionGenerator()
+    runtime.get_comfyui_model = Mock(
+        side_effect=AssertionError("must reject before building the model")
+    )
+    return runtime
+
+
+def test_non_default_weight_dtype_is_rejected_before_worker_load() -> None:
+    """weight_dtype only reached the ComfyUI architecture companion, so fp8
+    produced output bit-identical to the default load."""
+    with pytest.raises(ValueError, match="weight_dtype must be 'default'"):
+        _runtime_that_must_reject().load_model(
+            model_path="h3.safetensors",
+            model_options={"dtype": torch.float8_e4m3fn},
+            sgld_options={},
+        )
+
+
+@pytest.mark.parametrize(
+    "options,error",
+    [
+        ({"attention_backend": "sage_attn_3"}, "would run torch_sdpa instead"),
+        ({"component_attention_backends": "transformer=sol_attn"}, "not installed"),
+        ({"attention_backend": "not_a_backend"}, "not an SGLang attention backend"),
+        ({"attention_backend": "sage_attn"}, None),
+    ],
+)
+def test_attention_backends_are_checked_before_worker_load(
+    monkeypatch, options, error
+) -> None:
+    """SGLang serves a missing sage_attn / sage_attn_3 kernel as FA / SDPA, so an
+    explicit choice ran another backend; a missing sparse kernel only failed
+    after the full model load."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import preflight
+    from sglang.multimodal_gen.runtime.platforms.interface import (
+        AttentionBackendEnum as Backend,
+    )
+
+    def resolved(backend):
+        if backend is Backend.SOL_ATTN:
+            raise ImportError("Sol-Attn backend is not installed")
+        return {Backend.SAGE_ATTN_3: Backend.TORCH_SDPA}.get(backend, backend)
+
+    monkeypatch.setattr(preflight, "_resolved_backend", resolved)
+    with pytest.raises(
+        ValueError if error else AssertionError, match=error or "must reject before"
+    ):
+        _runtime_that_must_reject().load_model(
+            model_path="h3.safetensors", sgld_options=options
+        )
+
+
+@pytest.mark.parametrize(
+    "options,error",
+    [
+        ({"num_gpus": 2, "tp_size": 1, "sp_degree": 1}, "must equal"),
+        ({"num_gpus": 2, "tp_size": 2, "sp_degree": 2}, "must equal"),
+        ({"num_gpus": 2, "dp_size": 2}, "dp_size > 1"),
+        ({"num_gpus": 2, "tp_size": 2, "sp_degree": 1}, None),
+        ({"num_gpus": 2, "tp_size": 1, "sp_degree": None}, None),
+    ],
+)
+def test_parallel_layout_is_checked_before_worker_load(options, error) -> None:
+    """num_gpus=2 with tp=sp=1 left rank 1 without a process group, hanging
+    worker startup forever; dp_size=2 sent sampler steps to a replica without
+    the run's cached conditioning."""
+    with pytest.raises(
+        ValueError if error else AssertionError, match=error or "must reject before"
+    ):
+        _runtime_that_must_reject().load_model(
+            model_path="h3.safetensors", sgld_options=options
+        )
+
+
+def test_worker_exit_during_load_names_where_the_reason_is(monkeypatch) -> None:
+    """A worker that raised while loading surfaced as an empty EOFError."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+
+    def exit_during_load(**kwargs):
+        raise EOFError
+
+    monkeypatch.setattr(generator.DiffGenerator, "from_pretrained", exit_during_load)
+    with pytest.raises(RuntimeError, match="traceback is in the ComfyUI console"):
+        SGLDiffusionGenerator().init_generator("h3.safetensors", "MiniMaxH3Pipeline")
+
+
+def test_multi_gpu_single_file_starts_without_cfg_parallel(
+    tmp_path, monkeypatch
+) -> None:
+    """Auto CFG parallel read a model_index.json, so a Flux single file on two GPUs
+    failed ServerArgs validation; ComfyUI already splits cond/uncond requests."""
+    import torch
+    from safetensors.torch import save_file
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+    path = tmp_path / "flux.safetensors"
+    save_file({"double_blocks.0.img_attn.qkv.weight": torch.zeros(1)}, path)
+    seen = {}
+    monkeypatch.setattr(
+        generator.DiffGenerator,
+        "from_pretrained",
+        lambda **kwargs: seen.update(kwargs) or object(),
+    )
+    SGLDiffusionGenerator().init_generator(str(path), "FluxPipeline", {"num_gpus": 2})
+    assert seen["cfg_parallel_degree"] == 1
+    if torch.cuda.device_count() >= 2:
+        server_args = ServerArgs.from_kwargs(**seen)
+        assert server_args.enable_cfg_parallel is False
+        assert server_args.sp_degree == 2
+    seen.clear()
+    SGLDiffusionGenerator().init_generator(
+        str(path), "FluxPipeline", {"num_gpus": 2, "enable_cfg_parallel": True}
+    )
+    assert "cfg_parallel_degree" not in seen
+
+
+def _status_runtime(**widgets):
+    """A runtime whose worker was started from SGLDOptions(**widgets)."""
+    from sglang.multimodal_gen.runtime.utils.perf_logger import (
+        MemorySnapshot,
+        RequestMetrics,
+    )
+
+    options = SGLDOptions().create_options(**widgets)[0]
+    plugin = {k: options.pop(k) for k in PLUGIN_KEYS if k in options}
+    # ServerArgs defaults for the fields the status reads, then the loader's kwargs.
+    server_args = {
+        "num_gpus": 1,
+        "tp_size": 1,
+        "ulysses_degree": 1,
+        "ring_degree": 1,
+        "attention_backend": None,
+        "quantization": None,
+        "enable_torch_compile": False,
+        "regional_compile": False,
+        "enable_breakable_cuda_graph": False,
+        "dit_layerwise_offload": False,
+        "dit_layerwise_resident_layers": 0.0,
+        "dit_offload_prefetch_size": 0.0,
+    }
+    server_args.update((k, v) for k, v in options.items() if k in server_args)
+    runtime = SGLDiffusionGenerator()
+    runtime.generator = SimpleNamespace(
+        server_args=SimpleNamespace(
+            model_path="z.safetensors",
+            pipeline_class_name="ZImagePipeline",
+            **server_args,
+        )
+    )
+    runtime.model_type = "zimage"
+    runtime.last_options = {
+        "sgld_options": options,
+        "int8_kernel": plugin.get("int8_kernel", "auto"),
+    }
+    metrics = RequestMetrics(request_id="r")
+    metrics.total_duration_ms = 123.4
+    metrics.record_memory_snapshot(
+        "after_forward",
+        MemorySnapshot(
+            allocated_mb=1.0,
+            reserved_mb=2.0,
+            peak_allocated_mb=3000.0,
+            peak_reserved_mb=4000.0,
+        ),
+    )
+    runtime.executor = SimpleNamespace(last_metrics=metrics)
+    _apply_cache_mode(runtime.executor, plugin)
+    runtime._worker_processes = lambda: [SimpleNamespace(pid=7, is_alive=lambda: True)]
+    runtime._is_live = lambda: False
+    return runtime
+
+
+def test_status_text_reports_sgldoptions_widget_values() -> None:
+    """Every loader widget a user sets reads back unchanged, under its own name."""
+    widgets = {
+        "num_gpus": 2,
+        "parallel_mode": "manual",
+        "tp_size": 2,
+        "attention_backend": "flash_attention",
+        "quantization": "convrot_int8",
+        "int8_gemm": "sglang_jit",
+        "execution_mode": "torch_compile",
+        "regional_compile": True,
+        "memory_mode": "layerwise_offload",
+        "resident_layers": 2,
+        "prefetch_layers": 1,
+    }
+    text = _status_runtime(
+        **widgets, cache_mode="cache_dit", cache_dit_tuning="manual"
+    ).status_text()
+    for name, value in widgets.items():
+        assert f" {name}={value}" in text
+    assert "per-run settings (apply to the next request): cache_mode=cache_dit" in text
+    assert "'max_warmup_steps': 4" in text
+
+
+def test_status_text_defaults_hide_fields_that_do_not_apply() -> None:
+    text = _status_runtime().status_text()
+    assert "NOT live pids=[7]" in text
+    assert (
+        "loader settings (fixed until the worker restarts): model_type=zimage "
+        "num_gpus=1 parallel_mode=auto tp_size=1 ulysses_degree=1 ring_degree=1 "
+        "attention_backend=auto quantization=none execution_mode=eager "
+        "memory_mode=resident\n"
+    ) in text
+    assert "cache_mode=off\n" in text
+    assert "123.4 ms" in text
+    assert "peak allocated 3000 MiB, peak reserved 4000 MiB" in text
+
+
+def test_status_text_reports_backend_for_prequantized_h3() -> None:
+    text = _status_runtime(int8_gemm="comfy_kitchen").status_text()
+    assert "quantization=none" in text
+    assert "int8_gemm=comfy_kitchen" in text
+
+
+def test_status_text_before_first_call_and_without_worker() -> None:
+    runtime = _status_runtime()
+    runtime.executor.last_metrics = None
+    assert "last DiT call: none yet" in runtime.status_text()
+    _apply_cache_mode(runtime.executor, {})
+    assert "cache_mode=worker default" in runtime.status_text()
+    assert "not started" in SGLDiffusionGenerator().status_text()
+
+
+def test_spawned_workers_do_not_reexecute_launcher_main(monkeypatch) -> None:
+    """Workers must not re-run ComfyUI's main.py; its imports break under spawn."""
+    import multiprocessing.spawn
+    import sys
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
+        _spawn_without_launcher_main,
+    )
+
+    main_dict = vars(sys.modules["__main__"])
+    monkeypatch.setitem(main_dict, "__file__", "/comfy/main.py")
+    with _spawn_without_launcher_main():
+        data = multiprocessing.spawn.get_preparation_data("worker")
+    assert "init_main_from_path" not in data
+    assert "init_main_from_name" not in data
+    assert main_dict["__file__"] == "/comfy/main.py"
+
+
+def _h3_runtime_that_must_not_start() -> SGLDiffusionGenerator:
+    runtime = SGLDiffusionGenerator()
+    runtime.get_comfyui_model = lambda *a: (SimpleNamespace(), None, "minimax_h3")
+    runtime.init_generator = Mock(side_effect=AssertionError("worker must not start"))
+    return runtime
+
+
+@pytest.mark.parametrize(
+    "key, sgld_options, error",
+    [
+        # A FastH3 file loaded as base H3 died in the worker on to_gate_compress.
+        ("blocks.0.attn.to_gate_compress.weight", {}, "SGLDNativeModelLoader"),
+        # The single-file loader builds no quant config, so this was silently ignored.
+        (
+            "blocks.0.attn.to_q.weight",
+            {"quantization": "convrot_int8"},
+            "native model directory",
+        ),
+    ],
+)
+def test_unservable_h3_file_is_rejected_before_worker_load(
+    tmp_path, key, sgld_options, error
+) -> None:
+    from safetensors.torch import save_file
+
+    path = tmp_path / "h3.safetensors"
+    save_file({key: torch.zeros(1)}, path)
+    with pytest.raises(ValueError, match=error):
+        _h3_runtime_that_must_not_start().load_model(
+            model_path=str(path), sgld_options=sgld_options
+        )
+
+
+def test_fasth3_runtime_dir_is_checked_before_worker_load(tmp_path) -> None:
+    """The 4-step preview and a raw (unmaterialized) FastH3 V2 download were
+    only rejected by the worker after a full model load."""
+    import json
+
+    release = {
+        "schema_version": 1,
+        "partition": "fl2va",
+        "tasks": ["t2va"],
+        "task_aliases": {},
+        "sigma_shift_scales": {"video": 10.0, "audio": 3.0},
+    }
+    (tmp_path / "transformer").mkdir()
+    index = tmp_path / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
+    runtime = _h3_runtime_that_must_not_start()
+    for dmd, weight_map, message in (
+        (None, {}, "no trained DMD rungs"),
+        ([999, 500], {"blocks.0.x": "a.safetensors"}, "raw FastH3 download"),
+    ):
+        meta = dict(release, **({"dmd_denoising_steps": dmd} if dmd else {}))
+        (tmp_path / "model_index.json").write_text(
+            json.dumps({"_class_name": "FastH3Pipeline", "_minimax_h3": meta})
+        )
+        index.write_text(json.dumps({"weight_map": weight_map}))
+        with pytest.raises(ValueError, match=message):
+            runtime.load_model(model_path=str(tmp_path), sgld_options={})
+
+
+@pytest.mark.parametrize(
+    "name, pipeline, config_cls",
+    [
+        ("h3_local.safetensors", "MiniMaxH3Pipeline", "MiniMaxH3PipelineConfig"),
+        ("VDN-H3-8nfe", "VDNH3Pipeline", "VDNH3PipelineConfig"),
+    ],
+)
+def test_renamed_h3_paths_resolve_through_the_plugin_model_id(
+    tmp_path, monkeypatch, name, pipeline, config_cls
+) -> None:
+    """A local H3 file or VDN copy whose path lacks the HF name matched no
+    registry detector or model-id keyed default."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+    from sglang.multimodal_gen.registry import _get_config_info
+
+    seen = {}
+    monkeypatch.setattr(
+        generator.DiffGenerator,
+        "from_pretrained",
+        lambda **kwargs: seen.update(kwargs) or object(),
+    )
+    path = str(tmp_path / name)
+    SGLDiffusionGenerator().init_generator(path, pipeline, {})
+    assert seen["warmup_mode"] == "off"
+    info = _get_config_info(path, model_id=seen["model_id"])
+    assert info.pipeline_config_cls.__name__ == config_cls
+
+
+def test_get_model_info_reads_the_card_from_v1_models(monkeypatch) -> None:
+    """The plugin reads the OpenAI /v1/models route, not the deprecated root
+    /models, so it must unwrap the card from the list envelope."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import server_api
+
+    card = {"id": "wan", "object": "model", "task_type": "T2V"}
+    urls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        urls.append(url)
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"object": "list", "data": [card]},
+        )
+
+    monkeypatch.setattr(server_api.requests, "get", fake_get)
+    client = server_api.SGLDiffusionServerAPI(base_url="http://host:30010/v1")
+    assert client.get_model_info() == card
+    assert urls == ["http://host:30010/v1/models"]
+
+
+def test_status_text_reads_executor_that_ran_after_rebuild() -> None:
+    """After a cached executor rebuilds the worker, status shows its metrics."""
+    runtime = _status_runtime()
+    running = runtime.executor
+    runtime.executor = SimpleNamespace(last_metrics=None)
+    runtime._owns_live = lambda executor: True
+    runtime.ensure_executor(running)
+    assert "123.4 ms" in runtime.status_text()
+
+
+def test_worker_status_is_pushed_to_the_page(monkeypatch) -> None:
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
+        _push_worker_status,
+    )
+
+    sent = []
+    server = SimpleNamespace(
+        PromptServer=SimpleNamespace(
+            instance=SimpleNamespace(send_sync=lambda *a: sent.append(a))
+        )
+    )
+    monkeypatch.setitem(sys.modules, "server", server)
+    monkeypatch.setattr(SGLDiffusionGenerator, "shared", lambda: _status_runtime())
+    _push_worker_status()
+    assert sent[0][0] == "sgld.worker_status"
+    assert "123.4 ms" in sent[0][1]["text"]

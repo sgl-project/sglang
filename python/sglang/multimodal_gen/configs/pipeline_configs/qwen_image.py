@@ -12,11 +12,15 @@ from sglang.multimodal_gen.configs.models.dits.qwenimage import (
     QwenImageEditPlus_2511_DitConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
+from sglang.multimodal_gen.configs.models.vaes.base import (
+    get_channelwise_decode_scale_and_shift,
+)
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
     maybe_unpad_latents,
+    pack_latents_2x2,
     pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
 )
@@ -26,11 +30,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
 )
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.utils.condition_expansion import (
     PromptToSampleBatchExpander,
 )
-from sglang.multimodal_gen.runtime.utils.vision import resize
+from sglang.multimodal_gen.runtime.utils.vision import preprocess_image, resize
 
 
 def _calculate_dimensions(target_area, ratio):
@@ -139,19 +144,6 @@ def _shard_qwen_edit_freqs_cis_for_sp(freqs_cis, noisy_img_seq_len, device):
         ),
         (txt_cos, txt_sin),
     )
-
-
-# Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._pack_latents
-def _pack_latents(latents, batch_size, num_channels_latents, height, width):
-    latents = latents.view(
-        batch_size, num_channels_latents, height // 2, 2, width // 2, 2
-    )
-    latents = latents.permute(0, 2, 4, 1, 3, 5)
-    latents = latents.reshape(
-        batch_size, (height // 2) * (width // 2), num_channels_latents * 4
-    )
-
-    return latents
 
 
 @dataclass
@@ -292,19 +284,14 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         width = 2 * (batch.width // (vae_scale_factor * 2))
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
         # pack latents
-        return _pack_latents(latents, batch_size, num_channels_latents, height, width)
+        return pack_latents_2x2(
+            latents, batch_size, num_channels_latents, height, width
+        )
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        vae_arch_config = self.vae_config.arch_config
-        scaling_factor = 1.0 / torch.tensor(
-            vae_arch_config.latents_std, device=device
-        ).view(1, vae_arch_config.z_dim, 1, 1, 1).to(device, dtype)
-        shift_factor = (
-            torch.tensor(vae_arch_config.latents_mean)
-            .view(1, vae_arch_config.z_dim, 1, 1, 1)
-            .to(device, dtype)
+        return get_channelwise_decode_scale_and_shift(
+            self.vae_config.arch_config, device, dtype
         )
-        return scaling_factor, shift_factor
 
     @staticmethod
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
@@ -594,7 +581,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             image_latents = latent_condition
         image_latent_height, image_latent_width = image_latents.shape[3:]
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
-        image_latents = _pack_latents(
+        image_latents = pack_latents_2x2(
             image_latents,
             batch_size,
             num_channels_latents,
@@ -639,21 +626,6 @@ VAE_IMAGE_SIZE = 1024 * 1024
 class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
     task_type: ModelTaskType = ModelTaskType.I2I
 
-    def _get_condition_image_sizes(self, batch) -> list[tuple[int, int]]:
-        image = batch.condition_image
-        if not isinstance(image, list):
-            image = [image]
-
-        condition_image_sizes = []
-        for img in image:
-            image_width, image_height = img.size
-            edit_width, edit_height, _ = _calculate_dimensions(
-                VAE_IMAGE_SIZE, image_width / image_height
-            )
-            condition_image_sizes.append((edit_width, edit_height))
-
-        return condition_image_sizes
-
     def prepare_image_processor_kwargs(self, batch, neg=False) -> dict:
         prompt = batch.prompt if not neg else batch.negative_prompt
         if not prompt:
@@ -686,14 +658,6 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
     def prepare_calculated_size(self, image):
         return self.calculate_vae_image_size(image, image.width, image.height)
 
-    def resize_condition_image(self, images, target_width, target_height):
-        if not isinstance(images, list):
-            images = [images]
-        new_images = []
-        for img, width, height in zip(images, target_width, target_height):
-            new_images.append(resize(img, height, width, resize_mode="default"))
-        return new_images
-
     def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
         calculated_width, calculated_height, _ = _calculate_dimensions(
             CONDITION_IMAGE_SIZE, width / height
@@ -713,7 +677,11 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         vae_image_sizes = []
         for img in batch.condition_image:
             width, height = self.calculate_vae_image_size(img, img.width, img.height)
-            new_images.append(vae_image_processor.preprocess(img, height, width))
+            new_images.append(
+                preprocess_image(
+                    img, device=get_local_torch_device(), size=(width, height)
+                )
+            )
             vae_image_sizes.append((width, height))
         batch.vae_image = new_images
         batch.vae_image_sizes = vae_image_sizes
@@ -838,12 +806,17 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
             [noisy_img_complex, img_complex[noisy_img_seq_len:, :]], dim=0
         ).to(device=device)
 
+        # one tensor for both CFG branches, so the DiT's modulation cache hits
+        additional_t_cond = batch.extra.get("qwen_layered_t_cond")
+        if additional_t_cond is None:
+            additional_t_cond = torch.zeros(1, device=device, dtype=torch.long)
+            batch.extra["qwen_layered_t_cond"] = additional_t_cond
         cond_kwargs = {
             "txt_seq_lens": txt_seq_lens,
             "img_shapes": img_shapes,
             "freqs_cis": (img_cache, txt_cache),
             "freqs_complex": (img_complex, txt_complex),
-            "additional_t_cond": torch.tensor([0], device=device, dtype=torch.long),
+            "additional_t_cond": additional_t_cond,
             "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
         return cond_kwargs

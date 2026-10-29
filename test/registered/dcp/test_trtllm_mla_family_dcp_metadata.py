@@ -14,22 +14,30 @@ import torch
 
 from sglang.srt.layers.attention import trtllm_mla_backend as backend_module
 from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
-from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
 )
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
 
 NUM_DRAFT_TOKENS = 8
 DCP_SIZE = 4
 DCP_RANK = 2
+
+
+def _routed(pool):
+    """A stand-in pool whose layers its own plain router hands out."""
+    pool.start_layer, pool.layer_transfer_counter = 0, None
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
 
 
 class _RealVerifyPath(Exception):
@@ -55,6 +63,7 @@ def _apply(backend, *, bs: int, seq_lens: torch.Tensor, forward_mode):
         patch.object(backend, "_fill_dcp_block_kv_indices") as fill,
     ):
         backend._apply_cuda_graph_metadata(
+            plan=None,  # DCP builds its own block table
             bs=bs,
             req_pool_indices=torch.arange(bs, dtype=torch.int32, device="cuda"),
             seq_lens=seq_lens,
@@ -108,16 +117,17 @@ class _DCPMetadataTests:
         heads, v_head_dim, n = 4, 512, 3 * NUM_DRAFT_TOKENS
         backend = object.__new__(self.backend_cls)
         backend.data_type = backend.q_data_type = torch.bfloat16
-        backend._decode_kernel_loc = None
 
         def real_path(*args, **kwargs):
             raise _RealVerifyPath
 
-        backend.token_to_kv_pool = SimpleNamespace(set_mla_kv_buffer=real_path)
+        backend.token_to_kv_pool = _routed(SimpleNamespace(set_mla_kv_buffer=real_path))
         backend._run_decode_kernel = real_path
-        layer = SimpleNamespace(tp_q_head_num=heads, v_head_dim=v_head_dim)
+        layer = SimpleNamespace(layer_id=0, tp_q_head_num=heads, v_head_dim=v_head_dim)
         forward_batch = SimpleNamespace(
-            forward_mode=ForwardMode.TARGET_VERIFY, out_cache_loc=None
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            out_cache_loc=None,
+            out_cache_loc_is_physical=False,
         )
         k = torch.zeros((n, 1, v_head_dim), dtype=torch.bfloat16, device="cuda")
         k_rope = torch.zeros((n, 1, 64), dtype=torch.bfloat16, device="cuda")
@@ -164,10 +174,6 @@ class _DCPMetadataTests:
 
 class TestTRTLLMMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
     backend_cls = TRTLLMMLABackend
-
-
-class TestTokenspeedMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
-    backend_cls = TokenspeedMLABackend
 
 
 class TestCuteDslMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
@@ -292,14 +298,13 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
     PAGE_SIZE = 64
     DCP_SIZE = 4
     DCP_RANK = 2
-    MULTIPLIER = 3
     # Virtual page per request, deliberately not the identity so a missing
     # gather cannot coincide with the right answer.
     VIRTUAL_PAGES = [[5, 2, 9], [7, 0, 4], [1, 8, 6]]
     # Global KV lengths: one spanning 3 pages, one 2, one under a page.
     SEQ_LENS = [3 * PAGE_SIZE * DCP_SIZE, 2 * PAGE_SIZE * DCP_SIZE - 1, 10]
 
-    def _make_backend(self, translator):
+    def _make_backend(self, runner_ids):
         bs = len(self.VIRTUAL_PAGES)
         max_pos = max(self.SEQ_LENS)
         req_to_token = torch.full((bs, max_pos), -1, dtype=torch.int32, device="cuda")
@@ -317,11 +322,11 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
         backend = object.__new__(TRTLLMMLABackend)
         backend.page_size = self.PAGE_SIZE
         backend.req_to_token = req_to_token
-        backend.kv_index_translator = translator
+        backend.runner_ids = runner_ids
         return backend, req_to_token
 
-    def _fill(self, translator):
-        backend, req_to_token = self._make_backend(translator)
+    def _fill(self, runner_ids):
+        backend, req_to_token = self._make_backend(runner_ids)
         bs = len(self.VIRTUAL_PAGES)
         seq_lens = torch.tensor(self.SEQ_LENS, dtype=torch.int32, device="cuda")
         local_seq_lens = get_dcp_lens(seq_lens, self.DCP_SIZE, self.DCP_RANK).to(
@@ -340,7 +345,7 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
             )
         return block_kv_indices.cpu(), local_seq_lens.cpu(), req_to_token.cpu()
 
-    def _reference(self, req_to_token, local_seq_lens, v2p, multiplier):
+    def _reference(self, req_to_token, local_seq_lens, v2p):
         """What each live entry must be, derived from the id-space definition."""
         rows = []
         for req in range(local_seq_lens.numel()):
@@ -353,7 +358,7 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
                 if v2p is None:
                     row.append(collapsed_page)
                 else:
-                    row.append(max(int(v2p[collapsed_page]) * multiplier, 0))
+                    row.append(max(int(v2p[collapsed_page]), 0))
             rows.append(row)
         return rows
 
@@ -365,9 +370,9 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
             self.assertTrue((table[req, len(row) :] == -1).all())
 
     def test_static_pool_entries_are_the_collapsed_page(self):
-        translator = SimpleNamespace(full_v2p_table=None, full_page_multiplier=1)
-        table, local_lens, req_to_token = self._fill(translator)
-        self._assert_matches(table, self._reference(req_to_token, local_lens, None, 1))
+        runner_ids = SimpleNamespace(full_v2p_table=None)
+        table, local_lens, req_to_token = self._fill(runner_ids)
+        self._assert_matches(table, self._reference(req_to_token, local_lens, None))
 
     def test_unified_pool_entries_go_through_the_page_table(self):
         num_pages = 1 + max(max(p) for p in self.VIRTUAL_PAGES)
@@ -377,26 +382,22 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
             dtype=torch.int64,
             device="cuda",
         )
-        translator = SimpleNamespace(
-            full_v2p_table=v2p, full_page_multiplier=self.MULTIPLIER
-        )
-        table, local_lens, req_to_token = self._fill(translator)
-        expected = self._reference(req_to_token, local_lens, v2p.cpu(), self.MULTIPLIER)
+        runner_ids = SimpleNamespace(full_v2p_table=v2p)
+        table, local_lens, req_to_token = self._fill(runner_ids)
+        expected = self._reference(req_to_token, local_lens, v2p.cpu())
         self._assert_matches(table, expected)
         # And it is genuinely a translation, not an accident of the fixture.
-        static = self._reference(req_to_token, local_lens, None, 1)
+        static = self._reference(req_to_token, local_lens, None)
         self.assertNotEqual(expected, static)
 
     def test_freed_page_lands_on_the_padding_sink(self):
         # A tombstoned (-1) v2p row must clamp to entry 0, the reserved
-        # padding page, rather than scale -1 into a wild block id.
+        # padding page, rather than emit -1 as a block id.
         num_pages = 1 + max(max(p) for p in self.VIRTUAL_PAGES)
         v2p = torch.arange(num_pages, dtype=torch.int64, device="cuda")
         v2p[self.VIRTUAL_PAGES[0][0]] = -1
-        translator = SimpleNamespace(
-            full_v2p_table=v2p, full_page_multiplier=self.MULTIPLIER
-        )
-        table, _, _ = self._fill(translator)
+        runner_ids = SimpleNamespace(full_v2p_table=v2p)
+        table, _, _ = self._fill(runner_ids)
         self.assertEqual(int(table[0, 0]), 0)
 
 
@@ -418,7 +419,7 @@ class TestFusedFp8WriteGate(CustomTestCase):
         backend.data_type = torch.float8_e4m3fn
         backend.kv_lora_rank = 512
         backend.qk_rope_head_dim = 64
-        backend.kv_index_translator = SimpleNamespace(is_translating=is_translating)
+        backend.runner_ids = SimpleNamespace(is_translating=is_translating)
         parallel = SimpleNamespace(
             dcp_enabled=dcp_enabled,
             attn_dcp_size=DCP_SIZE if dcp_enabled else 1,
@@ -440,7 +441,7 @@ class TestFusedFp8WriteGate(CustomTestCase):
                 and backend.qk_rope_head_dim == 64
                 and not (
                     backend_module.get_parallel().dcp_enabled
-                    and backend.kv_index_translator.is_translating
+                    and backend.runner_ids.is_translating
                 )
                 and backend_module.can_use_set_mla_kv_concat_q_fp8()
             )
@@ -460,7 +461,7 @@ class TestFusedFp8WriteGate(CustomTestCase):
         """Belt and braces: reaching the helper with a resolved loc asserts
         rather than silently storing into the sink."""
         backend = object.__new__(TRTLLMMLABackend)
-        backend.kv_index_translator = SimpleNamespace(is_translating=True)
+        backend.runner_ids = SimpleNamespace(is_translating=True)
         parallel = SimpleNamespace(
             dcp_enabled=True, attn_dcp_size=DCP_SIZE, attn_dcp_rank=DCP_RANK
         )
@@ -476,9 +477,11 @@ class TestFusedFp8WriteGate(CustomTestCase):
             patch.object(
                 backend,
                 "token_to_kv_pool",
-                SimpleNamespace(
-                    get_key_buffer=lambda _: torch.zeros(
-                        (8, 576), dtype=torch.uint8, device="cuda"
+                _routed(
+                    SimpleNamespace(
+                        get_key_buffer=lambda _: torch.zeros(
+                            (8, 576), dtype=torch.uint8, device="cuda"
+                        )
                     )
                 ),
                 create=True,
@@ -496,7 +499,7 @@ class TestFusedFp8WriteGate(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "the fused translate is Triton")
-class TestFusedWriteLocTranslateCuda(CustomTestCase):
+class TestTranslateTokenIdsCuda(CustomTestCase):
     """The fused write-loc translate must agree with its own CPU branch.
 
     The two implementations must not drift: Triton truncates division toward
@@ -506,7 +509,7 @@ class TestFusedWriteLocTranslateCuda(CustomTestCase):
     """
 
     def test_cuda_matches_the_cpu_branch(self):
-        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 
         for page_size in (1, 64):
             span = page_size * 4
@@ -526,12 +529,11 @@ class TestFusedWriteLocTranslateCuda(CustomTestCase):
             for dcp_size, dcp_rank in ((1, 0), (2, 1), (4, 2)):
                 kw = dict(
                     page_size=page_size,
-                    stride=page_size * 3,
                     dcp_size=dcp_size,
                     dcp_rank=dcp_rank,
                 )
-                cpu = write_loc_to_kernel_ids(loc=loc, v2p=v2p, **kw)
-                gpu = write_loc_to_kernel_ids(loc=loc.cuda(), v2p=v2p.cuda(), **kw)
+                cpu = translate_token_ids(loc=loc, v2p=v2p, **kw)
+                gpu = translate_token_ids(loc=loc.cuda(), v2p=v2p.cuda(), **kw)
                 self.assertEqual(
                     cpu.tolist(),
                     gpu.cpu().tolist(),
@@ -542,40 +544,36 @@ class TestFusedWriteLocTranslateCuda(CustomTestCase):
         """`out_width` past the batch must zero the tail in the same launch.
 
         This is what lets a backend hand in its whole capture-stable buffer:
-        a shorter replay leaves stale kernel-facing ids past the batch, and the
+        a shorter replay leaves stale physical ids past the batch, and the
         captured write kernel consumes the full buffer, so an uncleared tail
         scatters pad rows into live KV pages.
         """
-        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 
         v2p = torch.tensor([2, 5, 1, 3, 4], dtype=torch.int64, device="cuda")
         loc = torch.tensor([0, 64, 128], dtype=torch.int64, device="cuda")
         width = 8
         # Poison the whole buffer so an unwritten or uncleared cell is visible.
         buf = torch.full((width,), -999, dtype=torch.int64, device="cuda")
-        write_loc_to_kernel_ids(
-            loc=loc, v2p=v2p, page_size=64, stride=64 * 2, out=buf, out_width=width
-        )
-        self.assertEqual(buf[:3].tolist(), [2 * 128, 5 * 128, 1 * 128])
+        translate_token_ids(loc=loc, v2p=v2p, page_size=64, out=buf, out_width=width)
+        self.assertEqual(buf[:3].tolist(), [2 * 64, 5 * 64, 1 * 64])
         self.assertEqual(buf[3:].tolist(), [0] * (width - 3))
 
         # And it must agree with the narrow call on the live prefix.
-        narrow = write_loc_to_kernel_ids(loc=loc, v2p=v2p, page_size=64, stride=64 * 2)
+        narrow = translate_token_ids(loc=loc, v2p=v2p, page_size=64)
         self.assertEqual(narrow.tolist(), buf[:3].tolist())
 
     def test_out_is_written_in_place(self):
         # The captured decode path hands in a capture-stable buffer; rebinding
         # instead of filling it would leave the graph on a stale pointer.
-        from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 
         v2p = torch.tensor([2, 5, -1, 3], dtype=torch.int64, device="cuda")
         loc = torch.tensor([0, 64, 128, 192], dtype=torch.int64, device="cuda")
         dst = torch.full_like(loc, -7)
-        ret = write_loc_to_kernel_ids(
-            loc=loc, v2p=v2p, page_size=64, stride=64 * 2, out=dst
-        )
+        ret = translate_token_ids(loc=loc, v2p=v2p, page_size=64, out=dst)
         self.assertIs(ret, dst)
-        self.assertEqual(dst.tolist(), [2 * 128, 5 * 128, 0, 3 * 128])
+        self.assertEqual(dst.tolist(), [2 * 64, 5 * 64, 0, 3 * 64])
 
 
 class TestDcpDecodeLayout(CustomTestCase):

@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import logging
 import math
-from enum import IntEnum
+from contextlib import contextmanager
+from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.sampling import softmax as sampling_softmax
+from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.kernels.ops.speculative.spec_tree import (
-    sgl_build_tree_kernel_efficient_triton,
-    verify_tree_greedy_kernel_triton,
+    TreeMaskMode,
+    build_tree_kernel_efficient_func,
+    verify_tree_greedy_func,
 )
+from sglang.kernels.ops.speculative.verify_sampling import (
+    chain_speculative_sampling_triton,
+    tree_speculative_sampling_target_only,
+)
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
@@ -24,8 +33,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    is_musa,
-    is_npu,
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -38,30 +45,17 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.sampling.watermarking.core import WatermarkState
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_npu = is_npu()
-_is_musa = is_musa()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
+_COMPACT_VERIFY_SAMPLING = envs.SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING.get()
+_PACKED_VERIFY_BCAST = envs.SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST.get()
 
 logger = logging.getLogger(__name__)
-
-if _is_cuda or _is_hip:
-    from sglang.kernels.ops.speculative.tree import (
-        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
-    )
-elif _is_musa:
-    from sgl_kernel import (
-        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
-    )
-elif _is_cpu:
-    from sgl_kernel import (
-        build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
-    )
-    from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
 
 
 def per_step_draft_out_cache_loc(
@@ -86,6 +80,38 @@ def per_step_draft_out_cache_loc(
         .permute(2, 0, 1)
         .reshape(num_steps, -1)
     )
+
+
+@contextmanager
+def draft_step_writes(
+    forward_batch, step: int, *, topk: int, num_steps: int, enabled: bool
+):
+    """Bind draft step ``step``'s slice of the batch's write ids, as
+    `EagleWorkerV2.draft_forward` slices them, and its columns of the
+    iteration's write window, while a per-step backend derives its write
+    targets (the window ids included) from the batch. A no-op unless
+    ``enabled`` (the step's backend writes a window sub-pool)."""
+    loc, cols = forward_batch.out_cache_loc, forward_batch.iteration_cols
+    if loc is None or not enabled:
+        yield
+        return
+    if cols is None:
+        # The draft's own window, each row laid out (topk, num_steps).
+        step_cols = slice(step, None, num_steps)
+    else:
+        # A chain draft writes the leading columns of the verify window.
+        assert topk == 1 and isinstance(cols, slice) and cols.step is None
+        step_cols = slice(cols.start + step, cols.start + step + 1)
+    # Contiguous: a step's ids are strided across the window, and metadata
+    # kernels read their write ids by contiguous offsets.
+    forward_batch.out_cache_loc = per_step_draft_out_cache_loc(
+        loc, forward_batch.batch_size, topk, num_steps
+    )[step].contiguous()
+    forward_batch.iteration_cols = step_cols
+    try:
+        yield
+    finally:
+        forward_batch.out_cache_loc, forward_batch.iteration_cols = loc, cols
 
 
 def _eagle_prefill_tail_tokens(
@@ -137,12 +163,6 @@ def organize_draft_results(
         )
 
     return parent_list, top_scores_index, draft_tokens
-
-
-class TreeMaskMode(IntEnum):
-    FULL_MASK = 0
-    QLEN_ONLY = 1
-    QLEN_ONLY_BITPACKING = 2
 
 
 def default_tree_mask_mode() -> TreeMaskMode:
@@ -226,66 +246,20 @@ def build_tree_kernel_efficient(
     # then, positions = [7, 8, 8, 9]
     positions = torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
 
-    if _is_npu:
-        torch.ops.npu.build_tree_kernel_efficient(
-            parent_list.to(dtype=torch.int64),
-            top_scores_index,
-            seq_lens,
-            tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-            tree_mask_mode,
-        )
-    elif _is_xpu:
-        sgl_build_tree_kernel_triton(
-            parent_list,
-            top_scores_index,
-            seq_lens,
-            tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-            tree_mask_mode,
-        )
-    elif _is_cpu:
-        sgl_build_tree_kernel_efficient_cpu(
-            parent_list,
-            top_scores_index,
-            seq_lens,
-            tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-            tree_mask_mode,
-        )
-    else:
-        sgl_build_tree_kernel_efficient(
-            parent_list,
-            top_scores_index,
-            seq_lens,
-            tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-            tree_mask_mode,
-        )
+    build_tree_kernel_efficient_func(
+        parent_list,
+        top_scores_index,
+        seq_lens,
+        tree_mask,
+        positions,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        topk,
+        spec_steps,
+        num_verify_tokens,
+        tree_mask_mode,
+    )
     return (
         tree_mask,
         positions,
@@ -294,159 +268,6 @@ def build_tree_kernel_efficient(
         retrieve_next_sibling,
         draft_tokens,
     )
-
-
-def sgl_build_tree_kernel_triton(
-    parent_list: torch.Tensor,
-    selected_index: torch.Tensor,
-    verified_seq_len: torch.Tensor,
-    tree_mask: torch.Tensor,
-    positions: torch.Tensor,
-    retrieve_index: torch.Tensor,
-    retrieve_next_token: torch.Tensor,
-    retrieve_next_sibling: torch.Tensor,
-    topk: int,
-    depth: int,
-    draft_token_num: int,
-    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
-):
-    """Triton-based implementation."""
-    # TODO: Add support for QLEN_ONLY_BITPACKING mode
-    if tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
-        raise NotImplementedError(
-            "QLEN_ONLY_BITPACKING is not supported in Triton implementation"
-        )
-
-    batch_size = verified_seq_len.shape[0]
-    seq_len_prefix_sum = torch.cumsum(verified_seq_len, dim=0) - verified_seq_len
-
-    # Launch kernel with one program per batch item
-    grid = (batch_size,)
-
-    sgl_build_tree_kernel_efficient_triton[grid](
-        parent_list,
-        selected_index,
-        verified_seq_len,
-        seq_len_prefix_sum,
-        tree_mask,
-        positions,
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        topk=topk,
-        depth=depth,
-        draft_token_num=draft_token_num,
-        tree_mask_mode=int(tree_mask_mode),
-        batch_size=batch_size,
-        parent_list_stride=(
-            parent_list.stride(0) if parent_list.dim() > 1 else parent_list.shape[0]
-        ),
-        selected_index_stride=selected_index.stride(0),
-    )
-
-
-def verify_tree_greedy_triton(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    candidates: torch.Tensor,
-    retrieve_index: torch.Tensor,
-    retrieve_next_token: torch.Tensor,
-    retrieve_next_sibling: torch.Tensor,
-    target_predict: torch.Tensor,
-):
-    """Triton-based implementation."""
-    batch_size = candidates.shape[0]
-    num_speculative_tokens = accept_index.shape[1]
-    num_draft_tokens = candidates.shape[1]
-
-    # Launch kernel with one program per batch item
-    grid = (batch_size,)
-
-    verify_tree_greedy_kernel_triton[grid](
-        predicts,
-        accept_index,
-        accept_token_num,
-        candidates,
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        target_predict,
-        batch_size=batch_size,
-        num_speculative_tokens=num_speculative_tokens,
-        num_draft_tokens=num_draft_tokens,
-    )
-
-
-def verify_tree_greedy_func(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    candidates: torch.Tensor,
-    retrieve_index: torch.Tensor,
-    retrieve_next_token: torch.Tensor,
-    retrieve_next_sibling: torch.Tensor,
-    target_predict: torch.Tensor,
-    topk: int = -1,
-):
-    if _is_cuda or _is_hip or _is_musa:
-        if _is_cuda or _is_hip:
-            from sglang.kernels.ops.speculative.tree import verify_tree_greedy
-        else:
-            from sgl_kernel import verify_tree_greedy
-
-        verify_tree_greedy(
-            predicts=predicts,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=accept_token_num,  # mutable
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
-            target_predict=target_predict,
-        )
-
-    elif _is_cpu:
-        sgl_verify_tree_greedy_cpu(
-            predicts=predicts,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=accept_token_num,  # mutable
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match the CUDA op schema, so
-            # the CPU/CUDA call sites stay grep-symmetric.
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
-            target_predict=target_predict,
-        )
-
-    elif _is_npu:
-        from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
-
-        verify_tree_greedy(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
-            target_predict=target_predict,
-        )
-    elif _is_xpu:
-        verify_tree_greedy_triton(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrieve_index=retrieve_index,
-            retrieve_next_token=retrieve_next_token,
-            retrieve_next_sibling=retrieve_next_sibling,
-            target_predict=target_predict,
-        )
-    return predicts, accept_index, accept_token_num
 
 
 def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
@@ -566,14 +387,19 @@ def eagle_prepare_for_verify(
         # Uniform variant: end offsets (= start + draft_token_num) are computed
         # inside the kernel, keeping the eager `seq_lens + N` add off the host
         # critical path (bs=1 MTP inter-phase seam).
-        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
-            device=device,
-        )
+        if verify_input.prepared_out_cache_loc is not None:
+            batch.out_cache_loc = verify_input.prepared_out_cache_loc
+        else:
+            batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
+            )
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
@@ -601,6 +427,8 @@ def eagle_prepare_for_verify(
         target_worker.model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
+        spec_mrope_positions=verify_input.prepared_mrope_positions,
+        iteration_ids=verify_input.iteration_ids,
     )
 
     # Run attention backend plan and cuda graph preparation
@@ -636,11 +464,9 @@ def _seeded_verify_coins(
     per-draft rejection coins; column draft_token_num drives the final
     fallback-sampling coin.
 
-    Scope: this seeds only the verify-side RNG. With rejection sampling the
-    draft workers still pick candidates via unseeded multinomial
-    (fast_sample in eagle_worker_v2), so that mode stays non-deterministic
-    until the draft RNG is seeded in a follow-up; top-k/greedy draft
-    selection is already deterministic.
+    Draft proposal draws use a separate domain-separated seeded stream in
+    ``fast_sample``. Keeping the streams separate preserves the independence
+    required by rejection sampling.
     """
     from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 
@@ -728,19 +554,42 @@ def _can_use_sparse_uno_tree_target_sampling(
     )
 
 
+def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
+    """The support for eagle_sample's compact top-k branch under
+    SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING, or None for the dense branch: every
+    request must sample with a finite top-k within the compact limit."""
+    if not _COMPACT_VERIFY_SAMPLING or batch.forward_mode.is_idle():
+        return None
+    from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
+
+    top_ks = [req.sampling_params.top_k for req in batch.reqs]
+    if not top_ks or any(k <= 1 or k > _SPARSE_TOP_K_LIMIT for k in top_ks):
+        return None
+    return max(top_ks)
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
+    *,
+    watermark_state: Optional[WatermarkState] = None,
+    watermark_full_mask: bool = True,
+    simulated_acc_len: Optional[torch.Tensor] = None,
+    simulated_acc_len_rng: Optional[torch.Generator] = None,
+    sparse_bonus_argmax: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
-    (which contains spec decoding information).
+    (which contains spec decoding information). simulated_acc_len: the injected
+    acceptance length already drawn on the host, as a device int64 [1], so a CUDA
+    graph can replay the injection. simulated_acc_len_rng: the generator to draw
+    it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
+    injected acceptance's bonus is the target argmax on the compact top-k branch
+    too, as on the dense one.
     """
-    import torch.nn.functional as F
-
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
@@ -752,6 +601,7 @@ def eagle_sample(
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
         generate_simulated_accept_index,
+        generate_simulated_accept_index_device,
     )
     from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 
@@ -796,13 +646,55 @@ def eagle_sample(
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
 
+    watermark_context_hashes = None
+    watermark_selected = None
+    if watermark_state is not None and sampling_info.has_watermark_candidates:
+        if batch.return_logprob:
+            # compute_spec_logprobs reads logits_output after verify.
+            next_token_logits = next_token_logits.clone()
+        if next_token_logits.is_cuda:
+            watermark_context_hashes, watermark_selected = (
+                watermark_state.force_speculative_from_tree(
+                    logits=next_token_logits,
+                    req_pool_indices=batch.req_pool_indices,
+                    draft_tokens=verify_input.draft_token,
+                    custom_mask=verify_input.custom_mask,
+                    positions=verify_input.positions,
+                    sampling_info=sampling_info,
+                    draft_token_num=verify_input.draft_token_num,
+                    full_mask=watermark_full_mask,
+                )
+            )
+        else:
+            contexts, context_lengths = watermark_state.speculative_contexts(
+                req_pool_indices=batch.req_pool_indices,
+                draft_tokens=verify_input.draft_token,
+                custom_mask=verify_input.custom_mask,
+                positions=verify_input.positions,
+                draft_token_num=verify_input.draft_token_num,
+                full_mask=watermark_full_mask,
+                context_windows=watermark_state.context_windows(sampling_info),
+            )
+            watermark_context_hashes, watermark_selected = (
+                watermark_state.force_speculative(
+                    logits=next_token_logits,
+                    req_pool_indices=batch.req_pool_indices,
+                    contexts=contexts,
+                    context_lengths=context_lengths,
+                    sampling_info=sampling_info,
+                    draft_token_num=verify_input.draft_token_num,
+                )
+            )
+
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-    accept_index = torch.full(
-        (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+    predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
+        rows=math.prod(predict_shape),
+        bs=bs,
+        depth=verify_input.max_tree_depth,
+        device=device,
+        packed=_PACKED_VERIFY_BCAST,
     )
-    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
     target_predict = None
@@ -875,56 +767,26 @@ def eagle_sample(
             else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+            if verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            else:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
     else:
-        if _is_npu:
-            from sgl_kernel_npu.sample import (
-                chain_speculative_sampling_triton,
-                top_k_renorm_prob,
-                top_p_renorm_prob,
-                tree_speculative_sampling_target_only,
-            )
-        else:
-            from sglang.kernels.ops.speculative.reject_sampling import (
-                chain_speculative_sampling_triton,
-            )
-
-        # if/else, not a ternary: the CUDA-only name still has to resolve in the
-        # branch not taken, and HIP only reaches here with rejection sampling on.
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
+            if get_spec().speculative_use_block_verification:
+                sampling_fn = partial(sampling_fn, block_verification=True)
         else:
-            if _is_cuda:
-                from sglang.kernels.ops.speculative.sampling import (
-                    tree_speculative_sampling_target_only,
-                )
-            elif not _is_npu:
-                from sgl_kernel import tree_speculative_sampling_target_only
-
             sampling_fn = tree_speculative_sampling_target_only
-
-        if _is_hip:
-            # Same names, same contract: dflash_utils.py aliases these too.
-            from sglang.kernels.ops.sampling.renorm_triton import (
-                top_k_renorm_probs_triton as top_k_renorm_prob,
-            )
-            from sglang.kernels.ops.sampling.renorm_triton import (
-                top_p_renorm_probs_triton as top_p_renorm_prob,
-            )
-        elif _is_cuda:
-            from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
-            from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
-        elif not _is_npu:
-            from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
-        target_probs = F.softmax(
-            next_token_logits / expanded_temperature, dim=-1
+        target_probs = sampling_softmax(
+            next_token_logits, temperatures=expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:
@@ -1002,9 +864,12 @@ def eagle_sample(
             else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+            if verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            else:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
@@ -1025,32 +890,72 @@ def eagle_sample(
                 )
 
             # Use target argmax as the synthetic bonus for non-greedy requests.
-            if target_predict is None:
+            if target_predict is None or sparse_bonus_argmax:
                 target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
                     bs, verify_input.draft_token_num
                 )
-        accept_index = generate_simulated_accept_index(
-            accept_index=accept_index,
-            predict=predict,  # mutable
-            num_correct_drafts=num_correct_drafts,  # mutable
-            candidates=candidates,
-            target_predict=target_predict,
-            simulate_acc_len=SIMULATE_ACC_LEN,
-            simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
-            bs=bs,
-            spec_steps=verify_input.max_tree_depth - 1,
-        )
+        if simulated_acc_len is not None:
+            accept_index = generate_simulated_accept_index_device(
+                accept_index=accept_index,
+                predict=predict,  # mutable
+                num_correct_drafts=num_correct_drafts,  # mutable
+                candidates=candidates,
+                target_predict=target_predict,
+                bs=bs,
+                spec_steps=verify_input.max_tree_depth - 1,
+                simulate_acc_len=simulated_acc_len,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+            )
+        else:
+            accept_index = generate_simulated_accept_index(
+                accept_index=accept_index,
+                predict=predict,  # mutable
+                num_correct_drafts=num_correct_drafts,  # mutable
+                candidates=candidates,
+                target_predict=target_predict,
+                simulate_acc_len=SIMULATE_ACC_LEN,
+                simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
+                bs=bs,
+                spec_steps=verify_input.max_tree_depth - 1,
+                generator=simulated_acc_len_rng,
+            )
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
-    return predict, num_correct_drafts + 1, accept_index
+    accept_lens = num_correct_drafts + 1
+    if watermark_state is not None and sampling_info.has_watermark_candidates:
+        watermark_state.record_speculative(
+            batch.req_pool_indices,
+            watermark_context_hashes,
+            watermark_selected,
+            accept_index,
+            accept_lens,
+        )
+    return predict, accept_lens, accept_index
+
+
+def _verify_outputs(
+    *, rows: int, bs: int, depth: int, device, packed: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """predict [rows] (zeros), accept_index [bs, depth] (-1) and num_correct_drafts
+    [bs] int32; packed (SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST): views of one buffer,
+    returned last so a sampled result goes to the TP group in one broadcast."""
+    if not packed:
+        predict = torch.zeros((rows,), dtype=torch.int32, device=device)
+        accept_index = torch.full((bs, depth), -1, dtype=torch.int32, device=device)
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+        return predict, accept_index, num_correct_drafts, None
+    out = torch.empty((rows + bs * depth + bs,), dtype=torch.int32, device=device)
+    predict = out[:rows]
+    predict.zero_()
+    accept_index = out[rows : rows + bs * depth].view(bs, depth)
+    accept_index.fill_(-1)
+    return predict, accept_index, out[rows + bs * depth :], out
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
-
-    bs = batch.batch_size()
 
     # Accumulate penalty
     # This is a relaxed version of penalties for speculative decoding.
@@ -1070,6 +975,13 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
+
+    # Mirrorless opt-out: publish the host-side max of the page-aligned
+    # kv_allocated_len (>= committed + alloc reserve, so it upper-bounds
+    # every length attention can read next round) for the NPU backend's
+    # D2H-free block-table gather sizing.
+    if batch.seq_lens_cpu is None:
+        batch.max_seq_len_host = int(cur_kv_lens_cpu.max())
 
     # Fail fast if the page>1 + topk>1 draft over-allocation
     # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below

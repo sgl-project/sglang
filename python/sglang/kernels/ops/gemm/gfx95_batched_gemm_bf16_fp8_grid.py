@@ -11,7 +11,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import fp8_grid_round
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    fp8_grid_quant,
+    fp8_grid_round,
+)
 
 # 16 x 32 x 512, 2 warps: the fastest N tile holding whole 32-groups; nonkdim 16 is aiter's MFMA
 _BLOCK_M, _BLOCK_N, _BLOCK_K = 16, 32, 512
@@ -50,11 +53,15 @@ def _batched_gemm_bf16_fp8_grid_kernel(
     stride_cb,
     stride_cm,
     stride_cn,
+    scale_ptr,
+    stride_sb,
+    stride_sm,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     EVEN_K: tl.constexpr,
     FP8_GRID: tl.constexpr,
+    EMIT_FP8: tl.constexpr,
     cache_modifier: tl.constexpr,
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
@@ -117,12 +124,21 @@ def _batched_gemm_bf16_fp8_grid_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    c = accumulator.to(c_ptr.type.element_ty)
-    if FP8_GRID:
-        # the consumer's fake-quant on the bf16-rounded output: one ue8m0 group per 32 N elements
-        xg = tl.reshape(c.to(tl.float32), (BLOCK_SIZE_M * (BLOCK_SIZE_N // 32), 32))
-        c = tl.reshape(fp8_grid_round(xg), (BLOCK_SIZE_M, BLOCK_SIZE_N))
-        c = c.to(c_ptr.type.element_ty)
+    if EMIT_FP8:
+        # the consumer's own quant of the bf16-rounded output: fp8 codes + one ue8m0 per 32 N
+        xg = tl.reshape(
+            accumulator.to(tl.bfloat16).to(tl.float32),
+            (BLOCK_SIZE_M * (BLOCK_SIZE_N // 32), 32),
+        )
+        q8, e8 = fp8_grid_quant(xg)
+        c = tl.reshape(q8, (BLOCK_SIZE_M, BLOCK_SIZE_N))
+    else:
+        c = accumulator.to(c_ptr.type.element_ty)
+        if FP8_GRID:
+            # the consumer's fake-quant on the bf16-rounded output: one ue8m0 group per 32 N elements
+            xg = tl.reshape(c.to(tl.float32), (BLOCK_SIZE_M * (BLOCK_SIZE_N // 32), 32))
+            c = tl.reshape(fp8_grid_round(xg), (BLOCK_SIZE_M, BLOCK_SIZE_N))
+            c = c.to(c_ptr.type.element_ty)
 
     offs_cm = tl.cast(pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M), tl.int64)
     offs_cn = tl.cast(pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N), tl.int64)
@@ -134,6 +150,16 @@ def _batched_gemm_bf16_fp8_grid_kernel(
     )
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
+    if EMIT_FP8:
+        offs_sn = pid_n * (BLOCK_SIZE_N // 32) + tl.arange(0, BLOCK_SIZE_N // 32)
+        tl.store(
+            scale_ptr
+            + stride_sb * batch_id
+            + stride_sm * offs_cm[:, None]
+            + offs_sn[None, :],
+            tl.reshape(e8, (BLOCK_SIZE_M, BLOCK_SIZE_N // 32)).to(tl.uint8),
+            mask=(offs_cm[:, None] < M) & (offs_sn[None, :] < N // 32),
+        )
 
 
 @triton.jit
@@ -208,10 +234,14 @@ def _batched_gemm_split_k_reduce_kernel(
     N,
     stride_cb,
     stride_cm,
+    scale_ptr,
+    stride_sb,
+    stride_sm,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     SPLIT_K: tl.constexpr,
     FP8_GRID: tl.constexpr,
+    EMIT_FP8: tl.constexpr,
 ):
     """Grid (G, row tiles x N tiles): sums the partials of one output tile in split order,
     rounds to bf16 and, with FP8_GRID, onto the consumer's fp8 grid."""
@@ -231,11 +261,19 @@ def _batched_gemm_split_k_reduce_kernel(
             + (tile + tl.arange(0, BLOCK_SIZE_M))[:, None] * N
             + offs_n[None, :]
         )
-    c = acc.to(c_ptr.type.element_ty)
-    if FP8_GRID:
-        xg = tl.reshape(c.to(tl.float32), (BLOCK_SIZE_M * (BLOCK_SIZE_N // 32), 32))
-        c = tl.reshape(fp8_grid_round(xg), (BLOCK_SIZE_M, BLOCK_SIZE_N))
-        c = c.to(c_ptr.type.element_ty)
+    if EMIT_FP8:
+        xg = tl.reshape(
+            acc.to(tl.bfloat16).to(tl.float32),
+            (BLOCK_SIZE_M * (BLOCK_SIZE_N // 32), 32),
+        )
+        q8, e8 = fp8_grid_quant(xg)
+        c = tl.reshape(q8, (BLOCK_SIZE_M, BLOCK_SIZE_N))
+    else:
+        c = acc.to(c_ptr.type.element_ty)
+        if FP8_GRID:
+            xg = tl.reshape(c.to(tl.float32), (BLOCK_SIZE_M * (BLOCK_SIZE_N // 32), 32))
+            c = tl.reshape(fp8_grid_round(xg), (BLOCK_SIZE_M, BLOCK_SIZE_N))
+            c = c.to(c_ptr.type.element_ty)
     c_ptrs = (
         c_ptr
         + stride_cb * batch_id
@@ -243,6 +281,16 @@ def _batched_gemm_split_k_reduce_kernel(
         + offs_n[None, :]
     )
     tl.store(c_ptrs, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+    if EMIT_FP8:
+        offs_sn = pid_n * (BLOCK_SIZE_N // 32) + tl.arange(0, BLOCK_SIZE_N // 32)
+        tl.store(
+            scale_ptr
+            + stride_sb * batch_id
+            + stride_sm * tl.cast(offs_m, tl.int64)[:, None]
+            + offs_sn[None, :],
+            tl.reshape(e8, (BLOCK_SIZE_M, BLOCK_SIZE_N // 32)).to(tl.uint8),
+            mask=(offs_m[:, None] < M) & (offs_sn[None, :] < N // 32),
+        )
 
 
 def _split_k_applies(T: int, D: int, R: int) -> bool:
@@ -255,7 +303,11 @@ def _split_k_applies(T: int, D: int, R: int) -> bool:
 
 
 def _batched_gemm_split_k(
-    x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, fp8_grid: bool
+    x: torch.Tensor,
+    w: torch.Tensor,
+    out: torch.Tensor,
+    fp8_grid: bool,
+    scale: Optional[torch.Tensor] = None,
 ) -> None:
     T, G, D = x.shape
     R = w.shape[1]
@@ -293,10 +345,14 @@ def _batched_gemm_split_k(
         R,
         R,
         G * R,
+        scale if scale is not None else out,
+        R // 32,
+        G * R // 32,
         BLOCK_SIZE_M=_BLOCK_M,
         BLOCK_SIZE_N=_BLOCK_N,
         SPLIT_K=_SPLIT_K,
         FP8_GRID=fp8_grid,
+        EMIT_FP8=scale is not None,
         num_warps=_NUM_WARPS,
     )
 
@@ -306,26 +362,38 @@ def batched_gemm_bf16_fp8_grid(
     w: torch.Tensor,
     fp8_grid: bool = True,
     split_k: Optional[bool] = None,
-) -> torch.Tensor:
+    emit_fp8: bool = False,
+):
     """x [T, G, D] bf16, w [G, R, D] bf16 -> [T, G * R] bf16 with out[t, g*R:(g+1)*R] =
     x[t, g] @ w[g]^T, on the fp8 grid when fp8_grid; split_k=None picks the regime by shape,
-    False keeps the single launch at every T (deterministic inference)."""
+    False keeps the single launch at every T (deterministic inference).
+    emit_fp8 returns (fp8 e4m3 [T, G * R], ue8m0 uint8 [T, G * R // 32]) instead."""
     assert x.dim() == 3 and w.dim() == 3, (x.shape, w.shape)
     T, G, D = x.shape
     assert w.shape[0] == G and w.shape[2] == D, (x.shape, w.shape)
     R = w.shape[1]
     assert x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16
     assert x.stride(2) == 1 and w.is_contiguous()
-    assert not fp8_grid or R % 32 == 0, R
-    out = torch.empty((T, G * R), dtype=torch.bfloat16, device=x.device)
+    assert not (fp8_grid or emit_fp8) or R % 32 == 0, R
+    out = torch.empty(
+        (T, G * R),
+        dtype=torch.float8_e4m3fn if emit_fp8 else torch.bfloat16,
+        device=x.device,
+    )
+    scale = (
+        torch.empty((T, G * R // 32), dtype=torch.uint8, device=x.device)
+        if emit_fp8
+        else None
+    )
+    result = (out, scale) if emit_fp8 else out
     if T == 0:
-        return out
+        return result
     if split_k is None:
         split_k = _split_k_applies(T, D, R)
     if split_k:
         assert _split_k_applies(T, D, R), (T, D, R)
-        _batched_gemm_split_k(x, w, out, fp8_grid)
-        return out
+        _batched_gemm_split_k(x, w, out, fp8_grid, scale)
+        return result
     block_m, block_n, block_k, num_warps = _tile_config(T)
     grid = (G, triton.cdiv(T, block_m) * triton.cdiv(R, block_n))
     _batched_gemm_bf16_fp8_grid_kernel[grid](
@@ -344,15 +412,19 @@ def batched_gemm_bf16_fp8_grid(
         R,
         G * R,
         1,
+        scale if scale is not None else out,
+        R // 32,
+        G * R // 32,
         BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_K=block_k,
         EVEN_K=(D % block_k == 0),
         FP8_GRID=fp8_grid,
+        EMIT_FP8=emit_fp8,
         cache_modifier=_CACHE_MODIFIER,
         num_warps=num_warps,
         num_stages=_NUM_STAGES,
         waves_per_eu=_WAVES_PER_EU,
         matrix_instr_nonkdim=_MFMA_NONKDIM,
     )
-    return out
+    return result

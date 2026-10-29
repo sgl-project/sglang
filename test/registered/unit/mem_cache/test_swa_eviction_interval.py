@@ -12,19 +12,28 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class _SwaCache(RadixCache):
     def __init__(self, *, auxiliary=False):
+        self.disable = False
         self.sliding_window_size = 128
         self.page_size = 16
         self.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.arange(1024).reshape(1, -1)
         )
         self.token_to_kv_pool_allocator = Mock(
-            spec=["free_swa_segment", "free_group_begin", "free_group_end"]
+            spec=[
+                "free_swa_segment",
+                "free_group_begin",
+                "free_group_end",
+                "page_size",
+                "storage",
+            ]
         )
+        self.token_to_kv_pool_allocator.page_size = 16
+        self.token_to_kv_pool_allocator.storage = None
         self.trim_calls = 0
         self.auxiliary = auxiliary
 
@@ -34,9 +43,10 @@ class _SwaCache(RadixCache):
     def supports_auxiliary_swa(self):
         return self.auxiliary
 
-    def evict_sliding_windows(self, req, pre_len, *, eviction_interval=1):
+    def swa_retain_floor(self, req):
+        # Read once per window retirement the scheduler runs.
         self.trim_calls += 1
-        super().evict_sliding_windows(req, pre_len, eviction_interval=eviction_interval)
+        return super().swa_retain_floor(req)
 
 
 class TestSWAEvictionInterval(unittest.TestCase):
@@ -47,7 +57,7 @@ class TestSWAEvictionInterval(unittest.TestCase):
             with (
                 self.subTest(protected=protected, shield=shield, auxiliary=auxiliary),
                 envs.SGLANG_SWA_EVICTION_INTERVAL.override(128),
-                envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.override(False),
+                envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
             ):
                 cache = _SwaCache(auxiliary=auxiliary)
                 req = SimpleNamespace(
@@ -113,7 +123,7 @@ class TestSWAEvictionInterval(unittest.TestCase):
             patch("sglang.srt.managers.schedule_batch._is_hip", True),
             envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.override(True),
             envs.SGLANG_SWA_EVICTION_INTERVAL.override(128),
-            envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.override(False),
+            envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
         ):
             batch.maybe_evict_swa()
             free.assert_not_called()

@@ -339,6 +339,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._topk_cache: dict = {}
         self._topk_cache_owner: Optional[ForwardBatch] = None
 
+        from sglang.srt.layers.attention.minimax_sparse_ops.indexer_cp import (
+            make_indexer_cp,
+        )
+
+        self.indexer_cp = make_indexer_cp(self, runner, sparse_cfg)
+
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
@@ -1486,7 +1492,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 layer.idx_k_scale_float,
                 layer.idx_v_scale_float,
             )
-        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_pool.layer_router.read(layer.layer_id).kv()
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
@@ -1727,7 +1733,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 layer.idx_k_scale_float,
                 layer.idx_v_scale_float,
             )
-        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_pool.layer_router.read(layer.layer_id).kv()
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
@@ -1836,6 +1842,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 cached_topk_idx=_cached_topk,
                 topk_out=_topk_buf if _want_topk else None,
                 hisparse_swap_in_fn=hisparse_swap_in_fn,
+                indexer_cp=self.indexer_cp,
+                # the verify funnel lays out each request's draft rows consecutively
+                packed_queries=(
+                    self.speculative_num_draft_tokens
+                    if forward_batch.forward_mode.is_target_verify()
+                    else 1
+                ),
             )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
@@ -1854,7 +1867,7 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     ):
         self.dense = dense_backend
         self.sparse = sparse_backend
-        self.kv_index_translator = dense_backend.kv_index_translator
+        self.runner_ids = dense_backend.runner_ids
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
