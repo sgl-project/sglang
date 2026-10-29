@@ -376,39 +376,28 @@ class TestLayerNorm:
     @pytest.mark.parametrize("ndim", [2, 3], ids=["2d", "3d"])
     @pytest.mark.parametrize(
         "input_dtype",
-        [torch.bfloat16, torch.float32],
-        ids=["input-bf16", "input-fp32"],
+        [torch.float16, torch.bfloat16, torch.float32],
+        ids=["input-fp16", "input-bf16", "input-fp32"],
     )
     @pytest.mark.parametrize(
-        "weight_dtype",
-        [torch.bfloat16, torch.float32],
-        ids=["weight-bf16", "weight-fp32"],
+        "parameter_dtype",
+        [torch.float16, torch.bfloat16, torch.float32],
+        ids=["parameter-fp16", "parameter-bf16", "parameter-fp32"],
     )
-    @pytest.mark.parametrize(
-        "bias_dtype",
-        [None, torch.bfloat16, torch.float32],
-        ids=["no-bias", "bias-bf16", "bias-fp32"],
-    )
+    @pytest.mark.parametrize("has_bias", [False, True], ids=["no-bias", "bias"])
     def test_layernorm(
         self,
         hidden_size: int,
         ndim: int,
         input_dtype: torch.dtype,
-        weight_dtype: torch.dtype,
-        bias_dtype: Optional[torch.dtype],
+        parameter_dtype: torch.dtype,
+        has_bias: bool,
     ) -> None:
         """CPU LayerNorm supports mixed input/parameter dtypes, but one parameter dtype."""
-        if bias_dtype is not None and bias_dtype != weight_dtype:
-            pytest.skip("weight and bias must have the same dtype")
-
         shape = [8, hidden_size] if ndim == 2 else [8, 3, hidden_size]
         x = make_non_contiguous(torch.randn(shape, dtype=input_dtype))
-        weight = torch.randn(hidden_size, dtype=weight_dtype)
-        bias = (
-            torch.randn(hidden_size, dtype=bias_dtype)
-            if bias_dtype is not None
-            else None
-        )
+        weight = torch.randn(hidden_size, dtype=parameter_dtype)
+        bias = torch.randn(hidden_size, dtype=parameter_dtype) if has_bias else None
 
         output = torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, eps)
         expected = self._forward_native(x, weight, eps, bias=bias)
@@ -417,11 +406,7 @@ class TestLayerNorm:
         atol = rtol = precision[input_dtype]
         torch.testing.assert_close(output, expected, atol=atol, rtol=rtol)
 
-        if (
-            input_dtype == torch.bfloat16
-            and weight_dtype == input_dtype
-            and (bias_dtype is None or bias_dtype == input_dtype)
-        ):
+        if input_dtype in DTYPES and parameter_dtype == input_dtype:
             residual = torch.randn(shape, dtype=input_dtype)
             expected_residual = residual.clone()
             output = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
