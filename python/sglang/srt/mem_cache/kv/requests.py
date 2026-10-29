@@ -56,6 +56,7 @@ class RequestTable:
         tracking: Optional[StateTracking],
         device: str,
         enable_memory_saver: bool,
+        reserved_rows: Optional[int] = None,
     ):
         assert (state_sub_pool is None) == (tracking is None), (
             "a state sub-pool comes with its tracking, and only then"
@@ -63,7 +64,10 @@ class RequestTable:
         # Running requests; rows for preallocated transfers come on top.
         self.size = size
         self.pre_alloc_size = pre_alloc_size
-        self._num_rows = size + pre_alloc_size + 1
+        self._num_rows = (
+            reserved_rows if reserved_rows is not None else size + pre_alloc_size + 1
+        )
+        assert self._num_rows >= size + pre_alloc_size + 1
         self.max_context_len = max_context_len
         self.device = device
         self.state_sub_pool = state_sub_pool

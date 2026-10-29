@@ -52,6 +52,7 @@ class _Pool:
     @staticmethod
     def set_mamba_ping_pong_slot(req, idx, value):
         req.kv.mamba_ping_pong_track_buffer[idx] = value
+        req.kv.mamba_ping_pong_empty[idx] = value == -1
 
     @staticmethod
     def get_mamba_ping_pong_other_idx(idx):
@@ -70,6 +71,7 @@ class _Req:
         self.decode_batch_idx = 3
         self.kv = SimpleNamespace(
             mamba_ping_pong_track_buffer=torch.tensor(buf, dtype=torch.int64),
+            mamba_ping_pong_empty=[slot == -1 for slot in buf],
             mamba_next_track_idx=next_idx,
             mamba_last_track_idx=last_idx,
             mamba_last_track_seqlen=None,

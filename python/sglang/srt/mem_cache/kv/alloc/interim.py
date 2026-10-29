@@ -128,11 +128,6 @@ class _InterimPolicy:
         them, by sub-pool name: tokens, or slots for a state sub-pool."""
         raise NotImplementedError
 
-    def resize(self, c: ChainAllocator, config) -> None:
-        raise NotImplementedError(
-            "post-capture resize is planned only for a full + sliding-window chain"
-        )
-
     def memo_violations(self, c: ChainAllocator) -> List[str]:
         return []
 
@@ -149,6 +144,58 @@ class _InterimPolicy:
         self, c: ChainAllocator, cpu_copy, indices, *, mamba_indices, req_pool_index
     ) -> None:
         raise NotImplementedError
+
+    def prefill_state_fits(
+        self,
+        c,
+        full_tokens,
+        swa_tokens,
+        state_slots,
+        *,
+        full_evictable_tokens=0,
+        swa_evictable_tokens=0,
+        state_evictable_slots=0,
+    ):
+        """Shared-byte competition, separate from token quotas and per-side gates."""
+        from sglang.srt.mem_cache.kv.alloc.pricing import (
+            reclaimed_snapshot,
+            sequential_fit,
+        )
+
+        credits = {c.roles.owner: int(full_evictable_tokens) // c.page_size}
+        if c.roles.window is not None:
+            credits[c.roles.window] = int(swa_evictable_tokens) // c.page_size
+        credits[c.roles.state] = int(state_evictable_slots)
+        snapshot = reclaimed_snapshot(_snapshot(c), credits)
+        demands = [
+            (c.roles.state, int(state_slots)),
+            (c.roles.owner, int(-(-full_tokens // c.page_size))),
+        ]
+        if c.roles.window is None:
+            # Two fixed ends use the same state-before-token take order.
+            return sequential_fit(snapshot, tuple(demands))
+        demands.append((c.roles.window, int(-(-swa_tokens // c.page_size))))
+        # Preserve the split policy's physical surcharge: a pinned window can
+        # strand bytes on either side even when the aggregate arena has room.
+        # State competes for these bytes, but never consumes FULL token IDs.
+        physical_full = c.full_attn_allocator._schedulable_physical_tokens()
+        if full_tokens + state_slots * self._state_slot_cost(c) > (
+            physical_full + full_evictable_tokens
+        ):
+            return False
+        # The old one-window policy retains its per-side physical placement
+        # checks. This additional byte gate prevents state from spending the
+        # same shared bytes as pending tokens, without treating it as FULL IDs.
+        occupied = sum(b.live * b.page_bytes for b in snapshot.bands)
+        requested = sum(
+            snapshot.band(name).page_bytes * pages for name, pages in demands
+        )
+        return (
+            occupied
+            + requested
+            + min(b.min_page * b.page_bytes for b in snapshot.bands)
+            <= snapshot.total_bytes
+        )
 
 
 class _TokenAndSlotEndsPolicy(_InterimPolicy):
@@ -216,9 +263,6 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
             * get_parallel().attn_dcp_size
             // c.full_attn_allocator.entry_bytes
         )
-
-    def resize(self, c: ChainAllocator, config) -> None:
-        BaseTokenToKVPoolAllocator.resize(c, config)
 
     cpu_copy_carries_state = True
 
@@ -289,7 +333,8 @@ class _WindowPolicy(_InterimPolicy):
         return min(self._size_full, self._size_swa)
 
     def size_full(self, c: ChainAllocator) -> int:
-        return self._size_full
+        cap = c.full_attn_allocator.max_live_tokens
+        return self._size_full if cap is None else min(self._size_full, cap)
 
     def size_swa(self, c: ChainAllocator) -> int:
         return self._size_swa
@@ -683,52 +728,6 @@ class _TokenEndsPolicy(_WindowPolicy):
         # A zero-reclaim plan can still depend on compaction before allocation.
         return c.ensure_capacity(num_tokens, required_swa)
 
-    def resize(self, c: ChainAllocator, config) -> None:
-        """Synchronize allocator capacity after the shared pool is finalized."""
-        if not c.arena.backed_after_capture:
-            raise RuntimeError("ChainAllocator.resize requires post-capture backing")
-        final_pool_bytes = config.unified_memory_pool_bytes
-        if final_pool_bytes is None:
-            raise ValueError(
-                "ChainAllocator.resize requires config.unified_memory_pool_bytes"
-            )
-        if int(final_pool_bytes) != c.arena.total_bytes:
-            raise RuntimeError(
-                "the arena must be backed before allocator.resize: "
-                f"config has {int(final_pool_bytes)} bytes but the pool exposes "
-                f"{c.arena.total_bytes} bytes"
-            )
-        fa, sa = c.full_attn_allocator, c.swa_attn_allocator
-        for allocator in (fa, sa):
-            if allocator.allocated_count() != 0 or allocator._pending_reuse:
-                raise RuntimeError(
-                    f"cannot resize non-empty unified allocator "
-                    f"{allocator.sub_pool_name!r}"
-                )
-        fa._set_capacity(c.arena.num_entries(fa.sub_pool_name))
-        sa._set_capacity(
-            c.arena.num_entries(sa.sub_pool_name),
-            virtual_num_pages=fa.ids.num_virtual_ids,
-        )
-        self._empty_shared_gap_bytes = fa._current_gap_bytes()
-        self._size_full = fa.available_size()
-        self._size_swa = min(
-            sa.available_size(),
-            len(fa.free_virtual_ids) * c.page_size,
-        )
-        self._full_max_total_num_tokens = self._size_full
-        self._swa_max_total_num_tokens = self._size_swa
-        c.get_kvcache().size = fa.max_slots - 1
-        for allocator, host_capacity in (
-            (fa, self._size_full),
-            (sa, self._size_swa),
-        ):
-            pool = c.views[allocator.sub_pool_name]
-            pool.num_pages = allocator.num_pages
-            pool.size = allocator.num_pages * c.page_size - c.page_size
-            pool.host_capacity_tokens = host_capacity
-            pool.host_capacity_bytes = host_capacity * allocator.entry_bytes
-
 
 class _FloatChainPolicy(_WindowPolicy):
     """A slot end, the window floating in the middle, and the owner end:
@@ -855,7 +854,7 @@ class _FloatChainPolicy(_WindowPolicy):
                 },
             )
             return c.can_reserve(full_tokens, swa_tokens)
-        need_tokens = -(-int(full_tokens) // c.page_size) * c.page_size
+        need_tokens = int(-(-full_tokens // c.page_size)) * c.page_size
         chain = self._chain(c)
         if not float_token_id_capacity(_snapshot(c), chain, need_tokens):
             return False
@@ -991,6 +990,8 @@ class _FloatChainPolicy(_WindowPolicy):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
         full_reclaim = tree_cache.full_evictable_size()
+        if c._full_cap_reclaim(num_tokens) > full_reclaim:
+            return False
         swa_reclaim = tree_cache.swa_evictable_size()
         state_reclaim = tree_cache.mamba_evictable_size()
         fa, sa, ma = (
@@ -1026,8 +1027,9 @@ class _FloatChainPolicy(_WindowPolicy):
         if full_reclaim or swa_reclaim:
             result = tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=num_tokens, swa_num_tokens=num_tokens),
-                allocation_reclaim_satisfied=lambda: float_reclaim_satisfied(
-                    _snapshot(c), chain, num_tokens
+                allocation_reclaim_satisfied=lambda: (
+                    not c._full_cap_reclaim(num_tokens)
+                    and float_reclaim_satisfied(_snapshot(c), chain, num_tokens)
                 ),
             )
             state_freed = result.mamba_num_evicted
@@ -1047,8 +1049,9 @@ class _FloatChainPolicy(_WindowPolicy):
         if state_quota and tree_cache.mamba_evictable_size():
             result = tree_cache.evict_for_alloc(
                 EvictParams(mamba_num=state_quota),
-                allocation_reclaim_satisfied=lambda: float_reclaim_satisfied(
-                    _snapshot(c), chain, num_tokens
+                allocation_reclaim_satisfied=lambda: (
+                    not c._full_cap_reclaim(num_tokens)
+                    and float_reclaim_satisfied(_snapshot(c), chain, num_tokens)
                 ),
             )
             if (

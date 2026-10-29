@@ -1843,6 +1843,12 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+
+    @property
+    def backing_owner(self):
+        """Identity of the allocation whose post-capture bytes this pool reports."""
+        return self
+
     # Prepared before final KV sizing; reused by the host pool after resizing.
     # page_first MHA uses separate K/V buffers; page_unified uses one page buffer.
     hicache_write_back_staging: (
@@ -4233,6 +4239,10 @@ class HybridLinearKVPool(KVCache):
         else:
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
+
+    @property
+    def backing_owner(self):
+        return self.full_kv_pool.backing_owner
 
     @property
     def post_capture_active(self) -> bool:

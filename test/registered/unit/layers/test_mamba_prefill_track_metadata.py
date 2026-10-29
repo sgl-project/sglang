@@ -109,6 +109,47 @@ def make_relabeled_decode_batch(seq_lens, num_tokens, track_mask=None):
 
 
 class TestMambaPrefillTrackMetadata(unittest.TestCase):
+    def test_short_conv_cpu_capture_without_cuda_tracking_buffer(self):
+        """CPU capture must initialize conv metadata without CUDA-only tracking."""
+        from sglang.srt.layers.attention.linear.short_conv_backend import (
+            ShortConvAttnBackend,
+        )
+
+        backend = object.__new__(ShortConvAttnBackend)
+        backend.device = "cpu"
+        backend.pad_slot_id = -1
+        backend.topk = 1
+        backend.state_indices_list = []
+        backend.query_start_loc_list = []
+        backend.mamba_track_indices_buf = None
+        backend.replayssm_write_pos_list = None
+        backend.replayssm_force_flush_list = None
+        backend._cache_indices_buf = None
+        backend._state_ids = SimpleNamespace(ids=lambda ids: ids)
+        mapping = torch.tensor([0, 7, 3], dtype=torch.int32)
+        backend.req_to_token_pool = SimpleNamespace(
+            get_mamba_indices=lambda rows: mapping[rows]
+        )
+        backend.init_cpu_graph_state(2, 2)
+        backend.init_forward_metadata_capture_cpu_graph(
+            bs=2,
+            num_tokens=2,
+            req_pool_indices=torch.tensor([1, 2]),
+            seq_lens=torch.tensor([8, 9]),
+            out_cache_loc=torch.tensor([4, 5]),
+            encoder_lens=None,
+            forward_mode=ForwardMode.DECODE,
+            spec_info=None,
+        )
+        torch.testing.assert_close(
+            backend._cache_indices, torch.tensor([7, 3], dtype=torch.int64)
+        )
+        torch.testing.assert_close(
+            backend.forward_metadata.query_start_loc,
+            torch.tensor([0, 1, 2], dtype=torch.int32),
+        )
+        self.assertIsNone(backend.state_tracking_indices)
+
     def test_cpu_plan_matches_existing_tensor_planner(self):
         rng = random.Random(2026)
         for backend_type in (MambaAttnBackendBase, Mamba2AttnBackend):
