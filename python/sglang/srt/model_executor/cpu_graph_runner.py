@@ -479,9 +479,11 @@ def patch_model(
 
 
 def _get_mamba_pool(model_runner: ModelRunner):
-    if model_runner is None or model_runner.token_to_kv_pool is None:
+    token_to_kv_pool = getattr(model_runner, "token_to_kv_pool", None)
+    layer_router = getattr(token_to_kv_pool, "layer_router", None)
+    if layer_router is None:
         return None
-    return model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
+    return layer_router.part_view(STATE_PART)
 
 
 def _install_cpu_compile_layer_caches(model_runner: ModelRunner):
@@ -2034,7 +2036,7 @@ class CPUGraphRunner:
         ):
             try:
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-                if self.enable_torch_compile:
+                if self.enable_torch_compile and forward_batch.batch_size >= 2:
                     self._mark_dynamic_prefill_metadata()
                 with _disable_cpu_graph_custom_op_aliasing_check(), torch.no_grad():
                     get_parallel().tp_group.barrier()
