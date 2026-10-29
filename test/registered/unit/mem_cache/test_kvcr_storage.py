@@ -330,6 +330,7 @@ class TestKVCRStorage(CustomTestCase):
         controller.mem_pool_host = self.pool
         controller.storage_host_pool = self.pool
         controller.mem_pool_host.storage_format_tag = None
+        controller.storage_backend_type = "kvcr"
         controller.attn_cp_group = None
         controller.enable_storage_metrics = False
         sources = []
@@ -347,6 +348,46 @@ class TestKVCRStorage(CustomTestCase):
             [source["source_control_endpoint"] for source in sources],
             ["tcp://source.example:32100", "tcp://source.example:32102"],
         )
+
+    def test_cp_shards_without_attention_dp_use_dense_offsets(self):
+        """TP4/CP2 inventory and source endpoints must cover exactly four shards."""
+        from sglang.srt.mem_cache.storage_events import StorageEventReducer
+
+        controller = object.__new__(HiCacheController)
+        controller.mem_pool_device = object()
+        controller.mem_pool_host = self.pool
+        controller.storage_host_pool = self.pool
+        controller.mem_pool_host.storage_format_tag = None
+        controller.storage_backend_type = "kvcr"
+        controller.enable_storage_metrics = False
+        backends = []
+        with get_context().override_server_args(tp_size=4, attn_cp_size=2):
+            for rank in range(4):
+                cp_rank, attn_tp_rank = divmod(rank, 2)
+                controller.get_attn_cp_rank_and_size = lambda: (cp_rank, 2)
+                with get_parallel().override(
+                    tp_rank=rank,
+                    pp_rank=0,
+                    dp_rank=0,
+                    attn_tp_rank=attn_tp_rank,
+                    attn_cp_rank=cp_rank,
+                ):
+                    config = controller._generate_storage_config(
+                        "glm-test", {"control_advertise_host": "source.example"}
+                    )
+                    backend = KVCRStore(config, self.pool)
+                    self.addCleanup(backend.close)
+                    backends.append(backend)
+
+        self.assertEqual([b.kv_event_shard for b in backends], [0, 1, 2, 3])
+        self.assertEqual([b.kv_event_shard_count for b in backends], [4] * 4)
+        self.assertEqual([b._source_offset for b in backends], [0, 1, 2, 3])
+        self.assertEqual(
+            [control_address(b.config, b._extra)[1] for b in backends],
+            [32100, 32101, 32102, 32103],
+        )
+        batches = {backend.kv_event_shard: [] for backend in backends}
+        self.assertEqual(StorageEventReducer(4).update(batches), [])
 
     def test_hint_source_uses_backend_resolved_address_without_starting_io(self):
         config = copy.copy(self.config)
