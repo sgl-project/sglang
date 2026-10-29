@@ -168,6 +168,34 @@ def _multi_window_state_allocator(
 
 
 class TestJointStatePrefillMemoryBudget(unittest.TestCase):
+    def test_fractional_decode_reservation_rounds_after_summing(self):
+        storage = _multi_window_state_allocator()
+        allocator = storage.allocator
+        cache = _cache()
+        cache.supports_mamba = lambda: True
+        cache.mamba_evictable_size = lambda: 0
+        budget = allocator.create_prefill_budget(cache)
+        # Running decode estimates can be fractional under new_token_ratio.
+        budget.total_offset = 0.5
+        budget.swa_offset = 0.5
+        budget.auxiliary_swa_offset = 0.5
+        with unittest.mock.patch.object(
+            allocator._policy, "_demands", wraps=allocator._policy._demands
+        ) as demands:
+            self.assertTrue(budget._fits(4, 4, auxiliary_swa_tokens=4, state_slots=1))
+        pages = dict(
+            allocator._policy._demands(
+                *demands.call_args.args, **demands.call_args.kwargs
+            )
+        )
+        self.assertEqual(pages[allocator.roles.state], 1)
+        self.assertEqual(pages[allocator.roles.owner], 2)
+        for band in allocator._windows:
+            self.assertEqual(pages[band.sub_pool_name], 2)
+        self.assertIsNotNone(allocator.alloc_state_slots(1))
+        self.assertIsNotNone(allocator.alloc(8))
+        self.assertEqual(storage.accounting_violations(), [])
+
     def test_pending_state_slots_share_the_actual_token_envelope(self):
         for lazy, tracking in (
             (False, False),
@@ -307,34 +335,6 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                 )
             )
             self.assertEqual(reclaim.call_args.kwargs["state_slots"], 3)
-
-    def test_fractional_decode_reservation_rounds_after_summing(self):
-        storage = _multi_window_state_allocator()
-        allocator = storage.allocator
-        cache = _cache()
-        cache.supports_mamba = lambda: True
-        cache.mamba_evictable_size = lambda: 0
-        budget = allocator.create_prefill_budget(cache)
-        # Running decode estimates can be fractional under new_token_ratio.
-        budget.total_offset = 0.5
-        budget.swa_offset = 0.5
-        budget.auxiliary_swa_offset = 0.5
-        with unittest.mock.patch.object(
-            allocator._policy, "_demands", wraps=allocator._policy._demands
-        ) as demands:
-            self.assertTrue(budget._fits(4, 4, auxiliary_swa_tokens=4, state_slots=1))
-        pages = dict(
-            allocator._policy._demands(
-                *demands.call_args.args, **demands.call_args.kwargs
-            )
-        )
-        self.assertEqual(pages[allocator.roles.state], 1)
-        self.assertEqual(pages[allocator.roles.owner], 2)
-        for band in allocator._windows:
-            self.assertEqual(pages[band.sub_pool_name], 2)
-        self.assertIsNotNone(allocator.alloc_state_slots(1))
-        self.assertIsNotNone(allocator.alloc(8))
-        self.assertEqual(storage.accounting_violations(), [])
 
 
 class TestSharedPrefillMemoryBudget(unittest.TestCase):

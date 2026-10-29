@@ -34,7 +34,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip, is_npu, retry
 from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
@@ -219,6 +219,23 @@ def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     with dcp_size 1.
     """
     return dcp_size > 1 and is_hip() and is_deepseek_dsa(config)
+
+
+def mla_attention_dcp_size(config, *, dcp_size: int, is_nextn: bool) -> int:
+    """The DCP width used by MLA execution, including platform draft policies.
+
+    KV planning must use this same width before the attention module is built.
+    """
+    # Ascend draft backends use allocator-global slots and non-DCP attention.
+    if is_nextn and is_npu():
+        return 1
+    if (
+        is_nextn
+        and is_deepseek_dsa(config)
+        and not dsa_draft_shards_under_dcp(config, dcp_size)
+    ):
+        return 1
+    return dcp_size
 
 
 def is_glm_moe_dsa(config) -> bool:

@@ -363,7 +363,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
         forward_mode = forward_batch.forward_mode
-        spec_info = forward_batch.spec_info
+        # Idle ranks participate in collectives without prepared speculative CSR.
+        spec_info = None if forward_mode.is_idle() else forward_batch.spec_info
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
@@ -447,6 +448,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_sum,
                 decode_wrapper=self.decode_wrapper,
                 init_metadata_replay=False,
+                spec_info=(
+                    None
+                    if forward_batch.forward_mode.is_idle()
+                    else forward_batch.spec_info
+                ),
                 req_pool_indices=forward_batch.req_pool_indices,
                 plan=forward_batch.iteration_ids,
             )
@@ -924,7 +930,8 @@ class FlashInferMLAIndicesUpdaterDecode:
         q_indptr = q_indptr[: bs + 1]
         kv_lens = paged_kernel_lens.to(torch.int32)
         sm_scale = self.scaling
-        if spec_info is None:
+        # Only active draft inputs supply prepared CSR.
+        if spec_info is None or not spec_info.is_draft_input():
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             # On replay `kv_indices` IS the capture-stable buffer the captured
@@ -1263,6 +1270,8 @@ class FlashInferMLAMultiStepDraftBackend:
         forward_batch: ForwardBatch,
         kv_indices_buffer: torch.Tensor,
         call_fn: Callable,
+        *,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
@@ -1309,10 +1318,36 @@ class FlashInferMLAMultiStepDraftBackend:
         assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
-            forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
-            forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
+            indptr = self.kv_indptr[i, : bs + 1]
+            indices = kv_indices_buffer[i][
                 : draft_kv_indices_used_len(seq_lens_sum, self.topk, bs, i + 1)
             ]
+            if get_parallel().dcp_enabled and not src.is_translated:
+                # The speculative consumer expects kernel-ready CSR metadata,
+                # just like ordinary decode after selecting this rank's tokens.
+                lengths = (indptr[1:] - indptr[:-1]).to(torch.int32)
+                fast_decode_kwargs = {}
+                if seq_lens_cpu is not None:
+                    # The index generator adds i + 1 tokens to each branch.
+                    # Replay must size this rank's shard without device scalars.
+                    local_lens_cpu = (
+                        seq_lens_cpu[:num_seqs] + i + 1
+                    ).repeat_interleave(self.topk)
+                    update_local_kv_lens_for_dcp(local_lens_cpu)
+                    local_lens_cpu.clamp_(min=0)
+                    fast_decode_kwargs["kv_len_arr_cpu"] = local_lens_cpu
+                local_count = plan_dcp_decode_metadata(
+                    lengths,
+                    indptr,
+                    indices,
+                    seq_lens_cpu is not None,
+                    fast_decode_kwargs,
+                    bs,
+                )
+                indices = indices[:local_count]
+                indices.copy_(self.runner_ids.translate_dcp_read_ids(indices))
+            forward_batch.spec_info.kv_indptr = indptr
+            forward_batch.spec_info.kv_indices = indices
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -1367,11 +1402,23 @@ class FlashInferMLAMultiStepDraftBackend:
         )
 
         def call_fn(i, _forward_batch):
+            # Each draft step reads the prefix plus its own proposed tokens.
+            # Keep the replay planner's host lengths in the same token domain.
+            inner_fb.seq_lens = forward_batch.seq_lens + i + 1
+            inner_fb.seq_lens_sum = (
+                forward_batch.seq_lens_sum + forward_batch.batch_size * (i + 1)
+            )
+            inner_fb.seq_lens_cpu = forward_batch.seq_lens_cpu + i + 1
             self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture
             )
 
-        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+        self.common_template(
+            forward_batch,
+            self.cuda_graph_kv_indices,
+            call_fn,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for attn_backend in self.attn_backends:

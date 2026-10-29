@@ -1,5 +1,5 @@
 {
- "source": "test/manual/mem_cache/gen_unified_layout_golden.py with joint initial request and scratch sizing and per-side borrowing capacities",
+ "source": "test/manual/mem_cache/gen_unified_layout_golden.py with aligned temporal-state rows and entry pitches",
  "layouts": {
   "swa_p1": {
    "chain": [["swa", "up"], ["full", "down"]],

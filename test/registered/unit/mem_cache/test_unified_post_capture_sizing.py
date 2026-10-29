@@ -26,6 +26,7 @@ that size, without moving the tensor the graphs captured.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -149,7 +150,13 @@ def _capacities(bundle) -> dict:
 
 
 def _mla_draft_bundle(
-    dcp_size, *, latent_dim=8, rope_dim=8, total_bytes=1 << 20, draft_layers=1
+    dcp_size,
+    *,
+    latent_dim=8,
+    rope_dim=8,
+    total_bytes=1 << 20,
+    draft_layers=1,
+    post_capture_active=False,
 ):
     from transformers import PretrainedConfig
 
@@ -171,7 +178,7 @@ def _mla_draft_bundle(
     )
     placement = place_fused_draft(
         profile=draft_kv_profile(
-            mc, num_layers=draft_layers, attn_tp_size=1
+            mc, num_layers=draft_layers, attn_tp_size=1, dcp_size=dcp_size
         ),
         num_runners=1,
         ctx=PlacementContext(host_names=("full", "mamba"), dcp_size=dcp_size),
@@ -201,7 +208,89 @@ def _mla_draft_bundle(
         model_context_len=512,
         fused_draft=placement,
         lazy_compaction=False,
+        post_capture_active=post_capture_active,
     )
+
+
+def _flashinfer_draft_backend(reader, max_context_len, steps=3):
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
+
+    from sglang.kernels.ops.speculative.cache_locs import (
+        generate_draft_decode_kv_indices,
+    )
+    from sglang.srt.layers.attention.flashinfer_mla_backend import (
+        FlashInferMLAAttnBackend,
+        FlashInferMLAIndicesUpdaterDecode,
+        FlashInferMLAMultiStepDraftBackend,
+    )
+
+    multi = object.__new__(FlashInferMLAMultiStepDraftBackend)
+    multi.topk = 1
+    multi.speculative_num_steps = steps
+    multi.runner_ids = reader
+    multi.page_size = 64
+    multi.max_context_len = max_context_len
+    multi.kv_indptr = torch.zeros((steps, 3), dtype=torch.int32, device="cuda")
+    multi.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
+    multi.attn_backends = []
+    for _ in range(steps - 1):
+        backend = object.__new__(FlashInferMLAAttnBackend)
+        updater = object.__new__(FlashInferMLAIndicesUpdaterDecode)
+        updater.scaling = 576**-0.5
+        updater.num_local_heads = 16
+        updater.kv_lora_rank = 512
+        updater.qk_rope_head_dim = 64
+        updater.data_type = torch.float16
+        updater.attn_backend = backend
+        updater.q_indptr = torch.arange(3, device="cuda", dtype=torch.int32)
+        updater.kv_indptr = torch.zeros(3, device="cuda", dtype=torch.int32)
+        backend.runner_ids = reader
+        backend.indices_updater_decode = updater
+        backend.device = "cuda"
+        backend.q_indptr_decode = updater.q_indptr
+        backend.kv_indptr = updater.kv_indptr
+        backend.decode_cuda_graph_metadata = {}
+        backend.workspace_buffer = torch.empty(
+            128 << 20, dtype=torch.uint8, device="cuda"
+        )
+        backend.decode_wrapper = BatchMLAPagedAttentionWrapper(
+            backend.workspace_buffer, backend="auto"
+        )
+        multi.attn_backends.append(backend)
+    return multi
+
+
+def _assert_host_scalar(tensor, *args, **kwargs):
+    if tensor.is_cuda:
+        raise AssertionError("draft replay metadata must not read GPU scalars")
+    return _tensor_item(tensor, *args, **kwargs)
+
+
+_tensor_item = torch.Tensor.item
+
+
+def _run_draft_mla(multi, query, cache):
+    return [
+        backend.forward_metadata.decode_wrapper.run(
+            query[..., :512], query[..., 512:], cache[..., :512], cache[..., 512:]
+        )
+        for backend in multi.attn_backends
+    ]
+
+
+def _draft_mla_reference(reader, table, query, cache, factor, rank):
+    outputs = []
+    for step in range(2):
+        rows = []
+        for row, length in enumerate((8, 11), start=1):
+            ids = table[row, : length + step + 1]
+            ids = ids[ids % factor == rank]
+            physical = reader.translate_dcp_read_ids(ids).long()
+            kv = cache[physical, 0].float()
+            scores = query[row - 1].float() @ kv.T * (576**-0.5)
+            rows.append((scores.softmax(-1) @ kv[:, :512]).half())
+        outputs.append(torch.stack(rows))
+    return outputs
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -294,6 +383,24 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
         a.free(virtual)
         self.assertEqual(a.verify_byte_accounting(), [])
 
+    def test_mla_state_registration_after_backing_shrink(self):
+        """Shared MLA and state registrations end at the backed prefix."""
+        bundle = _mla_draft_bundle(
+            1, total_bytes=_RESERVED_BYTES, post_capture_active=True
+        )
+        config = _final_config(bundle)
+        bundle.token_to_kv_pool.finalize_backing(config)
+        bundle.token_to_kv_pool_allocator.resize(config)
+        self.assertLess(bundle.arena.accessible_bytes, bundle.arena.raw.numel())
+        regions = set()
+        for view in bundle.token_to_kv_pool_allocator.views.values():
+            pointers, lengths, _ = view.get_contiguous_buf_infos()
+            regions.update(zip(pointers, lengths))
+        self.assertEqual(
+            regions,
+            {(bundle.arena.raw.data_ptr(), bundle.arena.accessible_bytes)},
+        )
+
     def test_dflash_mla_prefix_store_preserves_masked_rows_on_graph_replay(self):
         """Accepted prefixes reach their draft lane without touching rejected rows."""
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
@@ -367,6 +474,104 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                     torch.testing.assert_close(buffers[1], expected)
                     self.assertTrue(torch.all(buffers[0] == -7))
                     self.assertTrue(torch.all(target == 23))
+
+    def test_mla_draft_dcp_reader_matches_writes_after_relocation(self):
+        """DCP readers and graph writes must agree on a draft's moved KV pages."""
+        from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
+        from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+        from sglang.srt.mem_cache.kv.layout.mla import DraftMLAView
+
+        for factor in (1, 2, 4):
+            for rank in range(factor):
+                with (
+                    self.subTest(dcp=factor, rank=rank),
+                    get_parallel().override(
+                        attn_dcp_size=factor,
+                        attn_dcp_rank=rank,
+                        dcp_size=factor,
+                        dcp_rank=rank,
+                        dcp_enabled=factor > 1,
+                    ),
+                ):
+                    bundle = _mla_draft_bundle(factor)
+                    alloc = bundle.token_to_kv_pool_allocator
+                    first = alloc.alloc(64 * factor)
+                    live = alloc.alloc(64 * factor)
+                    table = torch.zeros(
+                        (2, live.numel()), dtype=torch.int32, device="cuda"
+                    )
+                    table[1] = live.int()
+                    view = DraftMLAView(
+                        arena=bundle.arena,
+                        host_spec=bundle.storage.plan.owner().spec,
+                        layer_lanes={0: 0},
+                        page_size=64,
+                    )
+                    runner = RunnerIds(
+                        req_to_token=table,
+                        token_to_kv_pool_allocator=alloc,
+                        token_to_kv_pool=view,
+                        page_size=64,
+                        device="cuda",
+                        is_draft_worker=True,
+                    )
+                    k = torch.arange(live.numel(), device="cuda", dtype=torch.float32)
+                    k = (
+                        (k % 31)
+                        .to(torch.float16)[:, None, None]
+                        .expand(-1, 1, 16)
+                        .contiguous()
+                    )
+                    layer = SimpleNamespace(layer_id=0)
+                    req = torch.tensor([1], dtype=torch.int64, device="cuda")
+                    lens = torch.tensor([64], dtype=torch.int32, device="cuda")
+                    backends = [
+                        object.__new__(cls)
+                        for cls in (TRTLLMMLABackend, CuteDslMLABackend)
+                    ]
+                    outputs = [
+                        torch.zeros((1, 64), dtype=torch.int32, device="cuda")
+                        for _ in backends
+                    ]
+                    for backend in backends:
+                        backend.page_size, backend.req_to_token, backend.runner_ids = (
+                            64,
+                            table,
+                            runner,
+                        )
+
+                    def write_and_read():
+                        loc = runner.ids_in("full", live)
+                        view.set_mla_kv_buffer(
+                            layer,
+                            KVWriteLoc(loc, physical=True),
+                            k[..., :8],
+                            k[..., 8:],
+                        )
+                        for backend, output in zip(backends, outputs):
+                            backend._fill_dcp_block_kv_indices(output, req, lens)
+
+                    write_and_read()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        write_and_read()
+                    before = runner.ids_in("full", live)[rank].item()
+                    alloc.free(first)
+                    k.add_(7)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    after = runner.ids_in("full", live)[rank].item()
+                    self.assertNotEqual(before, after)
+                    for output in outputs:
+                        rows = output[0, 0].long() * 64 + torch.arange(
+                            64, device="cuda"
+                        )
+                        torch.testing.assert_close(
+                            view.kv_buffer[0][rows], k[rank::factor]
+                        )
+                    alloc.free(live)
+                    self.assertEqual(alloc.verify_byte_accounting(), [])
 
     def setUp(self):
         setup_allocator_context()
@@ -538,6 +743,271 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
         ids = pools[2].alloc(4)
         self.assertIsNotNone(ids)
         pools[2].free(ids)
+
+    def test_flashinfer_idle_spec_inputs_use_dummy_decode_metadata(self):
+        """Padded idle target and draft ranks must plan without prepared draft CSR."""
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+        from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+
+        inputs = (
+            EagleVerifyInput.create_idle_input(1, 3, 4, "cuda"),
+            EagleDraftInput.create_idle_input(
+                "cuda", 8, torch.float16, 1, CaptureHiddenMode.LAST
+            ),
+        )
+        for spec_info in inputs:
+            with self.subTest(input_type=type(spec_info).__name__):
+                pool = MLATokenToKVPool(
+                    size=256,
+                    page_size=64,
+                    dtype=torch.float16,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    layer_num=1,
+                    device="cuda",
+                    enable_memory_saver=False,
+                )
+                reader = RunnerIds(
+                    req_to_token=torch.zeros(
+                        (2, 128), dtype=torch.int32, device="cuda"
+                    ),
+                    token_to_kv_pool_allocator=None,
+                    token_to_kv_pool=pool,
+                    page_size=64,
+                    device="cuda",
+                )
+                multi = _flashinfer_draft_backend(reader, 128)
+                backend = multi.attn_backends[0]
+                batch = SimpleNamespace(
+                    batch_size=1,
+                    forward_mode=ForwardMode.IDLE,
+                    spec_info=spec_info,
+                    seq_lens=torch.ones(1, dtype=torch.int32, device="cuda"),
+                    seq_lens_cpu=torch.ones(1, dtype=torch.int32),
+                    seq_lens_sum=1,
+                    req_pool_indices=torch.zeros(1, dtype=torch.int32, device="cuda"),
+                    positions=torch.zeros(1, dtype=torch.int64, device="cuda"),
+                    iteration_ids=None,
+                )
+                cache = pool.kv_buffer[0].view(-1, 1, 576)
+                cache.zero_()
+                query = torch.zeros((1, 16, 576), device="cuda", dtype=torch.float16)
+                backend.init_forward_metadata(batch)
+                output = backend.forward_metadata.decode_wrapper.run(
+                    query[..., :512],
+                    query[..., 512:],
+                    cache[..., :512],
+                    cache[..., 512:],
+                )
+                torch.testing.assert_close(output, torch.zeros_like(output))
+                multi.init_cuda_graph_state(2, 2)
+                backend.init_forward_metadata_out_graph(batch, in_capture=True)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = backend.forward_metadata.decode_wrapper.run(
+                        query[..., :512],
+                        query[..., 512:],
+                        cache[..., :512],
+                        cache[..., 512:],
+                    )
+                backend.init_forward_metadata_out_graph(batch)
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(output, torch.zeros_like(output))
+
+    def test_flashinfer_draft_reads_moved_kv_in_eager_and_graph(self):
+        """Real MLA planning and kernels must retain each draft step after relocation."""
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+        from sglang.srt.mem_cache.kv.layout.mla import DraftMLAView
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch,
+            ForwardMode,
+        )
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        for factor in (1, 2, 4):
+            for rank in range(factor):
+                with (
+                    self.subTest(dcp=factor, rank=rank),
+                    get_parallel().override(
+                        attn_dcp_size=factor,
+                        attn_dcp_rank=rank,
+                        dcp_size=factor,
+                        dcp_rank=rank,
+                        dcp_enabled=factor > 1,
+                    ),
+                ):
+                    bundle = _mla_draft_bundle(
+                        factor, latent_dim=512, rope_dim=64, total_bytes=32 << 20
+                    )
+                    alloc = bundle.token_to_kv_pool_allocator
+                    gap = alloc.alloc(64 * factor)
+                    live = alloc.alloc(128 * factor)
+                    table = torch.zeros(
+                        (3, 64 * factor), dtype=torch.int32, device="cuda"
+                    )
+                    table[1:] = live.reshape(2, -1).int()
+                    view = DraftMLAView(
+                        arena=bundle.arena,
+                        host_spec=bundle.storage.plan.owner().spec,
+                        layer_lanes={0: 0},
+                        page_size=64,
+                    )
+                    reader = RunnerIds(
+                        req_to_token=table,
+                        token_to_kv_pool_allocator=alloc,
+                        token_to_kv_pool=view,
+                        page_size=64,
+                        device="cuda",
+                        is_draft_worker=True,
+                    )
+                    req = torch.tensor([1, 2], device="cuda")
+                    lens = torch.tensor([8, 11], device="cuda", dtype=torch.int32)
+                    fb = ForwardBatch(
+                        forward_mode=ForwardMode.DECODE,
+                        batch_size=2,
+                        input_ids=req,
+                        req_pool_indices=req,
+                        seq_lens=lens,
+                        out_cache_loc=live[:2],
+                        seq_lens_sum=19,
+                        seq_lens_cpu=lens.cpu(),
+                        positions=lens,
+                        spec_info=EagleDraftInput(),
+                        iteration_ids=reader.plan(
+                            req_pool_indices=req,
+                            seq_lens=lens,
+                            seq_lens_cpu=lens.cpu(),
+                            write_virtual=None,
+                            read_extent=3,
+                        ),
+                    )
+                    multi = _flashinfer_draft_backend(reader, 64 * factor)
+                    cache = view.kv_buffer[0].view(-1, 1, 576)
+                    cache.normal_(std=0.2)
+                    query = torch.randn(
+                        (2, 16, 576), device="cuda", dtype=torch.float16
+                    )
+                    multi.init_forward_metadata(fb)
+                    eager = _run_draft_mla(multi, query, cache)
+                    expected = _draft_mla_reference(
+                        reader, table, query, cache, factor, rank
+                    )
+                    for actual, reference in zip(eager, expected):
+                        torch.testing.assert_close(
+                            actual, reference, atol=2e-3, rtol=2e-3
+                        )
+                    multi.init_cuda_graph_state(2, 2)
+                    multi.init_forward_metadata_out_graph(fb, in_capture=True)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        captured = _run_draft_mla(multi, query, cache)
+                    graph.replay()
+                    for actual, reference in zip(captured, expected):
+                        torch.testing.assert_close(
+                            actual, reference, atol=2e-3, rtol=2e-3
+                        )
+                    before = reader.translate_dcp_read_ids(table[1, :1]).clone()
+                    alloc.free(gap)
+                    self.assertFalse(
+                        torch.equal(before, reader.translate_dcp_read_ids(table[1, :1]))
+                    )
+                    with patch.object(torch.Tensor, "item", _assert_host_scalar):
+                        multi.init_forward_metadata_out_graph(fb)
+                    graph.replay()
+                    for actual, reference in zip(captured, expected):
+                        torch.testing.assert_close(
+                            actual, reference, atol=2e-3, rtol=2e-3
+                        )
+                    torch.testing.assert_close(fb.seq_lens, lens)
+                    self.assertEqual(fb.seq_lens_cpu.tolist(), [8, 11])
+                    alloc.free(live)
+                    self.assertEqual(alloc.verify_byte_accounting(), [])
+
+    def test_static_flashinfer_draft_replay_uses_host_lengths(self):
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch,
+            ForwardMode,
+        )
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        setup_allocator_context()
+        for factor in (2, 4):
+            for rank in range(factor):
+                with (
+                    self.subTest(dcp=factor, rank=rank),
+                    get_parallel().override(
+                        attn_dcp_size=factor,
+                        attn_dcp_rank=rank,
+                        dcp_size=factor,
+                        dcp_rank=rank,
+                        dcp_enabled=True,
+                    ),
+                ):
+                    pool = MLATokenToKVPool(
+                        size=256,
+                        page_size=64,
+                        dtype=torch.float16,
+                        kv_lora_rank=512,
+                        qk_rope_head_dim=64,
+                        layer_num=1,
+                        device="cuda",
+                        enable_memory_saver=False,
+                    )
+                    table = torch.zeros((3, 64), dtype=torch.int32, device="cuda")
+                    table[1:] = torch.arange(
+                        64 * factor, 64 * factor + 128, device="cuda"
+                    ).reshape(2, 64)
+                    reader = RunnerIds(
+                        req_to_token=table,
+                        token_to_kv_pool_allocator=None,
+                        token_to_kv_pool=pool,
+                        page_size=64,
+                        device="cuda",
+                        is_draft_worker=True,
+                    )
+                    req = torch.tensor([1, 2], device="cuda")
+                    multi = _flashinfer_draft_backend(reader, 64, steps=4)
+                    multi.init_cuda_graph_state(2, 2)
+                    for replay, lengths in enumerate(([8, 11], [9, 12], [10, 13])):
+                        lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+                        fb = ForwardBatch(
+                            forward_mode=ForwardMode.DECODE,
+                            batch_size=2,
+                            input_ids=req,
+                            req_pool_indices=req,
+                            seq_lens=lens,
+                            seq_lens_sum=sum(lengths),
+                            seq_lens_cpu=torch.tensor(lengths),
+                            out_cache_loc=table[1, :2],
+                            positions=lens,
+                            spec_info=EagleDraftInput(),
+                        )
+                        if replay == 0:
+                            multi.init_forward_metadata_out_graph(fb, in_capture=True)
+                        with patch.object(torch.Tensor, "item", _assert_host_scalar):
+                            multi.init_forward_metadata_out_graph(fb)
+                        for step in range(3):
+                            rows = []
+                            for row, length in enumerate(lengths, start=1):
+                                ids = table[row, : length + step + 1]
+                                rows.append(ids[ids % factor == rank] // factor)
+                            expected = torch.cat(rows).int()
+                            torch.testing.assert_close(
+                                multi.cuda_graph_kv_indices[step, : len(expected)],
+                                expected,
+                            )
+                            self.assertEqual(
+                                multi.kv_indptr[step].tolist(),
+                                [0, len(rows[0]), len(expected)],
+                            )
 
     def _post_capture_bundle(self, total_bytes=_RESERVED_BYTES):
         return _bundle(total_bytes=total_bytes, post_capture_active=True)
@@ -726,6 +1196,9 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 with (
                     self.subTest(dcp=dcp, rank=rank),
                     get_parallel().override(attn_dcp_size=dcp, attn_dcp_rank=rank),
+                    patch(
+                        "sglang.srt.mem_cache.kv.memory.snapshot._COPY_CHUNK_BYTES", 256
+                    ),
                 ):
                     bundle = _bundle(
                         total_bytes=_FINAL_BYTES,
@@ -764,6 +1237,10 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
             ("tri", 1),
             ("state", 2),
             ("state", 4),
+            ("swa", 2),
+            ("swa", 4),
+            ("tri", 2),
+            ("tri", 4),
         ):
             with (
                 self.subTest(chain=chain, dcp=dcp),
@@ -788,6 +1265,34 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 config = _final_config(bundle)
                 bundle.token_to_kv_pool.finalize_backing(config)
                 allocator.resize(config)
+                if allocator.has_window_pool:
+                    full_rows = config.full_max_total_num_tokens
+                    window_rows = config.swa_max_total_num_tokens
+                    if chain == "swa":
+                        full_rows = (
+                            allocator.full_attn_allocator.available_size() // dcp
+                        )
+                        window_rows = (
+                            allocator.swa_attn_allocator.available_size() // dcp
+                        )
+                        self.assertGreater(full_rows, config.full_max_total_num_tokens)
+                    self.assertEqual(allocator.size_full, full_rows * dcp)
+                    self.assertEqual(allocator.size_swa, window_rows * dcp)
+                    for band, rows in (
+                        (
+                            allocator.full_attn_allocator,
+                            full_rows,
+                        ),
+                        *((b, window_rows) for b in allocator._windows),
+                    ):
+                        view = allocator.views[band.sub_pool_name]
+                        self.assertEqual(view.host_capacity_tokens, rows)
+                        self.assertEqual(
+                            view.host_capacity_bytes, rows * band.entry_bytes
+                        )
+                        self.assertEqual(
+                            storage.host_layout(band.sub_pool_name).capacity, rows * dcp
+                        )
                 graph.replay()
                 torch.cuda.synchronize()
                 self.assertEqual(bundle.arena.raw[0].item(), 9)
@@ -816,7 +1321,6 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                         state.host_capacity_bytes,
                         state.size * allocator.mamba_allocator.entry_bytes,
                     )
-
 
     def test_short_draft_rows_store_and_replay_without_touching_host(self):
         for dtype in (torch.float16, torch.bfloat16, torch.float32):

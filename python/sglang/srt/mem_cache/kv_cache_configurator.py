@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.arg_groups.kv_cache_hook import draft_rows_refusal
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.configs.attention_execution import attention_dcp_size
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
@@ -19,7 +20,6 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import (
     ModelConfig,
-    dsa_draft_shards_under_dcp,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    mla_attention_dcp_size,
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
@@ -546,15 +547,21 @@ class KVCacheConfigurator:
     # Note(kpham-sgl):
     # 1. A replicated draft indexes the allocator's virtual locs raw, so its pools
     #    span and page that space; the sharded target translates and stays per-rank.
-    #    A ROCm DSA draft runs under DCP itself and shards like the target.
+    #    A draft that executes DCP shards like the target.
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
         dcp_size = get_parallel().attn_dcp_size
-        replicated_draft = self.is_draft_worker and not dsa_draft_shards_under_dcp(
-            self.model_config.hf_config, dcp_size
+        if not self.is_draft_worker:
+            return 1
+        execution_width = (
+            mla_attention_dcp_size(
+                self.model_config.hf_config, dcp_size=dcp_size, is_nextn=True
+            )
+            if self.use_mla_backend
+            else 1
         )
-        return dcp_size if (replicated_draft and dcp_size > 1) else 1
+        return dcp_size // execution_width
 
     @property
     def pool_page_size(self) -> int:
@@ -569,8 +576,8 @@ class KVCacheConfigurator:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
-        # Draft pools are replicated, not DCP-sharded, yet consume the shared
-        # allocator's virtual locs in [0, max_total * dcp_size) untranslated.
+        # Only drafts that execute without DCP need the full logical token
+        # domain; DCP drafts retain the target's per-rank capacity.
         loc_scale = self.loc_space_scale
         max_total_num_tokens *= loc_scale
         if full_max_total_num_tokens is not None:
@@ -1179,10 +1186,38 @@ class KVCacheConfigurator:
             draft_backend = resolve_draft_worker_attention_backend()
         else:
             draft_backend = get_spec().speculative_draft_attention_backend
+        draft_backends = (
+            (draft_backend,) if draft_backend is not None else attention_backends()
+        )
+        execution_by_backend = {
+            backend: attention_dcp_size(
+                backend=backend,
+                model_config=aux.draft_model_config,
+                dcp_size=get_parallel().attn_dcp_size,
+                is_draft_worker=True,
+                is_dspark=self.spec_algorithm.is_dspark(),
+                is_hip=_is_hip,
+            )
+            for backend in draft_backends
+        }
+        if execution_by_backend.get("triton", 1) > 1:
+            return FusedDraftDecision(
+                declined=(
+                    "Triton draft attention with DCP does not translate unified KV "
+                    "read indices and write locations. Select a draft backend with "
+                    "replicated execution or disable unified memory."
+                )
+            )
+        execution_widths = set(execution_by_backend.values())
+        if len(execution_widths) != 1:
+            return FusedDraftDecision(
+                declined="draft prefill and decode backends use different DCP widths"
+            )
         profile = draft_kv_profile(
             aux.draft_model_config,
             num_layers=int(aux.draft_kv_num_layers),
             attn_tp_size=self.draft_attn_tp_size,
+            dcp_size=execution_widths.pop(),
             # A DFLASH-family draft config inherits the target's NEXTN depth
             # count; its draft is one block, replicated per runner.
             num_depths=None if self.spec_algorithm.is_eagle() else 1,
