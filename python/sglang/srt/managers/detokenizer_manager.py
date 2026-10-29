@@ -386,11 +386,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         ipcs = [
             None if header is None else header.http_worker_ipc for header in headers
         ]
-        finished_ipcs = recv_obj.finished_http_worker_ipcs
-        if finished_ipcs is not None:
-            # A finished row's own route wins: the stored header may be missing
-            # (evicted) or another request's (one rid in flight on two workers).
-            for i, ipc in enumerate(finished_ipcs):
+        own_ipcs = recv_obj.http_worker_ipcs
+        if own_ipcs is not None:
+            # A row's own route wins: the stored header may be missing (evicted)
+            # or another request's (one rid in flight on two workers).
+            for i, ipc in enumerate(own_ipcs):
                 if ipc is not None:
                     ipcs[i] = ipc
         return ipcs

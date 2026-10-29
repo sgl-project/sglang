@@ -386,7 +386,7 @@ class _GenerationStreamAccumulator:
     current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
     output_reqs: list[Req] = field(default_factory=list)
-    # OutputSink.TOKENIZER only; see BatchTokenIDOutput.
+    # OutputSink.TOKENIZER only: every row's http_worker_ipc; see BatchTokenIDOutput.
     http_worker_ipcs: Optional[list] = None
     finished_reasons: list = field(default_factory=list)
     output_ids: list = field(default_factory=list)
@@ -394,7 +394,7 @@ class _GenerationStreamAccumulator:
     detokenize_headers: list = field(default_factory=list)
     has_detokenize_header: bool = False
     # OutputSink.DETOKENIZER only: by row index, a finished row's
-    # http_worker_ipc; see BatchTokenIDOutput.
+    # http_worker_ipc, sent as a sparse http_worker_ipcs; see BatchTokenIDOutput.
     finished_http_worker_ipcs: dict = field(default_factory=dict)
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
@@ -761,7 +761,11 @@ class _GenerationStreamAccumulator:
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(
             rids=self.rids,
-            http_worker_ipcs=self.http_worker_ipcs,
+            http_worker_ipcs=(
+                [self.finished_http_worker_ipcs.get(i) for i in range(len(self.rids))]
+                if self.finished_http_worker_ipcs
+                else self.http_worker_ipcs
+            ),
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
             spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
@@ -772,11 +776,6 @@ class _GenerationStreamAccumulator:
             output_ids=self.output_ids,
             detokenize_headers=(
                 self.detokenize_headers if self.has_detokenize_header else None
-            ),
-            finished_http_worker_ipcs=(
-                [self.finished_http_worker_ipcs.get(i) for i in range(len(self.rids))]
-                if self.finished_http_worker_ipcs
-                else None
             ),
             reasoning_tokens=self.reasoning_tokens,
             completion_tokens=self.completion_tokens,

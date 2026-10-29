@@ -350,16 +350,14 @@ class TestDetokenizeRoundTrip(CustomTestCase):
         }
         obj = BatchTokenIDOutput(**{**required, "rids": ["a", "b"]})
         obj.detokenize_headers = [header, None]
-        obj.finished_http_worker_ipcs = [None, "ipc:///tmp/tokenizer-1"]
+        obj.http_worker_ipcs = [None, "ipc:///tmp/tokenizer-1"]
 
         decoded = _double_hop(obj)
 
         self.assertEqual(decoded.detokenize_headers, [header, None])
         self.assertIsInstance(decoded.detokenize_headers[0], DetokenizeHeader)
         self.assertIsInstance(decoded.detokenize_headers[0].prompt_tail_ids, array)
-        self.assertEqual(
-            decoded.finished_http_worker_ipcs, [None, "ipc:///tmp/tokenizer-1"]
-        )
+        self.assertEqual(decoded.http_worker_ipcs, [None, "ipc:///tmp/tokenizer-1"])
         release = DetokenizeReleaseReq(rid="a")
         self.assertEqual(_double_hop(release), release)
 

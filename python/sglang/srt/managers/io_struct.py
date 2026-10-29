@@ -1645,9 +1645,11 @@ def build_flat_top_logprobs_arrays(
 
 
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
-    # http_worker_ipcs is set only with --skip-tokenizer-init, where no
-    # detokenizer keeps it; otherwise the DetokenizeHeader and
-    # finished_http_worker_ipcs carry it.
+    # http_worker_ipcs: by row, the route the row carries, else None to use its
+    # stored DetokenizeHeader's; None when no row carries one. Filled on every row
+    # under OutputSink.TOKENIZER (no detokenizer keeps a header), on finished rows
+    # under OutputSink.DETOKENIZER (they route even with no stored state), and
+    # never under OutputSink.RUST.
 
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
@@ -1656,9 +1658,6 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # By row, the request's DetokenizeHeader on its first output, else None;
     # the whole field is None when no row carries one.
     detokenize_headers: Optional[List[Optional[DetokenizeHeader]]] = None
-    # By row, a finished row's http_worker_ipc, else None; the whole field is None
-    # when no row finished. A finished row routes by it, even with no stored state.
-    finished_http_worker_ipcs: Optional[List[Optional[str]]] = None
 
     # Token counts
     reasoning_tokens: List[int]

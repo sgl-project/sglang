@@ -978,8 +978,8 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
                 done.finished_reason = FINISH_LENGTH(length=2)
             streamer.stream_output([running, done], False)
 
-        self.assertIsNone(outputs[0].finished_http_worker_ipcs)
-        self.assertEqual(outputs[1].finished_http_worker_ipcs, [None, "worker-b"])
+        self.assertIsNone(outputs[0].http_worker_ipcs)
+        self.assertEqual(outputs[1].http_worker_ipcs, [None, "worker-b"])
 
     def test_skip_tokenizer_init_rows_carry_ipc_and_no_header(self):
         """Without a detokenizer the tokenizer-side router routes each row by

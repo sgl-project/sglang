@@ -68,7 +68,7 @@ def _output(sent, rows, *, ipc="worker-a"):
         ],
         output_ids=[array("q", ids) for _, ids, _, _ in rows],
         detokenize_headers=headers if any(headers) else None,
-        finished_http_worker_ipcs=(
+        http_worker_ipcs=(
             [ipc if finished else None for *_, finished in rows]
             if any(finished for *_, finished in rows)
             else None
