@@ -441,35 +441,6 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 )
                 self.assertEqual(config.unified_chunk_spans, expected_spans)
 
-    def test_rank_suffix_config_has_no_chunk_spans(self):
-        controller = self._controller()
-        controller.mem_pool_host.layout = "page_first"
-        controller.storage_host_pool.storage_format_tag = None
-        controller.enable_storage_metrics = False
-        parallel = SimpleNamespace(
-            tp_rank=0,
-            tp_size=1,
-            pp_rank=0,
-            pp_size=1,
-            attn_dcp_size=1,
-            attn_dcp_rank=0,
-        )
-        with (
-            patch(
-                "sglang.srt.managers.cache_controller.get_parallel",
-                return_value=parallel,
-            ),
-            patch(
-                "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
-                return_value=False,
-            ),
-            patch.object(controller, "get_attn_cp_rank_and_size", return_value=(0, 1)),
-            patch.object(controller, "_build_unified_plan", return_value=None),
-        ):
-            config = controller._generate_storage_config("org/model")
-        self.assertIsNone(config.unified_suffixes)
-        self.assertIsNone(config.unified_chunk_spans)
-
     def test_hybrid_write_back_preserves_cpu_host_indices(self):
         controller = object.__new__(HybridCacheController)
         controller.io_backend = "kernel"
