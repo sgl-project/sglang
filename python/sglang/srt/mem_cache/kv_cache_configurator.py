@@ -2713,7 +2713,6 @@ class KVCacheConfigurator:
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
-        # Ascend DSA uses the NPU MLA pool even when the model also has Mamba layers.
         if _is_npu:
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
