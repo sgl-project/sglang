@@ -1,7 +1,8 @@
 """Startup registration of token-space strategies.
 
 import managers.multimodal_processor -> no token-space model module imported
-import_processors(models package)
+register_token_space_models()
+  in a fresh process -> no serving module imported, so trainers can call it
   one module fails to import -> warned and skipped, the others still registered
 """
 
@@ -12,15 +13,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sglang.srt.managers.multimodal_processor import import_processors
+from sglang.srt.multimodal.token_space_mm_process import models
 from sglang.srt.multimodal.token_space_mm_process.registry import (
     TOKEN_SPACE_STRATEGY_MAPPING,
+    register_token_space_models,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-_PACKAGE = "broken_token_space_models"
 _MODELS = "sglang.srt.multimodal.token_space_mm_process.models"
 
 
@@ -40,12 +41,29 @@ class TestStrategyRegistry(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(loaded, "[]")
 
+    def test_registering_strategies_loads_no_serving_module(self):
+        """Trainers register strategies without the serving stack import_processors needs."""
+        loaded = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys\n"
+                "from sglang.srt.multimodal.token_space_mm_process.registry import "
+                "register_token_space_models\n"
+                "register_token_space_models()\n"
+                "print(sorted(m for m in sys.modules if m.startswith("
+                "('sglang.srt.managers', 'sglang.srt.server_args'))))",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(loaded, "[]")
+
     def test_a_module_that_fails_to_import_is_skipped(self):
         """One broken strategy module must not stop every server from starting."""
         with tempfile.TemporaryDirectory() as directory:
-            package = Path(directory) / _PACKAGE
-            package.mkdir()
-            (package / "__init__.py").write_text("")
+            package = Path(directory)
             (package / "ok.py").write_text(
                 "from sglang.srt.multimodal.token_space_mm_process.process_strategy "
                 "import TokenSpaceProcessStrategy\n"
@@ -53,24 +71,23 @@ class TestStrategyRegistry(unittest.TestCase):
                 "    models = ('OkForConditionalGeneration',)\n"
             )
             (package / "broken.py").write_text("import a_module_that_does_not_exist\n")
-            sys.path.insert(0, directory)
-            self.addCleanup(sys.path.remove, directory)
-            self.addCleanup(_forget_package)
+            self.addCleanup(_forget_modules)
             with (
+                patch.object(models, "__path__", [directory]),
                 patch.dict(TOKEN_SPACE_STRATEGY_MAPPING, clear=True),
                 self.assertLogs(
-                    "sglang.srt.managers.multimodal_processor", "WARNING"
+                    "sglang.srt.multimodal.token_space_mm_process.registry", "WARNING"
                 ) as logs,
             ):
-                import_processors(_PACKAGE)
+                register_token_space_models()
                 registered = list(TOKEN_SPACE_STRATEGY_MAPPING)
         self.assertEqual(registered, ["OkForConditionalGeneration"])
-        self.assertIn(f"{_PACKAGE}.broken", logs.output[0])
+        self.assertIn(f"{_MODELS}.broken", logs.output[0])
 
 
-def _forget_package():
-    for name in [name for name in sys.modules if name.startswith(_PACKAGE)]:
-        del sys.modules[name]
+def _forget_modules():
+    for name in (f"{_MODELS}.ok", f"{_MODELS}.broken"):
+        sys.modules.pop(name, None)
 
 
 if __name__ == "__main__":

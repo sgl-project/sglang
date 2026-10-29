@@ -35,6 +35,9 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 from sglang.srt.runtime_context import (
@@ -2002,7 +2005,7 @@ class MMReceiverBase(ABC):
         """Load processor and initialize mm_processor, shared by all backends."""
         transport_mode = determine_tensor_transport_mode()
         import_processors("sglang.srt.multimodal.processors")
-        import_processors("sglang.srt.multimodal.token_space_mm_process.models")
+        register_token_space_models()
 
         extra_kwargs = {}
         if get_serving().tokenizer_backend is not None:
