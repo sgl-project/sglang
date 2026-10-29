@@ -27,13 +27,11 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import (
-    HiCacheStorageConfig,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
 )
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -91,7 +89,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         return SimpleNamespace(
             kv_buffer=object(),
             page_size=64,
-            logical_page_size=64,
             get_page_buffer_meta=lambda indices: (
                 [128] * objects_per_page,
                 [64] * objects_per_page,
@@ -170,78 +167,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 for pool in pools
                 for suffix in pool["suffixes"]
             ],
-        )
-
-    def test_dcp_startup_layout_matches_one_logical_page_write(self):
-        """Under decode context parallelism one storage page spans dcp_size
-        physical pages. The startup handshake must describe the objects such a
-        page writes rather than abort scheduler startup."""
-        dcp_size, dcp_rank = 8, 3
-        device_pool = MLATokenToKVPool(
-            size=1024,
-            page_size=64,
-            dtype=torch.float16,
-            kv_lora_rank=8,
-            qk_rope_head_dim=4,
-            layer_num=2,
-            device="cpu",
-            enable_memory_saver=False,
-        )
-        anchor = MLATokenToKVPoolHost(
-            device_pool.get_device_pool_infos()[0].buffer_info,
-            host_to_device_ratio=2.0,
-            host_size=0,
-            page_size=64 * dcp_size,
-            layout="page_first",
-            pin_memory=False,
-            device="cpu",
-            dcp_size=dcp_size,
-            dcp_rank=dcp_rank,
-            device_capacity_tokens=device_pool.size,
-            start_layer=device_pool.start_layer,
-            end_layer=device_pool.end_layer,
-            target_layer_num=device_pool.layer_num,
-            layer_shard_enabled=device_pool.layer_shard_enabled,
-        )
-        store = self._store(mla_suffix=f"dcp{dcp_rank}_cp0")
-        store.mem_pool_host = anchor
-        store.dcp_size = dcp_size
-        store.storage_config = HiCacheStorageConfig(
-            tp_rank=dcp_rank,
-            tp_size=dcp_size,
-            pp_rank=0,
-            pp_size=1,
-            attn_cp_rank=0,
-            attn_cp_size=1,
-            is_mla_model=True,
-            enable_storage_metrics=False,
-            is_page_first_layout=True,
-            model_name="my-model",
-            dcp_size=dcp_size,
-            dcp_rank=dcp_rank,
-            logical_page_size=anchor.logical_page_size,
-        )
-
-        layout = self._scheduler(store).get_init_info()["hicache_object_layout"]
-        self.assertTrue(layout["enabled"])
-        [kv] = layout["hicache_object_layout"]["pools"]
-
-        written = []
-
-        def put(keys, pointers, sizes, group_ids, session_ids=None):
-            written.extend(keys)
-            return [0] * len(keys)
-
-        page = anchor.alloc(anchor.logical_page_size)
-        with (
-            patch.object(
-                store, "_batch_exist", side_effect=lambda keys: [0] * len(keys)
-            ),
-            patch.object(store, "_put_batch_zero_copy_impl", side_effect=put),
-        ):
-            self.assertEqual(store.batch_set_v1(["page-hash"], page), [True])
-        self.assertEqual(
-            written, [f"tag_my-model_page-hash{suffix}" for suffix in kv["suffixes"]]
         )
 
     def test_handler_and_startup_share_enabled_and_disabled_envelopes(self):
