@@ -11,14 +11,18 @@ from typing import Dict, List, Optional, Sequence, Tuple, Type
 import msgspec
 
 from sglang.srt.mem_cache.kv.decl import (
+    DerivedPartDecl,
     FullLifetime,
     KVLayerDecl,
     KVLifetime,
     MHAGeometry,
     MLAGeometry,
     PartGeometry,
+    RequestPartDecl,
+    ScratchDecl,
     StateGeometry,
     StateLifetime,
+    TensorPartDecl,
     WindowLifetime,
 )
 from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec, _store_dtype_for
@@ -27,16 +31,6 @@ from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.router import KV_PART, STATE_PART
 from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
-
-# The one chain whose builder resizes the buffer after CUDA graph capture.
-_RESIZED_AFTER_CAPTURE = frozenset({FullLifetime, WindowLifetime})
-
-
-def resized_after_capture(lifetime_types: frozenset) -> bool:
-    """Whether the unified pool of a plan with these lifetimes can resize its
-    buffer after CUDA graph capture."""
-    return lifetime_types == _RESIZED_AFTER_CAPTURE
-
 
 # The draft placement and the id spaces name sub-pools by these.
 _SUB_POOL_NAMES: Dict[Type, str] = {
@@ -129,6 +123,9 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
     # Chain order: the grow-up end first, the grow-down end last.
     sub_pools: Tuple[PlannedSubPool, ...]
     fused_draft: Optional[FusedDraftPlacement] = None
+    scratch: Tuple[ScratchDecl, ...] = ()
+    request_parts: Tuple[RequestPartDecl, ...] = ()
+    derived_parts: Tuple[DerivedPartDecl, ...] = ()
 
     def sub_pool(self, name: str) -> PlannedSubPool:
         for sub_pool in self.sub_pools:
@@ -292,6 +289,8 @@ def _spec_for(
         temporal_state_shape=geometry.temporal_state_shape,
         temporal_dtype=geometry.temporal_dtype,
         conv_slice_axis=geometry.conv_slice_axis,
+        extra_parts=geometry.extra_parts,
+        replay=geometry.replay,
         grow_direction=grow_direction,
         draft_region=draft_region,
     )
@@ -302,6 +301,9 @@ def plan_kv_storage(
     *,
     page_size: int,
     fused_draft: Optional[FusedDraftPlacement] = None,
+    speculative_num_draft_tokens: Optional[int] = None,
+    request_parts: Sequence[RequestPartDecl] = (),
+    derived_parts: Sequence[DerivedPartDecl] = (),
 ) -> KVStoragePlan:
     """The unified-buffer plan for these declarations."""
     assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
@@ -342,6 +344,68 @@ def plan_kv_storage(
                 external=_EXTERNAL[type(lifetime)],
             )
         )
+    request_parts = list(request_parts)
+    for sub_pool in sub_pools:
+        if isinstance(sub_pool.geometry, StateGeometry):
+            request_parts.extend(
+                RequestPartDecl(
+                    part=msgspec.structs.replace(
+                        part, name=f"{sub_pool.name}.{part.name}"
+                    )
+                )
+                for part in sub_pool.geometry.request_parts
+            )
+    scratch = [
+        ScratchDecl(
+            part=msgspec.structs.replace(part, name=f"{sub_pool.name}.{part.name}")
+        )
+        for sub_pool in sub_pools
+        if isinstance(sub_pool.geometry, StateGeometry)
+        for part in sub_pool.geometry.scratch_parts
+    ]
+    if speculative_num_draft_tokens is not None:
+        for sub_pool in sub_pools:
+            if not isinstance(sub_pool.geometry, StateGeometry):
+                continue
+            geometry = sub_pool.geometry
+            for name, shape, dtype in (
+                (
+                    "intermediate_ssm",
+                    geometry.temporal_state_shape,
+                    geometry.temporal_dtype,
+                ),
+                *(
+                    (f"intermediate_conv_window.{i}", shape, geometry.conv_dtype)
+                    for i, shape in enumerate(geometry.conv_state_shapes)
+                ),
+            ):
+                if (
+                    name == "intermediate_ssm"
+                    and geometry.replay is not None
+                    and geometry.replay.speculative
+                ):
+                    continue
+                scratch.append(
+                    ScratchDecl(
+                        part=TensorPartDecl(
+                            name=f"{sub_pool.name}.{name}",
+                            shape=(speculative_num_draft_tokens, *shape),
+                            dtype=dtype,
+                            layer_ids=sub_pool.layer_ids,
+                        )
+                    )
+                )
+    names = {s.name for s in sub_pools}
+    for derived in derived_parts:
+        if derived.sub_pool not in names:
+            raise ValueError(
+                f"derived part {derived.part.name!r} has no owning sub-pool"
+            )
     return KVStoragePlan(
-        page_size=page_size, sub_pools=tuple(sub_pools), fused_draft=fused_draft
+        page_size=page_size,
+        sub_pools=tuple(sub_pools),
+        fused_draft=fused_draft,
+        scratch=tuple(scratch),
+        request_parts=tuple(request_parts),
+        derived_parts=tuple(derived_parts),
     )

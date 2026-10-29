@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
 from sglang.srt.mem_cache.kv.layout.mha import MHAHostLayout
@@ -53,6 +55,33 @@ def _bundle(name):
 
 
 class TestPlanNames(CustomTestCase):
+    def test_nonzero_pipeline_stage_routes_local_views_and_global_metadata(self):
+        for mla in (False, True):
+            with self.subTest(mla=mla):
+                setup_allocator_context()
+                bundle = build_unified_bundle(
+                    UnifiedGeometry(
+                        chain="mamba",
+                        mla=mla,
+                        full_layer_ids=(4, 6),
+                        state_layer_ids=(5, 7),
+                        start_layer=4,
+                        end_layer=8,
+                        **_P16,
+                    )
+                )
+                storage = bundle.storage
+                view = storage.view("full")
+                self.assertEqual(view.model_layer_ids, (4, 6))
+                self.assertEqual(view.start_layer, 0)
+                self.assertEqual(view.get_device_pool_infos()[0].layer_ids, (4, 6))
+                first = view.kv_buffer[0] if mla else view.k_buffer[0]
+                second = view.kv_buffer[1] if mla else view.k_buffer[1]
+                first.fill_(11)
+                second.fill_(29)
+                route = bundle.token_to_kv_pool.layer_router.layer(6)
+                self.assertTrue(torch.all(route.key() == 29))
+
     def test_sub_pools_and_wire_entries_per_chain(self):
         expected = {
             "swa": (("full", "kv", "FULL"), ("swa", "swa", "SWA")),

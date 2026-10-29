@@ -41,6 +41,7 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     req.kv.kv_committed_len = 2
 
     batch = ScheduleBatch(reqs=[req])
+    batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
     batch.tree_cache = SimpleNamespace(page_size=TRACK_INTERVAL)
     batch.device = "cpu"
     batch.model_config = SimpleNamespace(is_encoder_decoder=False)
