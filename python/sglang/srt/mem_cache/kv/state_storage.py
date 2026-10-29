@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
+from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
 from sglang.srt.utils.common import async_h2d
 
@@ -134,7 +135,10 @@ class StateStorage:
                 # A zero write_pos empties the ReplaySSM ring;
                 # decode then reads only the checkpoint written by prefill.
                 if self.pool.replayssm_write_pos is not None:
-                    self.pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
+                    if l16_loopstat.prealloc_no_sync():
+                        self.pool.replayssm_write_pos.index_fill_(0, mid, 0)
+                    else:
+                        self.pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
             mamba_indices.append(req.kv.mamba_pool_idx)
             if table.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:

@@ -8,7 +8,10 @@ import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
-from sglang.srt.kernel_plugins.nvidia.binding import megakernel_graph_variants
+from sglang.srt.kernel_plugins.nvidia.binding import (
+    megakernel_graph_variants,
+    megakernel_variant_sizes,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -54,6 +57,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils import host_trace
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 from sglang.srt.utils.device_timer import device_timer_ctx
 
@@ -61,6 +65,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 _GREEDY_VARIANT = "greedy"
+_GRAPH_INPUTS = envs.SGLANG_PERFLL_HOST_GRAPH_INPUTS.get()
 
 
 @dataclass
@@ -83,6 +88,35 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     dsa_seed_topk: Optional[torch.Tensor] = None
+
+
+def _same_storage(src: Optional[torch.Tensor], buf: torch.Tensor) -> bool:
+    """Whether ``src`` is ``buf``'s leading rows already (draft_extend wrote them in place,
+    SGLANG_PERFLL_STEP5A), so copying it in would copy a buffer onto itself."""
+    return src is not None and src.data_ptr() == buf.data_ptr()
+
+
+def _topk_in_place(spec_info, buffers) -> bool:
+    """Whether both top-1 inputs are the runner's buffers already (they are copied together)."""
+    return _same_storage(spec_info.topk_index, buffers.topk_index) and _same_storage(
+        spec_info.topk_p, buffers.topk_p
+    )
+
+
+# the draft inputs a staged round takes from the previous post-verify graph (SGLANG_PERFLL_STEP2=3)
+_STAGED_INPUTS = frozenset({"seq_lens", "out_cache_loc", "positions", "mrope_positions"})
+
+
+def _private_inputs() -> frozenset:
+    """The draft inputs written outside this runner's own fill, kept out of the shared pool:
+    SGLANG_PERFLL_STEP2=3's staged inputs and the request slots a staged round keeps, and
+    SGLANG_PERFLL_STEP5A's top-1 / hidden rows that draft_extend writes in place."""
+    private = set()
+    if envs.SGLANG_PERFLL_STEP2.get() >= 3:
+        private |= _STAGED_INPUTS | {"req_pool_indices"}
+    if envs.SGLANG_PERFLL_STEP5A.get():
+        private |= {"topk_p", "topk_index", "hidden_states"}
+    return frozenset(private)
 
 
 class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
@@ -284,7 +318,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk=dsa_seed_topk,
         )
-        self.buffers.share_buffers()
+        # Inputs written outside this runner's fill stay private: the process-wide pool would
+        # alias them to the draft extend's same-named buffers, which its replay refills in between.
+        self.buffers.share_buffers(exclude=_private_inputs())
+        # (raw_bs, field mask) -> (destination views, copy plan); None once refused.
+        self._planned_inputs = {}
+        # Capture-owned storage: no reuse across graph variants or requests.
+        self._q38_step_fold_slots = {}
+        self._q38_full_frames = {}
         # the batch sizes whose graphs run the draft megakernel's draft_loop, captured
         # once per label of the graph variants it offers this runner
         self.megakernel = eagle_worker.megakernel
@@ -296,7 +337,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.attention_graph_variants = megakernel_graph_variants(
             model_runner.model, "draft_loop", batch_sizes=self.megakernel_served
         )
-        self.attention_variant_sizes = self.megakernel_served
+        self.attention_variant_sizes = megakernel_variant_sizes(
+            self.attention_graph_variants, self.megakernel_served
+        )
 
         self.backend = resolve_decode_backend(self)
 
@@ -352,6 +395,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # can_run_graph
     # -----------------------------------------------------------------
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if self._q38_full_frames and forward_batch.mm_input_embeds is not None:
+            return False
         # Uniform-width replay invariant: the batch's actual per-request width
         # must match this runner's capture width; anything else falls back to
         # eager. (Unset widths pass: not every path fills the field yet.)
@@ -406,6 +451,21 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     ):
         num_seqs = size  # EAGLE legacy name
         buffers = self.buffers
+        from sglang.kernels.ops.speculative.draft_full_inputs import make_frame
+
+        frame = make_frame(
+            self.model_runner.model, buffers, self.speculative_num_steps,
+            eligible=(size == 1 and self.topk == 1 and self.captured_req_width == 1
+                      and not get_spec().speculative_use_rejection_sampling
+                      and not self.require_gathered_buffer
+                      and self.eagle_worker.hot_token_id is None
+                      and size not in self.megakernel_served),
+        )
+        if frame is not None:
+            buffers = frame.buffers
+            self._q38_full_frames[self._make_graph_key(
+                size, variant_label=variant_label, attention_variant=attention_variant
+            )] = frame
         num_tokens = num_seqs * self.captured_req_width
 
         # Graph inputs
@@ -469,8 +529,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
         )
-        if self.buffers.dsa_seed_topk is not None:
-            spec_info.dsa_topk_indices = self.buffers.dsa_seed_topk[:num_seqs]
+        if buffers.dsa_seed_topk is not None:
+            spec_info.dsa_topk_indices = buffers.dsa_seed_topk[:num_seqs]
 
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
@@ -518,6 +578,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             ),
         )
         self.model_runner.runner_ids.bind_runner_slots(forward_batch)
+        from sglang.kernels.ops.speculative.draft_step_fold import make_fold_slots
+
+        fold_slots = (
+            make_fold_slots(self.model_runner.model, num_seqs, self.speculative_num_steps)
+            if self.topk == 1 and self.captured_req_width == 1
+            else None
+        )
+        self._q38_step_fold_slots[(size, stream_idx, variant_label, attention_variant)] = fold_slots
+        forward_batch._q38_step_fold_slots = fold_slots
+        forward_batch._q38_full_frame = frame
         served = num_seqs in self.megakernel_served
 
         def run_once():
@@ -593,10 +663,101 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         return parent_list, top_scores_index, draft_tokens, draft_probs
 
+    def _copy_planned_inputs(
+        self, forward_batch: ForwardBatch, *, raw_bs: int, inputs_staged: bool = False
+    ) -> bool:
+        """SGLANG_PERFLL_HOST_GRAPH_INPUTS: an unpadded round's input copies (the
+        default path's fields, draft probs and hidden states) as one field-copy launch
+        into views cached per input layout; False leaves them all to the default path.
+        ``inputs_staged``: the lengths, write slots and positions are in the buffers
+        already (SGLANG_PERFLL_STEP2=3), so they are not copied."""
+        buffers = self.buffers
+        spec_info = forward_batch.spec_info
+        # a staged round's batch is the previous round's, whose request slots are in place
+        srcs = [] if inputs_staged else [forward_batch.req_pool_indices]
+        mask = 0
+        if _topk_in_place(spec_info, buffers):
+            mask |= 64
+        else:
+            srcs = [spec_info.topk_p, spec_info.topk_index, *srcs]
+        if inputs_staged:
+            mask |= 32
+        else:
+            srcs = [
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
+                forward_batch.positions,
+                *srcs,
+            ]
+        if self.model_runner.model_config.model_is_mrope and not inputs_staged:
+            if forward_batch.mrope_positions is None:
+                return False
+            srcs.append(forward_batch.mrope_positions)
+            mask |= 1
+        if buffers.rids_int is not None and forward_batch.rids_int is not None:
+            srcs.append(forward_batch.rids_int)
+            mask |= 2
+        if (
+            buffers.bootstrap_room_ids_int is not None
+            and forward_batch.bootstrap_room_ids_int is not None
+        ):
+            srcs.append(forward_batch.bootstrap_room_ids_int)
+            mask |= 4
+        if buffers.draft_probs is not None and spec_info.draft_probs is not None:
+            srcs.append(spec_info.draft_probs)
+            mask |= 8
+        if (
+            buffers.hidden_states is not None
+            and spec_info.hidden_states is not None
+            and not _same_storage(spec_info.hidden_states, buffers.hidden_states)
+        ):
+            srcs.append(spec_info.hidden_states)
+            mask |= 16
+        key = (raw_bs, mask)
+        entry = self._planned_inputs.get(key, False)
+        if entry is False:
+            entry = self._planned_inputs[key] = self._plan_inputs(
+                raw_bs=raw_bs, mask=mask
+            )
+        if entry is not None and (not srcs or entry[1](entry[0], srcs)):
+            return True
+        # A refused layout keeps the default path from then on.
+        self._planned_inputs[key] = None
+        return False
+
+    def _plan_inputs(self, *, raw_bs: int, mask: int):
+        from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
+
+        buffers = self.buffers
+        raw_num_token = raw_bs * self.captured_req_width
+        dsts = [] if mask & 32 else [buffers.req_pool_indices[:raw_bs]]
+        if not mask & 64:
+            dsts = [buffers.topk_p[:raw_bs], buffers.topk_index[:raw_bs], *dsts]
+        if not mask & 32:
+            dsts = [
+                buffers.seq_lens[:raw_bs],
+                buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
+                buffers.positions[:raw_num_token],
+                *dsts,
+            ]
+        if mask & 1:
+            dsts.append(buffers.mrope_positions[:, :raw_num_token])
+        if mask & 2:
+            dsts.append(buffers.rids_int[:raw_bs])
+        if mask & 4:
+            dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
+        if mask & 8:
+            dsts.append(buffers.draft_probs[:raw_bs])
+        if mask & 16:
+            dsts.append(buffers.hidden_states[:raw_bs])
+        return dsts, SmallFieldCopyPlan()
+
     # -----------------------------------------------------------------
     # Replay
     # -----------------------------------------------------------------
-    def execute(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch, inputs_staged: bool = False):
+        """``inputs_staged``: the previous post-verify graph wrote this round's lengths,
+        write slots and positions into the buffers (SGLANG_PERFLL_STEP2=3)."""
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
@@ -617,6 +778,32 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         else:
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
 
+        shape_key = self._make_graph_key(
+            bs, variant_label=self._sampling_variant(forward_batch),
+            attention_variant=self._resolve_attention_variant(forward_batch, bs),
+        )
+        frame = self._q38_full_frames.get(shape_key) if raw_bs == bs == 1 else None
+        full_prepared = False
+        if frame is not None:
+            from sglang.kernels.ops.speculative.draft_full_inputs import publish
+
+            # Only native STEP2's actual row/order validation permits the tail
+            # frame. A new/filtered/merged batch always loads current tensors.
+            prepared = getattr(forward_batch.spec_info, "q38_prepared_frames", None)
+            full_prepared = inputs_staged and prepared is not None and any(
+                f is frame for f in prepared
+            )
+            if not full_prepared:
+                source = self.buffers if inputs_staged else forward_batch
+                publish(
+                    frame, token=forward_batch.spec_info.topk_index,
+                    hidden=forward_batch.spec_info.hidden_states,
+                    seed=forward_batch.spec_info.dsa_topk_indices, source=source,
+                    request_slots=forward_batch.req_pool_indices,
+                )
+            forward_batch.spec_info.q38_prepared_frames = None
+            buffers = frame.buffers
+
         if bs != raw_bs:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
@@ -625,12 +812,22 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.rids_int.zero_()
             if buffers.bootstrap_room_ids_int is not None:
                 buffers.bootstrap_room_ids_int.fill_(-1)
-            buffers.topk_p.zero_()
-            buffers.topk_index.zero_()
+            # draft_extend may have written this round's rows in place (SGLANG_PERFLL_STEP5A):
+            # clear only the padding rows of such a buffer
+            spec_info = forward_batch.spec_info
+            for buf, src in (
+                (buffers.topk_p, spec_info.topk_p),
+                (buffers.topk_index, spec_info.topk_index),
+                (buffers.hidden_states, spec_info.hidden_states),
+            ):
+                if buf is None:
+                    continue
+                if _same_storage(src, buf):
+                    buf[raw_bs:].zero_()
+                else:
+                    buf.zero_()
             if buffers.draft_probs is not None:
                 buffers.draft_probs.zero_()
-            if buffers.hidden_states is not None:
-                buffers.hidden_states.zero_()
             if buffers.dsa_seed_topk is not None:
                 buffers.dsa_seed_topk.zero_()
             buffers.req_pool_indices.zero_()
@@ -649,56 +846,76 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             f"{self.model_runner.model_config.vocab_size}",
         )
 
-        # Common inputs — batch the small per-field device copies into a grouped
-        # foreach copy (one foreach call per dtype pair) to cut launch overhead.
-        # hidden_states is handled separately below (see note), and seq_lens_cpu
-        # is handled further down since it lives on host.
-        copy_dsts = [
-            buffers.seq_lens[:raw_bs],
-            buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
-            buffers.positions[:raw_num_token],
-            buffers.topk_p[:raw_bs],
-            buffers.topk_index[:raw_bs],
-            buffers.req_pool_indices[:raw_bs],
-        ]
-        copy_srcs = [
-            forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
-            forward_batch.positions,
-            forward_batch.spec_info.topk_p,
-            forward_batch.spec_info.topk_index,
-            forward_batch.req_pool_indices,
-        ]
-        if self.model_runner.model_config.model_is_mrope:
-            if bs != raw_bs or forward_batch.mrope_positions is None:
-                buffers.mrope_positions.zero_()
-            if forward_batch.mrope_positions is not None:
-                copy_dsts.append(buffers.mrope_positions[:, :raw_num_token])
-                copy_srcs.append(forward_batch.mrope_positions)
-        if buffers.rids_int is not None and forward_batch.rids_int is not None:
-            copy_dsts.append(buffers.rids_int[:raw_bs])
-            copy_srcs.append(forward_batch.rids_int)
-        if (
-            buffers.bootstrap_room_ids_int is not None
-            and forward_batch.bootstrap_room_ids_int is not None
-        ):
-            copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
-            copy_srcs.append(forward_batch.bootstrap_room_ids_int)
-        _grouped_foreach_copy_(copy_dsts, copy_srcs)
+        inputs_staged = inputs_staged and bs == raw_bs
+        staged = frame is not None or (
+            _GRAPH_INPUTS
+            and bs == raw_bs
+            and self._copy_planned_inputs(
+                forward_batch, raw_bs=raw_bs, inputs_staged=inputs_staged
+            )
+        )
+        if not staged:
+            # Common inputs — batch the small per-field device copies into a grouped
+            # foreach copy (one foreach call per dtype pair) to cut launch overhead.
+            # hidden_states is handled separately below (see note), and seq_lens_cpu
+            # is handled further down since it lives on host.
+            copy_dsts = [] if inputs_staged else [buffers.req_pool_indices[:raw_bs]]
+            copy_srcs = [] if inputs_staged else [forward_batch.req_pool_indices]
+            if not _topk_in_place(forward_batch.spec_info, buffers):
+                copy_dsts += [buffers.topk_p[:raw_bs], buffers.topk_index[:raw_bs]]
+                copy_srcs += [
+                    forward_batch.spec_info.topk_p,
+                    forward_batch.spec_info.topk_index,
+                ]
+            if not inputs_staged:
+                copy_dsts += [
+                    buffers.seq_lens[:raw_bs],
+                    buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
+                    buffers.positions[:raw_num_token],
+                ]
+                copy_srcs += [
+                    forward_batch.seq_lens,
+                    forward_batch.out_cache_loc,
+                    forward_batch.positions,
+                ]
+            if self.model_runner.model_config.model_is_mrope and not inputs_staged:
+                if bs != raw_bs or forward_batch.mrope_positions is None:
+                    buffers.mrope_positions.zero_()
+                if forward_batch.mrope_positions is not None:
+                    copy_dsts.append(buffers.mrope_positions[:, :raw_num_token])
+                    copy_srcs.append(forward_batch.mrope_positions)
+            if buffers.rids_int is not None and forward_batch.rids_int is not None:
+                copy_dsts.append(buffers.rids_int[:raw_bs])
+                copy_srcs.append(forward_batch.rids_int)
+            if (
+                buffers.bootstrap_room_ids_int is not None
+                and forward_batch.bootstrap_room_ids_int is not None
+            ):
+                copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
+                copy_srcs.append(forward_batch.bootstrap_room_ids_int)
+            _grouped_foreach_copy_(copy_dsts, copy_srcs)
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.DXA)
 
-        # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
-        # DMA engine; foreach would force the ~3x slower compute-kernel copy.
-        if (
-            buffers.draft_probs is not None
-            and forward_batch.spec_info.draft_probs is not None
-        ):
-            buffers.draft_probs[:raw_bs].copy_(forward_batch.spec_info.draft_probs)
-        if (
-            buffers.hidden_states is not None
-            and forward_batch.spec_info.hidden_states is not None
-        ):
-            buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
-        if buffers.dsa_seed_topk is not None:
+        if not staged:
+            # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
+            # DMA engine; foreach would force the ~3x slower compute-kernel copy.
+            if (
+                buffers.draft_probs is not None
+                and forward_batch.spec_info.draft_probs is not None
+            ):
+                buffers.draft_probs[:raw_bs].copy_(forward_batch.spec_info.draft_probs)
+            if (
+                buffers.hidden_states is not None
+                and forward_batch.spec_info.hidden_states is not None
+                and not _same_storage(
+                    forward_batch.spec_info.hidden_states, buffers.hidden_states
+                )
+            ):
+                buffers.hidden_states[:raw_bs].copy_(
+                    forward_batch.spec_info.hidden_states
+                )
+        if frame is None and buffers.dsa_seed_topk is not None:
             seed = forward_batch.spec_info.dsa_topk_indices
             if seed is not None:
                 buffers.dsa_seed_topk[:raw_bs].copy_(seed)
@@ -767,6 +984,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.draft_attn_backend.init_forward_metadata_out_graph(
             SimpleNamespace(**vars(forward_batch), num_padding=bs - raw_bs)
         )
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.DXB)
         self.raw_bs = raw_bs
         self.bs = bs
 

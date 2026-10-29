@@ -5,11 +5,13 @@ the entries and their structs."""
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_agree,
     megakernel_enabled,
@@ -32,6 +34,8 @@ if TYPE_CHECKING:
 
 # the draft model's entries
 DRAFT_ENTRIES = ("draft_loop", "draft_extend", "begin_draft_round")
+
+logger = logging.getLogger(__name__)
 
 
 def _offers_eagle_entries(*, draft_model: Any) -> bool:
@@ -173,19 +177,21 @@ class EagleMegakernel:
         with the runner's outputs, and returns the batch sizes whose graphs run it."""
         if self._draft_extend is None:
             return frozenset()
-        out = SimpleNamespace(
-            topk_index=torch.zeros(
-                (runner.max_bs, 1), dtype=torch.int64, device=runner.device
-            ),
-            topk_p=torch.ones(
-                (runner.max_bs, 1), dtype=torch.float32, device=runner.device
-            ),
-            hidden=torch.zeros(
-                (runner.max_bs, self._draft_config.hidden_size),
-                dtype=self._draft_config.dtype,
-                device=runner.device,
-            ),
-        )
+        out = self._draft_inputs_as_extend_outputs(runner.max_bs)
+        if out is None:
+            out = SimpleNamespace(
+                topk_index=torch.zeros(
+                    (runner.max_bs, 1), dtype=torch.int64, device=runner.device
+                ),
+                topk_p=torch.ones(
+                    (runner.max_bs, 1), dtype=torch.float32, device=runner.device
+                ),
+                hidden=torch.zeros(
+                    (runner.max_bs, self._draft_config.hidden_size),
+                    dtype=self._draft_config.dtype,
+                    device=runner.device,
+                ),
+            )
         steps = self._draft_extend(
             tokens_per_request=runner.captured_req_width,
             max_bs=runner.max_bs,
@@ -197,6 +203,37 @@ class EagleMegakernel:
         if served:
             self._extend_graphs[id(runner)] = SimpleNamespace(steps=served, out=out)
         return frozenset(served)
+
+    def _draft_inputs_as_extend_outputs(self, max_bs: int) -> Optional[SimpleNamespace]:
+        """SGLANG_PERFLL_STEP5A: the draft graph runner's top-1 / hidden input buffers as
+        draft_extend's outputs when they fit (the draft runner is built before the extend
+        runner captures), so its next draft reads them in place; None otherwise."""
+        if not envs.SGLANG_PERFLL_STEP5A.get():
+            return None
+        draft_runner = self._draft_worker.cuda_graph_runner
+        if draft_runner is None:
+            return None
+        b = draft_runner.buffers
+        hidden = b.hidden_states
+        if (
+            b.topk_index.shape[0] < max_bs
+            or tuple(b.topk_index.shape[1:]) != (1,)
+            or b.topk_index.dtype != torch.int64
+            or tuple(b.topk_p.shape[1:]) != (1,)
+            or b.topk_p.dtype != torch.float32
+            or hidden is None
+            or hidden.shape[0] < max_bs
+            or hidden.shape[1] != self._draft_config.hidden_size
+            or hidden.dtype != self._draft_config.dtype
+        ):
+            logger.info("PERF-LL step5a: the draft runner's input buffers do not fit; not aliased")
+            return None
+        logger.info("PERF-LL step5a: draft_extend writes the draft graph runner's top-1 / hidden inputs in place")
+        return SimpleNamespace(
+            topk_index=b.topk_index[:max_bs],
+            topk_p=b.topk_p[:max_bs],
+            hidden=hidden[:max_bs],
+        )
 
     def run_draft_extend(self, *, runner: Any, forward_batch: ForwardBatch) -> Any:
         """Inside the draft-extend graph's capture: draft_extend's step in place of
@@ -251,11 +288,12 @@ class EagleMegakernel:
             return None
         self._served_input = (self._input_seq, _rids(batch))
         raw_bs = runner.raw_bs
+        topk_p, topk_index = graphs.out.topk_p[:raw_bs], graphs.out.topk_index[:raw_bs]
+        if envs.SGLANG_Q35MF_SPEC_RELAY_BYPASS.get():
+            # the next round's draft reads them before the next replay rewrites them
+            return topk_p, topk_index
         # the next replay rewrites the buffers before the next round reads them
-        return (
-            graphs.out.topk_p[:raw_bs].clone(),
-            graphs.out.topk_index[:raw_bs].clone(),
-        )
+        return topk_p.clone(), topk_index.clone()
 
     def begin_draft_round(
         self, *, runner: Any, batch: ScheduleBatch, draft_input: Any

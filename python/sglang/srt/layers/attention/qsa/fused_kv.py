@@ -1,6 +1,22 @@
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.qsa.mtp_lookup import DeferredMtpSparseIndices
+
+
+@triton.jit
+def _mtp_lookup_positions(
+    IDX, REQ, CAPTURED_LEN, QPOS, row, c, T: tl.constexpr, TAIL: tl.constexpr
+):
+    req = tl.load(REQ + row).to(tl.int64)
+    pos = tl.load(IDX + req * T + c, c < T - TAIL, -1)
+    base = tl.load(CAPTURED_LEN + req).to(tl.int64)
+    tail = base + c - (T - TAIL)
+    qpos = tl.load(QPOS + row).to(tl.int64)
+    return tl.where(
+        c < T - TAIL, pos, tl.where((c < T) & (tail <= qpos), tail, -1)
+    ).to(tl.int32)
+
 
 @triton.jit
 def _qsa_fused_kv_prepare(
@@ -17,6 +33,9 @@ def _qsa_fused_kv_prepare(
     COUNTS,
     OK,
     OV,
+    LOOKUP_REQ,
+    CAPTURED_LEN,
+    LOOKUP_QPOS,
     H: tl.constexpr,
     D: tl.constexpr,
     MAP_STRIDE: tl.constexpr,
@@ -34,6 +53,8 @@ def _qsa_fused_kv_prepare(
     IB: tl.constexpr,
     CHAIN: tl.constexpr,
     PAGE: tl.constexpr,
+    LOOKUP: tl.constexpr,
+    TAIL: tl.constexpr,
 ):
     tiles = tl.cdiv(S, B) + 2
     pid = tl.program_id(0)
@@ -73,7 +94,12 @@ def _qsa_fused_kv_prepare(
                 ),
             )
         else:
-            pos = tl.load(IDX + row * T + c, c < T, -1)
+            if LOOKUP:
+                pos = _mtp_lookup_positions(
+                    IDX, LOOKUP_REQ, CAPTURED_LEN, LOOKUP_QPOS, row, c, T, TAIL
+                )
+            else:
+                pos = tl.load(IDX + row * T + c, c < T, -1)
         length = tl.load(LENGTH + row)
         valid = (pos >= 0) & (pos < length) & (c < T)
         valid = valid & row_active
@@ -123,7 +149,12 @@ def _qsa_fused_kv_prepare(
             tl.store(COUNTS + row, n + tail_count)
         else:
             c = tl.arange(0, BT)
-            pos = tl.load(IDX + row * T + c, c < T, -1)
+            if LOOKUP:
+                pos = _mtp_lookup_positions(
+                    IDX, LOOKUP_REQ, CAPTURED_LEN, LOOKUP_QPOS, row, c, T, TAIL
+                )
+            else:
+                pos = tl.load(IDX + row * T + c, c < T, -1)
             length = tl.load(LENGTH + row)
             tl.store(COUNTS + row, tl.sum(((pos >= 0) & (pos < length)).to(tl.int32)))
 
@@ -156,6 +187,9 @@ def fused_kv_prepare(
     if rows == 0:
         return
     heads, dim = k_cache.shape[1:]
+    lookup = isinstance(indices, DeferredMtpSparseIndices)
+    if lookup:
+        assert compress_ratio == 1
     stride = packed_k.shape[0] // rows
     block = 8 if compress_ratio > 1 and rows <= 4 else 16
     _qsa_fused_kv_prepare[(rows * heads * (triton.cdiv(stride, block) + 2),)](
@@ -166,12 +200,15 @@ def fused_kv_prepare(
         loc,
         req_to_token,
         row_requests,
-        indices,
+        indices.indices if lookup else indices,
         sequence_lengths,
         query_positions,
         counts,
         packed_k,
         packed_v,
+        indices.requests if lookup else None,
+        indices.captured_len if lookup else None,
+        indices.positions if lookup else None,
         heads,
         dim,
         req_to_token.stride(0),
@@ -189,5 +226,7 @@ def fused_kv_prepare(
         input_topk,
         chain_positions,
         visible_page_size if compress_ratio > 1 else 0,
+        lookup,
+        indices.tail_width if lookup else 0,
         num_warps=4,
     )

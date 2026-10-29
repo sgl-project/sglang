@@ -534,8 +534,18 @@ crate-type = ["cdylib"]
             self.assertEqual(spaced_build.environment["CC_SHELL_ESCAPED_FLAGS"], "1")
             self.assertIn(f"'{spaced_header}'", spaced_build.environment["CXXFLAGS"])
 
-            fake_torch.__version__ = "2.15.0"
-            with self.assertRaisesRegex(RuntimeError, "PyTorch 2.11 through 2.14"):
+            fake_torch.__version__ = "2.15.0+cu134"
+            torch_215_build = torch_build_configuration(
+                compat_header=compat_header,
+                python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
+                torch_module=fake_torch,
+            )
+            self.assertEqual(
+                torch_215_build.fingerprint["torch_version"], "2.15.0+cu134"
+            )
+
+            fake_torch.__version__ = "2.16.0"
+            with self.assertRaisesRegex(RuntimeError, "PyTorch 2.11 through 2.15"):
                 torch_build_configuration(
                     compat_header=compat_header,
                     python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",

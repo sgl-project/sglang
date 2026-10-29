@@ -6,6 +6,8 @@ import triton.language as tl
 
 from sglang.kernels.numerics import round_bf16_to_fp32
 
+from sglang.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
+
 _QWEN4_HC_COUNT = 4
 _QWEN4_HIDDEN_SIZE = 2560
 
@@ -90,7 +92,11 @@ def _qwen4_gate_reduce_kernel(
     HIDDEN_SIZE: tl.constexpr,
     HC_COUNT: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    PDL_SMALL: tl.constexpr = False,
 ):
+    # Protect dynamic reads and reused-buffer writes before relaxing this edge.
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
     group = tl.program_id(0)
     hidden = tl.arange(0, BLOCK_SIZE)
     mask = hidden < HIDDEN_SIZE
@@ -109,6 +115,8 @@ def _qwen4_gate_reduce_kernel(
         value_ptr + (group // HC_COUNT) * HIDDEN_SIZE + hidden, mask, other=0
     ).to(tl.float32)
     tl.store(output_ptr + group * HIDDEN_SIZE + hidden, activated * value, mask)
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def can_fuse_qwen4_gate_reduce(key, query, value):
@@ -143,5 +151,7 @@ def fused_qwen4_gate_reduce(key, query, value):
             HC_COUNT=_QWEN4_HC_COUNT,
             BLOCK_SIZE=triton.next_power_of_2(_QWEN4_HIDDEN_SIZE),
             enable_fp_fusion=False,
+            launch_pdl=_PDL_SMALL,
+            PDL_SMALL=_PDL_SMALL,
         )
     return output

@@ -20,6 +20,7 @@ from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
     Q_MODE_CUMSUM,
     Q_MODE_NONE,
     Q_MODE_STRIDED,
+    update_draft_step_seqlens,
     update_trtllm_mha_graph_metadata,
 )
 from sglang.srt.environ import envs
@@ -1393,3 +1394,137 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+@pytest.mark.parametrize("bs", [1, 3, 16, 128])
+def test_shared_draft_metadata_reads_what_each_step_writes(bs):
+    """SGLANG_Q35MF_DRAFT_SHARED_METADATA: one page table written at the last draft step's
+    length plus one launch for the other steps' lengths give every step the cache_seqlens,
+    cu_seqlens_k and live page-table prefix its own update writes, bit for bit."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    steps, pool_size, max_num_pages = 5, 160, 16
+    req_to_token, req_pool_indices, seq_lens, _, _ = _build_inputs(
+        bs, pool_size, max_num_pages, None, (max_num_pages - 2) * PAGE_SIZE, 4321 + bs
+    )
+    seq_lens[0] = PAGE_SIZE - 2  # the later steps cross into the next page
+    common = dict(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        bs=bs,
+        max_seq_pages=max_num_pages,
+        page_size=PAGE_SIZE,
+    )
+    want = []
+    for step in range(steps):
+        lens = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+        cu_lens = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+        table = torch.zeros(bs, max_num_pages, dtype=torch.int32, device=DEVICE)
+        update_trtllm_mha_graph_metadata(
+            cache_seqlens=lens,
+            cu_seqlens_k=cu_lens,
+            page_table=table,
+            seqlen_offset=step + 1,
+            **common,
+        )
+        want.append((lens, cu_lens, table))
+
+    lens = torch.zeros(steps, bs, dtype=torch.int32, device=DEVICE)
+    cu_lens = torch.zeros(steps, bs + 1, dtype=torch.int32, device=DEVICE)
+    table = torch.zeros(bs, max_num_pages, dtype=torch.int32, device=DEVICE)
+    update_trtllm_mha_graph_metadata(
+        cache_seqlens=lens[-1],
+        cu_seqlens_k=cu_lens[-1],
+        page_table=table,
+        seqlen_offset=steps,
+        **common,
+    )
+    update_draft_step_seqlens(
+        seq_lens=seq_lens,
+        cache_seqlens=lens,
+        cu_seqlens_k=cu_lens,
+        bs=bs,
+        steps=steps - 1,
+        first_offset=1,
+    )
+    torch.cuda.synchronize()
+    for step, (want_lens, want_cu, want_table) in enumerate(want):
+        assert torch.equal(lens[step], want_lens)
+        assert torch.equal(cu_lens[step], want_cu)
+        for row in range(bs):
+            live = -(-int(want_lens[row]) // PAGE_SIZE)
+            assert torch.equal(table[row, :live], want_table[row, :live])
+
+
+def test_shared_draft_metadata_binds_one_table_and_one_update(monkeypatch):
+    """With SGLANG_Q35MF_DRAFT_SHARED_METADATA the multi-step draft backend binds every
+    step's metadata to one page table and to rows of shared length buffers, runs only the
+    last step's update in the graph body and points every step at its captured metadata."""
+    from sglang.srt.layers.attention.trtllm_mha_backend import (
+        TRTLLMHAAttnMultiStepDraftBackend,
+    )
+
+    steps, max_bs = 3, 4
+    calls = []
+
+    def step_backend(i):
+        b = SimpleNamespace(
+            device=torch.device("cpu"),
+            use_sliding_window_kv_pool=False,
+            kv_index_translator=SimpleNamespace(is_translating=False),
+            forward_metadata=None,
+        )
+
+        def init_state(max_bs, max_num_tokens):
+            b.decode_cuda_graph_metadata = {
+                "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32),
+                "cu_seqlens_k": torch.zeros(max_bs + 1, dtype=torch.int32),
+                "page_table_draft_decode": torch.zeros(max_bs, 8, dtype=torch.int32),
+            }
+
+        b.init_cuda_graph_state = init_state
+        b.init_forward_metadata_in_graph = lambda fb: calls.append(("update", i))
+        return b
+
+    multi = TRTLLMHAAttnMultiStepDraftBackend.__new__(TRTLLMHAAttnMultiStepDraftBackend)
+    multi.speculative_num_steps = steps + 1
+    multi.attn_backends = [step_backend(i) for i in range(steps)]
+    multi._shared_lens = None
+    with envs.SGLANG_Q35MF_DRAFT_SHARED_METADATA.override(True):
+        multi.init_cuda_graph_state(max_bs, 16)
+    metas = [b.decode_cuda_graph_metadata for b in multi.attn_backends]
+    tables = {m["page_table_draft_decode"].data_ptr() for m in metas}
+    assert len(tables) == 1
+    lens, cu_lens = multi._shared_lens
+    assert [m["cache_seqlens"].data_ptr() for m in metas] == [
+        lens[i].data_ptr() for i in range(steps)
+    ]
+    assert [m["cu_seqlens_k"].data_ptr() for m in metas] == [
+        cu_lens[i].data_ptr() for i in range(steps)
+    ]
+
+    for i, b in enumerate(multi.attn_backends):
+        b.decode_cuda_graph_metadata[2] = ("captured", i)
+    seqs = []
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "update_draft_step_seqlens",
+        lambda **kw: seqs.append((kw["steps"], kw["first_offset"], kw["bs"])),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.forward_batch_info.build_inner_fb_view",
+        lambda fb, **kw: fb,
+    )
+    fb = SimpleNamespace(
+        batch_size=2,
+        spec_info=SimpleNamespace(is_draft_input=lambda: True),
+        seq_lens=torch.zeros(2, dtype=torch.int32),
+        encoder_lens=None,
+    )
+    multi.init_forward_metadata_in_graph(fb)
+    assert calls == [("update", steps - 1)]
+    assert seqs == [(steps - 1, 1, 2)]
+    assert [b.forward_metadata for b in multi.attn_backends[:-1]] == [
+        ("captured", i) for i in range(steps - 1)
+    ]

@@ -18,7 +18,12 @@ from sglang.kernels.spec import (
 
 __all__ = []
 
-for _fn in ("hc_combine_gate", "hc_combine_apply", "hc_combine_apply_norm"):
+for _fn in (
+    "hc_combine_gate",
+    "hc_combine_apply",
+    "hc_combine_apply_norm",
+    "hc_combine_norm_gate",
+):
     register_kernel(
         KernelSpec(
             op=f"elementwise.{_fn}",

@@ -94,6 +94,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -1654,6 +1655,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
         else:
             raw_num_token = raw_bs * self.captured_req_width
+            if ab_variants.ACTIVE and self.capture_forward_mode.is_target_verify():
+                ab_variants.tick()
             if self.require_mlp_tp_gather:
                 max_batch_size = self._max_dp_batch_size(forward_batch)
                 bs = self._pad_to_bucket(max_batch_size, self.capture_bs)

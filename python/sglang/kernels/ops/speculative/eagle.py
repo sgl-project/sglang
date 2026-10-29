@@ -1,10 +1,16 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cpu, next_power_of_2
+from sglang.kernels.ops.speculative import perfll_spec_index
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_cpu, next_power_of_2, perfll_host
 
 _is_cpu = is_cpu()
+# SGLANG_PERFLL_GLUE_LINEAR_ACCEPT, read once
+_LINEAR_ACCEPT = envs.SGLANG_PERFLL_GLUE_LINEAR_ACCEPT.get()
 
 if _is_cpu:
     from sgl_kernel import fill_accept_out_cache_loc_cpu, fill_bonus_tokens_cpu
@@ -114,6 +120,25 @@ def _verify_commit_outputs_kernel(
     ids,
     DRAFT_WIDTH: tl.constexpr,
     TRACK_INTERVAL: tl.constexpr,
+    prefix=None,
+    extend=None,
+    post_lens=None,
+    positions=None,
+    start_locs=None,
+    mrope=None,
+    MROPE_STRIDE=0,
+    EXTEND_LAYOUT: tl.constexpr = False,
+    EXTEND_MROPE: tl.constexpr = False,
+    req_pool_indices=None,
+    runner_write_window=None,
+    track_indices=None,
+    num_accept_tokens=None,
+    runner_req_pool_indices=None,
+    runner_out_cache_loc=None,
+    runner_track_indices=None,
+    published_seq_lens=None,
+    RUNNER_INPUTS: tl.constexpr = False,
+    RUNNER_TRACK: tl.constexpr = False,
 ):
     row = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     valid = row < BS
@@ -149,10 +174,42 @@ def _verify_commit_outputs_kernel(
                 - row * DRAFT_WIDTH
             )
             tl.store(track_steps + row, tl.where(crossing, track, -1), valid)
+    if EXTEND_LAYOUT:
+        # prepare_draft_extend_layout of the pre-verify lengths (the draft extend's window)
+        tl.store(prefix + row, tl.maximum(length, 0), valid)
+        tl.store(extend + row, DRAFT_WIDTH, valid)
+        tl.store(post_lens + row, length + DRAFT_WIDTH, valid)
+        tl.store(start_locs + row, row * DRAFT_WIDTH, valid)
+        tokens = row < BS * DRAFT_WIDTH
+        base = tl.load(seq_lens + (row // DRAFT_WIDTH) * SEQ_STRIDE, tokens, other=0)
+        position = tl.maximum(base.to(tl.int64), 0).to(tl.int32) + (
+            row % DRAFT_WIDTH
+        ).to(tl.int32)
+        tl.store(positions + row, position.to(tl.int64), tokens)
+        if EXTEND_MROPE:
+            for axis in tl.static_range(3):
+                tl.store(mrope + axis * MROPE_STRIDE + row, position.to(tl.int64), tokens)
+    if RUNNER_INPUTS:
+        # the draft extend runner's other inputs and the FutureMap entries (SGLANG_PERFLL_RS_D1)
+        req = tl.load(req_pool_indices + row, valid, other=0).to(tl.int64)
+        tl.store(num_accept_tokens + row, accepted, valid)
+        tl.store(runner_req_pool_indices + row, req, valid)
+        tl.store(published_seq_lens + req, length + accepted, valid)
+        if RUNNER_TRACK:
+            tl.store(
+                runner_track_indices + row,
+                tl.load(track_indices + row, valid, other=0),
+                valid,
+            )
+        # Copy the immutable write window from this iteration's KVLocPlan. Re-indexing
+        # the mutable global req_to_token table here can select a different allocation.
+        tokens = row < BS * DRAFT_WIDTH
+        loc = tl.load(runner_write_window + row, tokens, other=0).to(tl.int64)
+        tl.store(runner_out_cache_loc + row, loc, tokens)
     idx = tl.where(idx < 0, idx + PREDICT_SIZE, idx)
     token = tl.load(predict + idx * PREDICT_STRIDE, valid, other=0)
     tl.store(new_seq_lens + row, length + accepted, valid)
-    tl.store(bonus + row, token, valid)
+    tl.store(bonus + row, token.to(bonus.dtype.element_ty), valid)
 
 
 def prepare_verify_commit_outputs(
@@ -162,24 +219,92 @@ def prepare_verify_commit_outputs(
     seq_lens,
     num_draft_tokens=0,
     mamba_track_interval=0,
+    extend_layout=False,
+    extend_mrope=False,
+    bonus_dtype=torch.int32,
+    runner_inputs=None,
+    req_pool_indices=None,
+    track_indices=None,
+    runner_write_window=None,
 ):
+    """``extend_layout`` (SGLANG_PST_SPEC_EXTEND_LAYOUT, with ``num_draft_tokens``): the same
+    launch also writes ``prepare_draft_extend_layout(seq_lens, num_draft_tokens, extend_mrope)``,
+    appended to the draft-extend inputs. ``bonus_dtype``: int64 for SGLANG_PERFLL_STEP5A_BONUS_I64,
+    the dtype the relay and the next draft read. ``runner_inputs`` (SGLANG_PERFLL_RS_D1, with
+    ``extend_layout``): a perfll_step2.DraftExtendInputs, whose views of the draft extend runner's
+    static inputs the launch writes in place of fresh outputs, with the exact immutable
+    ``runner_write_window`` from this iteration's KVLocPlan, and the new lengths published
+    to its FutureMap buffer at ``req_pool_indices``."""
     bs = accept_lens.numel()
+    assert runner_inputs is None or (
+        num_draft_tokens
+        and extend_layout
+        and req_pool_indices is not None
+        and runner_write_window is not None
+        and runner_write_window.numel() == bs * num_draft_tokens
+    )
     new_seq_lens = torch.empty(
         (bs,),
         device=seq_lens.device,
         dtype=torch.promote_types(seq_lens.dtype, accept_lens.dtype),
     )
-    bonus = torch.empty((bs,), device=predict.device, dtype=torch.int32)
+    bonus = torch.empty((bs,), device=predict.device, dtype=bonus_dtype)
     last_steps = track_steps = correct = select = ids = None
     if num_draft_tokens:
         last_steps = torch.empty((bs,), device=seq_lens.device, dtype=torch.int64)
         if mamba_track_interval:
             track_steps = torch.empty_like(last_steps)
-        correct = torch.empty_like(accept_lens, memory_format=torch.contiguous_format)
-        select = torch.empty_like(last_steps)
-        ids = torch.empty((predict.numel(),), device=predict.device, dtype=torch.int64)
+        if runner_inputs is None:
+            correct = torch.empty_like(
+                accept_lens, memory_format=torch.contiguous_format
+            )
+            select = torch.empty_like(last_steps)
+            ids = torch.empty(
+                (predict.numel(),), device=predict.device, dtype=torch.int64
+            )
+        else:
+            correct = runner_inputs.num_correct_drafts
+            select = runner_inputs.select_index
+            ids = runner_inputs.input_ids
+    layout = None
+    if num_draft_tokens and extend_layout:
+        tokens = bs * num_draft_tokens
+        device = seq_lens.device
+        runner = runner_inputs
+        layout = (
+            torch.empty((bs,), dtype=torch.int32, device=device),
+            (
+                torch.empty((bs,), dtype=torch.int32, device=device)
+                if runner is None
+                else runner.extend_seq_lens
+            ),
+            (
+                torch.empty((bs,), dtype=seq_lens.dtype, device=device)
+                if runner is None
+                else runner.seq_lens
+            ),
+            (
+                (
+                    torch.empty((tokens,), dtype=torch.int64, device=device)
+                    if runner is None
+                    else runner.positions
+                ),
+                torch.empty((bs,), dtype=torch.int32, device=device),
+                (
+                    None
+                    if not extend_mrope
+                    else (
+                        torch.empty((3, tokens), dtype=torch.int64, device=device)
+                        if runner is None
+                        else runner.mrope_positions
+                    )
+                ),
+            ),
+        )
     if bs:
         size = max(bs, predict.numel()) if num_draft_tokens else bs
+        if layout is not None:
+            size = max(size, bs * num_draft_tokens)
         _verify_commit_outputs_kernel[(triton.cdiv(size, 128),)](
             predict,
             accept_index,
@@ -202,10 +327,278 @@ def prepare_verify_commit_outputs(
             ids=ids,
             DRAFT_WIDTH=num_draft_tokens,
             TRACK_INTERVAL=mamba_track_interval,
+            **(
+                dict(
+                    prefix=layout[0],
+                    extend=layout[1],
+                    post_lens=layout[2],
+                    positions=layout[3][0],
+                    start_locs=layout[3][1],
+                    mrope=layout[3][2],
+                    MROPE_STRIDE=(
+                        bs * num_draft_tokens
+                        if layout[3][2] is None
+                        else layout[3][2].stride(0)
+                    ),
+                    EXTEND_LAYOUT=True,
+                    EXTEND_MROPE=layout[3][2] is not None,
+                )
+                if layout is not None
+                else {}
+            ),
+            **(
+                dict(
+                    req_pool_indices=req_pool_indices,
+                    runner_write_window=runner_write_window,
+                    track_indices=track_indices,
+                    num_accept_tokens=runner_inputs.num_accept_tokens,
+                    runner_req_pool_indices=runner_inputs.req_pool_indices,
+                    runner_out_cache_loc=runner_inputs.out_cache_loc,
+                    runner_track_indices=runner_inputs.mamba_track_indices,
+                    published_seq_lens=runner_inputs.published_seq_lens,
+                    RUNNER_INPUTS=True,
+                    RUNNER_TRACK=runner_inputs.mamba_track_indices is not None,
+                )
+                if runner_inputs is not None
+                else {}
+            ),
         )
     if num_draft_tokens:
-        return new_seq_lens, bonus, (last_steps, track_steps), (correct, select, ids)
+        draft = (correct, select, ids) + (() if layout is None else (layout,))
+        return new_seq_lens, bonus, (last_steps, track_steps), draft
     return new_seq_lens, bonus
+
+
+@triton.jit
+def _chain_walk(
+    retrieve_index,
+    retrieve_next_token,
+    retrieve_next_sibling,
+    candidates,
+    target_predict,
+    base,
+    cols,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # VerifyTreeGreedy over the request's tree, in registers
+    last = tl.load(retrieve_index + base).to(tl.int64)
+    first = last
+    acc = tl.where(cols == 0, last, -1)
+    pred = tl.zeros([BLOCK], dtype=tl.int64)
+    num = last * 0
+    cur = last * 0
+    done = last != last
+    for _ in tl.static_range(1, WIDTH):
+        active = ~done
+        cur = tl.load(retrieve_next_token + base + cur, mask=active, other=-1)
+        cur = cur.to(tl.int64)
+        target = tl.load(target_predict + last).to(tl.int64)
+        matched = last != last
+        for _ in tl.static_range(WIDTH):
+            searching = active & (cur != -1) & ~matched
+            node = tl.load(retrieve_index + base + cur, mask=searching, other=0)
+            draft = tl.load(candidates + base + cur, mask=searching, other=0)
+            hit = searching & (draft.to(tl.int64) == target)
+            pred = tl.where(hit & (cols == last - base), target, pred)
+            num = num + hit.to(tl.int64)
+            acc = tl.where(hit & (cols == num), node.to(tl.int64), acc)
+            last = tl.where(hit, node.to(tl.int64), last)
+            matched = matched | hit
+            sibling = tl.load(
+                retrieve_next_sibling + base + cur, mask=searching & ~hit, other=-1
+            )
+            cur = tl.where(searching & ~hit, sibling.to(tl.int64), cur)
+        done = done | (active & ~matched)
+    target = tl.load(target_predict + last).to(tl.int64)
+    pred = tl.where(cols == last - base, target, pred)
+    return first, acc, pred, num
+
+
+@triton.jit
+def _chain_linear(candidates, target_predict, base, cols, WIDTH: tl.constexpr):
+    # The walk's result on a canonical chain: the longest prefix of drafts that equal the
+    # previous node's target, from one vector compare.
+    in_row = cols < WIDTH
+    tgt = tl.load(target_predict + base + cols, mask=in_row, other=0).to(tl.int64)
+    drf = tl.load(candidates + base + cols + 1, mask=cols < WIDTH - 1, other=0)
+    hit = (cols < WIDTH - 1) & (drf.to(tl.int64) == tgt)
+    num = tl.min(tl.where(hit, WIDTH - 1, cols), axis=0).to(tl.int64)
+    acc = tl.where(cols <= num, base + cols, -1)
+    pred = tl.where(cols <= num, tgt, 0)
+    return base, acc, pred, num
+
+
+@triton.jit
+def _chain_is_canonical(
+    retrieve_index,
+    retrieve_next_token,
+    retrieve_next_sibling,
+    base,
+    cols,
+    WIDTH: tl.constexpr,
+):
+    # node i is row base + i, its only child node i + 1 (none for the last)
+    in_row = cols < WIDTH
+    nxt = tl.load(retrieve_next_token + base + cols, mask=in_row, other=-1).to(tl.int64)
+    sib = tl.load(retrieve_next_sibling + base + cols, mask=in_row, other=-1).to(
+        tl.int64
+    )
+    idx = tl.load(retrieve_index + base + cols, mask=in_row, other=0).to(tl.int64)
+    want = tl.where(cols < WIDTH - 1, cols + 1, -1)
+    bad = in_row & ((nxt != want) | (sib != -1) | (idx != base + cols))
+    return tl.sum(bad.to(tl.int32), axis=0) == 0
+
+
+@triton.jit
+def _chain_accept_kernel(
+    predict,
+    accept_index,
+    num_correct_drafts,
+    accept_lens,
+    sim_accept_index,
+    candidates,
+    retrieve_index,
+    retrieve_next_token,
+    retrieve_next_sibling,
+    target_predict,
+    bonus_target,
+    simulated_acc_len,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+    VERIFY: tl.constexpr,
+    FINISH: tl.constexpr,
+    SIMULATE: tl.constexpr,
+    REAL_DRAFT_TOKENS: tl.constexpr,
+    LINEAR: tl.constexpr = False,
+):
+    # One program per request; its WIDTH nodes are rows [b * WIDTH, (b + 1) * WIDTH) of
+    # predict / candidates / retrieve_*, and accept_index is [bs, WIDTH].
+    b = tl.program_id(0).to(tl.int64)
+    base = b * WIDTH
+    cols = tl.arange(0, BLOCK)
+    in_row = cols < WIDTH
+    if VERIFY:
+        if LINEAR:
+            if _chain_is_canonical(
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                base,
+                cols,
+                WIDTH,
+            ):
+                first, acc, pred, num = _chain_linear(
+                    candidates, target_predict, base, cols, WIDTH
+                )
+            else:
+                first, acc, pred, num = _chain_walk(
+                    retrieve_index,
+                    retrieve_next_token,
+                    retrieve_next_sibling,
+                    candidates,
+                    target_predict,
+                    base,
+                    cols,
+                    WIDTH,
+                    BLOCK,
+                )
+        else:
+            first, acc, pred, num = _chain_walk(
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                candidates,
+                target_predict,
+                base,
+                cols,
+                WIDTH,
+                BLOCK,
+            )
+        tl.store(accept_index + base + cols, acc.to(tl.int32), mask=in_row)
+        if not (FINISH and SIMULATE):
+            tl.store(predict + base + cols, pred.to(tl.int32), mask=in_row)
+            tl.store(num_correct_drafts + b, num.to(tl.int32))
+    else:
+        pred = tl.load(predict + base + cols, mask=in_row, other=0).to(tl.int64)
+        first = tl.load(accept_index + base).to(tl.int64)
+        num = tl.load(num_correct_drafts + b).to(tl.int64)
+    if FINISH:
+        if SIMULATE:
+            # spec_utils.generate_simulated_accept_index_device for a length on the device
+            length = tl.load(simulated_acc_len).to(tl.int64)
+            sim = tl.where(cols < length, first + cols, -1)
+            tl.store(sim_accept_index + base + cols, sim.to(tl.int32), mask=in_row)
+            num = length - 1
+            if REAL_DRAFT_TOKENS:
+                nxt = tl.minimum(cols + 1, WIDTH - 1)
+                drafted = tl.load(candidates + base + nxt, mask=in_row, other=0)
+                bonus = tl.load(bonus_target + base + cols, mask=in_row, other=0)
+                pred = tl.where(
+                    cols < length - 1,
+                    drafted.to(tl.int32).to(tl.int64),
+                    tl.where(cols == length - 1, bonus.to(tl.int32).to(tl.int64), pred),
+                )
+            else:
+                pred = tl.full([BLOCK], 100, dtype=tl.int64)
+            tl.store(predict + base + cols, pred.to(tl.int32), mask=in_row)
+            tl.store(num_correct_drafts + b, num.to(tl.int32))
+        tl.store(accept_lens + b, (num + 1).to(tl.int32))
+
+
+def chain_accept(
+    *,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
+    bonus_target: Optional[torch.Tensor],
+    simulated_acc_len: Optional[torch.Tensor],
+    real_draft_tokens: bool,
+    verify: bool,
+    finish: bool,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """eagle_sample's tail for a chain draft whose tree width equals the accept width,
+    bitwise: with verify, verify_tree_greedy over target_predict into the (unset)
+    predict / accept_index / num_correct_drafts; with finish, the injected acceptance
+    of simulated_acc_len (device int64 [1], None when off) and the accept lengths,
+    returned with the accept index eagle_sample returns. Contiguous [bs, width] rows."""
+    bs, width = accept_index.shape
+    accept_lens = sim_accept_index = None
+    if finish:
+        accept_lens = torch.empty((bs,), dtype=torch.int32, device=predict.device)
+        if simulated_acc_len is not None:
+            sim_accept_index = torch.empty_like(accept_index)
+    if bs:
+        _chain_accept_kernel[(bs,)](
+            predict,
+            accept_index,
+            num_correct_drafts,
+            accept_lens,
+            sim_accept_index,
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            target_predict,
+            bonus_target,
+            simulated_acc_len,
+            WIDTH=width,
+            BLOCK=next_power_of_2(width),
+            VERIFY=verify,
+            FINISH=finish,
+            SIMULATE=simulated_acc_len is not None,
+            REAL_DRAFT_TOKENS=real_draft_tokens,
+            LINEAR=_LINEAR_ACCEPT,
+            num_warps=1,
+        )
+    if not finish:
+        return None
+    return accept_lens, (accept_index if sim_accept_index is None else sim_accept_index)
 
 
 @triton.jit(do_not_specialize=["BS", "TOKENS"])
@@ -317,21 +710,20 @@ def prepare_draft_extend_lengths(seq_lens, num_draft_tokens, front_offset):
 
 def prepare_draft_extend_layout(seq_lens, num_draft_tokens, with_mrope):
     bs = seq_lens.numel()
-    prefix = torch.empty((bs,), dtype=torch.int32, device=seq_lens.device)
-    extend = torch.empty_like(prefix)
-    post = torch.empty((bs,), dtype=seq_lens.dtype, device=seq_lens.device)
-    positions = torch.empty(
-        (bs * num_draft_tokens,), dtype=torch.int64, device=seq_lens.device
-    )
-    starts = torch.empty_like(prefix)
-    mrope = (
-        torch.empty(
-            (3, bs * num_draft_tokens), dtype=torch.int64, device=seq_lens.device
+    device = seq_lens.device
+    empty = perfll_host.round_empty if perfll_host.OUT_POOL else perfll_host.torch_empty
+    prefix = empty((bs,), torch.int32, device)
+    extend = empty((bs,), torch.int32, device)
+    post = empty((bs,), seq_lens.dtype, device)
+    positions = empty((bs * num_draft_tokens,), torch.int64, device)
+    starts = empty((bs,), torch.int32, device)
+    mrope = empty((3, bs * num_draft_tokens), torch.int64, device) if with_mrope else None
+    if bs and not (
+        perfll_spec_index.ENABLED
+        and perfll_spec_index.extend_layout(
+            seq_lens, num_draft_tokens, prefix, extend, post, positions, starts, mrope
         )
-        if with_mrope
-        else None
-    )
-    if bs:
+    ):
         _prepare_draft_extend_lengths_kernel[
             (triton.cdiv(bs * num_draft_tokens, 128),)
         ](
@@ -421,28 +813,41 @@ def build_chain_tree(
     bs, depth = draft_tokens.shape
     width = depth + 1
     assert bonus_tokens.numel() == seq_lens.numel() == bs
+    device = seq_lens.device
+    empty = perfll_host.round_empty if perfll_host.OUT_POOL else perfll_host.torch_empty
     mask = tree_mask_buf
     if mask is None:
-        mask = torch.empty(
-            (bs * width * width,), dtype=torch.bool, device=seq_lens.device
-        )
+        mask = empty((bs * width * width,), torch.bool, device)
     assert mask.is_contiguous() and mask.numel() >= bs * width * width
-    positions = torch.empty((bs * width,), dtype=torch.int64, device=seq_lens.device)
-    retrieve = torch.empty((3, bs, width), dtype=torch.int64, device=seq_lens.device)
-    tokens = torch.empty(
+    positions = empty((bs * width,), torch.int64, device)
+    retrieve = empty((3, bs, width), torch.int64, device)
+    tokens = empty(
         (bs * width,),
-        dtype=torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
-        device=seq_lens.device,
+        torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
+        device,
     )
-    out_cache_loc = torch.empty_like(positions) if req_to_token is not None else None
-    mrope = (
-        torch.empty((3, bs * width), dtype=torch.int64, device=seq_lens.device)
-        if with_mrope
-        else None
+    out_cache_loc = (
+        empty((bs * width,), torch.int64, device) if req_to_token is not None else None
     )
+    mrope = empty((3, bs * width), torch.int64, device) if with_mrope else None
     if req_to_token is not None:
         assert req_pool_indices is not None and req_pool_indices.numel() == bs
-    if bs:
+    if bs and not (
+        perfll_spec_index.ENABLED
+        and perfll_spec_index.chain_tree(
+            bonus_tokens,
+            draft_tokens,
+            seq_lens,
+            mask,
+            positions,
+            retrieve,
+            tokens,
+            req_pool_indices,
+            req_to_token,
+            out_cache_loc,
+            mrope,
+        )
+    ):
         _build_chain_tree_kernel[(triton.cdiv(bs * width * width, 128),)](
             bonus_tokens,
             draft_tokens,

@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.eagle import (
     prepare_draft_extend_lengths,
     prepare_verify_commit_outputs,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -24,6 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.speculative import perfll_step2
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -39,7 +41,8 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.kernels.ops.speculative import perfll_spec_index
+from sglang.srt.utils import host_trace, is_cpu, perfll_host
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -49,6 +52,8 @@ from sglang.srt.utils.common import is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+# SGLANG_PERFLL_STEP5A_DRAFT_LOCS: a staged draft's write slots are the staged buffer itself
+_STAGED_DRAFT_LOCS = envs.SGLANG_PERFLL_STEP5A_DRAFT_LOCS.get()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -123,9 +128,12 @@ def prepare_for_draft_extend(
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
     iteration_ids: Optional[IterationIds] = None,
+    prepared_layout: Optional[tuple] = None,
 ):
     """``iteration_ids``: the iteration's plan, whose window the draft extend
-    writes again (the verify window); a widened window plans its own."""
+    writes again (the verify window); a widened window plans its own.
+    ``prepared_layout``: ``prepare_draft_extend_layout``'s outputs for these lengths, from
+    the post-verify graph (SGLANG_PST_SPEC_EXTEND_LAYOUT)."""
     bs = len(batch.seq_lens)
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
     # rows below the boundary. Locs/positions arrive precomputed; token/hidden
@@ -169,13 +177,17 @@ def prepare_for_draft_extend(
     fused_lengths = gpu_only and batch.seq_lens.is_cuda
     extend_position_info = None
     if fused_lengths and not widen and draft_extend_input.positions is None:
-        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
-            prepare_draft_extend_layout(
-                batch.seq_lens,
-                num_draft_tokens,
-                draft_model_runner.model_config.model_is_mrope
-                and all(x is None for x in batch.multimodal_inputs),
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        if prepared_layout is not None and (prepared_layout[3][2] is not None) == with_mrope:
+            layout = prepared_layout
+        else:
+            layout = prepare_draft_extend_layout(
+                batch.seq_lens, num_draft_tokens, with_mrope
             )
+        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
+            layout
         )
     elif fused_lengths:
         batch.prefix_lens, batch.extend_lens, post_seq_lens = (
@@ -202,6 +214,8 @@ def prepare_for_draft_extend(
         if batch.forward_mode.is_idle()
         else ForwardMode.DRAFT_EXTEND_V2
     )
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.EPA)
     forward_batch = ForwardBatch.init_new(
         batch,
         draft_model_runner,
@@ -210,6 +224,8 @@ def prepare_for_draft_extend(
         extend_position_info=extend_position_info,
         iteration_ids=None if widen else iteration_ids,
     )
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.EPB)
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
     forward_batch.seq_lens = (
@@ -251,11 +267,14 @@ def prepare_for_draft(
     *,
     target_translator: Optional[RunnerIds] = None,
     num_draft_tokens: Optional[int] = None,
+    staged: Any = None,
 ) -> tuple[ForwardBatch, bool, Optional[IterationIds]]:
     """The draft-decode batch. With ``target_translator``, a chain draft plans
     the iteration's whole write window (the ``num_draft_tokens`` slots past
     ``seq_lens`` that verify and draft extend also write) and writes its first
-    ``num_steps`` columns; that plan is returned, else None."""
+    ``num_steps`` columns; that plan is returned, else None. ``staged``: those
+    slots and positions as the previous post-verify graph wrote them
+    (perfll_step2.NextDraft, SGLANG_PERFLL_STEP2=3), taken instead of a launch."""
     prepared_positions = None
     prepared_mrope_positions = None
     iteration_ids = None
@@ -274,31 +293,64 @@ def prepare_for_draft(
         # A chain draft's slots lead the iteration's window: gather the whole
         # window in the same launch.
         window_cols = num_draft_tokens if plans_window else num_steps
-        if page_size == 1 or topk == 1:
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * window_cols,),
-                dtype=torch.int64,
-                device=batch.device,
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        if staged is not None and perfll_step2.takes_staging(
+            staged, num_requests=bs, plans_window=plans_window, with_mrope=with_mrope
+        ):
+            batch.out_cache_loc = staged.window
+            prepared_positions = staged.positions
+            prepared_mrope_positions = staged.mrope
+            iteration_ids = target_translator.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                write_virtual=batch.out_cache_loc,
+                read_extent=num_draft_tokens,
+            )
+            if _STAGED_DRAFT_LOCS:
+                # the same launch wrote them from the same slots as the window's first columns
+                iteration_ids.take_staged_cols(
+                    slice(0, num_steps), staged.draft_out_cache_loc
+                )
+        elif page_size == 1 or topk == 1:
+            empty = perfll_host.round_empty if perfll_host.OUT_POOL else perfll_host.torch_empty
+            batch.out_cache_loc = empty(
+                (bs * topk * window_cols,), torch.int64, batch.device
             )
             if batch.seq_lens.is_cuda and topk == 1:
-                prepared_positions = torch.empty_like(batch.seq_lens)
+                prepared_positions = empty((bs,), batch.seq_lens.dtype, batch.seq_lens.device)
                 if draft_model_runner.model_config.model_is_mrope and all(
                     x is None for x in batch.multimodal_inputs
                 ):
-                    prepared_mrope_positions = torch.empty(
-                        (3, bs), dtype=torch.int64, device=batch.device
-                    )
-            # TODO(lsyin): align with the default code path
-            assign_draft_cache_locs_contiguous_func(
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                topk,
-                window_cols,
-                positions=prepared_positions,
-                mrope=prepared_mrope_positions,
-            )
+                    prepared_mrope_positions = empty((3, bs), torch.int64, batch.device)
+            if not (
+                perfll_spec_index.ENABLED
+                and perfll_spec_index.draft_locs(
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    req_to_token_pool.req_to_token.shape[1],
+                    topk,
+                    window_cols,
+                    bs,
+                    prepared_positions,
+                    prepared_mrope_positions,
+                )
+            ):
+                # TODO(lsyin): align with the default code path
+                assign_draft_cache_locs_contiguous_func(
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    topk,
+                    window_cols,
+                    positions=prepared_positions,
+                    mrope=prepared_mrope_positions,
+                )
             if plans_window:
                 iteration_ids = target_translator.plan(
                     req_pool_indices=batch.req_pool_indices,
@@ -347,6 +399,8 @@ def prepare_for_draft(
                 page_size,
             )
 
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.PDA)
     # Get a forward batch
     # Actual width of the next draft-decode forward: topk tokens per req.
     draft_input.num_tokens_per_req = topk
@@ -370,6 +424,8 @@ def prepare_for_draft(
         iteration_ids=iteration_ids,
         write_cols=None if iteration_ids is None else slice(0, num_steps),
     )
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.PDB)
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
@@ -470,6 +526,8 @@ def build_eagle_verify_input(
         retrieve_next_sibling,
         draft_tokens,
     ) = tree_outputs
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.BVA)
 
     return EagleVerifyInput(
         draft_token=draft_tokens,
@@ -581,6 +639,8 @@ def run_eagle_verify(
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.VPA)
 
     bs = len(batch.seq_lens)
 
@@ -590,7 +650,7 @@ def run_eagle_verify(
         if plan_stream is not None:
             # Verify prep copies draft-produced tree metadata on the plan stream,
             # so it must not start before the draft frontier.
-            plan_stream.wait_stream(fwd_stream)
+            perfll_host.wait_stream(plan_stream, fwd_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,
@@ -603,7 +663,11 @@ def run_eagle_verify(
 
     # Correct some buffers due to the overlap plan
     if plan_stream:
-        torch.get_device_module(device).current_stream().wait_stream(plan_stream)
+        perfll_host.wait_stream(
+            torch.get_device_module(device).current_stream(), plan_stream
+        )
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.VPD)
         if (
             _is_npu
             and target_worker.model_runner.model_config.model_is_mrope
@@ -629,6 +693,8 @@ def run_eagle_verify(
             ),
         )
 
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.VP1)
     # Must stay ahead of the target verify launch below.
     grammar_tree = (
         GrammarTree.from_device(
@@ -662,6 +728,8 @@ def run_eagle_verify(
         is_verify=True,
         pp_proxy_tensors=pp_proxy_tensors,
     )
+    if host_trace.ENABLED:
+        host_trace.mark(host_trace.VF1)
     logits_output = forward_batch_output.logits_output
 
     kvcache = token_to_kv_pool_allocator.get_kvcache()

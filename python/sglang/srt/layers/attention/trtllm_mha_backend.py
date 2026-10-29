@@ -21,6 +21,7 @@ import torch
 from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
     Q_MODE_NONE,
     Q_MODE_STRIDED,
+    update_draft_step_seqlens,
     update_trtllm_mha_graph_metadata,
 )
 from sglang.kernels.ops.attention.trtllm_mha_page_table import (
@@ -408,6 +409,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             "trtllm_mha_default_kv_scale",
             lambda: torch.ones(1, dtype=torch.float32, device=self.device),
         )
+        self._cp_lite = None
+        if (
+            envs.SGLANG_TRTL1_ATTN_CP.get()
+            and not self.is_xqa_impl
+            and not self.is_nvfp4_kvcache
+            and self.data_type == torch.float8_e4m3fn
+            and self.page_size == 64
+        ):
+            from sglang.srt.layers.attention.q35_cp_lite import CpLite
+
+            self._cp_lite = CpLite.maybe_create(config, self.device)
         self.decode_seq_len_splits = envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.get()
         if self.decode_seq_len_splits < 1:
             raise ValueError(
@@ -1665,6 +1677,34 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if self.decode_uses_native_fp4 and not self.is_xqa_impl
             else None
         )
+        o = None
+        if self._cp_lite is not None and attention_sink is None and native_out is None:
+            o = self._cp_lite.attend(
+                q,
+                kv_cache,
+                page_table,
+                self.forward_metadata.cache_seqlens_int32,
+                1,
+                bmm1_scale,
+                bmm2_scale,
+                self.workspace_buffer,
+                layer,
+                forward_batch,
+                stock=lambda seq_lens, out: self._run_fixed_q_len_decode(
+                    q,
+                    kv_cache,
+                    page_table,
+                    seq_lens,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=layer.sliding_window_size,
+                    sinks=None,
+                    out=out,
+                    kv_cache_sf=kv_cache_block_scales,
+                ),
+            )
+        if o is not None:
+            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
         o = self._run_fixed_q_len_decode(
             q,
             kv_cache,
@@ -1867,21 +1907,54 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     if self.forward_metadata.max_seq_len_q > 1
                     else None
                 )
-                o = self._run_fixed_q_len_decode(
-                    q,
-                    kv_cache,
-                    page_table,
-                    self.forward_metadata.cache_seqlens_int32,
-                    bmm1_scale=bmm1_scale,
-                    bmm2_scale=bmm2_scale,
-                    window_left=layer.sliding_window_size,
-                    sinks=attention_sink,
-                    out=native_out,
-                    out_dtype=(None if uses_native_fp4 else self.q_data_type),
-                    kv_cache_sf=kv_cache_block_scales,
-                    q_len_per_req=self.forward_metadata.max_seq_len_q,
-                    mask=mask,
-                )
+                o = None
+                if (
+                    self._cp_lite is not None
+                    and attention_sink is None
+                    and not uses_native_fp4
+                ):
+                    o = self._cp_lite.attend(
+                        q,
+                        kv_cache,
+                        page_table,
+                        self.forward_metadata.cache_seqlens_int32,
+                        self.forward_metadata.max_seq_len_q,
+                        bmm1_scale,
+                        bmm2_scale,
+                        self.workspace_buffer,
+                        layer,
+                        forward_batch,
+                        stock=lambda seq_lens, out: self._run_fixed_q_len_decode(
+                            q,
+                            kv_cache,
+                            page_table,
+                            seq_lens,
+                            bmm1_scale=bmm1_scale,
+                            bmm2_scale=bmm2_scale,
+                            window_left=layer.sliding_window_size,
+                            sinks=None,
+                            out=out,
+                            kv_cache_sf=kv_cache_block_scales,
+                            q_len_per_req=self.forward_metadata.max_seq_len_q,
+                            mask=mask,
+                        ),
+                    )
+                if o is None:
+                    o = self._run_fixed_q_len_decode(
+                        q,
+                        kv_cache,
+                        page_table,
+                        self.forward_metadata.cache_seqlens_int32,
+                        bmm1_scale=bmm1_scale,
+                        bmm2_scale=bmm2_scale,
+                        window_left=layer.sliding_window_size,
+                        sinks=attention_sink,
+                        out=native_out,
+                        out_dtype=(None if uses_native_fp4 else self.q_data_type),
+                        kv_cache_sf=kv_cache_block_scales,
+                        q_len_per_req=self.forward_metadata.max_seq_len_q,
+                        mask=mask,
+                    )
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard
             # masking); the plain-causal fmha_v2 call below would be wrong.
@@ -2053,6 +2126,8 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
                     self.window_kv_indptr[i] if self.window_rail else None
                 ),
             )
+        # (lens, cu_lens) under SGLANG_Q35MF_DRAFT_SHARED_METADATA, set with the graph state
+        self._shared_lens = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # Each step writes its window layers at its own slice of the draft's
@@ -2064,6 +2139,29 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
+        # SGLANG_Q35MF_DRAFT_SHARED_METADATA: every step's metadata views one page table
+        # and one row of shared length buffers (bound before capture builds the views)
+        self._shared_lens = None
+        steps = self.speculative_num_steps - 1
+        if not (
+            envs.SGLANG_Q35MF_DRAFT_SHARED_METADATA.get()
+            and steps > 1
+            and all(
+                not b.use_sliding_window_kv_pool
+                and not b.runner_ids.is_translating
+                for b in self.attn_backends[:steps]
+            )
+        ):
+            return
+        device = self.attn_backends[0].device
+        lens = torch.zeros(steps, max_bs, dtype=torch.int32, device=device)
+        cu_lens = torch.zeros(steps, max_bs + 1, dtype=torch.int32, device=device)
+        last = self.attn_backends[steps - 1].decode_cuda_graph_metadata
+        for i in range(steps):
+            m = self.attn_backends[i].decode_cuda_graph_metadata
+            m["cache_seqlens"], m["cu_seqlens_k"] = lens[i], cu_lens[i]
+            m["page_table_draft_decode"] = last["page_table_draft_decode"]
+        self._shared_lens = (lens, cu_lens)
 
     def init_forward_metadata_out_graph(
         self,
@@ -2101,8 +2199,25 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             forward_mode=ForwardMode.DECODE,
             encoder_lens=forward_batch.encoder_lens,
         )
-        # The captured metadata kernel derives each step's window write ids
-        # from that step's own slice of the draft's write ids.
-        for i in range(self.speculative_num_steps - 1):
-            with self._step_writes(inner_fb, i):
-                self.attn_backends[i].init_forward_metadata_in_graph(inner_fb)
+        steps = self.speculative_num_steps - 1
+        if self._shared_lens is None:
+            for i in range(steps):
+                with self._step_writes(inner_fb, i):
+                    self.attn_backends[i].init_forward_metadata_in_graph(inner_fb)
+            return
+        # The last step's update writes the shared page table at the longest length (each
+        # step reads only its own live prefix); one launch writes the other steps' lengths.
+        self.attn_backends[steps - 1].init_forward_metadata_in_graph(inner_fb)
+        lens, cu_lens = self._shared_lens
+        bs = forward_batch.batch_size
+        update_draft_step_seqlens(
+            seq_lens=inner_fb.seq_lens,
+            cache_seqlens=lens,
+            cu_seqlens_k=cu_lens,
+            bs=bs,
+            steps=steps - 1,
+            first_offset=1,
+        )
+        for i in range(steps - 1):
+            b = self.attn_backends[i]
+            b.forward_metadata = b.decode_cuda_graph_metadata[bs]

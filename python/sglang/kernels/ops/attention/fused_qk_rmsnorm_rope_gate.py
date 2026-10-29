@@ -7,12 +7,15 @@ mrope positions, and gate deinterleave for Qwen3.5's interleaved Q+Gate layout.
 (token, head) pair. Q programs also copy the gate slice.
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
+
+from sglang.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
 
 
 def _pdl_supported() -> bool:
@@ -27,6 +30,7 @@ def _pdl_supported() -> bool:
 
 
 _ENABLE_PDL = _pdl_supported()
+_Q38C_QSA_PDL_FIX = os.environ.get("SGLANG_Q38C_QSA_PDL_FIX", "0") == "1"
 
 
 @triton.jit
@@ -63,6 +67,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     ENABLE_PDL: tl.constexpr,
     WEIGHT_SHIFT: tl.constexpr = 1.0,
     EXPLICIT_ROPE_FMA: tl.constexpr = False,
+    WAIT_PRIMARY: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -85,6 +90,9 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     # Full load -> RMSNorm variance
     head_offs = tl.arange(0, HEAD_BLOCK)
     head_mask = head_offs < HEAD_DIM
+    if WAIT_PRIMARY:
+        # QKV is dynamic producer output; an early PDL launch must wait for it.
+        tl.extra.cuda.gdc_wait()
     x = tl.load(in_base + head_offs, mask=head_mask, other=0.0).to(tl.float32)
     w = tl.load(w_ptr + head_offs, mask=head_mask, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=0) / HEAD_DIM
@@ -199,6 +207,17 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     rot_half_block = triton.next_power_of_2(half_rotary)
 
     grid = (T, num_q_heads + num_kv_heads)
+    pdl_fix = (
+        _ENABLE_PDL
+        and (
+            (_Q38C_QSA_PDL_FIX and T == 4 and (num_q_heads, num_kv_heads) == (24, 2))
+            or (_PDL_SMALL and (num_q_heads, num_kv_heads) == (6, 1))
+        )
+        and q_gate.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and (head_dim, rotary_dim) == (256, 64)
+        and has_gate
+    )
     _fused_qk_rmsnorm_rope_gate_kernel[grid](
         q_gate,
         k,
@@ -230,6 +249,8 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         HAS_GATE=has_gate,
         MROPE=mrope,
         ENABLE_PDL=_ENABLE_PDL,
+        WAIT_PRIMARY=pdl_fix,
+        launch_pdl=pdl_fix,
     )
 
     return q_out, k_out, gate_out if has_gate else None

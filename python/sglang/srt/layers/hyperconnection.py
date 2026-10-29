@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from typing import Optional
 
@@ -7,6 +8,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
+
+_HC_MACRO = envs.SGLANG_HC_MACRO.get()
+_HC_MACRO_MIN_ROWS = max(1, envs.SGLANG_HC_MACRO_MIN_ROWS.get())
+_HC_MACRO_MAX_ROWS = 32
+_SPLITK_MIX_MAX_ROWS = 32 if _HC_MACRO else 24
 
 
 @lru_cache(None)
@@ -166,6 +174,34 @@ class GatedResidual(HyperConnectionBase):
             self._mix_up_weight_padded = None
 
         self._gate_stream = None
+        self._splitk_mix_max_rows = (
+            _SPLITK_MIX_MAX_ROWS if get_parallel().tp_size == 1 else 24
+        )
+        self._macro_ok = (
+            _HC_MACRO
+            and get_parallel().tp_size == 1
+            and self.hc_count == 4
+            and self.hidden_size == 2560
+            and config.hc_per_branch_norm
+            and config.params_dtype == torch.bfloat16
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] == 10
+        )
+        self._macro_gate_ok = False
+        # The existing BF16 combine/next-norm kernel admits at most four rows.
+        # Resolve once before graph capture; the default retains the M=1 path.
+        self._gate_max_rows = (
+            16 if envs.SGLANG_Q38_HC_SMALLM16.get()
+            else 4 if envs.SGLANG_Q38_HC_SMALLM4.get() else 1
+        )
+        if os.environ.get("SGLANG_Q38C_HC_P2_M16_GATE", "0") == "1":
+            self._gate_max_rows = 32
+        self._hc_combine_parts = (
+            envs.SGLANG_Q38_HC_COMBINE_PARTS.get()
+            if envs.SGLANG_Q38_HC_SMALLM16.get() else 2
+        )
+        if self._hc_combine_parts not in (1, 2):
+            raise ValueError("HC combine parts must be 1 or 2")
         if use_combine:
             self.block_inject_weight = nn.Linear(
                 self.hidden_size * self.hc_count,
@@ -184,7 +220,11 @@ class GatedResidual(HyperConnectionBase):
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
-            if (
+            # The macro gate runs on the current stream, before the combine; the
+            # stock one-row gate keeps its side stream unless the macro takes
+            # one row too.
+            self._macro_gate_ok = self._macro_ok
+            if (not self._macro_ok or _HC_MACRO_MIN_ROWS > 1) and (
                 self.hc_count == 4
                 and self.hidden_size == 2560
                 and config.hc_per_branch_norm
@@ -233,11 +273,22 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
+    def _macro_rows(self, rows: int) -> bool:
+        """Whether the fused boundary serves this many rows; elsewhere the gate
+        partials, if any, come from the stock side stream."""
+        return self._macro_ok and _HC_MACRO_MIN_ROWS <= rows <= _HC_MACRO_MAX_ROWS
+
     def mix(
         self,
         hyper_input: torch.Tensor,
         normalized_input: Optional[torch.Tensor] = None,
+        partials: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+        """Mix the streams down for a block; return it and the write-back state.
+
+        ``partials`` are this read's gate partials, prepared with
+        ``normalized_input`` by the preceding ``combine_and_normalize``.
+        """
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
@@ -245,6 +296,8 @@ class GatedResidual(HyperConnectionBase):
             )
             return mixed_input, (hyper_input, hyper_input, None)
 
+        if partials is not None:
+            assert normalized_input is not None
         if normalized_input is not None:
             assert self.config.hc_per_branch_norm
             assert normalized_input.shape == hyper_input.shape
@@ -255,11 +308,42 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
+        # First/PLE/MTP-entry reads have no prepared gate from a predecessor.
+        if (
+            partials is None
+            and self._macro_gate_ok
+            and self._macro_rows(hyper_input.shape[0])
+            and hyper_input_normed.dtype == torch.bfloat16
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine_decode import hc_combine_gate
+
+            partials = hc_combine_gate(
+                hyper_input_normed, self.block_inject_weight.weight
+            )
+        # Retain FN's side-stream producer for all non-macro row counts.
+        stream = self._gate_stream
+        if (
+            stream is not None
+            and partials is None
+            and not self._macro_rows(hyper_input.shape[0])
+            and 0 < hyper_input.shape[0] <= self._gate_max_rows
+            and hyper_input.dtype == torch.bfloat16
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine_decode import hc_combine_gate
+
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                partials = hc_combine_gate(
+                    hyper_input_normed, self.block_inject_weight.weight
+                )
+            hyper_input_normed.record_stream(stream)
         if (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
-            and hyper_input_normed.shape[0] <= 24
+            and hyper_input_normed.shape[0] <= self._splitk_mix_max_rows
         ):
             from sglang.kernels.ops.gemm.hc_mix_splitk import (
                 hc_mix,
@@ -297,22 +381,6 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
-        partials = None
-        stream = self._gate_stream
-        if (
-            stream is not None
-            and hyper_input.shape[0] == 1
-            and hyper_input.dtype == torch.bfloat16
-            and not torch.compiler.is_compiling()
-        ):
-            from sglang.kernels.ops.elementwise.hc_combine_decode import hc_combine_gate
-
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                partials = hc_combine_gate(
-                    hyper_input_normed, self.block_inject_weight.weight
-                )
-            hyper_input_normed.record_stream(stream)
         return mixed_input, (hyper_input, hyper_input_normed, partials)
 
     def combine_and_normalize(
@@ -320,15 +388,50 @@ class GatedResidual(HyperConnectionBase):
         block_output: torch.Tensor,
         residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
         next_norm: Optional[GroupedGemmaRMSNorm],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Return the residual and its next HC normalization explicitly.
+        next_inject_weight: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Return the residual, its next HC normalization and the next gate
+        partials explicitly: ``(combined, normalized, partials)``.
 
         The BF16 combine result is retained before calculating the next norm.
-        Callers must only pass the norm when no PLE or other update intervenes.
+        Callers must only pass the norm when no PLE or other update intervenes,
+        and ``next_inject_weight`` only with the norm of the read it gates.
+        The next normalization and partials are None where not prepared.
         """
         hyper_input, _, partials = residuals
         if (
             partials is not None
+            and self._macro_rows(block_output.shape[0])
+            and next_norm is not None
+            and next_norm.group_size == self.hidden_size
+            and next_norm.weight.dtype == torch.bfloat16
+            and block_output.dtype == torch.bfloat16
+            and hyper_input.dtype == torch.bfloat16
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine_decode import (
+                hc_combine_norm_gate,
+            )
+
+            if next_inject_weight is not None and (
+                next_inject_weight.dtype != torch.bfloat16
+                or tuple(next_inject_weight.shape)
+                != (self.hc_count, self.hc_count * self.hidden_size)
+            ):
+                next_inject_weight = None
+            return hc_combine_norm_gate(
+                block_output,
+                hyper_input,
+                partials,
+                next_norm.weight,
+                next_norm.variance_epsilon,
+                next_inject_weight,
+            )
+        if (
+            partials is not None
+            # Stock: only the side-stream gate (one row) prepares partials.
+            and self._gate_stream is not None
+            and not self._macro_rows(block_output.shape[0])
             and next_norm is not None
             and next_norm.group_size == self.hidden_size
             and next_norm.weight.dtype == torch.bfloat16
@@ -341,14 +444,16 @@ class GatedResidual(HyperConnectionBase):
             current = torch.cuda.current_stream()
             current.wait_stream(self._gate_stream)
             partials.record_stream(current)
-            return hc_combine_apply_norm(
+            combined, normalized = hc_combine_apply_norm(
                 block_output,
                 hyper_input,
                 partials,
                 next_norm.weight,
                 next_norm.variance_epsilon,
+                parts=self._hc_combine_parts,
             )
-        return self.combine(block_output, residuals), None
+            return combined, normalized, None
+        return self.combine(block_output, residuals), None, None
 
     def combine(
         self,
@@ -361,9 +466,13 @@ class GatedResidual(HyperConnectionBase):
                 hc_combine_apply,
             )
 
-            current = torch.cuda.current_stream()
-            current.wait_stream(self._gate_stream)
-            partials.record_stream(current)
+            if self._gate_stream is not None and not self._macro_rows(
+                block_output.shape[0]
+            ):
+                # Made on the side stream; the macro path makes them on this one.
+                current = torch.cuda.current_stream()
+                current.wait_stream(self._gate_stream)
+                partials.record_stream(current)
             return hc_combine_apply(block_output, hyper_input, partials)
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size

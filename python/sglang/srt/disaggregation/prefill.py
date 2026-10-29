@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation import l12_trace
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
@@ -583,10 +584,14 @@ class SchedulerDisaggregationPrefillMixin:
         prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)
         if prefetch is None:
             return
+        lazy = envs.SGLANG_PERFPF_STAGING_LAZY.get()
         for req in batch.reqs:
             room = getattr(req, "bootstrap_room", None)
             if room is not None and room in kv_mgr.transfer_infos:
-                prefetch(room)
+                if lazy and req.extend_end is not None:
+                    prefetch(room, upto_tokens=req.extend_end)
+                else:
+                    prefetch(room)
 
     def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
         cache = self.tree_cache
@@ -660,12 +665,17 @@ class SchedulerDisaggregationPrefillMixin:
         self._process_hicache_events(
             should_retry_storage_prefetch=should_retry_storage_prefetch
         )
+        marks = getattr(self, "_l12_marks", None) if l12_trace.ENABLED else None
+        if marks is not None:
+            marks["th"] = time.time()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
         running_batch.batch_is_full = False
 
         self.resolve_waiting_queue_bootstrap()
+        if marks is not None:
+            marks["tr"] = time.time()
 
         # Skip repeated chunk processing while polling a pending batch.
         if last_batch is None or not last_batch.prefill_chunk_processed:
@@ -674,8 +684,12 @@ class SchedulerDisaggregationPrefillMixin:
             )
             if last_batch is not None:
                 last_batch.prefill_chunk_processed = True
+        if marks is not None:
+            marks["tc"] = time.time()
 
         prefill_plan = self.get_new_batch_prefill(running_batch)
+        if marks is not None:
+            marks["tg"] = time.time()
         batch = prefill_plan.batch_to_run
         running_batch = prefill_plan.running_batch
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
@@ -692,14 +706,19 @@ class SchedulerDisaggregationPrefillMixin:
             if self.gracefully_exit:
                 break
 
+            l12_t0 = time.time() if l12_trace.ENABLED else 0.0
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+            if l12_trace.ENABLED:
+                self._l12_marks = {"ta": time.time()}
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            if l12_trace.ENABLED:
+                self._l12_marks["tb"] = time.time()
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -714,15 +733,35 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                l12_t1 = time.time() if l12_trace.ENABLED else 0.0
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 result = self.run_batch(batch)
+                l12_t2 = time.time() if l12_trace.ENABLED else 0.0
                 self.process_batch_result(batch, result)
+                l12_t3 = time.time() if l12_trace.ENABLED else 0.0
+                if l12_trace.ENABLED and get_parallel().attn_tp_rank == 0:
+                    l12_trace.log_prefill_batch(
+                        batch,
+                        l12_t0,
+                        l12_t1,
+                        l12_t2,
+                        len(self.waiting_queue),
+                        len(self.disagg_prefill_inflight_queue),
+                    )
             else:
                 self._sched_idled = True
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+            if batch and l12_trace.ENABLED and get_parallel().attn_tp_rank == 0:
+                l12_trace.log_prefill_loop(
+                    l12_t0,
+                    {**self._l12_marks, "t1": l12_t1, "t2": l12_t2, "t3": l12_t3},
+                    batch.batch_size(),
+                    len(self.waiting_queue),
+                    len(self.disagg_prefill_inflight_queue),
+                )
 
             # Update last_batch
             self.last_batch = batch
@@ -1742,6 +1781,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             segments = [(start_idx, end_idx)]
 
+        fence_pending = envs.SGLANG_PERFPF_STAGING_GATHER_EVENT.get()
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             raw_kv_indices = self.req_to_token_pool.req_to_token[
@@ -1778,6 +1818,9 @@ class SchedulerDisaggregationPrefillMixin:
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
             send_state_indices = state_indices if segment_is_last else None
+            if fence_pending:
+                fence_pending = False
+                self._fence_kv_send(req)
             if indices_event is not None:
                 sender.send(
                     page_indices,
@@ -1798,6 +1841,15 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_pending_chunk_rids.discard(req.rid)
         else:
             self.disagg_prefill_pending_chunk_rids.add(req.rid)
+
+    def _fence_kv_send(self: Scheduler, req: Req) -> None:
+        # The staging gather fences on this event instead of the whole default stream;
+        # the room's later segments follow it in its transfer queue. Fresh per call.
+        ev = torch.cuda.Event()
+        ev.record(
+            self.forward_stream if self.enable_overlap else torch.cuda.current_stream()
+        )
+        req.disagg_kv_sender._early_send_wait_event = ev
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""

@@ -14,6 +14,7 @@ from typing import Callable, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     FfnInputFusion,
@@ -249,8 +250,8 @@ class CuteDSLFusion:
         )
 
     def _finalize_eligible(self, plan, forward_batch: ForwardBatch, m: int) -> bool:
-        return (
-            self._eligible(plan, forward_batch, m) and get_parallel().moe_ep_size == 1
+        return self._eligible(plan, forward_batch, m) and (
+            get_parallel().moe_ep_size == 1 or envs.SGLANG_TRTL3_EP_DEFER_FINALIZE.get()
         )
 
     def _all_reduce_eligible(self, plan, forward_batch: ForwardBatch, m: int) -> bool:

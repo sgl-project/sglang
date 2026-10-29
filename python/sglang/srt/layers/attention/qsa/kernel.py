@@ -11,6 +11,8 @@ import triton.language as tl
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import is_hip
 
+from sglang.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
+
 
 def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
     """FP32-average complete key groups shaped ``[groups, ratio, kv_heads, dim]``."""
@@ -154,7 +156,11 @@ def _expand_qsa_block_indices_kernel(
     TOKEN_TOPK: tl.constexpr,
     FINAL_TOPK: tl.constexpr,
     OUTPUT_BLOCK_SIZE: tl.constexpr,
+    PDL_SMALL: tl.constexpr = False,
 ):
+    # Protect dynamic reads and reused-buffer writes before relaxing this edge.
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     cols = tl.arange(0, OUTPUT_BLOCK_SIZE)
     sequence_length = tl.load(sequence_lengths + row)
@@ -213,6 +219,8 @@ def _expand_qsa_block_indices_kernel(
         result,
         mask=cols < FINAL_TOPK,
     )
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def triton_expand_qsa_block_indices(
@@ -243,6 +251,8 @@ def triton_expand_qsa_block_indices(
         FINAL_TOPK=final_topk,
         OUTPUT_BLOCK_SIZE=triton.next_power_of_2(final_topk),
         num_warps=8,
+        launch_pdl=_PDL_SMALL,
+        PDL_SMALL=_PDL_SMALL,
     )
     return output
 

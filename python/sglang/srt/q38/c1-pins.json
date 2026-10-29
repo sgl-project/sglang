@@ -1,0 +1,55 @@
+{
+  "_metadata": {
+    "flashinfer_version": "0.7.1",
+    "cuda_version": "13.0",
+    "cublas_version": "13.1.1",
+    "cudnn_version": "92400",
+    "cudnn_frontend_version": "1.31.0",
+    "cutlass_dsl_version": "nvidia-cutlass-dsl-libs-base==4.8.0;nvidia-cutlass-dsl-libs-core==4.8.0;nvidia-cutlass-dsl-libs-cu12==4.8.0;nvidia-cutlass-dsl-libs-cu13==4.8.0;nvidia-cutlass-dsl==4.8.0",
+    "gpu": "NVIDIA GB300"
+  },
+  "source": "cache-seeds/fastboot/sglang-nightly-dev-cu13-20261015-a6a8c560-plugin-e22d91e3d21a/sglang/flashinfer/autotune/0.7.1/sm103/82b2a7acefa68c4b/rank_tp0_pp0_dp0.json",
+  "target": {
+    "('flashinfer::trtllm_fp4_block_scale_moe', 'MoERunner', ((4, 2560), (4, 512), (4, 10), (4, 10), (4, 1280), (4, 160), (0,), (0,)), ('Module', 10, 512, 512, 0, 17826818, 17826818, 0, 2560, 2560, 640, 3, True, 0, False, False))": [
+      "MoERunner",
+      [
+        8,
+        307
+      ],
+      [
+        "cuda_graph_profile_replays",
+        1,
+        "l2_cache_policy",
+        "cold"
+      ]
+    ]
+  },
+  "draft": {
+    "('flashinfer::trtllm_fp8_block_scale_moe', 'MoERunner', ((1, 2560), (1, 512), (1,), (1,), (1, 2560), (20, 1), (0,), (0,)), ('Module', 10, 512, 512, 0, 1050629, 1050629, 1, 2560, 2560, 640, 3, False, 0, False, False))": [
+      "MoERunner",
+      [
+        8,
+        2
+      ],
+      [
+        "cuda_graph_profile_replays",
+        1,
+        "l2_cache_policy",
+        "cold"
+      ]
+    ],
+    "('flashinfer::trtllm_fp8_block_scale_moe', 'MoERunner', ((4, 2560), (4, 512), (4,), (4,), (4, 2560), (20, 4), (0,), (0,)), ('Module', 10, 512, 512, 0, 1050629, 1050629, 1, 2560, 2560, 640, 3, False, 0, False, False))": [
+      "MoERunner",
+      [
+        8,
+        15
+      ],
+      [
+        "cuda_graph_profile_replays",
+        1,
+        "l2_cache_policy",
+        "cold"
+      ]
+    ]
+  }
+}

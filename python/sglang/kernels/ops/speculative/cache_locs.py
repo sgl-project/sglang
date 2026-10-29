@@ -124,6 +124,105 @@ def assign_draft_cache_locs_contiguous_func(
 
 
 @triton.jit
+def _prepare_draft_window_kernel(
+    req_pool_indices,
+    req_to_token,
+    seq_lens,
+    seq_lens_out,
+    positions,
+    mrope,
+    draft_locs,
+    window_locs,
+    mrope_stride,
+    fill_seq_len,
+    pool_len: tl.constexpr,
+    STEPS: tl.constexpr,
+    WINDOW: tl.constexpr,
+    BLOCK: tl.constexpr,
+    WRITE_SEQ_LENS: tl.constexpr,
+    WRITE_POSITIONS: tl.constexpr,
+    WRITE_MROPE: tl.constexpr,
+    WRITE_DRAFT: tl.constexpr,
+    WRITE_WINDOW: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    req = tl.load(req_pool_indices + row).to(tl.int64)
+    length = tl.load(seq_lens + row).to(tl.int64)
+    # A padded row (or one whose window would leave its req_to_token row) reads nothing and
+    # writes the draft graph runner's fill values.
+    valid = (req >= 0) & (length > 0) & (length + WINDOW <= pool_len)
+    cols = tl.arange(0, BLOCK)
+    in_window = cols < WINDOW
+    locs = tl.load(
+        req_to_token + req * pool_len + length + cols, in_window & valid, other=0
+    ).to(tl.int64)
+    if WRITE_WINDOW:
+        tl.store(window_locs + row * WINDOW + cols, locs, in_window)
+    if WRITE_DRAFT:
+        tl.store(draft_locs + row * STEPS + cols, locs, cols < STEPS)
+    position = tl.where(valid, length, 0)
+    if WRITE_SEQ_LENS:
+        tl.store(seq_lens_out + row, tl.where(valid, length, fill_seq_len))
+    if WRITE_POSITIONS:
+        tl.store(positions + row, position)
+    if WRITE_MROPE:
+        for axis in tl.static_range(3):
+            tl.store(mrope + axis * mrope_stride + row, position)
+
+
+def prepare_draft_window(
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    *,
+    num_steps: int,
+    window: int,
+    seq_len_fill_value: int,
+    seq_lens_out: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+    mrope: Optional[torch.Tensor] = None,
+    draft_out_cache_loc: Optional[torch.Tensor] = None,
+    write_virtual: Optional[torch.Tensor] = None,
+) -> None:
+    """The next draft's inputs and the iteration's write window in one launch over every
+    row of ``req_pool_indices`` (a graph's static batch): ``write_virtual`` [rows * window]
+    gets each row's ``window`` req_to_token slots from its length, ``draft_out_cache_loc``
+    [rows * num_steps] their first ``num_steps``, ``seq_lens_out`` / ``positions`` / the
+    three ``mrope`` rows (int64 [3, stride]) the length. Rows with a negative request,
+    a length <= 0 or a window past req_to_token's row are padding: ``seq_len_fill_value``
+    and zeros, nothing read. Same values as assign_draft_cache_locs_contiguous (topk 1)."""
+    rows = req_pool_indices.numel()
+    if rows == 0:
+        return
+    assert num_steps <= window
+    assert req_pool_indices.is_contiguous() and seq_lens.is_contiguous()
+    for t in (seq_lens_out, positions, draft_out_cache_loc, write_virtual):
+        assert t is None or (t.dtype == torch.int64 and t.is_contiguous())
+    assert mrope is None or (mrope.dtype == torch.int64 and mrope.stride(1) == 1)
+    _prepare_draft_window_kernel[(rows,)](
+        req_pool_indices,
+        req_to_token,
+        seq_lens,
+        seq_lens_out,
+        positions,
+        mrope,
+        draft_out_cache_loc,
+        write_virtual,
+        mrope.stride(0) if mrope is not None else 0,
+        seq_len_fill_value,
+        pool_len=req_to_token.shape[1],
+        STEPS=num_steps,
+        WINDOW=window,
+        BLOCK=next_power_of_2(window),
+        WRITE_SEQ_LENS=seq_lens_out is not None,
+        WRITE_POSITIONS=positions is not None,
+        WRITE_MROPE=mrope is not None,
+        WRITE_DRAFT=draft_out_cache_loc is not None,
+        WRITE_WINDOW=write_virtual is not None,
+    )
+
+
+@triton.jit
 def _translate_token_ids(ids, v2p, mask, page_size: tl.constexpr):
     """Virtual token ids -> physical ones through the page-level v2p table,
     as `translate_kv_loc` does. A negative id maps to the page-0 sink instead

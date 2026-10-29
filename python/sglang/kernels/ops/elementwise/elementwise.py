@@ -7,6 +7,8 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import is_hip
 
+from sglang.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
+
 _is_hip = is_hip()
 
 
@@ -23,8 +25,12 @@ def _fused_sigmoid_mul_kernel(
     q_ptr=None,
     s_ptr=None,
     QUANT: tl.constexpr = False,
+    PDL_SMALL: tl.constexpr = False,
 ):
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
+    # Protect dynamic reads and reused-buffer writes before relaxing this edge.
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
     pid_row = tl.program_id(0).to(tl.int64)
     pid_block = tl.program_id(1)
 
@@ -48,6 +54,8 @@ def _fused_sigmoid_mul_kernel(
         tl.store(s_ptr + pid_row, y_s)
     else:
         tl.store(output_ptr + attn_off, result, mask=mask)
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_sigmoid_mul(
@@ -108,6 +116,8 @@ def fused_sigmoid_mul(
         BLOCK_H=block_h,
         num_warps=4,
         **kwargs,
+        launch_pdl=_PDL_SMALL,
+        PDL_SMALL=_PDL_SMALL,
     )
     return (q, s) if quant else out
 
@@ -284,3 +294,133 @@ def fused_gate_sigmoid_mul_add(
         final_hidden_states,
         do_add=True,
     )
+
+
+@triton.jit
+def _fused_finalize_gate_sigmoid_mul_add_kernel(
+    hidden_states_ptr,  # [num_tokens, hidden_dim]
+    gate_weight_ptr,  # [hidden_dim]
+    shared_output_ptr,  # [num_tokens, hidden_dim]
+    output_ptr,  # [num_tokens, hidden_dim]
+    gemm2_out_ptr,  # [num_permuted_rows, gemm2_stride] BF16
+    permuted_idx_ptr,  # [num_tokens * TOP_K] int32, -1 = not local
+    expert_weights_ptr,  # [num_tokens, TOP_K]
+    gemm2_stride,
+    hidden_dim: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
+):
+    # One row per program, laid out exactly as _fused_gate_sigmoid_mul_add_kernel
+    # so the gate reduction is the same; the routed term replaces its load of
+    # the TRT-LLM finalize output with that kernel's arithmetic: an FP32 FMA
+    # chain (flush-to-zero) over the top-k slots in slot order, rounded once
+    # to BF16.
+    pid = tl.program_id(axis=0).to(tl.int64)
+    row_offset = pid * hidden_dim
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < hidden_dim
+
+    w = tl.load(gate_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    h = tl.load(hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    s = tl.load(shared_output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for k in tl.static_range(TOP_K):
+        p = tl.load(permuted_idx_ptr + pid * TOP_K + k)
+        scale = tl.load(expert_weights_ptr + pid * TOP_K + k).to(tl.float32)
+        valid = p >= 0
+        x = tl.load(
+            gemm2_out_ptr + p.to(tl.int64) * gemm2_stride + offsets,
+            mask=mask & valid,
+            other=0.0,
+        ).to(tl.float32)
+        # finalizeKernel is built with -use_fast_math: fma.rn.ftz.f32.
+        fma = tl.inline_asm_elementwise(
+            "fma.rn.ftz.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            [scale + tl.zeros_like(x), x, acc],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        acc = tl.where(valid, fma, acc)
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    f = acc.to(tl.bfloat16).to(tl.float32)
+    gate_val = tl.sigmoid(tl.sum(h * w, axis=0))
+    result = gate_val * s
+    result += f
+    tl.store(output_ptr + row_offset + offsets, result, mask=mask)
+
+
+def fused_moe_finalize_gate_sigmoid_mul_add(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+) -> torch.Tensor:
+    """TRT-LLM MoE finalize plus the gated shared-expert add in one launch.
+
+    Bit-identical to the TRT-LLM finalizeKernel (the small-grid variant, used
+    while 10 * num_tokens < 1184) followed by fused_gate_sigmoid_mul_add.
+    """
+    assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
+    assert gate_weight.is_contiguous(), "gate_weight must be contiguous"
+    assert shared_output.is_contiguous(), "shared_output must be contiguous"
+    assert gemm2_out.dtype == torch.bfloat16 and gemm2_out.stride(1) == 1
+    assert expanded_idx_to_permuted_idx.dtype == torch.int32
+    assert expanded_idx_to_permuted_idx.is_contiguous()
+    assert expert_weights.is_contiguous()
+
+    num_tokens, hidden_dim = hidden_states.shape
+    top_k = expert_weights.shape[1]
+    assert gate_weight.shape == (hidden_dim,)
+    assert shared_output.shape == (num_tokens, hidden_dim)
+    assert expert_weights.shape[0] == num_tokens
+    assert expanded_idx_to_permuted_idx.numel() == num_tokens * top_k
+    assert gemm2_out.shape[1] >= hidden_dim
+
+    output = torch.empty_like(shared_output)
+    # Same launch configuration as _launch_fused_gate_sigmoid_mul.
+    max_warps = 16 if _is_hip else 32
+    config = {
+        "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
+        "num_warps": max(
+            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
+        ),
+    }
+    if guard_or_false(num_tokens >= 1024) or is_batch_invariant_mode_enabled():
+        config["num_warps"] = min(config["num_warps"], 8)
+
+    use_pdl = is_arch_support_pdl()
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
+
+    _fused_finalize_gate_sigmoid_mul_add_kernel[(num_tokens,)](
+        hidden_states,
+        gate_weight,
+        shared_output,
+        output,
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        gemm2_out.stride(0),
+        hidden_dim=hidden_dim,
+        TOP_K=top_k,
+        USE_PDL=use_pdl,
+        **config,
+        **pdl_kwargs,
+    )
+    return output

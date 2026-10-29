@@ -496,7 +496,15 @@ class ModelRunner:
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.forward_stream = torch.get_device_module(self.device).Stream(
+            priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+        )
+        if envs.SGLANG_PLB_FAKE_SCATTER.get():
+            from sglang.srt.disaggregation.common.staging_buffer import start_fake_scatter
+
+            start_fake_scatter(
+                self.device, self.gpu_id, get_parallel().tp_rank, self.forward_stream
+            )
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.

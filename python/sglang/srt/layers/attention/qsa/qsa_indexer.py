@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import functools
 from typing import Optional, Tuple
 
 import torch
@@ -35,10 +37,79 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_sm100_supported
+
+# Decode/verify indexer fast paths (both exact; set to 0 to run the stock kernels):
+# SGLANG_QSA_GROUPED_SCORE scores a request's target-verify rows from one load of
+# each compressed key tile (bit-identical logits) for batches of 1-16 requests;
+# SGLANG_QSA_SPLIT_TOPK runs the cluster-split exact top-k for up to 64 rows.
+# Both were measured at 4-32 rows; larger batches keep the stock kernels.
+_QSA_GROUPED_SCORE_MIN_REQUESTS = 1
+_QSA_GROUPED_SCORE_MAX_REQUESTS = 16
+_QSA_SPLIT_TOPK_MAX_ROWS = 64
+
+
+@functools.lru_cache(maxsize=None)
+def _qsa_env_flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+_QSA_SHADOW_STATS = {"calls": 0, "rows": 0, "grouped_calls": 0, "logit_rows_diff": 0,
+                     "set_equal": 0, "tie_only": 0, "value_mismatch": 0,
+                     "mismatch_new_exact": 0, "mismatch_stock_exact": 0,
+                     "mismatch_stock_rerun_differs": 0, "mismatch_rows_over_32k": 0}
+
+
+def _qsa_shadow_check(q, cache, table, lengths, max_model_len, k, logits, indices, rows_per_group):
+    """Debug only (SGLANG_QSA_SHADOW_CHECK=1, eager decode): rerun the stock per-row
+    scorer and fast_topk on the same inputs and count rows whose logits or
+    selected sets differ; ties at the k-th value are reported separately."""
+    if torch.cuda.is_current_stream_capturing():
+        return
+    import logging
+
+    from sglang.kernels.ops.attention.fast_topk import fast_topk
+
+    ref_logits = qsa_mqa_decode(q, cache, table, lengths, max_model_len, min_scored_len=k)
+    lens = lengths.to(torch.int32)
+    ref = fast_topk(ref_logits, lens, topk=k, row_starts=None)
+    st = _QSA_SHADOW_STATS
+    st["calls"] += 1
+    st["grouped_calls"] += int(rows_per_group > 1)
+    for r, length in enumerate(lens.tolist()):
+        st["rows"] += 1
+        if length > k and not torch.equal(logits[r, :length], ref_logits[r, :length]):
+            st["logit_rows_diff"] += 1
+        a, b = indices[r], ref[r]
+        if set(a.tolist()) == set(b.tolist()):
+            st["set_equal"] += 1
+            continue
+        row = ref_logits[r, :length]
+        va = torch.sort(row[a[a >= 0].long()]).values
+        vb = torch.sort(row[b[b >= 0].long()]).values
+        if torch.equal(va, vb):
+            st["tie_only"] += 1
+        else:
+            # Classify against the exact fp32 top-k and a second stock run
+            # (fast_topk drops threshold-bin entries past 4096 in atomic order).
+            st["value_mismatch"] += 1
+            truth = torch.sort(torch.topk(row, k).values).values
+            st["mismatch_new_exact"] += int(torch.equal(va, truth))
+            st["mismatch_stock_exact"] += int(torch.equal(vb, truth))
+            rerun = fast_topk(ref_logits[r : r + 1], lens[r : r + 1], topk=k, row_starts=None)[0]
+            vr = torch.sort(row[rerun[rerun >= 0].long()]).values
+            st["mismatch_stock_rerun_differs"] += int(not torch.equal(vr, vb))
+            st["mismatch_rows_over_32k"] += int(length > 32768)
+    if st["calls"] % 200 == 0:
+        logging.getLogger(__name__).info("QSA shadow check: %s", st)
+
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+_Q38C_SCORE_Q4 = os.environ.get("SGLANG_Q38C_SCORE_Q4", "0") == "1"
+_Q38C_MK_QSA = os.environ.get("SGLANG_Q38C_MK_QSA", "0") == "1"
 
 
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
@@ -171,8 +242,12 @@ class QSAIndexer(MultiPlatformOp):
         cache_loc: torch.Tensor | None = None,
         q_heads_padded: int | None = None,
         ensure_cos_sin_cache: bool = True,
+        projected_qk: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
-        qk, _ = self.index_qk_proj(hidden_states)
+        if projected_qk is None:
+            qk, _ = self.index_qk_proj(hidden_states)
+        else:
+            qk = projected_qk
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
             -1, self.index_kv_heads, self.index_head_dim
         )
@@ -545,6 +620,8 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
+        score_q4_requests: torch.Tensor | None = None,
+        rows_per_group: int = 1,
     ) -> torch.Tensor:
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
@@ -553,25 +630,82 @@ class QSAIndexer(MultiPlatformOp):
             and self.block_topk == 512
             and not is_batch_invariant_mode_enabled()
         )
-        logits = qsa_mqa_decode(
-            q,
-            compressed_cache,
-            compressed_page_table,
-            compressed_lengths,
-            max_model_len,
-            min_scored_len=self.block_topk if use_fast_topk else 0,
-        )
+        if not (
+            get_parallel().tp_size == 1
+            and is_sm100_supported()
+            and rows_per_group > 1
+            and q.shape[0] % rows_per_group == 0
+            and _QSA_GROUPED_SCORE_MIN_REQUESTS
+            <= q.shape[0] // rows_per_group
+            <= _QSA_GROUPED_SCORE_MAX_REQUESTS
+            and _qsa_env_flag("SGLANG_QSA_GROUPED_SCORE")
+        ):
+            rows_per_group = 1
+        use_mk = _Q38C_MK_QSA and score_q4_requests is not None and not is_batch_invariant_mode_enabled()
+        if score_q4_requests is not None and not is_batch_invariant_mode_enabled():
+            if use_mk:
+                from sglang.kernels.ops.attention.q38_mk_score import score_mk as score_q4
+            else:
+                from sglang.kernels.ops.attention.q38_score_q4 import score_q4
+
+            logits = score_q4(
+                q, compressed_cache, compressed_page_table, compressed_lengths,
+                max_model_len, score_q4_requests, min_scored_len=self.block_topk,
+            )
+        else:
+            logits = qsa_mqa_decode(
+                q,
+                compressed_cache,
+                compressed_page_table,
+                compressed_lengths,
+                max_model_len,
+                min_scored_len=self.block_topk if use_fast_topk else 0,
+                rows_per_group=rows_per_group,
+            )
         if use_fast_topk:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
-            from sglang.kernels.ops.attention.fast_topk import fast_topk
-
-            block_indices = fast_topk(
-                logits,
-                compressed_lengths.to(torch.int32),
-                topk=self.block_topk,
-                row_starts=None,
+            from sglang.srt.layers.attention.qsa.split_topk import (
+                split_fast_topk,
+                split_topk_supported,
             )
+
+            if (
+                get_parallel().tp_size == 1
+                and is_sm100_supported()
+                and logits.shape[0] <= _QSA_SPLIT_TOPK_MAX_ROWS
+                and _qsa_env_flag("SGLANG_QSA_SPLIT_TOPK")
+                and split_topk_supported(logits, self.block_topk)
+            ):
+                block_indices = split_fast_topk(
+                    logits,
+                    compressed_lengths.to(torch.int32),
+                    topk=self.block_topk,
+                )
+            else:
+                if use_mk:
+                    from sglang.kernels.ops.attention.q38_mk_topk import topk_mk as fast_topk
+                else:
+                    from sglang.kernels.ops.attention.fast_topk import fast_topk
+
+                block_indices = fast_topk(
+                    logits,
+                    compressed_lengths.to(torch.int32),
+                    topk=self.block_topk,
+                    row_starts=None,
+                )
+            if _qsa_env_flag("SGLANG_QSA_SHADOW_CHECK", "0"):
+                _qsa_shadow_check(
+                    q,
+                    compressed_cache,
+                    compressed_page_table,
+                    compressed_lengths,
+                    max_model_len,
+                    self.block_topk,
+                    logits,
+                    block_indices,
+                    rows_per_group,
+                )
         else:
             row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
             block_indices = qsa_fast_topk(
@@ -686,6 +820,7 @@ class QSAIndexer(MultiPlatformOp):
         forward_batch,
         indexer_metadata,
         cp_global_rope_positions: torch.Tensor | None = None,
+        projected_qk: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Portable orchestration shared by different platforms.
         Fast paths are gated per platforms inside kernel calls.
@@ -763,6 +898,7 @@ class QSAIndexer(MultiPlatformOp):
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),
+            projected_qk=projected_qk,
         )
         self.update_key_state_and_compress(
             token_k,
@@ -776,6 +912,32 @@ class QSAIndexer(MultiPlatformOp):
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
             )
+            rows_per_group = 1
+            if is_target_verify and get_parallel().tp_size == 1:
+                width = int(getattr(forward_batch.spec_info, "draft_token_num", 1) or 1)
+                if width > 1 and num_valid_tokens % width == 0:
+                    rows_per_group = width
+            score_q4_requests = None
+            if (
+                (_Q38C_SCORE_Q4 or _Q38C_MK_QSA)
+                and (is_target_verify or is_draft_extend)
+                and (is_draft_extend or get_parallel().tp_size != 1
+                     or not _qsa_env_flag("SGLANG_QSA_GROUPED_SCORE"))
+                and indexer_metadata.is_cuda_graph
+                and q.is_cuda
+                and is_sm100_supported()
+                and q.shape == (4, 8, 128)
+                and q.dtype == torch.bfloat16
+                and compressed_cache.dtype == torch.bfloat16
+                and compressed_cache.shape[1:3] == (16, 1)
+                and self.index_n_heads == 4
+                and self.block_topk == 512
+                and self.compress_ratio == 4
+                and forward_batch.req_pool_indices.numel() == 1
+                and indexer_metadata.req_pool_indices is not None
+                and indexer_metadata.req_pool_indices.numel() == 4
+            ):
+                score_q4_requests = indexer_metadata.req_pool_indices
             return self.select_decode_tokens(
                 q,
                 compressed_cache,
@@ -785,6 +947,8 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
                 defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
+                score_q4_requests=score_q4_requests,
+                rows_per_group=rows_per_group,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
@@ -813,6 +977,7 @@ class QSAIndexer(MultiPlatformOp):
         forward_batch,
         indexer_metadata,
         cp_global_rope_positions: torch.Tensor | None = None,
+        projected_qk: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self._forward_impl(
             hidden_states,
@@ -820,6 +985,7 @@ class QSAIndexer(MultiPlatformOp):
             forward_batch,
             indexer_metadata,
             cp_global_rope_positions,
+            projected_qk=projected_qk,
         )
 
     def forward_xpu(

@@ -23,6 +23,11 @@ This kernel performs the whole update in ONE launch:
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
+# Programs per batch row of the page-table rebuild (SGLANG_PERFLL_GLUE_META_SPLIT), read once.
+_ROW_SPLIT = 8 if envs.SGLANG_PERFLL_GLUE_META_SPLIT.get() else 1
+
 # cu_seqlens_q handling inside the fused kernel
 Q_MODE_NONE = 0  # cu_seqlens_q is preset (decode / target-verify)
 Q_MODE_CUMSUM = 1  # cu_seqlens_q[1:] = cumsum(qlens)   (draft-extend)
@@ -65,70 +70,131 @@ def update_trtllm_mha_graph_metadata_kernel(
     # 1: the page tables are refreshed out-of-graph, so rebuild only the
     # seqlen metadata. 0 = static pool, full rebuild.
     SKIP_PAGE_TABLE: tl.constexpr = 0,
+    # Programs per batch row (SGLANG_PERFLL_GLUE_META_SPLIT); 1 = one per row.
+    ROW_SPLIT: tl.constexpr = 1,
 ):
     pid = tl.program_id(axis=0)
 
-    if pid < bs:
-        # One program per batch row: cache_seqlens + page table row(s).
-        seqlen = (tl.load(seq_lens_ptr + pid) + seqlen_offset).to(tl.int32)
-        tl.store(cache_seqlens_ptr + pid, seqlen)
-
-        if not SKIP_PAGE_TABLE:
-            req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
-            row_in = req_to_token_ptr + req_pool_index * req_to_token_stride
-            row_out = page_table_ptr + pid.to(tl.int64) * page_table_stride
-            if HAS_SWA:
-                swa_row_out = (
-                    swa_page_table_ptr + pid.to(tl.int64) * swa_page_table_stride
-                )
-            # Self-guard on the device-side seqlen: pages past cdiv(cache_seqlen,
-            # PAGE_SIZE) keep stale values the attention kernels never read.
-            num_live_pages = tl.minimum(tl.cdiv(seqlen, PAGE_SIZE), max_seq_pages)
-            for i in range(tl.cdiv(num_live_pages, PAGE_BLOCK)):
-                page_idx = i * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
-                mask = page_idx < num_live_pages
-                token = tl.load(
-                    row_in + page_idx.to(tl.int64) * PAGE_SIZE, mask=mask, other=0
-                )
-                tl.store(row_out + page_idx, token // PAGE_SIZE, mask=mask)
+    if ROW_SPLIT > 1:
+        if pid < bs * ROW_SPLIT:
+            # ROW_SPLIT programs per row, page blocks dealt round-robin; same writes.
+            row = pid // ROW_SPLIT
+            part = pid % ROW_SPLIT
+            seqlen = (tl.load(seq_lens_ptr + row) + seqlen_offset).to(tl.int32)
+            if part == 0:
+                tl.store(cache_seqlens_ptr + row, seqlen)
+            if not SKIP_PAGE_TABLE:
+                req_pool_index = tl.load(req_pool_indices_ptr + row).to(tl.int64)
+                row_in = req_to_token_ptr + req_pool_index * req_to_token_stride
+                row_out = page_table_ptr + row.to(tl.int64) * page_table_stride
                 if HAS_SWA:
-                    token64 = token.to(tl.int64)
-                    # Real req_to_token slots are >=0; the token>=0 guard + other=-1 mirror
-                    # the swa_out_cache_loc -1 sentinel (uniform handling, no wrap).
-                    swa_token = tl.load(
-                        swa_mapping_ptr + token64, mask=mask & (token64 >= 0), other=-1
+                    swa_row_out = (
+                        swa_page_table_ptr + row.to(tl.int64) * swa_page_table_stride
                     )
-                    swa_page = tl.where(swa_token < 0, -1, swa_token // PAGE_SIZE)
-                    tl.store(swa_row_out + page_idx, swa_page.to(tl.int32), mask=mask)
-    elif pid == bs:
-        # Single program: cu_seqlens_k (+ optional cu_seqlens_q) cumsum.
-        offs = tl.arange(0, BS_BLOCK)
-        mask = offs < bs
-        seqlens = (tl.load(seq_lens_ptr + offs, mask=mask, other=0)).to(tl.int32)
-        seqlens = tl.where(mask, seqlens + seqlen_offset, 0)
-        tl.store(cu_seqlens_k_ptr + 1 + offs, tl.cumsum(seqlens, axis=0), mask=mask)
-        if Q_MODE == 1:  # Q_MODE_CUMSUM
-            qlens = tl.load(qlens_ptr + offs, mask=mask, other=0).to(tl.int32)
-            qlens = tl.where(mask, qlens, 0)
-            tl.store(cu_seqlens_q_ptr + 1 + offs, tl.cumsum(qlens, axis=0), mask=mask)
-        if Q_MODE == 2:  # Q_MODE_STRIDED
-            tl.store(
-                cu_seqlens_q_ptr + 1 + offs,
-                ((offs + 1) * q_stride).to(tl.int32),
-                mask=mask,
-            )
+                num_live_pages = tl.minimum(tl.cdiv(seqlen, PAGE_SIZE), max_seq_pages)
+                for i in range(part, tl.cdiv(num_live_pages, PAGE_BLOCK), ROW_SPLIT):
+                    page_idx = i * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
+                    mask = page_idx < num_live_pages
+                    token = tl.load(
+                        row_in + page_idx.to(tl.int64) * PAGE_SIZE, mask=mask, other=0
+                    )
+                    tl.store(row_out + page_idx, token // PAGE_SIZE, mask=mask)
+                    if HAS_SWA:
+                        token64 = token.to(tl.int64)
+                        swa_token = tl.load(
+                            swa_mapping_ptr + token64, mask=mask & (token64 >= 0), other=-1
+                        )
+                        swa_page = tl.where(swa_token < 0, -1, swa_token // PAGE_SIZE)
+                        tl.store(swa_row_out + page_idx, swa_page.to(tl.int32), mask=mask)
+        elif pid == bs * ROW_SPLIT:
+            offs = tl.arange(0, BS_BLOCK)
+            mask = offs < bs
+            seqlens = (tl.load(seq_lens_ptr + offs, mask=mask, other=0)).to(tl.int32)
+            seqlens = tl.where(mask, seqlens + seqlen_offset, 0)
+            tl.store(cu_seqlens_k_ptr + 1 + offs, tl.cumsum(seqlens, axis=0), mask=mask)
+            if Q_MODE == 1:  # Q_MODE_CUMSUM
+                qlens = tl.load(qlens_ptr + offs, mask=mask, other=0).to(tl.int32)
+                qlens = tl.where(mask, qlens, 0)
+                tl.store(cu_seqlens_q_ptr + 1 + offs, tl.cumsum(qlens, axis=0), mask=mask)
+            if Q_MODE == 2:  # Q_MODE_STRIDED
+                tl.store(
+                    cu_seqlens_q_ptr + 1 + offs,
+                    ((offs + 1) * q_stride).to(tl.int32),
+                    mask=mask,
+                )
+        else:
+            if HAS_SWA_OUT:
+                out_idx = (pid - bs * ROW_SPLIT - 1) * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
+                in_range = out_idx < swa_out_len
+                is_real = in_range & (out_idx < num_out_tokens)
+                loc = tl.load(out_cache_loc_ptr + out_idx, mask=is_real, other=0)
+                translated = tl.load(
+                    swa_mapping_ptr + loc, mask=is_real & (loc >= 0), other=0
+                )
+                translated = tl.where(is_real & (loc < 0), -1, translated)
+                tl.store(swa_out_cache_loc_ptr + out_idx, translated, mask=in_range)
     else:
-        # Remaining programs: swa_out_cache_loc translate + zero padding.
-        if HAS_SWA_OUT:
-            out_idx = (pid - bs - 1) * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
-            in_range = out_idx < swa_out_len
-            is_real = in_range & (out_idx < num_out_tokens)
-            loc = tl.load(out_cache_loc_ptr + out_idx, mask=is_real, other=0)
-            translated = tl.load(
-                swa_mapping_ptr + loc, mask=is_real & (loc >= 0), other=0
-            )
-            translated = tl.where(is_real & (loc < 0), -1, translated)
-            tl.store(swa_out_cache_loc_ptr + out_idx, translated, mask=in_range)
+        if pid < bs:
+            # One program per batch row: cache_seqlens + page table row(s).
+            seqlen = (tl.load(seq_lens_ptr + pid) + seqlen_offset).to(tl.int32)
+            tl.store(cache_seqlens_ptr + pid, seqlen)
+
+            if not SKIP_PAGE_TABLE:
+                req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
+                row_in = req_to_token_ptr + req_pool_index * req_to_token_stride
+                row_out = page_table_ptr + pid.to(tl.int64) * page_table_stride
+                if HAS_SWA:
+                    swa_row_out = (
+                        swa_page_table_ptr + pid.to(tl.int64) * swa_page_table_stride
+                    )
+                # Self-guard on the device-side seqlen: pages past cdiv(cache_seqlen,
+                # PAGE_SIZE) keep stale values the attention kernels never read.
+                num_live_pages = tl.minimum(tl.cdiv(seqlen, PAGE_SIZE), max_seq_pages)
+                for i in range(tl.cdiv(num_live_pages, PAGE_BLOCK)):
+                    page_idx = i * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
+                    mask = page_idx < num_live_pages
+                    token = tl.load(
+                        row_in + page_idx.to(tl.int64) * PAGE_SIZE, mask=mask, other=0
+                    )
+                    tl.store(row_out + page_idx, token // PAGE_SIZE, mask=mask)
+                    if HAS_SWA:
+                        token64 = token.to(tl.int64)
+                        # Real req_to_token slots are >=0; the token>=0 guard + other=-1 mirror
+                        # the swa_out_cache_loc -1 sentinel (uniform handling, no wrap).
+                        swa_token = tl.load(
+                            swa_mapping_ptr + token64, mask=mask & (token64 >= 0), other=-1
+                        )
+                        swa_page = tl.where(swa_token < 0, -1, swa_token // PAGE_SIZE)
+                        tl.store(swa_row_out + page_idx, swa_page.to(tl.int32), mask=mask)
+        elif pid == bs:
+            # Single program: cu_seqlens_k (+ optional cu_seqlens_q) cumsum.
+            offs = tl.arange(0, BS_BLOCK)
+            mask = offs < bs
+            seqlens = (tl.load(seq_lens_ptr + offs, mask=mask, other=0)).to(tl.int32)
+            seqlens = tl.where(mask, seqlens + seqlen_offset, 0)
+            tl.store(cu_seqlens_k_ptr + 1 + offs, tl.cumsum(seqlens, axis=0), mask=mask)
+            if Q_MODE == 1:  # Q_MODE_CUMSUM
+                qlens = tl.load(qlens_ptr + offs, mask=mask, other=0).to(tl.int32)
+                qlens = tl.where(mask, qlens, 0)
+                tl.store(cu_seqlens_q_ptr + 1 + offs, tl.cumsum(qlens, axis=0), mask=mask)
+            if Q_MODE == 2:  # Q_MODE_STRIDED
+                tl.store(
+                    cu_seqlens_q_ptr + 1 + offs,
+                    ((offs + 1) * q_stride).to(tl.int32),
+                    mask=mask,
+                )
+        else:
+            # Remaining programs: swa_out_cache_loc translate + zero padding.
+            if HAS_SWA_OUT:
+                out_idx = (pid - bs - 1) * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
+                in_range = out_idx < swa_out_len
+                is_real = in_range & (out_idx < num_out_tokens)
+                loc = tl.load(out_cache_loc_ptr + out_idx, mask=is_real, other=0)
+                translated = tl.load(
+                    swa_mapping_ptr + loc, mask=is_real & (loc >= 0), other=0
+                )
+                translated = tl.where(is_real & (loc < 0), -1, translated)
+                tl.store(swa_out_cache_loc_ptr + out_idx, translated, mask=in_range)
 
 
 def update_trtllm_mha_graph_metadata(
@@ -189,7 +255,8 @@ def update_trtllm_mha_graph_metadata(
         out_cache_loc = swa_out_cache_loc
 
     grid_extra = triton.cdiv(swa_out_len, PAGE_BLOCK) if has_swa_out else 0
-    grid = (bs + 1 + grid_extra,)
+    row_split = 1 if skip_page_table else _ROW_SPLIT
+    grid = (bs * row_split + 1 + grid_extra,)
 
     update_trtllm_mha_graph_metadata_kernel[grid](
         req_pool_indices,
@@ -220,4 +287,51 @@ def update_trtllm_mha_graph_metadata(
         PAGE_BLOCK=PAGE_BLOCK,
         BS_BLOCK=triton.next_power_of_2(bs),
         SKIP_PAGE_TABLE=1 if skip_page_table else 0,
+        ROW_SPLIT=row_split,
+    )
+
+
+@triton.jit
+def _draft_step_seqlens_kernel(
+    seq_lens_ptr,  # [bs] int
+    cache_seqlens_ptr,  # [steps, cache_seqlens_stride] int32
+    cu_seqlens_k_ptr,  # [steps, cu_seqlens_k_stride] int32
+    bs,
+    first_offset,
+    cache_seqlens_stride,
+    cu_seqlens_k_stride,
+    BS_BLOCK: tl.constexpr,
+):
+    # One program per draft step s: cache_seqlens = seq_lens + first_offset + s, and its
+    # cu_seqlens_k cumsum (cu_seqlens_k[s, 0] stays the preset 0).
+    s = tl.program_id(axis=0)
+    offs = tl.arange(0, BS_BLOCK)
+    mask = offs < bs
+    seqlens = tl.load(seq_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
+    seqlens = tl.where(mask, seqlens + first_offset + s, 0)
+    tl.store(cache_seqlens_ptr + s * cache_seqlens_stride + offs, seqlens, mask=mask)
+    tl.store(
+        cu_seqlens_k_ptr + s * cu_seqlens_k_stride + 1 + offs,
+        tl.cumsum(seqlens, axis=0),
+        mask=mask,
+    )
+
+
+def update_draft_step_seqlens(
+    *, seq_lens, cache_seqlens, cu_seqlens_k, bs: int, steps: int, first_offset: int
+):
+    """The cache_seqlens / cu_seqlens_k rows of ``steps`` draft decode steps in one launch:
+    row s holds what ``update_trtllm_mha_graph_metadata`` writes at
+    ``seqlen_offset = first_offset + s``."""
+    if bs == 0 or steps == 0:
+        return
+    _draft_step_seqlens_kernel[(steps,)](
+        seq_lens,
+        cache_seqlens,
+        cu_seqlens_k,
+        bs,
+        first_offset,
+        cache_seqlens.stride(0),
+        cu_seqlens_k.stride(0),
+        BS_BLOCK=triton.next_power_of_2(bs),
     )

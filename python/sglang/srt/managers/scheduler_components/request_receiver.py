@@ -37,6 +37,8 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
     get_shm_exchange,
+    recv_multihost_enabled,
+    recv_piggyback,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
@@ -46,6 +48,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
 from sglang.srt.utils import (
     broadcast_pyobj,
+    host_trace,
     point_to_point_pyobj,
 )
 
@@ -59,6 +62,15 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+_ZMQ_EVENTS = envs.SGLANG_PERFLL_HOST_ZMQ_EVENTS.get()
+
+
+def _zmq_readable(sock) -> bool:
+    # Not a zmq socket (a scripted test proxy): let recv decide.
+    if not isinstance(sock, zmq.Socket):
+        return True
+    return bool(sock.get(zmq.EVENTS) & zmq.POLLIN)
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -94,6 +106,10 @@ class SchedulerRequestReceiver:
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
 
+        if (pig := recv_piggyback()) is not None:
+            # values ride only this pass's exchange
+            pig[1](None)
+
         if self.recv_skipper is not None:
             if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
@@ -128,23 +144,25 @@ class SchedulerRequestReceiver:
                     )
                     return recv_reqs
 
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                if not _ZMQ_EVENTS or _zmq_readable(self.recv_from_tokenizer):
+                    while True:
+                        try:
+                            if self.recv_limit_reached(len(recv_reqs)):
+                                break
+                            recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
+                        except zmq.ZMQError:
                             break
-                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
+                        recv_reqs.append(recv_req)
 
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                if not _ZMQ_EVENTS or _zmq_readable(self.recv_from_rpc):
+                    while True:
+                        try:
+                            if self.recv_limit_reached(len(recv_reqs)):
+                                break
+                            recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
+                        except zmq.ZMQError:
                             break
-                        recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
+                        recv_reqs.append(recv_rpc)
             else:
                 recv_reqs = None
         else:
@@ -208,18 +226,28 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
-                exchange = get_shm_exchange(tp_group.cpu_group, "recv")
+                exchange = get_shm_exchange(
+                    tp_group.cpu_group, "recv", multihost=recv_multihost_enabled()
+                )
                 if exchange is not None:
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.RECV0)
                     recv_reqs = _broadcast_via_exchange(
                         recv_reqs, exchange=exchange, tp_group=tp_group
                     )
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.RECV1)
                 else:
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.RECV0)
                     recv_reqs = broadcast_pyobj(
                         recv_reqs,
                         tp_group.rank,
                         tp_group.cpu_group,
                         src=tp_group.ranks[0],
                     )
+                    if host_trace.ENABLED:
+                        host_trace.mark(host_trace.RECV1)
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
@@ -355,7 +383,15 @@ def _broadcast_via_exchange(
     only a non-empty payload goes over the cpu group."""
     is_src = tp_group.rank == tp_group.ranks[0]
     payload = pickle.dumps(recv_reqs) if is_src and recv_reqs else b""
-    size = exchange.allgather([len(payload)])[0][0]
+    pig = recv_piggyback()
+    extra = pig[0]() if pig is not None else None
+    if extra is not None and 1 + len(extra) <= exchange.width:
+        rows = exchange.allgather([len(payload), *extra])
+        size = rows[0][0]
+        # usable only when nothing arrived: request handling may reap acks first
+        pig[1]([row[1:] for row in rows] if size == 0 else None)
+    else:
+        size = exchange.allgather([len(payload)])[0][0]
     if size == 0:
         return recv_reqs if is_src else []
     if is_src:

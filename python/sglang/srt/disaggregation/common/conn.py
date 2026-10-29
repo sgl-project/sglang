@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferMetric,
     StateType,
 )
+from sglang.srt.disaggregation import l12_trace
 from sglang.srt.disaggregation.common.bootstrap import (
     BootstrapNotification,
     DeferredBootstrap,
@@ -961,6 +962,8 @@ class CommonKVManager(BaseKVManager):
                 handler = self._staging_handler
                 if handler.is_staging_room(bootstrap_room):
                     handler.submit_last_scatter_async(bootstrap_room)
+            if l12_trace.ENABLED and self.attn_tp_rank == 0:
+                l12_trace.decode_success_arrived(bootstrap_room)
             self.update_status(bootstrap_room, KVPoll.Success)
             return
         if status == KVPoll.Failed:

@@ -311,6 +311,35 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             )
         self.assertEqual(forward_batch.seq_lens_sum, sum(seq_lens))
 
+    def test_a_padded_replay_keeps_the_rows_draft_extend_wrote_in_place(self):
+        """SGLANG_PERFLL_STEP5A: draft_extend writes a round's top-1 / hidden rows into this
+        runner's input buffers; a padded replay clears only their padding rows, and an input
+        that is not in place (here topk_p) is still copied in."""
+        for topk_p_in_place in (True, False):
+            with self.subTest(topk_p_in_place=topk_p_in_place):
+                runner = self._build_runner(_RecordingDraftBackend())
+                b = runner.buffers
+                for buf in (b.topk_p, b.topk_index, b.hidden_states):
+                    buf.fill_(-1)  # stale rows
+                b.topk_p[:2] = torch.tensor([[0.5], [0.25]])
+                b.topk_index[:2] = torch.tensor([[7], [3]])
+                b.hidden_states[:2] = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+                forward_batch = self._build_forward_batch([10, 11], 21)
+                spec_info = forward_batch.spec_info
+                spec_info.topk_index = b.topk_index[:2]
+                spec_info.hidden_states = b.hidden_states[:2]
+                spec_info.topk_p = (
+                    b.topk_p[:2] if topk_p_in_place else torch.tensor([[0.75], [0.125]])
+                )
+                runner.execute(forward_batch)
+                expected_p = [0.5, 0.25] if topk_p_in_place else [0.75, 0.125]
+                self.assertEqual(b.topk_p.flatten().tolist(), expected_p + [0.0, 0.0])
+                self.assertEqual(b.topk_index.flatten().tolist(), [7, 3, 0, 0])
+                self.assertEqual(
+                    b.hidden_states.tolist(),
+                    [[1.0, 2.0], [3.0, 4.0], [0.0, 0.0], [0.0, 0.0]],
+                )
+
     def test_none_seq_lens_sum_is_preserved(self):
         # seq_lens_sum may be intentionally absent; padding must keep it None
         # rather than coerce it into an int.

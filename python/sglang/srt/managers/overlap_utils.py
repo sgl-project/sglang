@@ -72,6 +72,7 @@ _is_npu = is_npu()
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
 # via the existing SGLANG_IS_IN_CI; off in production.
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
+_INDEX_OPS = envs.SGLANG_PERFLL_HOST_INDEX_OPS.get()
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
@@ -116,6 +117,8 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
     - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
     """
+    if not future_map.takes_deferred_relay(batch):
+        future_map.flush_deferred_relay()
     if batch.prefill_input_ids_cpu is not None:
         prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:
@@ -328,7 +331,9 @@ class FutureMap:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )
-            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream()
+            self.fwd_prepare_d2h_stream = torch.get_device_module(self.device).Stream(
+                priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+            )
         else:
             self.new_seq_lens_cpu_pinned = None
             self.fwd_prepare_d2h_stream = None
@@ -361,6 +366,21 @@ class FutureMap:
         ):
             self._adopt_relay(_offered_relay)
 
+        # SGLANG_Q35MF_SPEC_RELAY_BYPASS: the last decode round's relay, stashed only when
+        # the next batch is not the same one (indices, payload, its draft input).
+        self.relay_bypass = (
+            envs.SGLANG_Q35MF_SPEC_RELAY_BYPASS.get()
+            and (spec_algo.is_eagle() or spec_algo.is_standalone())
+        )
+        self._deferred_relay: Optional[tuple] = None
+        # SGLANG_DEBUG_PERFLL_STEP5A_SEQ_LENS_CHECK(_GATE): staged lengths against the gather they replace
+        self.seq_lens_check = None
+        check_gate = envs.SGLANG_DEBUG_PERFLL_STEP5A_SEQ_LENS_CHECK_GATE.get()
+        if envs.SGLANG_DEBUG_PERFLL_STEP5A_SEQ_LENS_CHECK.get() or check_gate:
+            from sglang.srt.speculative.perfll_step2 import SeqLensCheck
+
+            self.seq_lens_check = SeqLensCheck(device, gate=check_gate)
+
     def _adopt_relay(self, relay: FutureRelayBuffers) -> None:
         if _DEBUG_ASSERT:
             relay.new_seq_lens.fill_(-1)
@@ -369,6 +389,29 @@ class FutureMap:
         self.output_tokens_buf = relay.output_tokens
         relay.adopted = True
         self._relay = relay
+    def defer_relay(
+        self,
+        future_indices: torch.Tensor,
+        payload: RelayPayload,
+        draft_input: EagleDraftInput,
+    ) -> None:
+        """Hold a decode round's stash until the next batch shows whether it reads the
+        draft input in place; the payload tensors must stay unwritten until then."""
+        self.flush_deferred_relay()
+        self._deferred_relay = (future_indices, payload, draft_input)
+
+    def takes_deferred_relay(self, batch: ScheduleBatch) -> bool:
+        """The batch is the deferred round's own, with its rows unchanged."""
+        relay = self._deferred_relay
+        if relay is None:
+            return False
+        draft_input = batch.spec_info
+        return draft_input is relay[2] and draft_input.future_indices is relay[0]
+
+    def flush_deferred_relay(self) -> None:
+        relay, self._deferred_relay = self._deferred_relay, None
+        if relay is not None:
+            self._stash(relay[0], relay[1])
 
     def _maybe_init_forward_bufs(self, payload: RelayPayload) -> None:
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
@@ -444,6 +487,7 @@ class FutureMap:
 
     def make_staged_spec_input(self, future_indices: torch.Tensor):
         """Build the relay handle for a request leaving HiSparse staging."""
+        self.flush_deferred_relay()
         if not (self.spec_algo.is_eagle() or self.spec_algo.is_standalone()):
             raise RuntimeError(
                 "HiSparse staging only supports EAGLE-family speculative inputs."
@@ -491,6 +535,20 @@ class FutureMap:
         indices = draft_input.future_indices
         if indices.shape[0] == 0:
             return
+        if self.takes_deferred_relay(batch):
+            # the worker left topk / hidden / bonus on this very draft input; the
+            # gather would return the bonus in the relay buffer's dtype
+            self._deferred_relay = None
+            draft_input.bonus_tokens = draft_input.bonus_tokens.to(
+                self.output_tokens_buf.dtype
+            )
+            if not draft_input.future_dsa_topk_indices_available:
+                draft_input.dsa_topk_indices = None
+            return
+        # A gathered FutureMap payload is not the capture-owned producer frame.
+        # Only the identity-checked deferred branch above can preserve it.
+        draft_input.q38_prepared_frames = None
+        self.flush_deferred_relay()
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
         if indices.device.type != "cpu":
@@ -538,12 +596,14 @@ class FutureMap:
     ) -> None:
         """Write only output_tokens_buf rows; for relays carrying no draft
         extras (stash() would lazy-init the spec bufs from the payload)."""
+        self.flush_deferred_relay()
         self.output_tokens_buf[indices] = bonus_tokens.to(self.output_tokens_buf.dtype)
 
     def resolve_mixed_spec_tails(self, batch: ScheduleBatch) -> None:
         """Late-bind a spec mixed batch's decode tails (overlap): schedule-time
         lengths lag the in-flight step's accept count, so rebuild the tail rows
         from the published committed lengths behind the publish fence."""
+        self.flush_deferred_relay()
         idx = batch.mix_running_indices
         n = int(idx.shape[0])
         if n == 0:
@@ -585,11 +645,21 @@ class FutureMap:
         ]
 
     def resolve_seq_lens_cpu(
-        self, batch: ScheduleBatch, stream_ordered: bool = False
+        self,
+        batch: ScheduleBatch,
+        stream_ordered: bool = False,
+        staged_seq_lens: Optional[torch.Tensor] = None,
     ) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
         # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
+        # staged_seq_lens (SGLANG_PERFLL_STEP5A_SEQ_LENS): the previous decode pass's published
+        # lengths, which this unchanged batch takes as they are: no wait, no gather here.
+        check = self.seq_lens_check
+        if check is not None and not check.active:
+            check = None
+        if check is not None:
+            check.retire()
         draft_input = batch.spec_info
         if draft_input is None:
             return
@@ -597,6 +667,7 @@ class FutureMap:
         fi = draft_input.future_indices
         if fi is None:
             return
+        gather = staged_seq_lens is None or check is not None
         if self.publish_ready is not None and stream_ordered:
             self._publish_fresh = False
         elif self.publish_ready is not None:
@@ -605,19 +676,29 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip:
+            if gather and _is_hip:
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
                 self.publish_ready.synchronize()
-            else:
+            elif gather:
                 self.publish_ready.wait()
-        batch.seq_lens = self.new_seq_lens_buf[fi]
+        if gather:
+            if _INDEX_OPS and fi.dtype is torch.int64:
+                batch.seq_lens = torch.index_select(self.new_seq_lens_buf, 0, fi)
+            else:
+                batch.seq_lens = self.new_seq_lens_buf[fi]
+        if staged_seq_lens is not None:
+            if gather:
+                check.compare(staged=staged_seq_lens, gathered=batch.seq_lens)
+            batch.seq_lens = staged_seq_lens
+        # rows only the gather consumed are poisoned (the staged path never reads them)
+        poison = _DEBUG_ASSERT and staged_seq_lens is None
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
             # skip the .cpu() D2H. Downstream takes the GPU-only path.
             batch.seq_lens_cpu = None
             batch.seq_lens_sum = None
-            if _DEBUG_ASSERT:
+            if poison:
                 # Poison consumed rows: each row must be re-published/seeded
                 # before the next resolve gathers it (safe here: the forward's
                 # re-publish is fenced behind this stream via wait_stream).
@@ -627,7 +708,7 @@ class FutureMap:
         if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            if _DEBUG_ASSERT:
+            if poison:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
@@ -641,7 +722,7 @@ class FutureMap:
         # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
         batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-        if _DEBUG_ASSERT:
+        if poison:
             # After the D2H copy completed (synchronize above), so the pinned
             # mirror is not poisoned.
             _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
@@ -651,17 +732,24 @@ class FutureMap:
         future_indices: torch.Tensor,
         new_seq_lens: torch.Tensor,
         confidence: Optional[torch.Tensor] = None,
+        *,
+        written: bool = False,
     ) -> None:
+        """``written`` (SGLANG_PERFLL_RS_D1): the post-verify graph already stored the lengths
+        in new_seq_lens_buf, ahead of this call on the same stream."""
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
         relay = self._relay
         if relay is not None and new_seq_lens is relay.published_seq_lens:
             relay.published_seq_lens = None
-        else:
-            self.new_seq_lens_buf[indices] = new_seq_lens.to(
-                self.new_seq_lens_buf.dtype
+        elif not written and _INDEX_OPS and indices.dtype is torch.int64:
+            # req pool indices are distinct, so the copy order does not matter
+            self.new_seq_lens_buf.index_copy_(
+                0, indices, new_seq_lens.to(self.new_seq_lens_buf.dtype)
             )
+        elif not written:
+            self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
@@ -678,6 +766,10 @@ class FutureMap:
             )
 
     def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
+        self.flush_deferred_relay()
+        self._stash(future_indices, payload)
+
+    def _stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
         indices = future_indices
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.

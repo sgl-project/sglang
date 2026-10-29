@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from copy import copy
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
@@ -33,6 +34,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_rope_position_matrix,
     compressed_decode_view,
 )
+from sglang.srt.layers.attention.qsa.mtp_lookup import DeferredMtpSparseIndices
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     pack_qsa_prefill_kv,
     qwen_sparse_fa2_cu_seqlens_triton,
@@ -53,13 +55,33 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_spec, get_stream
+from sglang.srt.runtime_context import get_parallel, get_spec, get_stream
 from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
 
 logger = logging.getLogger(__name__)
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+_Q38_ATTN_CORE_V1 = os.environ.get("Q38_ATTN_CORE_V1", "0") == "1"
+_Q38C_ATTN_CORE_TP4 = os.environ.get("SGLANG_Q38C_ATTN_CORE_TP4", "0") == "1"
+_Q38C_GLUE_MERGE = os.environ.get("SGLANG_Q38C_GLUE_MERGE", "0") == "1"
+
+
+# Measured at 4-32 verify rows; larger batches keep fused_kv_prepare + trtllm.
+_QSA_POOL_DECODE_MAX_ROWS = 64
+
+
+@lru_cache(maxsize=1)
+def _qsa_pool_decode_enabled() -> bool:
+    """SGLANG_QSA_POOL_DECODE=0 restores fused_kv_prepare + trtllm decode for
+    block-index (verify/decode) rows."""
+    return os.environ.get("SGLANG_QSA_POOL_DECODE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    )
 
 
 @lru_cache(maxsize=1)
@@ -234,6 +256,20 @@ class QwenSparseAttnBackend(AttentionBackend):
         if config is None:
             config = getattr(model_config, "hf_config", None)
         self.qsa_profile = parse_qsa_profile(config)
+        self._q38c_lookup_native = (
+            os.environ.get("SGLANG_Q38C_LOOKUP_NATIVE", "0") == "1"
+            and getattr(config, "hidden_size", None) == 2560
+            and getattr(config, "hc_count", None) == 4
+            and (
+                get_parallel().tp_size == 1
+                or (get_parallel().tp_size == 4
+                    and os.environ.get("SGLANG_Q38C_MK_MTP", "0") == "1")
+            )
+            and get_spec().speculative_num_steps == 3
+            and get_spec().speculative_eagle_topk == 1
+            and self._fused_kv_pool_eligible
+            and is_sm100_supported()
+        )
         self.max_context_len = int(getattr(model_config, "context_len", 0))
         self.compress_ratio = (
             self.qsa_profile.compress_ratio
@@ -1283,6 +1319,31 @@ class QwenSparseAttnBackend(AttentionBackend):
         bs = int(forward_batch.batch_size)
         if bs == 0 or forward_batch.req_pool_indices.numel() < bs:
             return
+        if (
+            _Q38C_GLUE_MERGE
+            and bs == 1
+            and getattr(forward_batch.spec_info, "num_accept_tokens", None) is not None
+        ):
+            from sglang.kernels.ops.speculative.mtp_capture_metadata import (
+                try_capture_metadata,
+            )
+
+            if try_capture_metadata(
+                topk_indices,
+                self._capture_extend_seq_lens(forward_batch)[:bs],
+                forward_batch.spec_info.num_accept_tokens[:bs],
+                forward_batch.req_pool_indices[:bs],
+                metadata.get_seqlens_expanded(),
+                state.indices[state.layer_slots[int(layer_id)]],
+                state.captured_len[state.layer_slots[int(layer_id)]],
+                forward_batch.spec_info.num_front_tokens,
+                state.trash_row,
+            ):
+                if not getattr(self, "_q38c_glue_merge_logged", False):
+                    logger.info("Q38C seed capture merge active: bs=1 rows=%s cols=%s",
+                                topk_indices.shape[0], topk_indices.shape[1])
+                    self._q38c_glue_merge_logged = True
+                return
         request_extend_lens = self._capture_extend_seq_lens(forward_batch)[:bs].long()
         block_ends = request_extend_lens.cumsum(0) - 1
         spec_info = forward_batch.spec_info
@@ -1316,6 +1377,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         logical_positions = metadata.decode_logical_positions
         if logical_positions is None:
             logical_positions = metadata.get_seqlens_expanded() - 1
+        if (
+            self._q38c_lookup_native
+            and forward_batch.forward_mode.is_decode()
+            and forward_batch.req_pool_indices.numel() == 1
+            and logical_positions.numel() == 1
+        ):
+            state = self._mtp_shared_sparse_indices
+            slot = state.layer_slots[int(layer_id)]
+            return DeferredMtpSparseIndices(
+                state.indices[slot],
+                state.captured_len[slot],
+                forward_batch.req_pool_indices,
+                logical_positions,
+                state._tail_offsets,
+            )
         return self._mtp_shared_sparse_indices.lookup(
             forward_batch.req_pool_indices,
             logical_positions,
@@ -1389,7 +1465,56 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.qsa_profile.budget,
         )
 
-    def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices):
+    def get_mtp_front_plan(self, layer, forward_batch, indices):
+        """M1 TP4-only plan; no projection or KV mutation on fallback."""
+        if not (
+            self._fused_kv_pool_eligible
+            and forward_batch.forward_mode.is_decode()
+            and isinstance(indices, DeferredMtpSparseIndices)
+            and indices.shape == (1, self.token_to_kv_pool.qsa_token_topk
+                                      + self.compress_ratio - 1 + indices.tail_width)
+            and self.token_to_kv_pool.qsa_token_topk == 2048
+            and self.compress_ratio == 4 and indices.tail_width == 4
+            and layer.tp_q_head_num == 6 and layer.tp_k_head_num == 1
+            and layer.head_dim == 256
+            and forward_batch.req_pool_indices.numel() == 1
+            and forward_batch.out_cache_loc.numel() == 1
+            and is_sm100_supported()
+            and _resolve_trtllm_sparse_decode() is not None
+        ):
+            return None
+        kc = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        vc = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        if not (kc.dtype == vc.dtype == torch.bfloat16
+                and kc.shape == vc.shape and kc.shape[1:] == (1, 256)
+                and kc.is_contiguous() and vc.is_contiguous()):
+            return None
+        metadata = self._resolve_metadata(forward_batch)
+        if metadata.sequence_lengths.numel() != 1:
+            return None
+        if metadata.is_cuda_graph:
+            counts = metadata.fa2_valid_counts
+            if counts is None:
+                return None
+        else:
+            counts = torch.empty(1, dtype=torch.int32, device=kc.device)
+        stride = (indices.shape[1] + _TRTLLM_SPARSE_PAGE_SIZE - 1) // _TRTLLM_SPARSE_PAGE_SIZE * _TRTLLM_SPARSE_PAGE_SIZE
+        capacity = self._cuda_graph_max_tokens if metadata.is_cuda_graph else 1
+        pk, pv = self._get_fa2_scratch(capacity * stride, 1, 256, kc.dtype, kc.device)
+        if not getattr(self, "_q38_mtp_front_logged", False):
+            logger.info("Q38C MK MTP front active: M1 Q6/KV1 BF16 Deferred T=%s stride=%s",
+                        indices.shape[1], stride)
+            self._q38_mtp_front_logged = True
+        from sglang.kernels.ops.speculative.q38_mk_mtp.front import MtpFrontPlan
+
+        return MtpFrontPlan(
+            kc, vc, forward_batch.out_cache_loc, self.req_to_token_pool.req_to_token,
+            metadata.row_req_pool_indices if metadata.row_req_pool_indices is not None
+            else forward_batch.req_pool_indices,
+            indices, metadata.sequence_lengths, counts, pk[:stride], pv[:stride],
+        )
+
+    def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices, output_gate=None):
         if not self._fused_kv_pool_eligible or not q.is_cuda or k is None or v is None:
             return None
         mode = forward_batch.forward_mode
@@ -1444,6 +1569,123 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata = self._resolve_metadata(forward_batch)
         if metadata.sequence_lengths.numel() != rows:
             return None
+        # Fused attention-core path. Preserve FN selection/scheduling,
+        # current-KV persistence and chain fresh/tail semantics.
+        # Other modes/shapes/precisions keep the existing implementation.
+        indexer = metadata.indexer_metadata
+        if (
+            _Q38C_ATTN_CORE_TP4
+            and is_sm100_supported()
+            and mode.is_target_verify()
+            and int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
+            and rows == width == 4
+            and metadata.is_cuda_graph
+            and self.compress_ratio == 4
+            and self._uses_block_indices(indices)
+            and indices.shape == (4, 512)
+            and layer.tp_q_head_num == 6
+            and layer.head_dim == 256
+            and kc.shape[1] == 1
+            and kc.dtype == vc.dtype == torch.bfloat16
+            and output_gate is not None
+            and output_gate.dtype == torch.bfloat16
+            and indexer is not None
+            and indexer.decode_logical_positions is not None
+        ):
+            row_requests = metadata.row_req_pool_indices
+            if row_requests is None:
+                row_requests = forward_batch.req_pool_indices
+            if row_requests.numel() == rows:
+                from sglang.kernels.ops.attention.q38c_attn_core_tp4 import run_gated
+
+                output = run_gated(
+                    q.reshape(rows, 6, 256), kc, vc, k, v, loc,
+                    self.req_to_token_pool.req_to_token, row_requests,
+                    indices.to(torch.int32).contiguous(), metadata.sequence_lengths,
+                    indexer.decode_logical_positions, layer.scaling,
+                    gate=output_gate, width=width,
+                )
+                return output.reshape(rows, -1), True
+        if (
+            _Q38_ATTN_CORE_V1
+            and is_sm100_supported()
+            and mode.is_target_verify()
+            and int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
+            and rows == width == 4
+            and metadata.is_cuda_graph
+            and self.compress_ratio == 4
+            and self._uses_block_indices(indices)
+            and indices.shape == (4, 512)
+            and layer.tp_q_head_num == 24
+            and layer.head_dim == 256
+            and kc.shape[1] == 2
+            and kc.dtype == torch.bfloat16
+            and vc.dtype == torch.bfloat16
+            and indexer is not None
+            and indexer.decode_logical_positions is not None
+        ):
+            from sglang.kernels.ops.attention.qsa_tcgen05_v1 import run
+
+            row_requests = metadata.row_req_pool_indices
+            if row_requests is None:
+                row_requests = forward_batch.req_pool_indices
+            if row_requests.numel() == rows:
+                gate_kwargs = {}
+                if output_gate is not None:
+                    from sglang.kernels.ops.attention.qsa_gate_epilogue_v2 import run_gated
+                    run = run_gated
+                    gate_kwargs["gate"] = output_gate
+                output = run(
+                    q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
+                    kc, vc, k, v, loc,
+                    self.req_to_token_pool.req_to_token,
+                    row_requests,
+                    indices.to(torch.int32).contiguous(),
+                    metadata.sequence_lengths,
+                    indexer.decode_logical_positions,
+                    layer.scaling,
+                    width=width,
+                    **gate_kwargs,
+                )
+                if output_gate is not None:
+                    return output.reshape(rows, -1), True
+                return output.reshape(rows, -1)
+        if (
+            get_parallel().tp_size == 1
+            and is_sm100_supported()
+            and rows <= _QSA_POOL_DECODE_MAX_ROWS
+            and _qsa_pool_decode_enabled()
+            and kc.dtype == torch.bfloat16
+            and self._uses_block_indices(indices)
+            and indexer is not None
+            and indexer.decode_logical_positions is not None
+        ):
+            # Read the selected K/V straight from the pool (split-K + merge)
+            # instead of packing them for trtllm decode; same selection,
+            # chain and tail semantics as fused_kv_prepare.
+            from sglang.srt.layers.attention.qsa.pool_decode import (
+                qsa_pool_sparse_decode,
+            )
+
+            row_requests = metadata.row_req_pool_indices
+            if row_requests is None:
+                row_requests = forward_batch.req_pool_indices
+            return qsa_pool_sparse_decode(
+                q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
+                kc,
+                vc,
+                k,
+                v,
+                loc,
+                self.req_to_token_pool.req_to_token,
+                row_requests,
+                indices.to(torch.int32).contiguous(),
+                metadata.sequence_lengths,
+                indexer.decode_logical_positions,
+                width,
+                layer.scaling,
+                ratio=self.compress_ratio,
+            )
         return self._forward_trtllm_sparse(
             q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
             kc,
@@ -1451,7 +1693,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer,
             forward_batch,
             metadata,
-            indices.to(torch.int32).contiguous(),
+            (
+                indices
+                if isinstance(indices, DeferredMtpSparseIndices)
+                else indices.to(torch.int32).contiguous()
+            ),
             trtllm_decode,
             new_kv=(k, v, loc, width),
         )
@@ -1477,7 +1723,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         if save_kv_cache:
             fused_output = self._try_fused_kv_attention(
-                q, k, v, layer, forward_batch, topk_indices
+                q, k, v, layer, forward_batch, topk_indices,
+                output_gate=kwargs.get("q38_output_gate"),
             )
             if fused_output is not None:
                 return fused_output
@@ -1760,6 +2007,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
         trtllm_decode,
         new_kv=None,
+        prepared_kv=None,
     ) -> torch.Tensor:
         """Pack selected KV at page-aligned row strides for FlashInfer's paged decode,
         driven by a static arange block table and the per-row valid counts."""
@@ -1797,7 +2045,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_dtype,
             k_buffer.device,
         )
-        if new_kv is not None:
+        if prepared_kv is not None:
+            valid_counts, packed_k, packed_v = prepared_kv
+        elif new_kv is not None:
             k, v, loc, width = new_kv
             row_requests = metadata.row_req_pool_indices
             if row_requests is None:
@@ -1902,6 +2152,17 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
+        prepared = kwargs.get("q38_mtp_prepared")
+        if prepared is not None:
+            # The fused front already persisted current KV and packed selection.
+            # Keep native FMHA, workspace, counters and ordinary completion.
+            return self._forward_trtllm_sparse(
+                q.reshape(-1, layer.tp_q_head_num, layer.head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                layer, forward_batch, self._resolve_metadata(forward_batch),
+                topk_indices, _resolve_trtllm_sparse_decode(), prepared_kv=prepared,
+            )
         if save_kv_cache:
             fused_output = self._try_fused_kv_attention(
                 q, k, v, layer, forward_batch, topk_indices
@@ -1912,6 +2173,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        if isinstance(topk_indices, DeferredMtpSparseIndices):
+            topk_indices = topk_indices.materialize()
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
     def _forward_paged_attention(

@@ -3,6 +3,7 @@ the torch implementations are the fallback and the reference."""
 
 import functools
 import math
+import os
 from typing import Optional
 
 import torch
@@ -382,6 +383,591 @@ if HAS_TILELANG:
 
         return kernel
 
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        }
+    )
+    def _tilelang_qsa_mqa_decode_grouped_kernel(
+        heads: int,
+        head_dim: int,
+        page_size: int = 64,
+        rows_per_group: int = 4,
+        ctas_per_group: int = 1,
+        min_scored_len: int = 0,
+        threads: int = 128,
+        dtype: str = "bfloat16",
+    ):
+        """``_tilelang_qsa_mqa_decode_kernel`` for groups of consecutive rows of one
+        request (the target-verify rows): each key tile is loaded once per group
+        and scored per row with that kernel's exact GEMM, ReLU, head sum and
+        scale, so every row's logits are bit-identical to the per-row kernel."""
+        GROUP = 64
+        assert GROUP % page_size == 0, page_size
+        sub_pages = GROUP // page_size
+        W = rows_per_group
+        batch = T.dynamic("batch")
+        pages = T.dynamic("pages")
+        max_pages = T.dynamic("max_pages")
+        max_model_len = T.dynamic("max_model_len")
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([batch, 1, heads, head_dim], dtype),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, head_dim], dtype),  # type: ignore
+            PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
+            ContextLens: T.Tensor([batch], T.int32),  # type: ignore
+            Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
+            Scale: T.float32,
+        ):
+            with T.Kernel(T.ceildiv(batch, W), ctas_per_group, threads=threads) as (
+                gx,
+                cta,
+            ):
+                q_all = T.alloc_shared([W * heads, head_dim], dtype)
+                q_shared = T.alloc_shared([heads, head_dim], dtype)
+                k_shared = T.alloc_shared([GROUP, head_dim], dtype)
+                scores = T.alloc_fragment([GROUP, heads], T.float32)
+                reduced = T.alloc_fragment([GROUP], T.float32)
+                group_len = T.alloc_var(T.int32)
+                row_len = T.alloc_var(T.int32)
+                # Rows of a group are one request's consecutive positions, so the
+                # last row is the longest and its page table covers the others.
+                last = gx * W + (W - 1)
+                group_len = ContextLens[last]
+                num_groups = T.ceildiv(group_len, GROUP)
+
+                if group_len > min_scored_len:
+                    for r in range(W):
+                        T.copy(Q[gx * W + r, 0, :, :], q_all[r * heads : (r + 1) * heads, :])
+                    for step in T.serial(T.ceildiv(num_groups, ctas_per_group)):
+                        group = step * ctas_per_group + cta
+                        if group < num_groups:
+                            for sp in range(sub_pages):
+                                if (group * sub_pages + sp) * page_size < group_len:
+                                    T.copy(
+                                        KCache[
+                                            PageTable[last, group * sub_pages + sp],
+                                            :,
+                                            0,
+                                            :,
+                                        ],
+                                        k_shared[
+                                            sp * page_size : (sp + 1) * page_size, :
+                                        ],
+                                    )
+                            for r in range(W):
+                                row_len = ContextLens[gx * W + r]
+                                if row_len > min_scored_len:
+                                    T.copy(q_all[r * heads : (r + 1) * heads, :], q_shared)
+                                    T.gemm(
+                                        k_shared,
+                                        q_shared,
+                                        scores,
+                                        transpose_B=True,
+                                        clear_accum=True,
+                                        policy=T.GemmWarpPolicy.FullCol,
+                                    )
+                                    for token, head in T.Parallel(GROUP, heads):
+                                        scores[token, head] = T.max(
+                                            scores[token, head], 0.0
+                                        )
+                                    T.reduce_sum(scores, reduced, dim=1, clear=True)
+                                    for token in T.Parallel(GROUP):
+                                        position = group * GROUP + token
+                                        if position < row_len:
+                                            Logits[gx * W + r, position] = (
+                                                reduced[token] / Scale
+                                            )
+
+        return kernel
+
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        }
+    )
+    def _tilelang_qsa_mqa_decode_grouped_v3_kernel(
+        heads: int,
+        head_dim: int,
+        page_size: int = 64,
+        rows_per_group: int = 4,
+        ctas_per_group: int = 1,
+        min_scored_len: int = 0,
+        threads: int = 128,
+        dtype: str = "bfloat16",
+        tiles_per_batch: int = 2,
+        row_guard: bool = True,
+        peel: bool = False,
+    ):
+        """Grouped scorer with batched K loads: each CTA owns a contiguous range
+        of a request's 64-key tiles and loads ``tiles_per_batch`` tiles into
+        separate shared buffers in one pass (one memory round trip for all of
+        them), then scores every row of the group on each tile. Each row's
+        query sits in its own shared buffer, so the per-row scoring needs no
+        shared copy or barrier. The per-row T.gemm(k[64, D], q[H, D]^T,
+        FullCol) / ReLU / reduce_sum / scale is the per-row kernel's, so the
+        logits are bit-identical to it. Sub-pages and tiles past the group's
+        length re-load the last valid page and are never stored."""
+        GROUP = 64
+        assert GROUP % page_size == 0, page_size
+        sub_pages = GROUP // page_size
+        W = rows_per_group
+        NT = tiles_per_batch
+        assert 1 <= W <= 4 and 1 <= NT <= 4, (W, NT)
+        C = ctas_per_group
+        batch = T.dynamic("batch")
+        pages = T.dynamic("pages")
+        max_pages = T.dynamic("max_pages")
+        max_model_len = T.dynamic("max_model_len")
+
+        @T.macro
+        def load_tile(KCache, PageTable, kbuf, last, tile, last_page):
+            for sp in T.unroll(sub_pages):
+                T.copy(
+                    KCache[
+                        PageTable[last, T.min(tile * sub_pages + sp, last_page)],
+                        :,
+                        0,
+                        :,
+                    ],
+                    kbuf[sp * page_size : (sp + 1) * page_size, :],
+                )
+
+        # Rows at or below min_scored_len are scored too when their group is
+        # (their logits are never read), so the rows' GEMMs carry no branch.
+        @T.macro
+        def score_row_body(Logits, kbuf, qbuf, scores, reduced, row, row_len, tile, Scale):
+            T.gemm(
+                kbuf,
+                qbuf,
+                scores,
+                transpose_B=True,
+                clear_accum=True,
+                policy=T.GemmWarpPolicy.FullCol,
+            )
+            for token, head in T.Parallel(GROUP, heads):
+                scores[token, head] = T.max(scores[token, head], 0.0)
+            T.reduce_sum(scores, reduced, dim=1, clear=True)
+            for token in T.Parallel(GROUP):
+                position = tile * GROUP + token
+                if position < row_len:
+                    Logits[row, position] = reduced[token] / Scale
+
+        # The per-row branch also keeps the rows' GEMMs from being interleaved
+        # (register pressure and occupancy).
+        @T.macro
+        def score_row(Logits, kbuf, qbuf, scores, reduced, row, row_len, tile, Scale):
+            if row_guard:
+                if row_len > min_scored_len:
+                    score_row_body(Logits, kbuf, qbuf, scores, reduced, row, row_len, tile, Scale)
+            else:
+                score_row_body(Logits, kbuf, qbuf, scores, reduced, row, row_len, tile, Scale)
+
+        @T.macro
+        def score_tile(Logits, kbuf, q0, q1, q2, q3, scores, reduced, gx, l0, l1, l2, l3, tile, Scale):
+            score_row(Logits, kbuf, q0, scores, reduced, gx * W, l0, tile, Scale)
+            if W > 1:
+                score_row(Logits, kbuf, q1, scores, reduced, gx * W + 1, l1, tile, Scale)
+            if W > 2:
+                score_row(Logits, kbuf, q2, scores, reduced, gx * W + 2, l2, tile, Scale)
+            if W > 3:
+                score_row(Logits, kbuf, q3, scores, reduced, gx * W + 3, l3, tile, Scale)
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([batch, 1, heads, head_dim], dtype),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, head_dim], dtype),  # type: ignore
+            PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
+            ContextLens: T.Tensor([batch], T.int32),  # type: ignore
+            Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
+            Scale: T.float32,
+        ):
+            with T.Kernel(T.ceildiv(batch, W), C, threads=threads) as (gx, cta):
+                q0 = T.alloc_shared([heads, head_dim], dtype)
+                q1 = T.alloc_shared([heads, head_dim], dtype)
+                q2 = T.alloc_shared([heads, head_dim], dtype)
+                q3 = T.alloc_shared([heads, head_dim], dtype)
+                k0 = T.alloc_shared([GROUP, head_dim], dtype)
+                k1 = T.alloc_shared([GROUP, head_dim], dtype)
+                k2 = T.alloc_shared([GROUP, head_dim], dtype)
+                k3 = T.alloc_shared([GROUP, head_dim], dtype)
+                scores = T.alloc_fragment([GROUP, heads], T.float32)
+                reduced = T.alloc_fragment([GROUP], T.float32)
+                group_len = T.alloc_var(T.int32)
+                last = gx * W + (W - 1)
+                group_len = ContextLens[last]
+                num_tiles = T.ceildiv(group_len, GROUP)
+                per_cta = T.ceildiv(num_tiles, C)
+                start = cta * per_cta
+                end = T.min(start + per_cta, num_tiles)
+                last_page = T.max(group_len - 1, 0) // page_size
+                l0 = T.alloc_var(T.int32)
+                l1 = T.alloc_var(T.int32)
+                l2 = T.alloc_var(T.int32)
+                l3 = T.alloc_var(T.int32)
+                l0 = ContextLens[gx * W]
+                l1 = l0
+                l2 = l0
+                l3 = l0
+                if W > 1:
+                    l1 = ContextLens[gx * W + 1]
+                if W > 2:
+                    l2 = ContextLens[gx * W + 2]
+                if W > 3:
+                    l3 = ContextLens[gx * W + 3]
+                if group_len > min_scored_len and start < end:
+                    # The first tile's (page table -> K) load chain is issued
+                    # before the query loads, so the two overlap.
+                    if peel:
+                        load_tile(KCache, PageTable, k0, last, start, last_page)
+                    T.copy(Q[gx * W, 0, :, :], q0)
+                    if W > 1:
+                        T.copy(Q[gx * W + 1, 0, :, :], q1)
+                    if W > 2:
+                        T.copy(Q[gx * W + 2, 0, :, :], q2)
+                    if W > 3:
+                        T.copy(Q[gx * W + 3, 0, :, :], q3)
+                    for it in T.serial(T.ceildiv(end - start, NT)):
+                        base = start + it * NT
+                        if peel:
+                            if it > 0:
+                                load_tile(KCache, PageTable, k0, last, base, last_page)
+                        else:
+                            load_tile(KCache, PageTable, k0, last, base, last_page)
+                        if NT > 1:
+                            load_tile(KCache, PageTable, k1, last, base + 1, last_page)
+                        if NT > 2:
+                            load_tile(KCache, PageTable, k2, last, base + 2, last_page)
+                        if NT > 3:
+                            load_tile(KCache, PageTable, k3, last, base + 3, last_page)
+                        score_tile(Logits, k0, q0, q1, q2, q3, scores, reduced, gx, l0, l1, l2, l3, base, Scale)
+                        if NT > 1:
+                            if base + 1 < end:
+                                score_tile(Logits, k1, q0, q1, q2, q3, scores, reduced, gx, l0, l1, l2, l3, base + 1, Scale)
+                        if NT > 2:
+                            if base + 2 < end:
+                                score_tile(Logits, k2, q0, q1, q2, q3, scores, reduced, gx, l0, l1, l2, l3, base + 2, Scale)
+                        if NT > 3:
+                            if base + 3 < end:
+                                score_tile(Logits, k3, q0, q1, q2, q3, scores, reduced, gx, l0, l1, l2, l3, base + 3, Scale)
+
+        return kernel
+
+
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        }
+    )
+    def _tilelang_qsa_mqa_decode_grouped_v6_kernel(
+        heads: int,
+        head_dim: int,
+        page_size: int = 64,
+        rows_per_group: int = 4,
+        ctas_per_group: int = 1,
+        min_scored_len: int = 0,
+        threads: int = 128,
+        dtype: str = "bfloat16",
+    ):
+        """The v3 grouped scorer (one K-tile load per group of rows, per-row
+        query buffers, the per-row kernel's exact GEMM / ReLU / reduce_sum /
+        scale) with a shorter dependency chain: CTA ``cta`` scores tiles
+        cta, cta + C, ... and reads its first tile's page-table entries
+        together with the context lengths, so the chain is
+        max(length, page table) -> K (+ queries) instead of
+        length -> queries -> page table -> K. Nothing but those four entries is
+        read before the length check, and sub-pages past the length re-load the
+        tile's first page (never stored)."""
+        GROUP = 64
+        assert GROUP % page_size == 0, page_size
+        sub_pages = GROUP // page_size
+        W = rows_per_group
+        assert 1 <= W <= 4, W
+        C = ctas_per_group
+        batch = T.dynamic("batch")
+        pages = T.dynamic("pages")
+        max_pages = T.dynamic("max_pages")
+        max_model_len = T.dynamic("max_model_len")
+
+        @T.macro
+        def load_tile(KCache, PageTable, kbuf, last, tile, last_page):
+            for sp in T.unroll(sub_pages):
+                T.copy(
+                    KCache[
+                        PageTable[last, T.min(tile * sub_pages + sp, last_page)],
+                        :,
+                        0,
+                        :,
+                    ],
+                    kbuf[sp * page_size : (sp + 1) * page_size, :],
+                )
+
+        @T.macro
+        def score_row(Logits, kbuf, qbuf, scores, reduced, row, row_len, tile, Scale):
+            T.gemm(
+                kbuf,
+                qbuf,
+                scores,
+                transpose_B=True,
+                clear_accum=True,
+                policy=T.GemmWarpPolicy.FullCol,
+            )
+            for token, head in T.Parallel(GROUP, heads):
+                scores[token, head] = T.max(scores[token, head], 0.0)
+            T.reduce_sum(scores, reduced, dim=1, clear=True)
+            for token in T.Parallel(GROUP):
+                position = tile * GROUP + token
+                if position < row_len:
+                    Logits[row, position] = reduced[token] / Scale
+
+        @T.macro
+        def score_tile(Logits, kbuf, q0, q1, q2, q3, scores, reduced, gx, l0, l1, l2, l3, tile, Scale):
+            score_row(Logits, kbuf, q0, scores, reduced, gx * W, l0, tile, Scale)
+            if W > 1:
+                score_row(Logits, kbuf, q1, scores, reduced, gx * W + 1, l1, tile, Scale)
+            if W > 2:
+                score_row(Logits, kbuf, q2, scores, reduced, gx * W + 2, l2, tile, Scale)
+            if W > 3:
+                score_row(Logits, kbuf, q3, scores, reduced, gx * W + 3, l3, tile, Scale)
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([batch, 1, heads, head_dim], dtype),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, head_dim], dtype),  # type: ignore
+            PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
+            ContextLens: T.Tensor([batch], T.int32),  # type: ignore
+            Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
+            Scale: T.float32,
+        ):
+            with T.Kernel(T.ceildiv(batch, W), C, threads=threads) as (gx, cta):
+                q0 = T.alloc_shared([heads, head_dim], dtype)
+                q1 = T.alloc_shared([heads, head_dim], dtype)
+                q2 = T.alloc_shared([heads, head_dim], dtype)
+                q3 = T.alloc_shared([heads, head_dim], dtype)
+                k0 = T.alloc_shared([GROUP, head_dim], dtype)
+                scores = T.alloc_fragment([GROUP, heads], T.float32)
+                reduced = T.alloc_fragment([GROUP], T.float32)
+                group_len = T.alloc_var(T.int32)
+                last = gx * W + (W - 1)
+                pidx = T.alloc_local([sub_pages], T.int32)
+                for sp in T.unroll(sub_pages):
+                    pidx[sp] = PageTable[last, T.min(cta * sub_pages + sp, max_pages - 1)]
+                group_len = ContextLens[last]
+                num_tiles = T.ceildiv(group_len, GROUP)
+                last_page = T.max(group_len - 1, 0) // page_size
+                l0 = T.alloc_var(T.int32)
+                l1 = T.alloc_var(T.int32)
+                l2 = T.alloc_var(T.int32)
+                l3 = T.alloc_var(T.int32)
+                l0 = ContextLens[gx * W]
+                l1 = l0
+                l2 = l0
+                l3 = l0
+                if W > 1:
+                    l1 = ContextLens[gx * W + 1]
+                if W > 2:
+                    l2 = ContextLens[gx * W + 2]
+                if W > 3:
+                    l3 = ContextLens[gx * W + 3]
+                if group_len > min_scored_len and cta < num_tiles:
+                    for sp in T.unroll(sub_pages):
+                        T.copy(
+                            KCache[
+                                T.if_then_else(
+                                    cta * sub_pages + sp <= last_page, pidx[sp], pidx[0]
+                                ),
+                                :,
+                                0,
+                                :,
+                            ],
+                            k0[sp * page_size : (sp + 1) * page_size, :],
+                        )
+                    T.copy(Q[gx * W, 0, :, :], q0)
+                    if W > 1:
+                        T.copy(Q[gx * W + 1, 0, :, :], q1)
+                    if W > 2:
+                        T.copy(Q[gx * W + 2, 0, :, :], q2)
+                    if W > 3:
+                        T.copy(Q[gx * W + 3, 0, :, :], q3)
+                    for it in T.serial(T.ceildiv(num_tiles - cta, C)):
+                        tile = cta + it * C
+                        if it > 0:
+                            load_tile(KCache, PageTable, k0, last, tile, last_page)
+                        score_tile(Logits, k0, q0, q1, q2, q3, scores, reduced, gx, l0, l1, l2, l3, tile, Scale)
+
+        return kernel
+
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        }
+    )
+    def _tilelang_qsa_mqa_decode_grouped_v7_kernel(
+        heads: int,
+        head_dim: int,
+        page_size: int = 64,
+        rows_per_group: int = 4,
+        ctas_per_group: int = 1,
+        min_scored_len: int = 0,
+        threads: int = 128,
+        dtype: str = "bfloat16",
+    ):
+        """The v3 grouped scorer (one K-tile load per group of rows, per-row
+        query buffers, the per-row kernel's exact GEMM / ReLU / reduce_sum /
+        scale) with a shorter dependency chain: CTA ``cta`` scores tiles
+        cta, cta + C, ... and reads its first tile's page-table entries
+        together with the context lengths, so the chain is
+        max(length, page table) -> K (+ queries) instead of
+        length -> queries -> page table -> K. Nothing but those four entries is
+        read before the length check, and sub-pages past the length re-load the
+        tile's first page (never stored). The second tile's (cta + C)
+        page-table entries are read up front as well, so a CTA's second tile
+        costs one K round trip."""
+        GROUP = 64
+        assert GROUP % page_size == 0, page_size
+        sub_pages = GROUP // page_size
+        W = rows_per_group
+        assert 1 <= W <= 4, W
+        C = ctas_per_group
+        batch = T.dynamic("batch")
+        pages = T.dynamic("pages")
+        max_pages = T.dynamic("max_pages")
+        max_model_len = T.dynamic("max_model_len")
+
+        @T.macro
+        def load_tile(KCache, PageTable, kbuf, last, tile, last_page):
+            for sp in T.unroll(sub_pages):
+                T.copy(
+                    KCache[
+                        PageTable[last, T.min(tile * sub_pages + sp, last_page)],
+                        :,
+                        0,
+                        :,
+                    ],
+                    kbuf[sp * page_size : (sp + 1) * page_size, :],
+                )
+
+        @T.macro
+        def score_row(Logits, kbuf, qbuf, scores, reduced, row, row_len, tile, Scale):
+            T.gemm(
+                kbuf,
+                qbuf,
+                scores,
+                transpose_B=True,
+                clear_accum=True,
+                policy=T.GemmWarpPolicy.FullCol,
+            )
+            for token, head in T.Parallel(GROUP, heads):
+                scores[token, head] = T.max(scores[token, head], 0.0)
+            T.reduce_sum(scores, reduced, dim=1, clear=True)
+            for token in T.Parallel(GROUP):
+                position = tile * GROUP + token
+                if position < row_len:
+                    Logits[row, position] = reduced[token] / Scale
+
+        @T.macro
+        def score_tile(Logits, kbuf, q0, q1, q2, q3, scores, reduced, gx, l0, l1, l2, l3, tile, Scale):
+            score_row(Logits, kbuf, q0, scores, reduced, gx * W, l0, tile, Scale)
+            if W > 1:
+                score_row(Logits, kbuf, q1, scores, reduced, gx * W + 1, l1, tile, Scale)
+            if W > 2:
+                score_row(Logits, kbuf, q2, scores, reduced, gx * W + 2, l2, tile, Scale)
+            if W > 3:
+                score_row(Logits, kbuf, q3, scores, reduced, gx * W + 3, l3, tile, Scale)
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([batch, 1, heads, head_dim], dtype),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, head_dim], dtype),  # type: ignore
+            PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
+            ContextLens: T.Tensor([batch], T.int32),  # type: ignore
+            Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
+            Scale: T.float32,
+        ):
+            with T.Kernel(T.ceildiv(batch, W), C, threads=threads) as (gx, cta):
+                q0 = T.alloc_shared([heads, head_dim], dtype)
+                q1 = T.alloc_shared([heads, head_dim], dtype)
+                q2 = T.alloc_shared([heads, head_dim], dtype)
+                q3 = T.alloc_shared([heads, head_dim], dtype)
+                k0 = T.alloc_shared([GROUP, head_dim], dtype)
+                scores = T.alloc_fragment([GROUP, heads], T.float32)
+                reduced = T.alloc_fragment([GROUP], T.float32)
+                group_len = T.alloc_var(T.int32)
+                last = gx * W + (W - 1)
+                pidx = T.alloc_local([sub_pages], T.int32)
+                pidx2 = T.alloc_local([sub_pages], T.int32)
+                for sp in T.unroll(sub_pages):
+                    pidx[sp] = PageTable[last, T.min(cta * sub_pages + sp, max_pages - 1)]
+                for sp in T.unroll(sub_pages):
+                    pidx2[sp] = PageTable[
+                        last, T.min((cta + C) * sub_pages + sp, max_pages - 1)
+                    ]
+                group_len = ContextLens[last]
+                num_tiles = T.ceildiv(group_len, GROUP)
+                last_page = T.max(group_len - 1, 0) // page_size
+                l0 = T.alloc_var(T.int32)
+                l1 = T.alloc_var(T.int32)
+                l2 = T.alloc_var(T.int32)
+                l3 = T.alloc_var(T.int32)
+                l0 = ContextLens[gx * W]
+                l1 = l0
+                l2 = l0
+                l3 = l0
+                if W > 1:
+                    l1 = ContextLens[gx * W + 1]
+                if W > 2:
+                    l2 = ContextLens[gx * W + 2]
+                if W > 3:
+                    l3 = ContextLens[gx * W + 3]
+                if group_len > min_scored_len and cta < num_tiles:
+                    for sp in T.unroll(sub_pages):
+                        T.copy(
+                            KCache[
+                                T.if_then_else(
+                                    cta * sub_pages + sp <= last_page, pidx[sp], pidx[0]
+                                ),
+                                :,
+                                0,
+                                :,
+                            ],
+                            k0[sp * page_size : (sp + 1) * page_size, :],
+                        )
+                    T.copy(Q[gx * W, 0, :, :], q0)
+                    if W > 1:
+                        T.copy(Q[gx * W + 1, 0, :, :], q1)
+                    if W > 2:
+                        T.copy(Q[gx * W + 2, 0, :, :], q2)
+                    if W > 3:
+                        T.copy(Q[gx * W + 3, 0, :, :], q3)
+                    for it in T.serial(T.ceildiv(num_tiles - cta, C)):
+                        tile = cta + it * C
+                        if it == 1:
+                            for sp in T.unroll(sub_pages):
+                                T.copy(
+                                    KCache[
+                                        T.if_then_else(
+                                            tile * sub_pages + sp <= last_page,
+                                            pidx2[sp],
+                                            pidx2[0],
+                                        ),
+                                        :,
+                                        0,
+                                        :,
+                                    ],
+                                    k0[sp * page_size : (sp + 1) * page_size, :],
+                                )
+                        else:
+                            if it > 1:
+                                load_tile(KCache, PageTable, k0, last, tile, last_page)
+                        score_tile(Logits, k0, q0, q1, q2, q3, scores, reduced, gx, l0, l1, l2, l3, tile, Scale)
+
+        return kernel
+
 
 def tilelang_qsa_mqa_prefill(
     q: torch.Tensor,
@@ -554,6 +1140,50 @@ def _decode_ctas_per_row(rows: int, device: torch.device) -> int:
     return _DECODE_CTAS_PER_ROW_LEVELS[-1]
 
 
+# Scorer v2 (v3 kernel) schedule: a request's verify rows share each K-tile
+# load (rows_per_group) and each CTA owns a contiguous range of a request's
+# 64-key tiles (one tile at <=128k context). The grid is about
+# _V2_TARGET_CTAS CTAs: ctas_per_group is the largest level <= target/groups.
+# It depends on the request count only (CUDA graph shapes), never on the
+# device-side lengths.
+_V2_CTA_LEVELS = (16, 32, 64, 128, 256, 512, 1024)
+_V2_TARGET_CTAS = 4096
+
+
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    v = os.environ.get(name)
+    return int(v) if v not in (None, "") else default
+
+
+def _v2_config(rows: int, rows_per_group: int, device: torch.device):
+    import os
+
+    if os.environ.get("SGLANG_QSA_SCORER_V2", "1") == "0":
+        return None
+    W = rows_per_group if rows_per_group > 1 and rows % rows_per_group == 0 else 1
+    if W > 4:
+        return None  # the v3/v6/v7 kernels hold at most four query rows
+    if W == 1 and os.environ.get("SGLANG_QSA_SCORER_V2_ROWS", "0") != "1":
+        return None
+    groups = rows // W
+    wanted = _env_int("SGLANG_QSA_SCORER_V2_TARGET", _V2_TARGET_CTAS) // max(groups, 1)
+    C = _V2_CTA_LEVELS[0]
+    for level in _V2_CTA_LEVELS:
+        if level <= wanted:
+            C = level
+    C = _env_int("SGLANG_QSA_SCORER_V2_C", C)
+    return {
+        "W": W,
+        "C": C,
+        "ver": _env_int("SGLANG_QSA_SCORER_V2_VER", 7),
+        "NT": _env_int("SGLANG_QSA_SCORER_V2_NT", 1),
+        "guard": _env_int("SGLANG_QSA_SCORER_V2_GUARD", 0) == 1,
+        "peel": _env_int("SGLANG_QSA_SCORER_V2_PEEL", 0) == 1,
+    }
+
+
 def tilelang_qsa_mqa_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -563,8 +1193,14 @@ def tilelang_qsa_mqa_decode(
     score_scale: Optional[float] = None,
     *,
     min_scored_len: int = 0,
+    rows_per_group: int = 1,
 ) -> torch.Tensor:
     """Validated TileLang paged decode kernel with weights removed.
+
+    With ``rows_per_group`` > 1, consecutive groups of that many rows must be one
+    request's consecutive query positions (target verify): their page-table rows
+    agree and lengths are non-decreasing. Each compressed key tile is then loaded
+    once per group; the logits are bit-identical to the per-row kernel.
 
     With ``min_scored_len`` > 0, rows whose context length is at most that are not
     scored and the logits past each row's context length are left unset: only for
@@ -580,7 +1216,13 @@ def tilelang_qsa_mqa_decode(
             "TileLang QSA decode requires a compressed page size of "
             f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
         )
-    if min_scored_len > 0:
+    if min_scored_len > 0 and os.environ.get("SGLANG_QSA_SCORER_POISON", "0") == "1":
+        # Debug: NaN-poison the unset logits so a missing store cannot pass a
+        # bit-identity check on reused allocator memory.
+        logits = torch.full(
+            (q.shape[0], max_model_len), float("nan"), dtype=torch.float32, device=q.device
+        )
+    elif min_scored_len > 0:
         logits = torch.empty(
             (q.shape[0], max_model_len), dtype=torch.float32, device=q.device
         )
@@ -611,14 +1253,61 @@ def tilelang_qsa_mqa_decode(
             ],
             dim=1,
         )
-    _tilelang_qsa_mqa_decode_kernel(
-        heads=kernel_heads,
-        head_dim=head_dim,
-        page_size=page_size,
-        ctas_per_row=_decode_ctas_per_row(q.shape[0], q.device),
-        min_scored_len=min_scored_len,
-        dtype=_TILELANG_DTYPES[scoring_dtype],
-    )(
+    rows = q.shape[0]
+    v2 = _v2_config(rows, rows_per_group, q.device)
+    if v2 is not None and v2["ver"] == 7:
+        kernel = _tilelang_qsa_mqa_decode_grouped_v7_kernel(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            rows_per_group=v2["W"],
+            ctas_per_group=v2["C"],
+            min_scored_len=min_scored_len,
+            dtype=_TILELANG_DTYPES[scoring_dtype],
+        )
+    elif v2 is not None and v2["ver"] == 6:
+        kernel = _tilelang_qsa_mqa_decode_grouped_v6_kernel(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            rows_per_group=v2["W"],
+            ctas_per_group=v2["C"],
+            min_scored_len=min_scored_len,
+            dtype=_TILELANG_DTYPES[scoring_dtype],
+        )
+    elif v2 is not None and v2["ver"] == 3:
+        kernel = _tilelang_qsa_mqa_decode_grouped_v3_kernel(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            rows_per_group=v2["W"],
+            ctas_per_group=v2["C"],
+            min_scored_len=min_scored_len,
+            dtype=_TILELANG_DTYPES[scoring_dtype],
+            tiles_per_batch=v2["NT"],
+            row_guard=v2["guard"],
+            peel=v2["peel"],
+        )
+    elif rows_per_group > 1 and rows % rows_per_group == 0:
+        kernel = _tilelang_qsa_mqa_decode_grouped_kernel(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            rows_per_group=rows_per_group,
+            ctas_per_group=_decode_ctas_per_row(rows // rows_per_group, q.device),
+            min_scored_len=min_scored_len,
+            dtype=_TILELANG_DTYPES[scoring_dtype],
+        )
+    else:
+        kernel = _tilelang_qsa_mqa_decode_kernel(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            ctas_per_row=_decode_ctas_per_row(rows, q.device),
+            min_scored_len=min_scored_len,
+            dtype=_TILELANG_DTYPES[scoring_dtype],
+        )
+    kernel(
         q_kernel.unsqueeze(1).contiguous(),
         k_cache.to(scoring_dtype).contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
@@ -668,6 +1357,7 @@ def qsa_mqa_decode(
     score_scale: Optional[float] = None,
     *,
     min_scored_len: int = 0,
+    rows_per_group: int = 1,
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
@@ -678,6 +1368,7 @@ def qsa_mqa_decode(
             max_model_len,
             score_scale,
             min_scored_len=min_scored_len,
+            rows_per_group=rows_per_group,
         )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale

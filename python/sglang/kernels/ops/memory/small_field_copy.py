@@ -156,6 +156,21 @@ class SmallFieldCopyPlan:
         return _run_host_desc(dsts[0], self._desc)
 
 
+_PLANS: dict = {}
+
+
+def cached_small_field_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool:
+    """small_field_copy through a SmallFieldCopyPlan per destination layout (pointer,
+    shape, stride, dtype of every destination); False when a field is not supported."""
+    key = tuple((d.data_ptr(), d.shape, d.stride(), d.dtype) for d in dsts)
+    plan = _PLANS.get(key)
+    if plan is None:
+        if len(_PLANS) >= 256:
+            _PLANS.clear()
+        plan = _PLANS[key] = SmallFieldCopyPlan()
+    return plan(dsts, srcs)
+
+
 def _run_host_desc(anchor: torch.Tensor, desc: torch.Tensor) -> bool:
     module = _jit_small_field_copy_module()
     run = (
@@ -166,4 +181,4 @@ def _run_host_desc(anchor: torch.Tensor, desc: torch.Tensor) -> bool:
     return run(anchor, desc) == 0
 
 
-__all__ = ["SmallFieldCopyPlan", "small_field_copy"]
+__all__ = ["SmallFieldCopyPlan", "cached_small_field_copy", "small_field_copy"]

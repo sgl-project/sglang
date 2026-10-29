@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
+
 _DRAFT_TOPK1_BLOCK = 8192
 
 
@@ -16,8 +18,12 @@ def _draft_topk1_partial_argmax_kernel(
     vocab_size: tl.constexpr,
     num_splits: tl.constexpr,
     BLOCK: tl.constexpr,
+    PDL_SMALL: tl.constexpr = False,
 ):
     # int64 row base: row * stride overflows int32 once bs * vocab reaches 2^31.
+    # Protect dynamic reads and reused-buffer writes before relaxing this edge.
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(1)
     offsets = split * BLOCK + tl.arange(0, BLOCK)
@@ -35,6 +41,8 @@ def _draft_topk1_partial_argmax_kernel(
     out_offset = row * num_splits + split
     tl.store(partial_vals + out_offset, max_val)
     tl.store(partial_indices + out_offset, split * BLOCK + local_index)
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -47,10 +55,18 @@ def _draft_topk1_finalize_kernel(
     draft_tokens,
     draft_tokens_stride,
     draft_token_column,
+    mrope,
+    mrope_axis_stride,
+    mrope_row_stride,
     num_splits: tl.constexpr,
     WRITE_DRAFT_TOKEN: tl.constexpr,
+    WRITE_MROPE: tl.constexpr,
     BLOCK: tl.constexpr,
+    PDL_SMALL: tl.constexpr = False,
 ):
+    # Protect dynamic reads and reused-buffer writes before relaxing this edge.
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
     mask = offsets < num_splits
@@ -69,6 +85,12 @@ def _draft_topk1_finalize_kernel(
 
     position = tl.load(positions + row)
     tl.store(positions + row, position + 1)
+    if WRITE_MROPE:
+        for axis in tl.static_range(3):
+            ptr = mrope + axis * mrope_axis_stride + row * mrope_row_stride
+            tl.store(ptr, tl.load(ptr) + 1)
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def draft_topk1_postprocess(
@@ -76,6 +98,7 @@ def draft_topk1_postprocess(
     positions: torch.Tensor,
     draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0,
+    mrope_positions: torch.Tensor | None = None,
 ):
     """Argmax draft logits for topk=1 and advance positions.
 
@@ -129,6 +152,8 @@ def draft_topk1_postprocess(
         num_splits,
         BLOCK=block,
         num_warps=8,
+        launch_pdl=_PDL_SMALL,
+        PDL_SMALL=_PDL_SMALL,
     )
     # Dummy operand for the disabled draft-token slot: the pointer must be
     # valid even though the kernel never dereferences it (gated off by
@@ -142,10 +167,16 @@ def draft_topk1_postprocess(
         draft_tokens if write_draft_token else topk_index,
         draft_tokens.stride(0) if write_draft_token else 0,
         draft_token_column,
+        mrope_positions,
+        mrope_positions.stride(0) if mrope_positions is not None else 0,
+        mrope_positions.stride(1) if mrope_positions is not None else 0,
         num_splits,
         WRITE_DRAFT_TOKEN=write_draft_token,
+        WRITE_MROPE=mrope_positions is not None,
         BLOCK=triton.next_power_of_2(num_splits),
         num_warps=1,
+        launch_pdl=_PDL_SMALL,
+        PDL_SMALL=_PDL_SMALL,
     )
     return topk_p, topk_index
 

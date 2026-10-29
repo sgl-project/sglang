@@ -53,6 +53,7 @@ from sglang.srt.sampling.sampling_params import (
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils import host_trace
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
@@ -956,7 +957,11 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
+            if host_trace.ENABLED:
+                host_trace.mark(host_trace.SYNC0)
             result.copy_done.synchronize()
+            if host_trace.ENABLED:
+                host_trace.mark(host_trace.SYNC1)
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
@@ -1097,7 +1102,11 @@ class SchedulerBatchResultProcessor:
                 auxiliary_output_starts,
             )
 
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.OUT0)
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        if host_trace.ENABLED:
+            host_trace.mark(host_trace.OUT1)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (

@@ -3,6 +3,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
+
 
 @triton.jit
 def softcap_inplace_logits_kernel(
@@ -15,7 +17,11 @@ def softcap_inplace_logits_kernel(
     output_row_stride=0,
     CAST_TO_FP32: tl.constexpr = False,
     APPLY_SOFTCAP: tl.constexpr = True,
+    PDL_SMALL: tl.constexpr = False,
 ):
+    # Protect dynamic reads and reused-buffer writes before relaxing this edge.
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(1).to(tl.int64)
     pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
@@ -38,6 +44,8 @@ def softcap_inplace_logits_kernel(
         tl.store(output_ptr + row * output_row_stride + offsets, x, mask=mask)
     else:
         tl.store(row_ptr + offsets, x, mask=mask)
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _softcap_logits(full_logits, final_logit_softcapping, output=None):
@@ -73,6 +81,8 @@ def _softcap_logits(full_logits, final_logit_softcapping, output=None):
         else 0,
         CAST_TO_FP32=output is not None,
         APPLY_SOFTCAP=final_logit_softcapping is not None,
+        launch_pdl=_PDL_SMALL,
+        PDL_SMALL=_PDL_SMALL,
     )
     return full_logits if output is None else output
 

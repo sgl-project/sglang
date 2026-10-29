@@ -6,6 +6,7 @@
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
 
+import os
 from contextlib import nullcontext
 from functools import lru_cache
 
@@ -98,11 +99,14 @@ def _layer_norm_fwd_1pass_kernel(
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    EARLY_DEPENDENTS: tl.constexpr = False,
     Q=None,
     S=None,
     QUANT: tl.constexpr = False,
 ):
     if USE_GDC:
+        if EARLY_DEPENDENTS:
+            tl.extra.cuda.gdc_launch_dependents()
         tl.extra.cuda.gdc_wait()
 
     # Map the program id to the starting row of X and Y it should compute.
@@ -205,7 +209,7 @@ def _layer_norm_fwd_1pass_kernel(
         # Write output
         tl.store(Y_base, y, mask=mask)
 
-    if USE_GDC:
+    if USE_GDC and not EARLY_DEPENDENTS:
         tl.extra.cuda.gdc_launch_dependents()
 
 
@@ -301,6 +305,15 @@ def _layer_norm_fwd(
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    # Mature Q35 front_norm ordering: native consumer may prefetch weights,
+    # while its activation DMA still waits for the norm producer to finish.
+    if (
+        pdl_kwargs and os.environ.get("Q38_GDN_NORM_EARLY") == "1"
+        and x.dtype == torch.bfloat16 and is_rms_norm and norm_before_gate
+        and activation == "sigmoid" and M == 192 and N == 128
+        and z_is_3d and z.shape[1] == 48
+    ):
+        pdl_kwargs["EARLY_DEPENDENTS"] = True
     # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
     # in that release — it creates a DynamoConfigPatchProxy that
     # SourcelessBuilder cannot wrap, causing a hard error under

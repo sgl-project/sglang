@@ -42,6 +42,17 @@ def _default_tree_cache_sanity_check() -> bool:
     return envs.SGLANG_IS_IN_CI.get()
 
 
+_UNREAD = object()
+# freeze_env_reads(): get() serves each field's first value read after the freeze; set,
+# clear and override drop it. A direct os.environ write after the freeze is not seen.
+_FROZEN = False
+
+
+def freeze_env_reads() -> None:
+    global _FROZEN
+    _FROZEN = True
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -51,6 +62,7 @@ class EnvField:
         # whether the env var is explicitly set to None.
         self._set_to_none = False
         self.secret = secret
+        self._frozen_value = _UNREAD
 
     def __set_name__(self, owner, name):
         assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
@@ -65,6 +77,14 @@ class EnvField:
         return self.default() if callable(self.default) else self.default
 
     def get(self) -> Any:
+        if _FROZEN:
+            value = self._frozen_value
+            if value is _UNREAD:
+                value = self._frozen_value = self._get()
+            return value
+        return self._get()
+
+    def _get(self) -> Any:
         value = os.getenv(self.name)
 
         # Explicitly set to None
@@ -91,6 +111,7 @@ class EnvField:
     def set(self, value: Any):
         self._set_to_none = value is None
         os.environ[self.name] = str(value)
+        self._frozen_value = _UNREAD
 
     @contextmanager
     def override(self, value: Any):
@@ -106,10 +127,12 @@ class EnvField:
             else:
                 os.environ.pop(self.name, None)
             self._set_to_none = backup_set_to_none
+            self._frozen_value = _UNREAD
 
     def clear(self):
         os.environ.pop(self.name, None)
         self._set_to_none = False
+        self._frozen_value = _UNREAD
 
     def __bool__(self):
         raise RuntimeError(
@@ -172,7 +195,7 @@ class _DeprecatedEnvFallback:
         super().__init__(default, secret=secret)
         self.deprecated_name = deprecated_name
 
-    def get(self) -> Any:
+    def _get(self) -> Any:
         if os.getenv(self.name) is None:
             fallback = os.getenv(self.deprecated_name)
             if fallback is not None:
@@ -184,7 +207,7 @@ class _DeprecatedEnvFallback:
                     stacklevel=2,
                 )
                 os.environ[self.name] = fallback
-        return super().get()
+        return super()._get()
 
 
 class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
@@ -300,6 +323,19 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # HC boundary fusion; read once. Zero restores the default HC path.
+    SGLANG_HC_MACRO = EnvBool(True)
+    SGLANG_HC_MACRO_MIN_ROWS = EnvInt(2)
+    # Opt-in HC gate overlap and combine/next-norm for two to four decode rows.
+    SGLANG_Q38_HC_SMALLM4 = EnvBool(False)
+    SGLANG_Q38_HC_SMALLM16 = EnvBool(False)
+    SGLANG_Q38_HC_COMBINE_PARTS = EnvInt(2)
+    # Keep the frozen cluster path by default; opt in to native rows except M4.
+    SGLANG_Q38C_HC_CLUSTER_M4ONLY = EnvBool(False)
+    # Experimental FN target router + input NVFP4 quantization, SM103 TP1/EP1.
+    SGLANG_Q38_ROUTER_FRONT = EnvBool(False)
+    SGLANG_Q38_ROUTER_HYBRID = EnvBool(False)
+    SGLANG_Q38_ROUTER_NATIVE_REDUCE = EnvBool(False)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device
@@ -862,6 +898,25 @@ class Envs:
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # PERF-PF: request decode staging only for the chunks the current prefill batch writes
+    SGLANG_PERFPF_STAGING_LAZY = EnvBool(False)
+    # PERF-PF: the prefill staging gather waits on an event recorded when its chunk is sent, not on
+    # the whole default stream (which holds the next prefill forward)
+    SGLANG_PERFPF_STAGING_GATHER_EVENT = EnvBool(False)
+    # PERF-PF: shortest-prefill-first puts requests that waited more than N batch formations first
+    SGLANG_PERFPF_SPF_AGE_ROUNDS = EnvInt(0)
+    # PERF-PF: shortest-prefill-first re-matches a waiting request's prefix only every N batch formations (ordering only)
+    SGLANG_PERFPF_SPF_MATCH_EVERY = EnvInt(0)
+    # PERF-PF: aged requests sort as if their prefill were one batch budget (they pick the next chunked request
+    # instead of jumping the queue), and the in-progress chunk keeps at least this percent of the budget (0 = off)
+    SGLANG_PERFPF_SPF_AGE_CAP = EnvBool(False)
+    SGLANG_PERFPF_SPF_CHUNK_MIN_PCT = EnvInt(0)
+    # PERF-PF: spread prefill KV transfers over the transfer queues by room instead of by destination sessions
+    SGLANG_PERFPF_TRANSFER_SHARD_BY_ROOM = EnvBool(False)
+    # PERF-PF: scheduler processes run gc.collect() + gc.freeze() right before their event loop
+    SGLANG_PERFPF_SCHED_GC_FREEZE = EnvBool(False)
+    # PERF-PF: API server and scheduler processes log every cyclic-GC pause of at least N ms (0 = off)
+    SGLANG_PERFPF_GC_LOG_MS = EnvInt(0)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
@@ -1257,6 +1312,9 @@ class Envs:
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
+    # Re-enable PDL for FlashInfer trtllm-gen MoE ops on SM107, where FlashInfer
+    # forces it off: off | all | comma list of fp4, fp8_block, fp8_tensor, bf16, mxint4.
+    SGLANG_TRTLLM_MOE_SM107_PDL = EnvStr("all")
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
@@ -1278,6 +1336,105 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
+    # TRT-L3: let the CuTe DSL fused MoE finalize take expert-parallel MoE handoffs
+    # (non-local experts' rows carry permuted index -1 and are skipped).
+    SGLANG_TRTL3_EP_DEFER_FINALIZE = EnvBool(False)
+    # TRT-L1 scratch: read-split context parallelism of TRT-LLM MHA decode-kernel calls
+    # (KV head replicated on TP // kv_heads ranks), from this many requests up.
+    SGLANG_TRTL1_ATTN_CP = EnvBool(False)
+    SGLANG_TRTL1_ATTN_CP_MIN_BS = EnvInt(2)
+    # LL exchanges (epoch in each 8-byte store) instead of CAS-flag barriers.
+    SGLANG_TRTL1_ATTN_CP_LL = EnvBool(True)
+    # TRT-LLM's fused CP partial kernel (owned pages + causal block + split combine in one launch).
+    SGLANG_TRTL1_ATTN_CP_FUSED = EnvBool(False)
+    # With FUSED: the fused partial on the context prefix only, the causal block in the fp32 merge.
+    SGLANG_TRTL1_ATTN_CP_EXACT = EnvBool(False)
+    # KV-length gate (LL exchanges): CP only for calls whose mean KV length per request reaches this many tokens,
+    # "<kv>" or "<b>:<kv>,..." by batch size (from b requests up); decided on the device, the stock call is captured
+    # too. Empty: no gate.
+    SGLANG_TRTL1_ATTN_CP_MIN_KV = EnvStr("")
+    # Gate on the batch's longest KV instead of the mean.
+    SGLANG_TRTL1_ATTN_CP_GATE_MAX = EnvBool(False)
+    # Gated calls: 0 serial; 1 the stock kernel on the current stream beside the CP gather + partial on a second
+    # stream, merge after the join; 2 as 1 with the merge on the second stream (stock gets no key when CP runs).
+    SGLANG_TRTL1_ATTN_CP_GATE_OVERLAP = EnvInt(1)
+    # TRT-L18, gated exact calls with GATE_OVERLAP 1: the q gather, fused partial and merge stay on the current stream;
+    # the stock call gets no key when CP runs and runs on the second stream from the partial's end to the merge's.
+    SGLANG_TRTL18_CP_MAIN = EnvBool(False)
+    # TRT-L18, with CP_MAIN: the q gather releases its dependents at entry and the fused partial (and the per-head
+    # merge) launch as programmatic dependents, so the partial requests its prefix KV while the queries are in flight.
+    SGLANG_TRTL18_CP_PDL = EnvBool(False)
+    # TRT-L18, with CP_MAIN: the merge runs one program per (row, head), with its own LL region and epochs.
+    SGLANG_TRTL18_CP_MERGE_H = EnvBool(False)
+    # TRT-L18: ungated exact calls (the plugin's draft steps) as gated ones with all three switches: the fused partial
+    # takes the prefix lengths as seq_lens - q_len itself (PDL after the q gather), then the per-(row, head) merge.
+    SGLANG_TRTL18_CP_UNGATED = EnvBool(False)
+    # An ungated exact CP-lite call writes the caller's attention output gate and o_proj's static FP8 input
+    # quantization in its per-head merge (CpLite.offer_gate_epilogue), bit for bit the separate launch.
+    SGLANG_PSM_CP_GATE_EPILOGUE = EnvBool(False)
+    # An ungated exact CP-lite call's q exchange in this many programs per row (1: one, as before), on an LL region and
+    # epoch counters of its own (TRT-LLM's _ll_group moves 256-word blocks, one per program).
+    SGLANG_PSM_CP_GATHER_CHUNKS = EnvInt(1)
+    # PERF-LB: the fused CP-lite partial (batches <= 32) shares one CTA per SM among the requests by their owned KV
+    # (TRT's TRTLLM_Q35_ATTN_CP_BALANCED_SPLIT): no idle SMs when splits x batch < SMs, a ragged batch costs its total
+    # KV instead of its longest request's. SM_RESERVE: SMs left out of that grid.
+    SGLANG_PLB_CP_BALANCED = EnvBool(False)
+    SGLANG_PLB_CP_SM_RESERVE = EnvInt(0)
+    # PERF-LB: CP-lite calls on the trtllm-gen partial (batches above the fused kernel's 32): the per-(row, head) merge
+    # (L18's, on the fold layout) instead of the per-row one, and, gated, the stock call gets no key when CP runs.
+    SGLANG_PLB_CP_FOLD_MH = EnvBool(False)
+    # PERF-LB: the trtllm-gen partial runs over chunk rows of C owned pages (each request's compact owned table cut into
+    # chunks), then a base-2 LSE combine per request: a ragged batch costs its total KV instead of its longest request's.
+    # "" off, "<C>" every batch size, or "<b>:<C>,..." (from b requests up; C in 32 / 64 / 128 / 256, 0 = off).
+    SGLANG_PLB_CP_FOLD_CHUNK = EnvStr("")
+    # PERF-LB: chunk rows only on a ragged batch: longest owned length x B >= this x the total (one row per request
+    # otherwise). 0: every batch.
+    SGLANG_PLB_CP_FOLD_RAGGED = EnvFloat(1.8)
+    # PERF-LB: EAGLE v2 joins the post-verify graphs' side-stream mamba state commit before the next verify (or a
+    # prefill batch) instead of right after the draft extend, so the commit can overlap the draft extend and the next
+    # round's draft steps (the draft model has no GDN layer).
+    SGLANG_PLB_COMMIT_LATE_JOIN = EnvBool(False)
+    # PERF-LB: the chunk spec for q_len 1 calls (draft steps); unset: SGLANG_PLB_CP_FOLD_CHUNK.
+    SGLANG_PLB_CP_FOLD_CHUNK_Q1 = EnvStr(None)
+    # PERF-LB: gated fold calls with the per-head merge fill the chunk rows' queries in the q gather and combine their
+    # partials in the merge (no copy / combine kernels).
+    SGLANG_PLB_CP_FOLD_FUSE = EnvBool(False)
+    # PERF-LB: priority of the decode streams (forward, schedule, copy, fwd-prepare d2h); < 0 ranks them above the PD
+    # staging scatter stream (default 0, the lowest), so a scatter only takes the SMs the forward leaves free.
+    SGLANG_PLB_STREAM_PRIORITY = EnvInt(0)
+    # PERF-LB: the PD staging scatter as a persistent kernel of this many CTAs (0: one CTA per 1024 elements; -1: one CTA
+    # per page and layer K / V, the page as one tile).
+    SGLANG_PLB_SCATTER_CTAS = EnvInt(0)
+    # PERF-LB: PD staging scatters wait for the scheduler, which launches them on the forward stream right before its
+    # next batch: a rank's scatter lands between two forwards (not under another rank's collective), and ranks whose
+    # chunks arrive in the same round take the delay together. 0: off; 1: on; k > 1: each scatter also waits k - 1
+    # more batches (test only: widens the window in which an abort finds it queued).
+    SGLANG_PLB_SCATTER_DEFER = EnvInt(0)
+    # PERF-LP (precision-lowered line, TRT's TRTLLM_Q35_MTP_MOE_QUANT=nvfp4): the MTP draft's routed experts become NVFP4
+    # at load time with TRT's ModelOpt recipe and run on the target's NVFP4 MoE path. The target is untouched.
+    SGLANG_PERFLP_DRAFT_MOE_NVFP4 = EnvBool(False)
+    # "<fc1>,<fc2>": the activation amax the draft experts' static NVFP4 input global scales are built for (TRT's
+    # TRTLLM_Q35_MTP_MOE_NVFP4_AMAX; "" = TRT's calibrated defaults 256,2048).
+    SGLANG_PERFLP_DRAFT_MOE_NVFP4_AMAX = EnvStr("")
+    # With DRAFT_MOE_NVFP4 and no expert parallelism: also keep the BF16 experts (checkpoint order, this rank's slice)
+    # for the megakernel plugin's single-launch draft MoE (draft steps of <= 2 tokens stay BF16).
+    SGLANG_PERFLP_DRAFT_MOE_KEEP_BF16 = EnvBool(False)
+    # PERF-LB static-bench probe: "<period_ms>:<MB>:<ctl file>": a thread per rank scatters MB from a dummy staging
+    # buffer about every period (random phase per rank) on its own default-priority stream while the ctl file reads 1
+    # (2: the persistent kernel of SGLANG_PLB_SCATTER_CTAS, 32 if unset). "": off.
+    SGLANG_PLB_FAKE_SCATTER = EnvStr("")
+    # With CP_UNGATED: the q gather of an ungated exact call launches as a programmatic dependent of the kernel that
+    # wrote q (it releases the fused partial, then waits), so the partial's prefix KV requests start under that kernel.
+    SGLANG_PERFLL_CP_GATHER_PDL = EnvBool(False)
+    # With CP_UNGATED: the fused partial of an ungated exact call releases the per-head merge right after its dependency
+    # wait, and the merge computes its causal block before its own wait (it reads only the step's q / K / V there).
+    SGLANG_PERFLL_CP_EARLY_MERGE = EnvBool(False)
+    # With CP_UNGATED: the per-head merge of an ungated exact call releases its own dependent at entry (that consumer
+    # touches the attention output only after its dependency wait, as the plugin's MKA epilogue and draft o_proj do).
+    SGLANG_PERFLL_CP_MERGE_RELEASE = EnvBool(False)
+    # Timing only: decode graph padding per block of Q35MF_AB_BLOCK target-verify rounds, the labels in turn
+    # ("pow2": the smallest captured power of two); model_executor/runner_backend/ab_variants.py. Empty: off.
+    SGLANG_TRTL17_PAD_AB = EnvTuple(())
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
@@ -1600,6 +1757,166 @@ class Envs:
     # the host leaders meet (HierTagExchange); with two hosts, optionally over one TCP link.
     SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST = EnvBool(False)
     SGLANG_Q35MF_EDGE_MULTIHOST_TCP = EnvBool(False)
+    # A topk-1 chain verify's greedy check, injected acceptance and accept lengths in one
+    # Triton launch (two around a sampled verify's broadcast), bit-identical.
+    SGLANG_Q35MF_FUSED_ACCEPT = EnvBool(False)
+    # Between two decode rounds of an unchanged batch, the draft reads the draft extend's
+    # outputs in place instead of through the FutureMap stash and gather (bit-identical);
+    # any other batch flushes the deferred stash first. Overlap scheduler, EAGLE topk 1.
+    SGLANG_Q35MF_SPEC_RELAY_BYPASS = EnvBool(False)
+    # The compact ReplaySSM commit of every GDN layer as one CUDA launch (one CTA per layer,
+    # request and value head); the same four high / low products, FP32 sums in another order.
+    SGLANG_Q35MF_COMMIT_CUDA = EnvBool(False)
+    # TP > 1 EAGLE topk-1 verify keeps the target logits vocabulary-sharded: greedy rows
+    # take a sharded argmax (bit-identical), temperature-only rows a sharded Gumbel-max
+    # (same distribution); any other batch all-gathers them first, as before.
+    SGLANG_Q35MF_SHARDED_VERIFY = EnvBool(False)
+    # SGLANG_Q35MF_SHARDED_VERIFY's per-row key exchange as one multimem.st all-gather over a symmetric
+    # buffer (two signal-pad barriers) in place of NCCL's ring all-gather of the int64 keys.
+    SGLANG_PERFLL_VERIFY_MC_GATHER = EnvBool(False)
+    # SGLANG_Q35MF_SHARDED_VERIFY's per-row keys from one program per 2048 columns (a row's shard split
+    # into ~16 parts at TP8 instead of one program looping over it), and the cross-rank / cross-part max
+    # with the token-id decode in one kernel after the exchange. Same tokens bit for bit.
+    SGLANG_PERFLL_VERIFY_KEY_SPLIT = EnvBool(False)
+    # SGLANG_Q35MF_SHARDED_VERIFY's key exchange for <= 64 rows as one launch with no barrier: every
+    # rank folds its keys per row and multicasts them as epoch-tagged 64-bit words into three rotating
+    # slots of a symmetric buffer, then polls its own copy until every rank's words carry the epoch.
+    SGLANG_PERFLL_VERIFY_LL_KEYS = EnvBool(False)
+    # The TRT-LLM MHA multi-step draft graph's attention metadata: one page table for every
+    # step, written once at the last step's length, and the other steps' sequence lengths in
+    # one launch (the steps read the same values). No SWA, no unified pool.
+    SGLANG_Q35MF_DRAFT_SHARED_METADATA = EnvBool(False)
+    # PD request timing trace: one "L12T" log line per finished request on each P / D
+    # TP0 (wall-clock stage times, keyed by bootstrap_room) and per transfer chunk on P TP0.
+    SGLANG_TRTL12_TRACE = EnvBool(False)
+    # Request allocation without host syncs: list-indexed mamba-slot writes go through
+    # pinned non-blocking copies, and PD decode sends a preallocated request's metadata
+    # on a later poll after a non-blocking index readback. A pageable H2D or a blocking
+    # D2H on the schedule stream waits for the in-flight forward (the stream is fenced
+    # on it) and stalls the overlap loop.
+    SGLANG_TRTL16_PREALLOC_NO_SYNC = EnvBool(False)
+    # The Qwen3.5 MTP draft's BF16 FlashInfer TRTLLM experts may leave their finalize to
+    # the caller (the megakernel plugin's draft hop, slot draft_fin).
+    SGLANG_Q35_DRAFT_BF16_DEFERRED_FINALIZE = EnvBool(False)
+    # PERF-LL host loop of a small decode batch (spec v2, overlap scheduler); all off by default.
+    # Diagnostic: with SGLANG_Q35MF_HOST_TRACE set, record only while this file exists
+    # (checked while the scheduler is idle), so one boot can bench with and without the trace.
+    SGLANG_PERFLL_HOST_TRACE_GATE = EnvStr(None)
+    # The HiCache ready-count exchange rides the same pass's request-size exchange when that
+    # pass received nothing (one cross-rank sync per pass instead of two).
+    SGLANG_PERFLL_HOST_HC_PIGGYBACK = EnvBool(False)
+    # Forced acceptance lengths ("match-expected") from one block of exponential draws per
+    # 4096 rounds, the same sequence as one torch.multinomial per round (checked against it
+    # at the first draw; falls back when they differ).
+    SGLANG_PERFLL_HOST_SIM_PREDRAW = EnvBool(False)
+    # The request poll reads each zmq socket's readiness (ZMQ_EVENTS) and calls recv only
+    # when a message is waiting, instead of a NOBLOCK recv that raises on an empty socket.
+    SGLANG_PERFLL_HOST_ZMQ_EVENTS = EnvBool(False)
+    # The decode result readback (next token ids, accept lengths) copies into a ring of
+    # pinned buffers kept per shape instead of a fresh pinned allocation per tensor and round.
+    SGLANG_PERFLL_HOST_D2H_RING = EnvBool(False)
+    # The scheduler's main thread on two reserved cores of its NUMA node, the process's other
+    # threads off them (utils/perfll_host.py).
+    SGLANG_PERFLL_HOST_PIN_MAIN = EnvBool(False)
+    # Graph-input staging (_grouped_foreach_copy_ of the decode / draft / draft-extend runners)
+    # through a JIT small-field copy plan cached per destination layout, ahead of the Triton
+    # small_copy whose per-call checks and launch cost ~100 us of host time.
+    SGLANG_PERFLL_HOST_FIELD_COPY = EnvBool(False)
+    # The two-host leader link of the EDGE exchange (SGLANG_Q35MF_EDGE_MULTIHOST_TCP) receives
+    # by spinning on a non-blocking socket, as the multi-host leader mesh does, instead of
+    # sleeping in a blocking recv.
+    SGLANG_PERFLL_HOST_LINK_SPIN = EnvBool(False)
+    # The run_batch forward isolation's ScheduleBatch snapshot / restore and its 2-iter
+    # keep-alive record read the field values straight from the instance dict (one cached
+    # name tuple) instead of dataclasses.fields() + getattr / setattr per field, twice.
+    SGLANG_PERFLL_HOST_SB_SNAPSHOT = EnvBool(False)
+    # Per-round stream joins (Stream.wait_stream creates, records and later destroys an event
+    # each call) through one cached event per (waiting, waited) stream pair, and the result
+    # readback's copy_done events from a ring of 4.
+    SGLANG_PERFLL_HOST_WAIT_EVENTS = EnvBool(False)
+    # The spec-v2 decode round's index kernels (draft cache locations, chain-tree verify
+    # inputs, draft-extend layout) from one JIT CUDA module and a cached host descriptor
+    # instead of three Triton launches; same integer results.
+    SGLANG_PERFLL_HOST_JIT_INDEX = EnvBool(False)
+    # SamplingBatchInfo.copy_for_forward copies the field values through the instance dict
+    # instead of dataclasses.replace (no __post_init__, no init=False fields: same object).
+    SGLANG_PERFLL_HOST_SAMPLING_COPY = EnvBool(False)
+    # A spec decode step that needs no new KV pages (most steps at page size 64) skips the
+    # length tensors and their two H2D copies, which only the allocation reads.
+    SGLANG_PERFLL_HOST_DECODE_ALLOC = EnvBool(False)
+    # GenerationBatchResult.copy_to_cpu opens its profiler range only while a torch
+    # profiler runs (the record_function decorator calls into the dispatcher every round).
+    SGLANG_PERFLL_HOST_RESULT_COPY = EnvBool(False)
+    # The FutureMap's per-round seq-lens gather and publish scatter as index_select /
+    # index_copy_ instead of advanced indexing (same rows, less dispatch).
+    SGLANG_PERFLL_HOST_INDEX_OPS = EnvBool(False)
+    # From the scheduler event loop's start, envs.X.get() serves each variable's first read
+    # (freeze_env_reads; set / clear / override still refresh it): dozens of os.environ
+    # lookups per round.
+    SGLANG_PERFLL_HOST_ENV_FREEZE = EnvBool(False)
+    # CudaGraphBufferRegistry.fill_from replays a per-shape plan (which slots reset their
+    # padding, each copy slot's destination view, the post-fill hooks) instead of walking
+    # and slicing every slot on each call.
+    SGLANG_PERFLL_HOST_FILL_PLAN = EnvBool(False)
+    # The draft and draft-extend graph runners stage an unpadded round's inputs, hidden states
+    # and draft probs included, with one JIT field copy into destination views cached per
+    # input layout, instead of slicing every buffer and a separate copy_ for hidden states.
+    SGLANG_PERFLL_HOST_GRAPH_INPUTS = EnvBool(False)
+    # The decode round's index outputs (draft cache locations, chain-tree verify inputs,
+    # draft-extend layout) come from rings of 8 tensors per shape instead of torch.empty;
+    # each is written whole by its kernel and read within the round.
+    SGLANG_PERFLL_HOST_OUT_POOL = EnvBool(False)
+    # PERF-LL GPU glue of a small decode round; all off by default.
+    # The TRTLLM MHA graph-metadata kernel rebuilds each batch row's page table with 8
+    # programs (page blocks dealt round-robin) instead of one, at the head of every
+    # verify / draft / draft-extend graph; same writes.
+    SGLANG_PERFLL_GLUE_META_SPLIT = EnvBool(False)
+    # The fused chain accept (SGLANG_Q35MF_FUSED_ACCEPT) matches a canonical chain's drafts
+    # against the targets in one vector compare instead of walking the tree node by node;
+    # other trees take the walk. Same outputs.
+    SGLANG_PERFLL_GLUE_LINEAR_ACCEPT = EnvBool(False)
+    # PERF-ST: the post-verify graph's commit-outputs launch also writes the draft extend's
+    # layout (prepare_draft_extend_layout's prefix / extend / post lengths, positions, starts,
+    # mrope), so the draft extend does not launch it eagerly.
+    SGLANG_PST_SPEC_EXTEND_LAYOUT = EnvBool(False)
+    # PERF-LL step 2 (the next round's draft inputs staged at the draft extend's tail). 1: count
+    # only -- each decode pass logs whether the previous pass could have staged its draft inputs
+    # (same batch in the same order, an unpadded graph size, every window allocated), and decode
+    # reserves three verify windows a request instead of two.
+    SGLANG_PERFLL_STEP2 = EnvInt(0)
+    # PERF-LL step 5a: the megakernel's draft extend writes its top-1 and hidden rows straight
+    # into the draft graph runner's input buffers, so the next draft does not copy them.
+    SGLANG_PERFLL_STEP5A = EnvBool(False)
+    # PERF-LL step 5a (2), with STEP2=3: a staged decode pass takes batch.seq_lens from the previous
+    # post-verify graph's new lengths instead of gathering them on the schedule stream, and its
+    # forward waits for the schedule stream (and the WAR barrier queued there) only when this
+    # pass's decode preparation launched work on it (a KV allocation).
+    SGLANG_PERFLL_STEP5A_SEQ_LENS = EnvBool(False)
+    # PERF-LL step 5a (3), with STEP2=3: a staged draft takes the draft steps' write slots the
+    # post-verify graph staged instead of copying the plan's first columns out of the window.
+    SGLANG_PERFLL_STEP5A_DRAFT_LOCS = EnvBool(False)
+    # PERF-LL step 5a (4): the post-verify graph writes the bonus tokens as int64, the dtype the
+    # relay and the next draft read, so the deferred relay does not cast them.
+    SGLANG_PERFLL_STEP5A_BONUS_I64 = EnvBool(False)
+    # Debug for SGLANG_PERFLL_STEP5A_SEQ_LENS: a staged pass also gathers its lengths the old way
+    # on the schedule stream and counts the passes where they differ (the forward then waits).
+    SGLANG_DEBUG_PERFLL_STEP5A_SEQ_LENS_CHECK = EnvBool(False)
+    # The same check, run only while this file exists (polled while the scheduler is idle), so
+    # one boot can time a workload and then check it.
+    SGLANG_DEBUG_PERFLL_STEP5A_SEQ_LENS_CHECK_GATE = EnvStr(None)
+    # PERF-LL remove-stages D1, with SGLANG_PST_SPEC_EXTEND_LAYOUT: the post-verify graph's
+    # commit-outputs launch also writes the draft extend runner's inputs in place (the hidden
+    # rows copied on a branch beside the accept chain) and the FutureMap's new lengths, so
+    # neither the extend's input copy nor the publish launches after the graph.
+    SGLANG_PERFLL_RS_D1 = EnvBool(False)
+    # The largest batch size SGLANG_PERFLL_RS_D1 serves (0: every size the draft extend graph
+    # replays unpadded). Above it the extend starts no earlier than today: at B8 an earlier start
+    # only overlaps more of the side-stream mamba commit.
+    SGLANG_PERFLL_RS_D1_MAX_BS = EnvInt(0)
+    # Debug for SGLANG_PERFLL_RS_D1, run only while this file exists (polled while the scheduler
+    # is idle): a pass that takes the written inputs also builds them the old way and counts
+    # the passes where the extend runner's inputs or the published lengths differ.
+    SGLANG_DEBUG_PERFLL_RS_D1_CHECK_GATE = EnvStr(None)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
@@ -1708,6 +2025,12 @@ class Envs:
     # Sequences a captured GDN extend bucket accepts (at most the request pool); a
     # larger prefill batch runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # PERF-PF: with the FlashInfer GDN prefill kernel, the captured GDN extend runs the FlashInfer core
+    # (CP kernel for one-sequence batches, non-CP kernel for the rest) instead of breaking at every layer.
+    SGLANG_PERFPF_GDN_GRAPH_FLASHINFER = EnvBool(False)
+    # Static sequence count of the captured non-CP FlashInfer path; each unused row costs ~10 us per layer
+    # (measured on GB300), and batches with more sequences run eagerly.
+    SGLANG_PERFPF_GDN_GRAPH_FI_MAX_SEQS = EnvInt(8)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls

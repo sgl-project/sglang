@@ -25,6 +25,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
+        GDNFlashInferGraphTables,
+    )
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -594,6 +597,85 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # Match Triton's [1, checkpoints, H, V, K] intermediate-state layout.
         h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
         return core_attn_out, None, h
+
+    def extend_in_graph(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        tables: GDNFlashInferGraphTables,
+        output: torch.Tensor,
+        checkpoint_rows: int,
+        checkpoint_every_n_tokens: int,
+    ) -> Optional[torch.Tensor]:
+        """The prefill core of a captured GDN extend on the bucket's static tables:
+        the CP kernel takes a one-sequence batch (if ``tables.cp_single``), the
+        non-CP kernel any other, and both update the pool in place by slot. ``output`` is [tokens, HV, V];
+        returns the [1, checkpoint_rows, HV, V, K] state checkpoints, if any."""
+        from sglang.kernels.ops.mamba.gdn_prefill_track import (
+            gdn_cp_tail_neutralize,
+        )
+        from sglang.kernels.ops.attention.fla.l2norm import (
+            gdn_prefill_qkv_prepare_fwd,
+        )
+
+        q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(q[0], k[0], v[0])
+        alpha = torch.exp(g[0].to(torch.float32))
+        beta_fi = beta[0].to(torch.float32)
+        common = dict(
+            q=q_fi,
+            k=k_fi,
+            v=v_fi,
+            g=alpha,
+            beta=beta_fi,
+            scale=None,
+            initial_state=ssm_states,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=False,
+            output=output,
+            output_state=ssm_states,
+        )
+        checkpoints = (
+            ssm_states.new_empty((checkpoint_rows, *ssm_states.shape[1:]))
+            if checkpoint_rows > 0
+            else None
+        )
+
+        def checkpoint_args(cu: torch.Tensor) -> dict:
+            if checkpoints is None:
+                return {}
+            return dict(
+                state_checkpoints=checkpoints,
+                checkpoint_cu_starts=cu,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            )
+
+        if tables.cp_single:
+            # Rows past T are bucket padding (stale graph-pool memory, possibly not finite).
+            gdn_cp_tail_neutralize(
+                q_fi, k_fi, v_fi, alpha, beta_fi, tables.cp_cu_seqlens
+            )
+            # max_seqlen bounds the CP launch grid; the bucket bounds any sequence.
+            self._prefill_fn(
+                **common,
+                cu_seqlens=tables.cp_cu_seqlens,
+                state_indices=tables.cp_state_indices,
+                use_cp=True,
+                max_seqlen=q_fi.shape[0],
+                **checkpoint_args(tables.cp_checkpoint_cu),
+            )
+        self._prefill_fn(
+            **common,
+            cu_seqlens=tables.ncp_cu_seqlens,
+            state_indices=tables.ncp_state_indices,
+            use_cp=False,
+            **checkpoint_args(tables.ncp_checkpoint_cu),
+        )
+        return checkpoints.unsqueeze(0) if checkpoints is not None else None
 
     # ---- target_verify (MTP) ----
 

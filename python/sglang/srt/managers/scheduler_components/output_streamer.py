@@ -19,6 +19,7 @@ from sglang.srt.beam_search.output import (
     beam_completion_tokens,
     pack_beam_search_output,
 )
+from sglang.srt.disaggregation import l12_trace
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -259,6 +260,20 @@ class SchedulerOutputStreamer:
         return False
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
+        if (
+            l12_trace.ENABLED
+            and req.finished()
+            and get_parallel().attn_tp_rank == 0
+            and req.time_stats.disagg_mode != DisaggregationMode.NULL
+        ):
+            l12_trace.log_request(
+                req,
+                (
+                    "prefill"
+                    if req.time_stats.disagg_mode == DisaggregationMode.PREFILL
+                    else "decode"
+                ),
+            )
         if (
             req.finished()
             and get_parallel().attn_tp_rank == 0

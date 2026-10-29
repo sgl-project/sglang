@@ -592,6 +592,16 @@ class FusedMoE(torch.nn.Module):
             and num_experts == 512
             and top_k == 10
         )
+        # The Qwen3.5 MTP draft's BF16 experts (hidden 4096); its finalize then runs in
+        # the megakernel plugin's draft hop (slot draft_fin)
+        qwen35_draft_bf16_deferred = (
+            envs.SGLANG_Q35_DRAFT_BF16_DEFERRED_FINALIZE.get()
+            and isinstance(self.quant_method, UnquantizedFusedMoEMethod)
+            and params_dtype == torch.bfloat16
+            and hidden_size == 4096
+            and num_experts == 512
+            and top_k == 10
+        )
         self.supports_deferred_finalize = False
 
         self.quant_method.create_weights(
@@ -616,7 +626,7 @@ class FusedMoE(torch.nn.Module):
         self.supports_deferred_finalize = (
             self.runner_backend is not None
             and self.runner_backend.is_flashinfer_trtllm()
-            and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
+            and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred or qwen35_draft_bf16_deferred)
         ) or packed_nvfp4_routed_deferred
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:

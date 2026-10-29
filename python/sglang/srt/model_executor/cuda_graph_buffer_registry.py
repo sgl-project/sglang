@@ -36,6 +36,7 @@ from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -43,6 +44,8 @@ if TYPE_CHECKING:
 
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
+_FIELD_COPY = envs.SGLANG_PERFLL_HOST_FIELD_COPY.get()
+_FILL_PLAN = envs.SGLANG_PERFLL_HOST_FILL_PLAN.get()
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
@@ -59,6 +62,13 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
                 dst.copy_(src)
 
     if dsts and dsts[0].is_cuda:
+        if _FIELD_COPY:
+            from sglang.kernels.ops.memory.small_field_copy import (
+                cached_small_field_copy,
+            )
+
+            if cached_small_field_copy(dsts, srcs):
+                return
         fast_path = envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.get()
         if fast_path and _has_foreach_copy and _one_dense_int_pair(dsts, srcs):
             # One foreach launch already writes what the small copy would; that kernel
@@ -343,6 +353,8 @@ class CudaGraphBufferRegistry:
         # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
         self._slots: Dict[str, GraphSlot] = {}
+        # SGLANG_PERFLL_HOST_FILL_PLAN: (shape key, slot enable mask) -> fill plan
+        self._fill_plans: Dict[tuple, tuple] = {}
 
     # ---- registration ------------------------------------------------------
 
@@ -449,6 +461,20 @@ class CudaGraphBufferRegistry:
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if _FILL_PLAN:
+            key = (
+                raw_bs,
+                padded_bs,
+                raw_num_tokens,
+                padded_num_tokens,
+                tuple(s.enabled for s in self._slots.values()),
+                tuple(sorted(skip_slots)),
+            )
+            plan = self._fill_plans.get(key)
+            if plan is None:
+                plan = self._fill_plans[key] = self._build_fill_plan(ctx, skip_slots=skip_slots)
+            self._fill_with_plan(plan, forward_batch, ctx)
+            return
 
         # Phase 1: reset padded regions where it matters (none when neither
         # axis is padded: reset_padding is then a no-op for every slot).
@@ -536,6 +562,61 @@ class CudaGraphBufferRegistry:
                 srcs.append(src)
         if dsts:
             _grouped_foreach_copy_(dsts, srcs)
+
+    def _build_fill_plan(self, ctx: FillContext, *, skip_slots=frozenset()) -> tuple:
+        """fill_from's per-shape decisions: (slots to reset with their raw / padded
+        lengths, copy entries, post-fill slots), in fill_from's slot order."""
+        resets, copies, post_fills = [], [], []
+        for slot in self._slots.values():
+            if not slot.enabled or slot.buffer is None or slot.name in skip_slots:
+                continue
+            raw_n = slot._raw_n(ctx.raw_bs, ctx.raw_num_tokens)
+            padded_n = slot._padded_n(ctx.padded_bs, ctx.padded_num_tokens)
+            if raw_n < padded_n:
+                resets.append((slot, raw_n, padded_n))
+            if slot.copy_from_fb:
+                if slot.source_fn is not None:
+                    copies.append((slot, None))
+                else:
+                    if slot.slice_fn is not None:
+                        dst = slot.slice_fn(slot.buffer, raw_n)
+                    elif slot.axis == "none":
+                        dst = slot.buffer
+                    else:
+                        dst = slot.buffer[:raw_n]
+                    copies.append((slot.name, dst))
+            if slot.post_fill is not None:
+                post_fills.append(slot)
+        return resets, copies, post_fills
+
+    def _fill_with_plan(self, plan: tuple, forward_batch, ctx: FillContext) -> None:
+        resets, copies, post_fills = plan
+        for slot, raw_n, padded_n in resets:
+            slot.reset_padding(raw_n, padded_n)
+        gpu_dsts: List[torch.Tensor] = []
+        gpu_srcs: List[torch.Tensor] = []
+        cpu_pairs = []
+        for name, dst in copies:
+            if dst is None:
+                src = name.source_fn(forward_batch, ctx)
+                if src is None:
+                    continue
+                dst = name.buffer[: src.shape[0]]
+            else:
+                src = getattr(forward_batch, name, None)
+                if src is None or not isinstance(src, torch.Tensor):
+                    continue
+            if dst.device.type == "cpu":
+                cpu_pairs.append((dst, src))
+            else:
+                gpu_dsts.append(dst)
+                gpu_srcs.append(src)
+        if gpu_dsts:
+            _grouped_foreach_copy_(gpu_dsts, gpu_srcs)
+        for dst, src in cpu_pairs:
+            dst.copy_(src)
+        for slot in post_fills:
+            slot.post_fill(slot.buffer, forward_batch, ctx)
 
     def extract_buffer(
         self,

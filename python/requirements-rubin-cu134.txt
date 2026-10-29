@@ -1,0 +1,5 @@
+# Runtime versions provided by the pinned CUDA 13.4 Rubin nightly image.
+# Keep the default pyproject pins unchanged for the existing GB300 image.
+# This file is an environment lock/reference; do not pip-install over the image.
+torch==2.15.0+cu134
+torchaudio==2.11.1+cu134

@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
+
 _QWEN4_NGRAM_SIZE = 3
 _QWEN4_HEADS_PER_NGRAM = 8
 _QWEN4_NGRAM_HEADS = 16
@@ -22,7 +24,11 @@ def _qwen4_ngram_hash_kernel(
     HEADS_PER_NGRAM: tl.constexpr,
     NGRAM_HEADS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    PDL_SMALL: tl.constexpr = False,
 ):
+    # Protect dynamic reads and reused-buffer writes before relaxing this edge.
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
     output_idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = output_idx < num_outputs
     token_idx = output_idx // NGRAM_HEADS
@@ -50,6 +56,8 @@ def _qwen4_ngram_hash_kernel(
     vocab_size = tl.load(vocab_sizes_ptr + head_idx, mask=mask, other=1)
     offset = tl.load(offsets_ptr + head_idx, mask=mask, other=0)
     tl.store(output_ptr + output_idx, mixed % vocab_size + offset, mask=mask)
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def can_fuse_qwen4_ngram_hash(
@@ -110,5 +118,7 @@ def fused_qwen4_ngram_hash(
             NGRAM_HEADS=_QWEN4_NGRAM_HEADS,
             BLOCK_SIZE=block_size,
             num_warps=4,
+            launch_pdl=_PDL_SMALL,
+            PDL_SMALL=_PDL_SMALL,
         )
     return output

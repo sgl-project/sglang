@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.mem_cache.kv.router import KVLayerRouter
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +46,9 @@ class ForwardContext:
     attn_backend: AttentionBackend
     # Resolve after batch preparation; captured calls retain the static buffer.
     moe_num_token_non_padded: Optional[Callable[[], Optional[torch.Tensor]]] = None
+    # Capture-time batch/phase let routed MoE select a fixed graph branch.
+    moe_batch_size: Optional[int] = None
+    moe_forward_mode: Optional[ForwardMode] = None
 
 
 _current: Optional[ForwardContext] = None
@@ -94,10 +97,24 @@ def forward_context(
 ):
     if forward_batch is not None:
         ctx = replace(
-            ctx, moe_num_token_non_padded=forward_batch.moe_num_token_non_padded
+            ctx,
+            moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
+            moe_batch_size=forward_batch.batch_size,
+            moe_forward_mode=forward_batch.forward_mode,
         )
     elif ctx.moe_num_token_non_padded is None and _current is not None:
-        ctx = replace(ctx, moe_num_token_non_padded=_current.moe_num_token_non_padded)
+        ctx = replace(
+            ctx,
+            moe_num_token_non_padded=_current.moe_num_token_non_padded,
+            moe_batch_size=(
+                ctx.moe_batch_size if ctx.moe_batch_size is not None
+                else _current.moe_batch_size
+            ),
+            moe_forward_mode=(
+                ctx.moe_forward_mode if ctx.moe_forward_mode is not None
+                else _current.moe_forward_mode
+            ),
+        )
     prev = set_forward_context(ctx)
     try:
         yield

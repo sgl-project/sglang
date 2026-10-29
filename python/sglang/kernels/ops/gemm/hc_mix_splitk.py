@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+
 import torch
+
+from sglang.srt.runtime_context import get_parallel
 
 _MAX_ROWS = 32
 _KPAD_ALIGN = 128
@@ -36,6 +40,36 @@ def _get_scratch(lowrank: int, dtype: torch.dtype, device: torch.device):
     return buf
 
 
+# Row-aware tactics for the HC mix pair (on with the HC macro-fusion, read
+# once): from 10 rows the down GEMV halves split-K (s16 -> s8, 8 stages), and
+# the gated up GEMV uses 64-wide MMA tiles with 4 stages at every row count.
+# Measured behind the fused HC boundary kernel, these tactics are faster at 16
+# and 32 rows; rel-L2 <= 8e-5 vs before.
+_TUNED_TACTICS = os.environ.get("SGLANG_HC_MACRO", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+
+def _tuned_tactic(m: int, n: int, k: int, SplitKTactic, validate_tactic):
+    if n <= 512 and k % (128 * 16) == 0:
+        tactic = (
+            SplitKTactic(mma_m=64, mma_n=8, split_k=16, ab_stages=6)
+            if m <= 8
+            else SplitKTactic(mma_m=64, mma_n=8, split_k=8, ab_stages=8)
+        )
+    else:
+        mma_n = 8 if m <= 8 else 16 if m <= 16 else 32
+        tactic = SplitKTactic(mma_m=64, mma_n=mma_n, split_k=1, ab_stages=4)
+    try:
+        validate_tactic(tactic, m, n, k)
+    except ValueError:
+        return None
+    return tactic
+
+
 def _get_tactic(m: int, n: int, k: int):
     key = (m, n, k)
     tactic = _tactic_cache.get(key)
@@ -46,6 +80,11 @@ def _get_tactic(m: int, n: int, k: int):
             validate_tactic,
         )
 
+        if _TUNED_TACTICS and get_parallel().tp_size == 1:
+            tactic = _tuned_tactic(m, n, k, SplitKTactic, validate_tactic)
+            if tactic is not None:
+                _tactic_cache[key] = tactic
+                return tactic
         if n <= 512 and k % (128 * 16) == 0:
             tactic = SplitKTactic(mma_m=64, mma_n=8, split_k=16, ab_stages=6)
             try:

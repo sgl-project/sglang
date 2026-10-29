@@ -6,6 +6,8 @@ import triton.language as tl
 
 from sglang.kernels.numerics import round_bf16_to_fp32
 
+from sglang.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
+
 _QWEN4_MAX_SHORT_CONV_STATE_LEN = 16
 
 
@@ -139,7 +141,11 @@ def _qwen4_verify_conv_prepare_kernel(
     STATE_LEN: tl.constexpr,
     HAS_INTERMEDIATE: tl.constexpr,
     BLOCK: tl.constexpr,
+    PDL_SMALL: tl.constexpr = False,
 ):
+    # Protect dynamic reads and reused-buffer writes before relaxing this edge.
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
     req = tl.program_id(0)
     offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     slot = tl.load(indices_ptr + req * index_stride)
@@ -194,6 +200,8 @@ def _qwen4_verify_conv_prepare_kernel(
             value,
             mask,
         )
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -206,7 +214,11 @@ def _qwen4_verify_conv_finish_kernel(
     CHANNELS: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
+    PDL_SMALL: tl.constexpr = False,
 ):
+    # Protect dynamic reads and reused-buffer writes before relaxing this edge.
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < num_elements
     token = offsets // CHANNELS
@@ -220,6 +232,8 @@ def _qwen4_verify_conv_finish_kernel(
     residual = tl.load(residual_ptr + offsets, mask, other=0).to(tl.float32)
     valid = tl.load(valid_ptr + token, mask, other=0)
     tl.store(output_ptr + offsets, tl.where(valid, activated + residual, 0), mask)
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def can_fuse_qwen4_verify_conv(
@@ -301,6 +315,8 @@ def fused_qwen4_verify_conv(
         STATE_LEN=state_len,
         HAS_INTERMEDIATE=intermediate is not None,
         BLOCK=256,
+        launch_pdl=_PDL_SMALL,
+        PDL_SMALL=_PDL_SMALL,
     )
     conv = torch.nn.functional.conv1d(
         conv_input, weight, dilation=dilation, groups=channels
@@ -315,5 +331,7 @@ def fused_qwen4_verify_conv(
         WIDTH=width,
         BLOCK=256,
         enable_fp_fusion=False,
+        launch_pdl=_PDL_SMALL,
+        PDL_SMALL=_PDL_SMALL,
     )
     return output

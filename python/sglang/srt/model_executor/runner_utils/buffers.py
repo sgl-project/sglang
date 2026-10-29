@@ -35,6 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
+_FIELD_COPY = envs.SGLANG_PERFLL_HOST_FIELD_COPY.get()
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
@@ -48,6 +49,13 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
                 dst.copy_(src)
 
     if dsts and dsts[0].is_cuda:
+        if _FIELD_COPY:
+            from sglang.kernels.ops.memory.small_field_copy import (
+                cached_small_field_copy,
+            )
+
+            if cached_small_field_copy(dsts, srcs):
+                return
         from sglang.kernels.ops.memory.small_copy import try_small_copy
 
         if try_small_copy(dsts, srcs):

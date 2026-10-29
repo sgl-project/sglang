@@ -12,7 +12,7 @@ Plugins are discovered automatically when installed via pip.
 
 import logging
 from collections.abc import Callable
-from importlib.metadata import entry_points
+from importlib.metadata import EntryPoint, entry_points
 from typing import Any
 
 from sglang.srt.environ import envs
@@ -54,7 +54,18 @@ def load_plugins_by_group(
     if allowed_str:
         allowed_set = {x.strip() for x in allowed_str.split(",") if x.strip()}
 
-    discovered = entry_points(group=group)
+    discovered = list(entry_points(group=group))
+    # Explicitly selected in-tree plugins also work with a source PYTHONPATH,
+    # before this checkout has been installed into the serving image.
+    if group == GENERAL_PLUGINS_GROUP and allowed_set:
+        builtins = {
+            "q38_shared_down_tgv": "sglang.srt.q38.shared_down_tgv:install",
+            "q38_moe_c1_pin": "sglang.srt.q38.moe_c1_pin:register",
+        }
+        names = {ep.name for ep in discovered}
+        for name, value in builtins.items():
+            if name in allowed_set and name not in names:
+                discovered.append(EntryPoint(name=name, value=value, group=group))
     if len(discovered) == 0:
         logger.debug("No plugins found for group %s.", group)
         return {}

@@ -105,11 +105,17 @@ from sglang.srt.models.qwen4_exp_ple_table import (
 from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
+from sglang.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
+
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+_Q38_QSA_EARLY_INDEXER = get_bool_env_var("Q38_QSA_EARLY_INDEXER", "False")
+_Q38_ATTN_GATE_V2 = get_bool_env_var("Q38_ATTN_GATE_V2", "False")
+_Q38_QSA_PDL_INDEX = get_bool_env_var("Q38_QSA_PDL_INDEX", "False")
+_Q38_MK_MTP = get_bool_env_var("SGLANG_Q38C_MK_MTP", "False")
 
 
 def _ple_table_is_fp8(
@@ -278,6 +284,26 @@ def _prepare_ple_batch(
     physical_tokens = input_ids.shape[0]
     processed_tokens = _get_processed_token_count(forward_batch, physical_tokens)
     tokens = input_ids[:processed_tokens]
+    if _Q38_MK_MTP:
+        from sglang.kernels.ops.speculative.q38_mk_mtp.metadata import (
+            try_prepare_verify_layout,
+        )
+
+        mk_layout = try_prepare_verify_layout(
+            input_ids, forward_batch, mode, get_req_to_token_pool(),
+            ngram_size=ngram_size, ngram_eos_token_id=ngram_eos_token_id,
+            processed_tokens=processed_tokens,
+        )
+        if mk_layout is not None:
+            return _PLEBatch(
+                mode=mode, use_decode_fast_path=False,
+                physical_tokens=physical_tokens, processed_tokens=processed_tokens,
+                lengths=mk_layout.lengths, row_width=4,
+                req_indices=mk_layout.req_indices, token_offsets=mk_layout.token_offsets,
+                valid_tokens=mk_layout.valid_tokens, state_indices=mk_layout.state_indices,
+                ngram_context=mk_layout.ngram_context,
+                ngram_eos_token_id=ngram_eos_token_id,
+            )
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
 
     if mode.is_target_verify():
@@ -880,7 +906,11 @@ def _gather_ple_embedding_from_pinned_kernel(
     tp_vocab_end,
     is_fp8: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    PDL_SMALL: tl.constexpr = False,
 ):
+    # Protect dynamic reads and reused-buffer writes before relaxing this edge.
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_wait()
     row_id = tl.program_id(0)
     global_idx = tl.load(ids_ptr + row_id)
     in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
@@ -901,6 +931,8 @@ def _gather_ple_embedding_from_pinned_kernel(
         tl.where(in_range, values, 0.0),
         mask=mask,
     )
+    if PDL_SMALL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
@@ -1033,6 +1065,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 tp_vocab_end=self.shard_indices.org_vocab_end_index,
                 is_fp8=self.weight.dtype == torch.float8_e4m3fn,
                 BLOCK_D=self._block_d,
+                launch_pdl=_PDL_SMALL,
+                PDL_SMALL=_PDL_SMALL,
             )
         return output
 
@@ -1463,12 +1497,21 @@ class _MixStreams:
 
 @dataclass
 class _HCNorms:
-    """Prepared norms for one layer invocation; never carried across PLE or PP."""
+    """Prepared norms for one layer invocation; never carried across PLE or PP.
+
+    Each prepared norm may come with its read's gate partials (the decode HC
+    boundary macro-fusion); those are None wherever the norm is.
+    """
 
     attn_input: Optional[torch.Tensor]
     next_norm: Optional[GroupedGemmaRMSNorm]
+    attn_partials: Optional[torch.Tensor] = None
+    # The next read's gate weight: prepares its partials with next_norm.
+    next_inject_weight: Optional[torch.Tensor] = None
     ffn_input: Optional[torch.Tensor] = None
+    ffn_partials: Optional[torch.Tensor] = None
     output: Optional[torch.Tensor] = None
+    output_partials: Optional[torch.Tensor] = None
 
 
 def _has_ple(layer_id, config) -> bool:
@@ -1613,6 +1656,18 @@ class Qwen4ExpLayerExtensionMixin:
             linear_attention=linear_attention,
         )
 
+        import os
+        self._shared_out_on = (
+            os.environ.get("Q38_SHARED_OUT", "0") == "1"
+            and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+            and get_parallel().tp_size == 1
+            and get_parallel().moe_ep_size == 1
+            and self.hc_count == 4 and self.hidden_size == 2560
+        )
+        if self._shared_out_on:
+            self.mlp._q38_push_shared = True
+            self.mlp._q38_shared_pending = None
+
         from sglang.srt.layers.moe.qwen4_decode import prepare_qwen4_decode_comm
 
         self._decode_moe_comm = (
@@ -1622,8 +1677,15 @@ class Qwen4ExpLayerExtensionMixin:
         )
 
     @contextmanager
-    def hc_norms(self, normalized_input, next_norm):
-        norms = _HCNorms(normalized_input, next_norm)
+    def hc_norms(
+        self, normalized_input, next_norm, partials=None, next_inject_weight=None
+    ):
+        norms = _HCNorms(
+            attn_input=normalized_input,
+            next_norm=next_norm,
+            attn_partials=partials if normalized_input is not None else None,
+            next_inject_weight=next_inject_weight if next_norm is not None else None,
+        )
         # A prepared norm can only follow its residual without row movement.
         self._hc_norms = (
             norms
@@ -1653,40 +1715,78 @@ class Qwen4ExpLayerExtensionMixin:
         own contribution to the streams and joins them before the read."""
         if self.ple is not None:
             residual = self._add_ple_embedding(residual)
-        normalized_input = (
-            self._hc_norms.attn_input
-            if self._hc_norms is not None and self.ple is None
-            else None
-        )
+        prepared = self._hc_norms is not None and self.ple is None
         return self.attn_hyper_connection.mix(
-            residual, normalized_input=normalized_input
+            residual,
+            normalized_input=self._hc_norms.attn_input if prepared else None,
+            partials=self._hc_norms.attn_partials if prepared else None,
         )
 
     def _attn_combine(self, hidden_states, residuals):
         if self._hc_norms is None:
             return self.attn_hyper_connection.combine(hidden_states, residuals)
-        hidden_states, self._hc_norms.ffn_input = (
-            self.attn_hyper_connection.combine_and_normalize(
-                hidden_states, residuals, self.mlp_hyper_connection.hc_norm
-            )
+        mlp_hc = self.mlp_hyper_connection
+        (
+            hidden_states,
+            self._hc_norms.ffn_input,
+            self._hc_norms.ffn_partials,
+        ) = self.attn_hyper_connection.combine_and_normalize(
+            hidden_states, residuals, mlp_hc.hc_norm, mlp_hc.block_inject_weight.weight
         )
         return hidden_states
 
     def _ffn_mix(self, residual):
-        normalized_input = (
-            self._hc_norms.ffn_input if self._hc_norms is not None else None
-        )
+        prepared = self._hc_norms is not None
         return self.mlp_hyper_connection.mix(
-            residual, normalized_input=normalized_input
+            residual,
+            normalized_input=self._hc_norms.ffn_input if prepared else None,
+            partials=self._hc_norms.ffn_partials if prepared else None,
         )
 
     def _ffn_combine(self, hidden_states, residuals):
+        if self._shared_out_on and self.mlp._q38_shared_pending is not None:
+            hidden, shared = self.mlp._q38_shared_pending
+            self.mlp._q38_shared_pending = None
+            res, _, partials = residuals
+            if partials is not None:
+                # _ffn_mix returns the native tuple unchanged: a non-None
+                # partial tensor is the native side-stream producer's result.
+                current = torch.cuda.current_stream()
+                if not self.mlp_hyper_connection._macro_rows(hidden_states.shape[0]):
+                    current.wait_stream(self.mlp_hyper_connection._gate_stream)
+                    partials.record_stream(current)
+                next_norm = self._hc_norms.next_norm if self._hc_norms is not None else None
+                if (next_norm is not None
+                    and next_norm.group_size == self.hidden_size
+                    and next_norm.weight.dtype == torch.bfloat16
+                    and hidden_states.dtype == torch.bfloat16):
+                    from sglang.kernels.ops.elementwise.hc_combine_decode import hc_shared_combine_apply_norm
+                    combined, self._hc_norms.output = hc_shared_combine_apply_norm(
+                        hidden, shared, hidden_states, res, partials,
+                        self.mlp.shared_expert_gate.weight.squeeze(), next_norm.weight,
+                        next_norm.variance_epsilon,
+                        parts=4,
+                    )
+                    return combined
+                # PLE/absent context forbids carrying the next HC norm.
+                from sglang.kernels.ops.elementwise.q38_shared_hc import shared_hc
+                if self._hc_norms is not None:
+                    self._hc_norms.output = None
+                return shared_hc(hidden, self.mlp.shared_expert_gate.weight.squeeze(),
+                                 shared, hidden_states, res, partials, self.layer_id)
+            # No native side partials: retain the native gate/add and HC path.
+            from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add
+            fused_gate_sigmoid_mul_add(hidden, self.mlp.shared_expert_gate.weight.squeeze(),
+                                       shared, hidden_states)
         if self._hc_norms is None:
             return self.mlp_hyper_connection.combine(hidden_states, residuals)
-        hidden_states, self._hc_norms.output = (
-            self.mlp_hyper_connection.combine_and_normalize(
-                hidden_states, residuals, self._hc_norms.next_norm
-            )
+        (
+            hidden_states,
+            self._hc_norms.output,
+            self._hc_norms.output_partials,
+        ) = self.mlp_hyper_connection.combine_and_normalize(
+            hidden_states, residuals, self._hc_norms.next_norm,
+            self._hc_norms.next_inject_weight,
         )
         return hidden_states
 
@@ -1829,6 +1929,7 @@ class Qwen4ExpAttentionDecoderLayer(
         from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
         self.is_qsa = is_qwen_qsa(config)
+        self._q38_mtp_is_nextn = is_nextn
         # The prefill graphs' top-k bridges, newest first. Buckets share the newest.
         self._qsa_prefill_topk_bridges: list = []
         if self.is_qsa:
@@ -1846,6 +1947,8 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
+        projected_qk: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
             rows = hidden_states.shape[0]
@@ -1871,6 +1974,7 @@ class Qwen4ExpAttentionDecoderLayer(
             hidden_states=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
+            projected_qk=projected_qk,
         )
 
     def _compute_qsa_topk_indices_eager(
@@ -1878,6 +1982,8 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
+        projected_qk: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -1897,6 +2003,8 @@ class Qwen4ExpAttentionDecoderLayer(
             backend, self.layer_id, forward_batch
         )
         indexer_kwargs = {}
+        if projected_qk is not None:
+            indexer_kwargs["projected_qk"] = projected_qk
         if _shards_rows_over_cp(forward_batch):
             # Prefill CP: this rank's rows select against the index keys of the
             # whole sequence, gathered in token order with the RoPE positions
@@ -1922,12 +2030,54 @@ class Qwen4ExpAttentionDecoderLayer(
             )
         return topk_indices
 
+    def _try_mk_mtp_self_attention(self, positions, hidden_states, forward_batch):
+        if not (
+            self._q38_mtp_is_nextn and self.is_qsa and self.attn_output_gate
+            and forward_batch.forward_mode.is_decode()
+            and hidden_states.is_cuda and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape == (1, 2560)
+            and self.num_heads == 6 and self.num_kv_heads == 1
+            and self.head_dim == 256 and self.rotary_emb.rotary_dim == 64
+            and not is_in_breakable_cuda_graph()
+        ):
+            return None
+        from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
+
+        backend = resolve_qsa_sparse_backend(get_attn_backend())
+        make_plan = getattr(backend, "get_mtp_front_plan", None)
+        if (make_plan is None or not backend._q38c_lookup_native
+                or not backend.should_reuse_mtp_sparse_indices(forward_batch)):
+            return None
+        indices = backend.lookup_mtp_sparse_indices(forward_batch, self.layer_id)
+        plan = make_plan(self.attn, forward_batch, indices)
+        if plan is None:
+            return None
+        qkv, _ = self.qkv_proj(hidden_states)
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        q, gate = plan.prepare(
+            q_gate, k, v, self.q_norm.weight.data, self.k_norm.weight.data,
+            self.rotary_emb.cos_sin_cache, positions,
+            self.rotary_emb.axis_map if positions.dim() == 2 else None,
+            eps=self.q_norm.variance_epsilon,
+        )
+        output = self.attn(
+            q.reshape(1, -1), None, None, forward_batch, save_kv_cache=False,
+            topk_indices=indices, q38_mtp_prepared=plan.prepared_kv,
+        )
+        output = fused_sigmoid_mul(output, gate, inplace=True)
+        output, _ = self.o_proj(output)
+        return output
+
     def self_attention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if _Q38_MK_MTP:
+            output = self._try_mk_mtp_self_attention(positions, hidden_states, forward_batch)
+            if output is not None:
+                return output
         overlap_indexer = (
             self.is_qsa
             and self.alt_stream is not None
@@ -1936,12 +2086,74 @@ class Qwen4ExpAttentionDecoderLayer(
             and not is_in_breakable_cuda_graph()
             and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
         )
+        early_indexer = (
+            overlap_indexer
+            and _Q38_QSA_EARLY_INDEXER
+            and self.attn_output_gate
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and self.indexer._use_fused_prep(hidden_states)
+        )
         attention_kwargs = {}
+        projected_qk = None
+        projection_nodes = None
         if overlap_indexer:
             # Safe to overlap: the indexer reads only hidden_states/positions,
             # and writes QSA-private pool buffers.
             current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
+            if (
+                _Q38_QSA_PDL_INDEX
+                and self.attn_output_gate
+                and hidden_states.is_cuda
+                and hidden_states.dtype == torch.bfloat16
+                and (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                )
+            ):
+                from sglang.srt.layers.attention.qsa.glue import get_qsa_indexer_metadata
+                from sglang.srt.layers.quantization.unquant import (
+                    UnquantizedLinearMethod,
+                    get_bf16_gemm_backend,
+                    should_enable_bf16_splitk_gemm,
+                    use_bf16_splitk_gemm,
+                )
+
+                metadata = get_qsa_indexer_metadata(
+                    get_attn_backend(), self.layer_id, forward_batch
+                )
+                rows = metadata.get_token_to_batch_idx().numel()
+                projection = self.indexer.index_qk_proj
+                if (
+                    0 < rows <= 16
+                    and rows <= hidden_states.shape[0]
+                    and self.indexer._use_fused_prep(hidden_states)
+                    and isinstance(projection.quant_method, UnquantizedLinearMethod)
+                    and projection.weight.dtype == torch.bfloat16
+                    and tuple(projection.weight.shape) == (640, 2560)
+                    and should_enable_bf16_splitk_gemm(get_bf16_gemm_backend())
+                    and use_bf16_splitk_gemm(rows, 640, 2560)
+                ):
+                    # Native BF16 SplitK already waits for its HC-mix producer
+                    # and triggers dependents from the weight-loader warp.
+                    # Keep it directly on this stream before main QKV, then
+                    # fork only Qprep/compress/score/top-k to the side stream.
+                    projected_qk, _ = projection(hidden_states[:rows])
+                    from sglang.srt.layers.attention.qsa.capture_fork import projection_frontier
+
+                    projection_nodes = projection_frontier(current_stream)
+            if projected_qk is None:
+                self.alt_stream.wait_stream(current_stream)
+            if early_indexer and projected_qk is None:
+                # Independent index Q/K projection reads the already-prepared
+                # HC/PLE hidden state, positions and QSA-private metadata/cache.
+                # Main QKV does not produce any of those inputs. Enqueue first
+                # to test SM scheduling order, without synchronously joining.
+                with torch.cuda.stream(self.alt_stream):
+                    topk_indices = self._compute_qsa_topk_indices(
+                        hidden_states, positions, forward_batch,
+                        projected_qk=projected_qk,
+                    )
 
         q, k, v, gate = self._prepare_qkv_gate(
             positions=positions,
@@ -1950,10 +2162,29 @@ class Qwen4ExpAttentionDecoderLayer(
         )
 
         if overlap_indexer:
-            with torch.cuda.stream(self.alt_stream):
-                topk_indices = self._compute_qsa_topk_indices(
-                    hidden_states, positions, forward_batch
-                )
+            if projected_qk is not None:
+                # There is no ordinary event between native index projection
+                # and QKV: their same-stream PDL chain stays intact. Join the
+                # capture here, then give the side stream a full projection
+                # completion edge instead of the temporary QKV event edge.
+                # Outside capture, the full QKV wait is a safe warmup path.
+                self.alt_stream.wait_stream(current_stream)
+                if projection_nodes is not None:
+                    from sglang.srt.layers.attention.qsa.capture_fork import fork_after_projection
+
+                    fork_after_projection(self.alt_stream, projection_nodes)
+                with torch.cuda.stream(self.alt_stream):
+                    topk_indices = self._compute_qsa_topk_indices(
+                        hidden_states, positions, forward_batch,
+                        projected_qk=projected_qk,
+                    )
+                projected_qk.record_stream(self.alt_stream)
+            if not early_indexer and projected_qk is None:
+                with torch.cuda.stream(self.alt_stream):
+                    topk_indices = self._compute_qsa_topk_indices(
+                        hidden_states, positions, forward_batch
+                    )
+            # Preserve all QSA state/store/top-k work before KV preparation.
             current_stream.wait_stream(self.alt_stream)
             # Allocated on alt_stream, consumed by attention on the current
             # stream; tell the caching allocator before alt_stream is reused.
@@ -1974,8 +2205,17 @@ class Qwen4ExpAttentionDecoderLayer(
                 hidden_states, positions, forward_batch
             )
 
+        # Request only the original BF16 M4 chain-verify core. Backend confirms
+        # actual fusion with a Python bool; fallback still receives native gate.
+        if (_Q38_ATTN_GATE_V2 and gate is not None and self.is_qsa
+            and q.is_cuda and q.dtype == torch.bfloat16 and q.shape[0] == 4
+            and forward_batch.forward_mode.is_target_verify()):
+            attention_kwargs["q38_output_gate"] = gate
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
-        if gate is not None:
+        gate_applied = False
+        if isinstance(attn_output, tuple):
+            attn_output, gate_applied = attn_output
+        if gate is not None and not gate_applied:
             if attn_output.is_cuda:
                 # The strided 3D gate view feeds the kernel directly, so the
                 # gate reshape copy disappears along with the sigmoid + mul.
@@ -2116,6 +2356,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             )
         aux_hidden_states = AuxHiddenStateList()
         normalized_input = None
+        gate_partials = None
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             if i + 1 < self.end_layer:
@@ -2128,15 +2369,24 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                             batch=ple_batch, forward_batch=forward_batch
                         )
             next_norm = None
+            next_inject_weight = None
             if i + 1 < self.end_layer:
                 next_layer = self.layers[i + 1]
                 if next_layer.ple is None:
-                    next_norm = next_layer.attn_hyper_connection.hc_norm
+                    next_hc = next_layer.attn_hyper_connection
+                    next_norm = next_hc.hc_norm
+                    next_inject_weight = next_hc.block_inject_weight.weight
             elif self.pp_group.is_last_rank:
+                # The terminal mix has no gate, so no partials to prepare.
                 next_norm = self.hyper_connection_mixer.hc_norm
             with (
                 get_global_expert_distribution_recorder().with_current_layer(i),
-                layer.hc_norms(normalized_input, next_norm) as norms,
+                layer.hc_norms(
+                    normalized_input,
+                    next_norm,
+                    partials=gate_partials,
+                    next_inject_weight=next_inject_weight,
+                ) as norms,
             ):
                 hidden_states = layer(
                     positions=positions,
@@ -2151,6 +2401,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 )
 
             normalized_input = norms.output
+            gate_partials = norms.output_partials
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)

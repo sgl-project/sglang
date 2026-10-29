@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import contextvars
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generator, Optional, cast
+from typing import TYPE_CHECKING, Generator, NamedTuple, Optional, cast
 
 import torch
 from torch.nn import Module
@@ -41,6 +42,7 @@ from sglang.srt.utils.common import (
 )
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+_Q38C_MK_MOE_ENABLED = os.environ.get("SGLANG_Q38C_MK_MOE", "0") == "1"
 
 logger = __import__("logging").getLogger(__name__)
 
@@ -132,6 +134,25 @@ def _make_deferred_finalize_output(
     )
 
 
+class Nvfp4RoutedInputPreQuant(NamedTuple):
+    """NVFP4 linear-layout quant of the routed MoE input, produced by the same
+    fp4_quantize call the runner would make. ``ready`` is recorded on the
+    producing stream; the runner waits on it before the routed MoE op."""
+
+    x_fp4: torch.Tensor
+    x_sf: torch.Tensor
+    ready: Optional[torch.cuda.Event]
+
+
+def quantize_nvfp4_routed_input(
+    hidden_states: torch.Tensor, input_scale_quant: torch.Tensor
+) -> Nvfp4RoutedInputPreQuant:
+    """Quantize on the current stream and record the event the runner waits on."""
+    x_fp4, x_sf = quantize_hidden_states_fp4(hidden_states, input_scale_quant)
+    ready = torch.cuda.current_stream().record_event()
+    return Nvfp4RoutedInputPreQuant(x_fp4, x_sf, ready)
+
+
 def round_up_to_multiple(x: int, m: int) -> int:
     """Round up *x* to the nearest multiple of *m*."""
     return (x + m - 1) // m * m
@@ -150,7 +171,12 @@ if TYPE_CHECKING:
     )
 
 if is_flashinfer_available():
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm_pdl import (
+        apply_trtllm_moe_sm107_pdl,
+    )
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+    apply_trtllm_moe_sm107_pdl()
 else:
     fp4_quantize = None
 
@@ -1034,6 +1060,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     output=symm_output,
                     fp8_quantization_type=int(fp8_quantization_type),
                     activation_type=quant_info.activation_type,
+                    **(
+                        {"enable_pdl": trtllm_moe_enable_pdl(a_q.shape[0])}
+                        if get_parallel().tp_size == 1 else {}
+                    ),
                 )
                 output = cast(torch.Tensor, symm_output)
         else:
@@ -1091,6 +1121,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     output=cast(torch.Tensor, symm_output),
                     fp8_quantization_type=int(fp8_quantization_type),
                     activation_type=quant_info.activation_type,
+                    **(
+                        {"enable_pdl": trtllm_moe_enable_pdl(a_q.shape[0])}
+                        if get_parallel().tp_size == 1 else {}
+                    ),
                 )
                 output = cast(torch.Tensor, symm_output)
     else:
@@ -1458,6 +1492,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     # Quantize hidden states to FP4
     hidden_states_scale = dispatch_output.hidden_states_scale
+    pre_quant = dispatch_output.hidden_states_pre_quant
+    router_pre_quant = pre_quant
+    if router_pre_quant is not None:
+        from sglang.kernels.ops.moe.q38_router_front import Nvfp4RouterInput
+
+        if not isinstance(router_pre_quant, Nvfp4RouterInput):
+            router_pre_quant = None
     per_token_scale = None
     unpadded_hidden_size = hidden_states.shape[-1]
     hidden_pad = 0
@@ -1468,7 +1509,20 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         hidden_pad = quant_info.padded_hidden_size - unpadded_hidden_size
         hidden_states = torch.nn.functional.pad(hidden_states, (0, hidden_pad))
-    if hidden_states_scale is not None:
+    if router_pre_quant is not None:
+        assert hidden_pad == 0 and not quant_info.use_per_token_activation
+        assert hidden_states_scale is None
+        hs_fp4, hs_scale_linear = router_pre_quant
+    elif (
+        isinstance(pre_quant, Nvfp4RoutedInputPreQuant)
+        and hidden_pad == 0
+        and not quant_info.use_per_token_activation
+    ):
+        assert pre_quant.x_fp4.shape[0] == hidden_states.shape[0]
+        hs_fp4, hs_scale_linear = pre_quant.x_fp4, pre_quant.x_sf
+        if pre_quant.ready is not None:
+            torch.cuda.current_stream().wait_event(pre_quant.ready)
+    elif hidden_states_scale is not None:
         # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
         # the dispatcher, so pass them through unchanged.
         hs_fp4 = hidden_states
@@ -1644,8 +1698,20 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
+        elif hidden_pad == 0 and get_parallel().tp_size == 1:
+            # Preserve the eagerly tuned full-width output shape in the cache key;
+            # do_finalize=False leaves this buffer unwritten.
+            moe_kwargs["output"] = hs_fp4.new_empty(
+                (hs_fp4.shape[0], hs_fp4.shape[1] * 2), dtype=torch.bfloat16
+            )
 
-        result = trtllm_fp4_block_scale_moe(**moe_kwargs)
+        result = None
+        if _Q38C_MK_MOE_ENABLED:
+            from sglang.kernels.ops.moe.q38_mk_q35 import maybe_run_service
+
+            result = maybe_run_service(moe_kwargs)
+        if result is None:
+            result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
             result = _make_deferred_finalize_output(result, top_k=topk_config.top_k)
         else:

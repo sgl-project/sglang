@@ -686,5 +686,40 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
 
 
+class TestOverlapLoopPerfllHostStart(CustomTestCase):
+    """Every overlap loop, the PD decode one included, applies the PERF-LL host
+    loop-start switches (main-thread pinning, frozen env reads) and only when set."""
+
+    def run_loop_entry(self, event_loop, enabled):
+        scheduler = Scheduler.__new__(Scheduler)
+        # The loop returns right after its entry.
+        scheduler.gracefully_exit = True
+        with (
+            envs.SGLANG_PERFLL_HOST_PIN_MAIN.override(enabled),
+            envs.SGLANG_PERFLL_HOST_ENV_FREEZE.override(enabled),
+            patch.object(scheduler_module.perfll_host, "pin_main_thread") as pin_main,
+            patch.object(scheduler_module, "freeze_env_reads") as freeze_reads,
+            patch.object(
+                scheduler_module, "get_device", return_value=SimpleNamespace(gpu_id=3)
+            ),
+        ):
+            event_loop(scheduler)
+        return pin_main, freeze_reads
+
+    @parameterized.expand(
+        [
+            ("overlap", Scheduler.event_loop_overlap),
+            ("decode_overlap", Scheduler.event_loop_overlap_disagg_decode),
+        ]
+    )
+    def test_loop_start_switches(self, name, event_loop):
+        pin_main, freeze_reads = self.run_loop_entry(event_loop, enabled=True)
+        pin_main.assert_called_once_with(3)
+        freeze_reads.assert_called_once_with()
+        pin_main, freeze_reads = self.run_loop_entry(event_loop, enabled=False)
+        pin_main.assert_not_called()
+        freeze_reads.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

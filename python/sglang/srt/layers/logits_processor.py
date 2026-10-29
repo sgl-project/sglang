@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -92,6 +93,7 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 # Skipping the LM head skips its [batch * num_dp_ranks, vocab] all-gather, which OOMs
 # under DP attention with a tight mem_fraction_static.
 _autotune_run_lm_head: Optional[bool] = None
+_Q38_LM_HEAD_ARTIFACTS = os.environ.get("SGLANG_Q38C_LM_HEAD_ARTIFACTS", "")
 
 
 class SamplingMaskStatus(IntEnum):
@@ -227,6 +229,11 @@ class LogitsProcessorOutput:
 
     # Original flattened token indices when only a subset of hidden rows is captured.
     hidden_states_token_indices: Optional[torch.Tensor] = None
+    # SGLANG_Q35MF_SHARDED_VERIFY: next_token_logits is this rank's [#seq, V / tp] shard
+    # of the vocabulary, laid out as this VocabShard says.
+    next_token_logits_vocab_shard: Optional[Any] = None
+    # Selected-row FN draft-extend top1, owned by that captured graph.
+    q38c_draft_top1: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     # Post-norm last-layer hidden states of every token, kept under full capture
     # when `hidden_states` holds the aux hidden states
@@ -356,6 +363,9 @@ class LogitsMetadata:
     # DRAFT_EXTEND_V2: when set, lm_head and LAST hidden capture use only these
     # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
+    # The FN native top-1 consumer widens BF16 logits to FP32 at each load.
+    # Keeping the head's unchanged BF16 output avoids a separate full-vocab copy.
+    q38c_native_top1: bool = False
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -398,6 +408,7 @@ class LogitsMetadata:
             forward_mode=forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
+            q38c_native_top1=getattr(forward_batch, "_q38c_native_top1", False),
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -490,6 +501,14 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
+        self.sharded_verify = (
+            envs.SGLANG_Q35MF_SHARDED_VERIFY.get()
+            and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and not self.use_tp_lm_head_all_to_all
+            and not return_full_logits
+        )
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -630,6 +649,14 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            vocab_shard = self._verify_vocab_shard(lm_head, logits_metadata)
+            if vocab_shard is not None:
+                return LogitsProcessorOutput(
+                    next_token_logits=self._get_shard_logits(pruned_states, lm_head),
+                    next_token_logits_vocab_shard=vocab_shard,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -663,6 +690,36 @@ class LogitsProcessor(nn.Module):
         )
         logprobs_result.write_input_to(logits_output)
         return logits_output
+
+    def _verify_vocab_shard(
+        self, lm_head: VocabParallelEmbedding, logits_metadata: LogitsMetadata
+    ):
+        """The VocabShard a target verify keeps its logits in, or None for the gather."""
+        if not (
+            self.sharded_verify
+            and not self.defer_verify_gather
+            and logits_metadata.forward_mode.is_target_verify()
+            and self.final_logit_softcapping is None
+            and isinstance(lm_head, VocabParallelEmbedding)
+            and lm_head.shard_indices.num_added_elements_padded == 0
+        ):
+            return None
+        from sglang.srt.speculative.sharded_verify import VocabShard
+
+        indices = lm_head.shard_indices
+        return VocabShard(
+            start=indices.org_vocab_start_index,
+            valid=indices.num_org_elements,
+            vocab_size=self.vocab_size,
+        )
+
+    def _get_shard_logits(
+        self, hidden_states: torch.Tensor, lm_head: VocabParallelEmbedding
+    ) -> torch.Tensor:
+        logits = self._compute_lm_head(hidden_states, lm_head)
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+        return logits
 
     def _get_pruned_states(
         self,
@@ -1196,6 +1253,17 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
+                if _Q38_LM_HEAD_ARTIFACTS and not self.use_fp32_lm_head_output:
+                    from sglang.kernels.ops.gemm.q38_lm_head import try_run_lm_head
+
+                    logits = try_run_lm_head(
+                        hidden_states,
+                        lm_head.weight,
+                        artifacts=_Q38_LM_HEAD_ARTIFACTS,
+                        is_draft=getattr(self, "_q38_is_draft_lm_head", False),
+                    )
+                    if logits is not None:
+                        return logits
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
                 )
@@ -1341,11 +1409,31 @@ class LogitsProcessor(nn.Module):
         softcap: Optional[float] = None,
     ) -> torch.Tensor:
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
+        if logits_metadata.q38c_native_top1 and not getattr(self, "_stack8_top1_boundary_logged", False):
+            logger.info(
+                "STACK8_D11_LOGITS_BOUNDARY mode=%s dtype=%s buffer_alias=%s softcap=%s fp32_head=%s fp32_output=%s",
+                logits_metadata.forward_mode, logits.dtype, logits is logits_buffer,
+                softcap, self.use_fp32_lm_head, self.use_fp32_lm_head_output,
+            )
+            self._stack8_top1_boundary_logged = True
         if logits is logits_buffer and softcap is None:
             return logits
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
         logits_width = logits.shape[-1]
+        if (
+            logits_metadata.q38c_native_top1
+            and logits_metadata.forward_mode.is_decode()
+            and logits.dtype == torch.bfloat16
+            and softcap is None
+        ):
+            if not getattr(self, "_q38c_native_top1_logged", False):
+                logger.info(
+                    "Q38C native BF16 top1 active: mode=%s rows=%s vocab=%s",
+                    logits_metadata.forward_mode, logits.shape[0], logits.shape[-1],
+                )
+                self._q38c_native_top1_logged = True
+            return logits
         if softcap is not None:
             if logits_buffer is None or tuple(logits_buffer.shape) != tuple(
                 logits.shape

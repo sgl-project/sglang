@@ -1,3 +1,5 @@
+import logging
+import os
 from typing import Optional, Tuple, Union
 
 import msgspec
@@ -48,8 +50,30 @@ from sglang.srt.runtime_context import (
     get_schedule,
     mamba_cache_chunk_size,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 from sglang.srt.utils.common import is_pin_memory_available, rank0_log
+
+# One-launch target-verify glue (conv + ReplaySSM circular spec + gated norm)
+# for the GDN layers; SGLANG_GDN_FUSED_VERIFY_GLUE=0 restores the stock chain.
+_GDN_FUSED_VERIFY_GLUE = (
+    is_cuda()
+    and not is_hip()
+    and get_bool_env_var("SGLANG_GDN_FUSED_VERIFY_GLUE", "false")
+)
+_fused_verify_glue_logged: set = set()
+
+
+def _log_fused_verify_glue_once(status: str) -> None:
+    if status not in _fused_verify_glue_logged:
+        _fused_verify_glue_logged.add(status)
+        rank0_log(f"GDN fused verify glue: {status}")
 
 _is_hip = is_hip()
 
@@ -67,6 +91,8 @@ if is_cuda() or is_hip() or is_xpu():
     )
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
+logger = logging.getLogger(__name__)
+_q38_front_engaged: set[int] = set()
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
@@ -577,6 +603,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.prefill_graph_max_seqs = min(
             self.req_to_token_pool.size, envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get()
         )
+        # Set by supports_prefill_graph_extend when the captured core is FlashInfer's.
+        self.prefill_graph_flashinfer = False
+        # [max bucket, HV, V] output rows shared by every captured bucket and layer.
+        self._fi_graph_output: Optional[torch.Tensor] = None
+        self._fi_graph_output_dtype = model_runner.dtype
+        self._fi_graph_cp_single = True
+        self._fi_graph_layers: dict[int, int] = {}
+        self._fi_graph_engage_logged = False
+        self._fi_graph_eager_batches = 0
 
     def supports_prefill_graph_extend(self) -> bool:
         # Read here, not in __init__: the support check reads model_config.
@@ -593,24 +628,99 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         mamba_cache = self.state_pool.mamba_cache
-        capture_tokens = get_exec().graph.cuda_graph_config.prefill.bs or []
-        supported = (
+        capture_tokens = get_prefill_num_tokens_to_capture(
+            get_exec().graph.cuda_graph_config.prefill.bs or []
+        )
+        common = (
             is_cuda()
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
             and not self.enable_mis
             # The track plan's h rows assume the delta-rule chunk size.
             and self.mamba_chunk_size == FLA_CHUNK_SIZE
             and all(conv.is_contiguous() for conv in mamba_cache.conv)
             and mamba_cache.temporal.is_contiguous()
-            and buckets_keep_chunk_o_block_size(
-                get_prefill_num_tokens_to_capture(capture_tokens)
-            )
         )
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        if isinstance(extend_kernel, TritonGDNKernel):
+            supported = common and buckets_keep_chunk_o_block_size(capture_tokens)
+            how = "on"
+            if envs.SGLANG_PERFPF_GDN_GRAPH_FLASHINFER.get():
+                rank0_log(
+                    "GDN extend graph: flashinfer requested, but the prefill kernel "
+                    "is Triton (set --linear-attn-prefill-backend flashinfer)"
+                )
+        elif envs.SGLANG_PERFPF_GDN_GRAPH_FLASHINFER.get():
+            reason = (
+                "needs CUDA, no MIS, chunk size 64 and a contiguous pool"
+                if not common
+                else self._flashinfer_graph_unsupported_reason(capture_tokens)
+            )
+            supported = reason is None
+            if not supported:
+                rank0_log(f"GDN extend graph: flashinfer unsupported here ({reason})")
+            else:
+                self._enable_flashinfer_graph(capture_tokens)
+            how = (
+                "on (FlashInfer core: "
+                + (
+                    "CP kernel for one-sequence batches, non-CP "
+                    if self._fi_graph_cp_single
+                    else "non-CP kernel, one-sequence batches included, "
+                )
+                + f"for up to {self.prefill_graph_max_seqs}; larger batches run eagerly)"
+            )
+        else:
+            supported = False
         rank0_log(
             "GDN prefill extend inside breakable prefill CUDA graphs: "
-            + ("on" if supported else "unsupported here, layers keep breaking")
+            + (how if supported else "unsupported here, layers keep breaking")
         )
         return supported
+
+    def _flashinfer_graph_unsupported_reason(
+        self, capture_tokens: list[int]
+    ) -> Optional[str]:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+        )
+
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        temporal = self.state_pool.mamba_cache.temporal
+        if not isinstance(extend_kernel, FlashInferGDNKernel):
+            return f"extend kernel is {type(extend_kernel).__name__}"
+        if torch.cuda.get_device_capability()[0] != 10:
+            return "validated on SM100 only"
+        if temporal.dtype != torch.bfloat16:
+            return f"SSM state dtype {temporal.dtype}, validated with bfloat16"
+        # FlashInfer writes the pool in place through 32-byte aligned pointers.
+        layer_bytes = temporal.stride(0) * temporal.element_size()
+        if temporal.data_ptr() % 32 or layer_bytes % 32:
+            return "SSM pool is not 32-byte aligned per layer"
+        # Checkpoints come every 64 tokens; the eager plan uses the cache chunk.
+        cache_chunk = mamba_cache_chunk_size()
+        if get_exec().mamba.enable_mamba_extra_buffer and cache_chunk != FLA_CHUNK_SIZE:
+            return f"mamba cache chunk {cache_chunk} != {FLA_CHUNK_SIZE}"
+        if not capture_tokens:
+            return "no prefill capture sizes"
+        return None
+
+    def _enable_flashinfer_graph(self, capture_tokens: list[int]) -> None:
+        self.prefill_graph_flashinfer = True
+        self.prefill_graph_max_seqs = envs.SGLANG_PERFPF_GDN_GRAPH_FI_MAX_SEQS.get()
+        num_v_heads, head_v_dim = (
+            self.state_pool.mamba_cache.temporal.shape[-3:-1]
+        )
+        # FlashInfer's own split on SM100: CP only while sequences x heads x 4 < SMs, so
+        # with 64 heads per rank (TP1) one sequence runs faster on the non-CP kernel.
+        self._fi_graph_cp_single = (
+            num_v_heads * 4
+            < torch.cuda.get_device_properties(self.device).multi_processor_count
+        )
+        # Rows past a batch keep the last finite values written there.
+        self._fi_graph_output = torch.zeros(
+            (max(capture_tokens), num_v_heads, head_v_dim),
+            dtype=self._fi_graph_output_dtype,
+            device=self.device,
+        )
 
     def prefill_graph_extend_active(self) -> bool:
         return self.prefill_graph_metadata is not None
@@ -627,6 +737,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             track=get_exec().mamba.enable_mamba_extra_buffer,
             cache_index_dtype=cache_indices.dtype,
             device=self.device,
+            flashinfer=self.prefill_graph_flashinfer,
+            flashinfer_cp_single=self._fi_graph_cp_single,
         )
         self._fill_prefill_graph_metadata(
             meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
@@ -636,6 +748,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def refresh_prefill_graph_metadata(
         self, meta: GDNPrefillGraphMetadata, forward_batch: ForwardBatch
     ) -> None:
+        if meta.flashinfer is not None and not self._fi_graph_engage_logged:
+            # Every capture is done by the first replay.
+            self._fi_graph_engage_logged = True
+            counts = sorted(set(self._fi_graph_layers.values()))
+            rank0_log(
+                f"GDN extend graph: flashinfer captured "
+                f"{counts[0] if len(counts) == 1 else counts} layers "
+                f"({len(self._fi_graph_layers)} buckets, non-CP rows "
+                f"{self.prefill_graph_max_seqs}"
+                f"{'' if self._fi_graph_cp_single else ', no CP kernel'})"
+            )
         self._fill_prefill_graph_metadata(
             meta=meta,
             forward_batch=forward_batch,
@@ -715,6 +838,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # An eager forward never runs on a graph bucket's tables.
         self.prefill_graph_metadata = None
+        if (
+            self.prefill_graph_flashinfer
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.batch_size > self.prefill_graph_max_seqs
+        ):
+            self._fi_graph_eager_batches += 1
+            if self._fi_graph_eager_batches % 500 == 1:
+                rank0_log(
+                    f"GDN extend graph: flashinfer batch of {forward_batch.batch_size} "
+                    f"sequences > {self.prefill_graph_max_seqs} runs eagerly "
+                    f"({self._fi_graph_eager_batches} such batches so far)"
+                )
         super().init_forward_metadata(forward_batch)
         self._init_target_verify_qkv_routing(forward_batch)
         self.mis_metadata = None
@@ -1168,6 +1304,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)
         query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
         g, beta = self._prefill_gates(layer, a, b)
+        if meta.flashinfer is not None:
+            return self._flashinfer_core_in_graph(
+                meta=meta,
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                ssm_states=ssm_states,
+            )
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=query,
             k=key,
@@ -1191,6 +1337,109 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         return core_attn_out
 
+    def _flashinfer_core_in_graph(
+        self,
+        *,
+        meta: GDNPrefillGraphMetadata,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """_forward_extend_in_graph's core on FlashInfer: in-place state by slot,
+        prefix-cache snapshots from the 64-token state checkpoints."""
+        tables = meta.flashinfer
+        num_tokens = query.shape[1]
+        if meta.track:
+            # A chunk-0 snapshot is the initial state, which the kernel overwrites.
+            gdn_track_ssm_state(
+                ssm_pool=ssm_states,
+                h=ssm_states.unsqueeze(0),
+                track_mode=tables.pre_track_mode,
+                track_h_row=tables.track_h_row,
+                track_dst=meta.track_dst,
+                cache_indices=meta.cache_indices,
+            )
+        output = self._fi_graph_output[:num_tokens]
+        checkpoints = self.kernel_dispatcher.extend_kernel.extend_in_graph(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            tables=tables,
+            output=output,
+            checkpoint_rows=num_tokens // FLA_CHUNK_SIZE if meta.track else 0,
+            checkpoint_every_n_tokens=FLA_CHUNK_SIZE,
+        )
+        if meta.track:
+            # Buckets under 64 tokens have no checkpoints and only final-state rows.
+            gdn_track_ssm_state(
+                ssm_pool=ssm_states,
+                h=checkpoints if checkpoints is not None else ssm_states.unsqueeze(0),
+                track_mode=tables.track_mode,
+                track_h_row=tables.track_h_row,
+                track_dst=meta.track_dst,
+                cache_indices=meta.cache_indices,
+            )
+        if torch.cuda.is_current_stream_capturing():
+            self._fi_graph_layers[num_tokens] = (
+                self._fi_graph_layers.get(num_tokens, 0) + 1
+            )
+        return output.view(1, num_tokens, *output.shape[1:])
+
+    def q38_inproj_conv_supported(self, forward_batch):
+        meta = self.forward_metadata
+        return (not pp_spec_stable_rows_enabled() and self.mis_metadata is None
+                and forward_batch.spec_info.draft_token_num == 4
+                and (meta.query_start_loc.shape[0] == 2 or (
+                    os.environ.get("SGLANG_Q38C_MK_GDN", "0") == "1"
+                    and (meta.query_start_loc.shape[0] in (3, 4) or (
+                        meta.query_start_loc.shape[0] == 5
+                        and forward_batch.batch_size >= 2
+                        and os.environ.get("SGLANG_Q38C_MK_GDN_WIDE", "0") == "1"))))
+                and meta.retrieve_next_token is None
+                and meta.retrieve_next_sibling is None
+                and meta.retrieve_parent_token is None)
+
+    def forward_inproj_conv(self, layer, forward_batch, x, weight, *, norm_weight=None, norm_eps=1e-6):
+        if os.environ.get("SGLANG_Q38C_MK_GDN", "0") == "1":
+            from sglang.srt.q38.q38_mkgdn_front import run
+        else:
+            from sglang.srt.q38.gdn_inproj_conv import run
+        from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+        meta = self.forward_metadata
+        params = self.state_layer_cache(layer.layer_id)
+        rows, batch = x.shape[0], x.shape[0] // 4
+        if norm_weight is not None:
+            pool = self.state_pool
+            if (params.temporal.dtype != torch.bfloat16
+                or params.replayssm_d is None
+                or getattr(pool, "replayssm_cache_base", None) is None
+                or getattr(pool, "replayssm_spec_fold", False)
+                or getattr(pool, "replayssm_is_kda", False)):
+                raise ValueError("MK_GDN fused norm requires the BF16 circular ReplaySSM path")
+        packed, convolved = run(
+            x, weight, layer.conv_weights, layer.bias,
+            params.conv[0], meta.mamba_cache_indices[:batch],
+            params.intermediate_conv_window[0],
+            self.verify_intermediate_state_indices[:batch], pad_slot=PAD_SLOT_ID,
+        )
+        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        z_end = qkv_dim + layer.v_dim
+        z = packed[:, qkv_dim:z_end].view(rows, layer.num_v_heads, 128)
+        b = packed[:, z_end:z_end + layer.num_v_heads]
+        a = packed[:, z_end + layer.num_v_heads:]
+        core = self.forward_extend(
+            layer, forward_batch, convolved, a, b, q38_conv_applied=True,
+            q38_mk_z=z if norm_weight is not None else None,
+            q38_mk_norm_weight=norm_weight, q38_mk_norm_eps=norm_eps,
+        )
+        return core, z
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -1201,6 +1450,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         **kwargs,
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
+        q38_conv_applied = kwargs.get("q38_conv_applied", False)
         seq_len = mixed_qkv.shape[0]
 
         if _is_hip and seq_len == 0:
@@ -1240,12 +1490,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            intermediate_state_indices = select_verify_intermediate_state_indices(
-                self.verify_intermediate_state_indices,
-                forward_batch.req_pool_indices,
-                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-                self.req_to_token_pool.size,
-            )
+            # PP-off selects the fixed table; do not evaluate its unused mask.
+            intermediate_state_indices = self.verify_intermediate_state_indices
+            if pp_spec_stable_rows_enabled():
+                intermediate_state_indices = select_verify_intermediate_state_indices(
+                    self.verify_intermediate_state_indices,
+                    forward_batch.req_pool_indices,
+                    cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                    self.req_to_token_pool.size,
+                )
             mamba_pool = self.state_pool
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None
@@ -1288,13 +1541,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
 
-        if is_target_verify:
+        if is_target_verify and not q38_conv_applied:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
+            conv_update = causal_conv1d_update
+            front_kwargs = {}
+            if os.environ.get("Q38_GDN_FRONT") == "1":
+                from sglang.kernels.ops.attention.q38_gdn_front.conv import conv_update as q35_conv_update
+                assert retrieve_next_token is None and retrieve_next_sibling is None and retrieve_parent_token is None
+                conv_update = q35_conv_update
+                front_kwargs = dict(block_n=128, token_major_out=True, num_warps=2)
+                if layer.layer_id not in _q38_front_engaged:
+                    _q38_front_engaged.add(layer.layer_id)
+                    logger.info("Q38_GDN_FRONT layer=%d heads=%d/%d draft=%d views=1 conv_tile=128 verify_tile=64/w1 source=Q35_plugin pdl=%s", layer.layer_id, layer.num_k_heads, layer.num_v_heads, draft_token_num, os.environ.get("Q38_GDN_PDL", "0"))
+            mixed_qkv_processed = conv_update(
                 mixed_qkv_reshaped,
                 conv_states,
                 layer.conv_weights,
@@ -1303,12 +1566,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_state_indices=cache_indices[:batch_size],
                 intermediate_conv_window=intermediate_conv_window_cache,
                 intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
+                **(front_kwargs if front_kwargs else dict(
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )),
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
-        else:
+        elif not is_target_verify:
             if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[
                     forward_metadata.track_conv_indices
@@ -1331,6 +1596,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and not self._use_strided_target_verify_qkv
+            and not (is_target_verify and os.environ.get("Q38_GDN_FRONT") == "1")
         ):
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
@@ -1383,6 +1649,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     replay_indices=forward_batch.req_pool_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
+                    wait_for_gate_producer=q38_conv_applied,
+                    packed_qkv=mixed_qkv,
+                    norm_z=kwargs.get("q38_mk_z"),
+                    norm_weight=kwargs.get("q38_mk_norm_weight"),
+                    norm_eps=kwargs.get("q38_mk_norm_eps", 1e-6),
+                    return_normalized=kwargs.get("q38_m32_return_normalized", False),
                 )
             else:
                 # The recurrent fallback needs the per-draft snapshots, which
@@ -1703,6 +1975,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         replay_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         draft_token_num: int,
+        wait_for_gate_producer: bool = False,
+        packed_qkv: Optional[torch.Tensor] = None,
+        norm_z: Optional[torch.Tensor] = None,
+        norm_weight: Optional[torch.Tensor] = None,
+        norm_eps: float = 1e-6,
+        return_normalized: bool = False,
     ) -> torch.Tensor:
         """ReplaySSM GDN spec-verify (Part B of #28511).
 
@@ -1722,6 +2000,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             gdn_replayssm_spec_decode,
         )
 
+        if os.environ.get("Q38_GDN_PDL") == "1":
+            from sglang.kernels.ops.attention.q38_gdn_front.replayssm_pdl import (
+                gdn_replayssm_spec_decode,
+            )
+
         H, K = layer.num_k_heads, layer.head_k_dim
         HV, V = layer.num_v_heads, layer.head_v_dim
         # q/k/v may be [1, seq, *] (fallback split) or [seq, *] (fused split);
@@ -1735,6 +2018,35 @@ class GDNAttnBackend(MambaAttnBackendBase):
         d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
         max_cache_len = d_cache.shape[-2]  # ring length L
         out = q.new_empty(seq_len, HV, V)
+        if (
+            os.environ.get("SGLANG_Q38C_MK_GDN", "0") == "1"
+            and draft_token_num == 4
+            and (seq_len in (4, 8, 12) or (
+                seq_len == 16 and (H, HV) == (4, 12)
+                and os.environ.get("SGLANG_Q38C_MK_GDN_WIDE", "0") == "1") or (
+                seq_len == 32 and (H, HV) == (4, 12)
+                and os.environ.get("SGLANG_Q38C_MK_GDN_M32_NORM", "0") == "1"
+                and norm_z is not None and norm_weight is not None
+                and norm_z.dtype == torch.bfloat16 and norm_weight.dtype == torch.bfloat16))
+            and (H, HV, K, V) in ((4, 12, 128, 128), (16, 48, 128, 128))
+            and layer_cache.temporal.dtype == torch.bfloat16
+            and max_cache_len == 16 and packed_qkv is not None
+        ):
+            from sglang.kernels.ops.attention.q38_mkgdn import core
+
+            normalized = torch.empty_like(out) if norm_weight is not None else None
+            result = core(
+                packed_qkv, a, b, layer.A_log, layer.dt_bias,
+                layer_cache.temporal, d_cache, layer_cache.replayssm_k,
+                layer_cache.replayssm_g, layer_cache.replayssm_rawv,
+                layer_cache.replayssm_rawk, cache_indices, replay_indices,
+                mamba_pool.replayssm_spec_write_pos, mamba_pool.replayssm_cache_base,
+                mamba_pool.replayssm_is_flush, out,
+                z=norm_z, norm_weight=norm_weight, normalized=normalized, eps=norm_eps,
+            )
+            if seq_len == 32 and return_normalized and normalized is not None:
+                return result.reshape(value.shape), True
+            return result.reshape(value.shape)
         gdn_replayssm_spec_decode(
             q=q,
             k=k,
@@ -1772,6 +2084,164 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            block_v=64,
+            num_warps=1,
+            **({"wait_for_gate_producer": True} if wait_for_gate_producer else {}),
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)
+
+    def fused_verify_glue_supported(self, layer, forward_batch, tokens, input_dtype,
+                                    norm_weight, norm_activation):
+        """FN TP1 dispatch precheck; b1 retains its in-projection/Conv path."""
+        if not _GDN_FUSED_VERIFY_GLUE:
+            return False
+        if not (
+            forward_batch.forward_mode.is_target_verify()
+            and forward_batch.logical_forward_mode.is_target_verify()
+        ):
+            return False
+        if self.mis_metadata is not None:
+            return False
+        metadata = self.forward_metadata
+        if (metadata.retrieve_next_token is not None
+            or metadata.retrieve_next_sibling is not None
+            or metadata.retrieve_parent_token is not None):
+            # Tree verify (topk > 1): the conv walks parent links.
+            return False
+        mamba_pool = self.state_pool
+        if getattr(mamba_pool, "replayssm_is_kda", False) or getattr(
+            mamba_pool, "replayssm_spec_fold", False
+        ):
+            return False
+        if getattr(mamba_pool, "replayssm_cache_base", None) is None:
+            return False
+        layer_cache = self.state_layer_cache(layer.layer_id)
+        if not isinstance(layer_cache, MambaPool.SpeculativeState):
+            return False
+        if layer_cache.replayssm_d is None:
+            return False
+
+        H, K = layer.num_k_heads, layer.head_k_dim
+        HV, V = layer.num_v_heads, layer.head_v_dim
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        conv_state = layer_cache.conv[0]
+        window = layer_cache.intermediate_conv_window[0]
+        qkv_dim = 2 * H * K + HV * V
+        if (
+            layer.num_q_heads != H
+            or layer.head_q_dim != K
+            or K != V
+            or V not in (64, 128)
+            or HV % H != 0
+            or draft_token_num != 4
+            or tokens < 2 * draft_token_num
+            or tokens > 4 * draft_token_num
+            or tokens % draft_token_num != 0
+            or input_dtype != torch.bfloat16
+            or conv_state.dtype != input_dtype
+            or window.dtype != input_dtype
+            or layer.activation not in ("silu", "swish")
+            or layer_cache.temporal.dtype != torch.bfloat16
+            or layer.bias is not None
+            or layer.conv_weights.dim() != 2
+            or layer.conv_weights.shape != (qkv_dim, 4)
+            or conv_state.dim() != 3
+            or conv_state.shape[1:] != (qkv_dim, 3)
+            or window.dim() != 4
+            or window.shape[1:] != (draft_token_num, qkv_dim, 3)
+            or norm_activation not in ("swish", "silu", "sigmoid")
+            or norm_weight.shape != (V,)
+        ):
+            _log_fused_verify_glue_once("inactive (unsupported layer/batch shape)")
+            return False
+
+        return True
+
+    def fused_verify_glue(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkvz: torch.Tensor,
+        mixed_ba: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+        norm_activation: Optional[str],
+    ) -> Optional[torch.Tensor]:
+        """One-launch target-verify glue for the ReplaySSM circular ring path.
+
+        Consumes the contiguous ``[q | k | v | z]`` / ``[b | a]`` in_proj output
+        and returns the gated-RMSNorm output ``[tokens, HV * V]`` (the out_proj
+        input), replacing the split -> causal_conv1d_update ->
+        gdn_replayssm_spec_circular -> gated-RMSNorm chain. Returns ``None``
+        whenever the batch or layer is outside the supported envelope; the
+        caller then runs the stock chain.
+        """
+        if not self.fused_verify_glue_supported(
+            layer, forward_batch, mixed_qkvz.shape[0], mixed_qkvz.dtype,
+            norm_weight, norm_activation,
+        ):
+            return None
+        H, K = layer.num_k_heads, layer.head_k_dim
+        HV, V = layer.num_v_heads, layer.head_v_dim
+        tokens = mixed_qkvz.shape[0]
+        qkv_dim = 2 * H * K + HV * V
+        if (mixed_ba.shape[0] != tokens or mixed_qkvz.shape[-1] < qkv_dim + HV * V
+            or mixed_ba.shape[-1] < 2 * HV or mixed_qkvz.stride(-1) != 1
+            or mixed_ba.stride(-1) != 1):
+            return None
+        metadata = self.forward_metadata
+        mamba_pool = self.state_pool
+        layer_cache = self.state_layer_cache(layer.layer_id)
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        conv_state = layer_cache.conv[0]
+        window = layer_cache.intermediate_conv_window[0]
+
+        from sglang.kernels.ops.attention.linear.gdn_fused_verify_glue import (
+            gdn_fused_verify_glue,
+        )
+
+        batch_size = tokens // draft_token_num
+        cache_indices = metadata.mamba_cache_indices
+        if pp_spec_stable_rows_enabled():
+            intermediate_state_indices = select_verify_intermediate_state_indices(
+                self.verify_intermediate_state_indices,
+                forward_batch.req_pool_indices,
+                cache_indices[:batch_size] >= 0,
+                self.req_to_token_pool.size,
+            )
+        else:
+            # Stock evaluates the `>= 0` mask every layer and discards it here.
+            intermediate_state_indices = self.verify_intermediate_state_indices
+        _log_fused_verify_glue_once("active")
+        return gdn_fused_verify_glue(
+            mixed_qkvz=mixed_qkvz,
+            mixed_ba=mixed_ba,
+            conv_state=conv_state,
+            conv_weight=layer.conv_weights,
+            conv_bias=None,
+            conv_activation=layer.activation,
+            intermediate_conv_window=window,
+            intermediate_state_indices=intermediate_state_indices,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            norm_activation=norm_activation,
+            checkpoint_state=layer_cache.temporal,
+            d_cache=layer_cache.replayssm_d,
+            k_cache=layer_cache.replayssm_k,
+            g_cache=layer_cache.replayssm_g,
+            rawv_cache=layer_cache.replayssm_rawv,
+            rawk_cache=layer_cache.replayssm_rawk,
+            beta_cache=layer_cache.replayssm_beta,
+            cache_indices=cache_indices,
+            replay_indices=forward_batch.req_pool_indices,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
+            cache_base=mamba_pool.replayssm_cache_base,
+            is_flush=mamba_pool.replayssm_is_flush,
+            num_k_heads=H,
+            head_k_dim=K,
+            draft_token_num=draft_token_num,
+        )

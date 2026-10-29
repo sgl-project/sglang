@@ -1,5 +1,6 @@
 """Unit tests for srt/managers/scheduler_components/shm_tag_exchange.py."""
 
+import os
 import sys
 import time
 import unittest
@@ -19,7 +20,7 @@ from sglang.srt.managers.scheduler_components import shm_tag_exchange
 from sglang.srt.managers.scheduler_components.request_receiver import (
     _broadcast_via_exchange,
 )
-from sglang.srt.managers.scheduler_components.shm_tag_exchange import ShmTagExchange
+from sglang.srt.managers.scheduler_components.shm_tag_exchange import ShmTagExchange, HierTagExchange
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.utils import stale_shm_cleanup
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -152,6 +153,51 @@ class TestShmTagExchange(CustomTestCase):
                 _exchange_rounds,
                 args=(str(Path(directory) / "gloo-init"),),
                 nprocs=2,
+                join=True,
+            )
+
+
+def _hier_allgather_over_hosts(rank: int, init_file: str, world: int, hosts: int) -> None:
+    torch.distributed.init_process_group(
+        backend="gloo", init_method=Path(init_file).as_uri(), rank=rank, world_size=world
+    )
+    env = {
+        "SGLANG_Q35MF_EDGE_SHM_SYNC": "1",
+        "SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST": "1",
+        "SGLANG_Q35MF_EDGE_MULTIHOST_TCP_MESH": "1",
+    }
+    try:
+        # Ranks 2h and 2h+1 pretend to share host h.
+        with (
+            patch.dict(os.environ, env),
+            patch("socket.gethostname", return_value=f"h{rank * hosts // world}"),
+            (
+                patch.object(stale_shm_cleanup, "_SGL_SHM_PREFIX", "s")
+                if sys.platform == "darwin"
+                else nullcontext()
+            ),
+        ):
+            exchange = HierTagExchange(torch.distributed.group.WORLD, f"t{hosts}")
+            assert len(exchange.members) == hosts
+            assert (exchange.mesh is not None) == exchange.is_leader
+            for call in range(3):
+                got = exchange.allgather([rank, call, 7])
+                assert got == [[r, call, 7] for r in range(world)], (rank, call, got)
+            exchange.local.close()
+            exchange.full.close()
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class TestHierTagExchangeLeaderMesh(CustomTestCase):
+    def test_leader_mesh_gathers_every_row_on_every_rank(self):
+        """With more than two hosts the host leaders swap rows over a TCP mesh;
+        every rank must still see every rank's row, call after call."""
+        with TemporaryDirectory() as directory:
+            torch.multiprocessing.spawn(
+                _hier_allgather_over_hosts,
+                args=(str(Path(directory) / "gloo-init"), 6, 3),
+                nprocs=6,
                 join=True,
             )
 

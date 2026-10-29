@@ -90,6 +90,7 @@ _is_musa = is_musa()
 # the registered path makes peers read stale data over IPC on replay (garbage
 # rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
 _AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
+_Q38C_AR_SMALLM_CA = os.environ.get("SGLANG_Q38C_AR_SMALLM_CA", "0") == "1"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -1014,6 +1015,25 @@ class GroupCoordinator:
 
     def _can_use_flashinfer_allreduce(self, input_: torch.Tensor) -> bool:
         if self._fi_workspace_hint is None:
+            return False
+        # Isolated TP4 small-message screen: keep the ordinary CA resolver and
+        # its graph-buffer registration, rather than sharing FI workspace state.
+        if (
+            _Q38C_AR_SMALLM_CA
+            and self.world_size == 4
+            and input_.ndim == 2
+            and input_.dtype == torch.bfloat16
+            and input_.shape[1] == 2560
+            and 0 < input_.shape[0] <= 4
+            and input_.is_contiguous()
+            and self.pymscclpp_comm is None
+            and self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and self.ca_comm.should_custom_ar(input_)
+        ):
+            if not getattr(self, "_stack8_ar_logged", False):
+                logger.info("STACK8_AR01_ACTIVE shape=%s custom_ar=%s", tuple(input_.shape), type(self.ca_comm).__name__)
+                self._stack8_ar_logged = True
             return False
         from sglang.srt.layers.flashinfer_comm_fusion import (
             can_use_flashinfer_allreduce,

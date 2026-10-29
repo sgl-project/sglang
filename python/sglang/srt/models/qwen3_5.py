@@ -1008,6 +1008,64 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        # The fused glue owns supported TP1 b>=2 verify; FN owns b1 and all TP4 paths.
+        fused_verify_glue = self._fused_verify_glue_eligible(hidden_states, forward_batch)
+        if (
+            os.environ.get("SGLANG_Q38C_MK_GDN", "0") == "1"
+            and not fused_verify_glue
+            and forward_batch.forward_mode.is_target_verify()
+            and hidden_states.dtype == torch.bfloat16 and hidden_states.ndim == 2
+            and (hidden_states.shape[0] in (4, 8, 12) or (
+                hidden_states.shape[0] == 16 and self.attn_tp_size == 4
+                and forward_batch.batch_size >= 2
+                and os.environ.get("SGLANG_Q38C_MK_GDN_WIDE", "0") == "1"))
+            and hidden_states.shape[1] == 2560
+            and self.attn_tp_size in (1, 4)
+            and self._fused_in_proj_weight is not None
+            and self._fused_in_proj_weight.dtype == torch.bfloat16
+            and self.activation in ("silu", "swish")
+        ):
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            backend = get_attn_backend()
+            backend = getattr(backend, "linear_attn_backend", backend)
+            if backend.q38_inproj_conv_supported(forward_batch):
+                normalized, _ = backend.forward_inproj_conv(
+                    self.attn, forward_batch, hidden_states, self._fused_in_proj_weight,
+                    norm_weight=self.norm.weight, norm_eps=self.norm.eps,
+                )
+                # out_proj returns a local TP contribution. The enclosing stage
+                # retains native all-reduce completion before HC combine.
+                return self.out_proj(normalized.reshape(hidden_states.shape[0], -1))[0]
+
+        if (os.environ.get("Q38_GDN_INPROJ_CONV") == "1"
+            and forward_batch.forward_mode.is_target_verify()
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2 and tuple(hidden_states.shape) == (4, 2560)
+            and self.attn_tp_size == 1 and self._fused_in_proj_weight is not None
+            and tuple(self._fused_in_proj_weight.shape) == (16480, 2560)
+            and self._fused_in_proj_weight.dtype == torch.bfloat16
+            and self.activation in ("silu", "swish")):
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+            backend = get_attn_backend()
+            backend = getattr(backend, "linear_attn_backend", backend)
+            if backend.q38_inproj_conv_supported(forward_batch):
+                core_attn_out, z = backend.forward_inproj_conv(
+                    self.attn, forward_batch, hidden_states, self._fused_in_proj_weight
+                )
+                core_attn_out = self.norm(core_attn_out.reshape(-1, 128), z)
+                projected_input = core_attn_out.reshape(4, 6144)
+                if (os.environ.get("Q38_GDN_OUTPROJ_BATCHSPLIT") == "1"
+                    and tuple(self.out_proj.weight.shape) == (2560, 6144)
+                    and self.out_proj.weight.dtype == torch.bfloat16
+                    and projected_input.dtype == torch.bfloat16
+                    and projected_input.stride(-1) == 1
+                    and self.out_proj.weight.stride(-1) == 1
+                    and getattr(self.out_proj, "bias", None) is None):
+                    from sglang.kernels.ops.attention.q38_gdn_front.outproj_batchsplit import gdn_outproj_batchsplit
+                    return gdn_outproj_batchsplit(projected_input, self.out_proj.weight)
+                return self.out_proj(projected_input)[0]
+
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
@@ -1021,6 +1079,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 return self._forward_xpu(
                     backend, projected_states_qkvz, projected_states_ba, forward_batch
                 )
+
+        if (
+            fused_verify_glue
+            and _is_cuda
+            and forward_batch.forward_mode.is_target_verify()
+            and isinstance(projected_states_qkvz, torch.Tensor)
+            and isinstance(projected_states_ba, torch.Tensor)
+            and self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
+            and self.norm.group_size is None
+            and self.norm.norm_before_gate
+            and self.norm.bias is None
+        ):
+            output = self._forward_fused_verify_glue(
+                projected_states_qkvz, projected_states_ba, forward_batch
+            )
+            if output is not None:
+                return output
 
         use_strided_prefill_z = False
         packed_verify = False
@@ -1057,7 +1132,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (
                 _is_cuda
-                and forward_batch.logical_forward_mode.is_extend_without_speculative()
+                and (
+                    forward_batch.logical_forward_mode.is_extend_without_speculative()
+                    or (os.environ.get("Q38_GDN_FRONT") == "1"
+                        and forward_batch.forward_mode.is_target_verify())
+                )
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
@@ -1084,12 +1163,42 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
-        attn_result = self.attn(
-            forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-        )
+        if (
+            hidden_states.shape[0] == 32 and self.attn_tp_size == 4
+            and forward_batch.forward_mode.is_target_verify()
+            and os.environ.get("SGLANG_Q38C_MK_GDN", "0") == "1"
+            and os.environ.get("SGLANG_Q38C_MK_GDN_M32_NORM", "0") == "1"
+            and not use_fused_proj_conv and z is not None
+            and hidden_states.dtype == torch.bfloat16
+            and z.dtype == torch.bfloat16 and self.norm.weight.dtype == torch.bfloat16
+        ):
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+            # Target-verify RadixLinearAttention.forward takes this same final
+            # backend call (no prefill trimming); extra norm metadata is local.
+            attn_result = get_attn_backend().forward(
+                layer=self.attn, forward_batch=forward_batch,
+                mixed_qkv=mixed_qkv, a=a, b=b,
+                q38_mk_z=z, q38_mk_norm_weight=self.norm.weight,
+                q38_mk_norm_eps=self.norm.eps, q38_m32_return_normalized=True,
+            )
+            if (isinstance(attn_result, tuple) and len(attn_result) == 2
+                and attn_result[1] is True):
+                if not getattr(self, "_q38_m32_norm_engaged", False):
+                    self._q38_m32_norm_engaged = True
+                    logger.info(
+                        "Q38C_GDN_M32_NORM_ACTIVE phase=TARGET_VERIFY tp_rank=%d layer=%d rows=32 tp=4 hk=4 hv=12 "
+                        "grid=96 block=128 fused_success=1 external_norm_skipped=1 "
+                        "norm_dtype=%s input_dtype=%s",
+                        self.attn_tp_rank, self.layer_id, self.norm.weight.dtype, hidden_states.dtype,
+                    )
+                return self.out_proj(attn_result[0].reshape(32, -1))[0]
+        else:
+            attn_result = self.attn(
+                forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
         if use_fused_proj_conv:
             if not isinstance(attn_result, tuple) or len(attn_result) != 2:
                 raise RuntimeError(
@@ -1136,6 +1245,59 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out.shape[-2] * core_attn_out.shape[-1],
         )
 
+        output, _ = self.out_proj(core_attn_out)
+        return output
+
+    def _fused_verify_glue_eligible(self, hidden_states, forward_batch):
+        if not (
+            _is_cuda and self.attn_tp_size == 1
+            and os.environ.get("SGLANG_GDN_FUSED_VERIFY_GLUE", "0") == "1"
+            and forward_batch.forward_mode.is_target_verify()
+            and hidden_states.ndim == 2 and hidden_states.dtype == torch.bfloat16
+            and self._fused_in_proj_weight is not None
+            and self._fused_in_proj_weight.dtype == torch.bfloat16
+            and self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
+            and self.norm.group_size is None and self.norm.norm_before_gate
+            and self.norm.bias is None
+        ):
+            return False
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        supported = getattr(backend, "fused_verify_glue_supported", None)
+        return (supported is not None and not getattr(backend, "supports_packed_verify", False)
+                and not _fp8_tuple_input(self.out_proj, hidden_states.shape[0])
+                and supported(self.attn, forward_batch, hidden_states.shape[0],
+                              hidden_states.dtype, self.norm.weight, self.norm.activation))
+
+    def _forward_fused_verify_glue(
+        self,
+        projected_states_qkvz: torch.Tensor,
+        projected_states_ba: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """Target verify through the GDN backend's one-launch glue, if it applies."""
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        fused_glue = getattr(backend, "fused_verify_glue", None)
+        # A packed-verify backend owns the projection/Conv1D boundary itself.
+        if fused_glue is None or getattr(backend, "supports_packed_verify", False):
+            return None
+        if _fp8_tuple_input(self.out_proj, projected_states_qkvz.shape[0]):
+            return None
+        core_attn_out = fused_glue(
+            layer=self.attn,
+            forward_batch=forward_batch,
+            mixed_qkvz=projected_states_qkvz,
+            mixed_ba=projected_states_ba,
+            norm_weight=self.norm.weight,
+            norm_eps=self.norm.eps,
+            norm_activation=self.norm.activation,
+        )
+        if core_attn_out is None:
+            return None
         output, _ = self.out_proj(core_attn_out)
         return output
 

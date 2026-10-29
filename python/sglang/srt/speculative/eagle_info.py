@@ -212,6 +212,9 @@ class EagleDraftInput(SpecInput):
     # DP attention synchronizes the bit across ranks before the worker runs.
     cuda_graph_compatible: bool = True
 
+    # Capture-owned inputs produced for this exact, unmodified next batch.
+    q38_prepared_frames: Optional[tuple] = None
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
@@ -255,6 +258,7 @@ class EagleDraftInput(SpecInput):
         new_indices: torch.Tensor,
         new_indices_cpu: Optional[List[int]] = None,
     ):
+        self.q38_prepared_frames = None
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
@@ -270,6 +274,7 @@ class EagleDraftInput(SpecInput):
             self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
+        self.q38_prepared_frames = None
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self_was_empty = len(self.future_indices) == 0

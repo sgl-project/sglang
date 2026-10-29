@@ -15,6 +15,7 @@ import numpy.typing as npt
 import torch
 from prometheus_client import Counter
 
+from sglang.srt.disaggregation import l12_trace
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
@@ -665,7 +666,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         return (ret, False)
 
-    def _prefetch_staging_reqs(self, room: int):
+    def _prefetch_staging_reqs(self, room: int, upto_tokens: Optional[int] = None):
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return
 
@@ -692,6 +693,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
             requester_pp_rank=self.pp_rank,
+            upto_tokens=upto_tokens,
         )
 
     def send_kvcache_staged(
@@ -2518,6 +2520,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                if l12_trace.ENABLED and not hasattr(kv_chunk, "l12_deq"):
+                    kv_chunk.l12_deq = time.time()
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2586,6 +2590,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
+                l12_s0 = time.time() if l12_trace.ENABLED else 0.0
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
@@ -2849,7 +2854,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
 
                 if staging_deferred:
+                    if l12_trace.ENABLED:
+                        kv_chunk.l12_defer = getattr(kv_chunk, "l12_defer", 0) + 1
                     continue
+                if l12_trace.ENABLED and self.attn_tp_rank == 0:
+                    l12_trace.log_chunk(kv_chunk, kv_chunk.l12_deq, l12_s0, time.time())
 
                 self._staging_outstanding[kv_chunk.room] -= 1
                 if self.enable_deferred_decode_kv_release:
@@ -3059,6 +3068,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
 
                 # Staging: prefill notifies a chunk written to staging buffer
+                if l12_trace.ENABLED and self.attn_tp_rank == 0 and msg[0] == b"CHUNK_READY":
+                    l12_trace.decode_chunk_arrived(int(msg[1].decode("ascii")))
                 if self.handle_chunk_ready(msg):
                     continue
 
@@ -3122,27 +3133,38 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
-        dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
-        shard_idx = session_port_sum % len(self.transfer_queues)
+        if envs.SGLANG_PERFPF_TRANSFER_SHARD_BY_ROOM.get():
+            # One decode worker gives every room the same session set, so the
+            # session sharding puts all transfers on one queue and one worker
+            # thread. A room's chunks still share one queue (their order is kept);
+            # failed sessions are checked per chunk from the shared set. The low
+            # bits of a room can encode the decode DP rank, so they are skipped.
+            shard_idx = (bootstrap_room >> 16) % len(self.transfer_queues)
+        else:
+            dst_infos = self.transfer_infos[bootstrap_room].keys()
+            session_port_sum = sum(
+                int(session.rsplit(":", 1)[1]) for session in dst_infos
+            )
+            shard_idx = session_port_sum % len(self.transfer_queues)
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                trace_ctx=trace_ctx,
-                wait_event=wait_event,
-                indices_event=indices_event,
-            )
+        kv_chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
+            trace_ctx=trace_ctx,
+            wait_event=wait_event,
+            indices_event=indices_event,
         )
+        if l12_trace.ENABLED:
+            kv_chunk.l12_enq = time.time()
+        self.transfer_queues[shard_idx].put(kv_chunk)
 
     def get_session_id(self):
         return self.engine.get_session_id()

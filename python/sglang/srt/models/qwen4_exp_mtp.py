@@ -70,6 +70,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.logits_processor._q38_is_draft_lm_head = True
 
     def _init_pre_fc_norms(self, config: PretrainedConfig) -> None:
         self.pre_fc_norm_embedding = GemmaRMSNorm(
@@ -142,6 +143,14 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         input_embeds: Optional[torch.Tensor],
     ) -> torch.Tensor:
         assert input_embeds is None
+        folded = getattr(forward_batch, "_q38_step_fold_embedding", None)
+        if folded is not None:
+            forward_batch._q38_step_fold_embedding = None
+            return folded
+        first = getattr(forward_batch, "_q38_full_first_embedding", None)
+        if first is not None:
+            forward_batch._q38_full_first_embedding = None
+            return first
         input_embeds = forward_batch.mm_input_embeds
         if (
             forward_batch.forward_mode.is_extend()
@@ -174,7 +183,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             # Mirror LogitsProcessor: the graph path selects rows via
             # spec_info.select_index and the worker no longer re-indexes them.
             select_index = forward_batch.spec_info.select_index
-            if select_index is not None:
+            if select_index is not None and not getattr(forward_batch, "_q38_full_tail", False):
                 hc_hidden_states = hc_hidden_states[select_index]
         elif (
             forward_batch.extend_seq_lens is not None

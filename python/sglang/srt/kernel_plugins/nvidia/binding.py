@@ -534,10 +534,20 @@ def megakernel_graph_variants(
         "NVIDIA megakernel: the %s graphs of batch sizes %s capture the attention "
         "variants %s",
         runner,
-        sorted(batch_sizes),
+        sorted(megakernel_variant_sizes(variants, batch_sizes)),
         list(variants.capture_labels),
     )
     return variants
+
+
+def megakernel_variant_sizes(
+    variants: Optional[AttentionGraphVariants], batch_sizes: Collection[int]
+) -> frozenset[int]:
+    """The batch sizes whose graphs capture one graph per label of variants: up to its
+    optional max_batch_size, past which select picks one label for every batch."""
+    # an optional member, as graph_variants is
+    limit = getattr(variants, "max_batch_size", None)
+    return frozenset(bs for bs in batch_sizes if limit is None or bs <= limit)
 
 
 def megakernel_verify_variants(
@@ -551,7 +561,9 @@ def megakernel_verify_variants(
         bs for bs in capture_bs if bs * tokens_per_request in built.widths
     )
     variants = megakernel_graph_variants(model, "target_verify", batch_sizes=sizes)
-    return (None, None) if variants is None else (variants, sizes)
+    if variants is None:
+        return None, None
+    return variants, megakernel_variant_sizes(variants, sizes)
 
 
 def _entries(built: BuiltMegakernel) -> Mapping[str, Optional[Callable]]:

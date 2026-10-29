@@ -16,7 +16,10 @@ does only after it has finished reading the previous call.
 Enabled by SGLANG_Q35MF_EDGE_SHM_SYNC=1 (default off). Groups that span hosts
 keep the stock gloo path unless SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST=1 is also
 set: then each host exchanges through shared memory and only the host leaders
-meet in one small gloo all_gather (HierTagExchange).
+meet in one small gloo all_gather (HierTagExchange). The leaders swap rows over
+TCP instead with SGLANG_Q35MF_EDGE_MULTIHOST_TCP=1 (two hosts) or
+SGLANG_Q35MF_EDGE_MULTIHOST_TCP_MESH=1 (more than two hosts), and the request
+broadcast's size takes the same path with SGLANG_Q35MF_EDGE_RECV_MULTIHOST=1.
 """
 
 from __future__ import annotations
@@ -43,6 +46,14 @@ _TAG_BITS = 23
 _VAL_BITS = 40
 _TAG_MASK = (1 << _TAG_BITS) - 1
 _VAL_MASK = (1 << _VAL_BITS) - 1
+
+
+def _leader_mesh_enabled() -> bool:
+    return os.environ.get("SGLANG_Q35MF_EDGE_MULTIHOST_TCP_MESH", "0") == "1"
+
+
+def recv_multihost_enabled() -> bool:
+    return os.environ.get("SGLANG_Q35MF_EDGE_RECV_MULTIHOST", "0") == "1"
 
 
 class ShmTagExchange:
@@ -174,11 +185,52 @@ class _LeaderLink:
             self.sock = socket.create_connection(box[0], timeout=timeout_s)
         self.sock.settimeout(timeout_s)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.timeout_s = timeout_s
+        # SGLANG_PERFLL_HOST_LINK_SPIN: spin on a non-blocking socket (no sleep / wakeup)
+        self.spin = envs.SGLANG_PERFLL_HOST_LINK_SPIN.get()
+        if self.spin:
+            self.sock.setblocking(False)
+            logger.info("PERF-LL host: LINK_SPIN on")
 
     def swap(self, payload: bytes) -> bytes:
-        self.sock.sendall(len(payload).to_bytes(4, "little") + payload)
+        msg = len(payload).to_bytes(4, "little") + payload
+        if self.spin:
+            return self._spin_swap(msg)
+        self.sock.sendall(msg)
         size = int.from_bytes(self._recv_exact(4), "little")
         return self._recv_exact(size)
+
+    def _spin_swap(self, msg: bytes) -> bytes:
+        deadline = time.monotonic() + self.timeout_s
+        view = memoryview(msg)
+        while view:
+            try:
+                view = view[self.sock.send(view) :]
+            except BlockingIOError:
+                self._spin_wait(deadline)
+        size = int.from_bytes(self._spin_recv(4, deadline), "little")
+        return self._spin_recv(size, deadline)
+
+    def _spin_recv(self, n: int, deadline: float) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                chunk = self.sock.recv(n - len(buf))
+            except BlockingIOError:
+                self._spin_wait(deadline)
+                continue
+            if not chunk:
+                raise RuntimeError("EDGE leader link closed by the peer leader")
+            buf += chunk
+        return bytes(buf)
+
+    def _spin_wait(self, deadline: float) -> None:
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"EDGE leader link timed out after {self.timeout_s:.0f}s; "
+                "the peer leader's scheduler is stuck or dead"
+            )
+        os.sched_yield()
 
     def _recv_exact(self, n: int) -> bytes:
         buf = bytearray()
@@ -188,6 +240,96 @@ class _LeaderLink:
                 raise RuntimeError("EDGE leader link closed by the peer leader")
             buf += chunk
         return bytes(buf)
+
+
+class _LeaderMesh:
+    """Persistent TCP connections between every pair of host leaders (more than two
+    hosts). A call sends this leader's rows to every peer, then spins on the peer
+    sockets until each has delivered its rows: one network hop and no thread wakeups,
+    where a gloo all_gather walks a ring through its worker threads."""
+
+    def __init__(self, leaders: dist.ProcessGroup, timeout_s: float):
+        from sglang.srt.utils.network import get_local_ip_auto
+
+        n = dist.get_world_size(leaders)
+        me = dist.get_rank(leaders)
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("0.0.0.0", 0))
+        server.listen(n)
+        addrs: List[Optional[tuple]] = [None] * n
+        dist.all_gather_object(
+            addrs, (get_local_ip_auto(), server.getsockname()[1]), group=leaders
+        )
+        # Leader j connects to every leader i < j and says who it is.
+        self.peers: Dict[int, socket.socket] = {}
+        for i in range(me):
+            sock = socket.create_connection(addrs[i], timeout=timeout_s)
+            sock.sendall(me.to_bytes(4, "little"))
+            self.peers[i] = sock
+        server.settimeout(timeout_s)
+        for _ in range(n - 1 - me):
+            sock, _ = server.accept()
+            sock.settimeout(timeout_s)
+            j = int.from_bytes(_recv_exact(sock, 4), "little")
+            self.peers[j] = sock
+        server.close()
+        for sock in self.peers.values():
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setblocking(False)
+        self.me = me
+        self.n = n
+        self.timeout_s = timeout_s
+
+    def all_gather(self, payload: bytes) -> List[bytes]:
+        msg = len(payload).to_bytes(4, "little") + payload
+        deadline = time.monotonic() + self.timeout_s
+        for sock in self.peers.values():
+            view = memoryview(msg)
+            while view:
+                try:
+                    view = view[sock.send(view) :]
+                except BlockingIOError:
+                    self._wait(deadline)
+        out: List[bytes] = []
+        for i in range(self.n):
+            if i == self.me:
+                out.append(payload)
+            else:
+                size = int.from_bytes(self._spin_recv(i, 4, deadline), "little")
+                out.append(self._spin_recv(i, size, deadline))
+        return out
+
+    def _spin_recv(self, peer: int, n: int, deadline: float) -> bytes:
+        sock = self.peers[peer]
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                chunk = sock.recv(n - len(buf))
+            except BlockingIOError:
+                self._wait(deadline, peer)
+                continue
+            if not chunk:
+                raise RuntimeError(f"EDGE leader link to leader {peer} closed")
+            buf += chunk
+        return bytes(buf)
+
+    def _wait(self, deadline: float, peer: int = -1) -> None:
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"EDGE leader mesh timed out after {self.timeout_s:.0f}s waiting for "
+                f"leader {peer}; a peer scheduler is stuck or dead"
+            )
+        os.sched_yield()
+
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise RuntimeError("EDGE leader link closed by a peer leader")
+        buf += chunk
+    return bytes(buf)
 
 
 class HierTagExchange:
@@ -223,12 +365,15 @@ class HierTagExchange:
         )
         # Two hosts: the leaders swap rows over one TCP connection instead of a gloo all_gather.
         self.link = None
+        self.mesh = None
         if (
             self.is_leader
             and len(self.members) == 2
             and envs.SGLANG_Q35MF_EDGE_MULTIHOST_TCP.get()
         ):
             self.link = _LeaderLink(self.leaders, host == 0, self.local.timeout_s)
+        elif self.is_leader and len(self.members) > 2 and _leader_mesh_enabled():
+            self.mesh = _LeaderMesh(self.leaders, self.local.timeout_s)
 
     def allgather(self, values: Sequence[int]) -> List[List[int]]:
         n = len(values)
@@ -242,6 +387,12 @@ class HierTagExchange:
             per_host = (
                 [mine, peer.tolist()] if self.host == 0 else [peer.tolist(), mine]
             )
+        elif self.mesh is not None:
+            per_host = []
+            for raw in self.mesh.all_gather(array("q", mine).tobytes()):
+                rows = array("q")
+                rows.frombytes(raw)
+                per_host.append(rows.tolist())
         else:
             flat = torch.zeros(self.local_max * n, dtype=torch.int64)
             flat[: len(mine)] = torch.tensor(mine, dtype=torch.int64)
@@ -257,6 +408,19 @@ class HierTagExchange:
 
 
 _EXCHANGES: Dict[tuple, object] = {}
+# (values_fn, store_fn): extra values one consumer adds to the request-size exchange
+# (SGLANG_PERFLL_HOST_HC_PIGGYBACK). values_fn returns the same-length list on every
+# rank or None; store_fn gets every rank's extra values, or None when not available.
+_RECV_PIGGYBACK: Optional[tuple] = None
+
+
+def set_recv_piggyback(values_fn, store_fn) -> None:
+    global _RECV_PIGGYBACK
+    _RECV_PIGGYBACK = (values_fn, store_fn)
+
+
+def recv_piggyback() -> Optional[tuple]:
+    return _RECV_PIGGYBACK
 
 
 def get_shm_exchange(

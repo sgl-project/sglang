@@ -128,8 +128,10 @@ class BuiltMegakernel(Protocol):
     then captures one graph per label, in order, the label readable through
     capture_mode.get_capture_attention_variant() during the capture, and replays the
     one select picks. select reads host state only, such as
-    ForwardBatch.attention_kv_len_lower_bound, and picks alike on every rank. Other
-    runners and batch sizes capture as they would without these variants.
+    ForwardBatch.attention_kv_len_lower_bound, and picks alike on every rank. Variants
+    may set max_batch_size: past it select picks one label for every batch, so those
+    batch sizes capture one graph, as without variants. Other runners and batch sizes
+    capture as they would without these variants.
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested

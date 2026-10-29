@@ -28,6 +28,7 @@ from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
     fold_u64,
     get_shm_exchange,
+    set_recv_piggyback,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
@@ -124,6 +125,7 @@ from sglang.srt.runtime_context import (
     get_observability,
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
+from sglang.srt.utils import host_trace
 from sglang.srt.utils.common import ceil_align, get_device_module
 from sglang.srt.utils.poll_timer import PollTimer
 
@@ -170,6 +172,7 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+_HC_PIGGYBACK = envs.SGLANG_PERFLL_HOST_HC_PIGGYBACK.get()
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -324,6 +327,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
+        # SGLANG_PERFLL_HOST_HC_PIGGYBACK: (ack epoch, every rank's ready counts)
+        # from this pass's request-size exchange
+        self._hc_piggy = None
+        self._hc_ack_epoch = 0
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
         # Host backups of restores whose host-to-device copies may still be in
         # flight, each with its copy's finish event; their host slots are
@@ -598,6 +605,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
+
+        if _HC_PIGGYBACK and self.pp_size == 1:
+            set_recv_piggyback(self._hc_piggy_values, self._hc_piggy_store)
+            logger.info("PERF-LL host: HC_PIGGYBACK on")
 
         if storage_backend is not None:
             self._storage_attachment.apply_runtime_config(
@@ -3526,7 +3537,17 @@ class UnifiedRadixCache(BasePrefixCache):
             # Storage adds a count per extra host pool; a row wider than the table
             # takes the gloo reduce below.
             if len(values) <= exchange.width:
-                rows = exchange.allgather(values)
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.HC0)
+                piggy = None
+                if _HC_PIGGYBACK:
+                    piggy, self._hc_piggy = self._hc_piggy, None
+                if piggy is not None and piggy[0] == self._hc_ack_epoch:
+                    rows = piggy[1]
+                else:
+                    rows = exchange.allgather(values)
+                if host_trace.ENABLED:
+                    host_trace.mark(host_trace.HC1)
                 assert all(row[-2:] == rows[0][-2:] for row in rows), (
                     "write_back duplicate-reclaim victims diverged across TP ranks"
                 )
@@ -3559,6 +3580,21 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pool_names,
         )
 
+    def _hc_piggy_values(self) -> Optional[list]:
+        """This rank's ready counts for the request-size exchange (same layout as
+        _sync_hicache_ready_counts' shm row), or None where that row is not used."""
+        cc = self.cache_controller
+        if cc is None or self.enable_storage or self.linker is not None:
+            return None
+        return [
+            self._count_ready_acks(cc.ack_write_queue),
+            self._count_ready_acks(cc.ack_load_queue),
+            *fold_u64(self.tree_core.write_back_duplicate_reclaim_digest),
+        ]
+
+    def _hc_piggy_store(self, rows: Optional[list]) -> None:
+        self._hc_piggy = None if rows is None else (self._hc_ack_epoch, rows)
+
     def _shm_count_exchange(self) -> Optional[ShmTagExchange]:
         # Only the single-group, single-stage layout; anything else keeps the gloo reduce.
         if self.pp_size > 1 or self.cache_controller is None:
@@ -3587,6 +3623,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
+            if _HC_PIGGYBACK:
+                self._hc_ack_epoch += 1
             cc.start_writing()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:

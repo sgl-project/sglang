@@ -194,6 +194,15 @@ class SchedulePolicy:
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        self._spf_age_rounds = envs.SGLANG_PERFPF_SPF_AGE_ROUNDS.get()
+        # rid -> batch formations waited; a round count, not wall time, so every TP rank orders alike
+        self._spf_rounds: Dict[str, int] = {}
+        self._spf_match_every = envs.SGLANG_PERFPF_SPF_MATCH_EVERY.get()
+        self._spf_age_cap = envs.SGLANG_PERFPF_SPF_AGE_CAP.get()
+        self._spf_chunk_min_pct = envs.SGLANG_PERFPF_SPF_CHUNK_MIN_PCT.get()
+        self._spf_match_round = 0
+        # rid -> round of its last prefix match in calc_priority
+        self._spf_matched: Dict[str, int] = {}
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -237,9 +246,14 @@ class SchedulePolicy:
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
-                SchedulePolicy._sort_by_shortest_prefill(
-                    waiting_queue, temporary_deprioritized
-                )
+                if self._spf_age_rounds > 0:
+                    self._sort_by_shortest_prefill_aged(
+                        waiting_queue, temporary_deprioritized
+                    )
+                else:
+                    SchedulePolicy._sort_by_shortest_prefill(
+                        waiting_queue, temporary_deprioritized
+                    )
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
                     logger.info(
@@ -346,8 +360,28 @@ class SchedulePolicy:
     ) -> Set[int]:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
+        every = (
+            self._spf_match_every
+            if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            else 0
+        )
+        if every > 1:
+            self._spf_match_round += 1
+            last, self._spf_matched = self._spf_matched, {}
 
         for r in waiting_queue:
+            if every > 1:
+                seen = last.get(r.rid)
+                # The sort only needs an estimate: admission re-matches every
+                # request it considers (init_next_round_input).
+                if (
+                    seen is not None
+                    and self._spf_match_round - seen < every
+                    and r.prefix_len > IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD
+                ):
+                    self._spf_matched[r.rid] = seen
+                    continue
+                self._spf_matched[r.rid] = self._spf_match_round
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt
@@ -413,6 +447,47 @@ class SchedulePolicy:
             )
         )
 
+    def _sort_by_shortest_prefill_aged(
+        self, waiting_queue: List[Req], temporary_deprioritized: Set[int]
+    ) -> None:
+        # Requests that waited more than _spf_age_rounds batch formations go first, oldest first.
+        rounds = {r.rid: self._spf_rounds.get(r.rid, 0) + 1 for r in waiting_queue}
+        self._spf_rounds = rounds
+        limit = self._spf_age_rounds
+        cap = get_schedule().chunked_prefill_size or 0
+        if self._spf_age_cap and cap > 0:
+            # An aged request sorts as if its prefill were one batch budget: after
+            # the requests that fit in a batch, before younger long ones (oldest
+            # first), so it becomes the next chunked request without blocking
+            # the short requests ahead of it.
+            def key(r):
+                work = SchedulePolicy._shortest_prefill_work(r)
+                aged = rounds[r.rid] > limit
+                return (
+                    r.rid in temporary_deprioritized,
+                    min(work, cap) if aged else work,
+                    not aged,
+                    -rounds[r.rid] if aged else 0,
+                    r.time_stats.wait_queue_entry_time,
+                    r.rid,
+                )
+
+            waiting_queue.sort(key=key)
+            return
+        waiting_queue.sort(
+            key=lambda r: (
+                rounds[r.rid] <= limit,
+                r.rid in temporary_deprioritized,
+                (
+                    SchedulePolicy._shortest_prefill_work(r)
+                    if rounds[r.rid] <= limit
+                    else -rounds[r.rid]
+                ),
+                r.time_stats.wait_queue_entry_time if rounds[r.rid] <= limit else 0.0,
+                r.rid,
+            )
+        )
+
     def shortest_prefill_chunk_limit(
         self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
     ) -> Optional[int]:
@@ -423,11 +498,17 @@ class SchedulePolicy:
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        # The chunk keeps at least min_chunk tokens per batch, so it always progresses.
+        min_chunk = max(page_size, budget * self._spf_chunk_min_pct // 100)
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
+            if work >= remaining:
+                if self._spf_chunk_min_pct:
+                    continue
+                break
+            if reserved + charge > budget - min_chunk:
                 break
             reserved += charge
         if not reserved:

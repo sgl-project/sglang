@@ -141,6 +141,51 @@ def _plan(src, rows, seq_lens, *, write_virtual=None, read_extent=0):
     )
 
 
+class TestStagedDraftColumns(unittest.TestCase):
+    def setUp(self):
+        _publish()
+        self.addCleanup(reset_context)
+
+    def test_a_staged_draft_binds_the_staged_slots_for_its_columns(self):
+        """SGLANG_PERFLL_STEP5A_DRAFT_LOCS: the draft steps' slots the post-verify graph staged
+        are the plan's first columns as they are, not a copy out of the window: same values,
+        same count (the draft's read extent), and other columns still come from the window."""
+        from sglang.srt.mem_cache.kv.alloc.iteration_ids import window_read_extent
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        src = RunnerIds(
+            req_to_token=torch.zeros((4, 16), dtype=torch.int64),
+            token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+            token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces, requires_physical_write_loc=False),
+            page_size=1,
+            device=_DEV,
+        )
+        rows = torch.tensor([2, 0])
+        window = torch.arange(100, 114, dtype=torch.int64)  # [2 rows, 7 columns]
+        staged = window.view(2, 7)[:, :6].reshape(-1).clone()
+        plan = _plan(
+            src, rows, torch.tensor([5, 3]), write_virtual=window, read_extent=7
+        )
+        copied = plan.write_ids(src, cols=slice(0, 6))
+        self.assertTrue(torch.equal(copied, staged))
+        plan.take_staged_cols(slice(0, 6), staged)
+        batch = SimpleNamespace()
+        plan.bind(batch, src, cols=slice(0, 6))
+        self.assertIs(batch.out_cache_loc, staged)
+        self.assertIsNone(batch.out_cache_loc_virtual)
+        extent = window_read_extent(
+            ForwardMode.DECODE, object(), batch.out_cache_loc, 2
+        )
+        self.assertEqual(extent, 6)
+        self.assertTrue(
+            torch.equal(
+                plan.write_ids(src, cols=slice(0, 3)),
+                window.view(2, 7)[:, :3].reshape(-1),
+            )
+        )
+        self.assertIs(plan.write_ids(src), window)
+
+
 def _alloc_and_fill(allocator, ps, lens):
     """Allocate per-request virtual runs and write them into a fake
     req_to_token."""

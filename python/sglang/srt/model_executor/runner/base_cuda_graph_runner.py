@@ -22,8 +22,10 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
+from sglang.srt.disaggregation import l16_loopstat
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
+from sglang.srt.model_executor.runner_backend import ab_variants
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -176,6 +178,14 @@ class BaseCudaGraphRunner(BaseRunner):
             f"size {raw_size} exceeds max captured bucket {buckets[-1]}; "
             f"can_run_graph should have rejected this batch"
         )
+        if ab_variants.ACTIVE:
+            padded = ab_variants.pad(raw_size, buckets)
+            if padded is not None:
+                return padded
+        if l16_loopstat.COARSE_ACTIVE is not None:
+            coarse = l16_loopstat.coarse_pad(raw_size, buckets)
+            if coarse is not None:
+                return coarse
         index = bisect.bisect_left(buckets, raw_size)
         return buckets[index]
 
