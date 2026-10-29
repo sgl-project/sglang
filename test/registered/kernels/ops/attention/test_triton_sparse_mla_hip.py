@@ -132,6 +132,49 @@ def test_short_prefill_index_bound_matches_full_scan(topk):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def _snr_db(ref, out):
+    noise = (out.float() - ref).pow(2).mean()
+    return float(10 * torch.log10(ref.pow(2).mean() / noise))
+
+
+@pytest.mark.skipif(not _IS_GFX950, reason="decode plan is gfx950-only")
+@pytest.mark.parametrize("seq", [48, 60, 96])
+@pytest.mark.parametrize("tail_invalid", [False, True])
+def test_gfx950_fp8_64h_decode_plan_matches_reference(seq, tail_invalid):
+    """GLM-5.2 decode / MTP-verify shape (64 heads, fp8 cache, topk 2048), which
+    takes the BLOCK_H == H split-K plan: within fp8 tolerance of an fp32
+    reference, with and without a -1 tail on the index rows."""
+    torch.manual_seed(seq)
+    heads, value_dim, tail_dim, topk = 64, 512, 64, 2048
+    kv = (
+        torch.randn(1 << 16, 1, value_dim + tail_dim, device="cuda")
+        .clamp_(-4, 4)
+        .to(torch.float8_e4m3fn)
+    )
+    q_nope = (
+        torch.randn(seq, heads, value_dim, device="cuda")
+        .clamp_(-4, 4)
+        .to(torch.float8_e4m3fn)
+    )
+    q_rope = (
+        torch.randn(seq, heads, tail_dim, device="cuda")
+        .clamp_(-4, 4)
+        .to(torch.float8_e4m3fn)
+    )
+    indices = torch.randint(
+        0, kv.shape[0], (seq, 1, topk), device="cuda", dtype=torch.int32
+    )
+    if tail_invalid:
+        lengths = torch.randint(256, topk, (seq,), device="cuda")
+        pos = torch.arange(topk, device="cuda")
+        indices[:, 0] = torch.where(pos < lengths[:, None], indices[:, 0], -1)
+    sm_scale = 0.0625
+    out = triton_sparse_mla_fwd(q_nope, q_rope, kv, indices, sm_scale, value_dim)
+    q = torch.cat([q_nope, q_rope], dim=-1)
+    ref, _ = _sparse_mla_reference(q, kv, indices[:, 0], sm_scale, value_dim)
+    assert _snr_db(ref, out.reshape(ref.shape)) > 35.0
+
+
 @pytest.mark.parametrize("active_splits", [2, 4])
 def test_reduce_d_chunk_is_bitwise_identical(active_splits):
     torch.manual_seed(active_splits)
