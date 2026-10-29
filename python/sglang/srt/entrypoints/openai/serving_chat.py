@@ -89,6 +89,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
+    _byte_fallback_piece_to_bytes,
     cached_tokens_details_from_dict,
     process_cached_tokens_details_from_ret,
     process_hidden_states_for_response,
@@ -3157,7 +3158,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         Only byte-level BPE tokenizers (GPT-2 family) use the byte decoder;
         SentencePiece tokenizers (Mistral, Gemma) fall back to the display
-        text, so multi-byte characters like é are NOT corrupted to [233].
+        text, so multi-byte characters like é are NOT corrupted to [233],
+        except for byte-fallback pieces ``<0xNN>``, which map to their byte.
         """
         tokenizer = self.tokenizer_manager.tokenizer
         from sglang.srt.entrypoints.openai.utils import _is_byte_level_tokenizer
@@ -3171,7 +3173,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if is_byte_level:
                 token_bytes = token_id_to_bytes(tokenizer, token_id)
             else:
-                token_bytes = None
+                token_bytes = _byte_fallback_piece_to_bytes(
+                    tokenizer=tokenizer, token_id=token_id
+                )
             if token_bytes is None:
                 token_bytes = list((token_text or "").encode("utf-8"))
 
@@ -3185,7 +3189,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             if is_byte_level:
                                 top_bytes = token_id_to_bytes(tokenizer, top_id)
                             else:
-                                top_bytes = None
+                                top_bytes = _byte_fallback_piece_to_bytes(
+                                    tokenizer=tokenizer, token_id=top_id
+                                )
                             if top_bytes is None:
                                 top_bytes = list((top_text or "").encode("utf-8"))
                             top_logprobs.append(

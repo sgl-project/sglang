@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import Any, Literal
 
 import torch
@@ -121,6 +122,26 @@ def token_id_to_bytes(tokenizer, token_id) -> list[int] | None:
     if not out:
         return None
     return list(out)
+
+
+# SentencePiece byte-fallback piece, e.g. "<0xE0>";
+# HF's ByteFallback decoder also accepts lowercase hex.
+_BYTE_FALLBACK_PIECE = re.compile(r"<0x([0-9A-Fa-f]{2})>")
+
+
+# Non-byte-level tokenizers only;
+# a byte-level BPE vocab may hold "<0xE0>" as literal ASCII text.
+def _byte_fallback_piece_to_bytes(tokenizer, token_id) -> list[int] | None:
+    try:
+        piece = tokenizer.convert_ids_to_tokens(token_id)
+    except Exception:
+        return None
+    if not isinstance(piece, str):
+        return None
+    m = _BYTE_FALLBACK_PIECE.fullmatch(piece)
+    if m is None:
+        return None
+    return [int(m.group(1), 16)]
 
 
 def to_openai_style_logprobs(
