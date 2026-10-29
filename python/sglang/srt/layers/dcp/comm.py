@@ -212,9 +212,9 @@ def all_gather_kv_cache_for_mha_extend(
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
 ):
-    prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
-    )
+    prefix_kv_a, prefix_k_pe = token_to_kv_pool.layer_router.read(
+        attn_mqa.layer_id
+    ).read_mla(attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype)
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
@@ -302,7 +302,9 @@ def all_gather_kv_cache_for_mla_extend(
 ):
     # On hip, skip the all-gather when there is no cached prefix to avoid crash
     if not _is_hip or dcp_extend_prefix_lens_sum > 0:
-        cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+        cache_k_nope, cache_k_rope = token_to_kv_pool.layer_router.read(
+            attn_mqa.layer_id
+        ).read_mla(
             attn_mqa,
             dcp_local_prefix_kv_indices,
         )

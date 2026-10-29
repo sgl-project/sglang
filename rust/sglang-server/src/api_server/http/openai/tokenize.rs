@@ -244,7 +244,7 @@ mod tests {
 
     use super::super::test_utils::{body_json, post_json};
     use super::*;
-    use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+    use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
     use crate::message::config::ServerArgs;
     use crate::message::request::{RequestKind, TokenizeInput};
     use crate::message::response::ResponseItem;
@@ -296,6 +296,8 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(server_args.as_ref()),
                     metrics: None,
                 },
