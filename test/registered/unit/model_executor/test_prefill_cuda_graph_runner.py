@@ -788,6 +788,25 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
         waiter.join(timeout=5)
         self.assertFalse(waiter.is_alive())
 
+    def test_breakable_captured_linear_extend_waits_for_last_loaded_layer(self):
+        """A breakable graph that captured the linear-attention extend never reruns
+        the state pool's per-layer wait, so replay must wait for the whole load."""
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        counter.complete(0, 0)
+        counter.complete(0, 1)
+        runner = self._runner(counter, is_full_backend=False)
+        runner.use_captured_attn_metadata = True
+        runner.model_runner.attn_backend = SimpleNamespace(linear_attn_backend=object())
+        waiter = threading.Thread(target=runner._wait_for_layer_loads, daemon=True)
+        waiter.start()
+        waiter.join(timeout=0.2)
+        self.assertTrue(waiter.is_alive())
+
+        counter.complete(0, 2)
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
+
     def test_replay_without_a_layer_transfer_counter(self):
         self._runner(None)._wait_for_layer_loads()
 
