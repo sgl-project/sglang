@@ -66,7 +66,7 @@ class TestSchedulerUBTreeAdmission(CustomTestCase):
             get_parallel().override(tp_rank=0, pp_rank=0),
         ):
             for fields in (
-                {"params": {"temperature": 0.8, "top_k": 10}},
+                {"params": {"temperature": 0.8, "top_k": 10, "sampling_seed": 7}},
                 {"params": {"regex": "[a-z]+"}},
                 {"params": {"presence_penalty": 0.5}},
                 {"return_logprob": True},

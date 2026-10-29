@@ -554,7 +554,7 @@ print(response.choices[0].message.content)
 
 ## UBTree decoding
 
-UBTree adds a trained tree selector to a DFlash draft model. The current integration supports Ling3 (`BailingMoeV3ForCausalLM`) targets on NVIDIA CUDA, with FA3 attention, one running request, and greedy decoding. Use a UBTree draft export trained for the exact target checkpoint; a plain DFlash checkpoint does not contain the required selector weights.
+UBTree adds a trained tree selector to a DFlash draft model. The current integration supports Ling3 (`BailingMoeV3ForCausalLM`) targets on NVIDIA CUDA, with FA3 attention and one running request. Both greedy decoding and FlashInfer sampling are supported. Use a UBTree draft export trained for the exact target checkpoint; a plain DFlash checkpoint does not contain the required selector weights.
 
 Set `LING_TARGET` and `UBTREE_DRAFT` to your paired checkpoint paths, then launch:
 
@@ -580,13 +580,23 @@ SGLANG_PLUGINS=none python -m sglang.launch_server \
 
 `--speculative-num-draft-tokens` sets a fixed number of target verification nodes, including the root. Choose any integer from 2 through the exported `tree_budget + 1`. The default is 49, capped by that budget. The 32- and 49-node configurations have specialized kernel paths; other sizes use general paths. Throughput depends on acceptance length, tree size, model, and hardware, so benchmark your workload when choosing a size. The draft block size comes from the checkpoint. `--speculative-eagle-topk` is an internal tree-metadata setting for UBTree and does not tune proposal breadth.
 
-Send requests with `temperature=0` or `top_k=1`. Sampling, grammar constraints, logprobs, custom logits processors, sampling penalties, `min_new_tokens>0`, logit bias, watermarking, and hidden-state or sampling-mask outputs are rejected. Strict thinking, PD disaggregation/role switching, unified memory, PP>1, DP>1, and DP attention are unsupported.
+Send requests with `temperature=0` or `top_k=1` for greedy decoding. For sampling, use `--sampling-backend flashinfer` (the CUDA default) and set `temperature`, `top_k`, `top_p`, and optionally `min_p` in each request. For example:
+
+```bash
+curl http://localhost:30000/generate \
+    -H "Content-Type: application/json" \
+    -d '{"text": "Explain how speculative decoding works.", "sampling_params": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "max_new_tokens": 2048}}'
+```
+
+UBTree samples the target distribution at every tree node, follows children matching those samples, and returns the first sample without a matching child as the bonus token. Top-k/top-p uses FlashInfer's full-vocabulary joint filter, preserving ties at the cutoff; min-p uses the ordinary sampler's top-k/top-p renormalization path. Do not set `--speculative-use-rejection-sampling` or `--speculative-use-block-verification`.
+
+Non-greedy requests with `sampling_seed`, `--enable-deterministic-inference`, or a sampling backend other than FlashInfer are rejected before admission. Grammar constraints, logprobs, custom logits processors, sampling penalties, `min_new_tokens>0`, logit bias, watermarking, and hidden-state or sampling-mask outputs remain unsupported. Strict thinking, PD disaggregation/role switching, unified memory, PP>1, DP>1, and DP attention are unsupported.
 
 The target LM head must use dense FP16, BF16, or FP32 weights. Target-embedding-MLP selectors also require dense target embeddings. This restriction concerns the head and embeddings, rather than the dtype of MoE experts. Helion KDA verify cannot use UBTree's compact state; select Triton. The `nv_cutedsl` verify setting also dispatches Ling tree verification to Triton.
 
 Online target/draft weight updates are rejected when a target-embedding-MLP selector is bound, because its factor caches depend on both models. Restart with the new checkpoint pair. Lookup selectors do not impose this cache restriction.
 
-The full draft/proposal CUDA Graph is captured lazily on its first decode use. Default server warmup may trigger this capture; standard target Graph startup statistics do not include the lazy draft capture. Warm up decode before measuring steady-state throughput. Greedy decoding does not imply bitwise logit or token parity with a separately executed autoregressive baseline.
+The full draft/proposal CUDA Graph and the separate sampling/commit tail are captured lazily on their first decode use. The sampling tail generates fresh random seeds on every replay and does not recapture the target model. Default server warmup may trigger lazy capture; standard target Graph startup statistics do not include it. Warm up the request's sampling mode before measuring steady-state throughput. To run the same sampling and commit functions eagerly, replace `--cuda-graph-backend-decode full` with `--cuda-graph-backend-decode disabled` and keep prefill Graphs disabled. Greedy decoding does not imply bitwise logit or token parity with a separately executed autoregressive baseline.
 
 ## DFlash Decoding
 

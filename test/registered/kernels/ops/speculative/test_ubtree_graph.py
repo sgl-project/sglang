@@ -4,8 +4,11 @@
 
 """UBTree proposal, verify metadata, and cache-commit CUDA Graph regressions."""
 
+import gc
+import weakref
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -13,9 +16,7 @@ import torch
 from sglang.srt.speculative.ubtree_components.config import parse_ubtree_config
 from sglang.srt.speculative.ubtree_components.epilogue import UBTreeVerifyEpilogue
 from sglang.srt.speculative.ubtree_components.selector import UBTreeSelector
-from sglang.srt.speculative.ubtree_components.tree_graph import (
-    build_ubtree_proposal,
-)
+from sglang.srt.speculative.ubtree_components.tree_graph import build_ubtree_proposal
 from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -297,9 +298,7 @@ def test_proposal_tail_replays_changing_inputs_exactly():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
 def test_full_draft_graph_refreshes_replaced_request_tensors(monkeypatch):
-    from sglang.kernels.ops.speculative.ubtree import (
-        prepare_draft_commit_metadata,
-    )
+    from sglang.kernels.ops.speculative.ubtree import prepare_draft_commit_metadata
     from sglang.srt.speculative.ubtree_components import draft_graph
 
     # No collectives in this small backbone. Keep the real CUDA capture/replay
@@ -374,9 +373,7 @@ def test_full_draft_graph_refreshes_replaced_request_tensors(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_prepare_draft_commit_metadata_is_cuda_graph_replay_safe():
-    from sglang.kernels.ops.speculative.ubtree import (
-        prepare_draft_commit_metadata,
-    )
+    from sglang.kernels.ops.speculative.ubtree import prepare_draft_commit_metadata
 
     device = torch.device("cuda")
     req_to_token = torch.arange(4 * 64, dtype=torch.int64, device=device).view(4, 64)
@@ -419,9 +416,7 @@ def test_prepare_draft_commit_metadata_is_cuda_graph_replay_safe():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_prepare_target_kv_move_metadata_is_cuda_graph_replay_safe():
-    from sglang.kernels.ops.speculative.ubtree import (
-        prepare_target_kv_move_metadata,
-    )
+    from sglang.kernels.ops.speculative.ubtree import prepare_target_kv_move_metadata
 
     device = torch.device("cuda")
     req_to_token = torch.arange(4 * 64, dtype=torch.int64, device=device).view(4, 64)
@@ -465,9 +460,7 @@ def test_prepare_target_kv_move_metadata_is_cuda_graph_replay_safe():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_prepare_unified_commit_metadata_is_cuda_graph_replay_safe():
-    from sglang.kernels.ops.speculative.ubtree import (
-        prepare_unified_commit_metadata,
-    )
+    from sglang.kernels.ops.speculative.ubtree import prepare_unified_commit_metadata
 
     device = torch.device("cuda")
     target_req_to_token = torch.arange(4 * 64, dtype=torch.int64, device=device).view(
@@ -732,6 +725,284 @@ def test_worker_rejects_penalties_before_prefill():
     )
     with pytest.raises(ValueError, match="without penalties"):
         worker.forward_batch_generation(batch)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
+def test_sampling_graph_refreshes_coins_parameters_and_logits(monkeypatch):
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.speculative.ubtree_components import sampling_graph
+    from sglang.srt.speculative.ubtree_components.sampling_graph import (
+        UBTreeSamplingGraphRunner,
+    )
+
+    @contextmanager
+    def capture_context(stream):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            yield SimpleNamespace(stream=stream)
+
+    # Keep real capture/replay; this one-device fixture has no TP process group.
+    monkeypatch.setattr(sampling_graph, "graph_capture", capture_context)
+
+    width, vocab_size = 33, 64
+    epilogue = UBTreeVerifyEpilogue(
+        max_bs=1, node_count=width, max_depth=2, device="cuda"
+    )
+    metadata = SimpleNamespace(
+        batch_size=1,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64, device="cuda"),
+        seq_lens=torch.tensor([7], dtype=torch.int64, device="cuda"),
+        out_cache_loc=torch.arange(width, device="cuda"),
+        mamba_track_indices=None,
+    )
+    tree = SimpleNamespace(
+        batch_size=1,
+        tokens=torch.arange(width, device="cuda").view(1, -1),
+        retrieve_index=torch.arange(width, device="cuda").view(1, -1),
+        retrieve_next_token=torch.full((1, width), -1, device="cuda"),
+        retrieve_next_sibling=torch.full((1, width), -1, device="cuda"),
+    )
+    tree.retrieve_next_token[0, 0] = 1
+    tree.retrieve_next_sibling[0, 1:-1] = torch.arange(2, width, device="cuda")
+    epilogue.begin_tree_step(tree, metadata.seq_lens)
+    logits = torch.zeros((width, vocab_size), device="cuda")
+    hidden = torch.randn((width, 8), device="cuda")
+    epilogue.capture_hook(
+        SimpleNamespace(model_runner=SimpleNamespace(is_draft_worker=False)),
+        LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden),
+        metadata,
+        width,
+    )
+    sampling_info = SimpleNamespace(
+        temperatures=torch.ones((1, 1), device="cuda"),
+        top_ks=torch.tensor([20], dtype=torch.int32, device="cuda"),
+        top_ps=torch.ones((1,), device="cuda"),
+        min_ps=torch.zeros((1,), device="cuda"),
+        need_min_p_sampling=False,
+        is_all_greedy=False,
+        sampling_seed=None,
+    )
+    runner = UBTreeSamplingGraphRunner("cuda")
+    assert runner.device == logits.device
+    runner._generator.manual_seed(314159)
+
+    def run(graph=True):
+        return runner.run(
+            logits=logits,
+            hidden=hidden,
+            sampling_info=sampling_info,
+            epilogue=epilogue,
+            forward_batch=metadata,
+            can_run_cuda_graph=graph,
+        )
+
+    with patch(
+        "sglang.srt.speculative.ubtree_components.epilogue.get_tp_group",
+        return_value=SimpleNamespace(world_size=1),
+    ):
+        samples = []
+        for _ in range(4):
+            run()
+            captured = next(iter(runner._captured.values()))
+            samples.append(captured.target_predict.clone())
+        assert all(not torch.equal(samples[0], sample) for sample in samples[1:])
+        # A full-vocabulary top-k cutoff retains all equal-probability ties.
+        assert torch.cat(samples).max().item() >= 20
+        assert len(runner._captured) == 1
+
+        logits.fill_(-100)
+        logits[:, 3] = 0
+        logits[:, 5] = -0.1
+        sampling_info.top_ps.fill_(0.01)
+        run()
+        assert torch.all(captured.target_predict == 3)
+        assert len(runner._captured) == 1
+        logits[:, 3] = -100
+        logits[:, 5] = 0
+        run()
+        assert torch.all(captured.target_predict == 5)
+
+        sampling_info.need_min_p_sampling = True
+        sampling_info.min_ps.fill_(0.9)
+        sampling_info.top_ps.fill_(1.0)
+        run()
+        assert len(runner._captured) == 2
+        assert epilogue.read_result(1).predict[0].item() == 5
+        result = run(graph=False)
+        assert result.predict[0].item() == 5
+        assert result.accept_lens.item() == 2
+        assert result.new_seq_lens.item() == 9
+        # Eager metadata may alias the previous relay output.
+        metadata.seq_lens = result.new_seq_lens
+        epilogue.begin_tree_step(tree, metadata.seq_lens)
+        result = run(graph=False)
+        assert result.new_seq_lens.item() == 11
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
+@pytest.mark.parametrize("capture_sampling", [False, True])
+def test_verify_graphs_retain_materializer_workspace_after_prefill_growth(
+    monkeypatch, capture_sampling
+):
+    from sglang.kernels.ops.speculative.fused_kv_materialize import (
+        FusedKVMaterializeHelper,
+    )
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.speculative.ubtree_components import sampling_graph
+
+    @contextmanager
+    def capture_context(stream):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            yield SimpleNamespace(stream=stream)
+
+    monkeypatch.setattr(sampling_graph, "graph_capture", capture_context)
+    rotary = SimpleNamespace(
+        rotary_dim=16,
+        is_neox_style=True,
+        cos_sin_cache=torch.cat(
+            (torch.ones(512, 8, device="cuda"), torch.zeros(512, 8, device="cuda")),
+            dim=1,
+        ),
+    )
+    layers = [
+        SimpleNamespace(
+            self_attn=SimpleNamespace(
+                num_kv_heads=1,
+                head_dim=16,
+                rotary_emb=rotary,
+                q_size=16,
+                kv_size=16,
+                qkv_proj=SimpleNamespace(
+                    weight=torch.randn(48, 8, device="cuda", dtype=torch.bfloat16)
+                ),
+                k_norm=SimpleNamespace(
+                    weight=torch.ones(16, device="cuda", dtype=torch.bfloat16),
+                    variance_epsilon=1e-6,
+                ),
+            )
+        )
+        for _ in range(2)
+    ]
+    helper = FusedKVMaterializeHelper(
+        layers, rotary, 1, 16, torch.device("cuda"), max_position_hint=512
+    )
+    assert helper.get_workspace_tensors() == ()
+    output_k = torch.empty(2, 2, 1, 16, device="cuda", dtype=torch.bfloat16)
+    output_v = torch.empty_like(output_k)
+
+    def write_kv(layer, k, v):
+        output_k[layer].copy_(k)
+        output_v[layer].copy_(v)
+
+    def draft_commit(*, target_hidden, positions, **kwargs):
+        helper.materialize(target_hidden, positions, write_kv)
+
+    def grow_prefill_workspace(length):
+        helper.materialize(
+            torch.randn(length, 8, device="cuda", dtype=torch.bfloat16),
+            torch.arange(length, device="cuda"),
+            lambda layer, k, v: None,
+        )
+        torch.cuda.synchronize()
+        gc.collect()
+
+    def workspace_refs():
+        return tuple(weakref.ref(tensor) for tensor in helper.get_workspace_tensors())
+
+    epilogue = UBTreeVerifyEpilogue(max_bs=1, node_count=3, max_depth=2, device="cuda")
+    epilogue.attach_draft_kv_commit(
+        draft_commit=draft_commit,
+        req_to_token=torch.arange(512, device="cuda").view(1, -1),
+        get_workspace_tensors=helper.get_workspace_tensors,
+    )
+    metadata = SimpleNamespace(
+        batch_size=1,
+        req_pool_indices=torch.tensor([0], device="cuda"),
+        seq_lens=torch.tensor([7], device="cuda"),
+        out_cache_loc=torch.arange(3, device="cuda"),
+        mamba_track_indices=None,
+    )
+    tree = SimpleNamespace(
+        batch_size=1,
+        tokens=torch.tensor([[0, 2, 3]], device="cuda"),
+        retrieve_index=torch.arange(3, device="cuda").view(1, -1),
+        retrieve_next_token=torch.tensor([[1, 2, -1]], device="cuda"),
+        retrieve_next_sibling=torch.full((1, 3), -1, device="cuda"),
+    )
+    epilogue.begin_tree_step(tree, metadata.seq_lens)
+    logits = torch.full((3, 32), -100.0, device="cuda")
+    logits[:, 2] = 0
+    hidden = torch.randn(3, 8, device="cuda", dtype=torch.bfloat16)
+    output = LogitsProcessorOutput(next_token_logits=logits, hidden_states=hidden)
+
+    def target_tail():
+        epilogue.capture_hook(
+            SimpleNamespace(model_runner=SimpleNamespace(is_draft_worker=False)),
+            output,
+            metadata,
+            3,
+        )
+
+    target_tail()
+    target_refs = workspace_refs()
+    assert len(target_refs) == 3
+    assert epilogue._graph_draft_kv_workspaces == {}
+    target_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(target_graph):
+        target_tail()
+    target_graph.replay()
+    expected_k, expected_v = output_k.clone(), output_v.clone()
+
+    # Prefill replaces all three workspaces captured by the folded target tail.
+    grow_prefill_workspace(80)
+    assert all(ref() is not None for ref in target_refs)
+    sampling_refs = workspace_refs()
+    runner = sampling_graph.UBTreeSamplingGraphRunner("cuda")
+    sampling_info = SimpleNamespace(
+        temperatures=torch.ones(1, 1, device="cuda"),
+        top_ks=torch.tensor([20], dtype=torch.int32, device="cuda"),
+        top_ps=torch.tensor([0.95], device="cuda"),
+        min_ps=torch.zeros(1, device="cuda"),
+        need_min_p_sampling=False,
+        is_all_greedy=False,
+        sampling_seed=None,
+    )
+
+    def sampling_tail():
+        return runner.run(
+            logits=logits,
+            hidden=hidden,
+            sampling_info=sampling_info,
+            epilogue=epilogue,
+            forward_batch=metadata,
+            can_run_cuda_graph=True,
+        )
+
+    with get_parallel().override(tp_group=SimpleNamespace(world_size=1)):
+        if capture_sampling:
+            sampling_tail()
+        # A second growth must also preserve the separate sampling tail's
+        # workspace. Uncaptured intermediate prefill buffers remain reclaimable.
+        grow_prefill_workspace(200)
+        uncaptured_refs = workspace_refs()
+        grow_prefill_workspace(400)
+        assert all(ref() is None for ref in uncaptured_refs)
+        assert all(ref() is not None for ref in target_refs)
+        assert all((ref() is not None) == capture_sampling for ref in sampling_refs)
+        torch.cuda.empty_cache()
+        epilogue.set_armed(True)
+        target_graph.replay()
+        torch.testing.assert_close(output_k, expected_k, rtol=0, atol=0)
+        torch.testing.assert_close(output_v, expected_v, rtol=0, atol=0)
+        if capture_sampling:
+            assert sampling_tail().accept_lens.item() == 2
+            torch.testing.assert_close(output_k, expected_k, rtol=0, atol=0)
+            torch.testing.assert_close(output_v, expected_v, rtol=0, atol=0)
+            runner._captured.clear()
+            gc.collect()
+            assert all(ref() is None for ref in sampling_refs)
 
 
 if __name__ == "__main__":

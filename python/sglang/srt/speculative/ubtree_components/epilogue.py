@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -22,6 +22,7 @@ from sglang.kernels.ops.speculative.ubtree import (
     prepare_target_kv_move_metadata,
     prepare_unified_commit_metadata,
 )
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
@@ -38,7 +39,7 @@ class UBTreeVerifyResult:
 
 
 class UBTreeVerifyEpilogue:
-    """Fold greedy tree accept and accepted-path compaction into target Graph.
+    """Fold tree acceptance and accepted-path compaction into a CUDA Graph.
 
     Tree topology is dynamic, so runtime inputs are copied into stable buffers
     before replay. When target KV storage is configured, accepted-path metadata
@@ -68,6 +69,9 @@ class UBTreeVerifyEpilogue:
         self.req_to_token = req_to_token
         self.draft_commit = draft_commit
         self.draft_req_to_token = draft_req_to_token
+        self._get_draft_kv_workspace: Optional[
+            Callable[[], tuple[torch.Tensor, ...]]
+        ] = None
         self.kda_spec_state = None
         self.mamba_index_mapping: Optional[torch.Tensor] = None
         self.mamba_track_interval = 0
@@ -108,6 +112,11 @@ class UBTreeVerifyEpilogue:
         self.accept_lens_buf = torch.empty(
             (self.max_bs,), dtype=torch.int32, device=device
         )
+        # The target Graph includes the greedy epilogue. Sampling requests
+        # disarm its persistent writes, then arm the separate sampling tail.
+        # A device gate lets both paths reuse the same captured model.
+        self.commit_gate_buf = torch.ones((1,), dtype=torch.int32, device=device)
+        self.commit_lens_buf = torch.empty_like(self.accept_lens_buf)
         # Only the root-inclusive accepted path can be committed to the draft
         # cache.  Keeping a node_count-wide safe-index/hidden buffer gathered 65
         # rows per request even though UBTree's maximum accepted path is the
@@ -150,6 +159,14 @@ class UBTreeVerifyEpilogue:
             (self.max_bs,), dtype=torch.int64, device=device
         )
         self.mamba_steps_to_track_buf = torch.empty_like(self.last_correct_step_buf)
+        self._graph_metadata: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+        ] = {}
+        self._graph_draft_kv_workspaces: dict[int, tuple[torch.Tensor, ...]] = {}
+
+    def set_armed(self, armed: bool) -> None:
+        """Enable persistent writes and sequence-length publication on replay."""
+        self.commit_gate_buf.fill_(int(armed))
 
     def _stage_tree_inputs(
         self,
@@ -223,6 +240,12 @@ class UBTreeVerifyEpilogue:
         bs = int(forward_batch.batch_size)
         if num_tokens != bs * self.node_count:
             return
+        self._graph_metadata[bs] = (
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.out_cache_loc,
+            forward_batch.mamba_track_indices,
+        )
         self(
             logits=out.next_token_logits,
             hidden=out.hidden_states,
@@ -232,6 +255,28 @@ class UBTreeVerifyEpilogue:
             out_cache_loc=forward_batch.out_cache_loc,
             mamba_track_indices=forward_batch.mamba_track_indices,
         )
+        if torch.cuda.is_current_stream_capturing():
+            # The folded target Graph keeps using these addresses after prefill
+            # grows the materializer's workspace. Retain only captured buffers;
+            # eager warmups and ordinary prefill growth need no extra ownership.
+            self._graph_draft_kv_workspaces[bs] = self.draft_kv_workspace_tensors()
+
+    def draft_kv_workspace_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Snapshot the external materializer workspace used by this tail."""
+        if self._get_draft_kv_workspace is None:
+            return ()
+        return self._get_draft_kv_workspace()
+
+    def graph_metadata(
+        self, bs: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Return the target Graph's stable metadata for the sampling tail."""
+        try:
+            return self._graph_metadata[bs]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"UBTree target Graph metadata is unavailable for BS={bs}"
+            ) from exc
 
     def _ensure_hidden_buffer(self, hidden: torch.Tensor) -> torch.Tensor:
         buf = self.compact_hidden_buf
@@ -262,7 +307,11 @@ class UBTreeVerifyEpilogue:
         self.req_to_token = req_to_token
 
     def attach_draft_kv_commit(
-        self, *, draft_commit, req_to_token: torch.Tensor
+        self,
+        *,
+        draft_commit,
+        req_to_token: torch.Tensor,
+        get_workspace_tensors: Optional[Callable[[], tuple[torch.Tensor, ...]]] = None,
     ) -> None:
         """Attach a graph-safe draft hidden/KV writer after pool allocation."""
 
@@ -270,6 +319,7 @@ class UBTreeVerifyEpilogue:
             raise ValueError("draft KV commit requires writer and req_to_token")
         self.draft_commit = draft_commit
         self.draft_req_to_token = req_to_token
+        self._get_draft_kv_workspace = get_workspace_tensors
 
     def attach_kda_tree_commit(
         self,
@@ -317,14 +367,43 @@ class UBTreeVerifyEpilogue:
         mamba_track_indices: Optional[torch.Tensor] = None,
     ) -> None:
         rows = bs * self.node_count
+        target_predict = self.target_predict_buf[:bs]
+        torch.argmax(logits[:rows], dim=-1, out=target_predict.reshape(-1))
+        self.run_from_target_predict(
+            target_predict=target_predict,
+            hidden=hidden,
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            mamba_track_indices=mamba_track_indices,
+        )
+
+    def run_from_target_predict(
+        self,
+        *,
+        target_predict: torch.Tensor,
+        hidden: torch.Tensor,
+        bs: int,
+        req_pool_indices: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        out_cache_loc: Optional[torch.Tensor] = None,
+        mamba_track_indices: Optional[torch.Tensor] = None,
+        broadcast_outputs: bool = False,
+    ) -> None:
+        """Walk and commit a tree using one target prediction per node.
+
+        Predictions may be argmax tokens or independent target samples. A
+        matching child extends the sampled path; the first missing child ends
+        it with a bonus token. Sampling therefore needs no draft probabilities.
+        """
+        rows = bs * self.node_count
         predict = self.predict_buf[:bs].reshape(-1)
         accept_index = self.accept_index_buf[:bs]
         accept_lens = self.accept_lens_buf[:bs]
-        target_predict = self.target_predict_buf[:bs]
 
         predict.zero_()
         accept_index.fill_(-1)
-        torch.argmax(logits[:rows], dim=-1, out=target_predict.reshape(-1))
         verify_tree_greedy_func(
             predicts=predict,
             accept_index=accept_index,
@@ -336,9 +415,19 @@ class UBTreeVerifyEpilogue:
             target_predict=target_predict,
             topk=-1,
         )
+        if broadcast_outputs:
+            # All TP ranks must commit rank zero's sampled path, including its
+            # hidden-state indices. Greedy requests retain the existing path.
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(accept_lens, src=0)
         # The verify kernel reports accepted drafts; UBTree's public accept_lens
         # includes the trailing bonus token.
         accept_lens.add_(1)
+        commit_lens = self.commit_lens_buf[:bs]
+        torch.mul(accept_lens, self.commit_gate_buf, out=commit_lens)
 
         safe_index = self.safe_accept_index_buf[:bs]
         safe_index.copy_(accept_index)
@@ -373,12 +462,6 @@ class UBTreeVerifyEpilogue:
             out=self.bonus_tokens_i32_buf[:bs],
         )
         self.bonus_tokens_buf[:bs].copy_(self.bonus_tokens_i32_buf[:bs].reshape(-1))
-        torch.add(
-            self.seq_lens_buf[:bs],
-            accept_lens,
-            out=self.new_seq_lens_buf[:bs],
-        )
-
         if self.folds_target_kv or self.folds_draft_kv or self.folds_kda_commit:
             if req_pool_indices is None or seq_lens is None:
                 raise ValueError(
@@ -398,9 +481,9 @@ class UBTreeVerifyEpilogue:
                 req_pool_indices=req_pool_indices[:bs],
                 target_req_to_token=self.req_to_token,
                 draft_req_to_token=self.draft_req_to_token,
-                seq_lens=seq_lens[:bs],
+                seq_lens=self.seq_lens_buf[:bs],
                 accept_index=accept_index,
-                accept_lens=accept_lens,
+                accept_lens=commit_lens,
                 out_cache_loc=out_cache_loc[:rows],
                 target_cache_loc_out=target_cache_loc_2d,
                 source_cache_loc_out=source_cache_loc_2d,
@@ -416,16 +499,16 @@ class UBTreeVerifyEpilogue:
                 prepare_target_kv_move_metadata(
                     req_pool_indices=req_pool_indices[:bs],
                     req_to_token=self.req_to_token,
-                    seq_lens=seq_lens[:bs],
+                    seq_lens=self.seq_lens_buf[:bs],
                     accept_index=accept_index,
-                    accept_lens=accept_lens,
+                    accept_lens=commit_lens,
                     out_cache_loc=out_cache_loc[:rows],
                     target_cache_loc_out=target_cache_loc_2d.reshape(-1),
                     source_cache_loc_out=source_cache_loc_2d.reshape(-1),
                 )
             if self.folds_draft_kv:
                 prepare_draft_commit_metadata(
-                    seq_lens=seq_lens[:bs],
+                    seq_lens=self.seq_lens_buf[:bs],
                     req_pool_indices=req_pool_indices[:bs],
                     req_to_token=self.draft_req_to_token,
                     positions_out=positions_2d,
@@ -444,7 +527,7 @@ class UBTreeVerifyEpilogue:
                 cache_loc=draft_cache_loc_2d.reshape(-1),
                 cache_loc_2d=draft_cache_loc_2d,
                 positions=positions_2d.reshape(-1),
-                commit_lens=accept_lens,
+                commit_lens=commit_lens,
             )
 
         if self.folds_kda_commit:
@@ -460,6 +543,9 @@ class UBTreeVerifyEpilogue:
             if has_track:
                 _, mamba_steps_to_track = fused_commit_track_indices(
                     accept_index,
+                    # This helper requires a nonempty path. Only the commit
+                    # kernels consume the gated length; they skip zero rows
+                    # before reading or writing temporal/conv/track state.
                     accept_lens,
                     self.seq_lens_buf[:bs],
                     self.node_count,
@@ -472,12 +558,20 @@ class UBTreeVerifyEpilogue:
                 state_batch_indices=state_batch_indices,
                 factor_cache_indices=self.factor_cache_indices_buf[:bs],
                 accept_index=accept_index,
-                accept_lens=accept_lens,
+                accept_lens=commit_lens,
                 tree_width=self.node_count,
                 mamba_track_indices=(mamba_track_indices[:bs] if has_track else None),
                 mamba_steps_to_track=mamba_steps_to_track,
                 null_block_id=-1,
             )
+
+        # Publish last: eager seq_lens may alias this previous step's output.
+        # A disarmed greedy tail must preserve the staged prefix length.
+        torch.add(
+            self.seq_lens_buf[:bs],
+            commit_lens,
+            out=self.new_seq_lens_buf[:bs],
+        )
 
     def read_result(self, bs: int) -> UBTreeVerifyResult:
         hidden_rows = bs * self.max_depth

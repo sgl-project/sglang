@@ -13,11 +13,14 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
-from sglang.kernels.ops.speculative.dflash import (
-    _prepare_dflash_draft_block_unchecked,
-)
+from sglang.kernels.ops.speculative.dflash import _prepare_dflash_draft_block_unchecked
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -26,22 +29,18 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_exec, get_spec, mamba_track_grid
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
-from sglang.srt.speculative.eagle_utils import (
-    TreeMaskMode,
-    eagle_prepare_for_verify,
-)
+from sglang.srt.speculative.eagle_utils import TreeMaskMode, eagle_prepare_for_verify
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.ubtree_components.config import parse_ubtree_config
 from sglang.srt.speculative.ubtree_components.draft_graph import (
     UBTreeDraftSegmentGraphRunner,
 )
 from sglang.srt.speculative.ubtree_components.epilogue import UBTreeVerifyEpilogue
-from sglang.srt.speculative.ubtree_components.tree import (
-    UBTreeBatch,
+from sglang.srt.speculative.ubtree_components.sampling_graph import (
+    UBTreeSamplingGraphRunner,
 )
-from sglang.srt.speculative.ubtree_components.tree_graph import (
-    build_ubtree_proposal,
-)
+from sglang.srt.speculative.ubtree_components.tree import UBTreeBatch
+from sglang.srt.speculative.ubtree_components.tree_graph import build_ubtree_proposal
 from sglang.srt.speculative.ubtree_components.vocab import validate_ubtree_lm_head
 from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
 
@@ -123,12 +122,13 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         self._verify_positions_buf = torch.empty(
             (1, resolved_verify_node_count), dtype=torch.int64, device=self.device
         )
+        self._sampling_graph_runner = UBTreeSamplingGraphRunner(self.device)
         self._draft_segment_graph_runner = None
-        if not get_exec().graph.disable_cuda_graph:
+        if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             self.model_runner.capture_tail_hooks.append(self._capture_verify_epilogue)
 
     def _defer_target_verify_gather(self):
-        # The graph-folded argmax consumes global vocabulary IDs. Keep
+        # Greedy and sampled verification consume global vocabulary IDs. Keep
         # DFlash's deferred local-logits optimization out of UBTree.
         return None
 
@@ -171,7 +171,7 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         """Capture the full draft, including proposal and pre-verify staging."""
         self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
         exec_cfg = get_exec()
-        if exec_cfg.graph.disable_cuda_graph:
+        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
         decode_bs = exec_cfg.graph.cuda_graph_config.decode.bs
         backend = self.draft_model_runner.attn_backend
@@ -232,6 +232,7 @@ class UBTreeWorkerV2(DFlashWorkerV2):
             epilogue.attach_draft_kv_commit(
                 draft_commit=self._append_target_hidden_to_draft_kv_by_loc,
                 req_to_token=req_to_token_pool.req_to_token,
+                get_workspace_tensors=self._fused_kv_helper.get_workspace_tensors,
             )
             epilogue.attach_kda_tree_commit(
                 spec_state=req_to_token_pool.get_speculative_mamba2_params_all_layers(),
@@ -388,13 +389,21 @@ class UBTreeWorkerV2(DFlashWorkerV2):
     @staticmethod
     def _can_fold_verify_epilogue(batch) -> bool:
         sampling_info = batch.sampling_info
-        if sampling_info is None or not sampling_info.is_all_greedy:
+        if sampling_info is None:
             return False
         if getattr(sampling_info, "acc_additive_penalties", None) is not None:
             return False
         if getattr(sampling_info, "acc_scaling_penalties", None) is not None:
             return False
         if getattr(sampling_info, "logit_bias", None) is not None:
+            return False
+        if getattr(sampling_info, "has_custom_logit_processor", False):
+            return False
+        if not sampling_info.is_all_greedy and (
+            sampling_info.sampling_seed is not None
+            or get_exec().kernel.sampling_backend != "flashinfer"
+            or get_exec().deterministic.enable_deterministic_inference
+        ):
             return False
         from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
 
@@ -413,7 +422,8 @@ class UBTreeWorkerV2(DFlashWorkerV2):
             batch
         ):
             raise ValueError(
-                "UBTREE requires greedy sampling without penalties, logit bias, or simulated acceptance"
+                "UBTREE requires greedy or unseeded FlashInfer sampling without "
+                "penalties, logit bias, custom processors, or simulated acceptance"
             )
         if getattr(batch, "has_grammar", False):
             raise ValueError("UBTREE currently does not support constrained decoding")
@@ -449,7 +459,8 @@ class UBTreeWorkerV2(DFlashWorkerV2):
 
         if not self._can_fold_verify_epilogue(batch):
             raise ValueError(
-                "UBTREE requires greedy sampling without penalties, logit bias, or simulated acceptance"
+                "UBTREE requires greedy or unseeded FlashInfer sampling without "
+                "penalties, logit bias, custom processors, or simulated acceptance"
             )
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
@@ -459,6 +470,10 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         batch.spec_info = verify_input
         batch_size = tree.batch_size
         verify_epilogue = self._verify_epilogue
+        is_greedy = batch.sampling_info.is_all_greedy
+        # The target model is captured once with its greedy tail. Sampling
+        # must leave persistent state intact until its own path is selected.
+        verify_epilogue.set_armed(is_greedy)
         if not tree.preverify_staged:
             verify_epilogue.begin_tree_step(tree, prefix_lens)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
@@ -474,17 +489,27 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         )
         logits_output = target_output.logits_output
         node_count = tree.node_count
-        if not target_output.can_run_cuda_graph:
-            verify_epilogue(
+        if is_greedy:
+            if not target_output.can_run_cuda_graph:
+                verify_epilogue(
+                    logits=logits_output.next_token_logits,
+                    hidden=logits_output.hidden_states,
+                    bs=batch_size,
+                    req_pool_indices=verify_forward_batch.req_pool_indices,
+                    seq_lens=verify_forward_batch.seq_lens,
+                    out_cache_loc=verify_forward_batch.out_cache_loc,
+                    mamba_track_indices=verify_forward_batch.mamba_track_indices,
+                )
+            folded = verify_epilogue.read_result(batch_size)
+        else:
+            folded = self._sampling_graph_runner.run(
                 logits=logits_output.next_token_logits,
                 hidden=logits_output.hidden_states,
-                bs=batch_size,
-                req_pool_indices=verify_forward_batch.req_pool_indices,
-                seq_lens=verify_forward_batch.seq_lens,
-                out_cache_loc=verify_forward_batch.out_cache_loc,
-                mamba_track_indices=verify_forward_batch.mamba_track_indices,
+                sampling_info=batch.sampling_info,
+                epilogue=verify_epilogue,
+                forward_batch=verify_forward_batch,
+                can_run_cuda_graph=target_output.can_run_cuda_graph,
             )
-        folded = verify_epilogue.read_result(batch_size)
         bonus_tokens = folded.bonus_tokens
         new_seq_lens = folded.new_seq_lens
         # Publish before the scheduler's private output copies, preserving the

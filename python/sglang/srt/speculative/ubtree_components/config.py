@@ -150,7 +150,10 @@ def validate_runtime_config(cfg, target_backends: tuple[str, ...]) -> None:
     if cfg.speculative_draft_sink_size is not None:
         raise ValueError("UBTREE does not support --speculative-draft-sink-size")
     if cfg.speculative_use_rejection_sampling or cfg.speculative_use_block_verification:
-        raise ValueError("UBTREE currently supports greedy tree verification only")
+        raise ValueError(
+            "UBTREE samples target tokens directly; --speculative-use-rejection-sampling "
+            "and --speculative-use-block-verification are unsupported"
+        )
     if cfg.speculative_adaptive:
         raise ValueError(
             "UBTREE requires a fixed verify width; adaptive steps are unsupported"
@@ -162,7 +165,9 @@ def validate_runtime_config(cfg, target_backends: tuple[str, ...]) -> None:
     if cfg.page_size != 1:
         raise ValueError("UBTREE with FA3 requires --page-size 1")
     decode = str(cfg.cuda_graph_config.decode.backend).lower()
-    if not cfg.disable_cuda_graph and "disabled" not in decode:
+    # Phase backends are authoritative. A deprecated disable flag may coexist
+    # with an explicitly selected full backend after argument resolution.
+    if "disabled" not in decode:
         if "full" not in decode:
             raise ValueError("UBTREE requires full decode CUDA Graphs")
         if "disabled" not in str(cfg.cuda_graph_config.prefill.backend).lower():

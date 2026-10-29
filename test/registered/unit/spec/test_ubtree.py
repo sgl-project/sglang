@@ -412,6 +412,15 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
             ),
         )
         validate_runtime_config(cfg, ("fa3",))
+        legacy_disabled = SimpleNamespace(**(vars(cfg) | {"disable_cuda_graph": True}))
+        validate_runtime_config(legacy_disabled, ("fa3",))
+        with self.assertRaises(ValueError):
+            validate_runtime_config(
+                SimpleNamespace(
+                    **(vars(legacy_disabled) | {"disable_cuda_graph_padding": False})
+                ),
+                ("fa3",),
+            )
         for backend in ("flashinfer", "triton"):
             with self.subTest(backend=backend), self.assertRaises(ValueError):
                 validate_runtime_config(cfg, (backend,))
@@ -488,7 +497,7 @@ class TestUBTreeRequestValidation(CustomTestCase):
             req = self._request(sampling_params=SamplingParams(**params))
             self.assertIsNone(validate_ubtree_request(req))
         for params, message in [
-            ({"temperature": 0.8, "top_k": 10}, "greedy"),
+            ({"temperature": 0.8, "top_k": 10, "sampling_seed": 7}, "sampling_seed"),
             ({"json_schema": '{"type":"object"}'}, "grammar"),
             ({"regex": "[a-z]+"}, "grammar"),
             ({"ebnf": 'root ::= "hello"'}, "grammar"),
@@ -510,6 +519,28 @@ class TestUBTreeRequestValidation(CustomTestCase):
         self.assertIn(
             "grammar", validate_ubtree_request(self._request(grammar=object()))
         )
+
+    def test_flashinfer_sampling_admission_and_unsupported_backends(self):
+        exec_cfg = SimpleNamespace(
+            kernel=SimpleNamespace(sampling_backend="flashinfer"),
+            deterministic=SimpleNamespace(enable_deterministic_inference=False),
+        )
+        with patch(
+            "sglang.srt.speculative.ubtree_components.validation.get_exec",
+            return_value=exec_cfg,
+        ):
+            for params in (
+                {"temperature": 1.0, "top_k": 20, "top_p": 0.95},
+                {"temperature": 0.7, "top_k": -1, "min_p": 0.05},
+            ):
+                with self.subTest(params=params):
+                    req = self._request(sampling_params=SamplingParams(**params))
+                    self.assertIsNone(validate_ubtree_request(req))
+            req = self._request(sampling_params=SamplingParams(temperature=1.0))
+            exec_cfg.kernel.sampling_backend = "pytorch"
+            self.assertIn("flashinfer", validate_ubtree_request(req))
+            exec_cfg.deterministic.enable_deterministic_inference = True
+            self.assertIn("deterministic", validate_ubtree_request(req))
 
 
 class TestUBTreeLoading(CustomTestCase):

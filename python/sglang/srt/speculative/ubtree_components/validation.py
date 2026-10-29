@@ -2,11 +2,13 @@
 # Copyright (c) 2026 The DeepSpec Authors
 # See LICENSE in this directory for the original license.
 
-"""Request admission for UBTree's greedy-only serving contract."""
+"""Request admission for UBTree's greedy and target-sampling paths."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -28,9 +30,13 @@ def validate_ubtree_request(req: Req) -> str | None:
     # SamplingParams normalizes temperature=0 to temperature=1, top_k=1.
     # Use the same greedy criterion as SamplingBatchInfo.
     if sampling_params.top_k != 1:
-        return (
-            "UBTREE currently supports greedy decoding only (temperature=0 or top_k=1)."
-        )
+        if sampling_params.sampling_seed is not None:
+            return "UBTREE does not support sampling_seed for non-greedy requests yet."
+        exec_cfg = get_exec()
+        if exec_cfg.deterministic.enable_deterministic_inference:
+            return "UBTREE does not support deterministic sampling yet."
+        if exec_cfg.kernel.sampling_backend != "flashinfer":
+            return "UBTREE non-greedy requests require --sampling-backend flashinfer."
     if req.grammar is not None or any(
         constraint is not None
         for constraint in (
