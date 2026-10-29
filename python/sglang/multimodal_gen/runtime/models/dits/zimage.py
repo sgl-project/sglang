@@ -53,6 +53,7 @@ except Exception:
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+_is_xpu = current_platform.is_xpu()
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -448,7 +449,16 @@ class ZImageAttention(nn.Module):
                     q, k = apply_flashinfer_rope_qk_inplace(
                         q, k, cos_sin_cache, is_neox=False, positions=positions
                     )
-            elif _is_cuda and q.shape == k.shape:
+            # Single-image XPU freqs_cis is 2D; give it the fused QK/RoPE path.
+            elif (
+                _is_cuda
+                or (
+                    _is_xpu
+                    and self.qk_norm
+                    and self.enable_zimage_qk_fusion
+                    and cos.dim() == 2
+                )
+            ) and q.shape == k.shape:
                 cos_sin_cache = torch.cat(
                     [
                         cos.to(dtype=torch.float32).contiguous(),
