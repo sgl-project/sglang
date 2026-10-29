@@ -26,6 +26,7 @@ from transformers.utils import logging
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     Mamba2StateShape,
+    mamba2_spec_replay_supported,
     mamba2_state_dtype,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -435,7 +436,7 @@ class NemotronHConfig(PretrainedConfig):
         )
 
         return Mamba2CacheParams(
-            is_mamba2=True,
+            supports_mamba2_spec_replay=mamba2_spec_replay_supported(self.model_type),
             shape=shape,
             layers=self.mamba_layer_ids,
             dtype=mamba2_state_dtype(self),

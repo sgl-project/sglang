@@ -112,8 +112,8 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
 class BaseLinearStateParams(ABC):
     dtype: Mamba2StateDType = field(default_factory=lambda: mamba2_state_dtype(None))
     layers: list[int]
-    # Mamba2CacheParams is also used by linear-attention models.
-    is_mamba2: bool = False
+    # Opt-in for the supported Mamba2 speculative replay path, not model identity.
+    supports_mamba2_spec_replay: bool = False
 
     @property
     def mamba_cache_per_req(self) -> int:
@@ -379,9 +379,14 @@ class KimiLinearCacheParams(BaseLinearStateParams):
         return True
 
 
+def mamba2_spec_replay_supported(model_type: str) -> bool:
+    """Keep early argument checks and cache eligibility on the same model scope."""
+    return model_type == "nemotron_h"
+
+
 def mamba2_spec_replay_enabled(enable_linear_replayssm_spec, cache_params):
     """Select runtime replay from the resolved cache metadata."""
-    return enable_linear_replayssm_spec and cache_params.is_mamba2
+    return enable_linear_replayssm_spec and cache_params.supports_mamba2_spec_replay
 
 
 class Mamba2ReplaySizing(msgspec.Struct, frozen=True):

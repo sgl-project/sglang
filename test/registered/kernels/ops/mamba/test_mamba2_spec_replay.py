@@ -59,7 +59,7 @@ class TestMamba2SpecReplay(CustomTestCase):
                 conv_kernel=4,
             ),
             dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float16),
-            is_mamba2=True,
+            supports_mamba2_spec_replay=True,
             layers=list(range(layers)),
         )
 
@@ -246,15 +246,16 @@ class TestMamba2SpecReplay(CustomTestCase):
         )
         self.assertIsNone(pool.mamba_cache.intermediate_ssm)
         # The shared flag must not allocate GDN/KDA rings or cursors for Mamba2.
-        for name in (
-            "replayssm_d",
-            "replayssm_k",
-            "replayssm_g",
-            "replayssm_rawv",
-            "replayssm_rawk",
-            "replayssm_beta",
+        cache = pool.mamba_cache
+        for value in (
+            cache.replayssm_d,
+            cache.replayssm_k,
+            cache.replayssm_g,
+            cache.replayssm_rawv,
+            cache.replayssm_rawk,
+            cache.replayssm_beta,
         ):
-            self.assertIsNone(getattr(pool.mamba_cache, name), name)
+            self.assertIsNone(value)
         self.assertIsNone(pool.replayssm_spec_write_pos)
         self.assertIsNone(pool.replayssm_cache_base)
         self.assertIsNone(pool.replayssm_is_flush)

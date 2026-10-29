@@ -30,7 +30,7 @@ def mamba2_params():
             conv_kernel=4,
         ),
         dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float16),
-        is_mamba2=True,
+        supports_mamba2_spec_replay=True,
         layers=list(range(40)),
     )
 
@@ -231,12 +231,15 @@ class TestMamba2ReplaySizing(CustomTestCase):
             with rc.get_context().override_server_args(
                 enable_linear_replayssm_spec=enabled
             ):
-                for is_mamba2 in (True, False, None):
+                for supports_mamba2_spec_replay in (True, False, None):
                     configurator.mambaish_config = (
                         SimpleNamespace(
-                            mamba2_cache_params=replace(params, is_mamba2=is_mamba2)
+                            mamba2_cache_params=replace(
+                                params,
+                                supports_mamba2_spec_replay=supports_mamba2_spec_replay,
+                            )
                         )
-                        if is_mamba2 is not None
+                        if supports_mamba2_spec_replay is not None
                         else None
                     )
                     for model_type in ("nemotron_h", "qwen3_next"):
@@ -247,14 +250,43 @@ class TestMamba2ReplaySizing(CustomTestCase):
                             configurator.is_draft_worker = draft
                             with self.subTest(
                                 enabled=enabled,
-                                is_mamba2=is_mamba2,
+                                supports_mamba2_spec_replay=supports_mamba2_spec_replay,
                                 model=model_type,
                                 draft=draft,
                             ):
                                 self.assertEqual(
                                     configurator._mamba2_spec_replay_enabled,
-                                    enabled and is_mamba2 is True and not draft,
+                                    enabled
+                                    and supports_mamba2_spec_replay is True
+                                    and not draft,
                                 )
+
+    def test_puzzle_uses_stock_path_in_hooks_and_pool_dispatch(self):
+        """Puzzle must not inherit replay eligibility while bypassing its early checks."""
+        from sglang.srt.arg_groups.mamba_hook import mamba2_spec_replay_requested
+        from sglang.srt.configs.mamba_utils import mamba2_spec_replay_enabled
+        from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
+        from sglang.srt.runtime_context import get_parallel
+
+        for config, supported in (
+            (NemotronHConfig(), True),
+            (NemotronHPuzzleConfig(block_configs=[], mtp_block_configs=[{}]), False),
+        ):
+            with get_parallel().override(attn_tp_size=1):
+                params = config.mamba2_cache_params
+            for enabled in (False, True):
+                with self.subTest(model=config.model_type, enabled=enabled):
+                    expected = enabled and supported
+                    self.assertEqual(
+                        mamba2_spec_replay_requested(
+                            SimpleNamespace(enable_linear_replayssm_spec=enabled),
+                            config.model_type,
+                        ),
+                        expected,
+                    )
+                    self.assertEqual(
+                        mamba2_spec_replay_enabled(enabled, params), expected
+                    )
 
     def test_global_flag_preserves_model_specific_resolution(self):
         """Mamba2 must not inherit GDN/KDA's FP32 default or replay backend gate."""

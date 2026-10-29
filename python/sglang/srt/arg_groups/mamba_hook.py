@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 
 def mamba2_spec_replay_requested(cfg, model_type):
     """Recognize Mamba2 replay requests before cache parameters are resolved."""
-    return cfg.enable_linear_replayssm_spec and model_type == "nemotron_h"
+    from sglang.srt.configs.mamba_utils import mamba2_spec_replay_supported
+
+    return cfg.enable_linear_replayssm_spec and mamba2_spec_replay_supported(model_type)
 
 
 def validate_mamba2_spec_replay(cfg, *, is_cuda, cache_params, activation_dtype):
