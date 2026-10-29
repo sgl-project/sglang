@@ -1,5 +1,6 @@
 import dataclasses
 import pickle
+import time
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
+from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import (
@@ -105,6 +107,8 @@ def _accumulator(
     current_weight_version="default",
     return_sampling_mask=False,
     request_level_keys=frozenset(),
+    rust_server_mode=False,
+    enable_metrics=False,
 ):
     return _GenerationStreamAccumulator(
         return_logprob=False,
@@ -119,24 +123,33 @@ def _accumulator(
         get_cached_tokens_details=lambda req: None,
         is_request_level_customized_info_key=request_level_keys.__contains__,
         current_weight_version=current_weight_version,
+        rust_server_mode=rust_server_mode,
+        enable_metrics=enable_metrics,
     )
+
+
+def _enter_streamer_scope(test):
+    """Patch what `SchedulerOutputStreamer` reads per call, for `test`."""
+    serving_patch = patch(
+        "sglang.srt.managers.scheduler_components.output_streamer.get_serving",
+        return_value=SimpleNamespace(stream_interval=1, weight_version="default"),
+    )
+    observability_patch = patch(
+        "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
+        return_value=SimpleNamespace(
+            enable_metrics=False, enable_request_time_stats_logging=False
+        ),
+    )
+    serving_patch.start()
+    observability_patch.start()
+    enter_scope(test, published_topology(ranks={"dp_rank": 0}))
+    test.addCleanup(serving_patch.stop)
+    test.addCleanup(observability_patch.stop)
 
 
 class TestOutputStreamerCustomizedInfo(unittest.TestCase):
     def setUp(self):
-        serving_patch = patch(
-            "sglang.srt.managers.scheduler_components.output_streamer.get_serving",
-            return_value=SimpleNamespace(stream_interval=1, weight_version="default"),
-        )
-        observability_patch = patch(
-            "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
-            return_value=SimpleNamespace(enable_request_time_stats_logging=False),
-        )
-        serving_patch.start()
-        observability_patch.start()
-        enter_scope(self, published_topology(ranks={"dp_rank": 0}))
-        self.addCleanup(serving_patch.stop)
-        self.addCleanup(observability_patch.stop)
+        _enter_streamer_scope(self)
 
     def test_customized_info_is_padded_for_mixed_batches(self):
         accumulator = _accumulator()
@@ -262,6 +275,21 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             unwrap_from_pickle(payload.customized_info),
             {key: [[], [386.25]]},
         )
+
+    def test_rust_egress_takes_each_steps_values_unpickled(self):
+        """Each step sends the values for its new tokens; the Rust egress
+        encodes the lists itself."""
+        probed = _FakeReq("r0", [20, 21], customized_info={"probe": [200, 201]})
+        steps = []
+        for _ in range(2):
+            accumulator = _accumulator(rust_server_mode=True)
+            accumulator.accept(req=probed)
+            payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+            steps.append(payload.customized_info)
+            probed.output_ids.append(22)
+            probed.customized_info["probe"].append(202)
+
+        self.assertEqual(steps, [{"probe": [[200, 201]]}, {"probe": [[202]]}])
 
     def test_additional_customized_info_uses_the_existing_payload(self):
         class Streamer(SchedulerOutputStreamer):
@@ -455,7 +483,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         class Streamer(SchedulerOutputStreamer):
             has_additional_customized_info = True
 
-        with self.assertRaisesRegex(ValueError, "Rust egress"):
+        with self.assertRaisesRegex(ValueError, "Rust frontend does not run"):
             Streamer(
                 send_to_detokenizer=SimpleNamespace(),
                 tree_cache=None,
@@ -499,6 +527,81 @@ class TestOutputStreamerWeightVersions(unittest.TestCase):
         payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
 
         self.assertIsNone(payload.weight_versions)
+
+
+class TestOutputStreamerDecodeLatency(unittest.TestCase):
+    def setUp(self):
+        _enter_streamer_scope(self)
+
+    def test_rust_mode_times_finished_non_streaming_requests(self):
+        """In Rust mode a finished non-streaming request's decode latency runs
+        from the prefill stamp, which Python's TokenizerManager reads only with
+        metrics on, and the scheduler hands it to the Rust frontend by payload
+        row with the batch; other requests, and Python mode, record none."""
+        stamp = time.perf_counter() - 0.5
+
+        def req(rid, *, stream=False, finished=True, metrics=True, stamp=stamp):
+            req = _FakeReq(rid, [1], finished=finished)
+            req.stream = stream
+            req.time_stats = SimpleNamespace(
+                enable_metrics=metrics, prefill_finished_time=stamp
+            )
+            return req
+
+        rust_server = Mock()
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=None,
+            tree_cache=None,
+            server_args=SimpleNamespace(),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            enable_hicache_storage=lambda: False,
+            rust_server=rust_server,
+        )
+        streamer._stream_output_generation(
+            [
+                req("streaming", stream=True),
+                req("timed"),
+                req("running", finished=False),
+                req("no_metrics", metrics=False),
+                req("no_stamp", stamp=0.0),
+            ],
+            False,
+        )
+        payload, decode_latencies = rust_server.push_generation.call_args.args
+        self.assertEqual(payload.rids[1], "timed")
+        self.assertEqual(list(decode_latencies), [1])
+        self.assertGreaterEqual(decode_latencies[1], 0.5)
+
+        python_mode = _accumulator()
+        python_mode.accept(req=req("timed"))
+        self.assertEqual(python_mode.decode_latencies, {})
+
+
+class TestOutputStreamerTimeStats(unittest.TestCase):
+    def test_rows_carry_time_stats_only_with_metrics_on(self):
+        """With metrics on every emitted row carries its request's time stats,
+        None for a request whose own metrics are off; with metrics off the
+        payload carries none at all."""
+        timed = SchedulerReqTimeStats(enable_metrics=True)
+        timed.queue_duration_s = 0.25
+
+        def req(rid, time_stats):
+            req = _FakeReq(rid, [1])
+            req.time_stats = time_stats
+            return req
+
+        for enable_metrics, expected in (
+            (True, [timed.to_output_time_stats(), None]),
+            (False, None),
+        ):
+            with self.subTest(enable_metrics=enable_metrics):
+                accumulator = _accumulator(enable_metrics=enable_metrics)
+                accumulator.accept(req=req("timed", timed))
+                accumulator.accept(req=req("untimed", SchedulerReqTimeStats()))
+                payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+                self.assertEqual(payload.time_stats, expected)
 
 
 class TestOutputStreamerStreamInterval(unittest.TestCase):

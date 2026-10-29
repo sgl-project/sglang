@@ -6,7 +6,7 @@ import pickle
 import threading
 import time
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
@@ -54,6 +54,15 @@ from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.pi05_segment_scheduler import (
     Pi05SegmentSchedulerMixin,
 )
+from sglang.multimodal_gen.runtime.managers.progress_reporter import (
+    get_progress_reporter,
+    init_progress_reporter,
+)
+from sglang.multimodal_gen.runtime.managers.request_cancel import (
+    init_request_cancel,
+    poll_cancellations,
+)
+from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
@@ -89,6 +98,8 @@ _BATCH_METRICS_LOG_INTERVAL = 5
 # Each pending finalize pins one request's output tensor on the GPU; arbitrary,
 # picked to bound that memory while still hiding one save behind one forward.
 _MAX_INFLIGHT_FINALIZES = 2
+# Longest an idle loop with a finalize in flight goes without checking for requests.
+_FINALIZE_IDLE_WAIT_S = 0.001
 
 
 class _DeferredOutput(msgspec.Struct):
@@ -160,8 +171,19 @@ class Scheduler(
                 f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
                 f"{actual_endpoint}"
             )
+            if server_args.progress_endpoint is not None:
+                init_progress_reporter(
+                    context=self.context, endpoint=server_args.progress_endpoint
+                )
         else:
             self.receiver = None
+        if server_args.cancel_endpoint is not None:
+            # every rank takes part in each stop decision; only the driver
+            # receives the cancelled request ids
+            init_request_cancel(
+                endpoint=server_args.cancel_endpoint,
+                context=self.context if self.receiver is not None else None,
+            )
         from sglang.multimodal_gen.runtime.platforms import current_platform
 
         Exec_worker = CPUWorker if current_platform.is_cpu() else GPUWorker
@@ -331,7 +353,47 @@ class Scheduler(
     ):
         """Dispatch generation requests, merging compatible requests when allowed."""
         reqs = self._normalize_generation_reqs(reqs)
+        if (
+            allow_dynamic_batching
+            and len(reqs) > 1
+            and any(req.cancellable for req in reqs)
+        ):
+            # filter before merging; a running mixed batch cannot stop just one member
+            errors = [GPUWorker._cancel_error(req) for req in reqs]
+            if any(error is not None for error in errors):
+                live = [req for req, error in zip(reqs, errors) if error is None]
+                outputs = (
+                    self._handle_generation(
+                        live, allow_dynamic_batching=allow_dynamic_batching
+                    )
+                    if live
+                    else []
+                )
+                streaming = isinstance(outputs, _SequentiallyReturnedOutputs)
+                if streaming:
+                    outputs = outputs.outputs
+                elif not isinstance(outputs, list):
+                    outputs = [outputs]
+                live_outputs = iter(outputs)
+                restored = (
+                    OutputBatch(error=str(error), cancelled=True)
+                    if error is not None
+                    else next(live_outputs)
+                    for error in errors
+                )
+                return (
+                    _SequentiallyReturnedOutputs(restored)
+                    if streaming
+                    else list(restored)
+                )
         if self._async_output_save:
+            # continuous forward/save overlap must occasionally leave GC enabled
+            if request_gc.needs_collection_window() or any(
+                req.is_warmup or req.extra.get("server_internal_prewarm")
+                for req in reqs
+            ):
+                while self._inflight_finalizes:
+                    self._inflight_finalizes.popleft().result()
             # Reserve capacity before any forward allocates another output.
             # The single finalize worker completes futures in FIFO order.
             while len(self._inflight_finalizes) >= _MAX_INFLIGHT_FINALIZES:
@@ -344,6 +406,11 @@ class Scheduler(
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._ensure_warmup_progress_bar(warmup_reqs[0])
+        progress_reporter = get_progress_reporter()
+        if progress_reporter is not None:
+            for req in reqs:
+                if req.report_progress and not req.is_warmup:
+                    progress_reporter.start(request_ids=req.client_request_ids())
 
         # Use the head request trace context for scheduler-side dispatch work.
         req = reqs[0]
@@ -377,6 +444,11 @@ class Scheduler(
             batch_size = len(reqs)
             try:
                 output_batch = self.worker.execute_forward([merged_req])
+                if output_batch.cancelled:
+                    # the worker logged the cancel
+                    return self._build_dynamic_batch_error_outputs(
+                        reqs=reqs, error_msg=output_batch.error, cancelled=True
+                    )
                 if output_batch.error:
                     logger.error(
                         "Dynamic batch execution returned error. Skipping sequential fallback and returning errors: %s",
@@ -426,6 +498,11 @@ class Scheduler(
 
         try:
             output_batch = self.worker.execute_forward(reqs)
+            if output_batch.cancelled:
+                # the worker logged the cancel
+                return self._build_dynamic_batch_error_outputs(
+                    reqs=reqs, error_msg=output_batch.error, cancelled=True
+                )
             if output_batch.error:
                 logger.error(
                     "Native grouped execution returned error. Returning per-request errors: %s",
@@ -810,8 +887,9 @@ class Scheduler(
         self,
         reqs: List[Req],
         error_msg: str,
+        cancelled: bool = False,
     ) -> List[OutputBatch]:
-        return [OutputBatch(error=error_msg) for _ in reqs]
+        return [OutputBatch(error=error_msg, cancelled=cancelled) for _ in reqs]
 
     def _should_return_lightweight_warmup_result(self, processed_req: Any) -> bool:
         req = get_first_generation_req(processed_req)
@@ -819,6 +897,7 @@ class Scheduler(
             is_warmup_req(processed_req) and should_return_warmup_result(processed_req)
         )
 
+    @request_gc.defer()
     def return_result(
         self,
         output_batch: OutputBatch,
@@ -837,7 +916,7 @@ class Scheduler(
                         output_batch, "Scheduler.return_result.spill_arrays"
                     ):
                         output_batch.output = spill_large_arrays_to_file_refs(
-                            output_batch.output
+                            output_batch.output, identity
                         )
 
                 with self._record_return_stage(
@@ -915,6 +994,7 @@ class Scheduler(
         )
         self._inflight_finalizes.append(future)
 
+    @request_gc.defer()
     def _finalize_and_reply(
         self,
         *,
@@ -940,6 +1020,23 @@ class Scheduler(
             logger.error(f"ZMQ error sending deferred reply: {e}")
         except Exception as e:
             logger.error("Deferred reply failed: %s", e, exc_info=True)
+
+    def _wait_idle(self, timeout_s: float) -> None:
+        """Wait up to timeout_s for a new request or an in-flight finalize."""
+        if self._inflight_finalizes:
+            # Never wait holding _socket_lock: the finalize thread needs it to
+            # reply, and threading.Lock is not fair, so polling under it and
+            # re-taking it right after starves the reply.
+            wait(
+                self._inflight_finalizes,
+                timeout=min(timeout_s, _FINALIZE_IDLE_WAIT_S),
+                return_when=FIRST_COMPLETED,
+            )
+        elif self.receiver is not None:
+            with self._socket_lock:
+                self._poller.poll(timeout=timeout_s * 1000.0)
+        else:
+            time.sleep(timeout_s)
 
     def _reap_finalizes(self) -> None:
         while self._inflight_finalizes and self._inflight_finalizes[0].done():
@@ -1055,6 +1152,19 @@ class Scheduler(
                         req.output_file_path(req.num_outputs_per_prompt, output_idx)
                     )
             merged_req.extra["dynamic_batch_output_paths"] = dynamic_output_paths
+        merged_req.merged_request_ids = [
+            req.request_id
+            for req in reqs
+            if req.report_progress and req.request_id is not None
+        ]
+        merged_req.report_progress = bool(merged_req.merged_request_ids)
+        # The batch stops only when each member is cancelled, so the ids must
+        # name each member. video_api sets report_progress with cancellable,
+        # so each cancellable member is in merged_request_ids; the length check
+        # keeps that true if another caller sets cancellable alone.
+        merged_req.cancellable = all(req.cancellable for req in reqs) and len(
+            merged_req.merged_request_ids
+        ) == len(reqs)
         merged_req.request_id = f"dynamic_batch::{merged_req.request_id}"
 
         return merged_req
@@ -1161,6 +1271,9 @@ class Scheduler(
                 error=output_batch.error,
                 output_file_paths=self._slice_batched_value(
                     output_batch.output_file_paths, start, end, total_items
+                ),
+                output_image_bytes=self._slice_batched_value(
+                    output_batch.output_image_bytes, start, end, total_items
                 ),
                 metrics=metrics,
                 noise_pred=self._slice_batched_value(
@@ -1334,33 +1447,43 @@ class Scheduler(
         tensors on NCCL so per-step latents do not pickle onto the gloo group.
         """
         if self.receiver is not None:
-            try:
-                recv_reqs: list[tuple[bytes, Any]] = []
-                received: list[list[bytes]] = []
-                with self._socket_lock:
-                    while len(received) < _MAX_RECV_REQS_PER_POLL:
-                        try:
-                            received.append(self.receiver.recv_multipart(zmq.NOBLOCK))
-                        except zmq.Again:
-                            break
-                for parts in received:
-                    # Accept valid REQ envelopes only, ignore malformed/probe frames.
+            poll_cancellations()
+            recv_reqs: list[tuple[bytes, Any]] = []
+            received: list[list[bytes]] = []
+            with self._socket_lock:
+                while len(received) < _MAX_RECV_REQS_PER_POLL:
                     try:
-                        identity, payload = parts[0], parts[-1]
-                        reqs = pickle.loads(payload) if len(parts) > 2 else []
-                    except (pickle.UnpicklingError, IndexError, EOFError):
-                        continue
-
-                    recv_reqs.extend(self._normalize_received_payload(identity, reqs))
-            except zmq.ZMQError:
-                # re-raise or handle appropriately to let the outer loop continue
-                raise
+                        received.append(self.receiver.recv_multipart(zmq.NOBLOCK))
+                    except zmq.Again:
+                        break
+            for parts in received:
+                # ignore probes without a complete REQ envelope
+                if len(parts) != 3 or parts[1] != b"":
+                    continue
+                identity, _, payload = parts
+                try:
+                    items = self._normalize_received_payload(
+                        identity, pickle.loads(payload)
+                    )
+                    if not items:
+                        raise ValueError("request list cannot be empty")
+                    # isolate decoding/IPC failures before broadcasting to other ranks
+                    items = materialize_cuda_refs(items)
+                except Exception as exc:
+                    error = f"Invalid scheduler request: {type(exc).__name__}: {exc}"
+                    logger.warning(error)
+                    try:
+                        with self._socket_lock:
+                            self.receiver.send_multipart(
+                                [identity, b"", pickle.dumps(OutputBatch(error=error))],
+                                zmq.NOBLOCK,
+                            )
+                    except zmq.ZMQError:
+                        logger.warning("Could not reply to invalid scheduler request")
+                    continue
+                recv_reqs.extend(items)
         else:
             recv_reqs = None
-
-        # Rebuild CUDA IPC handles on rank 0 (no-op when the payload has none).
-        if recv_reqs is not None:
-            recv_reqs = materialize_cuda_refs(recv_reqs)
 
         if self.server_args.comfyui_mode and self._is_multi_rank():
             recv_reqs = self._broadcast_recv_reqs(recv_reqs)
@@ -1456,30 +1579,41 @@ class Scheduler(
             # 2: execute, make sure a reply is always sent
             items = self.get_next_batch_to_run()
             if not items:
+                release_wait_s = None
                 if (
                     release_cache_if_idle is not None
                     and not self.waiting_queue
                     and not self._inflight_finalizes
                 ):
-                    release_cache_if_idle()
+                    release_wait_s = release_cache_if_idle()
                 if self.waiting_queue and self._dynamic_batching_enabled():
                     oldest_ts = self.waiting_queue[0][2]
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
                     remaining_ms = max(0, self._batching_delay_s * 1000.0 - elapsed_ms)
-                    if remaining_ms > 0 and self.receiver is not None:
-                        with self._socket_lock:
-                            self._poller.poll(timeout=remaining_ms)
-                    elif remaining_ms > 0:
-                        time.sleep(remaining_ms / 1000.0)
+                    if remaining_ms > 0:
+                        self._wait_idle(remaining_ms / 1000.0)
                 elif self._inflight_finalizes:
                     # An idle hot spin convoys the finalize thread: each of its
                     # short GIL-holding ops waits a full switch interval, which
                     # turns a sub-second save into minutes. Yield instead.
-                    if self.receiver is not None:
-                        with self._socket_lock:
-                            self._poller.poll(timeout=1)
-                    else:
-                        time.sleep(0.001)
+                    self._wait_idle(_FINALIZE_IDLE_WAIT_S)
+                elif (
+                    not self.waiting_queue
+                    and self.receiver is not None
+                    and not self._is_multi_rank()
+                    and self.server_args.sleep_on_idle
+                ):
+                    # Wait instead of spinning a core. Multi rank replicas keep
+                    # spinning because their other ranks time their idle cache
+                    # release by this loop's iterations.
+                    with self._socket_lock:
+                        self._poller.poll(
+                            timeout=(
+                                1000
+                                if release_wait_s is None
+                                else min(release_wait_s * 1000.0, 1000)
+                            )
+                        )
                 continue
 
             if self.metrics is not None:

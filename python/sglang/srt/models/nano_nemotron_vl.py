@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_token_pairs,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -139,20 +140,18 @@ class NemotronH_Nano_VL_V2(EVS):
         )
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        im_start_id: int = mm_inputs.im_start_id
-        im_end_id: int = mm_inputs.im_end_id
-
         visual_items = [item for item in mm_inputs.mm_items if not item.is_audio()]
         audio_items = [item for item in mm_inputs.mm_items if item.is_audio()]
 
         all_data_offsets = []
 
         if visual_items:
+            # Literal boundary tokens in text must not change which spans are images.
             mm_inputs.mm_items = visual_items
-            input_ids = pad_mm_token_pairs(
-                input_ids, mm_inputs, data_token_pairs=[(im_start_id, im_end_id)]
+            input_ids = pad_mm_tokens(input_ids, mm_inputs)
+            all_data_offsets.extend(
+                start - 1 for item in visual_items for start, _ in item.offsets
             )
-            all_data_offsets.extend(mm_inputs.data_offsets)
 
         audio_start_id = getattr(mm_inputs, "audio_start_id", None)
         audio_end_id = getattr(mm_inputs, "audio_end_id", None)

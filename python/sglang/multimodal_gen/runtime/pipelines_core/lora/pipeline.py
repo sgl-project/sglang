@@ -284,6 +284,12 @@ class LoRAPipeline(ComposedPipelineBase):
         else:
             return [], f"Invalid target: {target}. Valid targets: {self.VALID_TARGETS}"
 
+    def _lora_module(self, name: str):
+        """Look up a module by LoRA target name ("critic" is fake_score_transformer)."""
+        if name == "critic":
+            name = "fake_score_transformer"
+        return self.modules.get(name)
+
     def _has_layerwise_offload(
         self,
         target_modules: list[tuple[str, dict[str, BaseLayerWithLoRA]]] | None = None,
@@ -294,7 +300,7 @@ class LoRAPipeline(ComposedPipelineBase):
         else:
             names = ["transformer", "transformer_2", "critic"]
         return any(
-            is_layerwise_offloaded_module(self.modules.get(name)) for name in names
+            is_layerwise_offloaded_module(self._lora_module(name)) for name in names
         )
 
     def _weight_update_context(
@@ -352,7 +358,7 @@ class LoRAPipeline(ComposedPipelineBase):
 
         offload_disabled_modules = []
         for module_name in module_names:
-            module = self.modules.get(module_name)
+            module = self._lora_module(module_name)
             if isinstance(module, torch.nn.Module):
                 restore_weight_snapshot(module)
             if module is not None and is_layerwise_offloaded_module(module):
@@ -377,7 +383,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 return True
             if any(layer.merged for layer in lora_layers_dict.values()):
                 return True
-            module = self.modules.get(module_name)
+            module = self._lora_module(module_name)
             if (
                 isinstance(module, torch.nn.Module)
                 and weight_snapshot(module) is not None
@@ -814,7 +820,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     alpha_key = name + ".alpha"
                     adapter_lora_alpha = self.loaded_adapter_alphas.get(nickname)
                     if alpha_key in self.lora_adapters[nickname]:
-                        inferred_alpha = int(
+                        inferred_alpha = float(
                             self.lora_adapters[nickname][alpha_key].item()
                         )
                     elif adapter_lora_alpha is not None:
@@ -837,9 +843,9 @@ class LoRAPipeline(ComposedPipelineBase):
                         lora_path=path,
                         strength=lora_strength,
                         merge_weights=merge_weights and not use_cache,
-                        clear_existing=(
-                            clear_existing and idx == 0
-                        ),  # Only clear on first LoRA
+                        # Clear on the first adapter that covers this layer
+                        clear_existing=clear_existing
+                        and adapted_count == adapted_before,
                     )
                     adapted_count += 1
                     applied_count_by_adapter[idx] += 1
@@ -924,11 +930,13 @@ class LoRAPipeline(ComposedPipelineBase):
 
         active_count = 0
         for name, layer in lora_layers.items():
-            if layer.merged or len(layer.lora_weights_list) != 1:
+            if layer.merged:
                 return None
             has_adapter = name + ".lora_A" in adapter and name + ".lora_B" in adapter
             if not has_adapter:
                 continue
+            if len(layer.lora_weights_list) != 1:
+                return None
             if (
                 layer.lora_A is None
                 or layer.lora_B is None
@@ -1017,8 +1025,8 @@ class LoRAPipeline(ComposedPipelineBase):
         if adapter_lora_alpha is None:
             adapter_lora_alpha = get_peft_lora_alpha(adapter_config)
 
-        if lora_nickname in self.lora_adapters:
-            self.lora_adapters[lora_nickname].clear()
+        # Swapped in at the end so a failed load keeps the previous adapter.
+        new_adapter: dict[str, torch.Tensor] = {}
 
         config = self.server_args.pipeline_config.dit_config.arch_config
 
@@ -1034,7 +1042,7 @@ class LoRAPipeline(ComposedPipelineBase):
         to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
         for name, weight in lora_state_dict.items():
             name = name.replace("diffusion_model.", "")
-            name = name.replace(".weight", "")
+            name = name.removesuffix(".weight")
             # misc-format -> HF-format
             name, _, _ = lora_param_names_mapping_fn(name)
             # HF-format (LoRA) -> SGLang-dit-format
@@ -1043,8 +1051,8 @@ class LoRAPipeline(ComposedPipelineBase):
             # see param mapping in HunyuanVideoArchConfig
             if merge_index is not None:
                 to_merge_params[target_name][merge_index] = weight
-                # A/B of one fused layer must be laid out together (GQA B cannot stack).
-                if target_name.endswith((".lora_A", ".lora_B")):
+                # A/B/alpha of one fused layer are laid out together (GQA B cannot stack).
+                if target_name.endswith((".lora_A", ".lora_B", ".alpha")):
                     continue
                 if len(to_merge_params[target_name]) == num_params_to_merge:
                     sorted_tensors = [
@@ -1058,23 +1066,22 @@ class LoRAPipeline(ComposedPipelineBase):
                     continue
 
             weight = _swap_peft_swiglu_fc1_lora_b(name, target_name, weight)
-            if target_name in self.lora_adapters[lora_nickname]:
+            if target_name in new_adapter:
                 raise ValueError(
                     f"Dit target weight name {target_name} already exists in lora_adapters[{lora_nickname}]"
                 )
-            self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
+            new_adapter[target_name] = weight.to(self.device)
 
         _store_fused_lora_groups(
-            self.lora_adapters[lora_nickname],
+            new_adapter,
             to_merge_params,
             adapter_lora_alpha,
             self.device,
         )
         transformer = self.modules["transformer"]
         if isinstance(transformer, BaseDiT):
-            self.lora_adapters[lora_nickname] = transformer.prepare_lora_adapter(
-                self.lora_adapters[lora_nickname]
-            )
+            new_adapter = transformer.prepare_lora_adapter(new_adapter)
+        self.lora_adapters[lora_nickname] = new_adapter
 
         self.loaded_adapter_paths[lora_nickname] = lora_path
         self.loaded_adapter_files[lora_nickname] = lora_local_path
@@ -1188,7 +1195,6 @@ class LoRAPipeline(ComposedPipelineBase):
             )
 
             # Skip if LoRA configuration matches exactly (including order and strength)
-            # Since all modules for the same target apply the same config, checking one is sufficient
             first_module_name, first_lora_layers_dict = target_modules[0]
             first_effective_merge_weights = self._should_merge_lora_for_layers(
                 first_module_name, first_lora_layers_dict, merge_mode
@@ -1209,12 +1215,15 @@ class LoRAPipeline(ComposedPipelineBase):
                     )
                 )
 
-            if self._check_lora_config_matches(
-                first_module_name,
-                tgt_nicknames,
-                tgt_strengths,
-                first_effective_merge_weights,
-                adapter_updated,
+            if all(
+                self._check_lora_config_matches(
+                    module_name,
+                    tgt_nicknames,
+                    tgt_strengths,
+                    merge_weights_by_module[module_name],
+                    adapter_updated,
+                )
+                for module_name, _ in target_modules
             ):
                 logger.info("LoRA configuration matches exactly, skipping")
                 continue
@@ -1451,6 +1460,15 @@ class LoRAPipeline(ComposedPipelineBase):
                 self.cur_adapter_config.pop(module_name, None)
                 logger.info("LoRA weights deactivated for %s", module_name)
 
+    def _record_merge_strength(self, module_name: str, strength: float) -> None:
+        self.cur_adapter_strength[module_name] = strength
+        config = self.cur_adapter_config.get(module_name)
+        if config is not None:
+            self.cur_adapter_config[module_name] = (
+                config[0],
+                [strength] * len(config[0]),
+            )
+
     def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
         """
         Merge LoRA weights into the base model for the specified target.
@@ -1482,7 +1500,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         layer.disable_lora = False
                         layer.strength = strength
                     self.is_lora_merged[module_name] = False
-                    self.cur_adapter_strength[module_name] = strength
+                    self._record_merge_strength(module_name, strength)
                     logger.info(
                         "Dynamic LoRA activated for %s (strength: %s)",
                         module_name,
@@ -1491,7 +1509,13 @@ class LoRAPipeline(ComposedPipelineBase):
                     continue
                 if self.is_lora_merged.get(module_name, False):
                     # Check if strength is the same - if so, skip (idempotent)
-                    if self.cur_adapter_strength.get(module_name) == strength:
+                    config = self.cur_adapter_config.get(module_name)
+                    current = (
+                        config[1]
+                        if config
+                        else [self.cur_adapter_strength.get(module_name)]
+                    )
+                    if all(s == strength for s in current):
                         logger.warning(
                             "LoRA weights are already merged for %s with same strength",
                             module_name,
@@ -1514,7 +1538,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         logger.warning("Could not merge layer %s: %s", name, e)
                         continue
                 self.is_lora_merged[module_name] = True
-                self.cur_adapter_strength[module_name] = strength
+                self._record_merge_strength(module_name, strength)
                 logger.info(
                     "LoRA weights merged for %s (strength: %s)", module_name, strength
                 )

@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import is_npu
 
@@ -17,8 +18,49 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.kv.router import KVLayerRouter
+    from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+def resolve_window_kv_pool(model_runner: ModelRunner) -> Optional[KVCache]:
+    """The pool whose window sub-pool this runner's window layers address, or
+    None when there is none.
+
+    A draft runner shares the target's allocator for token bookkeeping but owns
+    a separate KV pool, so the allocator's pool is not its pool. A frozen-KV MTP
+    draft is the exception: it reads the target's KV directly.
+    """
+    active_pool = model_runner.token_to_kv_pool
+    if active_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+        return active_pool
+    if (
+        model_runner.is_draft_worker
+        and not model_runner.spec_algorithm.is_frozen_kv_mtp()
+    ):
+        return None
+    kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
+    if kvcache.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
+        return kvcache
+    return None
+
+
+def resolve_window_id_space(
+    model_runner: ModelRunner, window_pool: Optional[KVCache]
+) -> Optional[IdSpace]:
+    """How ``window_pool``'s window sub-pool names the iteration's slots: by
+    its allocator's tables when the allocator hands out virtual ids and the
+    pool's writes take physical ones (the unified pool, and a draft fused into
+    it, view the sub-pools whose tables are the allocator's), else as the pool
+    maps them itself."""
+    if window_pool is None:
+        return None
+    allocator = model_runner.token_to_kv_pool_allocator
+    if allocator.hands_out_virtual_ids and window_pool.requires_physical_write_loc:
+        return allocator.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
+    return window_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
 
 
 class SharedReadEnds(Enum):
@@ -63,6 +105,10 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # Whether target verify runs correctly under decode context parallelism:
+    # each rank reads its shard of the DCP-widened pages with the global causal
+    # bound and returns its LSE for the cross-rank merge.
+    supports_dcp_target_verify: bool = False
     # DeepSeek-V4.1 encoder SWA replay: True if the backend floors the window and
     # skips cached-row compression for replay rows folded into the extend.
     folds_encoder_swa_replay: bool = False
@@ -84,11 +130,18 @@ class AttentionBackend(ABC):
     # (metadata glue graph) can read it off any backend without hasattr.
     forward_metadata: Optional[object] = None
 
-    # The runner's KVIndexTranslator; backends that read through it set the
+    # The runner's RunnerIds; backends that read through it set the
     # instance attribute in __init__. None means "no translate" -- a backend
     # that never set it cannot serve the unified pool, which the server-args
     # allow-list enforces.
-    kv_index_translator = None
+    runner_ids = None
+
+    @property
+    def kv_layers(self) -> KVLayerRouter:
+        """Per-layer KV of ``token_to_kv_pool``, derived on every access: a
+        frozen-KV MTP draft swaps its backend's pool for the target's, and its
+        reads and writes must follow the swap."""
+        return self.token_to_kv_pool.layer_router
 
     def get_fused_kv_write_buffers(
         self, layer: RadixAttention, forward_batch: ForwardBatch
@@ -103,6 +156,16 @@ class AttentionBackend(ABC):
         """
         self.init_forward_metadata_out_graph(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
+
+    def glue_target_verify_metadata(self) -> str:
+        """Empty if the target verify prep may be captured into the metadata glue graph
+        (reads only runner slots and backend buffers), else the reason it may not."""
+        return "the attention backend declares no host-free target verify prep"
+
+    def glue_draft_metadata(self) -> str:
+        """Empty if the draft prep may be captured into the metadata glue graph (host
+        inputs constant per replay key), else the reason it may not."""
+        return "the attention backend declares no host-free draft prep"
 
     def init_forward_metadata_out_graph(
         self,
@@ -170,6 +233,10 @@ class AttentionBackend(ABC):
     # Backends may keep MIXED prefill eager under DP attention when replaying
     # the EXTEND graph is a known serving-performance regression.
     prefer_eager_mixed_prefill_under_dp_attention: bool = False
+
+    # An idle DP rank replays the padded prefill graph without attention
+    # metadata; only backends whose replay reads none on such a rank opt in.
+    skips_prefill_metadata_on_idle_dp_rank: bool = False
 
     # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
     supports_prefill_cuda_graph_max_context_size: bool = False

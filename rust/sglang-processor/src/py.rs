@@ -8,11 +8,24 @@ use serde_json::Value;
 /// Python's `json.dumps(value, ensure_ascii=ascii)`: `", "` and `": "` separators.
 pub(crate) fn python_json(value: &Value, ascii: bool) -> String {
     let mut out = String::new();
-    write_python_json(value, ascii, &mut out);
+    write_python_json(value, ascii, (", ", ": "), &mut out);
     out
 }
 
-fn write_python_json(value: &Value, ascii: bool, out: &mut String) {
+/// Python's `json.dumps(value, ensure_ascii=False, separators=(",", ":"))`.
+#[cfg(feature = "render")]
+pub(crate) fn python_json_compact(value: &Value) -> String {
+    let mut out = String::new();
+    write_python_json(value, false, (",", ":"), &mut out);
+    out
+}
+
+fn write_python_json(
+    value: &Value,
+    ascii: bool,
+    (item_sep, key_sep): (&str, &str),
+    out: &mut String,
+) {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -25,9 +38,9 @@ fn write_python_json(value: &Value, ascii: bool, out: &mut String) {
             out.push('[');
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
-                    out.push_str(", ");
+                    out.push_str(item_sep);
                 }
-                write_python_json(item, ascii, out);
+                write_python_json(item, ascii, (item_sep, key_sep), out);
             }
             out.push(']');
         }
@@ -35,11 +48,11 @@ fn write_python_json(value: &Value, ascii: bool, out: &mut String) {
             out.push('{');
             for (i, (key, item)) in map.iter().enumerate() {
                 if i > 0 {
-                    out.push_str(", ");
+                    out.push_str(item_sep);
                 }
                 write_python_str(key, ascii, out);
-                out.push_str(": ");
-                write_python_json(item, ascii, out);
+                out.push_str(key_sep);
+                write_python_json(item, ascii, (item_sep, key_sep), out);
             }
             out.push('}');
         }
@@ -458,10 +471,6 @@ fn py_space(c: char) -> bool {
 
 pub(crate) fn py_strip(text: &str) -> &str {
     text.trim_matches(py_space)
-}
-
-pub(crate) fn py_rstrip(text: &str) -> &str {
-    text.trim_end_matches(py_space)
 }
 
 #[cfg(test)]

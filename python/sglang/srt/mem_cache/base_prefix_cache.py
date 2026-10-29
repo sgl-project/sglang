@@ -315,6 +315,11 @@ class MatchResult(NamedTuple):
     full_kv_hit_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
+    # Deepest non-root node visited, including nodes rejected by validators.
+    last_visited_node_id: Optional[int] = None
+    # Reusable prefix length in FULL's device-value scan, before node-boundary
+    # or auxiliary constraints. None means no shorter prefix was reported.
+    full_device_match_len: Optional[int] = None
 
 
 def zero_match_result(
@@ -334,6 +339,8 @@ def zero_match_result(
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        last_visited_node_id=None,
+        full_device_match_len=None,
     )
 
 
@@ -679,24 +686,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if self.sliding_window_size is None:
             return None
         return max(self.sliding_window_size, self.draft_swa_window)
-
-    def evict_sliding_windows(
-        self, req: Req, pre_len: int, *, eviction_interval: int = 1
-    ) -> None:
-        """Slide request-owned windows at the scheduler's safe eviction frontier."""
-        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
-
-        free_swa_out_of_window_slots(
-            req,
-            pre_len,
-            sliding_window_size=self.swa_retain_window,
-            page_size=self.page_size,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            supports_prefix_sharing=self.supports_prefix_sharing(),
-            retain_floor=self.swa_retain_floor(req),
-            eviction_interval=eviction_interval,
-        )
 
     def swa_retain_floor(self, req) -> int | None:
         # A match lands on a state checkpoint rather than on the tail, so a cache
