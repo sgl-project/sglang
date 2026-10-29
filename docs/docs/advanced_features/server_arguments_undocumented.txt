@@ -86,6 +86,3 @@
 --trust-mm-content-hashes
 --trust-request-chat-template
 --uno-lora-path
---weight-cache-mode
---weight-cache-socket
---weight-cache-timeout
