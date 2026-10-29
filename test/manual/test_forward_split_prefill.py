@@ -120,6 +120,7 @@ class TestForwardSplitPrefill(CustomTestCase):
         dummy_tree_cache = TreeCacheNamespace(
             page_size=1,
             device=self.model_runner.device,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
         )
 
