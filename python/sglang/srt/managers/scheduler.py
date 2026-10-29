@@ -77,6 +77,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation import role_switch
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -3908,12 +3909,18 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
-            req.pending_bootstrap = False
-        self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+            if req.disagg_kv_sender.poll() == KVPoll.Transferring:
+                self.disagg_prefill_inflight_queue.append(req)
+            else:
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
+                req.pending_bootstrap = False
+                self._release_aborted_request(req)
+                release_kv_cache(req, self.tree_cache, checkpoint=False)
+        else:
+            self._release_aborted_request(req)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None

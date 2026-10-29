@@ -604,6 +604,9 @@ class SchedulerDisaggregationPrefillMixin:
         sender = getattr(req, "disagg_kv_sender", None)
         if sender is not None and hasattr(sender, "abort"):
             sender.abort()
+            if sender.poll() == KVPoll.Transferring:
+                self.disagg_prefill_inflight_queue.append(req)
+                return
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=False)
