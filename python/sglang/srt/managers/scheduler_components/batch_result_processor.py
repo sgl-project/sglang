@@ -305,8 +305,11 @@ class SchedulerBatchResultProcessor:
 
             # Check finish conditions
             logprob_pt = 0
+            # Decode reqs in a mixed batch, or every req of a converted decode batch.
+            decoding_req_ids = {id(req) for req in batch.decoding_reqs or ()}
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                is_decoding = id(req) in decoding_req_ids
                 should_commit_output = (
                     not req.finished()
                     and not req.is_retracted
@@ -352,7 +355,8 @@ class SchedulerBatchResultProcessor:
 
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
-                    req.request_meta_stale = True
+                    if not is_decoding:
+                        req.request_meta_stale = True
 
                     if discard_finish_reason is not None:
                         req.to_finish = discard_finish_reason
@@ -374,8 +378,7 @@ class SchedulerBatchResultProcessor:
                     # so the next spec prepare_for_decode reserves from the right base.
                     if (
                         not req.finished()
-                        and batch.decoding_reqs
-                        and req in batch.decoding_reqs
+                        and is_decoding
                         and not batch.spec_algorithm.is_none()
                     ):
                         req.kv.kv_committed_len += 1
@@ -385,7 +388,7 @@ class SchedulerBatchResultProcessor:
                             self._maybe_collect_indexer_topk(req)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.request_finished(req)
-                        if batch.decoding_reqs and req in batch.decoding_reqs:
+                        if is_decoding:
                             self._prepare_kv_cache_release(req)
                         release_kv_cache(
                             req,
@@ -393,7 +396,7 @@ class SchedulerBatchResultProcessor:
                             checkpoint=discard_finish_reason is None,
                         )
                         req.time_stats.set_completion_time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    elif not is_decoding:
                         checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)

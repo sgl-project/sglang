@@ -1394,8 +1394,7 @@ class Req(ReqDllmMixin):
         self.retraction_count = 0
         self.retraction_mb_id = None
 
-        # Set when the output metadata (RequestOutputMeta) may have changed
-        # since the last output: at creation, retraction and each prefill result.
+        # Set when RequestOutputMeta may have changed since the last output.
         self.request_meta_stale = True
 
         # For observability

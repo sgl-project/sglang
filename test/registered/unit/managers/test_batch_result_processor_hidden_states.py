@@ -285,6 +285,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
         req.return_sampling_mask = True
         batch = SimpleNamespace(
             reqs=[req],
+            decoding_reqs=None,
             return_logprob=False,
             return_hidden_states=False,
             return_hidden_states_mode=CaptureHiddenMode.NULL,

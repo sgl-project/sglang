@@ -1708,7 +1708,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     dp_ranks: Optional[List[Optional[int]]] = None
 
     # By row, the request's metadata when it is new since the request's last
-    # output, else None; the whole field is None when no row carries one.
+    # output or when the row finishes, else None; the whole field is None when
+    # no row carries one.
     request_metas: Optional[List[Optional[RequestOutputMeta]]] = None
 
     # Rust server mode only: per-step header columns of
