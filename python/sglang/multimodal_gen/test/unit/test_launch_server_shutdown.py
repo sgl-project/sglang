@@ -1,3 +1,4 @@
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -5,6 +6,7 @@ from unittest.mock import Mock, patch
 from sglang.multimodal_gen.runtime import launch_server as ls
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
+from sglang.test.test_utils import CustomTestCase
 
 
 class _FakeProcess:
@@ -16,11 +18,16 @@ class _FakeProcess:
         self.join_timeouts = []
         self.terminated = False
         self.killed = False
+        self.exitcode = None
+
+    def start(self):
+        pass
 
     def join(self, timeout=None):
         self.join_timeouts.append(timeout)
         if self.exit_on_join:
             self.alive = False
+            self.exitcode = 0
 
     def is_alive(self):
         return self.alive
@@ -31,9 +38,59 @@ class _FakeProcess:
     def kill(self):
         self.killed = True
         self.alive = False
+        self.exitcode = -9
 
 
-class TestLaunchServerShutdown(unittest.TestCase):
+class TestLaunchServerShutdown(CustomTestCase):
+    def test_webui_observes_worker_failure_and_stops_watch_before_shutdown(self):
+        """A returned WebUI launch must still detect dead ranks, until shutdown."""
+        for unexpected_failure in (True, False):
+            with self.subTest(unexpected_failure=unexpected_failure):
+                worker = _FakeProcess(exit_on_join=True)
+                http = _FakeProcess(exit_on_join=True)
+                context = Mock()
+                context.Pipe.return_value = (
+                    Mock(recv=Mock(return_value={"status": "ready"})),
+                    Mock(),
+                )
+                context.Process.side_effect = [worker, http]
+                args = SimpleNamespace(
+                    enable_metrics=False,
+                    num_gpus=1,
+                    nnodes=1,
+                    node_rank=0,
+                    webui=True,
+                    causal_pipeline_mode="block",
+                    pipeline_config=Mock(supports_action_endpoint=lambda: False),
+                )
+                terminated = threading.Event()
+                with (
+                    patch.object(ls, "apply_plugin_hooks"),
+                    patch.object(ls, "configure_logger"),
+                    patch.object(ls.mp, "get_context", return_value=context),
+                    patch.object(ls.ServerArgsPayload, "capture", return_value=b"args"),
+                    patch.object(
+                        ls,
+                        "kill_process_tree",
+                        side_effect=lambda *a, **kw: terminated.set(),
+                    ),
+                ):
+                    processes = ls.launch_server(args)
+                    try:
+                        if unexpected_failure:
+                            worker.exitcode = 1
+                            self.assertTrue(terminated.wait(2))
+                        else:
+                            ls.shutdown_scheduler_processes(
+                                None, processes, request_shutdown=False
+                            )
+                            self.assertEqual(worker.exitcode, 0)
+                            self.assertFalse(terminated.wait(0.6))
+                    finally:
+                        ls.shutdown_scheduler_processes(
+                            None, processes, request_shutdown=False
+                        )
+
     def test_monolithic_shutdown_requests_scheduler_then_forces_worker(self):
         process = _FakeProcess()
         server_args = SimpleNamespace(disagg_role=RoleType.MONOLITHIC)

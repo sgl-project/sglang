@@ -1362,7 +1362,14 @@ class Scheduler(
         if recv_reqs is not None:
             recv_reqs = materialize_cuda_refs(recv_reqs)
 
-        if self.server_args.comfyui_mode and self._is_multi_rank():
+        if self.server_args.causal_pipeline_mode != "off":
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_world_group,
+            )
+
+            group = get_world_group()
+            recv_reqs = broadcast_pyobj(recv_reqs, group.rank, group.cpu_group, src=0)
+        elif self.server_args.comfyui_mode and self._is_multi_rank():
             recv_reqs = self._broadcast_recv_reqs(recv_reqs)
         else:
             # TODO: fix this condition

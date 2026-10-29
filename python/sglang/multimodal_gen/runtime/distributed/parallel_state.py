@@ -391,6 +391,7 @@ def initialize_model_parallel(
     pipeline_parallel_degree: int = 1,
     vae_parallel_size: int = 0,
     backend: Optional[str] = None,
+    separate_decode_ranks: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -603,7 +604,11 @@ def initialize_model_parallel(
     global _VAE_DECODE
     assert _VAE_DECODE is None, "VAE decode parallel group is already initialized"
     _VAE_DECODE = init_parallel_group_coordinator(
-        group_ranks=_get_vae_decode_group_ranks(rank_generator),
+        group_ranks=(
+            [[r] for r in range(world_size)]
+            if separate_decode_ranks
+            else _get_vae_decode_group_ranks(rank_generator)
+        ),
         local_rank=get_world_group().local_rank,
         backend=backend,
         parallel_mode="vae_decode",
@@ -653,6 +658,8 @@ def maybe_init_distributed_environment_and_model_parallel(
     dp_size: int = 1,
     distributed_init_method: str = "env://",
     dist_timeout: int | None = None,
+    pipeline_parallel_degree: int = 1,
+    separate_decode_ranks: bool = False,
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -664,6 +671,11 @@ def maybe_init_distributed_environment_and_model_parallel(
         assert get_sp_world_size() == sp_size, (
             f"You are trying to initialize model parallel groups with size {sp_size}, but they are already initialized with size {get_sp_world_size()}"
         )
+        assert _PP.world_size == pipeline_parallel_degree, (
+            "Existing pipeline group does not match the requested pipeline degree"
+        )
+        if separate_decode_ranks:
+            assert _VAE_DECODE.world_size == 1, "Causal VAE decode must be rank-local"
         return
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -694,6 +706,8 @@ def maybe_init_distributed_environment_and_model_parallel(
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
+        pipeline_parallel_degree=pipeline_parallel_degree,
+        separate_decode_ranks=separate_decode_ranks,
     )
 
 

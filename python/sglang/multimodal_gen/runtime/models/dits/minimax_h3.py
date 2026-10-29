@@ -1265,6 +1265,8 @@ class MiniMaxH3Attention(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         x_prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
+        causal_context=None,
+        unfused_qkv: bool = False,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -1289,11 +1291,23 @@ class MiniMaxH3Attention(nn.Module):
             )
 
         total = x.shape[0]
-        qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
-        q, k, v = qkv.split(self.local_inner_dim, dim=-1)
+        if unfused_qkv:
+            # Separate projections preserve the Diffusers refiner's GEMM
+            # shapes and BF16 rounding for unquantized TP=1 execution.
+            q, k, v = (
+                nn.functional.linear(x, weight)
+                for weight in self.qkv_proj.weight.split(self.local_inner_dim, dim=0)
+            )
+        else:
+            qkv, _ = self.qkv_proj(x if x_prequant is None else x_prequant)
+            q, k, v = qkv.split(self.local_inner_dim, dim=-1)
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
         v = v.view(total, self.num_heads, self.head_dim)
+        if causal_context is not None:
+            out = causal_context.attend(self, q, k, v)
+            out, _ = self.out_proj(out.reshape(total, self.local_inner_dim))
+            return out
         if (
             self.hybrid is not None
             and self._attention_backend_enum
@@ -1575,6 +1589,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
+        unfused_qkv: bool = False,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
@@ -1582,6 +1597,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
+            unfused_qkv=unfused_qkv,
         )
         x = x + self.mlp(self.norm2(x))
         return x
@@ -1615,6 +1631,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
         cu_seqlens: torch.Tensor,
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
+        unfused_qkv: bool = False,
     ) -> torch.Tensor:
         for block in self.blocks:
             x = block(
@@ -1622,6 +1639,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
                 cu_seqlens=cu_seqlens,
                 cu_seqlens_host=cu_seqlens_host,
                 max_seqlen=max_seqlen,
+                unfused_qkv=unfused_qkv,
             )
         return self.final_norm(x)
 
@@ -1673,6 +1691,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
+        causal_context=None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1716,6 +1735,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         h = self.attn(
             h,
             x_prequant=h_prequant,
+            causal_context=causal_context,
             rope_cache=rope_cache,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
@@ -2218,7 +2238,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         )
         self.arch = arch
         if arch.checkpoint_uses_diffusers_layout:
-            self.preprocess_loaded_state_dict = _diffusers_h3_checkpoint
+            self.preprocess_loaded_state_dict = self._preprocess_diffusers_state_dict
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim
@@ -2478,6 +2498,19 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             if getattr(param, "missing_param_init", None) is None:
                 param.missing_param_init = "error"
 
+    def _preprocess_diffusers_state_dict(self, iterator):
+        has_rope = False
+        for name, value in _diffusers_h3_checkpoint(iterator):
+            has_rope |= name == "rope.inv_freq"
+            yield name, value
+        if not has_rope:
+            # Diffusers derives this non-persistent buffer from config. Native
+            # H3 checkpoints store it, so synthesize it only for this layout.
+            count = self.arch.rope_inv_freq_len
+            powers = torch.arange(count, dtype=torch.float32, device="cpu") / count
+            theta = float(self.hf_config.get("rope_theta", 10000.0))
+            yield "rope.inv_freq", 1.0 / (theta**powers)
+
     def post_load_weights(self) -> None:
         fp32_param_names = list(_MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER)
         if self.adaln_t_table is not None:
@@ -2555,6 +2588,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         refiner_cu_seqlens: torch.Tensor,
         *,
         device: torch.device,
+        unfused_qkv: bool = False,
     ) -> torch.Tensor:
         """Project and refine request-static text conditioning once."""
         self.materialize_mps_non_layer_weights(
@@ -2580,6 +2614,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             cu_seqlens=true_refiner_cu,
             cu_seqlens_host=(0, text_len, text_len),
             max_seqlen=text_len,
+            unfused_qkv=unfused_qkv,
         )
         self.release_mps_non_layer_weights("condition_proj", "token_refiner.final_norm")
         return refined

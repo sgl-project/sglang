@@ -449,6 +449,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             dp_size=self.server_args.dp_size,
             distributed_init_method=rendezvous_addr.to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
+            pipeline_parallel_degree=(
+                self.server_args.num_gpus
+                if self.server_args.causal_pipeline_mode != "off"
+                else 1
+            ),
+            separate_decode_ranks=self.server_args.causal_pipeline_mode != "off",
         )
 
         from sglang.srt.runtime_context import get_context, publish
@@ -584,6 +590,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         IPC_A2A.check_timeout()
         IPC_A2A_MULTI.check_timeout()
         if len(batch) > 1:
+            if self.server_args.causal_pipeline_mode != "off":
+                raise ValueError("Causal pipelines do not support grouped outputs")
             if return_req:
                 raise ValueError(
                     "Grouped execute_forward does not support return_req=True"
@@ -1729,8 +1737,16 @@ def run_scheduler_process(
             }
         )
         scheduler.event_loop()
-    except _oom_exceptions() as _e:
-        logger.warning(OOM_MSG)
+    except BaseException as exc:
+        if isinstance(exc, _oom_exceptions()):
+            logger.warning(OOM_MSG)
+        if server_args.causal_pipeline_mode != "off":
+            logger.exception(
+                "Causal pipeline worker failed; terminating the replica worker"
+            )
+            # A failed rank cannot participate in collective communicator
+            # teardown. Exit so the process supervisor can handle the failure.
+            os._exit(1)
         raise
     finally:
         # Clean up resources to speed up shutdown
