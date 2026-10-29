@@ -2152,12 +2152,17 @@ class MQALayer(MqaAttentionBase):
             qkv_a = None
 
         if self.use_fused_qk_norm_rope:
-            if _is_gfx95_supported or _is_gfx1250_supported:
+            q_lora_e8m0 = (
+                _is_gfx95_supported or _is_gfx1250_supported
+            ) and self._q_lora_quant_e8m0(with_indexer=False)
+            if (_is_gfx95_supported or _is_gfx1250_supported) and (
+                _use_aiter or q_lora_e8m0
+            ):
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
                     self.q_norm.variance_epsilon,
-                    e8m0=self._q_lora_quant_e8m0(with_indexer=False),
+                    e8m0=q_lora_e8m0,
                 )
                 q, _ = self.wq_b(q_for_wqb)
             else:
@@ -2294,12 +2299,17 @@ class MQALayer(MqaAttentionBase):
         # The indexer's wq_b reuses the fp8 quant of the normed q_lora made here.
         q_lora_quant = None
         if do_fused_qk_norm_rope:
-            if _is_gfx95_supported or _is_gfx1250_supported:
+            q_lora_e8m0 = (
+                _is_gfx95_supported or _is_gfx1250_supported
+            ) and self._q_lora_quant_e8m0(with_indexer=True)
+            if (_is_gfx95_supported or _is_gfx1250_supported) and (
+                _use_aiter or q_lora_e8m0
+            ):
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
                     self.q_norm.variance_epsilon,
-                    e8m0=self._q_lora_quant_e8m0(with_indexer=True),
+                    e8m0=q_lora_e8m0,
                 )
                 q, _ = self.wq_b(q_for_wqb)
                 q_lora_quant = q_for_wqb
