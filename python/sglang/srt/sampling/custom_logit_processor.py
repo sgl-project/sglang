@@ -377,9 +377,13 @@ def _ngram_banned_tokens(req, params: Dict[str, Any], *, vocab_size: int) -> Lis
     # vLLM hands the processor generated tokens only, so the window
     # slides over the output, not the prompt.
     if params.get(NGRAM_OUTPUT_ONLY_KEY):
-        sequence = req.output_ids
+        sequence = req.output_ids[-window_size:]
+    elif len(req.output_ids) >= window_size:
+        sequence = req.output_ids[-window_size:]
     else:
-        sequence = req.origin_input_ids + req.output_ids
+        # only the searched tail can contribute a repeated n-gram
+        prompt_tokens = window_size - len(req.output_ids)
+        sequence = req.origin_input_ids[-prompt_tokens:] + req.output_ids
     if len(sequence) < ngram_size:
         return []
 
@@ -395,9 +399,8 @@ def _ngram_banned_tokens(req, params: Dict[str, Any], *, vocab_size: int) -> Lis
 
     banned_tokens: Set[int] = set()
     for idx in range(search_start, search_end):
-        ngram = sequence[idx : idx + ngram_size]
-        if ngram_size == 1 or ngram[:-1] == current_prefix:
-            banned_tokens.add(ngram[-1])
+        if ngram_size == 1 or sequence[idx : idx + ngram_size - 1] == current_prefix:
+            banned_tokens.add(sequence[idx + ngram_size - 1])
 
     whitelist_ids = params.get("whitelist_token_ids") or []
     try:

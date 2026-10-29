@@ -14,7 +14,11 @@ from sglang.kernels.ops.attention.unlimited_ocr_dash.page2d_rope import (
 )
 from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -69,8 +73,7 @@ class UnlimitedOCRV2Attention(nn.Module):
             "the DASH router is single-head; sparse_num_index_heads must be 1"
         )
 
-        # Separate q/k/v, not the fused QKVParallelLinear: the main branch is
-        # rotated with per-token page2d cos/sin, unrelated to the standard rope.
+        # main attention heads are sharded independently of the single router head
         self.q_proj = ColumnParallelLinear(
             self.hidden_size,
             self.total_num_heads * self.head_dim,
@@ -103,14 +106,14 @@ class UnlimitedOCRV2Attention(nn.Module):
         # Router branch (checkpoint: self_attn.dash_router.*). Gemma-style RMSNorm
         # (x * (1 + w)): trained weights are ~0, so plain x*w would zero the scores.
         eps = config.rms_norm_eps
-        self.index_q_proj = ColumnParallelLinear(
+        self.index_q_proj = ReplicatedLinear(
             self.hidden_size,
             self.idx_head_dim,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("index_q_proj", prefix),
         )
-        self.index_k_proj = ColumnParallelLinear(
+        self.index_k_proj = ReplicatedLinear(
             self.hidden_size,
             self.idx_head_dim,
             bias=False,
@@ -341,20 +344,21 @@ class UnlimitedOCRV2ForCausalLM(UnlimitedOCRForCausalLM):
         prefix: str = "",
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        # Weight loading runs later, so replacing the base tower only discards
-        # uninitialized parameters.
-        text_config = config.text_config
-        text_config.sparse_attention_config = config.sparse_attention_config
-        self.model = UnlimitedOCRV2LanguageModel(
-            config=text_config,
-            quant_config=quant_config,
-            prefix=add_prefix("language", prefix),
-        )
         self.crop_transfer = UnlimitedOcrCropTransfer(
             model_dtype=self.vision_model.dtype
         )
         # The image encoder; split-document prefetch fills it ahead of prefill.
         self.early_embeddings = EarlyEmbeddings(encode=self.get_image_feature)
+
+    def _build_language_model(self, config, quant_config, prefix):
+        # construct the DASH tower directly, without allocating a discarded v1 tower
+        text_config = config.text_config
+        text_config.sparse_attention_config = config.sparse_attention_config
+        return UnlimitedOCRV2LanguageModel(
+            config=text_config,
+            quant_config=quant_config,
+            prefix=add_prefix("language", prefix),
+        )
 
     def _stack_crop_inputs(
         self,

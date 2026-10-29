@@ -10,11 +10,48 @@ from sglang.srt.models.unlimited_ocr_crop_transfer import (
     RetiredTransfer,
     UnlimitedOcrCropTransfer,
 )
-from sglang.srt.models.unlimited_ocr_v2 import UnlimitedOCRV2ForCausalLM
+from sglang.srt.models.unlimited_ocr_v2 import (
+    UnlimitedOCRV2Attention,
+    UnlimitedOCRV2ForCausalLM,
+)
+from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestUnlimitedOCRRouterTP(CustomTestCase):
+    def test_each_rank_loads_and_projects_the_full_router_head(self):
+        """TP shards main attention heads, but every rank needs all 128 router dimensions."""
+        self.addCleanup(reset_context)
+        config = SimpleNamespace(
+            hidden_size=1280,
+            num_attention_heads=10,
+            num_key_value_heads=10,
+            rms_norm_eps=1e-6,
+            sparse_attention_config={"sparse_index_dim": 128},
+        )
+        hidden = torch.arange(2 * 1280, dtype=torch.float32).reshape(2, 1280) / 1280
+        weight = torch.arange(128 * 1280, dtype=torch.float32).reshape(128, 1280)
+        weight = weight / weight.numel()
+        expected = torch.nn.functional.linear(hidden, weight)
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                reset_context()
+                publish(
+                    ServerArgs(model_path="dummy", device="cpu", tp_size=2),
+                    role="test",
+                    ranks=SpawnRanks(world_rank=rank),
+                )
+                attention = UnlimitedOCRV2Attention(config, layer_id=0)
+                self.assertEqual(attention.q_proj.weight.shape, (640, 1280))
+                for projection in (attention.index_q_proj, attention.index_k_proj):
+                    projection.weight.weight_loader(projection.weight, weight)
+                    actual, _ = projection(hidden)
+                    self.assertEqual(actual.shape, (2, 128))
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 class TestUnlimitedOCRSpatialMetadata(CustomTestCase):

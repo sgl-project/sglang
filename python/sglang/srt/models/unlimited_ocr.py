@@ -73,11 +73,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
                 f"Only 2D tile_tag is supported currently, got: {self.tile_tag}"
             )
 
-        self.model = DeepseekForCausalLM(
-            config=config.text_config,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "language"),
-        )
+        self.model = self._build_language_model(config, quant_config, prefix)
 
         self.sam_model = build_sam_vit_b()
         self.vision_model = build_clip_l()
@@ -92,6 +88,13 @@ class UnlimitedOCRForCausalLM(nn.Module):
         )
 
         self.image_token_id = None
+
+    def _build_language_model(self, config, quant_config, prefix):
+        return DeepseekForCausalLM(
+            config=config.text_config,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "language"),
+        )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         """Return the sliding window size from the model config, or None."""

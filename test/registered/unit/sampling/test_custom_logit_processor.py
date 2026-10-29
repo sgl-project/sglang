@@ -404,6 +404,45 @@ class TestThinkingBudgetLogitProcessor(CustomTestCase):
 
 # DeepseekOCRNoRepeatNGramLogitProcessor
 class TestDeepseekOCRNoRepeatNGramLogitProcessor(CustomTestCase):
+    def test_window_tail_preserves_ngrams_crossing_the_prompt_boundary(self):
+        """Trimming history must retain prompt/output boundary n-grams and window limits."""
+        prompt = [9] * 10000 + [2, 3, 4, 2]
+        output = [3, 4, 2, 3]
+        for output_only in (False, True):
+            for ngram_size in (1, 2, 3, 5):
+                for window_size in (1, 3, 6, 16):
+                    with self.subTest(
+                        output_only=output_only, n=ngram_size, window=window_size
+                    ):
+                        sequence = output if output_only else prompt + output
+                        ngrams = zip(*(sequence[i:] for i in range(ngram_size)))
+                        prefix = (
+                            tuple(sequence[-(ngram_size - 1) :])
+                            if ngram_size > 1
+                            else ()
+                        )
+                        banned = {
+                            gram[-1]
+                            for i, gram in enumerate(ngrams)
+                            if i >= len(sequence) - window_size and gram[:-1] == prefix
+                        } - {4}
+                        logits = self.processor(
+                            self._logits(),
+                            [
+                                {
+                                    "__req__": _make_req(prompt, output),
+                                    "ngram_size": ngram_size,
+                                    "window_size": window_size,
+                                    NGRAM_OUTPUT_ONLY_KEY: output_only,
+                                    "whitelist_token_ids": [4],
+                                }
+                            ],
+                        )
+                        self.assertEqual(
+                            set(torch.isneginf(logits[0]).nonzero().flatten().tolist()),
+                            banned,
+                        )
+
     VOCAB = 100
 
     def setUp(self):
