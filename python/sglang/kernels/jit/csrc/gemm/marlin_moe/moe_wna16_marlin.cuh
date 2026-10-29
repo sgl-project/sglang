@@ -571,12 +571,13 @@ exec_config_t determine_exec_config(
             max_shared_mem / (cache_size + kSharedMemoryValidityMargin + kSharedMemoryLaunchReserve));
     allow_count = max(min(allow_count, thread_m_blocks == 1 ? 4 : 2), 1);
 
-    if (thread_m_blocks > 1) {
-      int problem_blocks = prob_n / th_config.thread_n * prob_m * top_k * 4;
-      if (problem_blocks < sms * allow_count) {
-        allow_count = max(problem_blocks / sms, 1);
-      }
-    }
+    // The split-K reduction chains blocks through a global lock array
+    // (barrier_acquire/barrier_release in marlin_template.h). That protocol is
+    // only correct with a single resident block per SM: with more than one, the
+    // accumulation of the partial sums is nondeterministic and a few output rows
+    // are silently corrupted (sgl-project/sglang#44999).
+    allow_count = 1;
+    (void)sms;
 
     if (allow_count > count) {
       count = allow_count;
