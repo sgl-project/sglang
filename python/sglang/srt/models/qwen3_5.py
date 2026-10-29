@@ -1802,6 +1802,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.hidden_size = config.hidden_size
         self.pp_group = get_parallel().pp_group
 
+        if quant_config is not None:
+            quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
+
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
         # Embedding layer
