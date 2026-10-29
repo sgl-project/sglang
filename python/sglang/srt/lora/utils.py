@@ -635,27 +635,34 @@ def build_lm_head_pass_segments(
     Returns:
         List of (seg_weight_indices, seg_lens) tuples, one per pass.
     """
-    # Expand to per-token weight index
-    token_wi: List[int] = []
-    for wi, pl in zip(weight_indices, pruned_lens):
-        token_wi.extend([wi] * pl)
-    total = len(token_wi)
-    num_passes = (total + logprobs_chunk_size - 1) // logprobs_chunk_size
+    if logprobs_chunk_size <= 0:
+        raise ValueError(
+            f"logprobs_chunk_size must be positive, got {logprobs_chunk_size}"
+        )
 
     result: List[Tuple[List[int], List[int]]] = []
-    for i in range(num_passes):
-        start = i * logprobs_chunk_size
-        end = min((i + 1) * logprobs_chunk_size, total)
+    seg_wi: List[int] = []
+    seg_lens: List[int] = []
+    room = logprobs_chunk_size
 
-        # Run-length encode the pass's adapter indices
-        seg_wi: List[int] = []
-        seg_lens: List[int] = []
-        for t in range(start, end):
-            if seg_wi and seg_wi[-1] == token_wi[t]:
-                seg_lens[-1] += 1
+    for wi, pl in zip(weight_indices, pruned_lens):
+        remaining = pl
+        while remaining > 0:
+            take = min(remaining, room)
+            if seg_wi and seg_wi[-1] == wi:
+                seg_lens[-1] += take
             else:
-                seg_wi.append(token_wi[t])
-                seg_lens.append(1)
+                seg_wi.append(wi)
+                seg_lens.append(take)
+            remaining -= take
+            room -= take
+            if room == 0:
+                result.append((seg_wi, seg_lens))
+                seg_wi = []
+                seg_lens = []
+                room = logprobs_chunk_size
+
+    if seg_wi:
         result.append((seg_wi, seg_lens))
 
     return result
