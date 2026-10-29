@@ -338,9 +338,6 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
             ttft_observed=False,
             last_completion_tokens=1,
             finished=False,
-            request_stats=SimpleNamespace(
-                prompt_tokens=100, cached_tokens=0, cached_tokens_details=None
-            ),
             time_stats=SimpleNamespace(
                 get_first_token_latency=lambda: 0.2,
                 get_interval=lambda: 0.2,
@@ -348,6 +345,9 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
                 get_time_per_output_token=lambda completion_tokens: None,
                 set_last_time=lambda: None,
             ),
+        )
+        request_stats = SimpleNamespace(
+            prompt_tokens=100, cached_tokens=0, cached_tokens_details=None
         )
         for j, count in enumerate(completion_tokens):
             last = j == len(completion_tokens) - 1
@@ -357,7 +357,7 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
             )
             if count is not None:
                 recv.completion_tokens = [count]
-            TokenizerManager.collect_metrics(manager, state, recv, 0)
+            TokenizerManager.collect_metrics(manager, state, recv, 0, request_stats)
         return collector
 
     def _itl_samples(self, collector):

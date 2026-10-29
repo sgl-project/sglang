@@ -267,9 +267,6 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 )
 
 
-_NO_SCHEDULER_TIME_STATS = SchedulerOutputTimeStats()
-
-
 @dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
@@ -321,11 +318,6 @@ class ReqState:
         ):
             self.request_stats = new_request_stats
         return self.request_stats
-
-    @property
-    def scheduler_time_stats(self) -> SchedulerOutputTimeStats:
-        # Embedding requests, and requests whose own metrics are off, carry none.
-        return self.request_stats.time_stats or _NO_SCHEDULER_TIME_STATS
 
     def get_crash_dump_output(self) -> Dict[Any, Any]:
         out = {}
@@ -472,6 +464,16 @@ class InputFormat(Enum):
     SINGLE_STRING = 1  # Regular single text like "Hello world"
     BATCH_STRINGS = 2  # Regular batch like ["Hello", "World"]
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
+
+
+_NO_SCHEDULER_TIME_STATS = SchedulerOutputTimeStats()
+
+
+def _scheduler_time_stats(
+    request_stats: RequestOutputStats,
+) -> SchedulerOutputTimeStats:
+    # Embedding requests, and requests whose own metrics are off, carry none.
+    return request_stats.time_stats or _NO_SCHEDULER_TIME_STATS
 
 
 _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
@@ -2543,7 +2545,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             }
 
             if self.enable_metrics:
-                meta_info.update(state.scheduler_time_stats.to_meta_info())
+                meta_info.update(_scheduler_time_stats(request_stats).to_meta_info())
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
@@ -2752,13 +2754,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state.time_stats.first_token_time == 0.0:
                 first_output_time = time.perf_counter()
                 state.time_stats.set_first_token_time(
-                    ts=self._get_scheduler_first_token_time(state) or first_output_time
+                    ts=self._get_scheduler_first_token_time(state, request_stats)
+                    or first_output_time
                 )
                 state.time_stats.set_last_time(ts=first_output_time)
 
             if state.finished:
                 span_attrs = (
-                    self.convert_to_span_attrs(state, recv_obj, i)
+                    self.convert_to_span_attrs(state, recv_obj, i, request_stats)
                     if state.time_stats.trace_ctx.tracing_enable
                     else None
                 )
@@ -2796,7 +2799,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     await asyncio.sleep(0)
 
             if self.enable_metrics and state.obj.log_metrics:
-                self.collect_metrics(state, recv_obj, i)
+                self.collect_metrics(state, recv_obj, i, request_stats)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
@@ -2807,11 +2810,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             s.event.set()
 
     @staticmethod
-    def _get_scheduler_first_token_time(state: ReqState) -> Optional[float]:
+    def _get_scheduler_first_token_time(
+        state: ReqState, request_stats: RequestOutputStats
+    ) -> Optional[float]:
         # Non-streaming outputs are batched; use the scheduler's first-token time.
         if getattr(state.obj, "stream", False):
             return None
-        stamp = state.scheduler_time_stats.prefill_finished_time
+        stamp = _scheduler_time_stats(request_stats).prefill_finished_time
         if stamp is None:
             return None
         ts = convert_realtime_to_time(stamp)
@@ -3227,7 +3232,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or obj.sampling_params.get("structural_tag", None)
         )
 
-    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
+    def collect_metrics(
+        self,
+        state: ReqState,
+        recv_obj: BatchStrOutput,
+        i: int,
+        request_stats: RequestOutputStats,
+    ):
         completion_tokens = (
             recv_obj.completion_tokens[i]
             if getattr(recv_obj, "completion_tokens", None)
@@ -3287,7 +3298,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else None
             )
 
-            request_stats = state.request_stats
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 request_stats.prompt_tokens,
@@ -3954,6 +3964,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchTokenIDOutput,
         ],
         i: int,
+        request_stats: RequestOutputStats,
     ) -> Dict[str, Any]:
         """Convert attributes to span attributes."""
         span_attrs = {}
@@ -3966,7 +3977,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             span_attrs[SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = (
                 recv_obj.completion_tokens[i]
             )
-        request_stats = state.request_stats
         span_attrs[SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS] = (
             request_stats.prompt_tokens
         )
