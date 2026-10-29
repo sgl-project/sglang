@@ -1,8 +1,8 @@
 //! OpenAI Chat Completions endpoint and chat-template preparation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     Json, Router,
@@ -39,7 +39,10 @@ use super::completions::completion_usage;
 use super::lowered;
 use super::pd_routing::PDRoutingFields;
 use super::template::{RenderedChat, render_chat};
-use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
+use super::tools::{
+    apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls,
+    tool_call_finish_reason,
+};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
     indexed_decode_stream, model_error, openai_error, submit_generation, unix_seconds_u32,
@@ -639,10 +642,7 @@ pub(super) async fn unary_chat(
                     parallel_tool_calls,
                 )
                 .await;
-                let finish_reason = match tool_calls {
-                    Some(_) => Some(OpenAIFinishReason::ToolCalls),
-                    None => finish_reason,
-                };
+                let finish_reason = tool_call_finish_reason(&output, tool_calls.is_some());
                 (reasoning_text, content, tool_calls, finish_reason)
             }
         };
@@ -697,6 +697,10 @@ pub(super) fn chat_event_stream(
     service_tier: Option<ChatServiceTier>,
 ) -> impl futures::Stream<Item = String> {
     let count = submitted.len();
+    // The tool-call stream promotes any stop with tool calls to `tool_calls`;
+    // a choice that ended in an abort did not finish its turn.
+    let aborted = Arc::new(Mutex::new(HashSet::new()));
+    let aborted_in_raw = aborted.clone();
     let (reasoning_parser, reasoning_options, parser, tools, deepseek) = match parsing {
         OutputParsing::Text {
             reasoning_parser,
@@ -780,6 +784,9 @@ pub(super) fn chat_event_stream(
             }
             completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
             let mut finish_reason = chat_finish_reason(&output);
+            if output.finish_reason.as_ref().and_then(|reason| reason.kind_name()) == Some("abort") {
+                aborted_in_raw.lock().unwrap().insert(u32::try_from(index).unwrap_or(u32::MAX));
+            }
             let mut emitted = Vec::with_capacity(2);
             if let Some(parser) = deepseek_parsers.get_mut(index) {
                 let finish = finish_reason.map(|_| deepseek_finish(output.finish_reason.as_ref()));
@@ -928,6 +935,13 @@ pub(super) fn chat_event_stream(
         futures::pin_mut!(parsed);
         while let Some(mut item) = parsed.next().await {
             if let Some(response) = item.data.as_mut() {
+                for choice in &mut response.choices {
+                    if choice.finish_reason == Some(OpenAIFinishReason::ToolCalls)
+                        && aborted.lock().unwrap().contains(&choice.index)
+                    {
+                        choice.finish_reason = Some(OpenAIFinishReason::Stop);
+                    }
+                }
                 // recipe's calls pass whole, as Python's recipe path passes them.
                 if !parallel_tool_calls && !recipe_parses {
                     for choice in &mut response.choices {
@@ -1668,10 +1682,13 @@ mod tests {
         use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
         use crate::message::config::ServerArgs;
         use crate::message::request::RequestKind;
+        use crate::message::response::ResponseItem;
         use crate::tokenizer_manager::wiring::TmEvent;
         use std::sync::Arc;
 
-        for stream in [false, true] {
+        // An aborted turn's tool calls are not promoted to `tool_calls`.
+        for (stream, abort) in [(false, false), (true, false), (false, true), (true, true)] {
+            let expected = if abort { "stop" } else { "tool_calls" };
             let args = Arc::new(ServerArgs {
                 served_model_name: "model".into(),
                 tool_call_parser: Some("kimi_k3".into()),
@@ -1721,8 +1738,16 @@ mod tests {
                         .unwrap()
                         .contains("lookup")
                 );
-                request.sink.try_send(chunk(request.rid.as_str(),
-                    "<|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>", true)).unwrap();
+                let mut item = chunk(
+                    request.rid.as_str(),
+                    "<|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>",
+                    true,
+                );
+                if abort && let ResponseItem::Done(output) = &mut item {
+                    output.finish_reason =
+                        Some(serde_json::from_value(serde_json::json!({"type": "abort"})).unwrap());
+                }
+                request.sink.try_send(item).unwrap();
             });
             let response = post_json(super::super::routes().with_state(state), "/v1/chat/completions", serde_json::json!({
                 "model":"model", "stream":stream,
@@ -1752,19 +1777,19 @@ mod tests {
                     ),
                     "{text}"
                 );
-                assert!(
-                    frames
-                        .iter()
-                        .any(|frame| frame["choices"][0]["finish_reason"] == "tool_calls"),
-                    "{text}"
-                );
+                let finishes: Vec<_> = frames
+                    .iter()
+                    .map(|frame| &frame["choices"][0]["finish_reason"])
+                    .filter(|reason| !reason.is_null())
+                    .collect();
+                assert_eq!(finishes, [expected], "{text}");
             } else {
                 let body = body_json(response).await;
                 assert_eq!(
                     body["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "lookup",
                     "{body}"
                 );
-                assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+                assert_eq!(body["choices"][0]["finish_reason"], expected);
             }
             responder.await.unwrap();
         }
