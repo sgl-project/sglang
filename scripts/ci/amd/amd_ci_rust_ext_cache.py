@@ -53,8 +53,14 @@ def _tree_core_supported() -> bool:
     )
 
 
-def export(dest: Path) -> int:
+def _load_tree_core(inspection: bool = False):
+    # Importing this module builds mem_cache, so it must stay inside the try.
     from sglang.srt.mem_cache.rust_tree_core.extension import load_tree_core_extension
+
+    return load_tree_core_extension(inspection=inspection)
+
+
+def export(dest: Path) -> int:
     from sglang.srt.rust_extensions import load_rust_extension
 
     builds = {
@@ -63,10 +69,8 @@ def export(dest: Path) -> int:
         ),
     }
     if _tree_core_supported():
-        builds["mem_cache"] = load_tree_core_extension
-        builds["mem_cache_inspection"] = lambda: load_tree_core_extension(
-            inspection=True
-        )
+        builds["mem_cache"] = _load_tree_core
+        builds["mem_cache_inspection"] = lambda: _load_tree_core(inspection=True)
     else:
         print("torch is outside the Rust TreeCore range; not building mem_cache")
 
