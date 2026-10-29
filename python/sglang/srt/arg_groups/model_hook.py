@@ -137,6 +137,18 @@ def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -
         logger.info("Disabled ROCm fp8 wo_a GEMM for checkpoint dtype %s", dtype)
 
 
+def _restrict_aiter_mxfp4_intermediate(model_arch: str | None) -> None:
+    if envs.AITER_MXFP4_INTERMEDIATE.get() and not (
+        get_platform().is_hip and model_arch == "Glm5NextForConditionalGeneration"
+    ):
+        logger.warning(
+            "AITER_MXFP4_INTERMEDIATE=1 is only supported for GLM-5.3-Flash on "
+            "ROCm; disabling it for %s.",
+            model_arch,
+        )
+        envs.AITER_MXFP4_INTERMEDIATE.set("0")
+
+
 def handle_model_specific_adjustments(server_args: Any):
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
@@ -160,6 +172,7 @@ def handle_model_specific_adjustments(server_args: Any):
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         # No model overrides for an instance connector: no hf_config to
         # key them on.
+        _restrict_aiter_mxfp4_intermediate(None)
         return
 
     model_config = model_config_of(server_args)
@@ -254,6 +267,8 @@ def handle_model_specific_adjustments(server_args: Any):
         )
 
         apply_glm5_next_spec_backend_defaults(server_args)
+
+    _restrict_aiter_mxfp4_intermediate(model_arch)
 
     if model_arch in [
         "DeepseekV4ForCausalLM",
