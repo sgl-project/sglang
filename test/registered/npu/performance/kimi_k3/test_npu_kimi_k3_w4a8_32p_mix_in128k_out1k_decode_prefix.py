@@ -70,13 +70,12 @@ KIMI_K3_W4A8_32P_ENVS = {
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
     # Low-latency decode tier: LONG_SEQ_ROUND 2 is what the dev 25.9 ms C12
     # TPOT was measured with (ROUND 64 is a throughput-oriented setting and
-    # wrong here). HCCL_BUFFSIZE 2000 is the CI-proven value (runs 11-15);
-    # the pure dev trio (HCCL 200 + DEEPEP 1800 + ROUND 2) never got judged
-    # in the CI pod - run 40507429709 crashed the DeepEP combine tiling with
-    # it, and run 40832348108 was cancelled before capture. If HCCL 2000 +
-    # DEEPEP 1800 + ROUND 2 still crashes the tiling, drop DEEPEP_HCCL_BUFFSIZE next.
+    # wrong here). No DEEPEP_HCCL_BUFFSIZE: the combine-tiling bisect is now
+    # conclusive - HCCL 2000 without it captures fine (run 40820212836),
+    # while HCCL 200 and HCCL 2000 both crash aclnnMoeLowLatencyCombineV2
+    # EZ1008 WITH it (runs 40507429709, 40850443874). The dev bare-metal
+    # 1800 value is not viable in the CI pod.
     "HCCL_BUFFSIZE": "2000",
-    "DEEPEP_HCCL_BUFFSIZE": "1800",
     "DEEP_NORMAL_LONG_SEQ_ROUND": "2",
     "DEEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
     "HCCL_OP_EXPANSION_MODE": "AIV",
