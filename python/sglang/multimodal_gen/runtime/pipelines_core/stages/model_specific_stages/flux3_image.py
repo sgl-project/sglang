@@ -261,17 +261,20 @@ def exact_vae_convolutions(exact: bool):
     MIOpen's default fp32 convolution kernels are not run-to-run deterministic
     for some VAE shapes, so the same reference encodes to slightly different
     latents on each request. Restrict MIOpen to deterministic kernels for the
-    call; other platforms are unchanged.
+    call, and turn off benchmark mode (``SGLANG_USE_ROCM_CUDNN_BENCHMARK``) so
+    the kernel is not picked by timing. Both flags are restored afterwards;
+    other platforms are unchanged.
     """
     if not (exact and current_platform.is_hip()):
         yield
         return
-    previous = torch.backends.cudnn.deterministic
-    torch.backends.cudnn.deterministic = True
+    cudnn = torch.backends.cudnn
+    previous = cudnn.deterministic, cudnn.benchmark
+    cudnn.deterministic, cudnn.benchmark = True, False
     try:
         yield
     finally:
-        torch.backends.cudnn.deterministic = previous
+        cudnn.deterministic, cudnn.benchmark = previous
 
 
 def vae_encode(vae, image: Tensor) -> tuple[Tensor, Tensor]:
