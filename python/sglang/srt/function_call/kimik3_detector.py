@@ -231,11 +231,12 @@ class KimiK3Detector(BaseFormatDetector):
                 )
             else:
                 last_end = max(match.end() for match in _CALL_RE.finditer(section))
-                if CALL_OPEN in section[last_end:]:
+                tail = section[last_end:].split(self.eot_token, 1)[0]
+                if CALL_OPEN in tail or partial_suffix_len(tail, [CALL_OPEN]):
                     logger.warning(
-                        "Kimi K3 tools section ended with an incomplete tool call; "
+                        "Kimi K3 tools section ended with an incomplete tool call or marker; "
                         "dropping %d buffered chars after the last complete call",
-                        len(section) - last_end,
+                        len(tail),
                     )
             return StreamingParseResult()
         pending = self._emit_normal_text(limit=len(self._buffer))

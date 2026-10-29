@@ -8,6 +8,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
+    CALL_OPEN,
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
@@ -251,6 +252,22 @@ def test_detector_capabilities_and_registration() -> None:
 
 
 class TestTrailingIncompleteCall(CustomTestCase):
+    def test_partial_next_opener_is_reported_at_each_cutoff(self):
+        """A generation cutoff inside the next opener must not hide truncation."""
+        first = _call_block("probe", 1, {"count": ("number", "1")})
+        for size in [1, 7, 23, 10000]:
+            for cutoff in range(1, len(CALL_OPEN) + 1):
+                with self.subTest(size=size, cutoff=cutoff):
+                    detector = KimiK3Detector()
+                    wire = TOOLS_OPEN + first + CALL_OPEN[:cutoff]
+                    _, calls = _stream(detector, _chunks(wire, size), [])
+                    assert len(calls) == 1
+                    assert json.loads(calls[0].parameters) == {"count": 1}
+                    with self.assertLogs(
+                        "sglang.srt.function_call.kimik3_detector", level="WARNING"
+                    ):
+                        assert detector.finish([]).calls == []
+
     def test_completed_call_does_not_hide_truncation(self):
         """Report an unfinished call even when a preceding call was emitted."""
         first = _call_block("probe", 1, {"count": ("number", "1")})
@@ -276,13 +293,22 @@ class TestTrailingIncompleteCall(CustomTestCase):
         """A completed tools section must not trigger the new tail warning."""
         first = _call_block("probe", 1, {"count": ("number", "1")})
         for size in [1, 7, 23, 10000]:
-            with self.subTest(size=size):
-                detector = KimiK3Detector()
-                _stream(detector, _chunks(TOOLS_OPEN + first + TOOLS_CLOSE, size), [])
-                with self.assertNoLogs(
-                    "sglang.srt.function_call.kimik3_detector", level="WARNING"
-                ):
-                    assert detector.finish([]).calls == []
+            for suffix in [
+                "",
+                TOOLS_CLOSE,
+                TOOLS_CLOSE + "<|open|>",
+                TOOLS_CLOSE + "<|open|>ca",
+            ]:
+                with self.subTest(size=size, suffix=suffix):
+                    detector = KimiK3Detector()
+                    _, calls = _stream(
+                        detector, _chunks(TOOLS_OPEN + first + suffix, size), []
+                    )
+                    assert len(calls) == 1
+                    with self.assertNoLogs(
+                        "sglang.srt.function_call.kimik3_detector", level="WARNING"
+                    ):
+                        assert detector.finish([]).calls == []
 
 
 if __name__ == "__main__":
