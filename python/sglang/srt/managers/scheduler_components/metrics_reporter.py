@@ -16,6 +16,8 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.forward_pass_metrics import (
     ScheduledRequestMetrics,
     WelfordAccumulator,
@@ -60,6 +62,7 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 _SPEC_DECODE_SNAPSHOT_ALGORITHMS = (
     SpeculativeAlgorithm.EAGLE,
     SpeculativeAlgorithm.EAGLE3,
+    SpeculativeAlgorithm.DFLASH,
     SpeculativeAlgorithm.DSPARK,
 )
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
@@ -1237,6 +1240,22 @@ class SchedulerMetricsReporter:
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
 
+        mamba_host_pool = None
+        if (
+            isinstance(self.scheduler.tree_cache, UnifiedRadixCache)
+            and self.scheduler.tree_cache.host_pool_group is not None
+        ):
+            entry = self.scheduler.tree_cache.host_pool_group.entry_map.get(
+                PoolName.MAMBA
+            )
+            mamba_host_pool = None if entry is None else entry.host_pool
+        if mamba_host_pool is not None:
+            mamba_total = mamba_host_pool.logical_size
+            self.stats.hicache_host_mamba_used_states = (
+                mamba_total - mamba_host_pool.available_size()
+            )
+            self.stats.hicache_host_mamba_total_states = mamba_total
+
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""
         if not self.scheduler.enable_lora:
@@ -1251,17 +1270,16 @@ class SchedulerMetricsReporter:
             mem_pool = lora_manager.memory_pool
             slots_total = mem_pool.max_loras_per_batch
 
-            # Calculate active adapters from running batch
-            # This gives a true measure of current load for autoscaling purposes
+            # Count active adapters, not idle adapters cached in the pool.
             active_lora_ids = set()
 
-            # For PP mode, check all running micro batches
+            # Include prefills not yet merged into their running microbatches.
             if get_parallel().pp_size > 1:
-                for batch in self.scheduler.running_mbs:
-                    if batch and hasattr(batch, "reqs"):
-                        for req in batch.reqs:
-                            if hasattr(req, "lora_id") and req.lora_id is not None:
-                                active_lora_ids.add(req.lora_id)
+                active_lora_ids.update(
+                    req.lora_id
+                    for req in self.scheduler._get_all_pp_reqs()
+                    if req.lora_id is not None
+                )
             # For normal mode, check running_batch
             elif self.scheduler.running_batch:
                 if hasattr(self.scheduler.running_batch, "reqs"):
@@ -1441,6 +1459,18 @@ class SchedulerMetricsReporter:
         self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
             host_reqs, priority_enabled
         )
+        full_tokens, swa_tokens = (
+            self.scheduler.disagg_decode_prealloc_queue.pre_allocated_token_counts()
+        )
+        pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
+        self.stats.prealloc_full_token_usage = (
+            full_tokens / pool_stats.full_capacity if pool_stats.full_capacity else 0.0
+        )
+        self.stats.prealloc_swa_token_usage = (
+            swa_tokens / pool_stats.swa_capacity
+            if pool_stats.is_hybrid_swa and pool_stats.swa_capacity
+            else 0.0
+        )
 
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""
@@ -1495,4 +1525,7 @@ class SchedulerMetricsReporter:
             )
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(priority_enabled)
+        # Host pools change without a batch (e.g. /flush_cache); refresh before
+        # publishing so the gauges do not hold the last batch's values.
+        self._log_hicache_stats()
         self.metrics_collector.log_stats(self.stats)

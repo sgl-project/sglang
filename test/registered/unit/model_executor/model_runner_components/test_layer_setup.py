@@ -5,15 +5,19 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from torch import nn
+
 from sglang.srt.distributed.utils import get_pp_indices
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    check_layer_types_hybrid_swa_split,
     compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestComputeAttentionAndMoeLayers(CustomTestCase):
@@ -126,7 +130,7 @@ class TestResolveHybridSWALayerIds(CustomTestCase):
                     is_draft_worker=True,
                     draft_model_idx=depth,
                 )
-                self.assertTrue(layer_info.is_hybrid_swa_mtp_draft)
+                self.assertTrue(layer_info.draft_owns_its_depth)
                 self.assertEqual(layer_info.swa_attention_layer_ids, swa)
                 self.assertEqual(layer_info.full_attention_layer_ids, full)
 
@@ -143,9 +147,52 @@ class TestResolveHybridSWALayerIds(CustomTestCase):
             draft_model_idx=1,
         )
 
-        self.assertFalse(layer_info.is_hybrid_swa_mtp_draft)
+        self.assertFalse(layer_info.draft_owns_its_depth)
         self.assertEqual(layer_info.swa_attention_layer_ids, [0])
         self.assertEqual(layer_info.full_attention_layer_ids, [])
+
+
+def _attention_layers(windows):
+    """A model whose RadixAttention layers have the given {layer_id: window}."""
+    model = nn.Module()
+    model.layers = nn.ModuleList(
+        RadixAttention(
+            num_heads=1,
+            head_dim=8,
+            scaling=1.0,
+            num_kv_heads=1,
+            layer_id=layer_id,
+            sliding_window_size=window,
+        )
+        for layer_id, window in windows.items()
+    )
+    return model
+
+
+class TestCheckLayerTypesHybridSWASplit(CustomTestCase):
+    def test_accepts_the_windows_the_model_builds(self):
+        model = _attention_layers(
+            {i: 4095 if i in GLOBAL_SWA_IDS else -1 for i in range(NUM_LAYERS)}
+        )
+        check_layer_types_hybrid_swa_split(
+            model=model, model_config=_hybrid_swa_model_config()
+        )
+
+    def test_rejects_layers_whose_attention_disagrees(self):
+        # Layer 0 should slide but attends fully; layer 1 should not slide.
+        model = _attention_layers({0: -1, 1: 4095, 2: 4095, 3: -1})
+        with self.assertRaisesRegex(
+            ValueError, r"layers \[0, 1\] .*--disable-hybrid-swa-memory"
+        ):
+            check_layer_types_hybrid_swa_split(
+                model=model, model_config=_hybrid_swa_model_config()
+            )
+
+    def test_checks_the_layers_one_pipeline_stage_builds(self):
+        model = _attention_layers({34: 4095, 35: -1})
+        check_layer_types_hybrid_swa_split(
+            model=model, model_config=_hybrid_swa_model_config()
+        )
 
 
 if __name__ == "__main__":
