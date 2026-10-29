@@ -171,6 +171,10 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Set the worker's health status
     fn set_healthy(&self, healthy: bool);
 
+    /// Stop publishing per-worker gauges once the worker is removed from the registry,
+    /// so in-flight requests and health checks cannot overwrite the removal values.
+    fn retire_metrics(&self);
+
     /// Perform an async health check on the worker
     async fn check_health_async(&self) -> WorkerResult<()>;
 
@@ -653,6 +657,7 @@ pub struct BasicWorker {
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
+    pub metrics_retired: Arc<AtomicBool>,
     pub consecutive_failures: Arc<AtomicUsize>,
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
@@ -698,6 +703,9 @@ impl BasicWorker {
     }
 
     fn update_running_requests_metrics(&self) {
+        if self.metrics_retired.load(Ordering::Acquire) {
+            return;
+        }
         let load = self.load();
         Metrics::set_worker_requests_active(self.url(), load);
     }
@@ -727,7 +735,14 @@ impl Worker for BasicWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Release);
-        Metrics::set_worker_health(self.url(), healthy);
+        if !self.metrics_retired.load(Ordering::Acquire) {
+            Metrics::set_worker_health(self.url(), healthy);
+        }
+    }
+
+    fn retire_metrics(&self) {
+        self.metrics_retired.store(true, Ordering::Release);
+        self.circuit_breaker.retire_metrics();
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -1045,6 +1060,10 @@ impl Worker for DPAwareWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.base_worker.set_healthy(healthy);
+    }
+
+    fn retire_metrics(&self) {
+        self.base_worker.retire_metrics();
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
