@@ -299,6 +299,12 @@ class DSAIndexerPoolHost(HostKVCache):
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
+                # Direct copies can coalesce all indexer pages in one layer.
+                registration_granularity_bytes=(
+                    self.indexer_page_num
+                    * self.indexer_page_stride_size
+                    * self.indexer_dtype.itemsize
+                ),
             )
             self.index_k_data_refs = [
                 self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
