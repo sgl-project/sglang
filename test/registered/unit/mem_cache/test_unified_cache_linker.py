@@ -502,6 +502,52 @@ class TestUnifiedCacheLinkerPythonBackend(
         (kv_lookup,) = transfers
         self.assertEqual(kv_lookup.keys, kv_offload.keys[2:])
 
+    def test_offload_skips_prefix_stored_by_prefill(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        cache, allocator, req_pool = build_fixture(cfg)
+        linker = _InMemoryUnifiedCacheLinker()
+        cache.init_cache_linker(linker)
+        tokens = list(range(1, 9))
+
+        with cache.linker.prefill_stored_prefix(4):
+            inserted = self._insert(cache, allocator, req_pool, tokens)
+        self.assertEqual(cache.linker.stored_prefix_len, 0)
+        (kv_offload,) = linker.offload_calls[0]
+        node = inserted.last_device_node
+        self.assertEqual(kv_offload.keys, cache.tree_core.get_hash_values(node)[2:])
+        self.assertTrue(
+            torch.equal(
+                kv_offload.device_indices,
+                node_device_value(cache, node, ComponentType.FULL)[4:],
+            )
+        )
+        linker.complete_next_offload(True)
+        cache.check_hicache_events()
+        self.assertTrue(cache.tree_core.is_external_cache_stored(node))
+
+    def test_node_inside_prefill_stored_prefix_is_marked_stored(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        cache, allocator, req_pool = build_fixture(cfg)
+        linker = _InMemoryUnifiedCacheLinker()
+        cache.init_cache_linker(linker)
+        tokens = list(range(1, 9))
+
+        with cache.linker.prefill_stored_prefix(4):
+            prompt = self._insert(cache, allocator, req_pool, tokens[:4])
+        self.assertEqual(linker.offload_calls, [])
+        self.assertTrue(
+            cache.tree_core.is_external_cache_stored(prompt.last_device_node)
+        )
+
+        full = self._insert(cache, allocator, req_pool, tokens)
+        (kv_offload,) = linker.offload_calls[0]
+        self.assertEqual(
+            kv_offload.keys, cache.tree_core.get_hash_values(full.last_device_node)
+        )
+        self.assertEqual(len(kv_offload.keys), 2)
+
     def test_decode_match_skips_linker_lookup(self):
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg
