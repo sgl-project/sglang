@@ -364,7 +364,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         second_per_grid_ts=None,
         **kwargs,
     ):
-        from sglang.srt.layers.rotary_embedding.mrope_rope_index import get_rope_index
+        from sglang.srt.multimodal.mrope_rope_index import get_rope_index
 
         return get_rope_index(
             spatial_merge_size,
@@ -393,7 +393,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         second_per_grid_ts=None,
         **kwargs,
     ):
-        from sglang.srt.layers.rotary_embedding.mrope_rope_index import (
+        from sglang.srt.multimodal.mrope_rope_index import (
             get_rope_index_qwen3_omni,
         )
 
@@ -414,7 +414,7 @@ class MRotaryEmbedding(RotaryEmbedding):
     def get_rope_index_glm4v(
         input_ids, hf_config, image_grid_thw, video_grid_thw, attention_mask, **kwargs
     ):
-        from sglang.srt.layers.rotary_embedding.mrope_rope_index import (
+        from sglang.srt.multimodal.mrope_rope_index import (
             get_rope_index_glm4v,
         )
 
@@ -431,7 +431,7 @@ class MRotaryEmbedding(RotaryEmbedding):
     def get_rope_index_ernie45(
         input_ids, hf_config, image_grid_thw, video_grid_thw, **kwargs
     ):
-        from sglang.srt.layers.rotary_embedding.mrope_rope_index import (
+        from sglang.srt.multimodal.mrope_rope_index import (
             get_rope_index_ernie45,
         )
 
