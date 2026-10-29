@@ -14,6 +14,7 @@ from sglang.kernels.ops.lora.dense.chunked_sgmv_shrink import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import (
+    MIN_CHUNK_SIZE,
     LoRABatchInfo,
     generate_sequence_lengths,
     get_batch_token_counts,
@@ -23,8 +24,6 @@ from sglang.srt.lora.utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_lora
 from sglang.srt.server_args import ServerArgs
-
-MIN_CHUNK_SIZE = 16
 
 
 class ChunkedSgmvLoRABackend(BaseLoRABackend):
@@ -219,7 +218,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             torch.cumsum(seg_lens, dim=0, out=indptr[1:])
         return indptr
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,

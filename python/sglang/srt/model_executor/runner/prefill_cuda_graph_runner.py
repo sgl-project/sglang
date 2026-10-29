@@ -74,6 +74,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
@@ -979,12 +980,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
         # the same replay path. Sparse-DP batches (one or more ranks with
         # zero local tokens) fall back to eager to avoid hanging ranks.
-        # MegaMoE graphs without a captured DP gather tolerate per-rank buckets
-        # and an eager idle rank; graphs with one fall through to the check.
+        # MegaMoE graphs without a captured DP gather or rank barrier tolerate
+        # per-rank buckets and an eager idle rank; others fall through.
         global_num_tokens = forward_batch.global_num_tokens_cpu
         if global_num_tokens is None:
             return False
-        if prefill_graph_tolerates_sum_len():
+        if (
+            prefill_graph_tolerates_sum_len()
+            and not get_flags().dp.prefill_graph_has_rank_barrier
+        ):
             return False
         return len(global_num_tokens) > 1 and any(
             int(num_tokens) == 0 for num_tokens in global_num_tokens
@@ -1289,8 +1293,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.input_ids = static_forward_batch.input_ids
             attn_backend.init_forward_metadata_out_graph(padded_view)
         elif not self.use_captured_attn_metadata:
-            attn_backend.init_forward_metadata(forward_batch)
-            build_snapshot = True
+            # An idle DP rank retains the padded graph shape for collective
+            # participation, but has no real sparse queries or KV writes.
+            if not (
+                attn_backend.skips_prefill_metadata_on_idle_dp_rank
+                and getattr(forward_batch, "global_num_token_non_padded_cpu", None) == 0
+            ):
+                attn_backend.init_forward_metadata(forward_batch)
+                build_snapshot = True
         else:
             assert self.attn_metadata_buffers is not None
             metadata = self.attn_metadata_buffers[shape_key]
@@ -1657,7 +1667,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.prefill_backend_name == Backend.FULL
                 ),
             )
-            self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
+            self.model_runner.runner_ids.bind_runner_slots(forward_batch)
             ngram_manager = self.model_runner.ngram_embedding_manager
             if ngram_manager.enabled:
                 forward_batch.ngram_embedding_info = NgramEmbeddingInfo.create(
@@ -1785,6 +1795,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._init_forward_metadata_for_capture(forward_batch, shape_key)
 
         def run_once():
+            if forward_batch.lora_ids is not None:
+                self.model_runner.lora_manager.reset_routing_cache()
             # Record LoRA kernels even when capture uses base-model requests.
             with (
                 model_capture_mode()
@@ -1806,9 +1818,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(self.backend, BreakableCudaGraphBackend):
             post_warmup_hook = None
             req_pool = self.model_runner.req_to_token_pool
-            mamba_pool = getattr(req_pool, "mamba_pool", None)
+            mamba_pool = self.model_runner.token_to_kv_pool.layer_router.part_view(
+                STATE_PART
+            )
             if mamba_pool is not None and not prefix_num_chunks:
-                capture_state_indices = req_pool.translate_mamba_indices(
+                state_ids = self.model_runner.runner_ids.state_ids(
+                    req_pool.state_sub_pool
+                )
+                capture_state_indices = state_ids.ids(
                     req_pool.get_mamba_indices(forward_batch.req_pool_indices)
                 ).unique()
 
@@ -1980,6 +1997,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,
+            # CP replay plans attention against this static view, including
+            # KDA's host-side checkpoint plan for the current request.
+            mamba_prefill_track_mask_cpu=forward_batch.mamba_prefill_track_mask_cpu,
+            mamba_track_seqlens_cpu=forward_batch.mamba_track_seqlens_cpu,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=(
                 forward_batch.return_logprob
@@ -2029,14 +2050,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
             max_seq_len_override=self.max_context_size,
         )
-        forward_batch.kv_loc_plan.bind_replay(
+        forward_batch.iteration_ids.bind_replay(
             static_forward_batch,
-            self.model_runner.kv_index_translator,
+            self.model_runner.runner_ids,
             slots=out_cache_loc,
         )
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
         static_forward_batch.engram_history = forward_batch.engram_history
+        # The engram lookup break reads the staged rows at replay.
+        static_forward_batch.engram_staged_rows = forward_batch.engram_staged_rows
         # The encoder replay fold: a replay builds the same window floors and
         # compressor slots as an eager prefill.
         static_forward_batch.encoder_swa_replay = forward_batch.encoder_swa_replay
@@ -2279,6 +2302,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_states=(
                 output.hidden_states[: self.raw_num_tokens]
                 if output.hidden_states is not None
+                else None
+            ),
+            last_hidden_states=(
+                output.last_hidden_states[: self.raw_num_tokens]
+                if output.last_hidden_states is not None
                 else None
             ),
             input_token_logprobs=output.input_token_logprobs,

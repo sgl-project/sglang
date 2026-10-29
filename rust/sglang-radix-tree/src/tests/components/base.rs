@@ -1,5 +1,9 @@
 use super::*;
-use crate::components::{FULL, FullComponent, MAMBA, MambaComponent, SWA, SwaComponent};
+use crate::cache_action::{CacheAction, MambaEvictExcessPathStates};
+use crate::components::{
+    FULL, Family, FullComponent, MAMBA, MambaComponent, SWA, SwaComponent, native_family,
+};
+use crate::test_utils::expect_action;
 use crate::unified_tree_core::CacheInitParams;
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +27,10 @@ impl Default for DefaultComponentForTest {
 impl TreeComponent<Vec<i64>> for DefaultComponentForTest {
     fn component_type(&self) -> ComponentType {
         self.component_type
+    }
+
+    fn family(&self) -> Family {
+        native_family(self.component_type())
     }
 
     fn reclaimable_value_len(&self, node: &Node<Vec<i64>>) -> usize {
@@ -56,12 +64,12 @@ impl TreeComponent<Vec<i64>> for DefaultComponentForTest {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) -> (usize, usize) {
-        cache_actions.push(CacheAction::MambaEvictExcessPathStates {
+        cache_actions.push(Box::new(MambaEvictExcessPathStates {
             tail_node_id: tree_core.arena.node(node_id).id,
-        });
+        }));
         FullComponent.evict_component(
             tree_core,
             node_id,
@@ -82,7 +90,7 @@ impl TreeComponent<Vec<i64>> for DefaultComponentForTest {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         unimplemented!()
     }
@@ -234,13 +242,10 @@ fn action_node(
     node
 }
 
-fn action_node_ids(actions: &[CacheAction]) -> Vec<usize> {
+fn action_node_ids(actions: &[Box<dyn CacheAction>]) -> Vec<usize> {
     actions
         .iter()
-        .map(|action| match action {
-            CacheAction::MambaEvictExcessPathStates { tail_node_id } => *tail_node_id,
-            _ => panic!("unexpected component action"),
-        })
+        .map(|action| expect_action::<MambaEvictExcessPathStates>(action.as_ref()).tail_node_id)
         .collect()
 }
 

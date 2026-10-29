@@ -26,6 +26,7 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_deepep_mode,
     get_moe_a2a_backend,
+    get_moe_ascend_ops_config,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.kt_ep_wrapper import (
@@ -33,9 +34,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
-from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-    AscendTPDispatcher,
-)
+from sglang.srt.layers.moe.token_dispatcher.ascend_ops import AscendOpsDispatcher
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
@@ -60,11 +59,15 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsFusedMoEMethod,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
+from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4MoE
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -107,7 +110,11 @@ def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
         getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
         or (
             isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
-            and (runner_backend is None or not runner_backend.is_marlin())
+            # Marlin, or the LoRA MoE runner on its Marlin NVFP4 vendor.
+            and (
+                runner_backend is None
+                or not (runner_backend.is_marlin() or runner_backend.is_lora_marlin())
+            )
         )
         or (
             runner_backend is not None
@@ -164,14 +171,38 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
+def _validate_ascend_no_a2a_layout(moe_runner_config: MoeRunnerConfig) -> None:
+    """Reject the one layout the Ascend no-A2A routing cannot express.
+
+    The routing op indexes the checkpoint's full expert space, and the grouped
+    matmuls consume that same range, so every rank must hold all experts.
+    With ``ep_size > 1`` the community dispatcher rewrites the top-k ids to
+    rank-local ones while the Ascend kernels would still index the global
+    range; route that configuration to a backend that implements EP instead of
+    silently mismatching experts.
+    """
+    if get_parallel().dwdp_size > 1:
+        # DWDP collapses the EP view onto full weights after construction.
+        return
+    if moe_runner_config.num_local_experts == moe_runner_config.num_experts:
+        return
+    raise ValueError(
+        "Expert parallelism (ep_size > 1) is not supported on Ascend NPU with "
+        "--moe-a2a-backend none: that path runs the Ascend routing over the "
+        "full expert range on every rank, but this layer holds "
+        f"{moe_runner_config.num_local_experts} of "
+        f"{moe_runner_config.num_experts} experts. Use "
+        "--moe-a2a-backend deepep (or ascend_fuseep) for EP on NPU, or keep "
+        "ep_size=1."
+    )
+
+
 def create_moe_dispatcher(
     moe_runner_config: MoeRunnerConfig,
     quant_method: FusedMoEMethodBase,
 ) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none() and is_npu():
-        return AscendTPDispatcher(moe_runner_config)
-    elif (
+    if (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
         or a2a_backend.is_flashinfer_megamoe()
@@ -182,6 +213,12 @@ def create_moe_dispatcher(
         # StandardDispatcher is created but never invoked.
         # flashinfer_megamoe does its EP all-to-all inside the kernel, so the
         # dispatcher stays a pure noop passthrough.
+        # On NPU the no-A2A path is this same dispatcher: the Ascend routing
+        # (expert permutation with fused activation quantization, and the
+        # weighted unpermute) runs in the MoE runner's permute hooks, see
+        # moe_runner/ascend.py.
+        if _is_npu and a2a_backend.is_none():
+            _validate_ascend_no_a2a_layout(moe_runner_config)
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()
@@ -221,6 +258,8 @@ def create_moe_dispatcher(
                 else 128
             ),
         )
+    elif a2a_backend.is_ascend_ops():
+        return AscendOpsDispatcher(moe_runner_config, get_moe_ascend_ops_config())
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_parallel().tp_group.device_group,
@@ -341,6 +380,7 @@ class FusedMoE(torch.nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        serves_fused_mxfp4: bool = True,
         prefix: str = "",
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
@@ -366,6 +406,10 @@ class FusedMoE(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
 
         self.params_dtype = params_dtype
+        # False for a model whose loader keeps compressed-tensors' `weight_packed`
+        # expert names; Mxfp4MoEMethod's fused `w13_weight`/`w2_weight` cannot
+        # serve those, so such a model routes to a compressed-tensors MoE scheme.
+        self.serves_fused_mxfp4 = serves_fused_mxfp4
         self.layer_name = prefix
         self.layer_id = layer_id
         self.is_draft = get_flags().moe.in_speculative_scope
@@ -410,6 +454,7 @@ class FusedMoE(torch.nn.Module):
         # Set by the quant method when it repacks experts for MegaMoE.
         self._mega_moe_weights_built = False
         self._mega_moe_nvfp4 = False
+        self._mega_moe_trtllm_layout = False
         # Read at construction: draft_model_build_scope applies the draft's own value.
         self._mega_moe_w4a4 = get_exec().moe.enable_w4a4_mxfp4_megamoe
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
@@ -426,7 +471,11 @@ class FusedMoE(torch.nn.Module):
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
-        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+        # Unquantized BF16 LoRA uses DeepGEMM's resident weight layout.
+        self.use_deep_gemm = (
+            get_moe_runner_backend().is_deep_gemm()
+            or get_moe_runner_backend().is_lora()
+        )
 
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -529,6 +578,13 @@ class FusedMoE(torch.nn.Module):
             and isinstance(self.quant_method, Fp8MoEMethod)
             and self.quant_method.block_quant
         )
+        # Packed NVFP4 experts on the routed TRT-LLM runner also return the
+        # do_finalize=False triple; their compressed-tensors method holds the scheme.
+        packed_nvfp4_routed_deferred = (
+            isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+            and isinstance(self.scheme, MiniMaxM3Nvfp4MoE)
+            and self.scheme.use_flashinfer_trtllm
+        )
         qwen4_bf16_deferred = (
             isinstance(self.quant_method, UnquantizedFusedMoEMethod)
             and params_dtype == torch.bfloat16
@@ -561,7 +617,7 @@ class FusedMoE(torch.nn.Module):
             self.runner_backend is not None
             and self.runner_backend.is_flashinfer_trtllm()
             and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
-        )
+        ) or packed_nvfp4_routed_deferred
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
             _deferred_finalize_info_logged = True
@@ -596,7 +652,10 @@ class FusedMoE(torch.nn.Module):
             _fuses_routed_scaling_factor_in_topk(self.quant_method, self.runner_backend)
         )
 
-        self.routing_method_type = routing_method_type
+        self.routing_method_type = self.quant_method.get_moe_routing_method_type(
+            self, routing_method_type
+        )
+        self.moe_runner_config.routing_method_type = self.routing_method_type
 
         # overlap args
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
@@ -723,6 +782,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         is_bias: bool = False,
+        load_full_w2: bool = False,
     ):
         # Load grouped weight scales for group quantization
         # or model weights
@@ -733,6 +793,7 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 is_bias=is_bias,
+                load_full=load_full_w2,
             )
         elif shard_id in ("w1", "w3", "w13"):
             self._load_w13(
@@ -808,11 +869,15 @@ class FusedMoE(torch.nn.Module):
         if self.use_padded_loading:
             if _is_cpu and is_bias:
                 shard_dim = 1
+            weight_start = shard_size * self.moe_tp_rank
+            # Pre-sharded CPU weights are rank-local; do not apply the TP offset again.
+            if _is_cpu and self.use_presharded_weights:
+                weight_start = 0
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
                 start,
-                shard_size * self.moe_tp_rank,
+                weight_start,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -858,6 +923,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         is_bias: bool = False,
+        load_full: bool = False,
     ):
         """Load w2 weights for down projection.
 
@@ -866,6 +932,7 @@ class FusedMoE(torch.nn.Module):
             shard_dim: The dimension to shard along
             shard_id: The shard ID (must be "w2")
             loaded_weight: The weight tensor to load from
+            load_full: Whether to load the complete w2 tensor without TP sharding.
         """
         if not isinstance(expert_data, torch.Tensor) or not isinstance(
             loaded_weight, torch.Tensor
@@ -896,20 +963,24 @@ class FusedMoE(torch.nn.Module):
             # for w2 in TP, it shards the input_features, i.e., shard_dim=2
             shard_size = expert_data.shape[shard_dim]
 
-        if self.use_padded_loading:
-            if _is_cpu and is_bias:
-                shard_dim = 1
-            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
-                expert_data,
-                loaded_weight,
-                0,  # param_data_start
-                shard_size * self.moe_tp_rank,
-                shard_dim,
-                shard_size,
-                not self.use_presharded_weights,
-            )
-        else:
-            if not is_bias and not self.use_presharded_weights:
+        if not load_full:
+            if self.use_padded_loading:
+                if _is_cpu and is_bias:
+                    shard_dim = 1
+                weight_start = shard_size * self.moe_tp_rank
+                # Pre-sharded CPU weights are rank-local; do not apply the TP offset again.
+                if _is_cpu and self.use_presharded_weights:
+                    weight_start = 0
+                expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    expert_data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    weight_start,
+                    shard_dim,
+                    shard_size,
+                    not self.use_presharded_weights,
+                )
+            elif not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 # Derive shard size from the loaded weight so padded buffers
@@ -936,6 +1007,78 @@ class FusedMoE(torch.nn.Module):
             expert_data.narrow(shard_dim, 0, loaded_size).copy_(loaded_weight)
         else:
             expert_data.copy_(loaded_weight)
+
+    def _maybe_load_bf16_shared_expert_as_fp4(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        expert_id: int,
+        shard_dim: int,
+    ) -> bool:
+        """Quantize an unquantized fused shared expert into its FP4 slot.
+
+        Some FP4 checkpoints exclude the shared expert body from quantization,
+        so it arrives in the model dtype while the routed experts it is fused
+        with are already packed FP4.  It is quantized here, after the expert id
+        has been mapped to a local slot, so that the TP sharding and padding
+        below stay shared with the routed experts.
+
+        A rank only sees its own shard, but it still reproduces what an
+        offline-quantized checkpoint would carry: the tensor is quantized whole
+        and sharded afterwards, and MX blocks run along K, which TP either
+        leaves intact (gate/up) or splits at a multiple of the block size
+        (down).
+        """
+        scheme = getattr(self, "scheme", None)
+        if (
+            not self._has_fused_shared
+            or expert_id < self._num_local_routed
+            or not getattr(scheme, "quantize_shared_expert_online", False)
+            or loaded_weight.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            return False
+
+        weight_param = self.w2_weight if shard_id == "w2" else self.w13_weight
+        if param is not weight_param:
+            return False
+
+        if shard_id not in ("w1", "w2", "w3"):
+            # make_expert_params_mapping_fused emits "w13" for a checkpoint that
+            # ships gate and up already concatenated, which this cannot convert:
+            # the helpers below place one half of w13 at a time.  Returning False
+            # would hand the unquantized tensor to the normal loader, which
+            # copies it into the packed FP4 buffer and serves garbage with
+            # nothing raised, so refuse loudly instead.  Unreachable from the
+            # Qwen3.5/Qwen3.8 checkpoints the gate admits today, which use the
+            # unfused mapping; it is here for the next model that does not.
+            raise ValueError(
+                f"Quantizing the shared expert at load time supports the w1, w2 "
+                f"and w3 shards, not the pre-fused {shard_id!r}. Drop "
+                f"--enforce-shared-experts-fusion to serve this checkpoint with "
+                f"a standalone shared expert."
+            )
+
+        scale_param = (
+            self.w2_weight_scale if shard_id == "w2" else self.w13_weight_scale
+        )
+
+        fp4_weight, fp4_scale = scheme.quantize_shared_expert(
+            loaded_weight, self._load_device
+        )
+        self._load_model_weight_or_group_weight_scale(
+            shard_dim=shard_dim,
+            expert_data=weight_param.data[expert_id],
+            shard_id=shard_id,
+            loaded_weight=fp4_weight,
+        )
+        self._load_model_weight_or_group_weight_scale(
+            shard_dim=shard_dim,
+            expert_data=scale_param.data[expert_id],
+            shard_id=shard_id,
+            loaded_weight=fp4_scale,
+        )
+        return True
 
     def _maybe_load_fp8_shared_expert_as_fp4(
         self,
@@ -1057,6 +1200,11 @@ class FusedMoE(torch.nn.Module):
         else:
             return -1
 
+    def _local_routed_expert_ids(self, physical_expert_ids: List[int]) -> List[int]:
+        start_idx = self._expert_storage_rank * self._num_local_routed
+        end_idx = start_idx + self._num_local_routed
+        return [i for i in physical_expert_ids if start_idx <= i < end_idx]
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -1128,6 +1276,10 @@ class FusedMoE(torch.nn.Module):
                     self.layer_id, expert_id, require_global_experts
                 )
             )
+            if not require_global_experts:
+                # Before the local mapping: after an elastic EP scale-up, another rank's
+                # routed slot can lie past _num_global_routed and map to the shared slot.
+                physical_expert_ids = self._local_routed_expert_ids(physical_expert_ids)
 
         for expert_id in physical_expert_ids:
             # Expert IDs are local unless this parameter explicitly requires
@@ -1272,6 +1424,15 @@ class FusedMoE(torch.nn.Module):
         if is_transposed:
             shard_dim = int(not shard_dim)
 
+        if self._maybe_load_bf16_shared_expert_as_fp4(
+            param=param,
+            loaded_weight=loaded_weight,
+            shard_id=shard_id,
+            expert_id=expert_id,
+            shard_dim=shard_dim,
+        ):
+            return
+
         if self._maybe_load_fp8_shared_expert_as_fp4(
             param=param,
             loaded_weight=loaded_weight,
@@ -1344,6 +1505,7 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
+                    load_full_w2=getattr(param, "load_full_w2", False),
                 )
             return
 
@@ -1375,6 +1537,7 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
+                    load_full_w2=getattr(param, "load_full_w2", False),
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
@@ -1408,6 +1571,7 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
+                load_full_w2=getattr(param, "load_full_w2", False),
             )
             return
 
@@ -1534,11 +1698,11 @@ class FusedMoE(torch.nn.Module):
 
             return forward_fuseep(self, hidden_states, topk_output)
         if is_in_tc_piecewise_cuda_graph():
-            if (
-                TopKOutputChecker.format_is_bypassed(topk_output)
-                and topk_output.expert_location_dispatch_info is not None
+            if TopKOutputChecker.format_is_bypassed(topk_output) and (
+                topk_output.expert_location_dispatch_info is not None
+                or topk_output.num_token_non_padded is not None
             ):
-                # The opaque logits-only op cannot carry placement metadata.
+                # The opaque logits-only op cannot carry padding or placement metadata.
                 return self.forward_impl(
                     hidden_states, topk_output, pre_quant_input=pre_quant_input
                 )
