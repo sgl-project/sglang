@@ -980,6 +980,10 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # AITER's MXFP4 MoE stage-2 `scatter` epilogue writes FP4 instead of BF16
+    # partials. Lossy and process-wide in AITER, so it is only honored for
+    # GLM-5.3-Flash on ROCm and cleared for every other launch.
+    AITER_MXFP4_INTERMEDIATE = EnvBool(False)
     # Set by someone bisecting a numerical or performance regression to an
     # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
     # without rebuilding. The tile is on by default because hipBLASLt ships no
