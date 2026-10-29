@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -13,6 +16,44 @@ SPEC.loader.exec_module(musa_python_stack)
 
 
 class MusaPythonStackTest(unittest.TestCase):
+    def test_installer_upgrades_tvm_ffi_without_replacing_vendor_torch(self) -> None:
+        script = MODULE_PATH.with_name("musa_install_dependency.sh").read_text()
+        start = script.index("VENDOR_WHEELS=(")
+        end = script.index('if [ -z "$MUSA_CI_ISOLATED_USERBASE" ]; then', start)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            old_ffi = bundle / "apache_tvm_ffi-0.1.9.post2+musa.1.whl"
+            torch_wheel = bundle / "torch-2.9.0.whl"
+            musa_wheel = bundle / "torch_musa-2.9.0.whl"
+            for wheel in (old_ffi, torch_wheel, musa_wheel):
+                wheel.touch()
+            ffi = root / "apache_tvm_ffi-0.1.11.post1+musa.1.whl"
+            torchada = root / "torchada-0.1.90.whl"
+            result = subprocess.run(
+                ["bash"],
+                input=(
+                    "set -euo pipefail\n"
+                    + script[start:end]
+                    + '\nprintf "%s\\n" "${VENDOR_WHEELS[@]}"\n'
+                ),
+                env={
+                    **os.environ,
+                    "WHL_DIR": str(bundle),
+                    "MUSA_TORCHADA_WHEEL": str(torchada),
+                    "MUSA_TRITON_WHEEL": "",
+                    "MUSA_TVM_FFI_WHEEL": str(ffi),
+                },
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+        self.assertCountEqual(
+            result.stdout.splitlines(),
+            [str(torchada), str(ffi), str(torch_wheel), str(musa_wheel)],
+        )
+
     def test_legacy_runner_installs_runtime_and_tests_without_new_vendor_pins(
         self,
     ) -> None:

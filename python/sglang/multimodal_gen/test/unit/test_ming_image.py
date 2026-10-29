@@ -220,7 +220,12 @@ def test_ming_norm_fusion_replay_and_native_fallback(dim, monkeypatch):
     kernel = Mock(wraps=ming_image.rmsnorm_cast_before_weight_bitexact)
     monkeypatch.setattr(ming_image, "rmsnorm_cast_before_weight_bitexact", kernel)
     assert torch.equal(norm(x), RMSNorm.forward_native(norm, x))
-    assert kernel.call_count == 1 and gate.verified and not gate.disabled
+    if torch.version.hip is not None:
+        # The ordered reduction reproduces CUDA's ATen reduction, so ROCm
+        # deliberately uses native RMSNorm. Exercise its graph replay too.
+        assert kernel.call_count == 0 and not gate.verified and not gate.disabled
+    else:
+        assert kernel.call_count == 1 and gate.verified and not gate.disabled
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = norm(x)

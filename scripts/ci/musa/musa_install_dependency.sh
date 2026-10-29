@@ -36,6 +36,11 @@ readonly MUSA_TRITON_INDEX_URL="https://dl.mthreads.com/repo/api/pypi/pypi/simpl
 readonly MUSA_TORCHADA_VERSION="0.1.90"
 readonly MUSA_TORCHADA_SHA256="01dc3cea4dfc48cd5005e34ee786fe9a8c39ff1ddcafd2207a4fc9fea6a12127"
 readonly MUSA_TORCHADA_INDEX_URL="https://pypi.org/simple"
+# xgrammar 0.2.7 requires TVM-FFI >=0.1.10. The legacy bundle still ships
+# 0.1.9; use the same MUSA build as srt_musa, without replacing vendor Torch.
+# Like the Triton pin above, this digest is for the CPython 3.10 x86_64 wheel.
+readonly MUSA_TVM_FFI_VERSION="0.1.11.post1+musa.1"
+readonly MUSA_TVM_FFI_SHA256="0ae0db276c1046f14bca10cf6f2d32506a79653c1d3a304c960b41587331a16a"
 readonly MUSA_SETUPTOOLS_SPEC="setuptools<82"
 MUSA_CI_SCRATCH="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sglang-musa-ci.XXXXXX")"
 MUSA_CI_ISOLATED_USERBASE=""
@@ -80,6 +85,7 @@ WHL_DIR="${WHL_DIR:-/sglang-checkout/whl}"
 MUSA_TRITON_WHEEL=""
 MUSA_TRITON_TASK_LOCAL=""
 MUSA_TORCHADA_WHEEL=""
+MUSA_TVM_FFI_WHEEL=""
 
 wheel_sha256() {
     sha256sum "$1" | awk '{print $1}'
@@ -188,14 +194,45 @@ if [ "$(wheel_sha256 "$MUSA_TORCHADA_WHEEL")" != "$MUSA_TORCHADA_SHA256" ]; then
 fi
 echo "Using torchada wheel: ${MUSA_TORCHADA_WHEEL}"
 
-VENDOR_WHEELS=("$MUSA_TORCHADA_WHEEL")
+if [ -d "$WHL_DIR" ]; then
+    for candidate in "${WHL_DIR}"/apache_tvm_ffi-"${MUSA_TVM_FFI_VERSION}"-*.whl; do
+        [ -f "$candidate" ] || continue
+        if [ "$(wheel_sha256 "$candidate")" = "$MUSA_TVM_FFI_SHA256" ]; then
+            MUSA_TVM_FFI_WHEEL="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "$MUSA_TVM_FFI_WHEEL" ]; then
+    tvm_ffi_download_dir="${MUSA_CI_SCRATCH}/musa-tvm-ffi"
+    mkdir -p "$tvm_ffi_download_dir"
+    python3 -m pip --isolated download \
+        --dest "$tvm_ffi_download_dir" \
+        --index-url "$MUSA_TRITON_INDEX_URL" \
+        --no-deps \
+        --only-binary=:all: \
+        "apache-tvm-ffi==${MUSA_TVM_FFI_VERSION}"
+    mapfile -t tvm_ffi_candidates < <(find "$tvm_ffi_download_dir" -maxdepth 1 -type f -name '*.whl')
+    if [ "${#tvm_ffi_candidates[@]}" -ne 1 ]; then
+        echo "::error::Expected one MUSA TVM-FFI wheel, found ${#tvm_ffi_candidates[@]}"
+        exit 1
+    fi
+    MUSA_TVM_FFI_WHEEL="${tvm_ffi_candidates[0]}"
+fi
+if [ "$(wheel_sha256 "$MUSA_TVM_FFI_WHEEL")" != "$MUSA_TVM_FFI_SHA256" ]; then
+    echo "::error::MUSA TVM-FFI wheel SHA256 does not match the pinned artifact"
+    exit 1
+fi
+echo "Using MUSA TVM-FFI wheel: ${MUSA_TVM_FFI_WHEEL}"
+
+VENDOR_WHEELS=("$MUSA_TORCHADA_WHEEL" "$MUSA_TVM_FFI_WHEEL")
 if [ -n "$MUSA_TRITON_WHEEL" ]; then
     VENDOR_WHEELS+=("$MUSA_TRITON_WHEEL")
 fi
 if [ -d "$WHL_DIR" ] && compgen -G "${WHL_DIR}"/*.whl > /dev/null; then
     for whl in "${WHL_DIR}"/*.whl; do
         case "$(basename "$whl")" in
-          triton-*.whl|torchada-*.whl) continue;;
+          triton-*.whl|torchada-*.whl|apache_tvm_ffi-*.whl) continue;;
         esac
         VENDOR_WHEELS+=("$whl")
     done

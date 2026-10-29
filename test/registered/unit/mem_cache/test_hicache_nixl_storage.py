@@ -267,8 +267,8 @@ class TestNixlUnified(CustomTestCase):
 
     def setUp(self):
         """Set up test environment."""
-        self.test_dir = "/tmp/test_nixl_unified"
-        os.makedirs(self.test_dir, exist_ok=True)
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_unified_")
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
 
         # Disable O_DIRECT here: these tests use small, arbitrarily-aligned
         # tensors that do not satisfy the sector-alignment constraints required
@@ -288,6 +288,9 @@ class TestNixlUnified(CustomTestCase):
             extra_config={
                 "plugin": {"posix": {"active": True}},
                 "use_direct_io": False,
+                # Round-trip checks require files to survive between writes
+                # and reads, even on a busy CI disk. Cleanup has its own suite.
+                "l3_cleaner_enabled": False,
             },
         )
 
@@ -296,13 +299,9 @@ class TestNixlUnified(CustomTestCase):
                 storage_config=self.storage_config,
                 file_path=self.test_dir,
             )
+            self.addCleanup(self.hicache.close)
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
-
-    def tearDown(self):
-        """Clean up test directories."""
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir, ignore_errors=True)
 
     @staticmethod
     def _open_fds() -> int:
