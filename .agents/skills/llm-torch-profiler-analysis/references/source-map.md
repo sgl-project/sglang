@@ -18,7 +18,7 @@ Use these upstream files when the workflow or behavior needs to be justified fro
 
 ## Scheduler-side trace writing
 
-- `python/sglang/srt/managers/scheduler_profiler_mixin.py`
+- `python/sglang/srt/managers/scheduler_components/profiler_manager.py`
   - actual trace start/stop behavior
   - filename pattern for `TP/DP/PP/EP` and optional stage suffixes
   - `CUDA_PROFILER` and torch profiler handling
@@ -37,6 +37,3 @@ Use these upstream files when the workflow or behavior needs to be justified fro
 
 - `test/registered/profiling/test_start_profile.py`
   - validates `/start_profile` behavior, including `CUDA_PROFILER`
-
-- `test/registered/profiling/test_profile_v2.py`
-  - validates stage-scoped trace outputs under `SGLANG_PROFILE_V2`

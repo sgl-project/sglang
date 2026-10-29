@@ -9,6 +9,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -20,12 +21,18 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestHiSparseDecodeRemap(CustomTestCase):
+    def test_spec_scratch_is_charged_only_before_request_slot_allocation(self):
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = 64
+
+        allocator.configure_spec_scratch(1024)
+
+        self.assertEqual(allocator.request_slot_reserve(has_req_pool_slot=False), 1024)
+        self.assertEqual(allocator.request_slot_reserve(has_req_pool_slot=True), 0)
+
     def test_page_size_one_reclaims_temporary_device_slot(self):
         """Decode remapping must reclaim its temporary slot without freeing the live slot."""
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-        from sglang.srt.mem_cache.allocator.hisparse import (
-            HiSparseTokenToKVPoolAllocator,
-        )
         from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
         pool = MiniMaxSparseKVPool(
@@ -209,7 +216,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             full_available_size=MagicMock(return_value=512),
         )
         queue.token_to_kv_pool_allocator = SimpleNamespace(
-            logical_attn_allocator=logical_allocator
+            logical_attn_allocator=logical_allocator, storage=None
         )
         queue.scheduler = SimpleNamespace(enable_hisparse=True, last_batch=None)
         queue.retracted_queue = []
@@ -256,6 +263,8 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         req_to_token_pool = ReqToTokenPool()
         allocator = SimpleNamespace(
+            state=None,
+            storage=None,
             device=torch.device("cpu"),
             page_size=256,
             available_size=MagicMock(return_value=fill_len),

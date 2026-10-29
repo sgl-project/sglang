@@ -25,8 +25,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -110,8 +110,7 @@ class Sarashina2VisionForCausalLM(nn.Module):
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input tokens with multimodal data hashes for RadixAttention."""
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_input_embeddings(self):
         """Get input embeddings from the language model."""

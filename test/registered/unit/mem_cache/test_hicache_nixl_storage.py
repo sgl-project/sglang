@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 import os
 import shutil
@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -266,8 +267,8 @@ class TestNixlUnified(CustomTestCase):
 
     def setUp(self):
         """Set up test environment."""
-        self.test_dir = "/tmp/test_nixl_unified"
-        os.makedirs(self.test_dir, exist_ok=True)
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_unified_")
+        self.addCleanup(shutil.rmtree, self.test_dir, ignore_errors=True)
 
         # Disable O_DIRECT here: these tests use small, arbitrarily-aligned
         # tensors that do not satisfy the sector-alignment constraints required
@@ -287,6 +288,9 @@ class TestNixlUnified(CustomTestCase):
             extra_config={
                 "plugin": {"posix": {"active": True}},
                 "use_direct_io": False,
+                # Round trips require retained files regardless of runner disk
+                # pressure. Cleaner behavior has its own dedicated test suite.
+                "l3_cleaner_enabled": False,
             },
         )
 
@@ -295,13 +299,9 @@ class TestNixlUnified(CustomTestCase):
                 storage_config=self.storage_config,
                 file_path=self.test_dir,
             )
+            self.addCleanup(self.hicache.close)
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
-
-    def tearDown(self):
-        """Clean up test directories."""
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir, ignore_errors=True)
 
     @staticmethod
     def _open_fds() -> int:
@@ -520,7 +520,9 @@ class TestNixlUnified(CustomTestCase):
             },
         )
         try:
-            return HiCacheNixl(storage_config=obj_config, file_path="")
+            hicache = HiCacheNixl(storage_config=obj_config, file_path="")
+            self.addCleanup(hicache.close)
+            return hicache
         except Exception as e:
             self.skipTest(f"NIXL OBJ backend unavailable: {e}")
 
@@ -632,6 +634,41 @@ class TestNixlUnified(CustomTestCase):
         ctx = self.hicache._hybrid_pool_ctx[PoolName.MAMBA]
         self.assertTrue(ctx.is_zero_copy)
         self.assertIs(ctx.host_pool, pool)
+
+    def test_mla_mamba_round_trip_keeps_each_tp_rank(self):
+        """MLA shares KV keys, but Mamba checkpoints must not overwrite another rank."""
+        for zero_copy in (False, True):
+            with self.subTest(zero_copy=zero_copy):
+                caches, pools, expected = [], [], []
+                transfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=[f"same_prefix_{zero_copy}"],
+                    host_indices=torch.tensor([0]),
+                )
+                for rank in range(2):
+                    config = replace(
+                        self.storage_config, tp_rank=rank, is_mla_model=True
+                    )
+                    cache = HiCacheNixl(storage_config=config, file_path=self.test_dir)
+                    self.addCleanup(cache.close)
+                    pool = MockHybridPool(expose_zero_copy=zero_copy)
+                    cache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+                    pool.temporal_buffer[0].fill_(rank + 11)
+                    pool.conv_buffer[0][0].fill_(rank + 21)
+                    expected.append(pool.get_data_page(0).clone())
+                    caches.append(cache)
+                    pools.append(pool)
+                    self.assertEqual(
+                        cache.batch_set_v2([transfer])[PoolName.MAMBA], [True]
+                    )
+
+                for cache, pool, page in zip(caches, pools, expected):
+                    pool.temporal_buffer.zero_()
+                    pool.conv_buffer[0].zero_()
+                    self.assertEqual(
+                        cache.batch_get_v2([transfer])[PoolName.MAMBA], [True]
+                    )
+                    self.assertTrue(torch.equal(pool.get_data_page(0), page))
 
     def test_register_mem_host_pool_v2_uses_persistent_bounce_otherwise(self):
         pool = MockHybridPool(expose_zero_copy=False)
