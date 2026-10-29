@@ -4,7 +4,8 @@ on:
   schedule:
     # After the image builds and the scheduled PR tests on them, before the
     # 22:00 UTC MILES nightlies (see the order in pr-test-amd.yml).
-    # rocm724/rocm720 run every other day, alternating with the PR test.
+    # rocm10 runs every day. rocm724/rocm720 run on even days, the same days as
+    # their scheduled PR test in pr-test-amd.yml.
     - cron: '0 19 2-30/2 * *'  # even days of the month: rocm10, rocm724 and rocm720
     - cron: '0 19 1-31/2 * *'  # odd days of the month: rocm10 only
   push:
