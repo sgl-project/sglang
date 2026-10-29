@@ -4,7 +4,13 @@ import msgspec
 import numpy as np
 import pytest
 
-from radix_transfer_plugins import OutputStore, RawField, StorageBackend, StoreRef
+from radix_transfer_plugins import (
+    OutputStore,
+    RangeRead,
+    RawField,
+    StorageBackend,
+    StoreRef,
+)
 from radix_transfer_plugins.stashes.token_output import TokenOutputStash
 
 
@@ -15,6 +21,7 @@ class MemoryBackend(StorageBackend):
     def __init__(self):
         self.objects: dict[str, dict[str, bytes]] = {}
         self.reads: list[list[str]] = []
+        self.range_reads: list[list[tuple[str, str, int, int, int]]] = []
         self.next_id = 0
 
     def put_many(self, objects):
@@ -34,6 +41,12 @@ class MemoryBackend(StorageBackend):
             # Like a real backend: the caller owns what a read returns.
             out.append({name: memoryview(bytearray(stored[name])) for name, _ in named})
         return out
+
+    def get_ranges(self, reads, *, into):
+        self.range_reads.append(list(reads))
+        for key, part, src_offset, nbytes, dst_offset in reads:
+            data = self.objects[key][part][src_offset : src_offset + nbytes]
+            into[dst_offset : dst_offset + nbytes] = data
 
     def delete_many(self, keys, *, parts):
         for key, names in zip(keys, parts):
@@ -275,3 +288,69 @@ def test_read_many_returns_empty_fields_without_reading():
     (got,) = store.read_many([(ref, ["routed_experts"])], stash_type=TokenOutputStash)
     assert got.routed_experts.shape == (0, 48, 8)
     assert backend.reads == [[]]
+
+
+def test_read_ranges_match_numpy_slices():
+    backend = MemoryBackend()
+    store = OutputStore(backend=backend)
+    stashes = [token_stash(40 + i) for i in range(3)]
+    refs = store.put_many(stashes)
+    rng = np.random.default_rng(0)
+    # Random row slices of random fields, packed into `into` in the order drawn.
+    reads, wants, end = [], [], 0
+    for _ in range(12):
+        i = int(rng.integers(len(refs)))
+        name = str(rng.choice(TokenOutputStash.__struct_fields__))
+        array = getattr(stashes[i], name)
+        start = int(rng.integers(len(array)))
+        want = array[start : int(rng.integers(start + 1, len(array) + 1))]
+        reads.append(
+            RangeRead(
+                ref=refs[i],
+                field=name,
+                src_offset=start * array[0].nbytes,
+                nbytes=want.nbytes,
+                dst_offset=end,
+            )
+        )
+        wants.append(want)
+        end += want.nbytes
+    into = np.zeros(end, dtype=np.uint8)
+
+    # Passed out of order: each range lands at its own dst_offset.
+    store.read_ranges(
+        [reads[j] for j in rng.permutation(len(reads))], into=memoryview(into)
+    )
+
+    assert into.tobytes() == b"".join(want.tobytes() for want in wants)
+    assert len(backend.range_reads) == 1
+
+
+def test_read_ranges_check_every_range_before_reading():
+    backend = MemoryBackend()
+    store = OutputStore(backend=backend)
+    (ref,) = store.put_many([token_stash(50)])
+    size = {s.name: s.nbytes for s in ref.fields}["indexer_topk"]
+    good = RangeRead(
+        ref=ref, field="indexer_topk", src_offset=0, nbytes=size, dst_offset=0
+    )
+    zstd = msgspec.structs.replace(
+        ref, fields=tuple(msgspec.structs.replace(s, codec="zstd") for s in ref.fields)
+    )
+    into = memoryview(bytearray(size))
+    for change, match in [
+        ({"field": "hidden_states"}, "no fields"),
+        ({"ref": zstd}, "zstd coded"),
+        ({"src_offset": -1}, "not a range"),
+        ({"nbytes": 0}, "not a range"),
+        ({"src_offset": 1}, "not a range"),  # runs past the field
+        ({"dst_offset": -1}, "outside"),
+        ({"dst_offset": 1}, "outside"),  # runs past `into`
+    ]:
+        bad = msgspec.structs.replace(good, **change)
+        with pytest.raises(ValueError, match=match):
+            store.read_ranges([good, bad], into=into)
+    with pytest.raises(ValueError, match="read-only"):
+        store.read_ranges([good], into=memoryview(bytes(size)))
+    store.read_ranges([], into=memoryview(bytearray()))
+    assert backend.range_reads == []

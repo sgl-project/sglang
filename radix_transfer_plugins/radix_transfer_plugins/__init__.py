@@ -5,12 +5,19 @@ from radix_transfer_plugins.backend import (
     available_backends,
     create_backend,
 )
-from radix_transfer_plugins.schema import FieldSpec, RawField, Stash, StoreRef
+from radix_transfer_plugins.schema import (
+    FieldSpec,
+    RangeRead,
+    RawField,
+    Stash,
+    StoreRef,
+)
 from radix_transfer_plugins.store import OutputStore
 
 __all__ = [
     "FieldSpec",
     "OutputStore",
+    "RangeRead",
     "RawField",
     "Stash",
     "StorageBackend",

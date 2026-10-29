@@ -132,6 +132,52 @@ def test_a_failing_read_still_unregisters_its_memory():
     assert store.registered == {}
 
 
+def test_range_reads_take_one_get_into_ranges_call_into_one_registration():
+    backend, store = make_backend()
+    (key,) = backend.put_many(
+        [{"a": memoryview(bytes(range(10))), "b": memoryview(bytes(range(100, 110)))}]
+    )
+    registers = []
+    register = store.register_buffer
+
+    def counting_register(ptr, size):
+        registers.append(size)
+        return register(ptr, size)
+
+    store.register_buffer = counting_register
+    into = memoryview(bytearray(7))
+
+    backend.get_ranges(
+        [(key, "a", 2, 3, 4), (key, "b", 5, 2, 0), (key, "a", 7, 2, 2)], into=into
+    )
+
+    assert registers == [7]
+    assert store.range_calls == [[[f"{key}/a", f"{key}/b"]]]
+    assert bytes(into) == bytes([105, 106, 7, 8, 2, 3, 4])
+    assert store.registered == {}
+
+
+def test_a_failed_range_read_names_the_part_and_unregisters_its_memory():
+    backend, store = make_backend()
+    (key,) = backend.put_many([parts(3)])
+    into = memoryview(bytearray(3))
+    with pytest.raises(KeyError, match=f"{key}/f9"):
+        backend.get_ranges([(key, "f0", 0, 3, 0), (key, "f9", 0, 3, 0)], into=into)
+    assert store.registered == {}
+    # Past the registered memory: Mooncake's -600 is a failed read, not a size mismatch.
+    with pytest.raises(RuntimeError, match=f"{key}/f0: -600"):
+        backend.get_ranges([(key, "f0", 0, 3, 1)], into=into)
+    assert store.registered == {}
+
+    def broken(*args):
+        raise OSError("transfer engine gone")
+
+    store.get_into_ranges = broken
+    with pytest.raises(OSError):
+        backend.get_ranges([(key, "f0", 0, 3, 0)], into=into)
+    assert store.registered == {}
+
+
 def test_delete_is_forced_and_idempotent():
     backend, store = make_backend()
     (key,) = backend.put_many([parts(3, 5)])

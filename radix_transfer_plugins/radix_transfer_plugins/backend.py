@@ -44,6 +44,17 @@ class StorageBackend(ABC):
         """
 
     @abstractmethod
+    def get_ranges(
+        self, reads: Sequence[tuple[str, str, int, int, int]], *, into: memoryview
+    ) -> None:
+        """Read (object key, part, src_offset, nbytes, dst_offset) of stored parts into
+        ``into``.
+
+        Raises ``KeyError`` for a part that is not stored and ``RuntimeError`` for a
+        range that could not be read.
+        """
+
+    @abstractmethod
     def delete_many(
         self, keys: Sequence[str], *, parts: Sequence[Sequence[str]]
     ) -> None:

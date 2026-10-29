@@ -29,7 +29,7 @@ from typing import Mapping, Optional, Sequence, TypeVar
 
 from radix_transfer_plugins.backend import StorageBackend
 from radix_transfer_plugins.codec import IDENTITY, get_codec
-from radix_transfer_plugins.schema import FieldSpec, Stash, StoreRef
+from radix_transfer_plugins.schema import FieldSpec, RangeRead, Stash, StoreRef
 
 S = TypeVar("S", bound=Stash)
 
@@ -91,6 +91,35 @@ class OutputStore:
             for specs, data in zip(wanted, stored)
         ]
 
+    def read_ranges(self, reads: Sequence[RangeRead], *, into: memoryview) -> None:
+        """Read byte ranges of stored fields into ``into``, memory the caller owns.
+
+        Only identity-coded fields. Fails before reading when ``into`` is read-only, a
+        field is missing or not identity coded, or a range falls outside its field or
+        ``into``.
+        """
+        if not reads:
+            return
+        if into.readonly:
+            raise ValueError("ranges cannot be read into read-only memory")
+        self._check_backend([read.ref for read in reads])
+        for read in reads:
+            (spec,) = _named_specs(read.ref, [read.field])
+            _check_range(read, spec=spec, into=into)
+        self._backend.get_ranges(
+            [
+                (
+                    read.ref.key,
+                    read.field,
+                    read.src_offset,
+                    read.nbytes,
+                    read.dst_offset,
+                )
+                for read in reads
+            ],
+            into=into,
+        )
+
     def delete_many(self, refs: Sequence[StoreRef]) -> None:
         """Delete every field of each ref."""
         self._check_backend(refs)
@@ -143,3 +172,24 @@ def _named_specs(ref: StoreRef, names: Sequence[str]) -> list[FieldSpec]:
     if missing:
         raise ValueError(f"{ref.key} has no fields {missing}")
     return [specs[name] for name in names]
+
+
+def _check_range(read: RangeRead, *, spec: FieldSpec, into: memoryview) -> None:
+    field = f"{read.ref.key} field {read.field!r}"
+    # Ranges are of the stored bytes, which are the array's bytes only under identity.
+    if spec.codec != IDENTITY:
+        raise ValueError(f"{field} is {spec.codec} coded; ranges need {IDENTITY}")
+    if not (
+        read.src_offset >= 0
+        and read.nbytes > 0
+        and read.src_offset + read.nbytes <= spec.nbytes
+    ):
+        raise ValueError(
+            f"{read.nbytes} bytes at {read.src_offset} are not a range of {field}, "
+            f"which has {spec.nbytes} bytes"
+        )
+    if not (read.dst_offset >= 0 and read.dst_offset + read.nbytes <= into.nbytes):
+        raise ValueError(
+            f"{read.nbytes} bytes of {field} at {read.dst_offset} fall outside the "
+            f"{into.nbytes} bytes they are read into"
+        )
