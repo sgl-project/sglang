@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
+
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.kernels.ops.speculative.spec_tree import (
@@ -24,12 +25,18 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
-from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
+from sglang.srt.mem_cache.allocation import (
+    alloc_for_spec_decode,
+    update_spec_decode_allocated_lens,
+)
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.speculative.prepared_next_draft import (
+    prepared_next_draft_enabled,
+)
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
@@ -1333,7 +1340,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     # Accumulate penalty
     # This is a relaxed version of penalties for speculative decoding.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
+    penalized = batch.sampling_info.penalizer_orchestrator.is_required
+    if penalized:
         batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
@@ -1346,6 +1354,17 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     )
     for r in batch.reqs:
         r.decode_batch_idx += 1
+
+    if num_needed_tokens == 0 and prepared_next_draft_enabled():
+        # No device allocation is needed; settle only the host-side watermark.
+        update_spec_decode_allocated_lens(batch.reqs, nxt_kv_lens)
+        batch.spec_decode_schedule_stream_idle = not (
+            penalized
+            or batch.tree_cache.supports_swa()
+            or get_exec().mamba.enable_mamba_extra_buffer_lazy
+        )
+        return
+    batch.spec_decode_schedule_stream_idle = False
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")

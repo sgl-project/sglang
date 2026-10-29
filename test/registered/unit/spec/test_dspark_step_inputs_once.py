@@ -211,6 +211,8 @@ class TestPostFoldRelay(unittest.TestCase):
         # __new__-only fixture: the fused spec-index path is resolved by __init__
         # in production and arrives in a later runtime commit.
         fm._use_spec_index_ops = False
+        # Deferred relays arrive in R7; production initializes this in __init__.
+        fm._deferred_relay = None
         fm.needs_confidence_relay = False
         fm.spec_algo = SimpleNamespace(is_some=lambda: False, is_ngram=lambda: False)
         fm._adopt_relay(relay)

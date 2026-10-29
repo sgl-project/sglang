@@ -673,13 +673,25 @@ class TestMergeBatch(CustomTestCase):
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
     def test_returns_copy_without_orchestrator(self):
-        """Test that copy_for_forward returns a copy with orchestrator set to None."""
-        orch = MagicMock(is_required=False)
-        info = _make_info(batch_size=1, penalizer_orchestrator=orch)
-        copied = info.copy_for_forward()
-        self.assertIsNone(copied.penalizer_orchestrator)
-        # Original should still have orchestrator
-        self.assertIsNotNone(info.penalizer_orchestrator)
+        """Both copy implementations preserve every field except the forward-only
+        penalizer removal, including fields declared with init=False."""
+        for fast_path in (False, True):
+            orch = MagicMock(is_required=False)
+            info = _make_info(batch_size=1, penalizer_orchestrator=orch)
+            with (
+                self.subTest(fast_path=fast_path),
+                patch(
+                    "sglang.srt.sampling.sampling_batch_info."
+                    "spec_decode_resources.enabled",
+                    return_value=fast_path,
+                ),
+            ):
+                copied = info.copy_for_forward()
+            self.assertIsNone(copied.penalizer_orchestrator)
+            self.assertIs(info.penalizer_orchestrator, orch)
+            for name, value in info.__dict__.items():
+                if name != "penalizer_orchestrator":
+                    self.assertIs(copied.__dict__[name], value, name)
 
 
 # from_schedule_batch

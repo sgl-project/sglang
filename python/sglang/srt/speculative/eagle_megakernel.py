@@ -290,11 +290,10 @@ class EagleMegakernel:
             return None
         self._served_input = (self._input_seq, _rids(batch))
         raw_bs = runner.raw_bs
-        # the next replay rewrites the buffers before the next round reads them
-        return (
-            graphs.out.topk_p[:raw_bs].clone(),
-            graphs.out.topk_index[:raw_bs].clone(),
-        )
+        topk_p, topk_index = graphs.out.topk_p[:raw_bs], graphs.out.topk_index[:raw_bs]
+        # The unchanged next round reads these before the next replay rewrites them;
+        # FutureMap flushes them to owned relay buffers if that batch changes.
+        return topk_p, topk_index
 
     def begin_draft_round(
         self, *, runner: Any, batch: ScheduleBatch, draft_input: Any

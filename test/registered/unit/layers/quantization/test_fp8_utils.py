@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers.quantization import fp8_utils
+from sglang.srt.layers.quantization import fp8_utils, modelopt_quant
 from sglang.srt.layers.quantization.fp8 import (
     Fp8MoEMethod,
     _is_cuda,
@@ -26,6 +26,107 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-large")
+
+
+class TestFlashinferBmmPrequantContract(unittest.TestCase):
+    def test_e4m3_rows_bypass_quantization_and_restore_producer_dtype(self):
+        for output_dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(output_dtype=output_dtype):
+                self._assert_prequantized_dtype(output_dtype)
+
+    def _assert_prequantized_dtype(self, output_dtype):
+        qinput = torch.empty((2, 4), dtype=torch.float8_e4m3fn, device="cpu")
+        weight = torch.empty((4, 3), dtype=torch.float8_e4m3fn, device="cpu")
+        input_scale = torch.tensor([0.02], device="cpu")
+        weight_scale = torch.tensor([0.01], device="cpu")
+        expected = torch.empty((2, 3), dtype=output_dtype, device="cpu")
+
+        with (
+            patch.object(fp8_utils, "static_quant_fp8") as quantize,
+            patch.object(
+                fp8_utils,
+                "flashinfer_bmm_fp8",
+                return_value=expected,
+                create=True,
+            ) as bmm,
+        ):
+            actual = fp8_utils.apply_fp8_linear_bmm_flashinfer(
+                qinput,
+                weight,
+                weight_scale,
+                input_scale,
+                pre_quant_output_dtype=output_dtype,
+            )
+
+        quantize.assert_not_called()
+        bmm.assert_called_once()
+        got_input, got_weight, got_input_scale, got_weight_scale, got_dtype = (
+            bmm.call_args.args
+        )
+        self.assertEqual(got_input.data_ptr(), qinput.data_ptr())
+        self.assertEqual(tuple(got_input.shape), tuple(qinput.shape))
+        self.assertIs(got_weight, weight)
+        self.assertIs(got_input_scale, input_scale)
+        self.assertIs(got_weight_scale, weight_scale)
+        self.assertIs(got_dtype, output_dtype)
+        self.assertEqual(actual.data_ptr(), expected.data_ptr())
+        self.assertEqual(tuple(actual.shape), (2, 3))
+
+    def test_e4m3_rows_require_an_explicit_output_dtype(self):
+        qinput = torch.empty((2, 4), dtype=torch.float8_e4m3fn, device="cpu")
+        weight = torch.empty((4, 3), dtype=torch.float8_e4m3fn, device="cpu")
+        with self.assertRaisesRegex(ValueError, "explicit BF16 or FP16"):
+            fp8_utils.apply_fp8_linear_bmm_flashinfer(
+                qinput,
+                weight,
+                torch.tensor([0.01]),
+                torch.tensor([0.02]),
+            )
+
+
+class TestModelOptPrequantOutputDtype(unittest.TestCase):
+    def test_model_dtype_reaches_both_static_fp8_backends(self):
+        for use_flashinfer_bmm in (False, True):
+            for output_dtype in (torch.bfloat16, torch.float16):
+                with self.subTest(
+                    use_flashinfer_bmm=use_flashinfer_bmm,
+                    output_dtype=output_dtype,
+                ):
+                    self._assert_model_dtype_forwarded(
+                        use_flashinfer_bmm=use_flashinfer_bmm,
+                        output_dtype=output_dtype,
+                    )
+
+    def _assert_model_dtype_forwarded(self, *, use_flashinfer_bmm, output_dtype):
+        method = modelopt_quant.ModelOptFp8LinearMethod.__new__(
+            modelopt_quant.ModelOptFp8LinearMethod
+        )
+        method.use_marlin = False
+        method.use_sm120_fp8 = False
+        method.cutlass_fp8_supported = False
+        layer = SimpleNamespace(
+            use_flashinfer_bmm=use_flashinfer_bmm,
+            orig_dtype=output_dtype,
+            weight=object(),
+            weight_scale=object(),
+            input_scale=object(),
+        )
+        x = torch.empty((2, 4), dtype=torch.float8_e4m3fn, device="cpu")
+        expected = object()
+        function_name = (
+            "apply_fp8_linear_bmm_flashinfer"
+            if use_flashinfer_bmm
+            else "apply_fp8_linear"
+        )
+        with patch.object(
+            modelopt_quant,
+            function_name,
+            return_value=expected,
+        ) as apply:
+            actual = method.apply(layer, x)
+
+        self.assertIs(actual, expected)
+        self.assertIs(apply.call_args.kwargs["pre_quant_output_dtype"], output_dtype)
 
 
 class TestMxfp8MoeScaleLayout(CustomTestCase):

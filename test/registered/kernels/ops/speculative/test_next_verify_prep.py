@@ -12,6 +12,121 @@ from sglang.kernels.ops.speculative.eagle import (
 )
 
 
+def test_speculative_round_arena_is_bounded_and_reuse_is_explicit(monkeypatch):
+    from sglang.srt.utils import speculative_decode_resources as resources
+
+    monkeypatch.setattr(resources, "enabled", lambda: True)
+    resources._round_contexts.clear()
+    resources._round_tensor_rings.clear()
+    torch.cuda.empty_cache()
+    before_allocated = torch.cuda.memory_allocated()
+    before_reserved = torch.cuda.memory_reserved()
+    explicit_device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        for bs in range(1, 513):
+            resources.begin_round(512, "cuda")
+            outputs = (
+                resources.empty(
+                    (bs,),
+                    tag="scan_i32",
+                    per_request_numel=1,
+                    dtype=torch.int32,
+                    device=explicit_device,
+                ),
+                resources.empty(
+                    (bs,),
+                    tag="scan_i64",
+                    per_request_numel=1,
+                    dtype=torch.int64,
+                    device=explicit_device,
+                ),
+                resources.empty(
+                    (bs * 4,),
+                    tag="scan_window",
+                    per_request_numel=4,
+                    dtype=torch.int64,
+                    device=explicit_device,
+                ),
+                resources.empty(
+                    (3, bs, 4),
+                    tag="scan_layout",
+                    per_request_numel=12,
+                    dtype=torch.int64,
+                    device=explicit_device,
+                ),
+            )
+            assert [tuple(x.shape) for x in outputs] == [
+                (bs,),
+                (bs,),
+                (bs * 4,),
+                (3, bs, 4),
+            ]
+            assert all(x.is_contiguous() for x in outputs)
+
+        torch.cuda.synchronize()
+        allocated_growth = torch.cuda.memory_allocated() - before_allocated
+        reserved_growth = torch.cuda.memory_reserved() - before_reserved
+        assert allocated_growth < 4 << 20, allocated_growth
+        # The allocator may reserve a slab larger than the live 688 KiB arena.
+        assert reserved_growth < 32 << 20, reserved_growth
+        assert len(resources._round_tensor_rings) == 4
+
+        resources.begin_round(512, "cuda")
+        resources.empty(
+            (8,),
+            tag="one_checkout",
+            per_request_numel=1,
+            dtype=torch.int64,
+            device="cuda",
+        )
+        with pytest.raises(AssertionError, match="checked out twice"):
+            resources.empty(
+                (8,),
+                tag="one_checkout",
+                per_request_numel=1,
+                dtype=torch.int64,
+                device="cuda",
+            )
+
+        pointers = []
+        for _ in range(resources._ROUND_RING_DEPTH + 1):
+            resources.begin_round(512, "cuda")
+            pointers.append(
+                resources.empty(
+                    (8,),
+                    tag="slot_lifetime",
+                    per_request_numel=1,
+                    dtype=torch.int64,
+                    device="cuda",
+                ).data_ptr()
+            )
+        assert len(set(pointers[:-1])) == resources._ROUND_RING_DEPTH
+        assert pointers[-1] == pointers[0]
+    finally:
+        resources._round_contexts.clear()
+        resources._round_tensor_rings.clear()
+        torch.cuda.empty_cache()
+
+
+def test_speculative_host_ring_uses_bounded_power_of_two_buckets(monkeypatch):
+    from sglang.srt.utils import speculative_decode_resources as resources
+
+    monkeypatch.setattr(resources, "enabled", lambda: True)
+    monkeypatch.setattr(resources, "is_pin_memory_available", lambda _device: True)
+    resources._host_tensor_rings.clear()
+    try:
+        for bs in range(1, 513):
+            source = torch.arange(bs, dtype=torch.int32, device="cuda")
+            last_host = resources.copy_to_host(source, tag="scan_host")
+        torch.cuda.synchronize()
+
+        # Exact batch sizes collapse into 1, 2, ..., 512 buckets.
+        assert len(resources._host_tensor_rings) == 10
+        torch.testing.assert_close(last_host, torch.arange(512, dtype=torch.int32))
+    finally:
+        resources._host_tensor_rings.clear()
+
+
 @pytest.mark.parametrize("bs", [0, 1, 3, 128, 256])
 @pytest.mark.parametrize("width", [1, 4, 7])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])

@@ -97,6 +97,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_npu,
     require_gathered_buffer,
+    speculative_decode_resources,
 )
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -1150,6 +1151,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ):
+        if speculative_decode_resources.enabled():
+            speculative_decode_resources.begin_round(
+                self.req_to_token_pool.size, self.device
+            )
         self.draft_worker.last_draft_extend_staged = False
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill

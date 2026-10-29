@@ -4,6 +4,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.speculative import speculative_index
 from sglang.srt.utils import is_cpu, next_power_of_2
+from sglang.srt.utils import speculative_decode_resources as spec_decode_resources
 
 _is_cpu = is_cpu()
 
@@ -528,16 +529,49 @@ def prepare_draft_extend_lengths(seq_lens, num_draft_tokens, front_offset):
 
 def prepare_draft_extend_layout(seq_lens, num_draft_tokens, with_mrope):
     bs = seq_lens.numel()
-    prefix = torch.empty((bs,), dtype=torch.int32, device=seq_lens.device)
-    extend = torch.empty_like(prefix)
-    post = torch.empty((bs,), dtype=seq_lens.dtype, device=seq_lens.device)
-    positions = torch.empty(
-        (bs * num_draft_tokens,), dtype=torch.int64, device=seq_lens.device
+    device = seq_lens.device
+    prefix = spec_decode_resources.empty(
+        (bs,),
+        tag="extend_prefix_lens",
+        per_request_numel=1,
+        dtype=torch.int32,
+        device=device,
     )
-    starts = torch.empty_like(prefix)
+    extend = spec_decode_resources.empty(
+        (bs,),
+        tag="extend_lens",
+        per_request_numel=1,
+        dtype=torch.int32,
+        device=device,
+    )
+    post = spec_decode_resources.empty(
+        (bs,),
+        tag="extend_post_lens",
+        per_request_numel=1,
+        dtype=seq_lens.dtype,
+        device=device,
+    )
+    positions = spec_decode_resources.empty(
+        (bs * num_draft_tokens,),
+        tag="extend_positions",
+        per_request_numel=num_draft_tokens,
+        dtype=torch.int64,
+        device=device,
+    )
+    starts = spec_decode_resources.empty(
+        (bs,),
+        tag="extend_start_locs",
+        per_request_numel=1,
+        dtype=torch.int32,
+        device=device,
+    )
     mrope = (
-        torch.empty(
-            (3, bs * num_draft_tokens), dtype=torch.int64, device=seq_lens.device
+        spec_decode_resources.empty(
+            (3, bs * num_draft_tokens),
+            tag="extend_mrope",
+            per_request_numel=3 * num_draft_tokens,
+            dtype=torch.int64,
+            device=device,
         )
         if with_mrope
         else None
@@ -643,22 +677,57 @@ def build_chain_tree(
     bs, depth = draft_tokens.shape
     width = depth + 1
     assert bonus_tokens.numel() == seq_lens.numel() == bs
+    device = seq_lens.device
     mask = tree_mask_buf
     if mask is None:
-        mask = torch.empty(
-            (bs * width * width,), dtype=torch.bool, device=seq_lens.device
+        mask = spec_decode_resources.empty(
+            (bs * width * width,),
+            tag="chain_mask",
+            per_request_numel=width * width,
+            dtype=torch.bool,
+            device=device,
         )
     assert mask.is_contiguous() and mask.numel() >= bs * width * width
-    positions = torch.empty((bs * width,), dtype=torch.int64, device=seq_lens.device)
-    retrieve = torch.empty((3, bs, width), dtype=torch.int64, device=seq_lens.device)
-    tokens = torch.empty(
+    positions = spec_decode_resources.empty(
         (bs * width,),
-        dtype=torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
-        device=seq_lens.device,
+        tag="chain_positions",
+        per_request_numel=width,
+        dtype=torch.int64,
+        device=device,
     )
-    out_cache_loc = torch.empty_like(positions) if req_to_token is not None else None
+    retrieve = spec_decode_resources.empty(
+        (3, bs, width),
+        tag="chain_retrieve",
+        per_request_numel=3 * width,
+        dtype=torch.int64,
+        device=device,
+    )
+    tokens = spec_decode_resources.empty(
+        (bs * width,),
+        tag="chain_tokens",
+        per_request_numel=width,
+        dtype=torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
+        device=device,
+    )
+    out_cache_loc = (
+        spec_decode_resources.empty(
+            (bs * width,),
+            tag="chain_cache_locs",
+            per_request_numel=width,
+            dtype=torch.int64,
+            device=device,
+        )
+        if req_to_token is not None
+        else None
+    )
     mrope = (
-        torch.empty((3, bs * width), dtype=torch.int64, device=seq_lens.device)
+        spec_decode_resources.empty(
+            (3, bs * width),
+            tag="chain_mrope",
+            per_request_numel=3 * width,
+            dtype=torch.int64,
+            device=device,
+        )
         if with_mrope
         else None
     )

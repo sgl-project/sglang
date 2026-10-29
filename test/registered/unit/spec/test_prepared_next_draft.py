@@ -3,8 +3,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.managers import overlap_utils
+from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
@@ -17,7 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.runtime_context import get_context, get_parallel, get_resources
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative import prepared_next_draft
+from sglang.srt.speculative import eagle_utils, prepared_next_draft
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 from sglang.srt.speculative.prepared_next_draft import (
     NextDraftInputStager,
@@ -79,6 +81,24 @@ def _prepared(num_requests: int = 2) -> PreparedNextDraftInputs:
         mrope_positions=None,
         draft_out_cache_loc=torch.zeros(num_requests * 6, dtype=torch.int64),
         write_window=torch.zeros(num_requests * 7, dtype=torch.int64),
+    )
+
+
+def _decode_prepare_batch(reqs, *, penalized=False):
+    return SimpleNamespace(
+        reqs=reqs,
+        maybe_evict_swa=lambda: None,
+        sampling_info=SimpleNamespace(
+            penalizer_orchestrator=SimpleNamespace(is_required=penalized)
+        ),
+        cumulate_penalty_output_tokens=lambda: None,
+        token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+        tree_cache=SimpleNamespace(supports_swa=lambda: False),
+        req_to_token_pool=SimpleNamespace(),
+        req_pool_indices=torch.tensor([req.kv.req_pool_idx for req in reqs]),
+        seq_lens_cpu=torch.tensor([req.kv.kv_committed_len for req in reqs]),
+        device="cpu",
+        spec_decode_schedule_stream_idle=False,
     )
 
 
@@ -557,6 +577,9 @@ class TestPreparedNextDraft(CustomTestCase):
         pool = SimpleNamespace(req_to_token=torch.zeros((8, 16), dtype=torch.int32))
         with (
             patch.object(overlap_utils, "_is_cuda", False),
+            patch.object(
+                overlap_utils, "spec_relay_bypass_enabled", return_value=False
+            ),
             patch(
                 "sglang.srt.speculative.prepared_next_draft."
                 "prepared_next_draft_enabled",
@@ -584,8 +607,8 @@ class TestPreparedNextDraft(CustomTestCase):
         """Prepared lengths alone do not waive a schedule-stream join when KV
         allocation or penalty bookkeeping launched work on that stream."""
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.forward_stream = Mock()
-        scheduler.schedule_stream = object()
+        scheduler.forward_stream = "forward"
+        scheduler.schedule_stream = "schedule"
         prepared = torch.tensor([10])
         cases = (
             (prepared, True, False),
@@ -594,14 +617,61 @@ class TestPreparedNextDraft(CustomTestCase):
         )
         for seq_lens, idle, joins in cases:
             batch = SimpleNamespace(spec_decode_schedule_stream_idle=idle)
-            scheduler.forward_stream.reset_mock()
-            with self.subTest(prepared=seq_lens is not None, idle=idle):
+            with (
+                self.subTest(prepared=seq_lens is not None, idle=idle),
+                patch.object(
+                    scheduler_module.spec_decode_resources, "wait_stream"
+                ) as wait,
+            ):
                 scheduler._join_schedule_stream(batch, seq_lens)
-                self.assertEqual(
-                    scheduler.forward_stream.wait_stream.call_count, int(joins)
-                )
+                self.assertEqual(wait.call_count, int(joins))
                 if seq_lens is not None:
                     self.assertFalse(batch.spec_decode_schedule_stream_idle)
+
+    def test_decode_without_new_pages_updates_only_host_watermarks(self):
+        """A fully reserved round avoids allocation tensors and marks the schedule
+        stream idle only when penalty and cache bookkeeping also launch no work."""
+        reserve = 21
+        rounds = (
+            (121, False, True),
+            (121, True, False),
+            (120, False, False),
+        )
+        for allocated, penalized, idle in rounds:
+            req = _req(5, allocated=allocated)
+            batch = _decode_prepare_batch([req], penalized=penalized)
+            with (
+                self.subTest(allocated=allocated, penalized=penalized),
+                patch.object(
+                    eagle_utils,
+                    "get_alloc_reserve_per_decode",
+                    return_value=reserve,
+                ),
+                patch.object(
+                    eagle_utils,
+                    "prepared_next_draft_enabled",
+                    return_value=True,
+                ),
+                patch.object(
+                    eagle_utils,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        mamba=SimpleNamespace(enable_mamba_extra_buffer_lazy=False)
+                    ),
+                ),
+                patch.object(
+                    eagle_utils, "update_spec_decode_allocated_lens"
+                ) as update,
+                patch.object(eagle_utils, "alloc_for_spec_decode") as allocate,
+            ):
+                eagle_utils.eagle_prepare_for_decode(batch)
+                self.assertEqual(batch.spec_decode_schedule_stream_idle, idle)
+                if allocated == 121:
+                    update.assert_called_once_with([req], [121])
+                    allocate.assert_not_called()
+                else:
+                    update.assert_not_called()
+                    allocate.assert_called_once()
 
 
 if __name__ == "__main__":

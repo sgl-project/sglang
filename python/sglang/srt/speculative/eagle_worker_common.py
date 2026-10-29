@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+
 from sglang.kernels.ops.speculative import speculative_index
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous_func,
@@ -42,6 +43,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
 )
 from sglang.srt.utils import is_cpu
+from sglang.srt.utils import speculative_decode_resources as spec_decode_resources
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -513,18 +515,30 @@ def prepare_for_draft(
                 slice(0, num_steps), prepared.draft_out_cache_loc
             )
         elif page_size == 1 or topk == 1:
-            batch.out_cache_loc = torch.empty(
+            batch.out_cache_loc = spec_decode_resources.empty(
                 (bs * topk * window_cols,),
+                tag="draft_write_window",
+                per_request_numel=topk * window_cols,
                 dtype=torch.int64,
                 device=batch.device,
             )
             if batch.seq_lens.is_cuda and topk == 1:
-                prepared_positions = torch.empty_like(batch.seq_lens)
+                prepared_positions = spec_decode_resources.empty(
+                    (bs,),
+                    tag="draft_positions",
+                    per_request_numel=1,
+                    dtype=batch.seq_lens.dtype,
+                    device=batch.seq_lens.device,
+                )
                 if draft_model_runner.model_config.model_is_mrope and all(
                     x is None for x in batch.multimodal_inputs
                 ):
-                    prepared_mrope_positions = torch.empty(
-                        (3, bs), dtype=torch.int64, device=batch.device
+                    prepared_mrope_positions = spec_decode_resources.empty(
+                        (3, bs),
+                        tag="draft_mrope_positions",
+                        per_request_numel=3,
+                        dtype=torch.int64,
+                        device=batch.device,
                     )
             if not (
                 speculative_index.draft_locs(
@@ -842,7 +856,7 @@ def run_eagle_verify(
         if plan_stream is not None:
             # Verify prep copies draft-produced tree metadata on the plan stream,
             # so it must not start before the draft frontier.
-            plan_stream.wait_stream(fwd_stream)
+            spec_decode_resources.wait_stream(plan_stream, fwd_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,
@@ -855,7 +869,9 @@ def run_eagle_verify(
 
     # Correct some buffers due to the overlap plan
     if plan_stream:
-        torch.get_device_module(device).current_stream().wait_stream(plan_stream)
+        spec_decode_resources.wait_stream(
+            torch.get_device_module(device).current_stream(), plan_stream
+        )
         if (
             _is_npu
             and target_worker.model_runner.model_config.model_is_mrope
