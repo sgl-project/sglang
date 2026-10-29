@@ -686,7 +686,10 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
         if exit_rows is ExitRows.ATTENTION or (
             following is not None and following.read.reads_after_attn_tp_gather
         ):
-            returned = attention
+            # "Attention rows" means the active variant's attention input:
+            # full attention rows normally, or the local TP row shard while
+            # LayerNorm SP owns the token axis.
+            returned = local if variant is BatchVariant.SEQUENCE_PARALLEL else attention
         elif exit_rows is ExitRows.SLICE:
             # The residual's rows during the FFN: this rank's slice for an FFN
             # on its own rows, else the attention's.
