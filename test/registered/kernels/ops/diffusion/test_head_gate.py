@@ -53,12 +53,13 @@ def test_head_gate_mul_rejects_strided_or_mismatched_inputs() -> None:
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("strided", [False, True])
-def test_head_gate_mul_fallback_matches_eager(dtype, strided):
-    if not torch.cuda.is_available():
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_head_gate_mul_preserves_reference_paths(dtype, strided, device):
+    if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
     for _ in range(2):
-        x = torch.randn(2, 12, 4, 8, device="cuda", dtype=dtype)
-        gate = torch.rand(2, 12, 4, device="cuda", dtype=dtype)
+        x = torch.randn(2, 12, 4, 8, device=device, dtype=dtype)
+        gate = torch.rand(2, 12, 4, device=device, dtype=dtype)
         if strided:
             x, gate = x[:, ::2], gate[:, ::2]
         expected = (x * (2.0 * gate.unsqueeze(-1))).flatten(2)
