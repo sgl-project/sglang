@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
 from functools import partial
 from typing import Iterable, Optional, Tuple
 
@@ -16,7 +18,10 @@ from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
-from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.distributed.communication_op import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -31,6 +36,9 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     should_apply_lm_head_quant_method,
 )
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_a2a_backend
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -41,6 +49,7 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
@@ -662,6 +671,488 @@ class DFlashMLP(nn.Module):
         return x
 
 
+_DFLASH_EXPERT_TENSOR = re.compile(
+    r"^experts\.(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj|w1|w2|w3)\.weight$"
+)
+# Qwen names, and the DeepSeek-style w1 (gate) / w2 (down) / w3 (up) aliases.
+_DFLASH_EXPERT_SHARDS = {
+    "gate_proj": "w1",
+    "up_proj": "w3",
+    "down_proj": "w2",
+    "w1": "w1",
+    "w2": "w2",
+    "w3": "w3",
+}
+# The router bias under SpecForge's name, DeepSeek's, and SpecForge's earlier
+# ``selection_bias`` name that older exports still carry.
+_DFLASH_EXPERT_BIAS_KEYS = (
+    "gate.expert_bias",
+    "gate.e_score_correction_bias",
+    "gate.selection_bias",
+)
+# Qwen's single gated shared expert and DeepSeek's summed shared experts.
+_DFLASH_SHARED_PREFIXES = ("shared_expert.", "shared_experts.")
+_DFLASH_MOE_KEY_PREFIXES = ("experts.", "gate.", "shared_expert")
+_DFLASH_LAYER_FFN = re.compile(r"^layers\.(\d+)\.mlp\.(.+)$")
+
+
+def _dflash_sub_prefix(prefix: str, name: str) -> str:
+    return name if not prefix else f"{prefix}.{name}"
+
+
+def _config_int(config, *names: str, default: int = 0) -> int:
+    for name in names:
+        value = getattr(config, name, None)
+        if value is not None:
+            return int(value)
+    return default
+
+
+@dataclass(frozen=True)
+class DFlashMoESpec:
+    """The MoE FFN a draft config describes, read from the HF fields the Qwen,
+    DeepSeek and Mixtral families share."""
+
+    num_experts: int
+    top_k: int
+    intermediate_size: int
+    hidden_act: str
+    # softmax or sigmoid expert scores; renormalize the picked weights.
+    scoring_func: str
+    renormalize: bool
+    # DeepSeek's group-limited top-k (n_group / topk_group); None = plain top-k.
+    num_expert_group: Optional[int]
+    topk_group: Optional[int]
+    routed_scaling_factor: Optional[float]
+    # Width of the shared expert (0 = none); gated = Qwen's sigmoid
+    # shared_expert_gate, else DeepSeek's plain sum.
+    shared_intermediate_size: int
+    shared_gated: bool
+
+    @property
+    def grouped(self) -> bool:
+        return self.num_expert_group is not None
+
+
+def parse_dflash_moe_spec(config) -> Optional[DFlashMoESpec]:
+    """``None`` for a dense draft, i.e. a config without routed experts."""
+    num_experts = _config_int(
+        config, "num_experts", "n_routed_experts", "num_local_experts"
+    )
+    if num_experts <= 0:
+        return None
+    top_k = _config_int(config, "num_experts_per_tok")
+    intermediate_size = _config_int(
+        config, "moe_intermediate_size", "intermediate_size"
+    )
+    if top_k <= 0 or intermediate_size <= 0:
+        raise ValueError(
+            "DFLASH MoE draft config needs positive num_experts_per_tok and "
+            f"moe_intermediate_size, got {top_k} and {intermediate_size}."
+        )
+    if top_k > num_experts:
+        raise ValueError(
+            f"DFLASH MoE draft num_experts_per_tok={top_k} exceeds "
+            f"num_experts={num_experts}."
+        )
+    scoring_func = str(getattr(config, "scoring_func", None) or "softmax")
+    if scoring_func not in ("softmax", "sigmoid"):
+        raise ValueError(
+            f"DFLASH MoE drafts route with softmax or sigmoid scores, got "
+            f"scoring_func={scoring_func!r}."
+        )
+    renormalize = getattr(config, "norm_topk_prob", None)
+    # transformers renormalizes when the config does not say.
+    renormalize = True if renormalize is None else bool(renormalize)
+    n_group = _config_int(config, "n_group", default=1)
+    topk_group = _config_int(config, "topk_group", default=1)
+    topk_method = getattr(config, "topk_method", None)
+    grouped = n_group > 1 or topk_method in ("noaux_tc", "group_limited_greedy")
+    if grouped and (n_group <= 0 or topk_group <= 0 or num_experts % n_group):
+        raise ValueError(
+            f"DFLASH MoE draft group-limited routing needs n_group dividing "
+            f"num_experts and a positive topk_group, got n_group={n_group}, "
+            f"topk_group={topk_group}, num_experts={num_experts}."
+        )
+    scale = getattr(config, "routed_scaling_factor", None)
+    routed_scaling_factor = (
+        None if scale is None or float(scale) == 1.0 else float(scale)
+    )
+    shared_intermediate_size = _config_int(config, "shared_expert_intermediate_size")
+    shared_gated = shared_intermediate_size > 0
+    if shared_intermediate_size <= 0:
+        shared_intermediate_size = (
+            _config_int(config, "n_shared_experts") * intermediate_size
+        )
+    return DFlashMoESpec(
+        num_experts=num_experts,
+        top_k=top_k,
+        intermediate_size=intermediate_size,
+        hidden_act=str(getattr(config, "hidden_act", None) or "silu"),
+        scoring_func=scoring_func,
+        renormalize=renormalize,
+        num_expert_group=n_group if grouped else None,
+        topk_group=topk_group if grouped else None,
+        routed_scaling_factor=routed_scaling_factor,
+        shared_intermediate_size=shared_intermediate_size,
+        shared_gated=shared_gated,
+    )
+
+
+class DFlashMoE(nn.Module):
+    """A draft decoder layer's MoE FFN, built from the config's HF MoE fields
+    rather than from a model family: a ``ReplicatedLinear`` router, SGLang's
+    ``TopK`` for the routing the config describes, ``FusedMoE`` for the SwiGLU
+    experts and, when the config sizes one, a shared expert that is either
+    sigmoid-gated (Qwen's ``shared_expert_gate``) or plainly summed (DeepSeek).
+
+    The config fields (see :func:`parse_dflash_moe_spec`): ``num_experts`` /
+    ``n_routed_experts`` / ``num_local_experts``, ``num_experts_per_tok``,
+    ``moe_intermediate_size``, ``hidden_act`` (silu), ``scoring_func``
+    (softmax or sigmoid), ``norm_topk_prob``, ``n_group`` / ``topk_group`` /
+    ``topk_method`` for group-limited top-k, ``routed_scaling_factor``, and
+    ``shared_expert_intermediate_size`` or ``n_shared_experts``.
+
+    Checkpoint tensors under ``layers.{i}.mlp.``: ``gate.weight`` [E, H]; the
+    experts stacked as ``experts.gate_up_proj`` [E, 2I, H] (gate rows, then up
+    rows) and ``experts.down_proj`` [E, H, I], or per expert as
+    ``experts.{e}.{gate_proj,up_proj,down_proj}.weight``; the shared expert as
+    ``shared_expert.*`` or ``shared_experts.*`` with ``shared_expert_gate.weight``
+    [1, H] when gated; and optionally a router bias, ``gate.expert_bias``,
+    ``gate.e_score_correction_bias`` or the older ``gate.selection_bias`` [E],
+    that shifts which experts are picked
+    but never their weights. The checkpoint alone decides the bias: present,
+    the router applies it (SpecForge's biased softmax top-k runs in torch
+    because the fused softmax routers keep softmax routing bias-free); absent,
+    the picks are the unbiased top-k. Loading is strict: a partially loaded
+    FFN is refused.
+    """
+
+    def __init__(
+        self, config, layer_id: int, quant_config=None, prefix: str = ""
+    ) -> None:
+        super().__init__()
+        spec = parse_dflash_moe_spec(config)
+        if spec is None:
+            raise ValueError("DFLASH MoE FFN needs a config with routed experts.")
+        if spec.hidden_act != "silu":
+            raise ValueError(
+                f"DFLASH MoE drafts serve silu experts only, got hidden_act={spec.hidden_act!r}."
+            )
+        if not get_moe_a2a_backend().is_none():
+            raise ValueError(
+                "DFLASH MoE drafts run FusedMoE with the standard dispatcher; "
+                f"--moe-a2a-backend {get_moe_a2a_backend().value} is not supported "
+                "for the draft."
+            )
+        self.spec = spec
+        self.layer_id = layer_id
+        self.hidden_size = int(config.hidden_size)
+        # Router logits in the activation dtype; the scores are taken in fp32.
+        self.gate = ReplicatedLinear(
+            self.hidden_size,
+            spec.num_experts,
+            bias=False,
+            quant_config=None,
+            prefix=_dflash_sub_prefix(prefix, "gate"),
+        )
+        # Zero until the checkpoint carries a router bias.
+        self.register_buffer(
+            "gate_expert_bias", torch.zeros(spec.num_experts, dtype=torch.float32)
+        )
+        self.has_expert_bias = False
+        self.experts = get_moe_impl_class(quant_config)(
+            num_experts=spec.num_experts,
+            hidden_size=self.hidden_size,
+            intermediate_size=spec.intermediate_size,
+            layer_id=layer_id,
+            top_k=spec.top_k,
+            quant_config=quant_config,
+            prefix=_dflash_sub_prefix(prefix, "experts"),
+            routing_method_type=self._routing_method_type(),
+            routed_scaling_factor=spec.routed_scaling_factor,
+        )
+        self.topk = self._make_router()
+        self.shared_expert: Optional[Qwen2MoeMLP] = None
+        self.shared_expert_gate: Optional[ReplicatedLinear] = None
+        if spec.shared_intermediate_size > 0:
+            self.shared_expert = Qwen2MoeMLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=spec.shared_intermediate_size,
+                hidden_act=spec.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=_dflash_sub_prefix(prefix, "shared_expert"),
+            )
+            if spec.shared_gated:
+                self.shared_expert_gate = ReplicatedLinear(
+                    self.hidden_size,
+                    1,
+                    bias=False,
+                    quant_config=None,
+                    prefix=_dflash_sub_prefix(prefix, "shared_expert_gate"),
+                )
+        self._loaded_experts: set = set()
+        self._loaded_params: set = set()
+
+    def describe(self) -> str:
+        spec = self.spec
+        routing = f"{spec.scoring_func} top-{spec.top_k}"
+        if spec.grouped:
+            routing += f" ({spec.topk_group} of {spec.num_expert_group} groups)"
+        if spec.renormalize:
+            routing += ", renormalized"
+        if spec.routed_scaling_factor is not None:
+            routing += f", scaled {spec.routed_scaling_factor}"
+        shared = "none"
+        if self.shared_expert is not None:
+            shared = f"{spec.shared_intermediate_size}"
+            shared += " (sigmoid-gated)" if spec.shared_gated else " (summed)"
+        return (
+            f"{spec.num_experts} routed experts, width {spec.intermediate_size}, "
+            f"routing {routing}, expert_bias={self.has_expert_bias}, "
+            f"shared={shared}, runner={self.experts.runner_backend.value}"
+        )
+
+    # -- routing ---------------------------------------------------------
+    def _routing_method_type(self) -> RoutingMethodType:
+        spec = self.spec
+        if spec.grouped:
+            return RoutingMethodType.DeepSeekV3
+        if spec.scoring_func == "sigmoid":
+            return (
+                RoutingMethodType.SigmoidRenorm
+                if spec.renormalize
+                else RoutingMethodType.Sigmoid
+            )
+        return (
+            RoutingMethodType.RenormalizeNaive
+            if spec.renormalize
+            else RoutingMethodType.Default
+        )
+
+    def _make_router(self) -> TopK:
+        """SGLang's TopK for the config's routing; a loaded bias rides along as
+        its correction bias, except with plain softmax scores, whose fused
+        routers keep the routing bias-free: that top-k runs in torch."""
+        spec = self.spec
+        bias = self.gate_expert_bias if self.has_expert_bias else None
+        custom_routing_function = None
+        if bias is not None and spec.scoring_func == "softmax" and not spec.grouped:
+            custom_routing_function, bias = self._route_with_expert_bias, None
+        if (
+            self.has_expert_bias
+            and self.experts.runner_backend.is_flashinfer_trtllm_routed()
+        ):
+            raise ValueError(
+                "DFLASH MoE draft carries a router bias, which the "
+                "flashinfer_trtllm_routed runner would drop by routing in-kernel "
+                "from the raw logits; choose another --moe-runner-backend."
+            )
+        topk = TopK(
+            top_k=spec.top_k,
+            layer_id=self.layer_id,
+            is_draft=True,
+            renormalize=spec.renormalize,
+            use_grouped_topk=spec.grouped,
+            num_expert_group=spec.num_expert_group,
+            topk_group=spec.topk_group,
+            scoring_func=spec.scoring_func,
+            correction_bias=bias,
+            custom_routing_function=custom_routing_function,
+            routed_scaling_factor=spec.routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=(
+                self.experts.should_fuse_routed_scaling_factor_in_topk
+            ),
+        )
+        topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
+        return topk
+
+    def _route_with_expert_bias(
+        self,
+        hidden_states: torch.Tensor,
+        gating_output: torch.Tensor,
+        topk: int,
+        renormalize: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Biased softmax top-k: ``scores + bias`` picks the experts, the
+        weights are the unbiased softmax scores."""
+        scores = torch.softmax(gating_output.float(), dim=-1)
+        topk_ids = torch.topk(scores + self.gate_expert_bias, k=topk, dim=-1).indices
+        topk_weights = scores.gather(-1, topk_ids)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        return topk_weights, topk_ids.to(torch.int32)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        shape = hidden_states.shape
+        x = hidden_states.view(-1, self.hidden_size)
+        if x.shape[0] > 0:
+            router_logits, _ = self.gate(x)
+            topk_output = self.topk(x, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(x.device)
+        shared = None
+        if self.shared_expert is not None and x.shape[0] > 0:
+            # Before the experts: the MoE runner may compute in place over x.
+            shared = self.shared_expert(x)
+            if self.shared_expert_gate is not None:
+                shared_gate, _ = self.shared_expert_gate(x)
+                shared = torch.sigmoid(shared_gate.float()).to(shared.dtype) * shared
+        out = self.experts(x, topk_output)
+        if not isinstance(out, torch.Tensor):
+            out = out[0] if isinstance(out, tuple) else out.hidden_states
+        if shared is not None:
+            out = out + shared
+        # Routed and shared partial sums are reduced once, like the dense
+        # MLP's row-parallel down projection.
+        if self.experts.moe_tp_size > 1 or self.experts.moe_ep_size > 1:
+            out = tensor_model_parallel_all_reduce(out)
+        return out.view(shape)
+
+    # -- loading ---------------------------------------------------------
+    def _check_shape(self, key: str, tensor: torch.Tensor, expected: tuple) -> None:
+        if tuple(tensor.shape) != tuple(expected):
+            raise ValueError(
+                f"DFLASH MoE FFN tensor {key!r} has shape {tuple(tensor.shape)}, "
+                f"the config expects {tuple(expected)} (num_experts="
+                f"{self.spec.num_experts}, moe_intermediate_size="
+                f"{self.spec.intermediate_size}, hidden_size={self.hidden_size})."
+            )
+
+    def _load_expert(
+        self, expert_id: int, shard_id: str, loaded_weight: torch.Tensor
+    ) -> None:
+        if expert_id >= self.spec.num_experts:
+            raise ValueError(
+                f"DFLASH MoE FFN checkpoint names expert {expert_id}; the config "
+                f"has num_experts={self.spec.num_experts}."
+            )
+        if shard_id == "w2":
+            param, name = self.experts.w2_weight, "w2_weight"
+        else:
+            param, name = self.experts.w13_weight, "w13_weight"
+        self.experts.weight_loader(
+            param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id
+        )
+        self._loaded_experts.add((expert_id, shard_id))
+
+    def _load_shared(self, key: str, name: str, loaded_weight: torch.Tensor) -> None:
+        if self.shared_expert is None:
+            raise ValueError(
+                f"DFLASH MoE FFN checkpoint carries {key!r} but the config sizes "
+                "no shared expert (shared_expert_intermediate_size / n_shared_experts)."
+            )
+        if name in ("gate_proj.weight", "up_proj.weight"):
+            param = self.shared_expert.gate_up_proj.weight
+            param.weight_loader(
+                param, loaded_weight, 0 if name.startswith("gate") else 1
+            )
+        elif name == "down_proj.weight":
+            param = self.shared_expert.down_proj.weight
+            getattr(param, "weight_loader", default_weight_loader)(param, loaded_weight)
+        else:
+            raise ValueError(
+                f"DFLASH MoE FFN checkpoint tensor {key!r} does not map to the "
+                "shared expert (gate_proj / up_proj / down_proj)."
+            )
+        self._loaded_params.add(f"shared_expert.{name}")
+
+    def load_weight(self, key: str, loaded_weight: torch.Tensor) -> None:
+        """Load one checkpoint tensor named relative to ``layers.{i}.mlp.``."""
+        num_experts, hidden, width = (
+            self.spec.num_experts,
+            self.hidden_size,
+            self.spec.intermediate_size,
+        )
+        if key == "experts.gate_up_proj":  # stacked [E, 2I, H]: gate rows, then up
+            self._check_shape(key, loaded_weight, (num_experts, 2 * width, hidden))
+            for expert_id, gate_up in enumerate(loaded_weight):
+                gate, up = gate_up.chunk(2, dim=0)
+                self._load_expert(expert_id, "w1", gate)
+                self._load_expert(expert_id, "w3", up)
+            return
+        if key == "experts.down_proj":  # stacked [E, H, I]
+            self._check_shape(key, loaded_weight, (num_experts, hidden, width))
+            for expert_id, down in enumerate(loaded_weight):
+                self._load_expert(expert_id, "w2", down)
+            return
+        match = _DFLASH_EXPERT_TENSOR.match(key)
+        if match is not None:
+            self._load_expert(
+                int(match["expert"]),
+                _DFLASH_EXPERT_SHARDS[match["proj"]],
+                loaded_weight,
+            )
+            return
+        if key in _DFLASH_EXPERT_BIAS_KEYS:
+            self._check_shape(key, loaded_weight, (num_experts,))
+            with torch.no_grad():
+                self.gate_expert_bias.copy_(loaded_weight.float())
+            self.has_expert_bias = True
+            self.topk = self._make_router()
+            self._loaded_params.add("gate.expert_bias")
+            return
+        for shared_prefix in _DFLASH_SHARED_PREFIXES:
+            if key.startswith(shared_prefix):
+                self._load_shared(key, key[len(shared_prefix) :], loaded_weight)
+                return
+        if key == "shared_expert_gate.weight":
+            if self.shared_expert_gate is None:
+                raise ValueError(
+                    f"DFLASH MoE FFN checkpoint carries {key!r} but the config "
+                    "describes no gated shared expert."
+                )
+            param = self.shared_expert_gate.weight
+        elif key == "gate.weight":
+            param = self.gate.weight
+        else:
+            raise ValueError(
+                f"DFLASH MoE FFN checkpoint tensor {key!r} does not map to any "
+                "parameter of the served FFN; does config.json match the export?"
+            )
+        getattr(param, "weight_loader", default_weight_loader)(param, loaded_weight)
+        self._loaded_params.add(key)
+
+    def check_loaded(self, where: str) -> None:
+        """Refuse to serve a partially loaded FFN."""
+        missing = [
+            f"experts.{expert_id}.{shard}"
+            for expert_id in range(self.spec.num_experts)
+            for shard in ("w1", "w2", "w3")
+            if (expert_id, shard) not in self._loaded_experts
+        ]
+        expected = {"gate.weight"}
+        if self.shared_expert is not None:
+            expected |= {
+                "shared_expert.gate_proj.weight",
+                "shared_expert.up_proj.weight",
+                "shared_expert.down_proj.weight",
+            }
+        if self.shared_expert_gate is not None:
+            expected.add("shared_expert_gate.weight")
+        missing += sorted(expected - self._loaded_params)
+        if missing:
+            shown = ", ".join(missing[:8]) + (", ..." if len(missing) > 8 else "")
+            raise ValueError(
+                f"DFLASH {where}: {len(missing)} MoE FFN tensor(s) missing from the "
+                f"checkpoint, the FFN would serve uninitialized: {shown}"
+            )
+
+
+def build_dflash_ffn(config, *, layer_id: int, quant_config=None, prefix: str = ""):
+    """The decoder layer's FFN: the MoE when the config has routed experts,
+    the dense MLP otherwise."""
+    if parse_dflash_moe_spec(config) is None:
+        return DFlashMLP(config=config, quant_config=quant_config, prefix=prefix)
+    return DFlashMoE(
+        config, layer_id=layer_id, quant_config=quant_config, prefix=prefix
+    )
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size, taps):
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
@@ -765,8 +1256,8 @@ class DFlashDecoderLayer(nn.Module):
         )
         self.post_attention_layernorm = norm_cls(hidden_size, eps=rms_norm_eps)
         mlp_prefix = f"{prefix}.mlp" if prefix else ""
-        self.mlp = DFlashMLP(
-            config=config, quant_config=quant_config, prefix=mlp_prefix
+        self.mlp = build_dflash_ffn(
+            config, layer_id=layer_id, quant_config=quant_config, prefix=mlp_prefix
         )
 
         self.attention_conv = attention_conv
@@ -1096,6 +1587,8 @@ class DFlashDraftModel(nn.Module):
                     "DFLASH checkpoint contains Domino projector weights but "
                     f"projector_type={self.projector_type!r}."
                 )
+            if self._load_moe_ffn_weight(unprefixed_name, loaded_weight, loaded_params):
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
                     continue
@@ -1166,7 +1659,33 @@ class DFlashDraftModel(nn.Module):
                     "DFLASH Domino checkpoint is missing required projector weights: "
                     f"{sorted(missing)}."
                 )
+        for index, layer in enumerate(self.layers):
+            if isinstance(layer.mlp, DFlashMoE):
+                layer.mlp.check_loaded(f"layers.{index}.mlp")
+        if self.layers and isinstance(self.layers[0].mlp, DFlashMoE):
+            logger.info("DFLASH MoE FFN: %s", self.layers[0].mlp.describe())
         self.post_load_weights()
+
+    def _load_moe_ffn_weight(
+        self, name: str, loaded_weight: torch.Tensor, loaded_params: set
+    ) -> bool:
+        """Hand ``layers.{i}.mlp.*`` tensors of MoE layers to their FFN; refuse
+        MoE tensors aimed at a dense layer instead of dropping them silently."""
+        match = _DFLASH_LAYER_FFN.match(name)
+        if match is None:
+            return False
+        index, key = int(match.group(1)), match.group(2)
+        mlp = self.layers[index].mlp if index < len(self.layers) else None
+        if isinstance(mlp, DFlashMoE):
+            mlp.load_weight(key, loaded_weight)
+            loaded_params.add(name)
+            return True
+        if key.startswith(_DFLASH_MOE_KEY_PREFIXES):
+            raise ValueError(
+                f"DFLASH checkpoint carries MoE FFN weight {name!r} but the draft "
+                f"config has no routed experts (layer {index} is a dense MLP)."
+            )
+        return False
 
     def post_load_weights(self) -> None:
         """Loaders that bypass load_weights call this directly."""
@@ -1490,6 +2009,11 @@ class DFlash2BeamDraftModel(DFlash2DraftModel):
     """Alias for checkpoints declaring architectures=["DFlash2BeamDraftModel"]."""
 
 
+class DFlashMoEDraftModel(DFlashDraftModel):
+    """Alias for SpecForge MoE exports normalized to
+    architectures=["DFlashMoEDraftModel"]; the FFN comes from the config either way."""
+
+
 EntryClass = [
     DFlashDraftModel,
     DFlashLagunaForCausalLM,
@@ -1497,4 +2021,5 @@ EntryClass = [
     DFlash2DraftModel,
     DFlash2BeamDraftModel,
     MiniMaxDFlash2DraftModel,
+    DFlashMoEDraftModel,
 ]

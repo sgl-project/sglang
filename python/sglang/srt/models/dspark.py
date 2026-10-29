@@ -1007,4 +1007,10 @@ class LingDSparkModel(DSparkDraftModel):
     pass
 
 
-EntryClass = [Qwen3DSparkModel, LingDSparkModel, DSparkDraftModel]
+class Qwen3MoeDSparkModel(Qwen3DSparkModel):
+    """Alias for SpecForge MoE DSpark exports normalized to
+    architectures=["Qwen3MoeDSparkModel"]; the MoE FFN comes from the config
+    either way."""
+
+
+EntryClass = [Qwen3DSparkModel, LingDSparkModel, Qwen3MoeDSparkModel, DSparkDraftModel]
