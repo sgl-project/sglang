@@ -177,7 +177,8 @@ class KVLayerRouter:
         the id the composite passes the view today. ``owner`` names the
         sub-pool whose write ids are the request's token ids (default: the
         first)."""
-        owner = layer_maps[0][0] if owner is None else owner
+        if owner is None and layer_maps:
+            owner = layer_maps[0][0]
         layers: Dict[int, KVLayer] = {}
         for name, view, indices in layer_maps:
             for layer_id, index in indices.items():

@@ -1290,9 +1290,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_beta=replayssm_beta,
             )
-            ring_indices = fm.replayssm_ring_indices
-            if ring_indices is not None:
-                ring_kwargs["ring_indices"] = ring_indices
+            # Request-scoped rows exist only for the host-only ring. The slot
+            # ring keeps writing at h0_indices, and metadata stubs that predate
+            # the field stay on that path.
+            if self.state_pool is not None and self.state_pool.replayssm_request_ring:
+                ring_indices = fm.replayssm_ring_indices
+                if ring_indices is not None:
+                    ring_kwargs["ring_indices"] = ring_indices
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
         intermediate_state_indices = select_verify_intermediate_state_indices(
             self.verify_intermediate_state_indices,
