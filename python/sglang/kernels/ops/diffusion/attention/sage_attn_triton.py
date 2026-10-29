@@ -19,6 +19,9 @@ Implementation choices, measured on Arc Pro B60 (Xe2):
 - Every operand is read through a tensor descriptor and K is transposed inside
   the dot. A transposed block-pointer load of K, or pointer-arithmetic loads,
   spill registers and run at 3-19 TFLOPs instead of ~80.
+- Q gets one scale per attention tile (BLOCK_Q rows), so the KV loop applies a
+  scalar. With a per-row scale vector, triton-xpu 3.8 converts its layout
+  through shared memory on every KV iteration (3x slower).
 - P @ V accumulates in FP32.
 - The optional log-sum-exp is in natural log and adds back q . mean(k), the
   logit shift that smoothing removed, so ring attention can merge partials.
@@ -33,14 +36,13 @@ import triton.language as tl
 
 _LOG2E = 1.4426950408889634
 
-# Rows that share one quantization scale (the paper's per-block granularity).
-_Q_ROWS_PER_SCALE = 128
+# K rows that share one quantization scale; Q uses one scale per BLOCK_Q tile.
 _K_ROWS_PER_SCALE = 64
 
 # head_dim -> (BLOCK_Q, BLOCK_KV, num_warps, num_stages); measured on Arc Pro B60.
 _ATTN_TILES = {
-    64: (64, 64, 4, 2),
-    128: (256, 32, 16, 2),
+    64: (64, 64, 8, 2),
+    128: (128, 64, 16, 1),
 }
 # head_dim -> num_warps of the Q and the K/V prepass; measured on Arc Pro B60.
 _PREPASS_WARPS = {
@@ -264,7 +266,6 @@ def _sage_attn_fwd_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,
-    Q_ROWS_PER_SCALE: tl.constexpr,
     K_ROWS_PER_SCALE: tl.constexpr,
     CAUSAL: tl.constexpr,
     WRITE_LSE: tl.constexpr,
@@ -298,13 +299,7 @@ def _sage_attn_fwd_kernel(
     q_start = q_block * BLOCK_Q
     q_pos = q_start + tl.arange(0, BLOCK_Q)
     kv_offs = tl.arange(0, BLOCK_KV)
-    q_scale_row = Q_scale + bh * num_q_scales
-    if Q_ROWS_PER_SCALE % BLOCK_Q == 0:
-        q_scale = tl.load(q_scale_row + q_start // Q_ROWS_PER_SCALE)
-    else:
-        q_scale = tl.load(
-            q_scale_row + q_pos // Q_ROWS_PER_SCALE, mask=q_pos < q_len, other=0.0
-        )[:, None]
+    q_scale = tl.load(Q_scale + bh * num_q_scales + q_block)
     k_scale_row = K_scale + bh_kv * num_k_scales
 
     q = q_desc.load([q_start, 0])
@@ -407,7 +402,8 @@ def _prepare_operands(
     batch, q_len, num_heads, head_dim = q.shape
     _, kv_len, num_kv_heads, _ = k.shape
     device = q.device
-    num_q_scales = triton.cdiv(q_len, _Q_ROWS_PER_SCALE)
+    q_rows_per_scale = _ATTN_TILES[head_dim][0]
+    num_q_scales = triton.cdiv(q_len, q_rows_per_scale)
     num_k_scales = triton.cdiv(kv_len, _K_ROWS_PER_SCALE)
     q_int8 = torch.empty(
         batch, num_heads, q_len, head_dim, device=device, dtype=torch.int8
@@ -443,7 +439,7 @@ def _prepare_operands(
         k_mean.stride(1) if write_lse_shift else 0,
         sm_scale * _LOG2E, sm_scale,
         NUM_HEADS=num_heads, GQA_GROUP=num_heads // num_kv_heads,
-        HEAD_DIM=head_dim, ROWS=_Q_ROWS_PER_SCALE,
+        HEAD_DIM=head_dim, ROWS=q_rows_per_scale,
         WRITE_LSE_SHIFT=write_lse_shift, num_warps=q_warps,
     )  # fmt: skip
     _prepare_kv_kernel[(num_k_scales, num_kv_heads, batch)](
@@ -487,7 +483,7 @@ def _run_attention(
         q_len, kv_len, operands.q_scale.shape[-1], operands.k_scale.shape[-1],
         NUM_HEADS=num_heads, GQA_GROUP=num_heads // num_kv_heads,
         HEAD_DIM=head_dim, BLOCK_Q=block_q, BLOCK_KV=block_kv,
-        Q_ROWS_PER_SCALE=_Q_ROWS_PER_SCALE, K_ROWS_PER_SCALE=_K_ROWS_PER_SCALE,
+        K_ROWS_PER_SCALE=_K_ROWS_PER_SCALE,
         CAUSAL=causal, WRITE_LSE=operands.lse is not None,
         num_warps=num_warps, num_stages=num_stages, grf_mode="256",
     )  # fmt: skip
