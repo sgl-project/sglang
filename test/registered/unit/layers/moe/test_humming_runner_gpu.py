@@ -144,11 +144,12 @@ class TestHummingRunnerGPU(CustomTestCase):
                 meta = layer.humming_metas[sublayer]
                 self.assertTrue(meta.use_block_scaled_mma)
                 self.assertTrue(meta.has_input_scale_2)
-                tuning = humming_runner.HummingMethod.get_default_tuning_configs(
-                    layer, gemm_type="indexed", sublayer_name=sublayer
-                )
-                for _, _, selected in tuning:
-                    selected["use_stream_k"] = False
+                tuning = [
+                    [lo, hi, {**selected, "use_stream_k": False}]
+                    for lo, hi, selected in humming_runner.HummingMethod.get_default_tuning_configs(
+                        layer, gemm_type="indexed", sublayer_name=sublayer
+                    )
+                ]
                 configs[f"{sublayer}_tuning_config"] = tuning
                 configs[f"{sublayer}_tuning_config_str"] = json.dumps(tuning)
         else:
