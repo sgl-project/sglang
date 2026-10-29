@@ -284,7 +284,7 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                     disaggregation_decode_enable_offload_kvcache=True,
                     enable_hisparse=False,
                 ):
-                    SchedulerBatchResultProcessor._handle_sampling_mask_abort(
+                    SchedulerBatchResultProcessor.release_uncommitted_req(
                         processor, req
                     )
 

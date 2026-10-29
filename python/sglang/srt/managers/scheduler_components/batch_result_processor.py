@@ -1103,7 +1103,7 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state(new_accept_len)
 
             if sampling_mask_finish_reason is not None:
-                self._handle_sampling_mask_abort(req)
+                self.release_uncommitted_req(req)
                 continue
 
             self._handle_finish_state_updated_req(
@@ -1417,7 +1417,7 @@ class SchedulerBatchResultProcessor:
         if callable(prepare_release):
             prepare_release(req)
 
-    def _handle_sampling_mask_abort(self, req: Req) -> None:
+    def release_uncommitted_req(self, req: Req) -> None:
         """Release a request whose sampled token must not be committed."""
         if req.multimodal_inputs is not None and req.session is None:
             req.multimodal_inputs.release_features()

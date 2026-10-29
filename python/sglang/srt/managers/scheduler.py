@@ -5939,6 +5939,7 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
         # Delete requests in the running batch
+        aborted_while_paused = []
         for req in self.collect_inflight_reqs():
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
@@ -5954,6 +5955,22 @@ class Scheduler(
                     )
                 else:
                     req.to_finish = FINISH_ABORT()
+                # A chunked req drains its middle-chunk accounting on resume.
+                if self._engine_paused and req is not self.chunked_req:
+                    aborted_while_paused.append(req)
+        if aborted_while_paused:
+            self._finish_aborted_reqs_while_paused(aborted_while_paused)
+
+    def _finish_aborted_reqs_while_paused(self, reqs: List[Req]) -> None:
+        # The paused event loop runs no forward step to act on `to_finish`, and
+        # the client waits on the abort before it resumes the engine.
+        for req in reqs:
+            req.update_finish_state()
+            self.batch_result_processor.release_uncommitted_req(req)
+            # Sets `finished_output`, so an overlap result still queued for this
+            # req neither commits its token nor streams it again.
+            self.output_streamer.stream_output([req], req.return_logprob)
+        self.running_batch.filter_batch()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

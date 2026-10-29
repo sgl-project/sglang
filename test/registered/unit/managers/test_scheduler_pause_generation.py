@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
 )
@@ -278,6 +279,58 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             self.drain_with_pause_start_seen(scheduler, "retract", 10.125), [0.125]
         )
         self.assertEqual(scheduler._pause_started_at, 0.125)
+
+    def _pause_in_place_with_running(self, reqs: List[Req]) -> Scheduler:
+        scheduler = self._new_scheduler()
+        scheduler.running_batch = self._make_batch(
+            scheduler, reqs=reqs, forward_mode=ForwardMode.DECODE, with_tensors=True
+        )
+        scheduler.batch_result_processor = MagicMock()
+        scheduler.output_streamer = MagicMock()
+        scheduler.mm_receiver = None
+        scheduler.dllm_config = None
+        scheduler.grammar_manager = MagicMock()
+        scheduler.enable_continuous_input_polling = False
+        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+        return scheduler
+
+    def test_abort_during_inplace_pause_finishes_running_reqs(self):
+        """An abort during an in_place pause must finish and report running reqs
+        immediately, since no forward step runs until the engine resumes."""
+        req = self._make_req("r1")
+        scheduler = self._pause_in_place_with_running([req])
+
+        scheduler.abort_request(AbortReq(abort_all=True))
+
+        self.assertTrue(req.finished())
+        self.assertNotIn(req, scheduler.running_batch.reqs)
+        scheduler.batch_result_processor.release_uncommitted_req.assert_called_once_with(
+            req
+        )
+        scheduler.output_streamer.stream_output.assert_called_once_with(
+            [req], req.return_logprob
+        )
+
+    def test_abort_by_rid_during_inplace_pause_keeps_other_reqs(self):
+        """An abort by rid during an in_place pause finishes only the matching req;
+        the other running reqs keep their state to continue after resume."""
+        req1 = self._make_req("r1")
+        req2 = self._make_req("r2")
+        scheduler = self._pause_in_place_with_running([req1, req2])
+
+        scheduler.abort_request(AbortReq(rid="r1"))
+
+        self.assertTrue(req1.finished())
+        self.assertNotIn(req1, scheduler.running_batch.reqs)
+        scheduler.batch_result_processor.release_uncommitted_req.assert_called_once_with(
+            req1
+        )
+        scheduler.output_streamer.stream_output.assert_called_once_with(
+            [req1], req1.return_logprob
+        )
+
+        self.assertFalse(req2.finished())
+        self.assertIn(req2, scheduler.running_batch.reqs)
 
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set _engine_paused and return."""
