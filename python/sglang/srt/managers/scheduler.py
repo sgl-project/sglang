@@ -4295,9 +4295,19 @@ class Scheduler(
             running_loras.update(req.lora_id for req in adder.can_run_list)
 
             if self.lora_drainer:
+                lora_manager = self.tp_worker.model_runner.lora_manager
                 self.lora_drainer.update_draining_state(
                     self.waiting_queue,
-                    running_reqs,
+                    [*running_reqs, *adder.can_run_list],
+                    pinned_loras=(
+                        {
+                            uid
+                            for uid, ref in lora_manager.lora_refs.items()
+                            if ref.pinned
+                        }
+                        if lora_manager.num_pinned_loras
+                        else None
+                    ),
                 )
 
         mamba_allocator = self.token_to_kv_pool_allocator.state_slots
@@ -4461,7 +4471,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.kv.swa_evict_floor = req.extend_end
+                req.kv.shield_swa_prefill(req.extend_end)
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
