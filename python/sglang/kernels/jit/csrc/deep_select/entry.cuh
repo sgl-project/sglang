@@ -268,7 +268,7 @@ struct TopkNormal {
         // tier buys residency by shrinking each CTA's plan, which costs per-CTA throughput; it is
         // only worth it when the extra residency removes a whole round.
         const auto rounds = [&](uint32_t occupancy) {
-          return div_ceil(uint64_t{plan.args.batch_size}, uint64_t{num_sm} * occupancy);
+          return host::div_ceil(uint64_t{plan.args.batch_size}, uint64_t{num_sm} * occupancy);
         };
         const bool fits = details::plan_smem_bytes<ConfigMoreCtas> * ConfigMoreCtas::target_occupancy <=
                           plan.args.shared_memory_size_per_sm;
