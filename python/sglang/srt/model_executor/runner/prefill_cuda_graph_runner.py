@@ -2343,8 +2343,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _wait_for_layer_loads(self) -> None:
         # Full replay skips the per-layer load waits in the pool accessors; breakable
-        # replay still runs them at its eager breaks.
-        if not self._is_full_backend:
+        # replay still runs them at its eager breaks, unless the linear extend is
+        # captured in the graph.
+        linear_extend_in_graph = (
+            self.use_captured_attn_metadata
+            and self.model_runner.attn_backend.breakable_cuda_graph_captures_linear_extend
+        )
+        if not (self._is_full_backend or linear_extend_in_graph):
             return
         counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
         if counter is not None and counter.consumer_index >= 0:
