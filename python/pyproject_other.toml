@@ -63,7 +63,7 @@ runtime_base = [
   "soundfile==0.13.1",
   "tiktoken",
   "tqdm",
-  "transformers==5.21.0",
+  "transformers==5.22.0",
   "uvicorn",
   "uvloop",
   "xxhash",

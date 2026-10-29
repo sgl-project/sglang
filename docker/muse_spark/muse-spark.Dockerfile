@@ -34,7 +34,7 @@ ARG FLASHINFER_VERSION=0.7.0.post1
 RUN python3 -m pip install --no-cache-dir \
         "flashinfer-python[cu13]==${FLASHINFER_VERSION}" \
         "nvidia-cutlass-dsl[cu13]==4.8.0" quack-kernels==0.6.5 \
-        sentencepiece==0.2.1 tokenizers==0.23.2 transformers==5.21.0 \
+        sentencepiece==0.2.1 tokenizers==0.23.2 transformers==5.22.0 \
     && python3 -m pip install --no-cache-dir \
         "flashinfer-cubin==${FLASHINFER_VERSION}" --index-url https://flashinfer.ai/whl \
     && python3 -m pip install --no-cache-dir \
