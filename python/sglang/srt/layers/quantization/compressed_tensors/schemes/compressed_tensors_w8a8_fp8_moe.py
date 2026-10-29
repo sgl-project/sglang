@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -381,7 +382,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         moe_runner_config = self.moe_runner_config
 
         if (
-            is_xpu()
+            _is_xpu
             and not get_moe_runner_backend().is_triton()
             and self.weight_quant.strategy != QuantizationStrategy.CHANNEL
         ):
@@ -390,10 +391,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
             topk_weights, topk_ids, _ = topk_output
-            if moe_runner_config.apply_router_weight_on_input:
-                x = x * topk_weights.to(x.dtype)
-                topk_weights = torch.ones_like(topk_weights)
-            is_block = self.weight_quant.strategy == QuantizationStrategy.BLOCK
             output = fused_experts(
                 x,
                 layer.w13_weight,
@@ -405,7 +402,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 use_fp8_w8a8=True,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
-                block_shape=self.weight_block_size if is_block else None,
+                block_shape=self.weight_block_size if self.block_quant else None,
                 activation=moe_runner_config.activation,
                 routed_scaling_factor=moe_runner_config.routed_scaling_factor,
                 gemm1_alpha=moe_runner_config.gemm1_alpha,

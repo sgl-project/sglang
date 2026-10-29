@@ -3066,9 +3066,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sgl_kernel import fused_experts
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
-            if moe_runner_config.apply_router_weight_on_input:
-                x = x * topk_weights.to(x.dtype)
-                topk_weights = torch.ones_like(topk_weights)
             assert layer.w13_weight.dtype == layer.w2_weight.dtype
             use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
@@ -3085,12 +3082,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8_w8a8=use_fp8_w8a8,
                 w1_scale=(
                     layer.w13_weight_scale_inv
-                    if self.block_quant or self.is_fp4_expert
+                    if self.block_quant
                     else layer.w13_weight_scale
                 ),
                 w2_scale=(
                     layer.w2_weight_scale_inv
-                    if self.block_quant or self.is_fp4_expert
+                    if self.block_quant
                     else layer.w2_weight_scale
                 ),
                 block_shape=(
