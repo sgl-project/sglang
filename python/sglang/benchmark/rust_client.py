@@ -47,7 +47,7 @@ SUPPORTED_BACKENDS = frozenset(
 )
 
 #: Datasets the Rust client implements.
-SUPPORTED_DATASETS = frozenset({"random", "random-ids", "sharegpt"})
+SUPPORTED_DATASETS = frozenset({"random", "random-ids", "sharegpt", "timed-trace"})
 
 #: Namespace attributes that map onto a Rust flag of the same name. Anything
 #: needing conversion is handled in :func:`build_config`.
@@ -71,6 +71,12 @@ _DIRECT_FIELDS = (
     "random_input_len",
     "random_output_len",
     "random_range_ratio",
+    "timed_trace_chunk_hash_size",
+    "timed_trace_sec_multiplier",
+    "timed_trace_label_timestamp",
+    "timed_trace_label_input_length",
+    "timed_trace_label_output_length",
+    "timed_trace_label_hash_ids",
     "max_concurrency",
     "warmup_requests",
     "output_file",
