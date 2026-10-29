@@ -179,12 +179,63 @@ IMATRIX_QUANT_TYPES = {
     WeightType.IQ4_XS,
     WeightType.IQ4_NL,
 }
-# TODO(Isotr0py): Currently, we don't have MMQ kernel for I-Matrix quantization.
-# Consolidate DEQUANT_TYPES, MMVQ_QUANT_TYPES and MMQ_QUANT_TYPES after we add
-# MMQ kernel for I-Matrix quantization.
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
-MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+# The MoE MMQ kernel (ggml_moe_a8) and the dense MMQ kernel on MUSA are the dp4a
+# kernels, which cover the standard and k-quant types.
+MOE_MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+if _is_cuda:
+    # ggml_mul_mat_a8 on CUDA is llama.cpp's MMQ (IQ1_M through llama_mmq's own
+    # tile loader): all standard, k-quant and i-quant types except Q8_1 (an
+    # activation format).
+    MMQ_QUANT_TYPES = (STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES) - {
+        WeightType.Q8_1,
+    }
+else:
+    MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+
+# llama.cpp's MMQ reads each weight row in steps of 256 values, so for a row
+# length K with K % 512 != 0 it reads past the last row; ggml pads its tensors
+# to a multiple of 512 values (MATRIX_ROW_PADDING) for this. Unmerged weights
+# are padded the same way at load time (zeros), merged shards are copied into a
+# padded buffer when sliced (_gguf_mmq_shard); ggml_mul_mat_a8 itself copies a
+# weight without the padding on every call.
+GGUF_MMQ_ROW_PADDING = 512
+
+
+def gguf_mmq_tail_bytes(qweight_type: int, row_bytes: int) -> int:
+    """Bytes ggml_mul_mat_a8 may read past the last row of a GGUF weight."""
+    if not _is_cuda or qweight_type not in MMQ_QUANT_TYPES:
+        return 0
+    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+    k = row_bytes // type_size * block_size
+    pad = -k % GGUF_MMQ_ROW_PADDING
+    return pad // block_size * type_size
+
+
+def _gguf_mmq_shard(
+    qweight: torch.Tensor, start: int, end: int, size: int, qweight_type: int
+) -> torch.Tensor:
+    """Rows [start, end), first `size` bytes, of a merged GGUF weight as a
+    contiguous tensor for fused_mul_mat_gguf. Like
+    qweight[start:end, :size].contiguous(), but a copy (when one is needed) goes
+    into a buffer extended by gguf_mmq_tail_bytes() of zeros, so that
+    ggml_mul_mat_a8 does not make its own padded copy."""
+    shard = qweight[start:end, :size]
+    tail = gguf_mmq_tail_bytes(qweight_type, size)
+    if shard.is_contiguous():
+        available = (
+            qweight.untyped_storage().nbytes() // qweight.element_size()
+            - shard.storage_offset()
+        )
+        if available >= shard.numel() + tail:
+            return shard
+    numel = shard.numel()
+    buf = torch.empty(numel + tail, dtype=qweight.dtype, device=qweight.device)
+    buf[numel:].zero_()
+    out = buf[:numel].view(end - start, size)
+    out.copy_(shard)
+    return out
 
 
 def ggml_moe_get_block_size(qweight_type: int) -> int:
@@ -209,7 +260,11 @@ def dequantize_gguf_weight(
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
-    if qweight_type in IMATRIX_QUANT_TYPES:
+    if _is_cuda and qweight_type in MMQ_QUANT_TYPES:
+        # llama.cpp's MMQ is faster than MMVQ from 2 tokens on (RTX 5070 Ti,
+        # 2048x2048 to 11008x4096, 10 types; at 1 token MMVQ is up to 1.8x faster).
+        mmvq_safe = 1
+    elif qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
     else:
         mmvq_safe = 2 if qweight.shape[0] > 5120 else 6
@@ -223,7 +278,7 @@ def fused_mul_mat_gguf(
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
-    # Use MMQ Kernel if it's available (standard + k-quants)
+    # Use the MMQ kernel if it's available (on CUDA every weight type)
     elif qweight_type in MMQ_QUANT_TYPES:
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # If there is no available MMQ kernel, fallback to dequantize
@@ -277,8 +332,8 @@ def fused_moe_gguf(
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
-        qweight_type2 in MMQ_QUANT_TYPES
-        and qweight_type in MMQ_QUANT_TYPES
+        qweight_type2 in MOE_MMQ_QUANT_TYPES
+        and qweight_type in MOE_MMQ_QUANT_TYPES
         and x.shape[0] > 64
     ):
         num_tokens, _ = x.shape
@@ -464,6 +519,7 @@ class GGUFLinearMethod(LinearMethodBase):
         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
         # materialize the padded weight parameter for CUDA Graph compatibility.
         self._create_padded_weight_param(layer)
+        self._pad_weight_storage_for_mmq(layer)
 
     def _create_padded_weight_param(self, layer: torch.nn.Module):
         """Create padded weight parameter for GGUF MergedLinear layer."""
@@ -503,6 +559,33 @@ class GGUFLinearMethod(LinearMethodBase):
             set_weight_attrs(padded_param, {"shard_offset_map": shard_offset_map})
             layer.register_parameter("qweight", padded_param)
 
+    def _pad_weight_storage_for_mmq(self, layer: torch.nn.Module):
+        """Extend the storage of an unmerged GGUF weight by the bytes
+        ggml_mul_mat_a8 may read past its last row (zeros)."""
+        qweight = layer.qweight
+        if (
+            qweight.shard_id
+            or isinstance(qweight, UninitializedParameter)
+            or qweight.dim() != 2
+        ):
+            return
+        tail = gguf_mmq_tail_bytes(layer.qweight_type.weight_type, qweight.shape[1])
+        available = qweight.untyped_storage().nbytes() - qweight.storage_offset()
+        if (
+            tail == 0
+            or not qweight.is_contiguous()
+            or available >= qweight.numel() + tail
+        ):
+            return
+        storage = torch.zeros(
+            qweight.numel() + tail, dtype=qweight.dtype, device=qweight.device
+        )
+        data = storage[: qweight.numel()].view(qweight.shape)
+        data.copy_(qweight.data)
+        padded_param = Parameter(data, requires_grad=False)
+        set_weight_attrs(padded_param, vars(qweight))
+        layer.register_parameter("qweight", padded_param)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -521,7 +604,9 @@ class GGUFLinearMethod(LinearMethodBase):
                 qweight_type = layer.qweight_type.shard_weight_type[idx]
                 result.append(
                     fused_mul_mat_gguf(
-                        x, qweight[start:end, :offset].contiguous(), qweight_type
+                        x,
+                        _gguf_mmq_shard(qweight, start, end, offset, qweight_type),
+                        qweight_type,
                     )
                 )
             out = torch.cat(result, axis=1)
