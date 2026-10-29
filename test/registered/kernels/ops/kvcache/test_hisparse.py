@@ -40,6 +40,10 @@ pytestmark = pytest.mark.skipif(
     reason="HiSparse kernel tests require CUDA/ROCm/XPU.",
 )
 
+_requires_shared_sources = pytest.mark.skipif(
+    is_xpu(), reason="Shared Device/Host sources require the CUDA/ROCm JIT swap kernel."
+)
+
 DEVICE = get_device()
 DTYPE = torch.float32
 KV_DIM = 8
@@ -132,6 +136,12 @@ def _run_kernel(
     if num_real_reqs is None:
         num_real_reqs = batch_size
 
+    source_kwargs = {}
+    if device_locs is not None:
+        source_kwargs["device_locs"] = device_locs
+    if host_binding is not None:
+        source_kwargs["host_binding"] = host_binding
+
     out = torch.full_like(top_k_tokens, output_fill_value)
     load_cache_to_device_buffer_mla(
         top_k_tokens=top_k_tokens,
@@ -150,8 +160,7 @@ def _run_kernel(
         page_size=1,
         block_size=256,
         num_real_reqs=torch.tensor([num_real_reqs], dtype=torch.int32, device=DEVICE),
-        device_locs=device_locs,
-        host_binding=host_binding,
+        **source_kwargs,
     )
     get_device_module().synchronize()
     return out
@@ -595,6 +604,7 @@ def _pool_source(rows: list[list[int]]) -> torch.Tensor:
     return torch.tensor(rows, dtype=torch.int32, device=DEVICE)
 
 
+@_requires_shared_sources
 def test_pass_through_returns_pool_slots_without_copying() -> None:
     """Pool-resident positions need neither buffer slots nor host copies."""
     state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
@@ -620,6 +630,7 @@ def test_pass_through_returns_pool_slots_without_copying() -> None:
     assert torch.equal(state["lru_slots"], lru_before)
 
 
+@_requires_shared_sources
 def test_pass_through_mixes_all_three_sources() -> None:
     """Mixed sources must preserve resident hits while copying only misses."""
     state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
@@ -650,6 +661,7 @@ def test_pass_through_mixes_all_three_sources() -> None:
     assert 2 in resident, f"buffer hit was evicted by a pool lane: {resident}"
 
 
+@_requires_shared_sources
 def test_pass_through_masks_a_lane_the_selector_left_unfilled() -> None:
     """Masked top-k lanes must not consume slots or index host locations."""
     state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
@@ -671,6 +683,7 @@ def test_pass_through_masks_a_lane_the_selector_left_unfilled() -> None:
     assert torch.equal(state["lru_slots"], lru_before)
 
 
+@_requires_shared_sources
 @pytest.mark.parametrize("pass_host_cache", [False, True])
 def test_late_bound_host_binding_matches_the_direct_tensor(
     pass_host_cache: bool,
@@ -704,6 +717,7 @@ def test_late_bound_host_binding_matches_the_direct_tensor(
         ), f"token {token} must be byte-exact through the late-bound base"
 
 
+@_requires_shared_sources
 def test_late_bound_host_binding_honours_a_wider_row_stride() -> None:
     """Interleaved host rows must use the supplied byte stride."""
     state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
@@ -739,6 +753,7 @@ def test_late_bound_host_binding_honours_a_wider_row_stride() -> None:
     assert (out.cpu() >= 0).all()
 
 
+@_requires_shared_sources
 def test_graph_replay_reads_updated_host_binding() -> None:
     """A captured swap-in must read the current host address on every replay."""
     state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [8])
@@ -798,6 +813,7 @@ def test_graph_replay_reads_updated_host_binding() -> None:
     )
 
 
+@_requires_shared_sources
 def test_pass_through_skips_the_short_sequence_fast_path() -> None:
     """Pool-backed short sequences must follow the explicit slot mapping."""
     state = _make_state([[9, 7, 3, 5, 11]], [[0, 1, 2, 3, -1]], [2])
