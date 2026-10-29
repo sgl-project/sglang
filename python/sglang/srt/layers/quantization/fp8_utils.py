@@ -687,26 +687,24 @@ if get_platform().is_blackwell and is_flashinfer_available():
         use_split_k: bool = False,
     ) -> torch.Tensor:
         if use_split_k:
-            # FlashInfer's public mm_mxfp8 does not accept an explicit tactic.
-            # This stateless runner is also used by its ordinary CuTe dispatch.
-            from flashinfer.gemm.gemm_base import _cute_dsl_gemm_mxfp8_runner
+            from flashinfer.gemm.gemm_base import (
+                _check_mm_mxfp8_problem_size,
+                _cute_dsl_gemm_mxfp8_runner,
+            )
 
             assert backend == "cute-dsl" and not use_8x4_sf_layout
             assert out_dtype == torch.bfloat16
+            # The explicit-tactic runner bypasses the public API's validation.
+            operands = [q_input, weight_t, x_scale_u8, weight_scale_t]
+            _check_mm_mxfp8_problem_size(
+                *operands, out_dtype=out_dtype, use_8x4_sf_layout=False
+            )
             output = q_input.new_empty(
                 (q_input.shape[0], weight_t.shape[1]), dtype=out_dtype
             )
             runner = _cute_dsl_gemm_mxfp8_runner(10, 3, True, out_dtype)
             runner(
-                inputs=[
-                    q_input,
-                    weight_t,
-                    x_scale_u8,
-                    weight_scale_t,
-                    out_dtype,
-                    output,
-                    None,  # CuTe split-K reduces inside the cluster; no workspace.
-                ],
+                inputs=[*operands, out_dtype, output, None],
                 tactic=((128, 8), (1, 1), True, False, 4),
             )
             return output
@@ -1950,23 +1948,12 @@ def flashinfer_mxfp8_blockscaled_linear(
         and weight.shape in ((1792, 5120), (1152, 5120))
         and output_dtype == torch.bfloat16
         and q_input.is_cuda
-        and q_input.dtype == torch.float8_e4m3fn
-        and q_input.is_contiguous()
-        and weight.is_contiguous()
-        and x_scale_u8.ndim == weight_scale_t.ndim == 1
-        and x_scale_u8.dtype == weight_scale_t.dtype == torch.uint8
-        and x_scale_u8.is_contiguous()
-        and weight_scale_t.is_contiguous()
-        and q_input.device
-        == weight.device
-        == x_scale_u8.device
-        == weight_scale_t.device
-        # The eligible shapes use one 128-row activation scale tile, K/32
-        # scales per row, and N divisible by 128. Keep malformed buffers on
-        # FlashInfer's validating path instead of passing them to the runner.
-        and x_scale_u8.numel() == 128 * (k // 32)
-        and weight_scale_t.numel() == weight.shape[0] * (k // 32)
         and get_device_sm() == 103
+        and x_scale_u8.ndim == weight_scale_t.ndim == 1
+        and all(
+            t.is_contiguous() and t.device == q_input.device
+            for t in (q_input, weight, x_scale_u8, weight_scale_t)
+        )
     ):
         from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
@@ -1975,17 +1962,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             or get_exec().deterministic.enable_deterministic_inference
         )
 
-    if use_split_k:
-        output = flashinfer_mm_mxfp8(
-            q_input,
-            weight.t(),
-            x_scale_u8,
-            weight_scale_t,
-            out_dtype=output_dtype,
-            backend=backend,
-            use_split_k=True,
-        )
-    elif pin_tactic:
+    if pin_tactic and not use_split_k:
         from flashinfer.autotuner import autotune
 
         with autotune(False, skip_ops={"mxfp8_gemm"}):
@@ -2007,6 +1984,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             out_dtype=output_dtype,
             use_8x4_sf_layout=False,
             backend=backend,
+            use_split_k=use_split_k,
         )
 
     if bias is not None:

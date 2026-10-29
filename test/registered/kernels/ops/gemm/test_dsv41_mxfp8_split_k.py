@@ -143,16 +143,21 @@ class TestDsv41Mxfp8SplitK(CustomTestCase):
             disable_batch_invariant_mode()
 
     @torch.inference_mode()
-    def test_truncated_scales_retain_validation(self):
-        """A short swizzled buffer must fail validation before any GEMM launch."""
+    def test_invalid_scales_retain_validation(self):
+        """Malformed swizzled scales must fail validation before GEMM launch."""
         from flashinfer import mxfp8_quantize
 
         x, _, wq, ws = self._operands()
         q, sf = mxfp8_quantize(x, is_sf_swizzled_layout=True, alignment=32)
-        for input_sf, weight_sf in ((sf[:-1], ws), (sf, ws[:-1])):
+        for input_sf, weight_sf, error in (
+            (sf[:-1], ws, "shape mismatch"),
+            (sf, ws[:-1], "shape mismatch"),
+            (sf.float(), ws, "a_descale must be a uint8 tensor"),
+            (sf, ws.float(), "b_descale must be a uint8 tensor"),
+        ):
             for enabled in (False, True):
                 with self.subTest(enabled=enabled, input_scale_size=input_sf.numel()):
-                    with self.assertRaisesRegex(ValueError, "shape mismatch"):
+                    with self.assertRaisesRegex(ValueError, error):
                         self._linear(
                             q,
                             wq,
