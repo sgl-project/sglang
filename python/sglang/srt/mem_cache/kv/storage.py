@@ -576,7 +576,25 @@ class KVStorage:
             token_boundary=token_boundary,
         )
 
-    def regions(self, sub_pool: str) -> Region:
+    def regions(self, sub_pool: str, *, part: Optional[str] = None) -> Region:
+        derived = [
+            d.part
+            for d in self._plan.derived_parts
+            if d.sub_pool == sub_pool
+            and (d.part.name == part or d.wire == part)
+            and part is not None
+        ]
+        request = [
+            d.part
+            for d in self._plan.request_parts
+            if (d.part.name == part or d.wire == part) and part is not None
+        ]
+        if derived:
+            return self._allocator.arena.page_parts[sub_pool].regions(derived)
+        if request:
+            return self._request_memory.regions(request)
+        if part not in (None, "kv", "state"):
+            raise KeyError(f"sub-pool {sub_pool!r} has no transfer part {part!r}")
         view = self._views[sub_pool]
         ptrs, lens, item_lens = view.get_contiguous_buf_infos()
         if isinstance(self._plan.sub_pool(sub_pool).spec, MambaSubPoolSpec):
