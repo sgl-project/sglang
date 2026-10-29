@@ -11,6 +11,7 @@ from array import array
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
@@ -154,6 +155,57 @@ class TestStopStrSpeculative(unittest.TestCase):
         req.update_finish_state(new_accepted_len=3)
         self.assertTrue(req.finished())
         self.assertIsNone(req.finished_len)
+
+
+class _ByteTokenizer:
+    """One token per UTF-8 byte, like byte-level BPE or SentencePiece byte
+    fallback on text it has no merges for."""
+
+    eos_token_id = -1
+    additional_stop_token_ids = None
+
+    def encode(self, s, add_special_tokens=False):
+        return list(s.encode("utf-8"))
+
+    def decode(self, ids):
+        return bytes(int(i) for i in ids).decode("utf-8", errors="replace")
+
+
+class TestStopRegexMultiByte(CustomTestCase):
+    """A stop_regex with non-ASCII text must fire when every character is split
+    into several byte tokens, one decode step at a time."""
+
+    def _run(self, text, stop_regex):
+        tokenizer = _ByteTokenizer()
+        sp = SamplingParams(max_new_tokens=1000, stop_regex=stop_regex)
+        sp.normalize(tokenizer=tokenizer)
+        req = Req(
+            rid="t",
+            origin_input_text="",
+            origin_input_ids=array("q", [0]),
+            sampling_params=sp,
+            eos_token_ids=frozenset(),
+            vocab_size=256,
+        )
+        req.tokenizer = tokenizer
+        req.output_ids = array("q")
+        for token_id in tokenizer.encode(text):
+            req.output_ids.append(token_id)
+            req.update_finish_state(new_accepted_len=1)
+            if req.finished():
+                break
+        return req
+
+    def test_cjk_literal(self):
+        req = self._run("思考过程很长。停止 后面不该输出", ["停止"])
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, "停止")
+        self.assertEqual(req.finished_len, len("思考过程很长。停止".encode("utf-8")))
+
+    def test_emoji_class(self):
+        req = self._run("Done 🛑 trailing text", [r"[🛑⛔]"])
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_len, len("Done 🛑".encode("utf-8")))
 
 
 if __name__ == "__main__":
