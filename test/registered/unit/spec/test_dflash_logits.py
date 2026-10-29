@@ -163,9 +163,7 @@ def test_selector_gathers_global_candidates_across_vocab_shards(
     org-vocab restriction, the global id offset, and the fp32 cast before the
     all-gather -- a
     regression in any of them returns wrong global candidates only under TP,
-    which no single-rank test observes. A head sharded within attention TP
-    (--enable-dp-lm-head) gathers over that group: under DP attention the full
-    TP group would mix other DP ranks' rows."""
+    which no single-rank test observes."""
     torch.manual_seed(0)
     k = 4
     # bf16 like production: makes the fp32 upcast before the gather observable.

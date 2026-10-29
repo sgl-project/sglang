@@ -129,9 +129,7 @@ def candidate_topk(
             "DFlash candidate top-k requires a dense FP16/BF16/FP32 target lm_head "
             "or a supported lm_head.quant_method."
         )
-    # Gather over the group the head is vocab-sharded on: with DP attention and
-    # --enable-dp-lm-head that is the attention-TP group, whose ranks hold this DP
-    # rank's tokens; the full TP group would mix other DP ranks' rows.
+    # Gather over the group the head is vocab-sharded on.
     parallel = get_parallel()
     group = (
         parallel.attn_tp_group
