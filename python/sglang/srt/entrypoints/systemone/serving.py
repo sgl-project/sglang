@@ -82,6 +82,7 @@ class SystemOneServing(OpenAIServingDecisions):
         return (
             self._validate_server(request.model)
             or self._validate_images(request.images)
+            or self._request_chat_template_error(request.chat_template_kwargs)
             or self._validate_reasoning(request.chat_template_kwargs)
         )
 
