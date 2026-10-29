@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -2394,6 +2395,41 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertEqual(swa_keys[leaf], cache.tree_core.get_hash_values(leaf))
         self._drain_buffer_writes(cache)
         cache.sanity_check()
+
+    @requires_hicache
+    def test_write_back_prefetch_looks_up_storage_below_a_device_anchor(self):
+        """A write-back tree holds a prefix on device only, with no host copy;
+        the scheduler still looks up L3 for the rest of the prompt, which another
+        writer may have stored."""
+        storage_dir = self._make_storage_dir()
+        base = self._make_seq(1, 2)
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(
+            cache,
+            write_policy="write_back",
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        self._insert(cache, allocator, req_to_token_pool, base)
+        self.assertFalse(cache.is_backuped(match_prefix(cache, base).last_device_node))
+
+        req = Req(
+            rid="device-anchor-req",
+            origin_input_text="",
+            origin_input_ids=array("q", base + self._make_seq(500, 2)),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        Scheduler._prefetch_kvcache(
+            SimpleNamespace(
+                tree_cache=cache, enable_hicache_storage=True, enable_lmcache=False
+            ),
+            req,
+        )
+
+        self.assertEqual(req.storage_prefetch_last_match_len, len(base))
+        self.assertIn(req.cache_request_handle, cache.ongoing_prefetch)
+        cache.release_aborted_request(req.cache_request_handle)
 
 
 define_config_test_classes(UnifiedRadixCacheStorageSuite, globals())
