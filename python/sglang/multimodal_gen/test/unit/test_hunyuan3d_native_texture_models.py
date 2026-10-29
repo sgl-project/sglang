@@ -11,6 +11,9 @@ from diffusers import AutoencoderKL as DiffusersAutoencoderKL
 from diffusers import LCMScheduler, UNet2DConditionModel
 
 from sglang.kernels.ops.diffusion.ext import mesh_processor
+from sglang.multimodal_gen.configs.models.dits.stable_diffusion_xl import (
+    StableDiffusionXLUNetConfig,
+)
 from sglang.multimodal_gen.configs.models.vaes.stable_diffusion import (
     StableDiffusionVAEConfig,
 )
@@ -23,6 +26,9 @@ from sglang.multimodal_gen.runtime.models.dits.hunyuan3d_paint import (
 from sglang.multimodal_gen.runtime.models.dits.stable_diffusion import (
     StableDiffusionUNet2DConditionModel,
     StableDiffusionUNetConfig,
+)
+from sglang.multimodal_gen.runtime.models.dits.stable_diffusion_xl import (
+    StableDiffusionXLUNet2DConditionModel,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
 from sglang.multimodal_gen.runtime.pipelines.hunyuan3d_pipeline import (
@@ -72,6 +78,41 @@ def _unet_config() -> dict:
     }
 
 
+def _sdxl_unet_config() -> dict:
+    return {
+        "sample_size": 8,
+        "in_channels": 4,
+        "out_channels": 4,
+        "center_input_sample": False,
+        "flip_sin_to_cos": True,
+        "freq_shift": 0,
+        "down_block_types": (
+            "DownBlock2D",
+            "CrossAttnDownBlock2D",
+            "CrossAttnDownBlock2D",
+        ),
+        "up_block_types": (
+            "CrossAttnUpBlock2D",
+            "CrossAttnUpBlock2D",
+            "UpBlock2D",
+        ),
+        "block_out_channels": (16, 32, 32),
+        "layers_per_block": 2,
+        "downsample_padding": 1,
+        "dropout": 0.0,
+        "norm_num_groups": 8,
+        "norm_eps": 1e-5,
+        "cross_attention_dim": 24,
+        "attention_head_dim": (2, 4, 4),
+        "transformer_layers_per_block": (1, 2, 3),
+        "use_linear_projection": True,
+        "addition_embed_type": "text_time",
+        "addition_time_embed_dim": 8,
+        # 12-dim pooled text embeds + 6 time ids * addition_time_embed_dim.
+        "projection_class_embeddings_input_dim": 60,
+    }
+
+
 class TestNativeStableDiffusionUNet(unittest.TestCase):
     def test_matches_diffusers_sd21_layout_and_forward(self):
         torch.manual_seed(0)
@@ -99,6 +140,37 @@ class TestNativeStableDiffusionUNet(unittest.TestCase):
                 encoder_hidden_states,
                 class_labels=class_labels,
             ).sample
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+    def test_sdxl_matches_diffusers_layout_and_text_time_forward(self):
+        torch.manual_seed(0)
+        raw_config = _sdxl_unet_config()
+        reference = UNet2DConditionModel(**raw_config).eval()
+        native = StableDiffusionXLUNet2DConditionModel(
+            StableDiffusionXLUNetConfig(), hf_config=raw_config
+        ).eval()
+        native.unet.load_state_dict(reference.state_dict(), strict=True)
+
+        sample = torch.randn(2, 4, 8, 8)
+        timestep = torch.tensor([10.0, 500.0])
+        encoder_hidden_states = torch.randn(2, 5, 24)
+        added_cond_kwargs = {
+            "text_embeds": torch.randn(2, 12),
+            "time_ids": torch.tensor([[64.0, 64.0, 0.0, 0.0, 64.0, 64.0]] * 2),
+        }
+        with torch.inference_mode():
+            expected = reference(
+                sample,
+                timestep,
+                encoder_hidden_states,
+                added_cond_kwargs=added_cond_kwargs,
+            ).sample
+            actual = native(
+                hidden_states=sample,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timestep,
+                added_cond_kwargs=added_cond_kwargs,
+            )
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
     def test_paint_reference_branch_and_layer_groups(self):
