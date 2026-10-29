@@ -2,6 +2,7 @@
 Unit tests for the OpenAIServingEmbedding class from serving_embedding.py.
 """
 
+import asyncio
 import base64
 import importlib
 import importlib.abc
@@ -11,7 +12,7 @@ import sys
 import types
 import unittest
 import uuid
-from unittest.mock import MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import jinja2
 
@@ -364,6 +365,50 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             "encoding_format must be either",
             self.serving_embedding._validate_request(invalid_request),
         )
+
+
+class TestEmbeddingConvertOnLoop(ServingEmbeddingTestCase):
+    def test_conversion_runs_on_the_event_loop(self):
+        serving = self.serving_embedding
+        self.tokenizer_manager.request_logger = Mock(log_requests=False)
+        sentinel = object()
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            with (
+                patch.object(
+                    loop, "run_in_executor", side_effect=AssertionError("executor used")
+                ),
+                patch.object(
+                    serving,
+                    "_handle_non_streaming_request",
+                    new=AsyncMock(return_value=sentinel),
+                ) as handle,
+            ):
+                result = await serving.handle_request(self.basic_req, self.request)
+            return result, handle
+
+        result, handle = asyncio.run(run())
+        self.assertIs(result, sentinel, getattr(result, "body", result))
+        adapted = handle.call_args.args[0]
+        self.assertIsInstance(adapted, EmbeddingReqInput)
+        self.assertEqual(adapted.text, "Hello, how are you?")
+        self.assertIsNotNone(adapted.received_time)
+
+    def test_only_text_and_token_ids_stay_on_the_loop(self):
+        serving = self.serving_embedding
+
+        def off_loop(**kwargs):
+            return serving._convert_off_loop(EmbeddingRequest(model="m", **kwargs))
+
+        self.assertFalse(off_loop(input="hello"))
+        self.assertFalse(off_loop(input=["a", "b"]))
+        self.assertFalse(off_loop(input=[1, 2, 3]))
+        self.assertFalse(off_loop(input=[[1, 2], [3]]))
+        self.assertTrue(
+            off_loop(input=[MultimodalEmbeddingInput(text="a", image="data:,")])
+        )
+        self.assertTrue(off_loop(input="hello", embed_overrides=[[[0.5, 0.5]]]))
 
 
 if __name__ == "__main__":

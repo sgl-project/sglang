@@ -41,6 +41,15 @@ class OpenAIServingEmbedding(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "embd-"
 
+    def _convert_off_loop(self, request: EmbeddingRequest) -> bool:
+        # Text or token ids without overrides only get wrapped (tokenization runs
+        # later in the TokenizerManager), so they stay on the event loop.
+        # Multimodal inputs (a chat template per item) and embed_overrides
+        # (float lists to tensors) can be slow and keep the default executor.
+        return request.embed_overrides is not None or not _is_text_or_token_ids(
+            request.input
+        )
+
     def _validate_request(self, request: EmbeddingRequest) -> Optional[str]:
         """Validate that the input is not empty or whitespace only."""
         if request.encoding_format not in ("float", "base64"):
@@ -306,3 +315,11 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 total_tokens=prompt_tokens,
             ),
         )
+
+
+def _is_text_or_token_ids(embedding_input) -> bool:
+    if isinstance(embedding_input, str):
+        return True
+    return isinstance(embedding_input, list) and all(
+        isinstance(item, (str, int, list)) for item in embedding_input
+    )
