@@ -70,3 +70,5 @@ sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" 
 [dev-dependencies]
 # `Router::oneshot` for handler-level router tests.
 tower = { version = "0.5", features = ["util"] }
+# Paused virtual time for deadline tests.
+tokio = { workspace = true, features = ["test-util"] }

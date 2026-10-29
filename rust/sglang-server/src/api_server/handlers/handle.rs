@@ -5,20 +5,24 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 
 use tokio::sync::{SetOnce, mpsc};
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
+use crate::message::finish_reason::{AbortReason, FinishKind};
 use crate::message::ids::Rid;
 use crate::message::request::{Request, RequestKind};
-use crate::message::response::{ResponseItem, ResponseSink};
+use crate::message::response::{
+    CachedTokensDetails, ChunkEvent, ChunkExtras, ResponseItem, ResponseSink,
+};
 use crate::multi_modality::worker::MmProcessor;
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
 use crate::utils::error::Error;
 use crate::utils::fsm::RequestState;
 
-use super::generate::{Generation, Generations};
+use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
 use crate::api_server::core::{CoreError, FrontendMetrics};
 
@@ -216,6 +220,8 @@ impl CoreHandle {
             expected_response,
             in_flight: true,
             generation,
+            last_output: LastOutput::default(),
+            abort_deadline: None,
         };
         let request = Request {
             rid: rid.clone(),
@@ -226,12 +232,24 @@ impl CoreHandle {
 
         let sent = tokio::select! {
             biased;
-            _ = async {
+            cancellation = async {
                 match call.generation.as_mut() {
                     Some(generation) => generation.cancelled().await,
                     None => std::future::pending().await,
                 }
-            } => return Err(CoreError::Cancelled("request aborted".into())),
+            } => match cancellation {
+                Cancellation::Error => {
+                    return Err(CoreError::Cancelled("request aborted".into()));
+                }
+                // The request never starts; the call yields its abort output.
+                Cancellation::Unstarted => {
+                    call.in_flight = false;
+                    return Ok(call);
+                }
+                // Intake took the event before the abort ran: the request is
+                // sent, and the call ends on the scheduler's answer.
+                Cancellation::Scheduler => Ok(()),
+            },
             result = self.inner.intake_tx.send_async(TmEvent::Intake { request, admission }) => result,
         };
         if sent.is_err() {
@@ -271,19 +289,76 @@ pub(super) struct RuntimeCall {
     pub(super) expected_response: ExpectedResponse,
     pub(super) in_flight: bool,
     pub(super) generation: Option<Generation>,
+    /// What the request's latest output reported, for a frontend abort output.
+    pub(super) last_output: LastOutput,
+    /// Set once the scheduler was asked to abort the request: when the call
+    /// stops waiting for the scheduler's terminal output.
+    pub(super) abort_deadline: Option<tokio::time::Instant>,
+}
+
+/// How long a call that `/abort_request` handed to the scheduler waits for
+/// the scheduler's terminal output. The scheduler answers at its next step;
+/// the bound only keeps a lost answer from holding the client forever.
+const SCHEDULER_ABORT_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The request-level counts and cache split every scheduler output reports
+/// in full, which a frontend abort output repeats.
+#[derive(Clone, Default)]
+pub(super) struct LastOutput {
+    prompt_tokens: u32,
+    cached_tokens: u32,
+    reasoning_tokens: u64,
+    cached_tokens_details: Option<CachedTokensDetails>,
+}
+
+/// What woke a call waiting for its next response.
+enum Wake {
+    Cancelled(Cancellation),
+    Item(Option<ResponseItem>),
+    AbortDeadline,
 }
 
 impl RuntimeCall {
     pub(super) async fn recv(&mut self) -> Option<ResponseItem> {
-        let mut item = tokio::select! {
-            biased;
-            _ = async {
-                match self.generation.as_mut() {
-                    Some(generation) => generation.cancelled().await,
-                    None => std::future::pending().await,
+        let mut item = loop {
+            let abort_deadline = self.abort_deadline;
+            let wake = tokio::select! {
+                biased;
+                cancellation = async {
+                    match self.generation.as_mut() {
+                        Some(generation) => generation.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                }, if abort_deadline.is_none() => Wake::Cancelled(cancellation),
+                item = self.response_rx.recv() => Wake::Item(item),
+                () = async {
+                    match abort_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => Wake::AbortDeadline,
+            };
+            match wake {
+                Wake::Cancelled(Cancellation::Scheduler) => {
+                    self.abort_deadline =
+                        Some(tokio::time::Instant::now() + SCHEDULER_ABORT_DEADLINE);
                 }
-            } => Some(ResponseItem::Error(Error::Disconnected)),
-            item = self.response_rx.recv() => item,
+                Wake::Cancelled(cancellation) => break Some(self.cancelled_item(cancellation)),
+                Wake::Item(Some(item)) => break Some(item),
+                // A cancellation can tear the response sink down before its
+                // notification is seen; it, not the closed sink, ends the call.
+                Wake::Item(None) => {
+                    let cancellation = self.generation.as_mut().and_then(Generation::try_cancelled);
+                    break cancellation.map(|cancellation| self.cancelled_item(cancellation));
+                }
+                Wake::AbortDeadline => {
+                    tracing::warn!(rid = %self.rid, "scheduler did not answer an abort; ending the request");
+                    if self.admission.cancel_requires_abort() {
+                        let _ = self.abort_tx.send(AbortSource::Guard(self.rid.clone()));
+                    }
+                    break Some(self.cancelled_item(Cancellation::Scheduler));
+                }
+            }
         };
         self.observe(item.as_ref());
         if let Some(item) = &mut item {
@@ -293,14 +368,11 @@ impl RuntimeCall {
     }
 
     pub(super) fn try_recv(&mut self) -> Result<ResponseItem, mpsc::error::TryRecvError> {
-        let mut item = if self
-            .generation
-            .as_ref()
-            .is_some_and(Generation::is_cancelled)
-        {
-            ResponseItem::Error(Error::Disconnected)
-        } else {
-            self.response_rx.try_recv()?
+        let mut item = match self.generation.as_mut().and_then(Generation::try_cancelled) {
+            Some(cancellation @ (Cancellation::Error | Cancellation::Unstarted)) => {
+                self.cancelled_item(cancellation)
+            }
+            Some(Cancellation::Scheduler) | None => self.response_rx.try_recv()?,
         };
         self.observe(Some(&item));
         self.name_client_rid(&mut item);
@@ -326,7 +398,52 @@ impl RuntimeCall {
         }
     }
 
+    /// The item that ends this generation on `cancellation` without the
+    /// scheduler's answer. The frontend abort output carries the plain abort
+    /// finish reason Python's scheduler writes and what the request last
+    /// reported, adds no tokens, and is marked as ended outside the output
+    /// stream, as the scheduler marks an abort it answers from its queue.
+    fn cancelled_item(&self, cancellation: Cancellation) -> ResponseItem {
+        if cancellation == Cancellation::Error {
+            return ResponseItem::Error(Error::Disconnected);
+        }
+        let last = &self.last_output;
+        ResponseItem::Done(ChunkEvent {
+            rid: self.rid.clone(),
+            finish_reason: Some(
+                FinishKind::Abort(Box::new(AbortReason {
+                    message: Some("Aborted".into()),
+                    status_code: None,
+                    err_type: None,
+                }))
+                .into(),
+            ),
+            prompt_tokens: last.prompt_tokens,
+            cached_tokens: last.cached_tokens,
+            reasoning_tokens: last.reasoning_tokens,
+            extras: Some(Box::new(ChunkExtras {
+                abort_output: true,
+                cached_tokens_details: last.cached_tokens_details.clone(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+
     fn observe(&mut self, item: Option<&ResponseItem>) {
+        if let Some(ResponseItem::Frame(output)) = item {
+            let last = &mut self.last_output;
+            last.prompt_tokens = output.prompt_tokens;
+            last.cached_tokens = output.cached_tokens;
+            last.reasoning_tokens = output.reasoning_tokens;
+            if let Some(details) = output
+                .extras
+                .as_deref()
+                .and_then(|extras| extras.cached_tokens_details.as_ref())
+            {
+                last.cached_tokens_details = Some(details.clone());
+            }
+        }
         if item.is_some_and(|item| self.expected_response.is_terminal(item)) {
             self.in_flight = false;
             if let Some(generation) = &mut self.generation {
