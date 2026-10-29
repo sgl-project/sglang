@@ -12,17 +12,21 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
+use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
 use sglang_processor::openai::{
-    ChatModel, ChatResponder, OpenAiHeaders, OpenAiSettings, Reply, lower_chat,
+    ChatModel, ChatResponder, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Reply, TokenPieces,
+    lower_chat,
 };
 use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
 
+use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
 use super::template::RenderedChat;
 use super::{AppState, ChatFormatter};
+use crate::api_server::core::CoreError;
 use crate::api_server::http::native_api::{
-    GenerateItem, RequestState, RequestTiming, drain_unary, generate_requests,
-    generation_event_stream,
+    GenerateItem, RequestState, RequestTiming, drain_unary_frame, generate_requests,
+    generation_event_stream_with,
 };
 use crate::message::config::ServerArgs;
 use crate::message::request::check_prompt_copies;
@@ -33,6 +37,26 @@ pub struct OpenAiChat {
     settings: OpenAiSettings,
     model: ChatModel,
     tokenizer: Arc<DynamoTokenizer>,
+    /// Token text and bytes for logprobs.
+    pieces: Arc<dyn OpenAiTokenizer>,
+}
+
+struct LogprobPieces {
+    tokenizer: Tokenizer,
+    /// `None` for a tokenizer without `tokenizer.json` (tiktoken).
+    pieces: Option<TokenPieces>,
+}
+
+impl OpenAiTokenizer for LogprobPieces {
+    fn decode(&self, ids: &[u32]) -> Option<String> {
+        match self.tokenizer.decode(ids, true).ok()? {
+            DecodeResult::Complete(text) | DecodeResult::Partial(text) => Some(text),
+        }
+    }
+
+    fn byte_level_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        self.pieces.as_ref()?.byte_level_bytes(id)
+    }
 }
 
 impl OpenAiChat {
@@ -55,6 +79,19 @@ impl OpenAiChat {
         .into_iter()
         .filter_map(|(key, value)| Some((key.to_owned(), value?)))
         .collect();
+        let revision = server_args.revision.as_deref();
+        let pieces = sglang_processor::resolve_model_file(
+            &server_args.tokenizer_path,
+            revision,
+            "tokenizer.json",
+        )
+        .and_then(|file| std::fs::read(file).ok())
+        .and_then(|json| serde_json::from_slice(&json).ok())
+        .map(|json| TokenPieces::from_tokenizer_json(&json));
+        let pieces = Arc::new(LogprobPieces {
+            tokenizer: tokenizer.tokenizer().clone(),
+            pieces,
+        });
         Self {
             settings: OpenAiSettings {
                 allow_auto_truncate: server_args.allow_auto_truncate,
@@ -67,6 +104,7 @@ impl OpenAiChat {
                 ),
                 incremental_streaming_output: server_args.incremental_streaming_output,
                 reasoning_parser: server_args.reasoning_parser.clone(),
+                served_model_name: Some(server_args.served_model_name.clone()),
                 stream_response_default_include_usage: server_args
                     .stream_response_default_include_usage,
                 tool_call_parser: server_args.tool_call_parser.clone(),
@@ -78,6 +116,7 @@ impl OpenAiChat {
                 ..ChatModel::for_formatter(formatter)
             },
             tokenizer,
+            pieces,
         }
     }
 
@@ -97,8 +136,7 @@ impl OpenAiChat {
             Err(TemplateError::NeedsRenderFallback { .. }) => {
                 let ChatBody { request: chat, raw } = ChatBody::deserialize(request).ok()?;
                 let args = TemplateArgs::new(&raw, defaults);
-                let prompt = formatter.render_template(&chat.request, &args).ok()?;
-                (prompt, String::new())
+                formatter.render_template(&chat.request, &args).ok()?
             }
             rendered => rendered.ok()?,
         };
@@ -125,35 +163,18 @@ pub(super) async fn chat(
     let sglext_ids = ["x-sglext-return-input-ids", "x-sglext-return-output-ids"]
         .into_iter()
         .any(|name| header(name).as_deref() == Some("1"));
-    let (lowering, body) = (state.clone(), body.clone());
-    // Rendering and tokenizing are CPU work, kept off the async workers.
-    let (generate, mut responder) = tokio::task::spawn_blocking(move || {
-        let openai = lowering.openai_chat.as_ref()?;
-        let formatter = lowering.chat_formatter.as_ref()?;
-        let headers = OpenAiHeaders {
-            routing_key: routing_key.as_deref(),
-            custom_labels: None,
-            sglext_ids,
-        };
-        let defaults = &lowering.server_args.default_chat_template_kwargs;
-        let render = |request: &Value| openai.render(formatter, request, defaults);
-        lower_chat(
-            &body,
-            &headers,
-            &openai.settings,
-            &openai.model,
-            render,
-            None,
-        )
-        .ok()
-    })
-    .await
-    .ok()??;
-    let mut generate = serde_json::to_value(generate).expect("api.v1 types serialize to JSON");
+    let (mut generate, mut responder) = lower(state, body.clone(), routing_key, sglext_ids).await?;
 
     let stream = generate["stream"] == true;
     if let Err(error) = copy_prompt_per_choice(&mut generate) {
         return Some(error_response(StatusCode::BAD_REQUEST, &error.to_string()));
+    }
+    // Python's `adapted_request` takes the router's override headers.
+    if state.server_args.enable_request_header_overrides
+        && let Err(error) = apply_header_overrides(&mut generate, headers)
+    {
+        // `apply_header_overrides` raises `HTTPException(400)`, typed by its status.
+        return Some(typed_error_response(StatusCode::BAD_REQUEST, "400", &error));
     }
     // Failures before the first frame answer unary even for a stream: Python
     // awaits the first chunk before it starts the stream.
@@ -177,24 +198,15 @@ pub(super) async fn chat(
         let drained = futures::future::try_join_all(calls.into_iter().map(
             |(mut call, request)| async move {
                 let rid = call.public_id().to_owned();
-                match drain_unary(&mut call, &rid, request).await {
-                    (StatusCode::OK, item) => Ok(item),
-                    failed => Err(failed),
-                }
+                drain_unary_frame(&mut call, &rid, request)
+                    .await
+                    .map(|frame| GenerateItem::Frame(Box::new(frame)))
             },
         ))
         .await;
         let items = match drained {
             Ok(items) => items,
-            Err((status, item)) => {
-                let message = match &item {
-                    GenerateItem::Error(failure) => {
-                        failure.error.as_ref().map(|e| e.message.clone())
-                    }
-                    GenerateItem::Frame(_) => None,
-                };
-                return Some(error_response(status, &message.unwrap_or_default()));
-            }
+            Err(error) => return Some(call_error_response(&error)),
         };
         // Every item is a frame: a failed one answered above.
         let output = items
@@ -216,7 +228,7 @@ pub(super) async fn chat(
     }
 
     let incremental = state.server_args.incremental_streaming_output;
-    let frames = generation_event_stream(calls, incremental, is_batch);
+    let frames = generation_event_stream_with(calls, incremental, is_batch, python_error_frame);
     let mut frames = Box::pin(frames);
     // An error before the first frame answers the whole request, as on Python.
     let mut first = Vec::new();
@@ -273,6 +285,53 @@ fn stream_data(responder: &mut ChatResponder, data: &str) -> Result<Vec<String>,
     }
 }
 
+/// The prompt ids lowered chat would send for a chat `body`, or `None` where
+/// chat leaves the request to the typed handler.
+pub(super) async fn prompt_ids(state: &Arc<AppState>, body: Bytes) -> Option<Vec<i64>> {
+    let (generate, _) = lower(state, body, None, false).await?;
+    generate["input_ids"]
+        .as_array()?
+        .iter()
+        .map(Value::as_i64)
+        .collect()
+}
+
+/// [`lower_chat`] with this server's processor, as JSON, under the request's
+/// routing key and sglext-ids header.
+async fn lower(
+    state: &Arc<AppState>,
+    body: Bytes,
+    routing_key: Option<String>,
+    sglext_ids: bool,
+) -> Option<(Value, ChatResponder)> {
+    let state = state.clone();
+    // Rendering and tokenizing are CPU work, kept off the async workers.
+    let (generate, responder) = tokio::task::spawn_blocking(move || {
+        let openai = state.openai_chat.as_ref()?;
+        let formatter = state.chat_formatter.as_ref()?;
+        let headers = OpenAiHeaders {
+            routing_key: routing_key.as_deref(),
+            custom_labels: None,
+            sglext_ids,
+        };
+        let defaults = &state.server_args.default_chat_template_kwargs;
+        let render = |request: &Value| openai.render(formatter, request, defaults);
+        lower_chat(
+            &body,
+            &headers,
+            &openai.settings,
+            &openai.model,
+            render,
+            Some(openai.pieces.clone()),
+        )
+        .ok()
+    })
+    .await
+    .ok()??;
+    let generate = serde_json::to_value(generate).expect("api.v1 types serialize to JSON");
+    Some((generate, responder))
+}
+
 /// A prompt's fields whose list form is repeated with it across `n` choices.
 const PROMPT_LIST_FIELDS: [&str; 6] = [
     "bootstrap_host",
@@ -322,14 +381,59 @@ fn copy_prompt_per_choice(generate: &mut Value) -> Result<(), Error> {
     Ok(())
 }
 
+/// Python's `/generate` streams a scheduler abort as a frame whose
+/// `finish_reason` carries its status, which its chat layer answers as an error event.
+fn python_error_frame(error: &CoreError, index: Option<u32>) -> String {
+    let CoreError::RuntimeRejected {
+        message,
+        legacy_http_status,
+        ..
+    } = error
+    else {
+        return serde_json::to_string(&error.stream_error(index))
+            .expect("api.v1 types serialize to JSON");
+    };
+    let finish_reason = serde_json::json!({
+        "type": "abort",
+        "message": message,
+        "status_code": legacy_http_status,
+    });
+    serde_json::json!({
+        "text": "",
+        "index": index,
+        "meta_info": {"finish_reason": finish_reason},
+    })
+    .to_string()
+}
+
 /// `OpenAIServingBase.create_error_response`: a 400 is a `BadRequestError`;
 /// any other status is an `HTTPException`, typed by its status code.
 fn error_response(status: StatusCode, message: &str) -> Response {
-    let code = status.as_u16();
     let err_type = match status {
         StatusCode::BAD_REQUEST => "BadRequestError".to_owned(),
-        _ => code.to_string(),
+        _ => status.as_u16().to_string(),
     };
+    typed_error_response(status, &err_type, message)
+}
+
+/// `handle_request`'s answer to a call that failed before its first frame: a
+/// scheduler abort is the `HTTPException` the tokenizer manager raises, while a
+/// failure of this server's own is Python's generic exception.
+fn call_error_response(error: &CoreError) -> Response {
+    let status = error.http_status();
+    match error {
+        CoreError::RuntimeRejected { .. } => error_response(status, &error.to_string()),
+        _ if status == StatusCode::INTERNAL_SERVER_ERROR => typed_error_response(
+            status,
+            "InternalServerError",
+            &format!("Internal server error: {error}"),
+        ),
+        _ => error_response(status, &error.to_string()),
+    }
+}
+
+fn typed_error_response(status: StatusCode, err_type: &str, message: &str) -> Response {
+    let code = status.as_u16();
     let error = serde_json::json!({
         "object": "error",
         "message": message,
@@ -351,13 +455,12 @@ mod tests {
 
     use axum::Router;
 
-    use sglang_processor::dynamo_tokenizers::Tokenizer;
-
     use super::super::test_utils::{
-        answering_app_state_with_item, body_json, checkpoint_formatter, chunk, post_json,
+        answering_app_state_with, answering_app_state_with_item, body_json, checkpoint_formatter,
+        chunk, oneshot, post_json,
     };
     use super::*;
-    use crate::message::response::ResponseItem;
+    use crate::message::response::{ChunkExtras, ResponseItem};
 
     /// A byte-level word tokenizer's `tokenizer.json`; id 3 is `é`'s bytes.
     fn tokenizer_path() -> &'static str {
@@ -461,6 +564,80 @@ mod tests {
         assert!(message.contains("byte limit"), "{message}");
     }
 
+    /// A scheduler abort in a stream, whatever its status, is Python's error
+    /// event under that status, then the stream's end, not a unary 400.
+    #[tokio::test]
+    async fn streamed_abort_keeps_its_status() {
+        for (status, name) in [
+            (503, "SERVICE_UNAVAILABLE"),
+            (400, "BAD_REQUEST"),
+            (412, "PRECONDITION_FAILED"),
+        ] {
+            let app = lowered_state(move |rid| {
+                let mut item = chunk(rid, "", true);
+                let ResponseItem::Done(output) = &mut item else {
+                    unreachable!()
+                };
+                let abort = json!({"type": "abort", "message": "aborted", "status_code": status});
+                output.finish_reason = Some(serde_json::from_value(abort).unwrap());
+                item
+            });
+            let messages = json!([{"role": "user", "content": "hi"}]);
+            let body = json!({"model": "model", "messages": messages, "stream": true});
+            let response = post_json(app, "/v1/chat/completions", body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[CONTENT_TYPE],
+                "text/event-stream; charset=utf-8"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            let error: Value = text
+                .split("\n\n")
+                .filter_map(|event| event.strip_prefix("data: "))
+                .find_map(|data| {
+                    serde_json::from_str::<Value>(data)
+                        .ok()?
+                        .get("error")
+                        .cloned()
+                })
+                .unwrap_or_else(|| panic!("no error event: {text}"));
+            assert_eq!(
+                (error["type"].as_str(), error["code"].as_u64()),
+                (Some(name), Some(status))
+            );
+            assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+        }
+    }
+
+    /// The router's override headers reach the request, as they reach
+    /// Python's `adapted_request`.
+    #[tokio::test]
+    async fn override_headers_reach_the_request() {
+        let args = ServerArgs {
+            enable_request_header_overrides: true,
+            ..Default::default()
+        };
+        let app = lowered_state_with(args, |rid| chunk(rid, "ok", true));
+        let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
+        let post = |header: &str, value: &str| {
+            let request = axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(header, value)
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            oneshot(app.clone(), request)
+        };
+        let response = post("x-override-rid", "routed").await;
+        assert_eq!(body_json(response).await["id"], "routed");
+        let response = post("x-override-priority", "high").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // `HTTPException(400)`, typed by its status.
+        assert_eq!(body_json(response).await["type"], "400");
+    }
+
     /// A failed choice answers at once, without waiting on an unfinished sibling.
     #[tokio::test]
     async fn failed_choice_does_not_wait_for_siblings() {
@@ -480,7 +657,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    /// A scheduler failure keeps its 500, as Python's `HTTPException` does.
+    /// This server's own failure answers as Python's generic exception does.
     #[tokio::test]
     async fn failed_choice_keeps_its_status() {
         let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
@@ -490,15 +667,17 @@ mod tests {
         let value = body_json(response).await;
         assert_eq!(
             (value["type"].as_str(), value["code"].as_u64()),
-            (Some("500"), Some(500))
+            (Some("InternalServerError"), Some(500))
         );
+        let message = value["message"].as_str().unwrap();
         assert!(
-            value["message"].as_str().unwrap().contains("boom"),
+            message.starts_with("Internal server error: ") && message.contains("boom"),
             "{value}"
         );
     }
 
-    /// A streamed failure before the first frame keeps its status too.
+    /// A streamed failure before the first frame keeps its status too, typed
+    /// as Python's generic exception.
     #[tokio::test]
     async fn failed_stream_keeps_its_status() {
         let body = json!({
@@ -509,7 +688,13 @@ mod tests {
         let app = lowered_state(|_| ResponseItem::Error(Error::Internal("boom".into())));
         let response = post_json(app, "/v1/chat/completions", body).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body_json(response).await["type"], "500");
+        let value = body_json(response).await;
+        assert_eq!(
+            (value["type"].as_str(), value["code"].as_u64()),
+            (Some("InternalServerError"), Some(500))
+        );
+        let message = value["message"].as_str().unwrap();
+        assert!(message.starts_with("Internal server error: "), "{value}");
     }
 
     /// A template's detected toggle decides reasoning before the parser's
@@ -534,6 +719,88 @@ mod tests {
         let message = &value["choices"][0]["message"];
         assert_eq!(message["content"], "Hello!");
         assert!(message["reasoning_content"].is_null(), "{value}");
+    }
+
+    /// Logprobs are served by the processor: a partial character's `bytes`
+    /// are its byte-level token's, as on Python, not the replacement text's.
+    #[tokio::test]
+    async fn processor_serves_logprobs() {
+        let args = ServerArgs {
+            tokenizer_path: tokenizer_path().into(),
+            ..Default::default()
+        };
+        let app = lowered_state_with(args, |rid| {
+            let mut item = chunk(rid, "\u{FFFD}", true);
+            let ResponseItem::Done(output) = &mut item else {
+                unreachable!()
+            };
+            output.extras = Some(Box::new(ChunkExtras {
+                out_lp_val: vec![-0.25],
+                out_lp_idx: vec![3],
+                out_lp_txt: vec!["\u{FFFD}".into()],
+                out_top_val: vec![-0.25, -2.0],
+                out_top_idx: vec![3, 1],
+                out_top_lens: vec![2],
+                out_top_txt: vec!["\u{FFFD}".into(), "!".into()],
+                ..Default::default()
+            }));
+            item
+        });
+        let messages = json!([{"role": "user", "content": "hi"}]);
+        let body =
+            json!({"model": "model", "messages": messages, "logprobs": true, "top_logprobs": 2});
+        let value = body_json(post_json(app, "/v1/chat/completions", body).await).await;
+        let token = &value["choices"][0]["logprobs"]["content"][0];
+        assert_eq!(token["token"], "\u{FFFD}");
+        assert_eq!(token["logprob"], -0.25);
+        assert_eq!(token["bytes"], json!([0xC3, 0xA9]));
+        assert_eq!(token["top_logprobs"][1]["token"], "!");
+        assert_eq!(token["top_logprobs"][1]["bytes"], json!([b'!']));
+        assert!(value["usage"].get("reasoning_tokens").is_some());
+
+        // Streamed, cumulative or incremental.
+        for incremental in [false, true] {
+            let args = ServerArgs {
+                tokenizer_path: tokenizer_path().into(),
+                incremental_streaming_output: incremental,
+                ..Default::default()
+            };
+            let app = lowered_state_with(args, |rid| {
+                let mut item = chunk(rid, "!", true);
+                if let ResponseItem::Done(output) = &mut item {
+                    output.extras = Some(Box::new(ChunkExtras {
+                        out_lp_val: vec![-0.5],
+                        out_lp_idx: vec![1],
+                        out_lp_txt: vec!["!".into()],
+                        ..Default::default()
+                    }));
+                }
+                item
+            });
+            let body =
+                json!({"model": "model", "messages": messages, "logprobs": true, "stream": true});
+            let response = post_json(app, "/v1/chat/completions", body).await;
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains(r#""logprob":-0.5"#), "{text}");
+        }
+    }
+
+    /// A served name with a colon, requested exactly, is not a LoRA adapter.
+    #[tokio::test]
+    async fn served_name_with_a_colon_is_the_base_model() {
+        let args = ServerArgs {
+            served_model_name: "model:tag".into(),
+            ..Default::default()
+        };
+        let formatter = checkpoint_formatter(&json!({}), "{{ messages[0].content }}");
+        let state = answering_app_state_with(Arc::new(args), formatter, Some(tokenizer()), "ok");
+        let app = super::super::routes().with_state(state);
+        let body = json!({"model": "model:tag", "messages": [{"role": "user", "content": "hi"}]});
+        let response = post_json(app, "/v1/chat/completions", body).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// A template without a detected reasoning toggle reasons by the parser's
@@ -564,6 +831,17 @@ mod tests {
         );
     }
 
+    /// `/tokenize` takes what chat takes, such as a mixed-case role Dynamo's
+    /// typed request rejects, and returns the ids chat would send.
+    #[tokio::test]
+    async fn tokenize_takes_what_chat_takes() {
+        let app = lowered_state(|rid| chunk(rid, "ok", true));
+        let messages =
+            json!([{"role": "System", "content": "Be brief."}, {"role": "user", "content": "hi"}]);
+        let response = post_json(app, "/v1/tokenize", json!({"messages": messages})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     /// A request the processor does not reproduce reaches the typed handler.
     #[tokio::test]
     async fn required_tool_choice_falls_back() {
@@ -588,18 +866,16 @@ mod tests {
             default_chat_template_kwargs: [("thinking".into(), Value::Bool(false))].into(),
             ..Default::default()
         };
-        let app = lowered_state_with(args, |rid| chunk(rid, "Hello!", true));
+        // recipe parses the mock's token id 1, which is `!`.
+        let app = lowered_state_with(args, |rid| chunk(rid, "!", true));
         let body = json!({"model":"model", "messages":[{"role":"user","content":"Hi"}]});
         let value =
             body_json(post_json(app.clone(), "/v1/chat/completions", body.clone()).await).await;
-        assert_eq!(value["choices"][0]["message"]["content"], "Hello!");
+        assert_eq!(value["choices"][0]["message"]["content"], "!");
         assert!(value["choices"][0]["message"]["reasoning_content"].is_null());
         let mut override_body = body;
         override_body["chat_template_kwargs"] = json!({"thinking":true});
         let value = body_json(post_json(app, "/v1/chat/completions", override_body).await).await;
-        assert_eq!(
-            value["choices"][0]["message"]["reasoning_content"],
-            "Hello!"
-        );
+        assert_eq!(value["choices"][0]["message"]["reasoning_content"], "!");
     }
 }
