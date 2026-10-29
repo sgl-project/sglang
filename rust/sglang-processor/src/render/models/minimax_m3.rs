@@ -401,8 +401,14 @@ fn template_message(mut message: Value) -> Result<Value, RenderError> {
 /// or root message renders an empty block rather than the default prompt.
 /// Joining it to `""` would be falsy, so decline instead of mis-rendering.
 fn join_text_parts(message: &mut Value) -> Result<(), RenderError> {
-    if let Some(parts) = message["content"].as_array().filter(|parts| !parts.is_empty()) {
-        let text: String = parts.iter().filter_map(|part| part["text"].as_str()).collect();
+    if let Some(parts) = message["content"]
+        .as_array()
+        .filter(|parts| !parts.is_empty())
+    {
+        let text: String = parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect();
         if text.is_empty() {
             return Err(RenderError::Declined("content parts with no text".into()));
         }

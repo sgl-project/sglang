@@ -111,8 +111,7 @@ mod tests {
                 {"role": "tool", "tool_call_id": "b", "content": "extra"},
             ],
         });
-        let request: CreateChatCompletionRequest =
-            serde_json::from_value(body.clone()).unwrap();
+        let request: CreateChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
         match render_chat(&formatter, body, &request, &HashMap::new()) {
             Err(TemplateError::Renderer { .. }) => {}
             Err(other) => panic!("expected a Renderer error, got {other:?}"),
