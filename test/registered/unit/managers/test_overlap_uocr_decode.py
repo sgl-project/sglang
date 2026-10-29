@@ -90,6 +90,9 @@ class TestUOCRDecodeGraphIO(CustomTestCase):
         sampling.logit_bias = torch.ones(1)
         self.assertFalse(graph_io.can_defer(batch))
         sampling.logit_bias = None
+        sampling.has_watermark_candidates = True
+        self.assertFalse(graph_io.can_defer(batch))
+        sampling.has_watermark_candidates = False
         batch.return_logprob = True
         self.assertFalse(graph_io.can_defer(batch))
 
@@ -110,6 +113,13 @@ class TestUOCRDecodeGraphIO(CustomTestCase):
         result.next_token_ids = torch.tensor([47, 53])
         graph_io.relay_result(batch, result, indices)
         self.assertEqual(graph_io.relay[indices].tolist(), [47, 53])
+
+        # watermarking samples after graph argmax; relay the actual sampled ids
+        batch.sampling_info.is_all_greedy = True
+        batch.sampling_info.has_watermark_candidates = True
+        result.next_token_ids = torch.tensor([59, 61])
+        graph_io.relay_result(batch, result, indices)
+        self.assertEqual(graph_io.relay[indices].tolist(), [59, 61])
 
 
 class TestDeferredThenEagerDecode(CustomTestCase):

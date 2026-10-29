@@ -62,6 +62,7 @@ class UOCRDecodeGraphIO:
             and sampling.logit_bias is None
             and sampling.grammar_mask is None
             and not sampling.has_custom_logit_processor
+            and not sampling.has_watermark_candidates
             and (penalizer is None or not penalizer.is_required)
         )
 
