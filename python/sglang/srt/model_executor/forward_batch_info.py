@@ -79,9 +79,10 @@ if TYPE_CHECKING:
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
-    from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
@@ -520,14 +521,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # This iteration's KV ids, translated once per sub-pool (`KVLocPlan`).
+    # This iteration's KV ids, translated once per sub-pool (`IterationIds`).
     # Every forward of the iteration holds the same plan; `out_cache_loc` is
     # its write window in the full-attention ids this runner's pool indexes,
     # and a backend that writes another sub-pool asks the plan for its ids
-    # (`KVIndexTranslator.write_ids`).
-    kv_loc_plan: Optional[KVLocPlan] = None
+    # (`RunnerIds.write_ids`).
+    iteration_ids: Optional[IterationIds] = None
     # The part of the plan's window this forward writes (None: all of it).
-    kv_loc_cols: Optional[Cols] = None
+    iteration_cols: Optional[Cols] = None
     # The same write ids in the virtual space when `out_cache_loc` holds
     # translated ones (None on a pool that indexes virtual ids), for the
     # scheduler's bookkeeping: lazy compaction's in-flight write set, TBO's
@@ -536,7 +537,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
-    # Whether `out_cache_loc` holds physical ids: set by `KVLocPlan.bind`.
+    # Whether `out_cache_loc` holds physical ids: set by `IterationIds.bind`.
     out_cache_loc_is_physical: bool = False
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
@@ -625,6 +626,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # Per-request target-verify geometry.
+    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # True for synthetic capture batches; init_new snapshots real request ranges.
@@ -965,18 +968,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
         extend_position_info=None,
         spec_mrope_positions: Optional[torch.Tensor] = None,
-        kv_loc_plan: Optional[KVLocPlan] = None,
+        pp_loras: Optional[set[Optional[str]]] = None,
+        iteration_ids: Optional[IterationIds] = None,
         write_cols: Optional[Cols] = None,
     ):
-        # init_new must not mutate the input ScheduleBatch; per-forward
-        # overrides go through explicit keyword arguments.
-        #
-        # `kv_loc_plan`: the iteration's plan when this forward is one of
-        # several over the same slots (a speculative iteration), `write_cols`
-        # the columns of its window this forward writes. Without one, this
-        # forward is its own iteration and builds the plan itself.
+        # init_new must not mutate ScheduleBatch; use explicit forward overrides.
+        # Speculative forwards share iteration_ids and select their write_cols;
+        # a standalone forward builds its own iteration plan.
 
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
@@ -1121,11 +1122,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
+            ragged_verify_layout=ragged_verify_layout,
         )
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities,
         # and so does the plan's window. An NPU DCP target writes rank-local
-        # slots, which its translator maps the window to at `bind` below; keep
+        # slots, which its `RunnerIds` maps the window to at `bind` below; keep
         # the global view for the consumers that read it.
         if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
@@ -1142,10 +1144,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             device,
         )
 
-        translator = model_runner.kv_index_translator
-        if kv_loc_plan is None:
-            kv_loc_plan = translator.own_plan(ret)
-        kv_loc_plan.bind(ret, translator, cols=write_cols)
+        runner_ids = model_runner.runner_ids
+        if iteration_ids is None:
+            iteration_ids = runner_ids.own_plan(ret)
+        iteration_ids.bind(ret, runner_ids, cols=write_cols)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
@@ -1297,7 +1299,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
             if not get_lora().enable_lora_overlap_loading:
-                model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+                model_runner.lora_manager.fetch_new_loras(
+                    set(ret.lora_ids), pp_loras=pp_loras
+                )
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
@@ -2341,13 +2345,14 @@ def build_inner_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         # A caller may hand in another view that does not carry this field.
         out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
-        kv_loc_plan=getattr(forward_batch, "kv_loc_plan", None),
-        kv_loc_cols=getattr(forward_batch, "kv_loc_cols", None),
+        iteration_ids=getattr(forward_batch, "iteration_ids", None),
+        iteration_cols=getattr(forward_batch, "iteration_cols", None),
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         # A caller may hand in another view that does not carry this field.
         max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         spec_info=forward_batch.spec_info,
+        ragged_verify_layout=forward_batch.ragged_verify_layout,
     )
 
 
