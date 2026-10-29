@@ -112,12 +112,32 @@ class GrammarManager:
         return data
 
     def abort_requests(self, recv_req: AbortReq):
-        for req in self.grammar_queue:
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                logger.debug(f"Abort grammar queue request. {req.rid=}")
-                if isinstance(req.grammar, futures.Future) and req.grammar:
-                    req.grammar.cancel()
-                req.set_finish_with_abort("Aborted by AbortReq.")
+        aborted = [
+            req
+            for req in self.grammar_queue
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid)
+        ]
+        self._cancel_compiles(aborted)
+        for req in aborted:
+            logger.debug(f"Abort grammar queue request. {req.rid=}")
+            req.set_finish_with_abort("Aborted by AbortReq.")
+
+    def _cancel_compiles(self, leaving: List[Req]) -> None:
+        leaving_ids = {id(req) for req in leaving}
+        # A compile keeps running while an unfinished queued request waits on it.
+        awaited = {
+            id(req.grammar)
+            for req in self.grammar_queue
+            if id(req) not in leaving_ids
+            and isinstance(req.grammar, futures.Future)
+            and not req.finished()
+        }
+        for req in leaving:
+            if (
+                isinstance(req.grammar, futures.Future)
+                and id(req.grammar) not in awaited
+            ):
+                req.grammar.cancel()
 
     def _get_request_thinking_budget(self, req: Req) -> int | None:
         custom_params = req.sampling_params.custom_params
@@ -303,26 +323,31 @@ class GrammarManager:
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
             try:
-                req.grammar = req.grammar.result()
+                grammar = req.grammar.result()
             except Exception as e:
                 logger.error(
                     f"Grammar compilation raised an exception: {e}, "
                     f"grammar_key={req.grammar_key}"
                 )
-                req.grammar = InvalidGrammarObject(f"Grammar compilation failed: {e}")
-            self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                grammar = InvalidGrammarObject(f"Grammar compilation failed: {e}")
+            # Requests for one key share its compile. No request decodes with
+            # the cached grammar; each gets its own copy.
+            self.grammar_backend.set_cache(req.grammar_key, grammar)
+            req.grammar = grammar.copy()
+            # The compile ran with the reasoning flag of the request that started it.
+            req.grammar.maybe_init_reasoning(req.require_reasoning)
             self._apply_request_reasoning_config(req)
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)
 
         # Return failed requests
-        for i in synced_failed_req_idxs:
-            req = self.grammar_queue[i]
+        failed_reqs = [self.grammar_queue[i] for i in synced_failed_req_idxs]
+        self._cancel_compiles(failed_reqs)
+        for req in failed_reqs:
             return_reqs.append(req)
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
-            req.grammar.cancel()
             self.grammar_backend.set_cache(
                 req.grammar_key, InvalidGrammarObject("Grammar preprocessing timed out")
             )
@@ -335,4 +360,7 @@ class GrammarManager:
             for i, req in enumerate(self.grammar_queue)
             if i not in synced_ready_req_idxs and i not in synced_failed_req_idxs
         ]
+        self.grammar_backend.drop_unawaited_compiles(
+            {req.grammar_key for req in self.grammar_queue}
+        )
         return return_reqs

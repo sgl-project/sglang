@@ -18,7 +18,7 @@ import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -204,6 +204,8 @@ class BaseGrammarBackend:
     def __init__(self):
         self.executor = ThreadPoolExecutor()
         self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
+        # The in-flight compile of each key, shared by the requests waiting on it.
+        self._compiling: Dict[Tuple[str, str], Future[BaseGrammarObject]] = {}
 
     def initialize_vocab_mask_buffer(
         self,
@@ -309,8 +311,18 @@ class BaseGrammarBackend:
             copied_value = value.copy()
             copied_value.maybe_init_reasoning(require_reasoning)
             return copied_value, True
-        value = self.executor.submit(self._init_value_dispatch, key, require_reasoning)
-        return value, False
+        # Requests for a key that is still compiling wait on that compile.
+        future = self._compiling.get(key)
+        if future is None or future.cancelled():
+            future = self.executor.submit(
+                self._init_value_dispatch, key, require_reasoning
+            )
+            self._compiling[key] = future
+        return future, False
+
+    def drop_unawaited_compiles(self, awaited_keys: Set[Tuple[str, str]]) -> None:
+        for key in [key for key in self._compiling if key not in awaited_keys]:
+            del self._compiling[key]
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
         self.cache[key] = value

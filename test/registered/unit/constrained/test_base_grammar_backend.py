@@ -3,7 +3,7 @@ Unit tests for sglang.srt.constrained.base_grammar_backend.
 
 Test Coverage:
 - BaseGrammarBackend: caching, dispatch routing, unsupported fallback,
-  thread pool execution, cache hit/miss
+  thread pool execution, cache hit/miss, sharing of in-flight compiles
 - create_grammar_backend: factory routing, "none" backend, invalid name,
   custom registry, reasoner wrapping
 
@@ -12,8 +12,9 @@ Usage:
 """
 
 import json
+import threading
 import unittest
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -134,27 +135,65 @@ class TestBaseGrammarBackend(unittest.TestCase):
         result = self.backend._init_value_dispatch(("json", "schema"), False)
         self.assertIsNone(result)
 
-    def test_cache_miss_duplicate_key_submits_separate_futures(self):
-        """Two cache misses for the same key each get their own Future.
+    def test_concurrent_misses_for_one_key_share_one_compile(self):
+        """A miss on a key that is still compiling waits on that compile."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        compiled = []
 
-        The backend does not deduplicate in-flight compilations — that is
-        handled at the GrammarManager level via grammar_queue. Each call
-        to get_cached_or_future_value with an uncached key submits a new
-        task to the executor."""
+        def dispatch_json(key_string):
+            compiled.append(key_string)
+            release.wait(timeout=10)
+            return InvalidGrammarObject("unused")
+
+        self.backend.dispatch_json = dispatch_json
         key = ("json", "schema")
-        result1, hit1 = self.backend.get_cached_or_future_value(key, False)
-        result2, hit2 = self.backend.get_cached_or_future_value(key, False)
+        results = [
+            self.backend.get_cached_or_future_value(key, False) for _ in range(5)
+        ]
+        release.set()
 
-        self.assertFalse(hit1)
-        self.assertFalse(hit2)
-        self.assertIsInstance(result1, Future)
-        self.assertIsInstance(result2, Future)
-        # They are independent futures, not shared
-        self.assertIsNot(result1, result2)
+        self.assertEqual([hit for _, hit in results], [False] * 5)
+        future = results[0][0]
+        self.assertTrue(all(value is future for value, _ in results))
+        future.result(timeout=5)
+        self.assertEqual(compiled, ["schema"])
 
-        # Both should complete successfully
-        self.assertIsInstance(result1.result(timeout=5), InvalidGrammarObject)
-        self.assertIsInstance(result2.result(timeout=5), InvalidGrammarObject)
+    def test_distinct_keys_compile_separately(self):
+        keys = [("json", "a"), ("json", "b"), ("regex", "a")]
+        results = [self.backend.get_cached_or_future_value(k, False) for k in keys]
+        self.assertEqual(len({id(future) for future, _ in results}), 3)
+
+    def test_cancelled_compile_is_not_joined(self):
+        # Keep the only worker busy so the first compile stays cancellable.
+        self.backend.executor.shutdown(wait=True)
+        self.backend.executor = ThreadPoolExecutor(max_workers=1)
+        busy = threading.Event()
+        self.addCleanup(busy.set)
+        self.backend.executor.submit(busy.wait, 10)
+        key = ("json", "schema")
+        first, _ = self.backend.get_cached_or_future_value(key, False)
+        self.assertTrue(first.cancel())
+
+        second, hit = self.backend.get_cached_or_future_value(key, False)
+        busy.set()
+
+        self.assertFalse(hit)
+        self.assertIsNot(second, first)
+        self.assertIsInstance(second.result(timeout=5), InvalidGrammarObject)
+
+    def test_dropped_compile_is_not_joined(self):
+        kept, _ = self.backend.get_cached_or_future_value(("json", "kept"), False)
+        dropped, _ = self.backend.get_cached_or_future_value(("json", "dropped"), False)
+
+        self.backend.drop_unawaited_compiles({("json", "kept")})
+
+        again_kept, _ = self.backend.get_cached_or_future_value(("json", "kept"), False)
+        again_dropped, _ = self.backend.get_cached_or_future_value(
+            ("json", "dropped"), False
+        )
+        self.assertIs(again_kept, kept)
+        self.assertIsNot(again_dropped, dropped)
 
 
 class TestCreateGrammarBackend(unittest.TestCase):
