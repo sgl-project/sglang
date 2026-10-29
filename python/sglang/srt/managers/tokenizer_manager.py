@@ -1354,8 +1354,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"model's context length ({self.context_len} tokens). "
                     "Truncating the input."
                 )
-                del input_ids[_max_req_len:]
-                input_token_num = len(input_ids)
+                # Truncate below the slots reserved for draft tokens.
+                del input_ids[_max_req_len - self.num_reserved_tokens :]
+                input_token_num = len(input_ids) + self.num_reserved_tokens
             else:
                 raise ValueError(
                     f"The input ({input_token_num} tokens) is longer than the "
