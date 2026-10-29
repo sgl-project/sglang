@@ -1842,6 +1842,21 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(
         max_context_len=64,
     )
 
+    def test_finished_zero_length_skips_checkpoint_source(self):
+        component = object.__new__(COMPONENT_REGISTRY[ComponentType.MAMBA])
+        component.cache = mock.Mock(enable_mamba_extra_buffer=True)
+        req = mock.Mock()
+        req.kv.mamba_last_track_seqlen = None
+        params = mock.Mock(mamba_value=None)
+
+        with mock.patch.object(
+            component,
+            "_select_finished_checkpoint",
+            side_effect=AssertionError("zero-length state must not be read"),
+        ):
+            self.assertEqual(component.prepare_for_caching_req(req, params, 4, True), 0)
+        self.assertIsNone(params.mamba_value)
+
     def test_finished_req_stores_radix_mamba_state_in_int8_pool(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ckpt_pool = req_to_token_pool.mamba_ckpt_pool
