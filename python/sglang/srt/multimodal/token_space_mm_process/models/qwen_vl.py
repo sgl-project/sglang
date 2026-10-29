@@ -95,6 +95,8 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             "pixel_values_videos": Modality.VIDEO,
             "video_grid_thw": Modality.VIDEO,
             "second_per_grid_ts": Modality.VIDEO,
+            # Omni's name for it; an item field so it scopes the item hash.
+            "video_second_per_grid": Modality.VIDEO,
             "input_features": Modality.AUDIO,
             "feature_attention_mask": Modality.AUDIO,
         }

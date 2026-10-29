@@ -974,6 +974,40 @@ class TestQwenTokenizedMedia(CustomTestCase):
         )
         self.assertEqual(output["video_second_per_grid"].tolist(), [0.5, 2.0])
 
+    @patch("sglang.srt.multimodal.qwen_vl_media_processing.is_cpu", return_value=True)
+    def test_omni_videos_with_equal_frames_but_different_fps_hash_apart(self, _is_cpu):
+        """Equal frames at different seconds per grid must not share a KV cache key.
+
+        Their M-RoPE positions differ, temporal_patch_size 2:
+            4 s at 8 fps, item fps 4 -> 16 frames, 2 / 4.0 = 0.5 s per grid
+            2 s at 8 fps, item fps 8 -> 16 frames, 2 / 8.0 = 0.25 s per grid
+        """
+        processor = _make_hf_processor(
+            Qwen3OmniMoeProcessor, 16, model_type="qwen3_omni_moe"
+        )
+        items = []
+        for num_frames, fps in ((32, 4.0), (16, 8.0)):
+            frames = torch.zeros(num_frames, 64, 64, 3, dtype=torch.uint8)
+            media = _process_media(
+                processor,
+                videos=[_VideoDecoder(frames, fps=8)],
+                preprocess_kwargs={"videos": [{"fps": fps}]},
+            )
+            expanded = expand_token_placeholders(
+                [VIDEO], _expansion_spec(processor, media)
+            )
+            with patch.object(
+                processor._core.strategy,
+                "compute_mrope_positions",
+                return_value=(None, None),
+            ):
+                items.append(_post_process(processor, expanded, media).mm_items[0])
+        self.assert_tensor_bytes_equal(items[0].feature, items[1].feature)
+        self.assertEqual(
+            items[0].video_grid_thw.tolist(), items[1].video_grid_thw.tolist()
+        )
+        self.assertNotEqual(items[0].hash, items[1].hash)
+
     def test_omni_audio_in_video_is_not_implicitly_enabled(self):
         processor = _make_hf_processor(
             Qwen3OmniMoeProcessor, 16, model_type="qwen3_omni_moe"
