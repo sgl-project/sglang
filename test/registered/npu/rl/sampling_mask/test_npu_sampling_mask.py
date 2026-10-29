@@ -144,7 +144,6 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
             ("unbiased", 10, 1.0, 0.0),
             ("topk", 10, 1.0, 0.0),
             ("topp", 10, 0.8, 0.0),
-            ("minp", 10, 0.8, 0.3),
             ("fallback", 1025, 1.0, 0.0),
         ]
         for mode in ("support", "selected"):

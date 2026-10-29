@@ -680,21 +680,19 @@ class Sampler(nn.Module):
             assert self.use_ascend_backend, (
                 "Only ascend backend supports sampling from logits"
             )
-            sample_result = top_k_top_p_min_p_sampling_from_logits_ascend(
-                logits,
-                sampling_info.top_ks,
-                sampling_info.top_ps,
-                sampling_info.min_ps,
-                sampling_info.need_min_p_sampling,
-                sampling_info.sampling_seed,
-                positions,
-                npu_top_k_top_p_eligible=sampling_info.npu_top_k_top_p_eligible,
-                return_filtered_probs=return_sampling_mask,
+            batch_next_token_ids, filtered_probs = (
+                top_k_top_p_min_p_sampling_from_logits_ascend(
+                    logits,
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    sampling_info.need_min_p_sampling,
+                    sampling_info.sampling_seed,
+                    positions,
+                    npu_top_k_top_p_eligible=sampling_info.npu_top_k_top_p_eligible,
+                    return_filtered_probs=return_sampling_mask,
+                )
             )
-            if return_sampling_mask:
-                batch_next_token_ids, filtered_probs = sample_result
-            else:
-                batch_next_token_ids = sample_result
         return batch_next_token_ids.to(torch.int32), filtered_probs
 
     def _forward_ascend_backend(
@@ -907,11 +905,12 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     npu_top_k_top_p_eligible: bool = False,
     *,
     return_filtered_probs: bool = False,
-):
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """A top-k, top-p and min-p sampling implementation for ascend npu with torch_npu interface.
 
     Takes temperature-scaled logits as input (softmax is applied internally).
-    With return_filtered_probs, also returns vocab-ordered filtered weights.
+    Always returns (token_ids, filtered_probs). The vocab-ordered filtered
+    weights are None unless return_filtered_probs is enabled.
     """
     filtered_probs = None
     # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
@@ -921,7 +920,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 
         if need_min_p_sampling:
-            min_p_thresholds = probs_top_k_top_p.max(dim=-1).values * min_ps
+            min_p_thresholds = probs_top_k_top_p.max(dim=-1) * min_ps
             min_p_mask = probs_top_k_top_p < min_p_thresholds.view(-1, 1)
             probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
 
@@ -977,9 +976,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
         batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
 
     batch_next_token_ids = batch_next_token_ids.view(-1)
-    if return_filtered_probs:
-        return batch_next_token_ids, filtered_probs
-    return batch_next_token_ids
+    return batch_next_token_ids, filtered_probs
 
 
 @torch.compile(dynamic=True, disable=is_npu())

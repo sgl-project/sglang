@@ -38,7 +38,7 @@ class TestAscendSamplerDispatch(unittest.TestCase):
                         side_effect=AssertionError("device predicate was inspected"),
                     ),
                 ):
-                    result = (
+                    result, filtered_probs = (
                         sampler_module.top_k_top_p_min_p_sampling_from_logits_ascend(
                             logits.clone(),
                             top_ks.clone(),
@@ -52,6 +52,7 @@ class TestAscendSamplerDispatch(unittest.TestCase):
                     )
 
                 self.assertEqual(tuple(result.shape), (1,))
+                self.assertIsNone(filtered_probs)
                 self.assertEqual(npu_top_k_top_p.called, eligible)
 
 
@@ -98,8 +99,11 @@ class TestAscendSamplingMaskCapture(unittest.TestCase):
                     torch.manual_seed(1234)
                     token, weights = self._sample(logits, fused=fused, export=True)
                     torch.manual_seed(1234)
-                    token_without_mask = self._sample(logits, fused=fused)
+                    token_without_mask, weights_without_mask = self._sample(
+                        logits, fused=fused
+                    )
                 self.assertIsInstance(token_without_mask, torch.Tensor)
+                self.assertIsNone(weights_without_mask)
                 self.assertEqual(tuple(token_without_mask.shape), (1,))
                 self.assertTrue(torch.equal(token, token_without_mask))
                 self.assertEqual(weights.dtype, dtype)
@@ -129,8 +133,11 @@ class TestAscendSamplingMaskCapture(unittest.TestCase):
                     token, weights = self._sample(
                         logits, fused=fused, seed=seed, export=True
                     )
-                    without_mask = self._sample(logits, fused=fused, seed=seed)
+                    without_mask, weights_without_mask = self._sample(
+                        logits, fused=fused, seed=seed
+                    )
                 self.assertTrue(torch.equal(token, without_mask))
+                self.assertIsNone(weights_without_mask)
                 self.assertEqual(weights.dtype, dtype)
                 # With a constant hash the maximum wins, in vocabulary order.
                 self.assertEqual(token.item(), 1)

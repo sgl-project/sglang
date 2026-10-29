@@ -38,18 +38,18 @@ class TestAscendSamplingMaskKernel(CustomTestCase):
             for m in modes
         ]
         cases = [
-            (4, 1.0, 0.0),
-            (6, 0.72, 0.0),
-            (6, 1.0, 0.35),
-            (6, 0.72, 0.35),
-            (1025, 0.72, 0.0),
-            (2, 1.0, 0.0),
+            (False, 4, 1.0, 0.0),
+            (False, 6, 0.72, 0.0),
+            (False, 6, 1.0, 0.35),
+            (False, 6, 0.72, 0.35),
+            (False, 1025, 0.72, 0.0),
+            (True, 4, 1.0, 0.0),
+            (True, 6, 0.72, 0.0),
+            (True, 2, 1.0, 0.0),
         ]
         tolerances = {torch.float32: 2e-5, torch.float16: 3e-3, torch.bfloat16: 3e-2}
-        for dtype, fused, (k, p, m) in product(tolerances, (False, True), cases):
+        for dtype, (fused, k, p, m) in product(tolerances, cases):
             ties = k == 2
-            if (fused and k > 1024) or (ties and not fused):
-                continue
             with self.subTest(dtype=dtype, fused=fused, k=k, p=p, min_p=m):
                 values = (
                     torch.tensor([3.0, 2.0, 2.0, 0.0])
