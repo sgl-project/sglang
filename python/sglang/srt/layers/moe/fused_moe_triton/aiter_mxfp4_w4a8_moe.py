@@ -23,6 +23,7 @@ from typing import Optional
 
 import torch
 import triton
+import triton.language as tl
 
 from sglang.srt.environ import envs
 
@@ -58,6 +59,65 @@ _FLYDSL_DIM_ALIGN = 256
 # against zero weights), and GEMM 1 on N = 2 * that, so GEMM 2's K follows.
 _GLUON_K_ALIGN = 128
 _E8M0_ONE = 127
+_FUSED_GATHER_QUANT = envs.SGLANG_GFX1250_W4A8_FUSED_GATHER_QUANT.get()
+
+
+@triton.jit
+def _gather_pad_static_fp8_kernel(
+    out_ptr,
+    x_ptr,
+    gather_idx_ptr,
+    scale_ptr,
+    topk,
+    cols,
+    width,
+    stride_x,
+    stride_out,
+    BLOCK_N: tl.constexpr,
+):
+    # Row r of the output is input row gather_idx[r] // topk times 1 / scale, as
+    # downcast_to_static_fp8 computes it, and zeros from cols to the padded width.
+    r = tl.program_id(0).to(tl.int64)
+    # gather_idx may be uint16 (aiter routing picks the narrowest index type)
+    src = (tl.load(gather_idx_ptr + r).to(tl.int32) // topk).to(tl.int64)
+    offs = tl.arange(0, BLOCK_N)
+    x = tl.load(x_ptr + src * stride_x + offs, mask=offs < cols, other=0.0)
+    scale = tl.load(scale_ptr)
+    q = x * (1 / scale)
+    tl.store(
+        out_ptr + r * stride_out + offs,
+        q.to(out_ptr.dtype.element_ty),
+        mask=offs < width,
+    )
+
+
+def _gather_pad_static_fp8(
+    x: torch.Tensor,
+    gather_idx: torch.Tensor,
+    topk: int,
+    scale: torch.Tensor,
+    width: int,
+) -> torch.Tensor:
+    """fp8 rows x[gather_idx // topk] zero-padded to width, in one kernel: the same values as
+    downcast_to_static_fp8(pad(x, width)[gather_idx // topk], scale)."""
+    assert x.stride(-1) == 1 and scale.numel() == 1
+    out = torch.empty(
+        (gather_idx.shape[0], width), dtype=torch.float8_e4m3fn, device=x.device
+    )
+    if out.shape[0]:
+        _gather_pad_static_fp8_kernel[(out.shape[0],)](
+            out,
+            x,
+            gather_idx,
+            scale,
+            topk,
+            x.shape[-1],
+            width,
+            x.stride(0),
+            out.stride(0),
+            BLOCK_N=triton.next_power_of_2(width),
+        )
+    return out
 
 
 def _import_aiter_w4a8():
@@ -273,7 +333,16 @@ def aiter_w4a8_gfx1250_forward(
 
     if hidden_states.shape[0] == 0:
         return hidden_states.new_empty(hidden_states.shape)
-    if pad_hidden_to and pad_hidden_to > hidden_states.shape[-1]:
+    fused_gather_quant = (
+        _FUSED_GATHER_QUANT
+        and not _KERNEL_GATHER
+        and expert_map is None
+        and not apply_router_weight_on_input
+        and hidden_states.stride(-1) == 1
+    )
+    if fused_gather_quant:
+        width = max(pad_hidden_to or 0, hidden_states.shape[-1])
+    elif pad_hidden_to and pad_hidden_to > hidden_states.shape[-1]:
         hidden_states = torch.nn.functional.pad(
             hidden_states, (0, pad_hidden_to - hidden_states.shape[-1])
         )
@@ -297,7 +366,12 @@ def aiter_w4a8_gfx1250_forward(
         gate_valid = None
     gammas = routing_data.gate_scal
 
-    if (
+    if fused_gather_quant:
+        x_fp8 = _gather_pad_static_fp8(
+            hidden_states, gather_idx, topk, a13_scale, width
+        )
+        gemm1_gather = None
+    elif (
         _KERNEL_GATHER
         and not preshuffled
         and expert_map is None
