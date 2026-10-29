@@ -533,8 +533,9 @@ class _GenerationStreamAccumulator:
             self.http_worker_ipcs.append(req.http_worker_ipc)
             decode_ids, read_offset = req.init_incremental_detokenize()
             self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+            # An evicted detokenizer state is rebuilt from only this chunk.
+            self.read_offsets.append(max(0, read_offset - req.send_decode_id_offset))
             req.send_decode_id_offset = len(decode_ids)
-            self.read_offsets.append(read_offset)
             self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
             self.spaces_between_special_tokens.append(
                 req.sampling_params.spaces_between_special_tokens
