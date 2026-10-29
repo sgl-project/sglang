@@ -166,6 +166,17 @@ class TestKDAPrefillGraph(CustomTestCase):
                 forward_batch=batch,
                 cache_indices=self.backend._prefill_graph_cache_indices(batch),
             )
+        if batch.mamba_track_indices is None:
+            self.assertIsNone(self.backend.state_tracking_indices)
+        else:
+            torch.testing.assert_close(
+                self.backend.state_tracking_indices,
+                batch.mamba_track_indices.to(meta.track_dst.dtype),
+            )
+            self.assertEqual(
+                self.backend.state_tracking_indices.data_ptr(),
+                meta.track_dst.data_ptr(),
+            )
 
     def _capture(self, *, track=True, num_tokens=BUCKET, max_seqs=MAX_SEQS):
         from sglang.srt.runtime_context import get_context

@@ -137,6 +137,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
+        full_cap_tokens: Optional[int] = None,
         full_max_total_num_tokens: Optional[int] = None,
         swa_max_total_num_tokens: Optional[int] = None,
     ):
@@ -172,6 +173,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             shards_under_dcp=shards_under_dcp,
             lazy_compaction=lazy_compaction,
             **band,
+        )
+        owner = self.full_attn_allocator
+        owner.max_live_tokens = (
+            None
+            if full_cap_tokens is None
+            else full_cap_tokens * (owner.page_size // owner.pool_page_size)
         )
         self.swa_attn_allocator: Optional[Band] = None
         if roles.window is not None:
@@ -210,6 +217,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self._band_positions = {b.sub_pool_name: i for i, b in enumerate(self.bands)}
         self._snapshot_key: Optional[int] = None
         self._snapshot_memo: Optional[ChainSnapshot] = None
+        self._window_capacity_from_sizing = full_max_total_num_tokens is not None
         self._policy = interim_policy_for(
             self,
             full_max_total_num_tokens=full_max_total_num_tokens,
@@ -298,11 +306,14 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             return []
         return [f"[chain] stale pricing snapshot: {self._snapshot_memo} != {fresh}"]
 
+    def _cap_full_available(self, tokens):
+        return self.full_attn_allocator.cap_available(tokens)
+
     def available_size(self) -> int:
-        return self._policy.available_size(self)
+        return self._cap_full_available(self._policy.available_size(self))
 
     def full_available_size(self) -> int:
-        return self._policy.full_available_size(self)
+        return self._cap_full_available(self._policy.full_available_size(self))
 
     def swa_available_size(self) -> int:
         return self._policy.swa_available_size(self)
@@ -341,14 +352,39 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         dcp_size = get_parallel().attn_dcp_size if owner.shards_under_dcp else 1
         return (owner.max_slots - 1) * dcp_size
 
+    def _full_cap_reclaim(self, full_tokens: int, *, empty_pool=False) -> int:
+        owner = self.full_attn_allocator
+        if owner.max_live_tokens is None:
+            return 0
+        demand = int(-(-full_tokens // self.page_size)) * self.page_size
+        live = 0 if empty_pool else owner.allocated_count()
+        return (
+            -(-max(0, live + demand - owner.max_live_tokens) // self.page_size)
+            * self.page_size
+        )
+
     def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool:
+        if self._full_cap_reclaim(full_tokens):
+            return False
         return self._policy.ensure_capacity(self, full_tokens, swa_tokens)
 
     def can_reserve(self, full_tokens, swa_tokens, **kwargs) -> bool:
+        if self._full_cap_reclaim(full_tokens, empty_pool=True):
+            return False
+        if self._full_cap_reclaim(
+            full_tokens, empty_pool=kwargs.get("empty_pool", False)
+        ) > kwargs.get("full_evictable_tokens", 0):
+            return False
         return self._policy.can_reserve(self, full_tokens, swa_tokens, **kwargs)
 
     def reclaim_plan(self, full_tokens, swa_tokens, **kwargs):
-        return self._policy.reclaim_plan(self, full_tokens, swa_tokens, **kwargs)
+        cap_reclaim = self._full_cap_reclaim(full_tokens)
+        if cap_reclaim > kwargs.get("full_evictable_tokens", 0):
+            return None
+        plan = self._policy.reclaim_plan(self, full_tokens, swa_tokens, **kwargs)
+        if plan is None:
+            return None
+        return max(plan[0], cap_reclaim), plan[1]
 
     def prealloc_fits_assumes_reclaim(self) -> bool:
         return self._policy.prealloc_fits_assumes_reclaim(self)
@@ -404,7 +440,64 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         return self._policy.evict_to_free_tokens(self, tree_cache, num_tokens, **kwargs)
 
     def resize(self, config) -> None:
-        self._policy.resize(self, config)
+        if (
+            not self.arena.backed_after_capture
+            or config.unified_memory_pool_bytes != self.arena.total_bytes
+        ):
+            raise RuntimeError("the arena must be backed before allocator.resize")
+        for band in self.members:
+            if band.allocated_count() or band._pending_reuse:
+                raise RuntimeError(
+                    f"cannot resize non-empty band {band.sub_pool_name!r}"
+                )
+        owner = self.full_attn_allocator
+        owner.max_live_tokens = (
+            None
+            if config.unified_full_cap_tokens is None
+            else config.unified_full_cap_tokens
+            * (owner.page_size // owner.pool_page_size)
+        )
+        for band in self.members:
+            band._set_capacity(
+                self.arena.num_entries(band.sub_pool_name),
+                virtual_num_pages=None
+                if band.is_id_owner
+                else owner.ids.num_virtual_ids,
+            )
+        self._policy = interim_policy_for(
+            self,
+            full_max_total_num_tokens=(
+                config.full_max_total_num_tokens
+                if self._window_capacity_from_sizing
+                else None
+            ),
+            swa_max_total_num_tokens=(
+                config.swa_max_total_num_tokens
+                if self._window_capacity_from_sizing
+                else None
+            ),
+        )
+        self.get_kvcache().size = (
+            config.full_max_total_num_tokens
+            if self.swa_attn_allocator is None
+            else owner.max_slots - 1
+        )
+        for band in self.members:
+            view = self.views[band.sub_pool_name]
+            view.size = band.max_slots - band.pool_page_size
+            if band.sub_pool_name == self.roles.state:
+                view.host_capacity_tokens = view.size
+                view.host_capacity_bytes = view.size * band.entry_bytes
+            else:
+                view.num_pages = band.num_pages
+        if self.swa_attn_allocator is not None:
+            self._size_window_host_pools()
+        else:
+            view = self.views[owner.sub_pool_name]
+            view.host_capacity_tokens = config.full_max_total_num_tokens
+            view.host_capacity_bytes = (
+                config.full_max_total_num_tokens * owner.entry_bytes
+            )
 
     def _flush_targets(self):
         return self._policy.flush_targets(self)
@@ -1054,3 +1147,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self.free_page_reps_group = None
         self.full_page_reps_group = []
         self.full_free_group = []
+
+    def prefill_state_fits(self, full_tokens, swa_tokens, state_slots, **kwargs):
+        """Check native state demand without charging it to the FULL-token cap."""
+        if self._full_cap_reclaim(full_tokens, empty_pool=True):
+            return False
+        if self._full_cap_reclaim(full_tokens) > kwargs.get("full_evictable_tokens", 0):
+            return False
+        return self._policy.prefill_state_fits(
+            self, full_tokens, swa_tokens, state_slots, **kwargs
+        )

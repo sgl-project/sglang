@@ -38,6 +38,10 @@ class MambaSlotAllocator:
         self._alloc_iter: Optional[Iterator] = None
         self.clear()
 
+    def translate(self, slot_ids: torch.Tensor) -> torch.Tensor:
+        """Static slot ids already index physical storage."""
+        return slot_ids
+
     def available_size(self) -> int:
         return len(self.free_slots)
 

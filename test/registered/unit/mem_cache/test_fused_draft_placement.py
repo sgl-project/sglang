@@ -231,9 +231,8 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertEqual(placement.hosts(), ("full", "mamba"))
         self.assertEqual(placement.region("mamba").lane_num, 3)
         self.assertEqual(placement.region("mamba").state, _STATE)
-        self.assertEqual(
-            placement.region("mamba").entry_bytes(), 3 * _STATE.layer_bytes()
-        )
+        # Temporal rows begin at the next 64-byte boundary.
+        self.assertEqual(placement.region("mamba").entry_bytes(), 128 + 3 * 256)
         for r in range(3):
             self.assertEqual(placement.lanes_for(r, "mamba"), range(r, r + 1))
         # A replicated head carries every state layer per runner.
@@ -513,7 +512,10 @@ class TestMambaHostPricing(CustomTestCase):
 
     def test_a_mamba_region_prices_this_runners_state_layers(self):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        self.enterContext(published_topology(role="tokenizer", device="cpu"))
         cfg.sliding_window_size = None
+        cfg.hybrid_gdn_config = None
+        cfg.hybrid_kda_config = None
         self.enterContext(patch.object(kcc, "mamba_cache_chunk_size", return_value=64))
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = False
@@ -527,8 +529,11 @@ class TestMambaHostPricing(CustomTestCase):
             full_attention_layer_ids=[4],
             mamba2_cache_params=SimpleNamespace(
                 layers=[0, 1, 2, 3],
-                shape=SimpleNamespace(conv=[(2, 2)], temporal=(2, 2)),
+                shape=SimpleNamespace(
+                    conv=[(2, 2)], temporal=(2, 2), num_k_heads_per_tp=2
+                ),
                 dtype=SimpleNamespace(conv=_DTYPE, temporal=_DTYPE),
+                is_kda=False,
             ),
         )
         state = DraftStateRegion(

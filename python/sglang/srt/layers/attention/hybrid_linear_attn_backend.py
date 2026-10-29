@@ -126,6 +126,15 @@ class MambaAttnBackendBase(AttentionBackend):
         # skips the per-cycle method dispatch.
         self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
 
+    @property
+    def state_tracking_indices(self) -> Optional[torch.Tensor]:
+        """Physical checkpoint destinations from the current execution metadata."""
+        return (
+            None
+            if self.forward_metadata is None
+            else self.forward_metadata.mamba_track_indices
+        )
+
     def state_layer(self, layer_id: int) -> KVLayer:
         """The layer's recurrent-state route, once a layer-wise host load-back
         has brought the layer in."""
@@ -708,6 +717,11 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        track_buf = (
+            None
+            if self.mamba_track_indices_buf is None
+            else self.mamba_track_indices_buf[:bs]
+        )
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
@@ -749,6 +763,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -759,6 +774,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )

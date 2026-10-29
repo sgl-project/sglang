@@ -1,7 +1,7 @@
 """Regenerate unified_layout_golden.json from the unified pool builder.
 
-The golden is a wire format (see test_unified_layout_golden.py). Regenerate it
-only for an intended byte-layout change, and say in the PR what moved and why:
+The golden pins entry formats and capacity results (test_unified_layout_golden.py).
+Regenerate it only for an intended layout or sizing change, and explain the delta:
     python test/manual/mem_cache/gen_unified_layout_golden.py
 
 The bs=1 floor terms are read from the builder's boot error at a one-byte
@@ -50,14 +50,10 @@ def _floor_terms(geometry):
 
 
 def _budget_at_floor(geometry, floor: int) -> int:
-    """The byte budget that makes the whole buffer exactly the floor: the state
-    chains' budget is the token side, their state slots ride on top."""
+    """The full budget includes the fixed allocations outside the shared arena."""
     setup_allocator_context()
-    summary = unified_layout_summary(build_unified_bundle(geometry))
-    state = summary["sub_pools"].get("mamba")
-    if state is None:
-        return floor
-    return floor - geometry.state_slots * state["entry_bytes"]
+    bundle = build_unified_bundle(geometry)
+    return floor + bundle.storage.sized.fixed_bytes
 
 
 def _compact(value, indent=0) -> str:
@@ -82,9 +78,22 @@ def main():
     floors = {}
     for name, geometry in module._FLOOR_CONFIGS.items():
         terms = _floor_terms(geometry)
+        budget = _budget_at_floor(geometry, sum(b for _, b in terms))
+        # Independently find the first feasible total budget; the regression
+        # pins this value, rather than searching when the test runs.
+        low, high = budget, build_unified_bundle(geometry).storage.sized.budget_bytes
+        while low < high:
+            mid = (low + high) // 2
+            try:
+                build_unified_bundle(msgspec.structs.replace(geometry, byte_budget=mid))
+            except RuntimeError:
+                low = mid + 1
+            else:
+                high = mid
         floors[name] = {
             "terms": terms,
-            "budget_at_floor": _budget_at_floor(geometry, sum(b for _, b in terms)),
+            "budget_at_floor": budget,
+            "minimum_usable_budget": low,
         }
     commit = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"],

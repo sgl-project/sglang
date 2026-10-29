@@ -1814,9 +1814,9 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         return False
     if cfg.device != "cuda":
         return False
-    if cfg.dcp_size != 1:
+    if cfg.dcp_size != 1 and not cfg.enable_unified_memory:
         return False
-    if mla_enabled:
+    if mla_enabled and not cfg.enable_unified_memory:
         return False
     if cfg.prefill_only_disable_kv_cache:
         return False
@@ -1832,19 +1832,7 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     ):
         return False
 
-    # Only the hybrid-SWA byte pool has a matching post-capture resize path.
     model_config = model_config_of(server_args)
-    if cfg.enable_unified_memory:
-        from sglang.srt.mem_cache.kv.decl import declared_lifetime_types
-        from sglang.srt.mem_cache.kv.plan import resized_after_capture
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        if not resized_after_capture(declared_lifetime_types(model_config)):
-            return False
-        # The solver budgets these independent draft pools again after capture.
-        spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
-        if spec.is_eagle() or spec.is_standalone() or spec.is_dflash_family():
-            return False
 
     if (
         cfg.disaggregation_mode != "prefill"

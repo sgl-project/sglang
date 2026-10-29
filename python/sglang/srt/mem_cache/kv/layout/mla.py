@@ -161,6 +161,7 @@ class MLAView(MLAKVView):
     kv_scale_buffer = None
     cpu_copy_carries_mamba = False
     layer_shard_enabled = False
+    hicache_write_back_staging = None
     post_capture_active = False
     host_capacity_tokens: Optional[int] = None
     host_capacity_bytes: Optional[int] = None
@@ -177,6 +178,7 @@ class MLAView(MLAKVView):
         spec: MLASubPoolSpec,
         kv_cache_dtype: torch.dtype,
         page_size: int,
+        model_layer_ids: Optional[Tuple[int, ...]] = None,
     ):
         assert spec.store_dtype == _store_dtype_for(kv_cache_dtype), (
             f"sub-pool {spec.name!r} store dtype {spec.store_dtype} does not "
@@ -200,7 +202,9 @@ class MLAView(MLAKVView):
         # Addressed by the 0..N-1 index of its layers.
         self.start_layer = 0
         self.end_layer = spec.layer_num - 1
-        self.model_layer_ids = tuple(range(spec.layer_num))
+        self.model_layer_ids = (
+            tuple(range(spec.layer_num)) if model_layer_ids is None else model_layer_ids
+        )
         self.layer_transfer_counter: Optional[LayerDoneCounter] = None
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
@@ -407,7 +411,7 @@ class MLAView(MLAKVView):
         each slot's entry, so the transfer item is a whole page envelope and both
         sides must build the pool with identical specs."""
         raw = self._arena.raw
-        return [raw.data_ptr()], [raw.numel()], [self.page_bytes]
+        return [raw.data_ptr()], [self._arena.accessible_bytes], [self.page_bytes]
 
     # -- retraction copies, at physical ids --
 

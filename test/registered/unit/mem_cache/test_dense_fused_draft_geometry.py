@@ -285,14 +285,17 @@ class TestFusedStateHost(unittest.TestCase):
     """A state (mamba) entry carries the draft's state block after the host's
     streams: the same aligned entry for both, byte-disjoint blocks within a
     slot, and the host's whole-entry copy/clear carry the draft block, so a
-    radix checkpoint restores the draft's state with the target's. Unfused,
-    the entry stays its raw size; that identity guards every state deploy."""
+    radix checkpoint restores the draft's state with the target's. Temporal
+    rows remain aligned both within and between entries."""
 
     SLOTS = 8
 
-    def test_unfused_spec_is_byte_identical_to_before(self):
+    def test_unfused_spec_preserves_temporal_row_alignment(self):
         s = _mamba_spec()
-        self.assertEqual(s.host_entry_bytes(), 2 * (3 * 8 * 2 + 2 * 4))
+        layout = s.entry_layout()
+        self.assertEqual(layout.offsets["temporal"], 128)
+        self.assertEqual(layout.layer_strides["temporal"], 64)
+        self.assertEqual(s.host_entry_bytes(), 256)
         self.assertEqual(s.entry_bytes(), s.host_entry_bytes())
 
     def _pool(self):
@@ -342,7 +345,6 @@ class TestFusedStateHost(unittest.TestCase):
         host = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
-            spec_state_size=2,
             mamba_layer_ids=[0, 1],
         )
         draft_conv, _ = pool.spec("mamba").draft_views(pool)
@@ -385,7 +387,6 @@ class TestFusedStateHost(unittest.TestCase):
         host = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
-            spec_state_size=2,
             mamba_layer_ids=[0, 1],
         )
         draft_conv, draft_temporal = pool.spec("mamba").draft_views(pool)

@@ -1828,6 +1828,12 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+
+    @property
+    def backing_owner(self):
+        """Identity of the allocation whose post-capture bytes this pool reports."""
+        return self
+
     # Prepared before final KV sizing; reused by the host pool after resizing.
     # page_first MHA uses separate K/V buffers; page_unified uses one page buffer.
     hicache_write_back_staging: (
@@ -4227,6 +4233,10 @@ class HybridLinearKVPool(KVCache):
         # Mamba state belongs to req_to_token_pool's MambaPool and is assembled
         # by _MambaStrategy, not declared through this pool.
         return self.full_kv_pool.host_pool_decls()
+
+    @property
+    def backing_owner(self):
+        return self.full_kv_pool.backing_owner
 
     @property
     def post_capture_active(self) -> bool:

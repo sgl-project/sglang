@@ -1,11 +1,11 @@
 {
- "source": "test/manual/mem_cache/gen_unified_layout_golden.py at 404f59412d",
+ "source": "test/manual/mem_cache/gen_unified_layout_golden.py; total-budget sizing based on 68b10822ef and per-side borrowing capacities",
  "layouts": {
   "swa_p1": {
    "chain": [["swa", "up"], ["full", "down"]],
-   "total_bytes": 8192,
+   "total_bytes": 8256,
    "reserved_floor": 64,
-   "active_allocation_bytes": 8192,
+   "active_allocation_bytes": 8256,
    "sub_pools": {
     "swa": {
      "kind": "MHASubPoolSpec",
@@ -13,12 +13,12 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 128,
+     "max_slots": 129,
      "min_slot_index": 1,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [128, 1, 8], [32, 8, 1], "torch.float16"], [32, [128, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [128, 1, 8], [32, 8, 1], "torch.float16"], [48, [128, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [129, 1, 8], [32, 8, 1], "torch.float16"], [32, [129, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [129, 1, 8], [32, 8, 1], "torch.float16"], [48, [129, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     },
     "full": {
@@ -27,47 +27,47 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 128,
+     "max_slots": 129,
      "min_slot_index": 1,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [128, 1, 8], [32, 8, 1], "torch.float16"], [32, [128, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [128, 1, 8], [32, 8, 1], "torch.float16"], [48, [128, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [129, 1, 8], [32, 8, 1], "torch.float16"], [32, [129, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [129, 1, 8], [32, 8, 1], "torch.float16"], [48, [129, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "swa": ["up", 128, 1, 128, 64],
-    "full": ["down", 128, 1, 128, 64]
+    "swa": ["up", 129, 1, 129, 64],
+    "full": ["down", 129, 1, 129, 64]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 8192, 64]],
-     "host_capacity": [64, 4096],
-     "page_envelope": [128, 64]
+     "buf_infos": [[0, 8256, 64]],
+     "host_capacity": [128, 8192],
+     "page_envelope": [129, 64]
     },
     "swa": {
-     "buf_infos": [[0, 8192, 64]],
-     "host_capacity": [64, 4096],
-     "page_envelope": [128, 64]
+     "buf_infos": [[0, 8256, 64]],
+     "host_capacity": [128, 8192],
+     "page_envelope": [129, 64]
     }
    },
    "layer_maps": {
     "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]]
    },
    "capacity": {
-    "available": 63,
-    "size_full": 64,
-    "draft_virtual_id_space": 127,
-    "size_swa": 64
+    "available": 64,
+    "size_full": 128,
+    "draft_virtual_id_space": 128,
+    "size_swa": 128
    },
    "bs1_floor_terms": [["swa_window_kv", 2112], ["sink", 64]]
   },
   "swa_p16": {
    "chain": [["swa", "up"], ["full", "down"]],
-   "total_bytes": 131072,
+   "total_bytes": 132096,
    "reserved_floor": 1024,
-   "active_allocation_bytes": 131072,
+   "active_allocation_bytes": 132096,
    "sub_pools": {
     "swa": {
      "kind": "MHASubPoolSpec",
@@ -75,12 +75,12 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 2048,
+     "max_slots": 2064,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [2048, 1, 8], [32, 8, 1], "torch.float16"], [32, [2048, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [2048, 1, 8], [32, 8, 1], "torch.float16"], [48, [2048, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [2064, 1, 8], [32, 8, 1], "torch.float16"], [32, [2064, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [2064, 1, 8], [32, 8, 1], "torch.float16"], [48, [2064, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     },
     "full": {
@@ -89,47 +89,47 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 2048,
+     "max_slots": 2064,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [2048, 1, 8], [32, 8, 1], "torch.float16"], [32, [2048, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [2048, 1, 8], [32, 8, 1], "torch.float16"], [48, [2048, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [2064, 1, 8], [32, 8, 1], "torch.float16"], [32, [2064, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [2064, 1, 8], [32, 8, 1], "torch.float16"], [48, [2064, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "swa": ["up", 128, 1, 128, 1024],
-    "full": ["down", 128, 1, 128, 1024]
+    "swa": ["up", 129, 1, 129, 1024],
+    "full": ["down", 129, 1, 129, 1024]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 131072, 1024]],
-     "host_capacity": [1024, 65536],
-     "page_envelope": [128, 1024]
+     "buf_infos": [[0, 132096, 1024]],
+     "host_capacity": [2048, 131072],
+     "page_envelope": [129, 1024]
     },
     "swa": {
-     "buf_infos": [[0, 131072, 1024]],
-     "host_capacity": [1024, 65536],
-     "page_envelope": [128, 1024]
+     "buf_infos": [[0, 132096, 1024]],
+     "host_capacity": [2048, 131072],
+     "page_envelope": [129, 1024]
     }
    },
    "layer_maps": {
     "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]]
    },
    "capacity": {
-    "available": 1008,
-    "size_full": 1024,
-    "draft_virtual_id_space": 2047,
-    "size_swa": 1024
+    "available": 1024,
+    "size_full": 2048,
+    "draft_virtual_id_space": 2063,
+    "size_swa": 2048
    },
    "bs1_floor_terms": [["swa_window_kv", 3072], ["sink", 1024]]
   },
   "swa_p64": {
    "chain": [["swa", "up"], ["full", "down"]],
-   "total_bytes": 524288,
+   "total_bytes": 528384,
    "reserved_floor": 4096,
-   "active_allocation_bytes": 524288,
+   "active_allocation_bytes": 528384,
    "sub_pools": {
     "swa": {
      "kind": "MHASubPoolSpec",
@@ -137,12 +137,12 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 8192,
+     "max_slots": 8256,
      "min_slot_index": 64,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [8192, 1, 8], [32, 8, 1], "torch.float16"], [32, [8192, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [8192, 1, 8], [32, 8, 1], "torch.float16"], [48, [8192, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [8256, 1, 8], [32, 8, 1], "torch.float16"], [32, [8256, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [8256, 1, 8], [32, 8, 1], "torch.float16"], [48, [8256, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     },
     "full": {
@@ -151,47 +151,47 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 8192,
+     "max_slots": 8256,
      "min_slot_index": 64,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [8192, 1, 8], [32, 8, 1], "torch.float16"], [32, [8192, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [8192, 1, 8], [32, 8, 1], "torch.float16"], [48, [8192, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [8256, 1, 8], [32, 8, 1], "torch.float16"], [32, [8256, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [8256, 1, 8], [32, 8, 1], "torch.float16"], [48, [8256, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "swa": ["up", 128, 1, 128, 4096],
-    "full": ["down", 128, 1, 128, 4096]
+    "swa": ["up", 129, 1, 129, 4096],
+    "full": ["down", 129, 1, 129, 4096]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 524288, 4096]],
-     "host_capacity": [4096, 262144],
-     "page_envelope": [128, 4096]
+     "buf_infos": [[0, 528384, 4096]],
+     "host_capacity": [8192, 524288],
+     "page_envelope": [129, 4096]
     },
     "swa": {
-     "buf_infos": [[0, 524288, 4096]],
-     "host_capacity": [4096, 262144],
-     "page_envelope": [128, 4096]
+     "buf_infos": [[0, 528384, 4096]],
+     "host_capacity": [8192, 524288],
+     "page_envelope": [129, 4096]
     }
    },
    "layer_maps": {
     "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]]
    },
    "capacity": {
-    "available": 4032,
-    "size_full": 4096,
-    "draft_virtual_id_space": 8191,
-    "size_swa": 4096
+    "available": 4096,
+    "size_full": 8192,
+    "draft_virtual_id_space": 8255,
+    "size_swa": 8192
    },
-   "bs1_floor_terms": [["swa_window_kv", 6144], ["sink", 4096]]
+   "bs1_floor_terms": [["swa_window_kv", 8192], ["sink", 4096]]
   },
   "swa_p16_asym": {
    "chain": [["swa", "up"], ["full", "down"]],
-   "total_bytes": 294912,
+   "total_bytes": 297472,
    "reserved_floor": 2560,
-   "active_allocation_bytes": 294912,
+   "active_allocation_bytes": 297472,
    "sub_pools": {
     "swa": {
      "kind": "MHASubPoolSpec",
@@ -199,12 +199,12 @@
      "entry_bytes": 128,
      "host_entry_bytes": 128,
      "draft_offset": null,
-     "max_slots": 2304,
+     "max_slots": 2324,
      "min_slot_index": 20,
      "parts": [["k", 0, 64, 2, [2, 8], "torch.float16"], ["v", 32, 64, 2, [2, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [2304, 2, 8], [64, 8, 1], "torch.float16"], [64, [2304, 2, 8], [64, 8, 1], "torch.float16"]],
-      "v": [[32, [2304, 2, 8], [64, 8, 1], "torch.float16"], [96, [2304, 2, 8], [64, 8, 1], "torch.float16"]]
+      "k": [[0, [2320, 2, 8], [64, 8, 1], "torch.float16"], [64, [2320, 2, 8], [64, 8, 1], "torch.float16"]],
+      "v": [[32, [2320, 2, 8], [64, 8, 1], "torch.float16"], [96, [2320, 2, 8], [64, 8, 1], "torch.float16"]]
      }
     },
     "full": {
@@ -213,29 +213,29 @@
      "entry_bytes": 160,
      "host_entry_bytes": 144,
      "draft_offset": null,
-     "max_slots": 1843,
+     "max_slots": 1859,
      "min_slot_index": 16,
      "parts": [["k", 0, 48, 3, [1, 8], "torch.float16"], ["v", 16, 48, 3, [1, 16], "torch.float16"]],
      "views": {
-      "k": [[0, [1840, 1, 8], [80, 8, 1], "torch.float16"], [96, [1840, 1, 8], [80, 8, 1], "torch.float16"]],
-      "v": [[16, [1840, 1, 16], [80, 16, 1], "torch.float16"], [112, [1840, 1, 16], [80, 16, 1], "torch.float16"]]
+      "k": [[0, [1856, 1, 8], [80, 8, 1], "torch.float16"], [96, [1856, 1, 8], [80, 8, 1], "torch.float16"]],
+      "v": [[16, [1856, 1, 16], [80, 16, 1], "torch.float16"], [112, [1856, 1, 16], [80, 16, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "swa": ["up", 144, 2, 115, 2048],
-    "full": ["down", 115, 1, 115, 2560]
+    "swa": ["up", 145, 2, 116, 2048],
+    "full": ["down", 116, 1, 116, 2560]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 294912, 2560]],
-     "host_capacity": [1024, 163840],
-     "page_envelope": [115, 2560]
+     "buf_infos": [[0, 297472, 2560]],
+     "host_capacity": [1824, 291840],
+     "page_envelope": [116, 2560]
     },
     "swa": {
-     "buf_infos": [[0, 294912, 2048]],
-     "host_capacity": [1024, 131072],
-     "page_envelope": [144, 2048]
+     "buf_infos": [[0, 297472, 2048]],
+     "host_capacity": [1840, 235520],
+     "page_envelope": [145, 2048]
     }
    },
    "layer_maps": {
@@ -243,17 +243,17 @@
    },
    "capacity": {
     "available": 1008,
-    "size_full": 1024,
-    "draft_virtual_id_space": 1842,
-    "size_swa": 1024
+    "size_full": 1824,
+    "draft_virtual_id_space": 1858,
+    "size_swa": 1840
    },
    "bs1_floor_terms": [["swa_window_kv", 6144], ["sink", 2560]]
   },
   "swa_p16_fp8": {
    "chain": [["swa", "up"], ["full", "down"]],
-   "total_bytes": 131072,
+   "total_bytes": 132096,
    "reserved_floor": 1024,
-   "active_allocation_bytes": 131072,
+   "active_allocation_bytes": 132096,
    "sub_pools": {
     "swa": {
      "kind": "MHASubPoolSpec",
@@ -261,12 +261,12 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 2048,
+     "max_slots": 2064,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [2, 8], "torch.uint8"], ["v", 16, 32, 2, [2, 8], "torch.uint8"]],
      "views": {
-      "k": [[0, [2048, 2, 8], [64, 8, 1], "torch.uint8"], [32, [2048, 2, 8], [64, 8, 1], "torch.uint8"]],
-      "v": [[16, [2048, 2, 8], [64, 8, 1], "torch.uint8"], [48, [2048, 2, 8], [64, 8, 1], "torch.uint8"]]
+      "k": [[0, [2064, 2, 8], [64, 8, 1], "torch.uint8"], [32, [2064, 2, 8], [64, 8, 1], "torch.uint8"]],
+      "v": [[16, [2064, 2, 8], [64, 8, 1], "torch.uint8"], [48, [2064, 2, 8], [64, 8, 1], "torch.uint8"]]
      }
     },
     "full": {
@@ -275,47 +275,47 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 2048,
+     "max_slots": 2064,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [2, 8], "torch.uint8"], ["v", 16, 32, 2, [2, 8], "torch.uint8"]],
      "views": {
-      "k": [[0, [2048, 2, 8], [64, 8, 1], "torch.uint8"], [32, [2048, 2, 8], [64, 8, 1], "torch.uint8"]],
-      "v": [[16, [2048, 2, 8], [64, 8, 1], "torch.uint8"], [48, [2048, 2, 8], [64, 8, 1], "torch.uint8"]]
+      "k": [[0, [2064, 2, 8], [64, 8, 1], "torch.uint8"], [32, [2064, 2, 8], [64, 8, 1], "torch.uint8"]],
+      "v": [[16, [2064, 2, 8], [64, 8, 1], "torch.uint8"], [48, [2064, 2, 8], [64, 8, 1], "torch.uint8"]]
      }
     }
    },
    "members": {
-    "swa": ["up", 128, 1, 128, 1024],
-    "full": ["down", 128, 1, 128, 1024]
+    "swa": ["up", 129, 1, 129, 1024],
+    "full": ["down", 129, 1, 129, 1024]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 131072, 1024]],
-     "host_capacity": [1024, 65536],
-     "page_envelope": [128, 1024]
+     "buf_infos": [[0, 132096, 1024]],
+     "host_capacity": [2048, 131072],
+     "page_envelope": [129, 1024]
     },
     "swa": {
-     "buf_infos": [[0, 131072, 1024]],
-     "host_capacity": [1024, 65536],
-     "page_envelope": [128, 1024]
+     "buf_infos": [[0, 132096, 1024]],
+     "host_capacity": [2048, 131072],
+     "page_envelope": [129, 1024]
     }
    },
    "layer_maps": {
     "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]]
    },
    "capacity": {
-    "available": 1008,
-    "size_full": 1024,
-    "draft_virtual_id_space": 2047,
-    "size_swa": 1024
+    "available": 1024,
+    "size_full": 2048,
+    "draft_virtual_id_space": 2063,
+    "size_swa": 2048
    },
    "bs1_floor_terms": [["swa_window_kv", 3072], ["sink", 1024]]
   },
   "swa_p16_draft_full": {
    "chain": [["swa", "up"], ["full", "down"]],
-   "total_bytes": 163840,
+   "total_bytes": 165376,
    "reserved_floor": 1536,
-   "active_allocation_bytes": 163840,
+   "active_allocation_bytes": 165376,
    "sub_pools": {
     "swa": {
      "kind": "MHASubPoolSpec",
@@ -323,12 +323,12 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 2560,
+     "max_slots": 2584,
      "min_slot_index": 24,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [2560, 1, 8], [32, 8, 1], "torch.float16"], [32, [2560, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [2560, 1, 8], [32, 8, 1], "torch.float16"], [48, [2560, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [2576, 1, 8], [32, 8, 1], "torch.float16"], [32, [2576, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [2576, 1, 8], [32, 8, 1], "torch.float16"], [48, [2576, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     },
     "full": {
@@ -337,49 +337,49 @@
      "entry_bytes": 96,
      "host_entry_bytes": 64,
      "draft_offset": 64,
-     "max_slots": 1706,
+     "max_slots": 1722,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"], ["draft_k", 64, 32, 1, [1, 8], "torch.float16"], ["draft_v", 80, 32, 1, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [1696, 1, 8], [48, 8, 1], "torch.float16"], [32, [1696, 1, 8], [48, 8, 1], "torch.float16"]],
-      "v": [[16, [1696, 1, 8], [48, 8, 1], "torch.float16"], [48, [1696, 1, 8], [48, 8, 1], "torch.float16"]],
-      "draft_k": [[64, [1696, 1, 8], [48, 8, 1], "torch.float16"], [64, [1696, 1, 8], [48, 8, 1], "torch.float16"]],
-      "draft_v": [[80, [1696, 1, 8], [48, 8, 1], "torch.float16"], [80, [1696, 1, 8], [48, 8, 1], "torch.float16"]]
+      "k": [[0, [1712, 1, 8], [48, 8, 1], "torch.float16"], [32, [1712, 1, 8], [48, 8, 1], "torch.float16"]],
+      "v": [[16, [1712, 1, 8], [48, 8, 1], "torch.float16"], [48, [1712, 1, 8], [48, 8, 1], "torch.float16"]],
+      "draft_k": [[64, [1712, 1, 8], [48, 8, 1], "torch.float16"], [64, [1712, 1, 8], [48, 8, 1], "torch.float16"]],
+      "draft_v": [[80, [1712, 1, 8], [48, 8, 1], "torch.float16"], [80, [1712, 1, 8], [48, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "swa": ["up", 160, 2, 106, 1024],
-    "full": ["down", 106, 1, 106, 1536]
+    "swa": ["up", 161, 2, 107, 1024],
+    "full": ["down", 107, 1, 107, 1536]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 163840, 1536]],
-     "host_capacity": [1024, 98304],
-     "page_envelope": [106, 1536]
+     "buf_infos": [[0, 165376, 1536]],
+     "host_capacity": [1680, 161280],
+     "page_envelope": [107, 1536]
     },
     "swa": {
-     "buf_infos": [[0, 163840, 1024]],
-     "host_capacity": [1024, 65536],
-     "page_envelope": [160, 1024]
+     "buf_infos": [[0, 165376, 1024]],
+     "host_capacity": [1696, 108544],
+     "page_envelope": [161, 1024]
     }
    },
    "layer_maps": {
     "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]]
    },
    "capacity": {
-    "available": 992,
-    "size_full": 1024,
-    "draft_virtual_id_space": 1705,
-    "size_swa": 1024
+    "available": 1008,
+    "size_full": 1680,
+    "draft_virtual_id_space": 1721,
+    "size_swa": 1696
    },
    "bs1_floor_terms": [["swa_window_kv", 3072], ["sink", 1536]]
   },
   "swa_p16_draft_full_swa": {
    "chain": [["swa", "up"], ["full", "down"]],
-   "total_bytes": 196608,
+   "total_bytes": 198144,
    "reserved_floor": 1536,
-   "active_allocation_bytes": 196608,
+   "active_allocation_bytes": 198144,
    "sub_pools": {
     "swa": {
      "kind": "MHASubPoolSpec",
@@ -387,14 +387,14 @@
      "entry_bytes": 96,
      "host_entry_bytes": 64,
      "draft_offset": 64,
-     "max_slots": 2048,
+     "max_slots": 2064,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"], ["draft_k", 64, 32, 1, [1, 8], "torch.float16"], ["draft_v", 80, 32, 1, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [2048, 1, 8], [48, 8, 1], "torch.float16"], [32, [2048, 1, 8], [48, 8, 1], "torch.float16"]],
-      "v": [[16, [2048, 1, 8], [48, 8, 1], "torch.float16"], [48, [2048, 1, 8], [48, 8, 1], "torch.float16"]],
-      "draft_k": [[64, [2048, 1, 8], [48, 8, 1], "torch.float16"], [64, [2048, 1, 8], [48, 8, 1], "torch.float16"]],
-      "draft_v": [[80, [2048, 1, 8], [48, 8, 1], "torch.float16"], [80, [2048, 1, 8], [48, 8, 1], "torch.float16"]]
+      "k": [[0, [2064, 1, 8], [48, 8, 1], "torch.float16"], [32, [2064, 1, 8], [48, 8, 1], "torch.float16"]],
+      "v": [[16, [2064, 1, 8], [48, 8, 1], "torch.float16"], [48, [2064, 1, 8], [48, 8, 1], "torch.float16"]],
+      "draft_k": [[64, [2064, 1, 8], [48, 8, 1], "torch.float16"], [64, [2064, 1, 8], [48, 8, 1], "torch.float16"]],
+      "draft_v": [[80, [2064, 1, 8], [48, 8, 1], "torch.float16"], [80, [2064, 1, 8], [48, 8, 1], "torch.float16"]]
      }
     },
     "full": {
@@ -403,49 +403,49 @@
      "entry_bytes": 96,
      "host_entry_bytes": 64,
      "draft_offset": 64,
-     "max_slots": 2048,
+     "max_slots": 2064,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"], ["draft_k", 64, 32, 1, [1, 8], "torch.float16"], ["draft_v", 80, 32, 1, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [2048, 1, 8], [48, 8, 1], "torch.float16"], [32, [2048, 1, 8], [48, 8, 1], "torch.float16"]],
-      "v": [[16, [2048, 1, 8], [48, 8, 1], "torch.float16"], [48, [2048, 1, 8], [48, 8, 1], "torch.float16"]],
-      "draft_k": [[64, [2048, 1, 8], [48, 8, 1], "torch.float16"], [64, [2048, 1, 8], [48, 8, 1], "torch.float16"]],
-      "draft_v": [[80, [2048, 1, 8], [48, 8, 1], "torch.float16"], [80, [2048, 1, 8], [48, 8, 1], "torch.float16"]]
+      "k": [[0, [2064, 1, 8], [48, 8, 1], "torch.float16"], [32, [2064, 1, 8], [48, 8, 1], "torch.float16"]],
+      "v": [[16, [2064, 1, 8], [48, 8, 1], "torch.float16"], [48, [2064, 1, 8], [48, 8, 1], "torch.float16"]],
+      "draft_k": [[64, [2064, 1, 8], [48, 8, 1], "torch.float16"], [64, [2064, 1, 8], [48, 8, 1], "torch.float16"]],
+      "draft_v": [[80, [2064, 1, 8], [48, 8, 1], "torch.float16"], [80, [2064, 1, 8], [48, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "swa": ["up", 128, 1, 128, 1536],
-    "full": ["down", 128, 1, 128, 1536]
+    "swa": ["up", 129, 1, 129, 1536],
+    "full": ["down", 129, 1, 129, 1536]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 196608, 1536]],
-     "host_capacity": [1024, 98304],
-     "page_envelope": [128, 1536]
+     "buf_infos": [[0, 198144, 1536]],
+     "host_capacity": [2048, 196608],
+     "page_envelope": [129, 1536]
     },
     "swa": {
-     "buf_infos": [[0, 196608, 1536]],
-     "host_capacity": [1024, 98304],
-     "page_envelope": [128, 1536]
+     "buf_infos": [[0, 198144, 1536]],
+     "host_capacity": [2048, 196608],
+     "page_envelope": [129, 1536]
     }
    },
    "layer_maps": {
     "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]]
    },
    "capacity": {
-    "available": 1008,
-    "size_full": 1024,
-    "draft_virtual_id_space": 2047,
-    "size_swa": 1024
+    "available": 1024,
+    "size_full": 2048,
+    "draft_virtual_id_space": 2063,
+    "size_swa": 2048
    },
    "bs1_floor_terms": [["swa_window_kv", 4608], ["sink", 1536]]
   },
   "swa_p16_bytes": {
    "chain": [["swa", "up"], ["full", "down"]],
-   "total_bytes": 1048576,
+   "total_bytes": 1043436,
    "reserved_floor": 1024,
-   "active_allocation_bytes": 1048576,
+   "active_allocation_bytes": 1043436,
    "sub_pools": {
     "swa": {
      "kind": "MHASubPoolSpec",
@@ -453,12 +453,12 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 16384,
+     "max_slots": 16303,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [16384, 1, 8], [32, 8, 1], "torch.float16"], [32, [16384, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [16384, 1, 8], [32, 8, 1], "torch.float16"], [48, [16384, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [16288, 1, 8], [32, 8, 1], "torch.float16"], [32, [16288, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [16288, 1, 8], [32, 8, 1], "torch.float16"], [48, [16288, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     },
     "full": {
@@ -467,60 +467,60 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 16384,
+     "max_slots": 16303,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [16384, 1, 8], [32, 8, 1], "torch.float16"], [32, [16384, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [16384, 1, 8], [32, 8, 1], "torch.float16"], [48, [16384, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [16288, 1, 8], [32, 8, 1], "torch.float16"], [32, [16288, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [16288, 1, 8], [32, 8, 1], "torch.float16"], [48, [16288, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "swa": ["up", 1024, 1, 1024, 1024],
-    "full": ["down", 1024, 1, 1024, 1024]
+    "swa": ["up", 1018, 1, 1018, 1024],
+    "full": ["down", 1018, 1, 1018, 1024]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 1048576, 1024]],
-     "host_capacity": [16368, 1047552],
-     "page_envelope": [1024, 1024]
+     "buf_infos": [[0, 1043436, 1024]],
+     "host_capacity": [16272, 1041408],
+     "page_envelope": [1018, 1024]
     },
     "swa": {
-     "buf_infos": [[0, 1048576, 1024]],
-     "host_capacity": [16368, 1047552],
-     "page_envelope": [1024, 1024]
+     "buf_infos": [[0, 1043436, 1024]],
+     "host_capacity": [16272, 1041408],
+     "page_envelope": [1018, 1024]
     }
    },
    "layer_maps": {
     "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]]
    },
    "capacity": {
-    "available": 8176,
-    "size_full": 16368,
-    "draft_virtual_id_space": 16383,
-    "size_swa": 16368
+    "available": 8128,
+    "size_full": 16272,
+    "draft_virtual_id_space": 16302,
+    "size_swa": 16272
    },
    "bs1_floor_terms": [["swa_window_kv", 3072], ["sink", 1024]]
   },
   "mamba_p1": {
    "chain": [["mamba", "up"], ["full", "down"]],
-   "total_bytes": 6912,
-   "reserved_floor": 352,
-   "active_allocation_bytes": 6912,
+   "total_bytes": 7552,
+   "reserved_floor": 384,
+   "active_allocation_bytes": 7552,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
      "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
      "draft_offset": null,
      "max_slots": 19,
      "min_slot_index": 1,
      "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
      "views": {
-      "conv": [[0, [2, 19, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 19, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 19, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 19, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
     "full": {
@@ -529,28 +529,28 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 108,
+     "max_slots": 118,
      "min_slot_index": 6,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [108, 1, 8], [32, 8, 1], "torch.float16"], [32, [108, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [108, 1, 8], [32, 8, 1], "torch.float16"], [48, [108, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [118, 1, 8], [32, 8, 1], "torch.float16"], [32, [118, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [118, 1, 8], [32, 8, 1], "torch.float16"], [48, [118, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "mamba": ["up", 19, 1, 19, 352],
-    "full": ["down", 108, 6, 108, 64]
+    "mamba": ["up", 19, 1, 19, 384],
+    "full": ["down", 118, 6, 118, 64]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 6912, 64]],
+     "buf_infos": [[0, 7552, 64]],
      "host_capacity": [64, 4096],
-     "page_envelope": [108, 64]
+     "page_envelope": [118, 64]
     },
     "mamba": {
-     "buf_infos": [[0, 6912, 352]],
-     "host_capacity": [18, 6336]
+     "buf_infos": [[0, 7552, 384]],
+     "host_capacity": [18, 6912]
     }
    },
    "layer_maps": {
@@ -558,30 +558,30 @@
     "state": [[2, 0], [3, 1]]
    },
    "capacity": {
-    "available": 102,
-    "size_full": 107,
-    "draft_virtual_id_space": 107,
+    "available": 112,
+    "size_full": 117,
+    "draft_virtual_id_space": 117,
     "state_slots": 18
    }
   },
   "mamba_p16": {
    "chain": [["mamba", "up"], ["full", "down"]],
-   "total_bytes": 68352,
+   "total_bytes": 69632,
    "reserved_floor": 1024,
-   "active_allocation_bytes": 68352,
+   "active_allocation_bytes": 69632,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
      "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
      "draft_offset": null,
-     "max_slots": 194,
+     "max_slots": 181,
      "min_slot_index": 3,
      "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
      "views": {
-      "conv": [[0, [2, 194, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 194, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 181, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 181, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
     "full": {
@@ -590,194 +590,7 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 1068,
-     "min_slot_index": 16,
-     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
-     "views": {
-      "k": [[0, [1056, 1, 8], [32, 8, 1], "torch.float16"], [32, [1056, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [1056, 1, 8], [32, 8, 1], "torch.float16"], [48, [1056, 1, 8], [32, 8, 1], "torch.float16"]]
-     }
-    }
-   },
-   "members": {
-    "mamba": ["up", 194, 3, 194, 352],
-    "full": ["down", 66, 1, 66, 1024]
-   },
-   "pools": {
-    "full": {
-     "buf_infos": [[0, 68352, 1024]],
-     "host_capacity": [1024, 65536],
-     "page_envelope": [66, 1024]
-    },
-    "mamba": {
-     "buf_infos": [[0, 68352, 352]],
-     "host_capacity": [193, 67936]
-    }
-   },
-   "layer_maps": {
-    "kv": [[0, 0], [1, 1]],
-    "state": [[2, 0], [3, 1]]
-   },
-   "capacity": {
-    "available": 1024,
-    "size_full": 1067,
-    "draft_virtual_id_space": 1067,
-    "state_slots": 193
-   }
-  },
-  "mamba_p64": {
-   "chain": [["mamba", "up"], ["full", "down"]],
-   "total_bytes": 264960,
-   "reserved_floor": 4096,
-   "active_allocation_bytes": 264960,
-   "sub_pools": {
-    "mamba": {
-     "kind": "MambaSubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
-     "draft_offset": null,
-     "max_slots": 752,
-     "min_slot_index": 12,
-     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
-     "views": {
-      "conv": [[0, [2, 752, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 752, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
-     }
-    },
-    "full": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 64,
-     "host_entry_bytes": 64,
-     "draft_offset": null,
-     "max_slots": 4140,
-     "min_slot_index": 64,
-     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
-     "views": {
-      "k": [[0, [4096, 1, 8], [32, 8, 1], "torch.float16"], [32, [4096, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [4096, 1, 8], [32, 8, 1], "torch.float16"], [48, [4096, 1, 8], [32, 8, 1], "torch.float16"]]
-     }
-    }
-   },
-   "members": {
-    "mamba": ["up", 752, 12, 752, 352],
-    "full": ["down", 64, 1, 64, 4096]
-   },
-   "pools": {
-    "full": {
-     "buf_infos": [[0, 264960, 4096]],
-     "host_capacity": [4096, 262144],
-     "page_envelope": [64, 4096]
-    },
-    "mamba": {
-     "buf_infos": [[0, 264960, 352]],
-     "host_capacity": [751, 264352]
-    }
-   },
-   "layer_maps": {
-    "kv": [[0, 0], [1, 1]],
-    "state": [[2, 0], [3, 1]]
-   },
-   "capacity": {
-    "available": 3968,
-    "size_full": 4139,
-    "draft_virtual_id_space": 4139,
-    "state_slots": 751
-   }
-  },
-  "mamba_p16_draft_full": {
-   "chain": [["mamba", "up"], ["full", "down"]],
-   "total_bytes": 101120,
-   "reserved_floor": 1536,
-   "active_allocation_bytes": 101120,
-   "sub_pools": {
-    "mamba": {
-     "kind": "MambaSubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
-     "draft_offset": null,
-     "max_slots": 287,
-     "min_slot_index": 5,
-     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
-     "views": {
-      "conv": [[0, [2, 287, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 287, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
-     }
-    },
-    "full": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 96,
-     "host_entry_bytes": 64,
-     "draft_offset": 64,
-     "max_slots": 1053,
-     "min_slot_index": 16,
-     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"], ["draft_k", 64, 32, 1, [1, 8], "torch.float16"], ["draft_v", 80, 32, 1, [1, 8], "torch.float16"]],
-     "views": {
-      "k": [[0, [1040, 1, 8], [48, 8, 1], "torch.float16"], [32, [1040, 1, 8], [48, 8, 1], "torch.float16"]],
-      "v": [[16, [1040, 1, 8], [48, 8, 1], "torch.float16"], [48, [1040, 1, 8], [48, 8, 1], "torch.float16"]],
-      "draft_k": [[64, [1040, 1, 8], [48, 8, 1], "torch.float16"], [64, [1040, 1, 8], [48, 8, 1], "torch.float16"]],
-      "draft_v": [[80, [1040, 1, 8], [48, 8, 1], "torch.float16"], [80, [1040, 1, 8], [48, 8, 1], "torch.float16"]]
-     }
-    }
-   },
-   "members": {
-    "mamba": ["up", 287, 5, 287, 352],
-    "full": ["down", 65, 1, 65, 1536]
-   },
-   "pools": {
-    "full": {
-     "buf_infos": [[0, 101120, 1536]],
-     "host_capacity": [1024, 98304],
-     "page_envelope": [65, 1536]
-    },
-    "mamba": {
-     "buf_infos": [[0, 101120, 352]],
-     "host_capacity": [286, 100672]
-    }
-   },
-   "layer_maps": {
-    "kv": [[0, 0], [1, 1]],
-    "state": [[2, 0], [3, 1]]
-   },
-   "capacity": {
-    "available": 1008,
-    "size_full": 1052,
-    "draft_virtual_id_space": 1052,
-    "state_slots": 286
-   }
-  },
-  "mamba_p16_draft_state": {
-   "chain": [["mamba", "up"], ["full", "down"]],
-   "total_bytes": 69888,
-   "reserved_floor": 1024,
-   "active_allocation_bytes": 69888,
-   "sub_pools": {
-    "mamba": {
-     "kind": "MambaSubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 544,
-     "host_entry_bytes": 352,
-     "draft_offset": 352,
-     "max_slots": 128,
-     "min_slot_index": 2,
-     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
-     "views": {
-      "conv": [[0, [2, 128, 3, 8], [24, 272, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 128, 1, 4, 8], [32, 136, 32, 8, 1], "torch.float32"],
-      "draft_conv": [[352, [1, 128, 3, 8], [24, 272, 8, 1], "torch.bfloat16"]],
-      "draft_temporal": [400, [1, 128, 1, 4, 8], [32, 136, 32, 8, 1], "torch.float32"]
-     }
-    },
-    "full": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 64,
-     "host_entry_bytes": 64,
-     "draft_offset": null,
-     "max_slots": 1092,
+     "max_slots": 1088,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
@@ -787,18 +600,18 @@
     }
    },
    "members": {
-    "mamba": ["up", 128, 2, 128, 544],
+    "mamba": ["up", 181, 3, 181, 384],
     "full": ["down", 68, 1, 68, 1024]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 69888, 1024]],
+     "buf_infos": [[0, 69632, 1024]],
      "host_capacity": [1024, 65536],
      "page_envelope": [68, 1024]
     },
     "mamba": {
-     "buf_infos": [[0, 69888, 544]],
-     "host_capacity": [127, 69088]
+     "buf_infos": [[0, 69632, 384]],
+     "host_capacity": [180, 69120]
     }
    },
    "layer_maps": {
@@ -807,29 +620,216 @@
    },
    "capacity": {
     "available": 1056,
-    "size_full": 1091,
-    "draft_virtual_id_space": 1091,
-    "state_slots": 127
+    "size_full": 1087,
+    "draft_virtual_id_space": 1087,
+    "state_slots": 180
+   }
+  },
+  "mamba_p64": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "total_bytes": 269312,
+   "reserved_floor": 4096,
+   "active_allocation_bytes": 269312,
+   "sub_pools": {
+    "mamba": {
+     "kind": "MambaSubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
+     "draft_offset": null,
+     "max_slots": 701,
+     "min_slot_index": 11,
+     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
+     "views": {
+      "conv": [[0, [2, 701, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 701, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
+     }
+    },
+    "full": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 64,
+     "host_entry_bytes": 64,
+     "draft_offset": null,
+     "max_slots": 4208,
+     "min_slot_index": 64,
+     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
+     "views": {
+      "k": [[0, [4160, 1, 8], [32, 8, 1], "torch.float16"], [32, [4160, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [4160, 1, 8], [32, 8, 1], "torch.float16"], [48, [4160, 1, 8], [32, 8, 1], "torch.float16"]]
+     }
+    }
+   },
+   "members": {
+    "mamba": ["up", 701, 11, 701, 384],
+    "full": ["down", 65, 1, 65, 4096]
+   },
+   "pools": {
+    "full": {
+     "buf_infos": [[0, 269312, 4096]],
+     "host_capacity": [4096, 262144],
+     "page_envelope": [65, 4096]
+    },
+    "mamba": {
+     "buf_infos": [[0, 269312, 384]],
+     "host_capacity": [700, 268800]
+    }
+   },
+   "layer_maps": {
+    "kv": [[0, 0], [1, 1]],
+    "state": [[2, 0], [3, 1]]
+   },
+   "capacity": {
+    "available": 4032,
+    "size_full": 4207,
+    "draft_virtual_id_space": 4207,
+    "state_slots": 700
+   }
+  },
+  "mamba_p16_draft_full": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "total_bytes": 102912,
+   "reserved_floor": 1536,
+   "active_allocation_bytes": 102912,
+   "sub_pools": {
+    "mamba": {
+     "kind": "MambaSubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
+     "draft_offset": null,
+     "max_slots": 268,
+     "min_slot_index": 4,
+     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
+     "views": {
+      "conv": [[0, [2, 268, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 268, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
+     }
+    },
+    "full": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 96,
+     "host_entry_bytes": 64,
+     "draft_offset": 64,
+     "max_slots": 1072,
+     "min_slot_index": 16,
+     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"], ["draft_k", 64, 32, 1, [1, 8], "torch.float16"], ["draft_v", 80, 32, 1, [1, 8], "torch.float16"]],
+     "views": {
+      "k": [[0, [1072, 1, 8], [48, 8, 1], "torch.float16"], [32, [1072, 1, 8], [48, 8, 1], "torch.float16"]],
+      "v": [[16, [1072, 1, 8], [48, 8, 1], "torch.float16"], [48, [1072, 1, 8], [48, 8, 1], "torch.float16"]],
+      "draft_k": [[64, [1072, 1, 8], [48, 8, 1], "torch.float16"], [64, [1072, 1, 8], [48, 8, 1], "torch.float16"]],
+      "draft_v": [[80, [1072, 1, 8], [48, 8, 1], "torch.float16"], [80, [1072, 1, 8], [48, 8, 1], "torch.float16"]]
+     }
+    }
+   },
+   "members": {
+    "mamba": ["up", 268, 4, 268, 384],
+    "full": ["down", 67, 1, 67, 1536]
+   },
+   "pools": {
+    "full": {
+     "buf_infos": [[0, 102912, 1536]],
+     "host_capacity": [1024, 98304],
+     "page_envelope": [67, 1536]
+    },
+    "mamba": {
+     "buf_infos": [[0, 102912, 384]],
+     "host_capacity": [267, 102528]
+    }
+   },
+   "layer_maps": {
+    "kv": [[0, 0], [1, 1]],
+    "state": [[2, 0], [3, 1]]
+   },
+   "capacity": {
+    "available": 1056,
+    "size_full": 1071,
+    "draft_virtual_id_space": 1071,
+    "state_slots": 267
+   }
+  },
+  "mamba_p16_draft_state": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "total_bytes": 71168,
+   "reserved_floor": 1024,
+   "active_allocation_bytes": 71168,
+   "sub_pools": {
+    "mamba": {
+     "kind": "MambaSubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 576,
+     "host_entry_bytes": 384,
+     "draft_offset": 384,
+     "max_slots": 123,
+     "min_slot_index": 2,
+     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
+     "views": {
+      "conv": [[0, [2, 123, 3, 8], [24, 288, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 123, 1, 4, 8], [32, 144, 32, 8, 1], "torch.float32"],
+      "draft_conv": [[384, [1, 123, 3, 8], [24, 288, 8, 1], "torch.bfloat16"]],
+      "draft_temporal": [448, [1, 123, 1, 4, 8], [32, 144, 32, 8, 1], "torch.float32"]
+     }
+    },
+    "full": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 64,
+     "host_entry_bytes": 64,
+     "draft_offset": null,
+     "max_slots": 1112,
+     "min_slot_index": 16,
+     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
+     "views": {
+      "k": [[0, [1104, 1, 8], [32, 8, 1], "torch.float16"], [32, [1104, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [1104, 1, 8], [32, 8, 1], "torch.float16"], [48, [1104, 1, 8], [32, 8, 1], "torch.float16"]]
+     }
+    }
+   },
+   "members": {
+    "mamba": ["up", 123, 2, 123, 576],
+    "full": ["down", 69, 1, 69, 1024]
+   },
+   "pools": {
+    "full": {
+     "buf_infos": [[0, 71168, 1024]],
+     "host_capacity": [1024, 65536],
+     "page_envelope": [69, 1024]
+    },
+    "mamba": {
+     "buf_infos": [[0, 71168, 576]],
+     "host_capacity": [122, 70272]
+    }
+   },
+   "layer_maps": {
+    "kv": [[0, 0], [1, 1]],
+    "state": [[2, 0], [3, 1]]
+   },
+   "capacity": {
+    "available": 1072,
+    "size_full": 1111,
+    "draft_virtual_id_space": 1111,
+    "state_slots": 122
    }
   },
   "mamba_p16_bytes": {
    "chain": [["mamba", "up"], ["full", "down"]],
-   "total_bytes": 1051392,
+   "total_bytes": 1043416,
    "reserved_floor": 1024,
-   "active_allocation_bytes": 1051392,
+   "active_allocation_bytes": 1043416,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
      "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
      "draft_offset": null,
-     "max_slots": 2986,
+     "max_slots": 2717,
      "min_slot_index": 3,
      "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
      "views": {
-      "conv": [[0, [2, 2986, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 2986, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 2717, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 2717, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
     "full": {
@@ -838,28 +838,28 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 16428,
+     "max_slots": 16303,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [16416, 1, 8], [32, 8, 1], "torch.float16"], [32, [16416, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [16416, 1, 8], [32, 8, 1], "torch.float16"], [48, [16416, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [16288, 1, 8], [32, 8, 1], "torch.float16"], [32, [16288, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [16288, 1, 8], [32, 8, 1], "torch.float16"], [48, [16288, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "mamba": ["up", 2986, 3, 2986, 352],
-    "full": ["down", 1026, 1, 1026, 1024]
+    "mamba": ["up", 2717, 3, 2717, 384],
+    "full": ["down", 1018, 1, 1018, 1024]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 1051392, 1024]],
+     "buf_infos": [[0, 1043416, 1024]],
      "host_capacity": [64, 4096],
-     "page_envelope": [1026, 1024]
+     "page_envelope": [1018, 1024]
     },
     "mamba": {
-     "buf_infos": [[0, 1051392, 352]],
-     "host_capacity": [2985, 1050720]
+     "buf_infos": [[0, 1043416, 384]],
+     "host_capacity": [2716, 1042944]
     }
    },
    "layer_maps": {
@@ -867,30 +867,30 @@
     "state": [[2, 0], [3, 1]]
    },
    "capacity": {
-    "available": 16384,
-    "size_full": 16427,
-    "draft_virtual_id_space": 16427,
-    "state_slots": 2985
+    "available": 16256,
+    "size_full": 16302,
+    "draft_virtual_id_space": 16302,
+    "state_slots": 2716
    }
   },
   "mamba_p16_slice_axis": {
    "chain": [["mamba", "up"], ["full", "down"]],
-   "total_bytes": 68352,
+   "total_bytes": 69632,
    "reserved_floor": 1024,
-   "active_allocation_bytes": 68352,
+   "active_allocation_bytes": 69632,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
      "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
      "draft_offset": null,
-     "max_slots": 194,
+     "max_slots": 181,
      "min_slot_index": 3,
      "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 1],
      "views": {
-      "conv": [[0, [2, 194, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 194, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 181, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 181, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
     "full": {
@@ -899,28 +899,28 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 1068,
+     "max_slots": 1088,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [1056, 1, 8], [32, 8, 1], "torch.float16"], [32, [1056, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [1056, 1, 8], [32, 8, 1], "torch.float16"], [48, [1056, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [1088, 1, 8], [32, 8, 1], "torch.float16"], [32, [1088, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [1088, 1, 8], [32, 8, 1], "torch.float16"], [48, [1088, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "mamba": ["up", 194, 3, 194, 352],
-    "full": ["down", 66, 1, 66, 1024]
+    "mamba": ["up", 181, 3, 181, 384],
+    "full": ["down", 68, 1, 68, 1024]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 68352, 1024]],
+     "buf_infos": [[0, 69632, 1024]],
      "host_capacity": [1024, 65536],
-     "page_envelope": [66, 1024]
+     "page_envelope": [68, 1024]
     },
     "mamba": {
-     "buf_infos": [[0, 68352, 352]],
-     "host_capacity": [193, 67936]
+     "buf_infos": [[0, 69632, 384]],
+     "host_capacity": [180, 69120]
     }
    },
    "layer_maps": {
@@ -928,30 +928,30 @@
     "state": [[2, 0], [3, 1]]
    },
    "capacity": {
-    "available": 1024,
-    "size_full": 1067,
-    "draft_virtual_id_space": 1067,
-    "state_slots": 193
+    "available": 1056,
+    "size_full": 1087,
+    "draft_virtual_id_space": 1087,
+    "state_slots": 180
    }
   },
   "mla_p1": {
    "chain": [["mamba", "up"], ["full", "down"]],
-   "total_bytes": 8960,
-   "reserved_floor": 352,
-   "active_allocation_bytes": 8960,
+   "total_bytes": 9600,
+   "reserved_floor": 384,
+   "active_allocation_bytes": 9600,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
      "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
      "draft_offset": null,
      "max_slots": 25,
      "min_slot_index": 1,
      "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
      "views": {
-      "conv": [[0, [2, 25, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 25, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 25, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 25, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
     "full": {
@@ -960,26 +960,26 @@
      "entry_bytes": 96,
      "host_entry_bytes": 96,
      "draft_offset": null,
-     "max_slots": 93,
+     "max_slots": 100,
      "min_slot_index": 4,
      "parts": [["kv", 0, 48, 2, [1, 24], "torch.float16"]],
      "views": {
-      "kv": [[0, [93, 1, 24], [48, 24, 1], "torch.float16"], [48, [93, 1, 24], [48, 24, 1], "torch.float16"]]
+      "kv": [[0, [100, 1, 24], [48, 24, 1], "torch.float16"], [48, [100, 1, 24], [48, 24, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "mamba": ["up", 25, 1, 25, 352],
-    "full": ["down", 93, 4, 93, 96]
+    "mamba": ["up", 25, 1, 25, 384],
+    "full": ["down", 100, 4, 100, 96]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 8960, 96]],
+     "buf_infos": [[0, 9600, 96]],
      "host_capacity": [64, 6144]
     },
     "mamba": {
-     "buf_infos": [[0, 8960, 352]],
-     "host_capacity": [24, 8448]
+     "buf_infos": [[0, 9600, 384]],
+     "host_capacity": [24, 9216]
     }
    },
    "layer_maps": {
@@ -987,30 +987,30 @@
     "state": [[2, 0], [3, 1]]
    },
    "capacity": {
-    "available": 89,
-    "size_full": 92,
-    "draft_virtual_id_space": 92,
+    "available": 96,
+    "size_full": 99,
+    "draft_virtual_id_space": 99,
     "state_slots": 24
    }
   },
   "mla_p16": {
    "chain": [["mamba", "up"], ["full", "down"]],
-   "total_bytes": 101120,
+   "total_bytes": 102912,
    "reserved_floor": 1536,
-   "active_allocation_bytes": 101120,
+   "active_allocation_bytes": 102912,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
      "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
      "draft_offset": null,
-     "max_slots": 287,
-     "min_slot_index": 5,
+     "max_slots": 268,
+     "min_slot_index": 4,
      "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
      "views": {
-      "conv": [[0, [2, 287, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 287, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 268, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 268, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
     "full": {
@@ -1019,26 +1019,26 @@
      "entry_bytes": 96,
      "host_entry_bytes": 96,
      "draft_offset": null,
-     "max_slots": 1053,
+     "max_slots": 1072,
      "min_slot_index": 16,
      "parts": [["kv", 0, 48, 2, [1, 24], "torch.float16"]],
      "views": {
-      "kv": [[0, [1040, 1, 24], [48, 24, 1], "torch.float16"], [48, [1040, 1, 24], [48, 24, 1], "torch.float16"]]
+      "kv": [[0, [1072, 1, 24], [48, 24, 1], "torch.float16"], [48, [1072, 1, 24], [48, 24, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "mamba": ["up", 287, 5, 287, 352],
-    "full": ["down", 65, 1, 65, 1536]
+    "mamba": ["up", 268, 4, 268, 384],
+    "full": ["down", 67, 1, 67, 1536]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 101120, 1536]],
+     "buf_infos": [[0, 102912, 1536]],
      "host_capacity": [1024, 98304]
     },
     "mamba": {
-     "buf_infos": [[0, 101120, 352]],
-     "host_capacity": [286, 100672]
+     "buf_infos": [[0, 102912, 384]],
+     "host_capacity": [267, 102528]
     }
    },
    "layer_maps": {
@@ -1046,30 +1046,30 @@
     "state": [[2, 0], [3, 1]]
    },
    "capacity": {
-    "available": 1008,
-    "size_full": 1052,
-    "draft_virtual_id_space": 1052,
-    "state_slots": 286
+    "available": 1056,
+    "size_full": 1071,
+    "draft_virtual_id_space": 1071,
+    "state_slots": 267
    }
   },
   "mla_p64": {
    "chain": [["mamba", "up"], ["full", "down"]],
-   "total_bytes": 396032,
+   "total_bytes": 402432,
    "reserved_floor": 6144,
-   "active_allocation_bytes": 396032,
+   "active_allocation_bytes": 402432,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
      "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
      "draft_offset": null,
-     "max_slots": 1125,
-     "min_slot_index": 18,
+     "max_slots": 1048,
+     "min_slot_index": 16,
      "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
      "views": {
-      "conv": [[0, [2, 1125, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 1125, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 1048, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 1048, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
     "full": {
@@ -1078,26 +1078,26 @@
      "entry_bytes": 96,
      "host_entry_bytes": 96,
      "draft_offset": null,
-     "max_slots": 4125,
+     "max_slots": 4192,
      "min_slot_index": 64,
      "parts": [["kv", 0, 48, 2, [1, 24], "torch.float16"]],
      "views": {
-      "kv": [[0, [4096, 1, 24], [48, 24, 1], "torch.float16"], [48, [4096, 1, 24], [48, 24, 1], "torch.float16"]]
+      "kv": [[0, [4160, 1, 24], [48, 24, 1], "torch.float16"], [48, [4160, 1, 24], [48, 24, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "mamba": ["up", 1125, 18, 1125, 352],
-    "full": ["down", 64, 1, 64, 6144]
+    "mamba": ["up", 1048, 16, 1048, 384],
+    "full": ["down", 65, 1, 65, 6144]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 396032, 6144]],
+     "buf_infos": [[0, 402432, 6144]],
      "host_capacity": [4096, 393216]
     },
     "mamba": {
-     "buf_infos": [[0, 396032, 352]],
-     "host_capacity": [1124, 395648]
+     "buf_infos": [[0, 402432, 384]],
+     "host_capacity": [1047, 402048]
     }
    },
    "layer_maps": {
@@ -1105,30 +1105,30 @@
     "state": [[2, 0], [3, 1]]
    },
    "capacity": {
-    "available": 3968,
-    "size_full": 4124,
-    "draft_virtual_id_space": 4124,
-    "state_slots": 1124
+    "available": 4096,
+    "size_full": 4191,
+    "draft_virtual_id_space": 4191,
+    "state_slots": 1047
    }
   },
   "mla_p16_draft_full": {
    "chain": [["mamba", "up"], ["full", "down"]],
-   "total_bytes": 133888,
+   "total_bytes": 136192,
    "reserved_floor": 2048,
-   "active_allocation_bytes": 133888,
+   "active_allocation_bytes": 136192,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
      "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
      "draft_offset": null,
-     "max_slots": 380,
+     "max_slots": 354,
      "min_slot_index": 6,
      "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
      "views": {
-      "conv": [[0, [2, 380, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 380, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 354, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 354, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
     "full": {
@@ -1137,28 +1137,28 @@
      "entry_bytes": 128,
      "host_entry_bytes": 96,
      "draft_offset": 96,
-     "max_slots": 1046,
+     "max_slots": 1064,
      "min_slot_index": 16,
      "parts": [["kv", 0, 48, 2, [1, 24], "torch.float16"], ["draft_k", 96, 32, 1, [1, 8], "torch.float16"], ["draft_v", 112, 32, 1, [1, 8], "torch.float16"]],
      "views": {
-      "kv": [[0, [1040, 1, 24], [64, 24, 1], "torch.float16"], [48, [1040, 1, 24], [64, 24, 1], "torch.float16"]],
-      "draft_k": [[96, [1040, 1, 8], [64, 8, 1], "torch.float16"], [96, [1040, 1, 8], [64, 8, 1], "torch.float16"]],
-      "draft_v": [[112, [1040, 1, 8], [64, 8, 1], "torch.float16"], [112, [1040, 1, 8], [64, 8, 1], "torch.float16"]]
+      "kv": [[0, [1056, 1, 24], [64, 24, 1], "torch.float16"], [48, [1056, 1, 24], [64, 24, 1], "torch.float16"]],
+      "draft_k": [[96, [1056, 1, 8], [64, 8, 1], "torch.float16"], [96, [1056, 1, 8], [64, 8, 1], "torch.float16"]],
+      "draft_v": [[112, [1056, 1, 8], [64, 8, 1], "torch.float16"], [112, [1056, 1, 8], [64, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "mamba": ["up", 380, 6, 380, 352],
-    "full": ["down", 65, 1, 65, 2048]
+    "mamba": ["up", 354, 6, 354, 384],
+    "full": ["down", 66, 1, 66, 2048]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 133888, 2048]],
+     "buf_infos": [[0, 136192, 2048]],
      "host_capacity": [1024, 131072]
     },
     "mamba": {
-     "buf_infos": [[0, 133888, 352]],
-     "host_capacity": [379, 133408]
+     "buf_infos": [[0, 136192, 384]],
+     "host_capacity": [353, 135552]
     }
    },
    "layer_maps": {
@@ -1166,30 +1166,30 @@
     "state": [[2, 0], [3, 1]]
    },
    "capacity": {
-    "available": 1008,
-    "size_full": 1045,
-    "draft_virtual_id_space": 1045,
-    "state_slots": 379
+    "available": 1024,
+    "size_full": 1063,
+    "draft_virtual_id_space": 1063,
+    "state_slots": 353
    }
   },
   "tri_p1": {
    "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
-   "total_bytes": 11008,
-   "reserved_floor": 352,
-   "active_allocation_bytes": 11008,
+   "total_bytes": 11648,
+   "reserved_floor": 384,
+   "active_allocation_bytes": 11648,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
      "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
      "draft_offset": null,
-     "max_slots": 31,
+     "max_slots": 30,
      "min_slot_index": 1,
      "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
      "views": {
-      "conv": [[0, [2, 31, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 31, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 30, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 30, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
     "swa": {
@@ -1198,12 +1198,12 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 172,
+     "max_slots": 182,
      "min_slot_index": 6,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [172, 1, 8], [32, 8, 1], "torch.float16"], [32, [172, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [172, 1, 8], [32, 8, 1], "torch.float16"], [48, [172, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [182, 1, 8], [32, 8, 1], "torch.float16"], [32, [182, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [182, 1, 8], [32, 8, 1], "torch.float16"], [48, [182, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     },
     "full": {
@@ -1212,34 +1212,34 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 172,
+     "max_slots": 182,
      "min_slot_index": 6,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [172, 1, 8], [32, 8, 1], "torch.float16"], [32, [172, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [172, 1, 8], [32, 8, 1], "torch.float16"], [48, [172, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [182, 1, 8], [32, 8, 1], "torch.float16"], [32, [182, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [182, 1, 8], [32, 8, 1], "torch.float16"], [48, [182, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "mamba": ["up", 31, 1, 31, 352],
-    "swa": ["float", 172, 6, 172, 64],
-    "full": ["down", 172, 6, 172, 64]
+    "mamba": ["up", 30, 1, 30, 384],
+    "swa": ["float", 182, 6, 182, 64],
+    "full": ["down", 182, 6, 182, 64]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 11008, 64]],
+     "buf_infos": [[0, 11648, 64]],
      "host_capacity": [64, 4096],
-     "page_envelope": [172, 64]
+     "page_envelope": [182, 64]
     },
     "swa": {
-     "buf_infos": [[0, 11008, 64]],
+     "buf_infos": [[0, 11648, 64]],
      "host_capacity": [64, 4096],
-     "page_envelope": [172, 64]
+     "page_envelope": [182, 64]
     },
     "mamba": {
-     "buf_infos": [[0, 11008, 352]],
-     "host_capacity": [30, 10560]
+     "buf_infos": [[0, 11648, 384]],
+     "host_capacity": [29, 11136]
     }
    },
    "layer_maps": {
@@ -1247,31 +1247,31 @@
     "state": [[0, 0], [2, 1]]
    },
    "capacity": {
-    "available": 83,
+    "available": 88,
     "size_full": 64,
-    "draft_virtual_id_space": 171,
+    "draft_virtual_id_space": 181,
     "size_swa": 64,
-    "state_slots": 30
+    "state_slots": 29
    }
   },
   "tri_p16": {
    "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
-   "total_bytes": 133888,
+   "total_bytes": 135168,
    "reserved_floor": 1024,
-   "active_allocation_bytes": 133888,
+   "active_allocation_bytes": 135168,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
      "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
      "draft_offset": null,
-     "max_slots": 380,
+     "max_slots": 352,
      "min_slot_index": 3,
      "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
      "views": {
-      "conv": [[0, [2, 380, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 380, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 352, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 352, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
     "swa": {
@@ -1280,423 +1280,7 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 2092,
-     "min_slot_index": 16,
-     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
-     "views": {
-      "k": [[0, [2080, 1, 8], [32, 8, 1], "torch.float16"], [32, [2080, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [2080, 1, 8], [32, 8, 1], "torch.float16"], [48, [2080, 1, 8], [32, 8, 1], "torch.float16"]]
-     }
-    },
-    "full": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 64,
-     "host_entry_bytes": 64,
-     "draft_offset": null,
-     "max_slots": 2092,
-     "min_slot_index": 16,
-     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
-     "views": {
-      "k": [[0, [2080, 1, 8], [32, 8, 1], "torch.float16"], [32, [2080, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [2080, 1, 8], [32, 8, 1], "torch.float16"], [48, [2080, 1, 8], [32, 8, 1], "torch.float16"]]
-     }
-    }
-   },
-   "members": {
-    "mamba": ["up", 380, 3, 380, 352],
-    "swa": ["float", 130, 1, 130, 1024],
-    "full": ["down", 130, 1, 130, 1024]
-   },
-   "pools": {
-    "full": {
-     "buf_infos": [[0, 133888, 1024]],
-     "host_capacity": [1024, 65536],
-     "page_envelope": [130, 1024]
-    },
-    "swa": {
-     "buf_infos": [[0, 133888, 1024]],
-     "host_capacity": [1024, 65536],
-     "page_envelope": [130, 1024]
-    },
-    "mamba": {
-     "buf_infos": [[0, 133888, 352]],
-     "host_capacity": [379, 133408]
-    }
-   },
-   "layer_maps": {
-    "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]],
-    "state": [[0, 0], [2, 1]]
-   },
-   "capacity": {
-    "available": 1024,
-    "size_full": 1024,
-    "draft_virtual_id_space": 2091,
-    "size_swa": 1024,
-    "state_slots": 379
-   }
-  },
-  "tri_p64": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
-   "total_bytes": 527104,
-   "reserved_floor": 4096,
-   "active_allocation_bytes": 527104,
-   "sub_pools": {
-    "mamba": {
-     "kind": "MambaSubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
-     "draft_offset": null,
-     "max_slots": 1497,
-     "min_slot_index": 12,
-     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
-     "views": {
-      "conv": [[0, [2, 1497, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 1497, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
-     }
-    },
-    "swa": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 64,
-     "host_entry_bytes": 64,
-     "draft_offset": null,
-     "max_slots": 8236,
-     "min_slot_index": 64,
-     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
-     "views": {
-      "k": [[0, [8192, 1, 8], [32, 8, 1], "torch.float16"], [32, [8192, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [8192, 1, 8], [32, 8, 1], "torch.float16"], [48, [8192, 1, 8], [32, 8, 1], "torch.float16"]]
-     }
-    },
-    "full": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 64,
-     "host_entry_bytes": 64,
-     "draft_offset": null,
-     "max_slots": 8236,
-     "min_slot_index": 64,
-     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
-     "views": {
-      "k": [[0, [8192, 1, 8], [32, 8, 1], "torch.float16"], [32, [8192, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [8192, 1, 8], [32, 8, 1], "torch.float16"], [48, [8192, 1, 8], [32, 8, 1], "torch.float16"]]
-     }
-    }
-   },
-   "members": {
-    "mamba": ["up", 1497, 12, 1497, 352],
-    "swa": ["float", 128, 1, 128, 4096],
-    "full": ["down", 128, 1, 128, 4096]
-   },
-   "pools": {
-    "full": {
-     "buf_infos": [[0, 527104, 4096]],
-     "host_capacity": [4096, 262144],
-     "page_envelope": [128, 4096]
-    },
-    "swa": {
-     "buf_infos": [[0, 527104, 4096]],
-     "host_capacity": [4096, 262144],
-     "page_envelope": [128, 4096]
-    },
-    "mamba": {
-     "buf_infos": [[0, 527104, 352]],
-     "host_capacity": [1496, 526592]
-    }
-   },
-   "layer_maps": {
-    "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]],
-    "state": [[0, 0], [2, 1]]
-   },
-   "capacity": {
-    "available": 4032,
-    "size_full": 4096,
-    "draft_virtual_id_space": 8235,
-    "size_swa": 4096,
-    "state_slots": 1496
-   }
-  },
-  "tri_p16_asym": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
-   "total_bytes": 232192,
-   "reserved_floor": 2048,
-   "active_allocation_bytes": 232192,
-   "sub_pools": {
-    "mamba": {
-     "kind": "MambaSubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
-     "draft_offset": null,
-     "max_slots": 659,
-     "min_slot_index": 6,
-     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
-     "views": {
-      "conv": [[0, [2, 659, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 659, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
-     }
-    },
-    "swa": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 128,
-     "host_entry_bytes": 128,
-     "draft_offset": null,
-     "max_slots": 1814,
-     "min_slot_index": 16,
-     "parts": [["k", 0, 64, 2, [2, 8], "torch.float16"], ["v", 32, 64, 2, [2, 8], "torch.float16"]],
-     "views": {
-      "k": [[0, [1808, 2, 8], [64, 8, 1], "torch.float16"], [64, [1808, 2, 8], [64, 8, 1], "torch.float16"]],
-      "v": [[32, [1808, 2, 8], [64, 8, 1], "torch.float16"], [96, [1808, 2, 8], [64, 8, 1], "torch.float16"]]
-     }
-    },
-    "full": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 96,
-     "host_entry_bytes": 96,
-     "draft_offset": null,
-     "max_slots": 2418,
-     "min_slot_index": 22,
-     "parts": [["k", 0, 48, 2, [1, 8], "torch.float16"], ["v", 16, 48, 2, [1, 16], "torch.float16"]],
-     "views": {
-      "k": [[0, [2416, 1, 8], [48, 8, 1], "torch.float16"], [48, [2416, 1, 8], [48, 8, 1], "torch.float16"]],
-      "v": [[16, [2416, 1, 16], [48, 16, 1], "torch.float16"], [64, [2416, 1, 16], [48, 16, 1], "torch.float16"]]
-     }
-    }
-   },
-   "members": {
-    "mamba": ["up", 659, 6, 659, 352],
-    "swa": ["float", 113, 1, 151, 2048],
-    "full": ["down", 151, 2, 151, 1536]
-   },
-   "pools": {
-    "full": {
-     "buf_infos": [[0, 232192, 1536]],
-     "host_capacity": [1024, 98304],
-     "page_envelope": [151, 1536]
-    },
-    "swa": {
-     "buf_infos": [[0, 232192, 2048]],
-     "host_capacity": [1024, 131072],
-     "page_envelope": [113, 2048]
-    },
-    "mamba": {
-     "buf_infos": [[0, 232192, 352]],
-     "host_capacity": [658, 231616]
-    }
-   },
-   "layer_maps": {
-    "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]],
-    "state": [[0, 0], [2, 1]]
-   },
-   "capacity": {
-    "available": 1008,
-    "size_full": 1024,
-    "draft_virtual_id_space": 2417,
-    "size_swa": 1024,
-    "state_slots": 658
-   }
-  },
-  "tri_p16_draft_full": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
-   "total_bytes": 166656,
-   "reserved_floor": 1536,
-   "active_allocation_bytes": 166656,
-   "sub_pools": {
-    "mamba": {
-     "kind": "MambaSubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
-     "draft_offset": null,
-     "max_slots": 473,
-     "min_slot_index": 5,
-     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
-     "views": {
-      "conv": [[0, [2, 473, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 473, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
-     }
-    },
-    "swa": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 64,
-     "host_entry_bytes": 64,
-     "draft_offset": null,
-     "max_slots": 2604,
-     "min_slot_index": 24,
-     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
-     "views": {
-      "k": [[0, [2592, 1, 8], [32, 8, 1], "torch.float16"], [32, [2592, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [2592, 1, 8], [32, 8, 1], "torch.float16"], [48, [2592, 1, 8], [32, 8, 1], "torch.float16"]]
-     }
-    },
-    "full": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 96,
-     "host_entry_bytes": 64,
-     "draft_offset": 64,
-     "max_slots": 1736,
-     "min_slot_index": 16,
-     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"], ["draft_k", 64, 32, 1, [1, 8], "torch.float16"], ["draft_v", 80, 32, 1, [1, 8], "torch.float16"]],
-     "views": {
-      "k": [[0, [1728, 1, 8], [48, 8, 1], "torch.float16"], [32, [1728, 1, 8], [48, 8, 1], "torch.float16"]],
-      "v": [[16, [1728, 1, 8], [48, 8, 1], "torch.float16"], [48, [1728, 1, 8], [48, 8, 1], "torch.float16"]],
-      "draft_k": [[64, [1728, 1, 8], [48, 8, 1], "torch.float16"], [64, [1728, 1, 8], [48, 8, 1], "torch.float16"]],
-      "draft_v": [[80, [1728, 1, 8], [48, 8, 1], "torch.float16"], [80, [1728, 1, 8], [48, 8, 1], "torch.float16"]]
-     }
-    }
-   },
-   "members": {
-    "mamba": ["up", 473, 5, 473, 352],
-    "swa": ["float", 162, 2, 108, 1024],
-    "full": ["down", 108, 1, 108, 1536]
-   },
-   "pools": {
-    "full": {
-     "buf_infos": [[0, 166656, 1536]],
-     "host_capacity": [1024, 98304],
-     "page_envelope": [108, 1536]
-    },
-    "swa": {
-     "buf_infos": [[0, 166656, 1024]],
-     "host_capacity": [1024, 65536],
-     "page_envelope": [162, 1024]
-    },
-    "mamba": {
-     "buf_infos": [[0, 166656, 352]],
-     "host_capacity": [472, 166144]
-    }
-   },
-   "layer_maps": {
-    "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]],
-    "state": [[0, 0], [2, 1]]
-   },
-   "capacity": {
-    "available": 1024,
-    "size_full": 1024,
-    "draft_virtual_id_space": 1735,
-    "size_swa": 1024,
-    "state_slots": 472
-   }
-  },
-  "tri_p16_draft_swa": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
-   "total_bytes": 166656,
-   "reserved_floor": 1536,
-   "active_allocation_bytes": 166656,
-   "sub_pools": {
-    "mamba": {
-     "kind": "MambaSubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
-     "draft_offset": null,
-     "max_slots": 473,
-     "min_slot_index": 5,
-     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
-     "views": {
-      "conv": [[0, [2, 473, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 473, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
-     }
-    },
-    "swa": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 96,
-     "host_entry_bytes": 64,
-     "draft_offset": 64,
-     "max_slots": 1736,
-     "min_slot_index": 16,
-     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"], ["draft_k", 64, 32, 1, [1, 8], "torch.float16"], ["draft_v", 80, 32, 1, [1, 8], "torch.float16"]],
-     "views": {
-      "k": [[0, [1728, 1, 8], [48, 8, 1], "torch.float16"], [32, [1728, 1, 8], [48, 8, 1], "torch.float16"]],
-      "v": [[16, [1728, 1, 8], [48, 8, 1], "torch.float16"], [48, [1728, 1, 8], [48, 8, 1], "torch.float16"]],
-      "draft_k": [[64, [1728, 1, 8], [48, 8, 1], "torch.float16"], [64, [1728, 1, 8], [48, 8, 1], "torch.float16"]],
-      "draft_v": [[80, [1728, 1, 8], [48, 8, 1], "torch.float16"], [80, [1728, 1, 8], [48, 8, 1], "torch.float16"]]
-     }
-    },
-    "full": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 64,
-     "host_entry_bytes": 64,
-     "draft_offset": null,
-     "max_slots": 2604,
-     "min_slot_index": 24,
-     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
-     "views": {
-      "k": [[0, [2592, 1, 8], [32, 8, 1], "torch.float16"], [32, [2592, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [2592, 1, 8], [32, 8, 1], "torch.float16"], [48, [2592, 1, 8], [32, 8, 1], "torch.float16"]]
-     }
-    }
-   },
-   "members": {
-    "mamba": ["up", 473, 5, 473, 352],
-    "swa": ["float", 108, 1, 162, 1536],
-    "full": ["down", 162, 2, 162, 1024]
-   },
-   "pools": {
-    "full": {
-     "buf_infos": [[0, 166656, 1024]],
-     "host_capacity": [1024, 65536],
-     "page_envelope": [162, 1024]
-    },
-    "swa": {
-     "buf_infos": [[0, 166656, 1536]],
-     "host_capacity": [1024, 98304],
-     "page_envelope": [108, 1536]
-    },
-    "mamba": {
-     "buf_infos": [[0, 166656, 352]],
-     "host_capacity": [472, 166144]
-    }
-   },
-   "layer_maps": {
-    "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]],
-    "state": [[0, 0], [2, 1]]
-   },
-   "capacity": {
-    "available": 1008,
-    "size_full": 1024,
-    "draft_virtual_id_space": 2603,
-    "size_swa": 1024,
-    "state_slots": 472
-   }
-  },
-  "tri_p16_draft_state": {
-   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
-   "total_bytes": 135424,
-   "reserved_floor": 1024,
-   "active_allocation_bytes": 135424,
-   "sub_pools": {
-    "mamba": {
-     "kind": "MambaSubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 544,
-     "host_entry_bytes": 352,
-     "draft_offset": 352,
-     "max_slots": 248,
-     "min_slot_index": 2,
-     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
-     "views": {
-      "conv": [[0, [2, 248, 3, 8], [24, 272, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 248, 1, 4, 8], [32, 136, 32, 8, 1], "torch.float32"],
-      "draft_conv": [[352, [1, 248, 3, 8], [24, 272, 8, 1], "torch.bfloat16"]],
-      "draft_temporal": [400, [1, 248, 1, 4, 8], [32, 136, 32, 8, 1], "torch.float32"]
-     }
-    },
-    "swa": {
-     "kind": "MHASubPoolSpec",
-     "layer_num": 2,
-     "entry_bytes": 64,
-     "host_entry_bytes": 64,
-     "draft_offset": null,
-     "max_slots": 2116,
+     "max_slots": 2112,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
@@ -1710,7 +1294,7 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 2116,
+     "max_slots": 2112,
      "min_slot_index": 16,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
@@ -1720,24 +1304,24 @@
     }
    },
    "members": {
-    "mamba": ["up", 248, 2, 248, 544],
+    "mamba": ["up", 352, 3, 352, 384],
     "swa": ["float", 132, 1, 132, 1024],
     "full": ["down", 132, 1, 132, 1024]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 135424, 1024]],
+     "buf_infos": [[0, 135168, 1024]],
      "host_capacity": [1024, 65536],
      "page_envelope": [132, 1024]
     },
     "swa": {
-     "buf_infos": [[0, 135424, 1024]],
+     "buf_infos": [[0, 135168, 1024]],
      "host_capacity": [1024, 65536],
      "page_envelope": [132, 1024]
     },
     "mamba": {
-     "buf_infos": [[0, 135424, 544]],
-     "host_capacity": [247, 134368]
+     "buf_infos": [[0, 135168, 384]],
+     "host_capacity": [351, 134784]
     }
    },
    "layer_maps": {
@@ -1747,29 +1331,29 @@
    "capacity": {
     "available": 1040,
     "size_full": 1024,
-    "draft_virtual_id_space": 2115,
+    "draft_virtual_id_space": 2111,
     "size_swa": 1024,
-    "state_slots": 247
+    "state_slots": 351
    }
   },
-  "tri_p16_slice_axis": {
+  "tri_p64": {
    "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
-   "total_bytes": 133888,
-   "reserved_floor": 1024,
-   "active_allocation_bytes": 133888,
+   "total_bytes": 531456,
+   "reserved_floor": 4096,
+   "active_allocation_bytes": 531456,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
      "layer_num": 2,
-     "entry_bytes": 352,
-     "host_entry_bytes": 352,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
      "draft_offset": null,
-     "max_slots": 380,
-     "min_slot_index": 3,
-     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 1],
+     "max_slots": 1384,
+     "min_slot_index": 11,
+     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
      "views": {
-      "conv": [[0, [2, 380, 3, 8], [24, 176, 8, 1], "torch.bfloat16"]],
-      "temporal": [96, [2, 380, 1, 4, 8], [32, 88, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 1384, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 1384, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
     "swa": {
@@ -1778,12 +1362,12 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 2092,
-     "min_slot_index": 16,
+     "max_slots": 8304,
+     "min_slot_index": 64,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [2080, 1, 8], [32, 8, 1], "torch.float16"], [32, [2080, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [2080, 1, 8], [32, 8, 1], "torch.float16"], [48, [2080, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [8256, 1, 8], [32, 8, 1], "torch.float16"], [32, [8256, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [8256, 1, 8], [32, 8, 1], "torch.float16"], [48, [8256, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     },
     "full": {
@@ -1792,34 +1376,116 @@
      "entry_bytes": 64,
      "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 2092,
-     "min_slot_index": 16,
+     "max_slots": 8304,
+     "min_slot_index": 64,
      "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [2080, 1, 8], [32, 8, 1], "torch.float16"], [32, [2080, 1, 8], [32, 8, 1], "torch.float16"]],
-      "v": [[16, [2080, 1, 8], [32, 8, 1], "torch.float16"], [48, [2080, 1, 8], [32, 8, 1], "torch.float16"]]
+      "k": [[0, [8256, 1, 8], [32, 8, 1], "torch.float16"], [32, [8256, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [8256, 1, 8], [32, 8, 1], "torch.float16"], [48, [8256, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "mamba": ["up", 380, 3, 380, 352],
-    "swa": ["float", 130, 1, 130, 1024],
-    "full": ["down", 130, 1, 130, 1024]
+    "mamba": ["up", 1384, 11, 1384, 384],
+    "swa": ["float", 129, 1, 129, 4096],
+    "full": ["down", 129, 1, 129, 4096]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 133888, 1024]],
-     "host_capacity": [1024, 65536],
-     "page_envelope": [130, 1024]
+     "buf_infos": [[0, 531456, 4096]],
+     "host_capacity": [4096, 262144],
+     "page_envelope": [129, 4096]
     },
     "swa": {
-     "buf_infos": [[0, 133888, 1024]],
-     "host_capacity": [1024, 65536],
-     "page_envelope": [130, 1024]
+     "buf_infos": [[0, 531456, 4096]],
+     "host_capacity": [4096, 262144],
+     "page_envelope": [129, 4096]
     },
     "mamba": {
-     "buf_infos": [[0, 133888, 352]],
-     "host_capacity": [379, 133408]
+     "buf_infos": [[0, 531456, 384]],
+     "host_capacity": [1383, 531072]
+    }
+   },
+   "layer_maps": {
+    "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]],
+    "state": [[0, 0], [2, 1]]
+   },
+   "capacity": {
+    "available": 4032,
+    "size_full": 4096,
+    "draft_virtual_id_space": 8303,
+    "size_swa": 4096,
+    "state_slots": 1383
+   }
+  },
+  "tri_p16_asym": {
+   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "total_bytes": 234496,
+   "reserved_floor": 2048,
+   "active_allocation_bytes": 234496,
+   "sub_pools": {
+    "mamba": {
+     "kind": "MambaSubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
+     "draft_offset": null,
+     "max_slots": 610,
+     "min_slot_index": 6,
+     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
+     "views": {
+      "conv": [[0, [2, 610, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 610, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
+     }
+    },
+    "swa": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 128,
+     "host_entry_bytes": 128,
+     "draft_offset": null,
+     "max_slots": 1832,
+     "min_slot_index": 16,
+     "parts": [["k", 0, 64, 2, [2, 8], "torch.float16"], ["v", 32, 64, 2, [2, 8], "torch.float16"]],
+     "views": {
+      "k": [[0, [1824, 2, 8], [64, 8, 1], "torch.float16"], [64, [1824, 2, 8], [64, 8, 1], "torch.float16"]],
+      "v": [[32, [1824, 2, 8], [64, 8, 1], "torch.float16"], [96, [1824, 2, 8], [64, 8, 1], "torch.float16"]]
+     }
+    },
+    "full": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 96,
+     "host_entry_bytes": 96,
+     "draft_offset": null,
+     "max_slots": 2442,
+     "min_slot_index": 22,
+     "parts": [["k", 0, 48, 2, [1, 8], "torch.float16"], ["v", 16, 48, 2, [1, 16], "torch.float16"]],
+     "views": {
+      "k": [[0, [2432, 1, 8], [48, 8, 1], "torch.float16"], [48, [2432, 1, 8], [48, 8, 1], "torch.float16"]],
+      "v": [[16, [2432, 1, 16], [48, 16, 1], "torch.float16"], [64, [2432, 1, 16], [48, 16, 1], "torch.float16"]]
+     }
+    }
+   },
+   "members": {
+    "mamba": ["up", 610, 6, 610, 384],
+    "swa": ["float", 114, 1, 152, 2048],
+    "full": ["down", 152, 2, 152, 1536]
+   },
+   "pools": {
+    "full": {
+     "buf_infos": [[0, 234496, 1536]],
+     "host_capacity": [1024, 98304],
+     "page_envelope": [152, 1536]
+    },
+    "swa": {
+     "buf_infos": [[0, 234496, 2048]],
+     "host_capacity": [1024, 131072],
+     "page_envelope": [114, 2048]
+    },
+    "mamba": {
+     "buf_infos": [[0, 234496, 384]],
+     "host_capacity": [609, 233856]
     }
    },
    "layer_maps": {
@@ -1829,79 +1495,413 @@
    "capacity": {
     "available": 1024,
     "size_full": 1024,
-    "draft_virtual_id_space": 2091,
+    "draft_virtual_id_space": 2441,
     "size_swa": 1024,
-    "state_slots": 379
+    "state_slots": 609
    }
   },
-  "tri_pp_stage": {
+  "tri_p16_draft_full": {
    "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
-   "total_bytes": 66944,
-   "reserved_floor": 512,
-   "active_allocation_bytes": 66944,
+   "total_bytes": 168448,
+   "reserved_floor": 1536,
+   "active_allocation_bytes": 168448,
    "sub_pools": {
     "mamba": {
      "kind": "MambaSubPoolSpec",
-     "layer_num": 1,
-     "entry_bytes": 176,
-     "host_entry_bytes": 176,
+     "layer_num": 2,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
      "draft_offset": null,
-     "max_slots": 380,
-     "min_slot_index": 3,
+     "max_slots": 438,
+     "min_slot_index": 4,
      "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
      "views": {
-      "conv": [[0, [1, 380, 3, 8], [24, 88, 8, 1], "torch.bfloat16"]],
-      "temporal": [48, [1, 380, 1, 4, 8], [32, 44, 32, 8, 1], "torch.float32"]
+      "conv": [[0, [2, 438, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 438, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
      }
     },
     "swa": {
      "kind": "MHASubPoolSpec",
-     "layer_num": 1,
-     "entry_bytes": 32,
-     "host_entry_bytes": 32,
+     "layer_num": 2,
+     "entry_bytes": 64,
+     "host_entry_bytes": 64,
      "draft_offset": null,
-     "max_slots": 2092,
-     "min_slot_index": 16,
-     "parts": [["k", 0, 32, 1, [1, 8], "torch.float16"], ["v", 16, 32, 1, [1, 8], "torch.float16"]],
+     "max_slots": 2632,
+     "min_slot_index": 24,
+     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [2080, 1, 8], [16, 8, 1], "torch.float16"], [0, [2080, 1, 8], [16, 8, 1], "torch.float16"]],
-      "v": [[16, [2080, 1, 8], [16, 8, 1], "torch.float16"], [16, [2080, 1, 8], [16, 8, 1], "torch.float16"]]
+      "k": [[0, [2624, 1, 8], [32, 8, 1], "torch.float16"], [32, [2624, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [2624, 1, 8], [32, 8, 1], "torch.float16"], [48, [2624, 1, 8], [32, 8, 1], "torch.float16"]]
      }
     },
     "full": {
      "kind": "MHASubPoolSpec",
-     "layer_num": 1,
-     "entry_bytes": 32,
-     "host_entry_bytes": 32,
-     "draft_offset": null,
-     "max_slots": 2092,
+     "layer_num": 2,
+     "entry_bytes": 96,
+     "host_entry_bytes": 64,
+     "draft_offset": 64,
+     "max_slots": 1754,
      "min_slot_index": 16,
-     "parts": [["k", 0, 32, 1, [1, 8], "torch.float16"], ["v", 16, 32, 1, [1, 8], "torch.float16"]],
+     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"], ["draft_k", 64, 32, 1, [1, 8], "torch.float16"], ["draft_v", 80, 32, 1, [1, 8], "torch.float16"]],
      "views": {
-      "k": [[0, [2080, 1, 8], [16, 8, 1], "torch.float16"], [0, [2080, 1, 8], [16, 8, 1], "torch.float16"]],
-      "v": [[16, [2080, 1, 8], [16, 8, 1], "torch.float16"], [16, [2080, 1, 8], [16, 8, 1], "torch.float16"]]
+      "k": [[0, [1744, 1, 8], [48, 8, 1], "torch.float16"], [32, [1744, 1, 8], [48, 8, 1], "torch.float16"]],
+      "v": [[16, [1744, 1, 8], [48, 8, 1], "torch.float16"], [48, [1744, 1, 8], [48, 8, 1], "torch.float16"]],
+      "draft_k": [[64, [1744, 1, 8], [48, 8, 1], "torch.float16"], [64, [1744, 1, 8], [48, 8, 1], "torch.float16"]],
+      "draft_v": [[80, [1744, 1, 8], [48, 8, 1], "torch.float16"], [80, [1744, 1, 8], [48, 8, 1], "torch.float16"]]
      }
     }
    },
    "members": {
-    "mamba": ["up", 380, 3, 380, 176],
-    "swa": ["float", 130, 1, 130, 512],
-    "full": ["down", 130, 1, 130, 512]
+    "mamba": ["up", 438, 4, 438, 384],
+    "swa": ["float", 164, 2, 109, 1024],
+    "full": ["down", 109, 1, 109, 1536]
    },
    "pools": {
     "full": {
-     "buf_infos": [[0, 66944, 512]],
-     "host_capacity": [1024, 32768],
-     "page_envelope": [130, 512]
+     "buf_infos": [[0, 168448, 1536]],
+     "host_capacity": [1024, 98304],
+     "page_envelope": [109, 1536]
     },
     "swa": {
-     "buf_infos": [[0, 66944, 512]],
-     "host_capacity": [1024, 32768],
-     "page_envelope": [130, 512]
+     "buf_infos": [[0, 168448, 1024]],
+     "host_capacity": [1024, 65536],
+     "page_envelope": [164, 1024]
     },
     "mamba": {
-     "buf_infos": [[0, 66944, 176]],
-     "host_capacity": [379, 66704]
+     "buf_infos": [[0, 168448, 384]],
+     "host_capacity": [437, 167808]
+    }
+   },
+   "layer_maps": {
+    "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]],
+    "state": [[0, 0], [2, 1]]
+   },
+   "capacity": {
+    "available": 1024,
+    "size_full": 1024,
+    "draft_virtual_id_space": 1753,
+    "size_swa": 1024,
+    "state_slots": 437
+   }
+  },
+  "tri_p16_draft_swa": {
+   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "total_bytes": 168448,
+   "reserved_floor": 1536,
+   "active_allocation_bytes": 168448,
+   "sub_pools": {
+    "mamba": {
+     "kind": "MambaSubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
+     "draft_offset": null,
+     "max_slots": 438,
+     "min_slot_index": 4,
+     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
+     "views": {
+      "conv": [[0, [2, 438, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 438, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
+     }
+    },
+    "swa": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 96,
+     "host_entry_bytes": 64,
+     "draft_offset": 64,
+     "max_slots": 1754,
+     "min_slot_index": 16,
+     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"], ["draft_k", 64, 32, 1, [1, 8], "torch.float16"], ["draft_v", 80, 32, 1, [1, 8], "torch.float16"]],
+     "views": {
+      "k": [[0, [1744, 1, 8], [48, 8, 1], "torch.float16"], [32, [1744, 1, 8], [48, 8, 1], "torch.float16"]],
+      "v": [[16, [1744, 1, 8], [48, 8, 1], "torch.float16"], [48, [1744, 1, 8], [48, 8, 1], "torch.float16"]],
+      "draft_k": [[64, [1744, 1, 8], [48, 8, 1], "torch.float16"], [64, [1744, 1, 8], [48, 8, 1], "torch.float16"]],
+      "draft_v": [[80, [1744, 1, 8], [48, 8, 1], "torch.float16"], [80, [1744, 1, 8], [48, 8, 1], "torch.float16"]]
+     }
+    },
+    "full": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 64,
+     "host_entry_bytes": 64,
+     "draft_offset": null,
+     "max_slots": 2632,
+     "min_slot_index": 24,
+     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
+     "views": {
+      "k": [[0, [2624, 1, 8], [32, 8, 1], "torch.float16"], [32, [2624, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [2624, 1, 8], [32, 8, 1], "torch.float16"], [48, [2624, 1, 8], [32, 8, 1], "torch.float16"]]
+     }
+    }
+   },
+   "members": {
+    "mamba": ["up", 438, 4, 438, 384],
+    "swa": ["float", 109, 1, 164, 1536],
+    "full": ["down", 164, 2, 164, 1024]
+   },
+   "pools": {
+    "full": {
+     "buf_infos": [[0, 168448, 1024]],
+     "host_capacity": [1024, 65536],
+     "page_envelope": [164, 1024]
+    },
+    "swa": {
+     "buf_infos": [[0, 168448, 1536]],
+     "host_capacity": [1024, 98304],
+     "page_envelope": [109, 1536]
+    },
+    "mamba": {
+     "buf_infos": [[0, 168448, 384]],
+     "host_capacity": [437, 167808]
+    }
+   },
+   "layer_maps": {
+    "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]],
+    "state": [[0, 0], [2, 1]]
+   },
+   "capacity": {
+    "available": 1040,
+    "size_full": 1024,
+    "draft_virtual_id_space": 2631,
+    "size_swa": 1024,
+    "state_slots": 437
+   }
+  },
+  "tri_p16_draft_state": {
+   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "total_bytes": 136704,
+   "reserved_floor": 1024,
+   "active_allocation_bytes": 136704,
+   "sub_pools": {
+    "mamba": {
+     "kind": "MambaSubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 576,
+     "host_entry_bytes": 384,
+     "draft_offset": 384,
+     "max_slots": 237,
+     "min_slot_index": 2,
+     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
+     "views": {
+      "conv": [[0, [2, 237, 3, 8], [24, 288, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 237, 1, 4, 8], [32, 144, 32, 8, 1], "torch.float32"],
+      "draft_conv": [[384, [1, 237, 3, 8], [24, 288, 8, 1], "torch.bfloat16"]],
+      "draft_temporal": [448, [1, 237, 1, 4, 8], [32, 144, 32, 8, 1], "torch.float32"]
+     }
+    },
+    "swa": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 64,
+     "host_entry_bytes": 64,
+     "draft_offset": null,
+     "max_slots": 2136,
+     "min_slot_index": 16,
+     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
+     "views": {
+      "k": [[0, [2128, 1, 8], [32, 8, 1], "torch.float16"], [32, [2128, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [2128, 1, 8], [32, 8, 1], "torch.float16"], [48, [2128, 1, 8], [32, 8, 1], "torch.float16"]]
+     }
+    },
+    "full": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 64,
+     "host_entry_bytes": 64,
+     "draft_offset": null,
+     "max_slots": 2136,
+     "min_slot_index": 16,
+     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
+     "views": {
+      "k": [[0, [2128, 1, 8], [32, 8, 1], "torch.float16"], [32, [2128, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [2128, 1, 8], [32, 8, 1], "torch.float16"], [48, [2128, 1, 8], [32, 8, 1], "torch.float16"]]
+     }
+    }
+   },
+   "members": {
+    "mamba": ["up", 237, 2, 237, 576],
+    "swa": ["float", 133, 1, 133, 1024],
+    "full": ["down", 133, 1, 133, 1024]
+   },
+   "pools": {
+    "full": {
+     "buf_infos": [[0, 136704, 1024]],
+     "host_capacity": [1024, 65536],
+     "page_envelope": [133, 1024]
+    },
+    "swa": {
+     "buf_infos": [[0, 136704, 1024]],
+     "host_capacity": [1024, 65536],
+     "page_envelope": [133, 1024]
+    },
+    "mamba": {
+     "buf_infos": [[0, 136704, 576]],
+     "host_capacity": [236, 135936]
+    }
+   },
+   "layer_maps": {
+    "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]],
+    "state": [[0, 0], [2, 1]]
+   },
+   "capacity": {
+    "available": 1040,
+    "size_full": 1024,
+    "draft_virtual_id_space": 2135,
+    "size_swa": 1024,
+    "state_slots": 236
+   }
+  },
+  "tri_p16_slice_axis": {
+   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "total_bytes": 135168,
+   "reserved_floor": 1024,
+   "active_allocation_bytes": 135168,
+   "sub_pools": {
+    "mamba": {
+     "kind": "MambaSubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 384,
+     "host_entry_bytes": 384,
+     "draft_offset": null,
+     "max_slots": 352,
+     "min_slot_index": 3,
+     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 1],
+     "views": {
+      "conv": [[0, [2, 352, 3, 8], [24, 192, 8, 1], "torch.bfloat16"]],
+      "temporal": [128, [2, 352, 1, 4, 8], [32, 96, 32, 8, 1], "torch.float32"]
+     }
+    },
+    "swa": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 64,
+     "host_entry_bytes": 64,
+     "draft_offset": null,
+     "max_slots": 2112,
+     "min_slot_index": 16,
+     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
+     "views": {
+      "k": [[0, [2112, 1, 8], [32, 8, 1], "torch.float16"], [32, [2112, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [2112, 1, 8], [32, 8, 1], "torch.float16"], [48, [2112, 1, 8], [32, 8, 1], "torch.float16"]]
+     }
+    },
+    "full": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 2,
+     "entry_bytes": 64,
+     "host_entry_bytes": 64,
+     "draft_offset": null,
+     "max_slots": 2112,
+     "min_slot_index": 16,
+     "parts": [["k", 0, 32, 2, [1, 8], "torch.float16"], ["v", 16, 32, 2, [1, 8], "torch.float16"]],
+     "views": {
+      "k": [[0, [2112, 1, 8], [32, 8, 1], "torch.float16"], [32, [2112, 1, 8], [32, 8, 1], "torch.float16"]],
+      "v": [[16, [2112, 1, 8], [32, 8, 1], "torch.float16"], [48, [2112, 1, 8], [32, 8, 1], "torch.float16"]]
+     }
+    }
+   },
+   "members": {
+    "mamba": ["up", 352, 3, 352, 384],
+    "swa": ["float", 132, 1, 132, 1024],
+    "full": ["down", 132, 1, 132, 1024]
+   },
+   "pools": {
+    "full": {
+     "buf_infos": [[0, 135168, 1024]],
+     "host_capacity": [1024, 65536],
+     "page_envelope": [132, 1024]
+    },
+    "swa": {
+     "buf_infos": [[0, 135168, 1024]],
+     "host_capacity": [1024, 65536],
+     "page_envelope": [132, 1024]
+    },
+    "mamba": {
+     "buf_infos": [[0, 135168, 384]],
+     "host_capacity": [351, 134784]
+    }
+   },
+   "layer_maps": {
+    "kv": [[0, 0, false], [1, 1, false], [2, 0, true], [3, 1, true]],
+    "state": [[0, 0], [2, 1]]
+   },
+   "capacity": {
+    "available": 1040,
+    "size_full": 1024,
+    "draft_virtual_id_space": 2111,
+    "size_swa": 1024,
+    "state_slots": 351
+   }
+  },
+  "tri_pp_stage": {
+   "chain": [["mamba", "up"], ["swa", "float"], ["full", "down"]],
+   "total_bytes": 67584,
+   "reserved_floor": 512,
+   "active_allocation_bytes": 67584,
+   "sub_pools": {
+    "mamba": {
+     "kind": "MambaSubPoolSpec",
+     "layer_num": 1,
+     "entry_bytes": 192,
+     "host_entry_bytes": 192,
+     "draft_offset": null,
+     "max_slots": 352,
+     "min_slot_index": 3,
+     "state": [[[3, 8]], "torch.bfloat16", [1, 4, 8], "torch.float32", 0],
+     "views": {
+      "conv": [[0, [1, 352, 3, 8], [24, 96, 8, 1], "torch.bfloat16"]],
+      "temporal": [64, [1, 352, 1, 4, 8], [32, 48, 32, 8, 1], "torch.float32"]
+     }
+    },
+    "swa": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 1,
+     "entry_bytes": 32,
+     "host_entry_bytes": 32,
+     "draft_offset": null,
+     "max_slots": 2112,
+     "min_slot_index": 16,
+     "parts": [["k", 0, 32, 1, [1, 8], "torch.float16"], ["v", 16, 32, 1, [1, 8], "torch.float16"]],
+     "views": {
+      "k": [[0, [2112, 1, 8], [16, 8, 1], "torch.float16"], [0, [2112, 1, 8], [16, 8, 1], "torch.float16"]],
+      "v": [[16, [2112, 1, 8], [16, 8, 1], "torch.float16"], [16, [2112, 1, 8], [16, 8, 1], "torch.float16"]]
+     }
+    },
+    "full": {
+     "kind": "MHASubPoolSpec",
+     "layer_num": 1,
+     "entry_bytes": 32,
+     "host_entry_bytes": 32,
+     "draft_offset": null,
+     "max_slots": 2112,
+     "min_slot_index": 16,
+     "parts": [["k", 0, 32, 1, [1, 8], "torch.float16"], ["v", 16, 32, 1, [1, 8], "torch.float16"]],
+     "views": {
+      "k": [[0, [2112, 1, 8], [16, 8, 1], "torch.float16"], [0, [2112, 1, 8], [16, 8, 1], "torch.float16"]],
+      "v": [[16, [2112, 1, 8], [16, 8, 1], "torch.float16"], [16, [2112, 1, 8], [16, 8, 1], "torch.float16"]]
+     }
+    }
+   },
+   "members": {
+    "mamba": ["up", 352, 3, 352, 192],
+    "swa": ["float", 132, 1, 132, 512],
+    "full": ["down", 132, 1, 132, 512]
+   },
+   "pools": {
+    "full": {
+     "buf_infos": [[0, 67584, 512]],
+     "host_capacity": [1024, 32768],
+     "page_envelope": [132, 512]
+    },
+    "swa": {
+     "buf_infos": [[0, 67584, 512]],
+     "host_capacity": [1024, 32768],
+     "page_envelope": [132, 512]
+    },
+    "mamba": {
+     "buf_infos": [[0, 67584, 192]],
+     "host_capacity": [351, 67392]
     }
    },
    "layer_maps": {
@@ -1909,26 +1909,29 @@
     "state": [[2, 0]]
    },
    "capacity": {
-    "available": 1024,
+    "available": 1040,
     "size_full": 1024,
-    "draft_virtual_id_space": 2091,
+    "draft_virtual_id_space": 2111,
     "size_swa": 1024,
-    "state_slots": 379
+    "state_slots": 351
    }
   }
  },
  "bs1_floors": {
   "swa_p16": {
    "terms": [["swa_window_kv", 3072], ["sink", 1024]],
-   "budget_at_floor": 4096
+   "budget_at_floor": 9236,
+   "minimum_usable_budget": 9236
   },
   "mamba_p16": {
-   "terms": [["bs1_state_slots", 1056], ["sink", 1024]],
-   "budget_at_floor": 1376
+   "terms": [["mamba_bs1_state_slots", 1152], ["sink", 1024]],
+   "budget_at_floor": 7336,
+   "minimum_usable_budget": 7976
   },
   "tri_p16": {
-   "terms": [["swa_window_kv", 3072], ["bs1_state_slots", 1056], ["sink", 1024]],
-   "budget_at_floor": 2336
+   "terms": [["mamba_bs1_state_slots", 1152], ["swa_window_kv", 3072], ["sink", 1024]],
+   "budget_at_floor": 10408,
+   "minimum_usable_budget": 11304
   }
  }
 }

@@ -187,6 +187,11 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         self.assertEqual(captured.tolist(), [[5, 5]] * 2 + [[0, 0]] * 4)
 
     def test_ple_replay_uses_live_request_layout(self):
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
             breakable_cuda_graph as bcg,
         )
@@ -203,10 +208,22 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         )
         context = SimpleNamespace(forward_batch=batch)
         capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
-        pool = Mock(get_mamba_indices=lambda indices: indices)
+        pool = SimpleNamespace(
+            state_sub_pool="mamba", get_mamba_indices=lambda indices: indices
+        )
+        backend = SimpleNamespace(
+            req_to_token_pool=pool,
+            runner_ids=RunnerIds(
+                req_to_token=torch.zeros((3, 8), dtype=torch.int32),
+                token_to_kv_pool_allocator=None,
+                token_to_kv_pool=SimpleNamespace(id_spaces=lambda: {}),
+                page_size=1,
+                device="cpu",
+            ),
+        )
         cases = [([8], [0] * 8), ([4, 4], [0] * 4 + [1] * 4)]
         with (
-            patch.object(qwen4_exp, "get_req_to_token_pool", return_value=pool),
+            forward_context(ForwardContext(attn_backend=backend)),
             patch.object(bcg, "_current_capture_var") as active,
             patch.object(
                 qwen4_exp, "get_tc_piecewise_forward_context", return_value=context
@@ -230,6 +247,10 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 for replay in capture.cuda_graph._break_fns:
                     replay()
                 self.assertEqual(holder.batch.req_indices.tolist(), expected)
+                self.assertEqual(
+                    holder.batch.state_indices.tolist(),
+                    list(range(1, len(lengths) + 1)),
+                )
 
     def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):
         class Model:

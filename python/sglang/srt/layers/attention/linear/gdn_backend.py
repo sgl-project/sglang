@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.linear.utils import (
     pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -678,7 +679,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             track_rows=track_rows,
         )
+        if track_rows is None and forward_batch.mamba_track_indices is not None:
+            meta.track_dst[: forward_batch.batch_size].copy_(
+                forward_batch.mamba_track_indices
+            )
         self.prefill_graph_metadata = meta
+        self.forward_metadata = ForwardMetadata(
+            query_start_loc=meta.cu_seqlens,
+            mamba_cache_indices=meta.cache_indices,
+            mamba_track_indices=None
+            if forward_batch.mamba_track_indices is None
+            else meta.track_dst[: forward_batch.batch_size],
+        )
 
     def _prefill_graph_track_rows(
         self, forward_batch: ForwardBatch

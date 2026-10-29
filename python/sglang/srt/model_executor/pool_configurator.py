@@ -91,6 +91,10 @@ class MemoryPoolConfig:
     # instead of re-summing token counts; None when a user token cap is the budget.
     unified_total_bytes: Optional[int] = None
 
+    # Live owner-token ceiling (user or PP), distinct from the arena's share.
+    # None allows token KV to borrow unused state/window capacity.
+    unified_full_cap_tokens: Optional[int] = None
+
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
             msg = "Not enough memory. Please try to increase --mem-fraction-static."

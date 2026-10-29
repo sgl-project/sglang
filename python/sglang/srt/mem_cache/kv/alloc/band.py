@@ -519,6 +519,13 @@ class Band:
 
     # -- size reporting --
 
+    max_live_tokens: Optional[int] = None
+
+    def cap_available(self, tokens: int) -> int:
+        if self.max_live_tokens is None:
+            return tokens
+        return min(tokens, max(0, self.max_live_tokens - self.allocated_count()))
+
     def _allocated_pages(self) -> int:
         """Number of allocated PAGES (TOKEN callers use `allocated_count()`)."""
         if self.grow_direction == "up":
@@ -698,7 +705,7 @@ class Band:
         if self._avail_memo_epoch != epoch:
             self._avail_memo_tokens = self._available_tokens()
             self._avail_memo_epoch = epoch
-        return self._avail_memo_tokens
+        return self.cap_available(self._avail_memo_tokens)
 
     def _peer_drainable_hole_bytes(self) -> int:
         """Gap bytes an urgent flush of the growth-side chain neighbor would
@@ -746,13 +753,7 @@ class Band:
 
         Allocation checks use available_size(). Cache by capacity and gate state.
         """
-        key = self._schedulable_capacity_key()
-        if self._sched_avail_memo_key != key:
-            self._sched_avail_memo_tokens = self._available_tokens(
-                extra_gap_bytes=self._peer_drainable_hole_bytes()
-            )
-            self._sched_avail_memo_key = key
-        return self._sched_avail_memo_tokens
+        return self.cap_available(self._schedulable_physical_tokens())
 
     def _flush_targets(self):
         """A band short on its OWN alloc asks only its growth-side neighbour to
@@ -777,6 +778,8 @@ class Band:
         physical PAGE ids, or `None` on shortfall.
         """
         with record_function("Band.take_physical"):
+            if need_size > self.cap_available(need_size):
+                return None
             if need_size <= 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
             assert need_size % self.page_size == 0, (
@@ -904,6 +907,10 @@ class Band:
     def take_physical_pages(self, num_pages: int) -> Optional[torch.Tensor]:
         """Page-granular wrapper around ``take_physical``."""
         with record_function("Band.take_physical_pages"):
+            if num_pages * self.page_size > self.cap_available(
+                num_pages * self.page_size
+            ):
+                return None
             return self.take_physical(num_pages * self.page_size)
 
     def _sorted_free_phys_pages(self) -> torch.Tensor:
@@ -947,6 +954,8 @@ class Band:
         when holes exist. Returns physical page ids [N], or None on shortfall.
         """
         with record_function("Band.place_pages"):
+            if N * self.page_size > self.cap_available(N * self.page_size):
+                return None
             if N == 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
 
@@ -1822,14 +1831,14 @@ class Band:
         self, max_slots: int, *, virtual_num_pages: Optional[int] = None
     ) -> None:
         """Set active ranges while retaining the captured v2p/p2v storage."""
-        num_pages = int(max_slots) // self.page_size
+        num_pages = int(max_slots) // self.pool_page_size
         num_virtual_ids = (
             num_pages if virtual_num_pages is None else int(virtual_num_pages)
         )
         self.num_pages = num_pages
         self.ids.num_virtual_ids = num_virtual_ids
-        self.max_slots = num_pages * self.page_size
-        self.size = self.max_slots
+        self.max_slots = num_pages * self.pool_page_size
+        self.size = num_pages * self.page_size
         self.clear()
 
     _load_pinned_pages: _CapacityField[int] = _CapacityField()
@@ -1917,6 +1926,16 @@ class Band:
             self.live_page_count -= int(physical_pages.shape[0])
             return
         self._compact_pending(physical_pages)
+
+    def _schedulable_physical_tokens(self) -> int:
+        """Physical room after neighbor flush, before the owner token quota."""
+        key = self._schedulable_capacity_key()
+        if self._sched_avail_memo_key != key:
+            self._sched_avail_memo_tokens = self._available_tokens(
+                extra_gap_bytes=self._peer_drainable_hole_bytes()
+            )
+            self._sched_avail_memo_key = key
+        return self._sched_avail_memo_tokens
 
 
 def chain_byte_accounting_violations(

@@ -1900,7 +1900,6 @@ class TestPagedBand(unittest.TestCase):
     # OOB kernel inputs.
     def test_paged_pool_translate_helper_returns_physical_tokens(self):
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-        from sglang.srt.mem_cache.kv.alloc.interim import _virtual_tokens_to_physical
 
         full_spec = MHASubPoolSpec(
             name="full",
@@ -1948,7 +1947,7 @@ class TestPagedBand(unittest.TestCase):
         v_tokens = allocator.alloc(2 * PS)
         self.assertIsNotNone(v_tokens)
 
-        swa_phys = _virtual_tokens_to_physical(v_tokens, allocator.swa_attn_allocator)
+        swa_phys = allocator.swa_attn_allocator.ids.translate(v_tokens)
 
         self.assertTrue(
             bool((swa_phys >= 0).all().item()),
@@ -2708,16 +2707,23 @@ class TestChainFrontierWalk(unittest.TestCase):
 
     def test_multi_hop_walk_stops_at_first_opaque(self):
         _, fa, ma = self._build_pair()
-        t1 = _ChainStub(low_byte=100, high_byte=100, transparent=True)
-        t2 = _ChainStub(low_byte=200, high_byte=260, transparent=False)
+        low = fa._byte_high_frontier()
+        gap = ma._byte_low_frontier() - low
+        self.assertGreater(gap, 0)
+        t1_pos = low + gap // 4
+        t2_lo, t2_hi = low + gap // 2, low + 3 * gap // 4
+        t1 = _ChainStub(low_byte=t1_pos, high_byte=t1_pos, transparent=True)
+        t2 = _ChainStub(low_byte=t2_lo, high_byte=t2_hi, transparent=False)
         fa.bind_high_peer(t1)
         t1.low_peer = fa
         t1.high_peer = t2
         t2.low_peer = t1
         t2.high_peer = ma
         ma.bind_low_peer(t2)
-        self.assertEqual(fa._current_gap_bytes(), 200 - fa._byte_high_frontier())
+        self.assertEqual(fa._current_gap_bytes(), t2_lo - fa._byte_high_frontier())
         self.assertIs(fa._growth_side_neighbor(), t2)
+        self.assertEqual(ma._current_gap_bytes(), ma._byte_low_frontier() - t2_hi)
+        self.assertIs(ma._growth_side_neighbor(), t2)
         t2.transparent = True
         self.assertIs(fa._growth_side_neighbor(), ma)
         self.assertEqual(
@@ -3422,7 +3428,6 @@ class TestDcpWidening(unittest.TestCase):
                 )
                 mamba_slots = UnifiedMambaSlotAllocator(
                     allocator.mamba_allocator,
-                    max_size=allocator.mamba_allocator.max_slots - 1,
                     device=_DEV,
                 )
 
@@ -3481,7 +3486,6 @@ class TestDcpWidening(unittest.TestCase):
             )
             mamba_slots = UnifiedMambaSlotAllocator(
                 allocator.mamba_allocator,
-                max_size=allocator.mamba_allocator.max_slots - 1,
                 device=_DEV,
             )
 

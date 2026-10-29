@@ -1594,35 +1594,17 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
 
             def _swa_payload():
-                allocator = self.token_to_kv_pool_allocator
-                kvcache = allocator.get_kvcache()
-                # A unified pool (one with transfer storage) keeps its window
-                # in a sub-pool, never in per-request window rows.
-                request_window = (
-                    None if allocator.storage is not None else kvcache.request_window
+                storage = kv_storage_of(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
-                # Under encoder replay the scheduler is not hybrid SWA and keeps no
-                # window size; the pool holds it.
-                window_size = (
-                    self.sliding_window_size
-                    if request_window is None
-                    else kvcache.sliding_window
+                resume = storage.resume_units(
+                    "swa",
+                    req,
+                    token_start=req.disagg_decode_prefix_len,
+                    token_boundary=seq_len,
+                    window=self.sliding_window_size,
                 )
-                window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
-                if request_window is not None:
-                    return request_window.page_indices(
-                        int(req.kv.req_pool_idx), window_start, seq_len
-                    )
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.kv.req_pool_idx, window_start:seq_len
-                ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
-                        window_kv_indices_full
-                    )
-                )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                return resume.unit_ids.cpu().numpy()
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[

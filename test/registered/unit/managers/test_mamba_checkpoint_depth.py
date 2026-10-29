@@ -63,6 +63,7 @@ def _prepare_extend(
     req.mamba_branching_seqlen = None
 
     batch = ScheduleBatch(reqs=[req])
+    batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
     batch.model_config = SimpleNamespace(
         hf_text_config=SimpleNamespace(mamba_chunk_size=CHUNK)
     )
