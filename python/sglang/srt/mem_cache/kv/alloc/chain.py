@@ -597,25 +597,29 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     @property
     def cpu_copy_carries_mamba(self) -> bool:
-        return self._policy.cpu_copy_carries_state
+        return self.roles.state is not None
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         """Retraction backup: `Req.offload_kv_cache` hands over `req_to_token`
         rows, which hold VIRTUAL ids here; each sub-pool's view copies its
         physical ones."""
-        return self._policy.get_cpu_copy(
-            self, indices, mamba_indices=mamba_indices, req_pool_index=req_pool_index
+        from sglang.srt.mem_cache.kv.memory.snapshot import copy_to_cpu
+
+        return copy_to_cpu(
+            self, indices, state_indices=mamba_indices, request_row=req_pool_index
         )
 
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
-        self._policy.load_cpu_copy(
+        from sglang.srt.mem_cache.kv.memory.snapshot import restore_from_cpu
+
+        restore_from_cpu(
             self,
             kv_cache_cpu,
             indices,
-            mamba_indices=mamba_indices,
-            req_pool_index=req_pool_index,
+            state_indices=mamba_indices,
+            request_row=req_pool_index,
         )
 
     # -- ordering with transfers and forwards --

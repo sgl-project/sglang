@@ -134,6 +134,11 @@ class KVStorage:
         return self.view(name).host_layout()
 
     @property
+    def request_memory(self):
+        """Fixed REQUEST parts, copied together when a request is retracted."""
+        return self._request_memory
+
+    @property
     def allocator(self):
         """The chain allocator, for what does not go through this storage yet:
         admission and eviction (capacity), the tree's frees."""

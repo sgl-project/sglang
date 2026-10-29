@@ -37,7 +37,6 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     float_reclaim_satisfied,
     float_token_id_capacity,
 )
-from sglang.srt.mem_cache.swa_memory_pool import filter_window_cpu_copy
 from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
@@ -61,16 +60,6 @@ class ChainAdmissionRules(msgspec.Struct, frozen=True, kw_only=True):
 
 def _snapshot(c: ChainAllocator) -> ChainSnapshot:
     return c.pricing_snapshot()
-
-
-def _virtual_tokens_to_physical(virtual_tokens: torch.Tensor, band) -> torch.Tensor:
-    """Virtual token ids -> the band's physical token ids, page-aware. A page
-    the band does not bind yields a negative id."""
-    page_size = band.page_size
-    if page_size == 1:
-        return band.ids.virtual_to_physical[virtual_tokens]
-    physical_pages = band.ids.virtual_to_physical[virtual_tokens // page_size]
-    return physical_pages * page_size + virtual_tokens % page_size
 
 
 def _state_usage(c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
@@ -130,20 +119,6 @@ class _InterimPolicy:
 
     def memo_violations(self, c: ChainAllocator) -> List[str]:
         return []
-
-    # Whether a retraction copy carries the request's state; otherwise the
-    # scheduler backs the state up on its own.
-    cpu_copy_carries_state = False
-
-    def get_cpu_copy(
-        self, c: ChainAllocator, indices, *, mamba_indices, req_pool_index
-    ):
-        raise NotImplementedError
-
-    def load_cpu_copy(
-        self, c: ChainAllocator, cpu_copy, indices, *, mamba_indices, req_pool_index
-    ) -> None:
-        raise NotImplementedError
 
 
 class _OwnerEndPolicy(_InterimPolicy):
@@ -214,37 +189,6 @@ class _OwnerEndPolicy(_InterimPolicy):
             * get_parallel().attn_dcp_size
             // c.full_attn_allocator.entry_bytes
         )
-
-    cpu_copy_carries_state = True
-
-    def get_cpu_copy(
-        self, c: ChainAllocator, indices, *, mamba_indices, req_pool_index
-    ):
-        owner = c.views[c.roles.owner]
-        kv_cpu = owner.get_cpu_copy(
-            c.full_attn_allocator.ids.translate(indices.to(torch.int64)),
-            req_pool_index=req_pool_index,
-        )
-        state_cpu = None
-        if mamba_indices is not None:
-            state_cpu = c.state.pool.get_cpu_copy(
-                c.state_ids(c.roles.state).ids(mamba_indices)
-            )
-        return kv_cpu, state_cpu
-
-    def load_cpu_copy(
-        self, c: ChainAllocator, cpu_copy, indices, *, mamba_indices, req_pool_index
-    ) -> None:
-        kv_cpu, state_cpu = cpu_copy
-        c.views[c.roles.owner].load_cpu_copy(
-            kv_cpu,
-            c.full_attn_allocator.ids.translate(indices.to(torch.int64)),
-            req_pool_index=req_pool_index,
-        )
-        if state_cpu is not None and mamba_indices is not None:
-            c.state.pool.load_cpu_copy(
-                state_cpu, c.state_ids(c.roles.state).ids(mamba_indices)
-            )
 
 
 class _WindowPolicy(_InterimPolicy):
@@ -357,46 +301,6 @@ class _WindowPolicy(_InterimPolicy):
             f"[joint] stale available_size memo: "
             f"cached={self._joint_avail_memo_tokens}, actual={actual}"
         ]
-
-    def get_cpu_copy(
-        self, c: ChainAllocator, indices, *, mamba_indices, req_pool_index
-    ):
-        # `indices` are virtual token ids; each side copies its physical ones,
-        # and the window only the tokens it still binds.
-        full_phys = _virtual_tokens_to_physical(indices, c.full_attn_allocator)
-        swa_phys = _virtual_tokens_to_physical(indices, c.swa_attn_allocator)
-        full_cpu = c.views[c.roles.owner].get_cpu_copy(
-            full_phys, req_pool_index=req_pool_index
-        )
-        valid = swa_phys >= 0
-        swa_cpu = None
-        if bool(valid.any().item()):
-            swa_cpu = c.views[c.roles.window].get_cpu_copy(swa_phys[valid])
-        return {"full": full_cpu, "swa": swa_cpu, "swa_mask": valid.cpu()}
-
-    def load_cpu_copy(
-        self, c: ChainAllocator, cpu_copy, indices, *, mamba_indices, req_pool_index
-    ) -> None:
-        full_phys = _virtual_tokens_to_physical(indices, c.full_attn_allocator)
-        c.views[c.roles.owner].load_cpu_copy(
-            cpu_copy["full"], full_phys, req_pool_index=req_pool_index
-        )
-        if cpu_copy.get("swa") is None:
-            return
-        window = c.views[c.roles.window]
-        swa_phys = _virtual_tokens_to_physical(indices, c.swa_attn_allocator)
-        old_swa_mask = cpu_copy["swa_mask"].to(indices.device)
-        assert old_swa_mask.shape == indices.shape
-        row_mask = (swa_phys >= 0)[old_swa_mask].cpu()
-        swa_phys = swa_phys[old_swa_mask][row_mask.to(indices.device)]
-        if swa_phys.numel() == 0:
-            return
-        window.load_cpu_copy(
-            filter_window_cpu_copy(
-                window, swa_kv_cpu=cpu_copy["swa"], row_mask=row_mask
-            ),
-            swa_phys,
-        )
 
 
 class _TokenEndsPolicy(_WindowPolicy):

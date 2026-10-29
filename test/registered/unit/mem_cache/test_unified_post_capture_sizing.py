@@ -201,6 +201,54 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
         self.assertIsNotNone(allocator.alloc(n))
         self.assertEqual(allocator.available_size(), 0)
 
+    def test_retraction_restores_complete_entries_at_new_dcp_coordinates(self):
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [2]},
+            regions={
+                "full": DenseDraftRegion(
+                    lane_num=2,
+                    head_num=1,
+                    head_dim=3,
+                    v_head_dim=5,
+                    store_dtype=torch.bfloat16,
+                )
+            },
+        )
+        for dcp in (1, 2, 4):
+            for rank in range(dcp):
+                with (
+                    self.subTest(dcp=dcp, rank=rank),
+                    get_parallel().override(attn_dcp_size=dcp, attn_dcp_rank=rank),
+                ):
+                    bundle = _bundle(
+                        total_bytes=_FINAL_BYTES,
+                        post_capture_active=False,
+                        chain="state",
+                        fused_draft=placement,
+                    )
+                    allocator = bundle.token_to_kv_pool_allocator
+                    source = allocator.alloc(16 * dcp)
+                    old_state = allocator.alloc_state_slots(1)
+                    target = allocator.alloc(16 * dcp)
+                    new_state = allocator.alloc_state_slots(1)
+                    for band in allocator.members:
+                        virtual = old_state if band.sub_pool_name == "mamba" else source
+                        physical = band.ids.translate_write(virtual.to(torch.int64))
+                        physical = physical[physical > 0]
+                        allocator.arena.entries(band.sub_pool_name)[physical] = 79
+                    saved = allocator.get_cpu_copy(source, mamba_indices=old_state)
+                    allocator.load_cpu_copy(saved, target, mamba_indices=new_state)
+                    for band in allocator.members:
+                        virtual = new_state if band.sub_pool_name == "mamba" else target
+                        physical = band.ids.translate_write(virtual.to(torch.int64))
+                        physical = physical[physical > 0]
+                        self.assertTrue(
+                            torch.all(
+                                allocator.arena.entries(band.sub_pool_name)[physical]
+                                == 79
+                            )
+                        )
+
     def test_every_chain_retains_captured_and_fixed_addresses(self):
         for chain, dcp in (
             ("full", 1),
