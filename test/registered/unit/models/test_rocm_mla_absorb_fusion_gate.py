@@ -17,6 +17,8 @@ import torch
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
 )
+from sglang.srt.models.kimi_k3_rocm_mla import KimiK3RocmMlaQCacheWriter
+from sglang.srt.runtime_context import get_resources
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -113,6 +115,71 @@ class TestAbsorbBmmConfig(CustomTestCase):
     def test_large_row_count_falls_back(self):
         self.assertIsNone(_ABSORB_CONFIG(16, 0, 512))
         self.assertIsNone(_ABSORB_CONFIG(16, 257, 512))
+
+
+class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
+    """The K3 writer replaces the split chain only where attention never reads its k,
+    and the cache holds the bytes the split chain would have written."""
+
+    def setUp(self):
+        # write() registers the shared zero-position buffer on this CPU device.
+        self.addCleanup(get_resources().buffers.pop, "kimi_k3_mla_zero_positions", None)
+        self.writer = KimiK3RocmMlaQCacheWriter(kv_lora_rank=512, qk_rope_head_dim=64)
+        self.fused_q = torch.zeros(2, 12, 576, dtype=torch.bfloat16)
+        # The kernels are the boundary; the gate in front of them is under test.
+        self.writer._write_aiter = lambda **_: self.fused_q
+
+    def _write(self, *, attention_backend, is_target_verify, k_scale_float=1.0):
+        return self.writer.write(
+            q_nope=torch.zeros(2, 12, 512, dtype=torch.bfloat16),
+            q_pe=torch.zeros(2, 12, 64, dtype=torch.bfloat16),
+            k_nope=torch.zeros(2, 1, 512, dtype=torch.bfloat16),
+            k_pe=torch.zeros(2, 1, 64, dtype=torch.bfloat16),
+            out_cache_loc=torch.arange(2, dtype=torch.int64),
+            kv_cache=torch.zeros(4, 1, 576, dtype=torch.bfloat16),
+            k_scale_float=k_scale_float,
+            attention_backend=attention_backend,
+            is_target_verify=is_target_verify,
+        )
+
+    def test_triton_target_verify_keeps_the_split_chain(self):
+        """Triton target-verify runs the extend kernel, which reads k;
+        fusing it would feed that kernel the uninitialized k placeholder."""
+        self.assertIsNone(
+            self._write(attention_backend="triton", is_target_verify=True)
+        )
+
+    def test_fused_routes(self):
+        for backend, verify in (("aiter", False), ("aiter", True), ("triton", False)):
+            with self.subTest(backend=backend, verify=verify):
+                fused = self._write(attention_backend=backend, is_target_verify=verify)
+                self.assertIs(fused[0], self.fused_q)
+                self.assertEqual(tuple(fused[1].shape), (2, 1, 576))
+
+    def test_non_unit_kv_scale_keeps_the_split_chain(self):
+        """The split chain's AITER cache write casts without the KV scale,
+        while the fused kernels divide by it; their bytes differ unless it is 1."""
+        for k_scale_float in (None, 1.0):
+            with self.subTest(k_scale_float=k_scale_float):
+                self.assertIsNotNone(
+                    self._write(
+                        attention_backend="aiter",
+                        is_target_verify=False,
+                        k_scale_float=k_scale_float,
+                    )
+                )
+        self.assertIsNone(
+            self._write(
+                attention_backend="aiter", is_target_verify=False, k_scale_float=2.0
+            )
+        )
+
+    def test_other_backends_keep_the_split_chain(self):
+        for verify in (False, True):
+            with self.subTest(verify=verify):
+                self.assertIsNone(
+                    self._write(attention_backend="dsa", is_target_verify=verify)
+                )
 
 
 if __name__ == "__main__":

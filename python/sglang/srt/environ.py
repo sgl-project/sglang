@@ -1071,6 +1071,9 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Kimi-K3 MLA decode: write the identity-RoPE Q and latent KV cache in one launch,
+    # AITER on gfx950 and AITER Triton elsewhere, instead of the split chain.
+    SGLANG_OPT_HIP_K3_MLA_Q_CACHE_FUSION = EnvBool(False)
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
