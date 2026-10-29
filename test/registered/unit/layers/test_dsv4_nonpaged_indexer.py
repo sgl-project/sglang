@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.dsv4.indexer import (
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
     _SM100_INDEXER_M_CHUNK,
+    _SM120_INDEXER_M_CHUNK,
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
     iter_row_chunks,
@@ -45,6 +46,10 @@ _ISSUE_ALIGNED_COLS = 93184
 
 class TestDSV4PagedIndexerMetadata(CustomTestCase):
     def test_sm120_fp4_forces_deep_gemm_metadata(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
         expected = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
         deep_gemm = SimpleNamespace(
             get_num_sms=MagicMock(return_value=1),
@@ -53,6 +58,10 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
 
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend.get_platform",
+                return_value=SimpleNamespace(is_sm100=False, is_sm120=True),
+            ),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
             envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(True),
@@ -61,14 +70,34 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
                 "sglang.kernels.ops.attention.dsv4.get_paged_mqa_logits_metadata"
             ) as jit_metadata,
         ):
-            metadata = PagedIndexerMetadata(
-                page_size=256,
-                compressed_page_size=64,
+            core = SimpleNamespace(
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
-                compressed_seq_lens=torch.tensor([65], dtype=torch.int32),
-                use_topk_v2=False,
-                force_deep_gemm_metadata=True,
+                **{
+                    name: torch.tensor([65], dtype=torch.int32)
+                    for name in (
+                        "c1_topk_lengths_clamp1",
+                        "c2_topk_lengths_clamp1",
+                        "c4_topk_lengths_raw",
+                    )
+                },
             )
+            for ratio in (1, 2, 4):
+                deep_gemm.get_paged_mqa_logits_metadata.reset_mock()
+                deep_gemm.get_num_sms.reset_mock()
+                backend = SimpleNamespace(
+                    page_size=256,
+                    enable_deepseek_v4_fp4_indexer=ratio == 4,
+                    token_to_kv_pool=SimpleNamespace(
+                        get_index_k_page_size=lambda _: 64
+                    ),
+                    dsa_topk_backend=SimpleNamespace(should_use_topk_v2=lambda: False),
+                )
+                metadata = DeepseekV4AttnBackend.init_forward_metadata_indexer(
+                    backend,
+                    core,
+                    compress_ratio=ratio,
+                )
+                self.assertIs(metadata.deep_gemm_metadata, expected, f"{ratio=}")
 
         self.assertIs(metadata.deep_gemm_metadata, expected)
         deep_gemm.get_num_sms.assert_called_once_with()
@@ -787,6 +816,8 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
         budget,
         use_topk_v2: bool,
         mx: bool = False,
+        sm120: bool = False,
+        jit_metadata: bool = False,
         first_len: int = 1,
     ):
         deep_gemm = SimpleNamespace(
@@ -804,10 +835,11 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
-            envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(False),
+            envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(jit_metadata),
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
             patch(f"{_METADATA}.is_hip", return_value=False),
             patch(f"{_METADATA}.is_xpu", return_value=False),
-            patch(f"{_METADATA}._IS_SM120", False),
+            patch(f"{_METADATA}._IS_SM120", sm120),
             patch(f"{_METADATA}.uses_mx_mqa_logits", return_value=mx),
             patch.object(
                 PagedIndexerMetadata, "_mqa_logits_budget", return_value=budget
@@ -883,17 +915,26 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
         deep_gemm.get_paged_mqa_logits_metadata.assert_called_once()
         plan_topk_v2.assert_called_once()
 
-    def test_sm100_caps_rows_per_deep_gemm_schedule(self):
-        num_rows = _SM100_INDEXER_M_CHUNK + 1
-        metadata, deep_gemm, _ = self._build(
-            num_rows=num_rows, budget=None, use_topk_v2=False, mx=True
-        )
-        self.assertEqual(metadata.rows_per_chunk, _SM100_INDEXER_M_CHUNK)
-        schedule_rows = [
-            call.args[0].shape[0]
-            for call in deep_gemm.get_paged_mqa_logits_metadata.call_args_list
-        ]
-        self.assertEqual(schedule_rows, [_SM100_INDEXER_M_CHUNK, 1])
+    def test_deep_gemm_schedule_caps_override_the_jit_planner(self):
+        for mx, cap in (
+            (True, _SM100_INDEXER_M_CHUNK),
+            (False, _SM120_INDEXER_M_CHUNK),
+        ):
+            with self.subTest(mx=mx):
+                metadata, deep_gemm, _ = self._build(
+                    num_rows=cap + 1,
+                    budget=None,
+                    use_topk_v2=False,
+                    mx=mx,
+                    sm120=not mx,
+                    jit_metadata=True,
+                )
+                self.assertEqual(metadata.rows_per_chunk, cap)
+                schedule_rows = [
+                    call.args[0].shape[0]
+                    for call in deep_gemm.get_paged_mqa_logits_metadata.call_args_list
+                ]
+                self.assertEqual(schedule_rows, [cap, 1])
 
     def test_graph_replay_copies_chunk_plans_in_place(self):
         num_rows = _SM100_INDEXER_M_CHUNK + 1
@@ -1206,6 +1247,39 @@ class TestGroupedVerifyRows(CustomTestCase):
 
 
 class TestCandidateIndexerGating(CustomTestCase):
+    def test_dense_fp4_dispatch_keeps_sm120(self):
+        from sglang.srt.layers.attention.dsv4 import v41_indexer
+
+        for major in (9, 10, 12):
+            with (
+                self.subTest(major=major),
+                patch.object(v41_indexer, "is_cuda", return_value=True),
+                patch.object(
+                    torch.cuda, "get_device_capability", return_value=(major, 0)
+                ),
+                patch.object(
+                    v41_indexer,
+                    "is_sm100_or_newer",
+                    v41_indexer.is_sm100_or_newer.__wrapped__,
+                ),
+                patch.object(
+                    v41_indexer,
+                    "_use_deep_gemm_prefill",
+                    v41_indexer._use_deep_gemm_prefill.__wrapped__,
+                ),
+                patch.object(v41_indexer, "has_dense_fp4_indexer", return_value=True),
+                patch(
+                    "sglang.srt.layers.attention.dsv4.v41_indexer.full_topk.is_deep_select_supported",
+                    return_value=False,
+                ),
+            ):
+                indexer = v41_indexer.make_full_topk_indexer(
+                    token_to_kv_pool=None,
+                    req_to_token=None,
+                )
+                self.assertEqual(indexer.use_deep_gemm_prefill, major in (10, 12))
+                self.assertEqual(indexer.use_deep_gemm_decode, major in (10, 12))
+
     def test_candidate_indexer_gating(self):
         from sglang.srt.layers.attention.dsv4 import v41_indexer
         from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
@@ -1213,13 +1287,13 @@ class TestCandidateIndexerGating(CustomTestCase):
         )
 
         def sm100(value):
-            return patch.object(
-                v41_indexer, "has_deep_gemm_index_logits", lambda: value
-            )
+            return patch.object(v41_indexer, "is_sm100_supported", lambda: value)
 
-        def make(topk_blocks, block_size):
+        def make(topk_blocks, block_size, *, dense_prefill=False):
             # The prefill choice reads the real DeepGEMM build and is cached.
-            with patch.object(v41_indexer, "_use_deep_gemm_prefill", lambda: False):
+            with patch.object(
+                v41_indexer, "_use_deep_gemm_prefill", lambda: dense_prefill
+            ):
                 return v41_indexer.make_candidate_indexer(
                     token_to_kv_pool=None,
                     req_to_token=torch.zeros((1, 1), dtype=torch.int32),
@@ -1238,6 +1312,12 @@ class TestCandidateIndexerGating(CustomTestCase):
                     prefill, decode = make(topk_blocks, block_size)
                 self.assertIsInstance(prefill, DenseBlocksBackend)
                 self.assertIsInstance(decode, DenseBlocksBackend)
+        # SM120 retains dense DeepGEMM prefill without entering SM100 sparse kernels.
+        with sm100(False), patch(flag, False):
+            prefill, decode = make(2048, 8, dense_prefill=True)
+            self.assertIsInstance(prefill, DenseBlocksBackend)
+            self.assertIs(prefill, decode)
+            self.assertTrue(prefill.use_deep_gemm_prefill)
         # Blackwell without DeepGEMM's sparse logits fails instead of falling back.
         with sm100(True), patch(flag, False):
             with self.assertRaises(RuntimeError):

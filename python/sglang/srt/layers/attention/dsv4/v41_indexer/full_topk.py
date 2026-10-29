@@ -1,5 +1,5 @@
 """The full top-k of the ratio-1/2 index layers outside the candidate scheme:
-DeepGEMM on SM100, torch elsewhere."""
+DeepGEMM on SM100/SM120, torch elsewhere."""
 
 from __future__ import annotations
 

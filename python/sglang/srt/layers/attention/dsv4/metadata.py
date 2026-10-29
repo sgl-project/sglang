@@ -219,13 +219,15 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            # SM100 DeepGEMM schedules varlen rows in its own format, which the
-            # JIT builder does not produce
+            # DeepGEMM uses its own SM100 varlen format and 128-token splits
+            # on SM120; neither matches the JIT builder's 256-token splits
             mx = uses_mx_mqa_logits(self.compressed_seq_lens.device)
             use_jit_indexer = (
                 not self.force_deep_gemm_metadata
                 and self.rows_per_request == 1
-                and not (mx and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get())
+                and not (
+                    (mx or _IS_SM120) and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+                )
                 and (
                     envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
                     or self.compressed_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD

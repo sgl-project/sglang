@@ -1541,7 +1541,10 @@ class DeepseekV4AttnBackend(
             force_deep_gemm_metadata=(
                 self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
             )
-            or (compress_ratio in (1, 2) and get_platform().is_sm100),
+            or (
+                compress_ratio in (1, 2)
+                and (get_platform().is_sm100 or get_platform().is_sm120)
+            ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
             rows_per_request=rows_per_request,
