@@ -21,7 +21,10 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
+from sglang.srt.beam_search.logits_capture import (
+    capture_pre_sample_logits,
+    is_beam_only_batch,
+)
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
@@ -729,6 +732,15 @@ class TpModelWorker(BaseTpWorker):
 
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
+                return batch_result
+
+            if logits_output.beam is not None and is_beam_only_batch(batch):
+                # The beam coordinator relays every row's token from the captured
+                # logits; this host placeholder only keeps the result's shape.
+                batch_result.next_token_ids = torch.zeros(
+                    len(batch.reqs), dtype=torch.int64
+                )
+                self._maybe_finalize_elastic_cuda_graph_scale()
                 return batch_result
 
             # Delay sampling only for normal generation requests.

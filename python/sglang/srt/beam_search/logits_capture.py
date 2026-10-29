@@ -16,6 +16,11 @@
 The sampler rewrites next_token_logits in place (temperature/softmax), and
 the scheduler-side joint selection runs later, at the relay point -- so the
 raw logits it needs are preserved here, before sampling.
+
+A beam-only batch skips the sampler: the coordinator selects every row's next
+token, so a sampled one would never be read. Nothing then rewrites the logits,
+and the capture keeps views instead of list-indexed clones, whose index upload
+would sync the host on the forward and stall the launch path behind it.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ if TYPE_CHECKING:
 class BeamLogitsCapture(msgspec.Struct):
     """The preserved raw logits, stashed on LogitsProcessorOutput.beam."""
 
-    leader_logits: torch.Tensor  # pre-sample clone of the leader rows
+    leader_logits: torch.Tensor  # leader rows: a pre-sample clone, a view if unsampled
     tail_logits: Optional[torch.Tensor] = None  # member rows' slice (decode)
     leader_rows: Optional[List[int]] = None  # leaders' batch indices (extend)
     leader_normalizer: Optional[torch.Tensor] = None
@@ -61,13 +66,28 @@ def _copy_leader_rows(tensor: torch.Tensor, rows: List[int]) -> torch.Tensor:
     return tensor.index_select(0, indices)
 
 
+def is_beam_only_batch(batch: ScheduleBatch) -> bool:
+    """Every reqs-aligned row is a beam leader, so the coordinator relays every
+    row's next token at this forward and the regular sampler has no reader."""
+    tail = batch.beam_tail
+    if tail is not None:
+        return len(tail.entries) == tail.num_base_rows
+    mode = batch.forward_mode
+    return (
+        mode.is_extend()
+        and not mode.is_mixed()
+        and all(req.beam_group is not None for req in batch.reqs)
+    )
+
+
 def capture_pre_sample_logits(
     batch: Optional[ScheduleBatch],
     forward_batch: ForwardBatch,
     logits_output: Optional[LogitsProcessorOutput],
 ) -> None:
     """Decode: split the member tail off logits/hidden_states/positions and
-    clone the leader rows. Extend: clone the leaders' rows. No-op otherwise."""
+    clone the leader rows. Extend: clone the leaders' rows. No-op otherwise.
+    A beam-only batch keeps views instead of clones."""
     if (
         batch is None
         or logits_output is None
@@ -80,20 +100,29 @@ def capture_pre_sample_logits(
         n = batch.beam_tail.num_base_rows
         logits = logits_output.next_token_logits
         logits_output.next_token_logits = logits[:n]
-        leader_rows = [e.leader_idx for e in batch.beam_tail.entries]
         normalizer = logits_output.beam_normalizer
-        logits_output.beam = BeamLogitsCapture(
-            leader_logits=_copy_leader_rows(logits, leader_rows),
-            tail_logits=logits[n:],
-            leader_normalizer=(
-                _copy_leader_rows(normalizer, leader_rows)
-                if normalizer is not None
-                else None
-            ),
-            tail_normalizer=(
-                normalizer[n:].clone() if normalizer is not None else None
-            ),
-        )
+        if is_beam_only_batch(batch):
+            # Unsampled, so views stay valid; leaders are rows [0, n) in entry order.
+            logits_output.beam = BeamLogitsCapture(
+                leader_logits=logits[:n],
+                tail_logits=logits[n:],
+                leader_normalizer=normalizer[:n] if normalizer is not None else None,
+                tail_normalizer=normalizer[n:] if normalizer is not None else None,
+            )
+        else:
+            leader_rows = [e.leader_idx for e in batch.beam_tail.entries]
+            logits_output.beam = BeamLogitsCapture(
+                leader_logits=_copy_leader_rows(logits, leader_rows),
+                tail_logits=logits[n:],
+                leader_normalizer=(
+                    _copy_leader_rows(normalizer, leader_rows)
+                    if normalizer is not None
+                    else None
+                ),
+                tail_normalizer=(
+                    normalizer[n:].clone() if normalizer is not None else None
+                ),
+            )
         logits_output.beam_normalizer = None
         if logits_output.hidden_states is not None:
             logits_output.hidden_states = logits_output.hidden_states[:n]
@@ -104,15 +133,22 @@ def capture_pre_sample_logits(
         leader_rows = [i for i, r in enumerate(batch.reqs) if r.beam_group is not None]
         if leader_rows:
             normalizer = logits_output.beam_normalizer
-            logits_output.beam = BeamLogitsCapture(
-                leader_logits=_copy_leader_rows(
-                    logits_output.next_token_logits, leader_rows
-                ),
-                leader_rows=leader_rows,
-                leader_normalizer=(
-                    _copy_leader_rows(normalizer, leader_rows)
-                    if normalizer is not None
-                    else None
-                ),
-            )
+            if is_beam_only_batch(batch):
+                logits_output.beam = BeamLogitsCapture(
+                    leader_logits=logits_output.next_token_logits,
+                    leader_rows=leader_rows,
+                    leader_normalizer=normalizer,
+                )
+            else:
+                logits_output.beam = BeamLogitsCapture(
+                    leader_logits=_copy_leader_rows(
+                        logits_output.next_token_logits, leader_rows
+                    ),
+                    leader_rows=leader_rows,
+                    leader_normalizer=(
+                        _copy_leader_rows(normalizer, leader_rows)
+                        if normalizer is not None
+                        else None
+                    ),
+                )
             logits_output.beam_normalizer = None

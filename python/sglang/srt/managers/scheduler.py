@@ -69,6 +69,7 @@ try:
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.beam_search.logits_capture import is_beam_only_batch
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -5287,14 +5288,16 @@ class Scheduler(
             payload = RelayPayload(bonus_tokens=batch_result.next_token_ids)
         else:
             return
-        if batch.beam_tail is not None:
-            # The worker sliced the tail off before sampling, so sampled tokens
-            # cover only the reqs-aligned rows; the coordinator relays the rest.
-            future_indices = future_indices[: batch.beam_tail.num_base_rows]
-        if self.uocr_runtime is not None:
-            # The decode graph reads its relay; a step it did not publish seeds it.
-            self.uocr_runtime.relay_result(batch, batch_result, future_indices)
-        self.future_map.stash(future_indices, payload)
+        # A beam-only batch was not sampled; the coordinator relays every row.
+        if not is_beam_only_batch(batch):
+            if batch.beam_tail is not None:
+                # The worker sliced the tail off before sampling, so sampled tokens
+                # cover only the reqs-aligned rows; the coordinator relays the rest.
+                future_indices = future_indices[: batch.beam_tail.num_base_rows]
+            if self.uocr_runtime is not None:
+                # The decode graph reads its relay; a step it did not publish seeds it.
+                self.uocr_runtime.relay_result(batch, batch_result, future_indices)
+            self.future_map.stash(future_indices, payload)
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
         )
