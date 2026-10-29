@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.kernels.ops.memory.small_copy import (
+    MAX_FIELD_NUMEL as SMALL_COPY_MAX_FIELD_NUMEL,
+)
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_graph_variants
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
@@ -619,19 +622,27 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             copy_dsts=copy_dsts,
             copy_srcs=copy_srcs,
         )
-        _grouped_foreach_copy_(copy_dsts, copy_srcs)
-
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
-        # DMA engine; foreach would force the ~3x slower compute-kernel copy.
+        # DMA engine; foreach would force the ~3x slower compute-kernel copy. A
+        # small batch's rows ride in the grouped copy instead.
+        hidden = None
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
             and forward_batch.spec_info.hidden_states.shape[1]
             == buffers.hidden_states.shape[1]
         ):
-            buffers.hidden_states[:num_tokens].copy_(
-                forward_batch.spec_info.hidden_states
+            hidden = (
+                buffers.hidden_states[:num_tokens],
+                forward_batch.spec_info.hidden_states,
             )
+            if hidden[0].numel() <= SMALL_COPY_MAX_FIELD_NUMEL:
+                copy_dsts.append(hidden[0])
+                copy_srcs.append(hidden[1])
+                hidden = None
+        _grouped_foreach_copy_(copy_dsts, copy_srcs)
+        if hidden is not None:
+            hidden[0].copy_(hidden[1])
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

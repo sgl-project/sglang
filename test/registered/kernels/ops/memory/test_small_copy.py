@@ -5,7 +5,11 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.memory import small_field_copy as small_field_copy_module
-from sglang.kernels.ops.memory.small_copy import _small_copy_kernel, try_small_copy
+from sglang.kernels.ops.memory.small_copy import (
+    MAX_FIELD_NUMEL,
+    _small_copy_kernel,
+    try_small_copy,
+)
 from sglang.kernels.ops.memory.small_field_copy import (
     SmallFieldCopyPlan,
     small_field_copy,
@@ -95,8 +99,8 @@ class TestSmallCopy(CustomTestCase):
         self.assertFalse(try_small_copy([x[:8], x[4:12]], [y[:8], y[:8]]))
         self.assertFalse(
             try_small_copy(
-                [torch.empty(8193, device="cuda")] * 2,
-                [torch.empty(8193, device="cuda")] * 2,
+                [torch.empty(MAX_FIELD_NUMEL + 1, device="cuda") for _ in range(2)],
+                [torch.empty(MAX_FIELD_NUMEL + 1, device="cuda") for _ in range(2)],
             )
         )
         self.assertFalse(
@@ -108,6 +112,20 @@ class TestSmallCopy(CustomTestCase):
         a = torch.empty(2)
         self.assertFalse(try_small_copy([a, a], [a, a]))
         self.assertTrue(try_small_copy([x, y], [x, y]))
+
+    def test_hidden_rows_ride_with_small_fields(self):
+        # a draft step's hidden rows and DSA seed next to its index fields
+        for rows in (1, 2, 8):
+            with self.subTest(rows=rows):
+                hidden = torch.randn(rows, 6144, device="cuda", dtype=torch.bfloat16)
+                seed = torch.randint(
+                    -1, 1 << 20, (rows, 2048), device="cuda", dtype=torch.int32
+                )
+                lens = torch.randint(1, 1 << 16, (rows,), device="cuda")
+                dsts = [torch.empty_like(t) for t in (hidden, seed, lens)]
+                self.assertTrue(try_small_copy(dsts, [hidden, seed, lens]))
+                for d, src in zip(dsts, (hidden, seed, lens)):
+                    self.assertTrue(torch.equal(_as_bytes(d), _as_bytes(src)))
 
     def test_broadcast_and_negative_views(self):
         source = torch.arange(7, device="cuda", dtype=torch.float32)

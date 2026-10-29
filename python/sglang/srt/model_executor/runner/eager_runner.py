@@ -71,6 +71,24 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 
 logger = logging.getLogger(__name__)
 
+# Set while a graph runner runs forwards on its own fixed-address buffers (EAGLE's
+# draft graph steps): the eager input load passes the batch's tensors through.
+_inputs_in_place = False
+
+
+@contextlib.contextmanager
+def eager_inputs_in_place():
+    """Eager forwards inside this context read the batch's tensors in place, without
+    the copy into the eager buffers; for callers whose batch already sits in fixed
+    buffers of their own."""
+    global _inputs_in_place
+    prev, _inputs_in_place = _inputs_in_place, True
+    try:
+        yield
+    finally:
+        _inputs_in_place = prev
+
+
 _is_hip = is_hip()
 
 if TYPE_CHECKING:
@@ -183,7 +201,7 @@ class EagerRunner(BaseRunner):
         """Copy the live batch into the fixed-max eager static buffers (sliced to
         this batch's shape) — the eager counterpart of the cuda-graph runners'
         load_batch."""
-        if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
+        if envs.SGLANG_EAGER_INPUT_NO_COPY.get() or _inputs_in_place:
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         if forward_batch.input_ids is not None:
