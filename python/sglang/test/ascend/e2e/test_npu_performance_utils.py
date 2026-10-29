@@ -391,23 +391,26 @@ def run_bench_serving(
     gsp_num_groups=None,
     gsp_prompts_per_group=None,
     cache_report=False,
+    min_cache_hit_rate=None,
+    min_device_hit_rate=None,
     min_host_hit_rate=None,
     env=None,
 ):
     """Run sglang.bench_serving against a live server and parse its metrics.
 
     cache_report=True collects the server's --enable-cache-report hit rates
-    without asserting anything. The parsed metrics dict then carries
-    cache_hit_rate_pct (overall), device_hit_rate_pct (L1) and
-    host_hit_rate_pct (L2/HiCache), so L1 can be checked by reading the
-    returned dict. min_host_hit_rate is a fraction (0.1 = 10%): setting it
-    implicitly turns on cache_report and asserts L2 > threshold; leaving it
-    None keeps the run assertion-free.
+    into the returned metrics dict without asserting anything:
+      - cache_hit_rate_pct: overall KV hit rate
+      - device_hit_rate_pct: L1 hit rate (device = GPU/NPU memory tier)
+      - host_hit_rate_pct: L2 hit rate (host = CPU memory / HiCache tier)
+    L3 (storage) is out of scope for now; the naming leaves room for a
+    future storage_hit_rate_pct entry.
+    min_*_hit_rate thresholds are fractions (0.1 = 10%) and can be combined
+    freely (min_cache_hit_rate / min_device_hit_rate / min_host_hit_rate);
+    each set threshold asserts its tier strictly greater than the value.
+    They all depend on the report: setting any threshold without
+    cache_report=True raises an error instead of silently skipping.
     """
-    # The assertion needs the report to exist; enable it implicitly so
-    # callers only set one knob for a checked L2 run.
-    if min_host_hit_rate is not None:
-        cache_report = True
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_file = (
         "./bench_log.txt"
@@ -643,27 +646,41 @@ def run_bench_serving(
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
 
-    if min_host_hit_rate is not None:
-        host_hit = metrics.get("host_hit_rate_pct")
-        if host_hit is None:
+    # Hit-rate assertions: any subset of overall / L1 (device) / L2 (host).
+    # All of them parse the --cache-report output, so that flag must be on.
+    hit_rate_thresholds = (
+        ("cache", "cache_hit_rate_pct", min_cache_hit_rate),
+        ("device", "device_hit_rate_pct", min_device_hit_rate),
+        ("host", "host_hit_rate_pct", min_host_hit_rate),
+    )
+    requested = [t for t in hit_rate_thresholds if t[2] is not None]
+    if requested and not cache_report:
+        raise Exception(
+            "A min_*_hit_rate threshold is set but cache_report is False; "
+            "hit-rate parsing requires --cache-report (and the server must "
+            "run with --enable-cache-report). Pass cache_report=True or "
+            "drop the thresholds."
+        )
+    for tier, metric_key, threshold in requested:
+        value = metrics.get(metric_key)
+        if value is None:
             raise Exception(
-                "No host hit rate found in bench_serving output while "
-                "min_host_hit_rate is set (did the server run with "
+                f"No {tier} hit rate found in bench_serving output while "
+                f"min_{tier}_hit_rate is set (did the server run with "
                 "--enable-cache-report and the bench with --cache-report?)"
             )
         # Parsed values are percentages ("18.2"); thresholds are fractions.
-        host_hit_rate = float(host_hit) / 100
-        dump_metric("host_hit_rate", host_hit_rate, labels={"type": "perf"})
+        hit_rate = float(value) / 100
+        dump_metric(f"{tier}_hit_rate", hit_rate, labels={"type": "perf"})
         dump_metric(
-            "host_hit_rate_baseline",
-            float(min_host_hit_rate),
+            f"{tier}_hit_rate_baseline",
+            float(threshold),
             labels={"type": "perf"},
         )
         # Strictly greater: a zero threshold stays meaningful (any actual
         # hit must be > 0), instead of trivially passing on ">=".
-        assert host_hit_rate > float(min_host_hit_rate), (
-            f"L2 host hit rate {host_hit}% is not above "
-            f"{float(min_host_hit_rate) * 100}%"
+        assert hit_rate > float(threshold), (
+            f"{tier} hit rate {value}% is not above {float(threshold) * 100}%"
         )
 
     return metrics

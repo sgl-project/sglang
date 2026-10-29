@@ -157,6 +157,7 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
             gsp_prompts_per_group=32,
             seed=42,
             warmup_requests=16,
+            cache_report=True,
             min_host_hit_rate=self.host_hit_rate,
         )
 
