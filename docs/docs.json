@@ -1534,6 +1534,12 @@
                     "pages": [
                       "cookbook/autoregressive/Kev/kev"
                     ]
+                  },
+                  {
+                    "group": "StartLux",
+                    "pages": [
+                      "cookbook/autoregressive/StartLux/StartLux-Decision-v1.1-27B-AutoThink"
+                    ]
                   }
                 ]
               },
