@@ -976,9 +976,18 @@ class Scheduler(
             if selectable_tokens:
                 selectable_sequences = []
                 for end_token in selectable_tokens:
-                    token_ids = self.tokenizer.encode(
-                        end_token, add_special_tokens=False
-                    )
+                    # Same native-id preference as get_think_end_token_ids: a
+                    # marker that is one vocabulary entry must resolve to its
+                    # id, not to the ordinary-token spelling encode() returns
+                    # under split_special_tokens.
+                    native_id = self.tokenizer.convert_tokens_to_ids(end_token)
+                    unk = self.tokenizer.unk_token_id
+                    if native_id is not None and (unk is None or native_id != unk):
+                        token_ids = [native_id]
+                    else:
+                        token_ids = self.tokenizer.encode(
+                            end_token, add_special_tokens=False
+                        )
                     if not token_ids:
                         raise ValueError(
                             f"Request-selectable reasoning terminator {end_token!r} "
