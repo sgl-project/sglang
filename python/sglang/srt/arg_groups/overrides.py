@@ -566,6 +566,15 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
+    if hip and dcp_size > 1:
+        no_dcp_path = chosen - {"triton", None}
+        if no_dcp_path:
+            raise ValueError(
+                f"The {'/'.join(sorted(no_dcp_path))} DSA backend has no DCP path "
+                "on ROCm; use --dsa-prefill-backend triton --dsa-decode-backend "
+                "triton with --dcp-size > 1."
+            )
+
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         return
     if prefill_backend != "tilelang" or decode_backend != "tilelang":
@@ -1072,6 +1081,24 @@ def _deterministic_allreduce_fusion_disable(view: Any) -> dict:
 
 
 @register_post_process
+def _deterministic_rocm_rccl_check(view: Any) -> dict:
+    # Deterministic TP on ROCm relies on the one-stage custom all-reduce; above two ranks
+    # RCCL's results change with the batch, even with its algorithm and protocol pinned.
+    if (
+        view.enable_deterministic_inference
+        and get_platform().is_hip
+        and view.tp_size > 2
+        and view.disable_custom_all_reduce
+    ):
+        raise ValueError(
+            "--disable-custom-all-reduce cannot be combined with "
+            "--enable-deterministic-inference on ROCm when --tp-size is above 2: "
+            "the all-reduce would run through RCCL, which is not batch-invariant."
+        )
+    return {}
+
+
+@register_post_process
 def _deterministic_attention_backend(view: Any) -> dict:
     if not view.enable_deterministic_inference:
         return {}
@@ -1303,6 +1330,33 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 
 
 @register_post_process
+def _hybrid_swa_memory_backend_disable(view: Any) -> dict:
+    if view.disable_hybrid_swa_memory:
+        return {}
+    from sglang.srt.configs.model_config import is_layer_types_hybrid_swa_model
+
+    model_config = model_config_of(view)
+    architectures = model_config.hf_config.architectures
+    if not is_layer_types_hybrid_swa_model(architectures, model_config.hf_text_config):
+        return {}
+    # aiter: with the SWA pool it serves these models through unified_attention,
+    # which loses a passkey 32K tokens back on Gemma 3 that triton retrieves;
+    # drop it here once unified_attention retrieves it too.
+    # wave, flex_attention: they never translate full-pool slots into SWA ones.
+    backends = [
+        backend
+        for backend in attention_backends_of(view)
+        if backend in ("aiter", "wave", "flex_attention")
+    ]
+    if not backends:
+        return {}
+    logger.warning(
+        f"Disable hybrid SWA memory for {architectures[0]} on the {backends[0]} attention backend."
+    )
+    return {"disable_hybrid_swa_memory": True}
+
+
+@register_post_process
 def _intel_xpu_page_constraint(view: Any) -> dict:
     prefill_backend, decode_backend = attention_backends_of(view)
     if "intel_xpu" in (prefill_backend, decode_backend):
@@ -1514,6 +1568,9 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
     Runs before the deprecated cutlass environment override.
     """
     runner = view.moe_runner_backend
+    if runner in ("lora_triton", "lora_cutedsl", "lora_marlin"):
+        logger.warning("LoRA MoE keeps shared experts separate for adapter attachment.")
+        return {"disable_shared_experts_fusion": True}
     if runner == "flashinfer_cutedsl":
         logger.warning(
             "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -1566,6 +1623,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "flashinfer_megamoe",
         "mori",
         "pplx",
+        "ascend_ops",
         "deepep_v2",
     }
 )
@@ -1621,11 +1679,16 @@ def _speculative_moe_runner_default(view: Any) -> dict:
     with a quantized draft can set --speculative-moe-runner-backend explicitly.
     (DeepGEMM megamoe is selected via the a2a backend and falls back per-layer
     when its weights are not prepared, so it needs no override.)
+
+    A target-only lora_* runner defaults the draft to auto: the draft carries
+    no adapters, so it takes the regular runner chain.
     """
     if view.speculative_moe_runner_backend is None:
         default = view.moe_runner_backend
         if default == "flashinfer_megamoe":
             default = "flashinfer_trtllm"
+        elif default.startswith("lora_"):
+            default = "auto"
         return {"speculative_moe_runner_backend": default}
     return {}
 
@@ -1799,10 +1862,11 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     # Only the hybrid-SWA byte pool has a matching post-capture resize path.
     model_config = model_config_of(server_args)
     if cfg.enable_unified_memory:
-        from sglang.srt.configs.hybrid_arch import mambaish_config
+        from sglang.srt.mem_cache.kv.decl import declared_lifetime_types
+        from sglang.srt.mem_cache.kv.plan import resized_after_capture
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        if not model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
+        if not resized_after_capture(declared_lifetime_types(model_config)):
             return False
         # The solver budgets these independent draft pools again after capture.
         spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
