@@ -164,6 +164,7 @@ class TestGraphRoutingContext(CustomTestCase):
         runner.is_draft_worker = False
         runner.spec_algorithm = SpeculativeAlgorithm.NONE
         runner.capture_tail_hooks = []
+        runner.capture_head_hooks = []
         runner.canary_manager = None
         runner.model = model
         return runner
@@ -258,9 +259,7 @@ class TestGraphRoutingContext(CustomTestCase):
         runner.positions = torch.arange(4)
         runner.mrope_positions = torch.zeros((3, 4), dtype=torch.int64)
         runner.num_token_non_padded = torch.zeros(1, dtype=torch.int64)
-        model_runner.kv_index_translator = SimpleNamespace(
-            bind_runner_slots=lambda batch: None
-        )
+        model_runner.runner_ids = SimpleNamespace(bind_runner_slots=lambda batch: None)
         backend.init_forward_metadata_capture_cpu_graph = lambda *args: None
         for size in reversed(runner.capture_bs):
             runner.graphs[size], _ = runner.capture_one_batch_size(
