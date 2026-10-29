@@ -199,8 +199,9 @@ class MambaPoolHost(HostKVCache):
                 f"size of the hierarchical cache."
             )
         logger.info(
-            "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
+            "Allocating %.2f GB host memory for hierarchical Mamba cache (%d state slots, layout=%s).",
             allocation_bytes / 1e9,
+            self.size,
             self.layout,
         )
 

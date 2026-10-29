@@ -773,6 +773,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         layout: str,
         allocator_type: str,
         mtp_draft_device_pools: Sequence = (),
+        pool_names: Sequence[str] = ("full", "swa"),
         pin_memory: bool = True,
         device: str = "cpu",
     ) -> tuple[HostKVCache, HostKVCache]:
@@ -783,7 +784,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         if len(device_pools) != 2:
             raise ValueError("A hybrid-SWA host pool pair requires exactly two pools.")
 
-        pool_names = ("full", "swa")
+        pool_names = tuple(pool_names)
         backing = _SharedPageEnvelopeHostBacking(
             device_pools=device_pools,
             pool_names=pool_names,

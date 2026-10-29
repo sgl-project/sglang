@@ -20,15 +20,24 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
 
 NUM_DRAFT_TOKENS = 8
 DCP_SIZE = 4
 DCP_RANK = 2
+
+
+def _routed(pool):
+    """A stand-in pool whose layers its own plain router hands out."""
+    pool.start_layer, pool.layer_transfer_counter = 0, None
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
 
 
 class _RealVerifyPath(Exception):
@@ -112,9 +121,9 @@ class _DCPMetadataTests:
         def real_path(*args, **kwargs):
             raise _RealVerifyPath
 
-        backend.token_to_kv_pool = SimpleNamespace(set_mla_kv_buffer=real_path)
+        backend.token_to_kv_pool = _routed(SimpleNamespace(set_mla_kv_buffer=real_path))
         backend._run_decode_kernel = real_path
-        layer = SimpleNamespace(tp_q_head_num=heads, v_head_dim=v_head_dim)
+        layer = SimpleNamespace(layer_id=0, tp_q_head_num=heads, v_head_dim=v_head_dim)
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
             out_cache_loc=None,
@@ -295,7 +304,7 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
     # Global KV lengths: one spanning 3 pages, one 2, one under a page.
     SEQ_LENS = [3 * PAGE_SIZE * DCP_SIZE, 2 * PAGE_SIZE * DCP_SIZE - 1, 10]
 
-    def _make_backend(self, translator):
+    def _make_backend(self, runner_ids):
         bs = len(self.VIRTUAL_PAGES)
         max_pos = max(self.SEQ_LENS)
         req_to_token = torch.full((bs, max_pos), -1, dtype=torch.int32, device="cuda")
@@ -313,11 +322,11 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
         backend = object.__new__(TRTLLMMLABackend)
         backend.page_size = self.PAGE_SIZE
         backend.req_to_token = req_to_token
-        backend.kv_index_translator = translator
+        backend.runner_ids = runner_ids
         return backend, req_to_token
 
-    def _fill(self, translator):
-        backend, req_to_token = self._make_backend(translator)
+    def _fill(self, runner_ids):
+        backend, req_to_token = self._make_backend(runner_ids)
         bs = len(self.VIRTUAL_PAGES)
         seq_lens = torch.tensor(self.SEQ_LENS, dtype=torch.int32, device="cuda")
         local_seq_lens = get_dcp_lens(seq_lens, self.DCP_SIZE, self.DCP_RANK).to(
@@ -361,8 +370,8 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
             self.assertTrue((table[req, len(row) :] == -1).all())
 
     def test_static_pool_entries_are_the_collapsed_page(self):
-        translator = SimpleNamespace(full_v2p_table=None)
-        table, local_lens, req_to_token = self._fill(translator)
+        runner_ids = SimpleNamespace(full_v2p_table=None)
+        table, local_lens, req_to_token = self._fill(runner_ids)
         self._assert_matches(table, self._reference(req_to_token, local_lens, None))
 
     def test_unified_pool_entries_go_through_the_page_table(self):
@@ -373,8 +382,8 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
             dtype=torch.int64,
             device="cuda",
         )
-        translator = SimpleNamespace(full_v2p_table=v2p)
-        table, local_lens, req_to_token = self._fill(translator)
+        runner_ids = SimpleNamespace(full_v2p_table=v2p)
+        table, local_lens, req_to_token = self._fill(runner_ids)
         expected = self._reference(req_to_token, local_lens, v2p.cpu())
         self._assert_matches(table, expected)
         # And it is genuinely a translation, not an accident of the fixture.
@@ -387,8 +396,8 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
         num_pages = 1 + max(max(p) for p in self.VIRTUAL_PAGES)
         v2p = torch.arange(num_pages, dtype=torch.int64, device="cuda")
         v2p[self.VIRTUAL_PAGES[0][0]] = -1
-        translator = SimpleNamespace(full_v2p_table=v2p)
-        table, _, _ = self._fill(translator)
+        runner_ids = SimpleNamespace(full_v2p_table=v2p)
+        table, _, _ = self._fill(runner_ids)
         self.assertEqual(int(table[0, 0]), 0)
 
 
@@ -410,7 +419,7 @@ class TestFusedFp8WriteGate(CustomTestCase):
         backend.data_type = torch.float8_e4m3fn
         backend.kv_lora_rank = 512
         backend.qk_rope_head_dim = 64
-        backend.kv_index_translator = SimpleNamespace(is_translating=is_translating)
+        backend.runner_ids = SimpleNamespace(is_translating=is_translating)
         parallel = SimpleNamespace(
             dcp_enabled=dcp_enabled,
             attn_dcp_size=DCP_SIZE if dcp_enabled else 1,
@@ -432,7 +441,7 @@ class TestFusedFp8WriteGate(CustomTestCase):
                 and backend.qk_rope_head_dim == 64
                 and not (
                     backend_module.get_parallel().dcp_enabled
-                    and backend.kv_index_translator.is_translating
+                    and backend.runner_ids.is_translating
                 )
                 and backend_module.can_use_set_mla_kv_concat_q_fp8()
             )
@@ -452,7 +461,7 @@ class TestFusedFp8WriteGate(CustomTestCase):
         """Belt and braces: reaching the helper with a resolved loc asserts
         rather than silently storing into the sink."""
         backend = object.__new__(TRTLLMMLABackend)
-        backend.kv_index_translator = SimpleNamespace(is_translating=True)
+        backend.runner_ids = SimpleNamespace(is_translating=True)
         parallel = SimpleNamespace(
             dcp_enabled=True, attn_dcp_size=DCP_SIZE, attn_dcp_rank=DCP_RANK
         )
@@ -468,9 +477,11 @@ class TestFusedFp8WriteGate(CustomTestCase):
             patch.object(
                 backend,
                 "token_to_kv_pool",
-                SimpleNamespace(
-                    get_key_buffer=lambda _: torch.zeros(
-                        (8, 576), dtype=torch.uint8, device="cuda"
+                _routed(
+                    SimpleNamespace(
+                        get_key_buffer=lambda _: torch.zeros(
+                            (8, 576), dtype=torch.uint8, device="cuda"
+                        )
                     )
                 ),
                 create=True,

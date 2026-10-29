@@ -41,13 +41,14 @@ struct MegaMoEPreDispatchParams {
   uint32_t hidden;
   uint32_t num_groups;  // hidden / group_size
   uint32_t top_k;
+  float topk_weight_scale;
 };
 
 // kGroupSize must match the consuming MoE's activation scale group (quant_group_size).
 // kMultiChunk covers rows too wide for one chunk per thread. It is a template
 // parameter rather than a runtime check because this kernel is issue-bound: the
 // loop bookkeeping alone costs ~10% on the rows that fit a single chunk.
-template <uint32_t kGroupSize, bool kUsePDL, bool kMultiChunk, bool kWriteSharedSF>
+template <uint32_t kGroupSize, bool kUsePDL, bool kMultiChunk, bool kWriteSharedSF, bool kCopyTopk>
 __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams __grid_constant__ params) {
   using namespace device;
@@ -135,10 +136,10 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     }
 
     // Copy this token's topk row (no alignment assumptions; top_k is small).
-    if (tid < params.top_k) {
+    if (kCopyTopk && tid < params.top_k) {
       const uint32_t off = token_id * params.top_k + tid;
       params.buf_topk_idx[off] = params.topk_idx[off];
-      params.buf_topk_weights[off] = params.topk_weights[off];
+      params.buf_topk_weights[off] = __fmul_rn(params.topk_weights[off], params.topk_weight_scale);
     }
   } else {
     // ---- Pad path: trailing blocks fill [num_tokens, padded_max) with (-1, 0) ----
@@ -158,13 +159,13 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
 // ---- Host wrapper
 // ------------------------------------------------------------------------------------------------------------------------
 
-template <int64_t kGroupSize, bool kUsePDL, bool kWriteSharedSF>
+template <int64_t kGroupSize, bool kUsePDL, bool kWriteSharedSF, bool kCopyTopk>
 struct MegaMoEPreDispatchKernel {
   static_assert(kGroupSize == 32 || kGroupSize == 64 || kGroupSize == 128, "unsupported group_size");
   static constexpr auto kernel_one_chunk =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false, kWriteSharedSF>;
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, false, kWriteSharedSF, kCopyTopk>;
   static constexpr auto kernel_multi_chunk =
-      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true, kWriteSharedSF>;
+      mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, true, kWriteSharedSF, kCopyTopk>;
 
   static void
   run(const tvm::ffi::TensorView x,
@@ -175,7 +176,8 @@ struct MegaMoEPreDispatchKernel {
       const tvm::ffi::TensorView buf_topk_idx,
       const tvm::ffi::TensorView buf_topk_weights,
       const tvm::ffi::Optional<tvm::ffi::TensorView> shared_x_sf,
-      const int64_t shared_block_m) {
+      const int64_t shared_block_m,
+      const double topk_weight_scale) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -190,14 +192,16 @@ struct MegaMoEPreDispatchKernel {
         .with_dtype<bf16_t>()
         .with_device(device)
         .verify(x);
-    TensorMatcher({M, K})  // topk_idx
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(topk_idx);
-    TensorMatcher({M, K})  // topk_weights
-        .with_dtype<float>()
-        .with_device(device)
-        .verify(topk_weights);
+    if constexpr (kCopyTopk) {
+      TensorMatcher({M, K})  // topk_idx
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(topk_idx);
+      TensorMatcher({M, K})  // topk_weights
+          .with_dtype<float>()
+          .with_device(device)
+          .verify(topk_weights);
+    }
     // DeepGEMM versions expose this fp8 dispatch buffer either as raw int8
     // storage or as torch.float8_e4m3fn; the kernel writes fp8 bytes in both.
     TensorMatcher({P, H})  // buf.x
@@ -263,7 +267,7 @@ struct MegaMoEPreDispatchKernel {
       shared_sf_stride = sf.stride(1);
     }
 
-    const auto pad_slots = (padded_max - num_tokens) * top_k;
+    const auto pad_slots = kCopyTopk ? (padded_max - num_tokens) * top_k : 0u;
     const uint32_t num_pad_blocks = pad_slots == 0 ? 0u : ((pad_slots + block_size - 1u) / block_size);
     const auto num_total_blocks = num_tokens + num_pad_blocks;
 
@@ -284,6 +288,7 @@ struct MegaMoEPreDispatchKernel {
         .hidden = hidden,
         .num_groups = num_groups,
         .top_k = top_k,
+        .topk_weight_scale = static_cast<float>(topk_weight_scale),
     };
 
     if (num_total_blocks == 0) return;
