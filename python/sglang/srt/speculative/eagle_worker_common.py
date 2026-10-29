@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative import speculative_index
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous_func,
 )
@@ -288,17 +289,30 @@ def prepare_for_draft(
                     prepared_mrope_positions = torch.empty(
                         (3, bs), dtype=torch.int64, device=batch.device
                     )
-            # TODO(lsyin): align with the default code path
-            assign_draft_cache_locs_contiguous_func(
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                topk,
-                window_cols,
-                positions=prepared_positions,
-                mrope=prepared_mrope_positions,
-            )
+            if not (
+                speculative_index.draft_locs(
+                    req=batch.req_pool_indices,
+                    table=req_to_token_pool.req_to_token,
+                    seq=batch.seq_lens,
+                    out_cache_loc=batch.out_cache_loc,
+                    pool_len=req_to_token_pool.req_to_token.shape[1],
+                    topk=topk,
+                    steps=window_cols,
+                    batch_size=bs,
+                    positions=prepared_positions,
+                    mrope=prepared_mrope_positions,
+                )
+            ):
+                assign_draft_cache_locs_contiguous_func(
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    topk,
+                    window_cols,
+                    positions=prepared_positions,
+                    mrope=prepared_mrope_positions,
+                )
             if plans_window:
                 iteration_ids = target_translator.plan(
                     req_pool_indices=batch.req_pool_indices,

@@ -108,10 +108,25 @@ def test_spec_mrope_positions_graph(dtype, mixed):
 @pytest.mark.parametrize("bs", [0, 1, 3, 129])
 @pytest.mark.parametrize("width", [1, 4, 7])
 @pytest.mark.parametrize("mrope", [False, True])
-def test_draft_extend_layout_graph(bs, width, mrope):
+def test_draft_extend_layout_graph(bs, width, mrope, monkeypatch):
     from sglang.kernels.ops.attention.position import compute_position_triton
+    from sglang.kernels.ops.speculative import speculative_index
     from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_layout
 
+    monkeypatch.setattr(
+        speculative_index, "_runtime_optimization_enabled", lambda: True
+    )
+    original_extend_layout = speculative_index.extend_layout
+    fast_path_calls = 0
+
+    def checked_extend_layout(**kwargs):
+        nonlocal fast_path_calls
+        engaged = original_extend_layout(**kwargs)
+        assert engaged
+        fast_path_calls += 1
+        return engaged
+
+    monkeypatch.setattr(speculative_index, "extend_layout", checked_extend_layout)
     seq = torch.arange(bs * 2, device="cuda", dtype=torch.int64)[::2]
     prepare_draft_extend_layout(seq, width, mrope)
     graph = torch.cuda.CUDAGraph()
@@ -139,17 +154,34 @@ def test_draft_extend_layout_graph(bs, width, mrope):
             )
         else:
             assert info[2] is None
+    assert fast_path_calls >= (2 if bs else 0)
 
 
 @pytest.mark.parametrize("bs", [1, 3, 128, 256])
 @pytest.mark.parametrize("depth", [1, 3, 7])
 @pytest.mark.parametrize("preallocated", [False, True])
-def test_chain_tree_graph(bs, depth, preallocated):
+def test_chain_tree_graph(bs, depth, preallocated, monkeypatch):
+    from sglang.kernels.ops.speculative import speculative_index
     from sglang.kernels.ops.speculative.eagle import build_chain_tree
     from sglang.srt.speculative.eagle_utils import (
         TreeMaskMode,
         build_tree_kernel_efficient,
     )
+
+    monkeypatch.setattr(
+        speculative_index, "_runtime_optimization_enabled", lambda: True
+    )
+    original_chain_tree = speculative_index.chain_tree
+    fast_path_calls = 0
+
+    def checked_chain_tree(**kwargs):
+        nonlocal fast_path_calls
+        engaged = original_chain_tree(**kwargs)
+        assert engaged
+        fast_path_calls += 1
+        return engaged
+
+    monkeypatch.setattr(speculative_index, "chain_tree", checked_chain_tree)
 
     bonus = torch.arange(bs * 2, device="cuda", dtype=torch.int32)[::2]
     draft = torch.arange(bs * depth * 4, device="cuda", dtype=torch.int64).reshape(
@@ -197,14 +229,30 @@ def test_chain_tree_graph(bs, depth, preallocated):
             torch.testing.assert_close(a, e, rtol=0, atol=0)
         if buf is not None:
             assert not buf[-19:].any()
+    assert fast_path_calls >= 2
 
 
 @pytest.mark.parametrize("bs", [0, 1, 3, 128])
 @pytest.mark.parametrize("depth", [1, 3, 7])
 @pytest.mark.parametrize("mrope", [False, True])
-def test_chain_tree_prepared_outputs_graph(bs, depth, mrope):
+def test_chain_tree_prepared_outputs_graph(bs, depth, mrope, monkeypatch):
+    from sglang.kernels.ops.speculative import speculative_index
     from sglang.kernels.ops.speculative.eagle import build_chain_tree
 
+    monkeypatch.setattr(
+        speculative_index, "_runtime_optimization_enabled", lambda: True
+    )
+    original_chain_tree = speculative_index.chain_tree
+    fast_path_calls = 0
+
+    def checked_chain_tree(**kwargs):
+        nonlocal fast_path_calls
+        engaged = original_chain_tree(**kwargs)
+        assert engaged
+        fast_path_calls += 1
+        return engaged
+
+    monkeypatch.setattr(speculative_index, "chain_tree", checked_chain_tree)
     table = torch.arange((bs + 3) * 128, dtype=torch.int32, device="cuda").reshape(
         bs + 3, 128
     )[:, ::2]
@@ -242,16 +290,22 @@ def test_chain_tree_prepared_outputs_graph(bs, depth, mrope):
             )
         else:
             assert out[7] is None
+    assert fast_path_calls >= (2 if bs else 0)
 
 
 @pytest.mark.parametrize("bs", [1, 128])
 @pytest.mark.parametrize("steps", [1, 7])
 @pytest.mark.parametrize("mrope", [False, True])
-def test_draft_cache_positions_graph(bs, steps, mrope):
+@pytest.mark.parametrize("optimized", [False, True])
+def test_draft_cache_positions_graph(bs, steps, mrope, optimized, monkeypatch):
+    from sglang.kernels.ops.speculative import speculative_index
     from sglang.kernels.ops.speculative.cache_locs import (
         assign_draft_cache_locs_contiguous_func,
     )
 
+    monkeypatch.setattr(
+        speculative_index, "_runtime_optimization_enabled", lambda: True
+    )
     table = torch.arange((bs + 3) * 64, dtype=torch.int32, device="cuda").reshape(
         bs + 3, 64
     )
@@ -262,9 +316,23 @@ def test_draft_cache_positions_graph(bs, steps, mrope):
     rope = torch.empty((3, bs), device="cuda", dtype=torch.int64) if mrope else None
 
     def run():
-        assign_draft_cache_locs_contiguous_func(
-            requests, table, seq, cache, 1, steps, positions=positions, mrope=rope
-        )
+        if optimized:
+            assert speculative_index.draft_locs(
+                req=requests,
+                table=table,
+                seq=seq,
+                out_cache_loc=cache,
+                pool_len=table.shape[1],
+                topk=1,
+                steps=steps,
+                batch_size=bs,
+                positions=positions,
+                mrope=rope,
+            )
+        else:
+            assign_draft_cache_locs_contiguous_func(
+                requests, table, seq, cache, 1, steps, positions=positions, mrope=rope
+            )
 
     run()
     graph = torch.cuda.CUDAGraph()
@@ -289,6 +357,271 @@ def test_draft_cache_positions_graph(bs, steps, mrope):
             torch.testing.assert_close(
                 rope, seq.long()[None, :].repeat(3, 1), rtol=0, atol=0
             )
+
+
+def test_speculative_index_master_off_uses_stock(monkeypatch):
+    from sglang.kernels.ops.speculative import speculative_index
+    from sglang.kernels.ops.speculative.cache_locs import (
+        assign_draft_cache_locs_contiguous_func,
+    )
+    from sglang.kernels.ops.speculative.eagle import (
+        build_chain_tree,
+        prepare_draft_extend_layout,
+    )
+
+    monkeypatch.setattr(
+        speculative_index, "_runtime_optimization_enabled", lambda: False
+    )
+
+    def forbidden_module():
+        raise AssertionError("master-off path must not load the JIT module")
+
+    monkeypatch.setattr(speculative_index, "_module", forbidden_module)
+
+    seq = torch.tensor([10, 20], dtype=torch.int64, device="cuda")
+    prefix, extend, post, info = prepare_draft_extend_layout(seq, 3, False)
+    assert torch.equal(prefix, seq.int())
+    assert torch.equal(extend, torch.full_like(extend, 3))
+    assert torch.equal(post, seq + 3)
+    assert torch.equal(info[0], torch.tensor([10, 11, 12, 20, 21, 22], device="cuda"))
+
+    bonus = torch.tensor([4, 5], dtype=torch.int32, device="cuda")
+    draft = torch.tensor([[6, 7], [8, 9]], dtype=torch.int64, device="cuda")
+    tree = build_chain_tree(bonus, draft, seq)
+    assert torch.equal(tree[1], info[0])
+    assert torch.equal(tree[5], torch.tensor([4, 6, 7, 5, 8, 9], device="cuda"))
+
+    table = torch.arange(4 * 64, dtype=torch.int32, device="cuda").reshape(4, 64)
+    requests = torch.tensor([0, 2], device="cuda")
+    cache = torch.empty(6, dtype=torch.int64, device="cuda")
+    assert not speculative_index.draft_locs(
+        req=requests,
+        table=table,
+        seq=seq,
+        out_cache_loc=cache,
+        pool_len=64,
+        topk=1,
+        steps=3,
+        batch_size=2,
+        positions=None,
+        mrope=None,
+    )
+    assign_draft_cache_locs_contiguous_func(requests, table, seq, cache, 1, 3)
+    assert torch.equal(
+        cache,
+        torch.cat((table[0, 10:13], table[2, 20:23])).long(),
+    )
+
+
+def test_speculative_index_rejects_unsupported_contracts(monkeypatch):
+    from sglang.kernels.ops.speculative import speculative_index
+
+    monkeypatch.setattr(
+        speculative_index, "_runtime_optimization_enabled", lambda: True
+    )
+
+    def forbidden_module():
+        raise AssertionError("unsupported inputs must not load the JIT module")
+
+    monkeypatch.setattr(speculative_index, "_module", forbidden_module)
+
+    bs, depth = 2, 2
+    width = depth + 1
+    seq = torch.tensor([10, 20], dtype=torch.int64, device="cuda")
+    chain_args = {
+        "bonus": torch.arange(bs, dtype=torch.int32, device="cuda"),
+        "draft": torch.arange(bs * depth, dtype=torch.int64).reshape(bs, depth),
+        "seq": seq,
+        "mask": torch.empty(bs * width * width, dtype=torch.bool, device="cuda"),
+        "positions": torch.empty(bs * width, dtype=torch.int64, device="cuda"),
+        "retrieve": torch.empty(3, bs, width, dtype=torch.int64, device="cuda"),
+        "tokens": torch.empty(bs * width, dtype=torch.int64, device="cuda"),
+        "req": None,
+        "table": None,
+        "out_cache_loc": None,
+        "mrope": None,
+    }
+    assert not speculative_index.chain_tree(**chain_args)
+    chain_args["draft"] = chain_args["draft"].cuda()
+    chain_args["table"] = torch.empty(4, 64, dtype=torch.int32, device="cuda")
+    assert not speculative_index.chain_tree(**chain_args)
+
+    assert not speculative_index.extend_layout(
+        seq=seq,
+        width=3,
+        prefix=torch.empty(bs, dtype=torch.int32, device="cuda"),
+        extend=torch.empty(bs, dtype=torch.int32, device="cuda"),
+        post=torch.empty_like(seq),
+        positions=torch.empty(bs * 3, dtype=torch.int32, device="cuda"),
+        starts=torch.empty(bs, dtype=torch.int32, device="cuda"),
+        mrope=None,
+    )
+
+    contiguous_table = torch.arange(4 * 64, dtype=torch.int32, device="cuda").reshape(
+        4, 64
+    )
+    noncontiguous_table = torch.empty(64, 4, dtype=torch.int32, device="cuda").T
+    draft_args = {
+        "req": torch.arange(bs, device="cuda"),
+        "table": noncontiguous_table,
+        "seq": seq,
+        "out_cache_loc": torch.empty(bs * 3, dtype=torch.int64, device="cuda"),
+        "pool_len": 64,
+        "topk": 1,
+        "steps": 3,
+        "batch_size": bs,
+        "positions": None,
+        "mrope": None,
+    }
+    assert not speculative_index.draft_locs(**draft_args)
+    draft_args["table"] = contiguous_table
+    draft_args["mrope"] = torch.empty(3, bs, dtype=torch.int64, device="cuda")
+    assert not speculative_index.draft_locs(**draft_args)
+
+
+@pytest.mark.parametrize("bs", [1, 3, 128])
+@pytest.mark.parametrize("steps,window", [(1, 1), (3, 4), (6, 7)])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_prepare_draft_window_matches_draft_locs(
+    bs, steps, window, dtype, mrope, monkeypatch
+):
+    from sglang.kernels.ops.speculative import speculative_index
+    from sglang.kernels.ops.speculative.cache_locs import (
+        assign_draft_cache_locs_contiguous,
+        prepare_draft_window,
+    )
+
+    monkeypatch.setattr(
+        speculative_index,
+        "_runtime_optimization_enabled",
+        lambda: True,
+    )
+
+    table = torch.arange((bs + 3) * 64, dtype=torch.int32, device="cuda").reshape(
+        bs + 3, 64
+    )
+    requests = torch.arange(bs, device="cuda")
+    seq = (torch.arange(bs, device="cuda", dtype=dtype) % 48) + 1
+    ref_cache = torch.empty((bs * window,), device="cuda", dtype=torch.int64)
+    ref_pos = torch.empty_like(seq)
+    ref_rope = torch.empty((3, bs), device="cuda", dtype=torch.int64) if mrope else None
+    window_locs = torch.empty((bs * window,), device="cuda", dtype=torch.int64)
+    draft_locs = torch.empty((bs * steps,), device="cuda", dtype=torch.int64)
+    req_out = torch.empty((bs,), device="cuda", dtype=torch.int64)
+    seq_out = torch.empty((bs,), device="cuda", dtype=torch.int64)
+    pos = torch.empty((bs,), device="cuda", dtype=torch.int64)
+    rope = torch.empty((3, bs + 5), device="cuda", dtype=torch.int64) if mrope else None
+
+    def run():
+        prepare_draft_window(
+            requests,
+            seq,
+            table,
+            num_steps=steps,
+            window=window,
+            seq_len_fill_value=1,
+            req_pool_indices_out=req_out,
+            seq_lens_out=seq_out,
+            positions=pos,
+            mrope=rope,
+            draft_out_cache_loc=draft_locs,
+            write_virtual=window_locs,
+        )
+
+    def check():
+        assign_draft_cache_locs_contiguous[(bs,)](
+            requests,
+            table,
+            seq,
+            ref_cache,
+            64,
+            1,
+            window,
+            positions=ref_pos,
+            mrope=ref_rope,
+            BS=bs,
+            WRITE_POSITIONS=True,
+            WRITE_MROPE=mrope,
+        )
+        assert torch.equal(window_locs, ref_cache)
+        assert torch.equal(req_out, requests.long())
+        assert torch.equal(draft_locs, ref_cache.view(bs, window)[:, :steps].flatten())
+        assert torch.equal(seq_out, seq.long()) and torch.equal(pos, ref_pos.long())
+        if mrope:
+            assert torch.equal(rope[:, :bs], ref_rope)
+        jit = torch.empty_like(ref_cache)
+        assert speculative_index.draft_locs(
+            req=requests,
+            table=table,
+            seq=seq,
+            out_cache_loc=jit,
+            pool_len=64,
+            topk=1,
+            steps=window,
+            batch_size=bs,
+            positions=None,
+            mrope=None,
+        )
+        assert torch.equal(window_locs, jit)
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(3):
+        requests.add_(1).remainder_(bs + 3)
+        seq.add_(5).remainder_(48).add_(1)
+        table.add_(17)
+        graph.replay()
+        check()
+
+
+def test_prepare_draft_window_pads_rows_it_cannot_serve():
+    from sglang.kernels.ops.speculative.cache_locs import prepare_draft_window
+
+    pool_len, window, steps, fill = 64, 7, 6, 3
+    table = torch.arange(8 * pool_len, dtype=torch.int32, device="cuda").reshape(
+        8, pool_len
+    )
+    # rows: served, negative request, length 0, window past the row, served
+    requests = torch.tensor([2, -1, 3, 4, 5], device="cuda")
+    seq = torch.tensor(
+        [10, 10, 0, pool_len - window + 1, pool_len - window], device="cuda"
+    )
+    rows = requests.numel()
+    window_locs = torch.full((rows * window,), -9, device="cuda", dtype=torch.int64)
+    draft_locs = torch.full((rows * steps,), -9, device="cuda", dtype=torch.int64)
+    req_out = torch.full((rows,), -9, device="cuda", dtype=torch.int64)
+    seq_out = torch.full((rows,), -9, device="cuda", dtype=torch.int64)
+    pos = torch.full((rows,), -9, device="cuda", dtype=torch.int64)
+    rope = torch.full((3, rows), -9, device="cuda", dtype=torch.int64)
+    prepare_draft_window(
+        requests,
+        seq,
+        table,
+        num_steps=steps,
+        window=window,
+        seq_len_fill_value=fill,
+        req_pool_indices_out=req_out,
+        seq_lens_out=seq_out,
+        positions=pos,
+        mrope=rope,
+        draft_out_cache_loc=draft_locs,
+        write_virtual=window_locs,
+    )
+    served = torch.tensor([True, False, False, False, True], device="cuda")
+    span = torch.arange(window, device="cuda")
+    cols = (seq[:, None] + span).clamp(max=pool_len - 1)
+    want = torch.where(served[:, None], table[requests.clamp(min=0)[:, None], cols], 0)
+    want = want.long()
+    assert torch.equal(window_locs.view(rows, window), want)
+    assert torch.equal(draft_locs.view(rows, steps), want[:, :steps])
+    assert torch.equal(req_out, torch.where(served, requests, 0))
+    assert torch.equal(seq_out, torch.where(served, seq, fill))
+    assert torch.equal(pos, torch.where(served, seq, 0))
+    assert torch.equal(rope, torch.where(served, seq, 0)[None, :].repeat(3, 1))
 
 
 @pytest.mark.parametrize("bs", [0, 1, 7, 128, 257])
