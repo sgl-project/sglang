@@ -15,7 +15,15 @@ def main():
     parser.add_argument("--width", type=int, default=1344)
     parser.add_argument("--num-frames", type=int, default=158)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--bootstrap-chunks", type=int, default=5)
+    parser.add_argument(
+        "--bootstrap-chunks",
+        type=int,
+        default=5,
+        help=(
+            "Number of opening latents to denoise jointly (default: 5). "
+            "Setting this to 1 may cause flicker in the opening frames."
+        ),
+    )
     parser.add_argument("--output-path", default="outputs/physis_h3")
     parser.add_argument(
         "--prompt",

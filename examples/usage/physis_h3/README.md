@@ -33,7 +33,9 @@ The default request produces 158 frames (47 latent chunks) at 1344×768 and 24
 FPS. Use `--height 256 --width 256 --num-frames 22` for a shorter,
 lower-resolution video.
 The first five latents are denoised jointly. Subsequent latents are generated
-one at a time. Use `--bootstrap-chunks 1` to initialize a single latent instead.
+one at a time. `--bootstrap-chunks 1` initializes a single latent and may cause
+flicker in the opening frames. Keep the default of `5` for joint initialization
+of the opening group.
 The Python equivalent is `pipeline_config={"physis_bootstrap_chunks": 1}`.
 Width and height must be multiples of 32. Supported frame counts are `17n+5`
 with `n>=1`, matching complete H3 decoder groups. Each request accepts one
