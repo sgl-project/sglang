@@ -1,7 +1,7 @@
 ---
 title: "Post-Training Integration"
 metatags:
-    description: "SGLang post-training: RLHF integration with Miles, slime, AReaL, ROLL, verl, Unsloth, LLaMA Factory."
+    description: "SGLang post-training: RLHF integration with Halo, Miles, slime, AReaL, ROLL, verl, Unsloth, and LLaMA Factory."
 ---
 SGLang has become the de facto inference backend for modern LLM training frameworks, powering state-of-the-art models across the industry. From GLM-4.6 to Qwen3, leading models leverage SGLang's high-performance inference during reinforcement learning and post-training workflows.
 
@@ -19,6 +19,7 @@ These capabilities, combined with native integration support across major framew
 ## Adoption
 
 - [**Miles**](https://github.com/radixark/miles): Enterprise-scale RL framework for large MoE models with SGLang-native rollout, speculative training, and production-grade stability
+- [**Halo**](https://github.com/whitecircle/halo): Hugging Face-native distributed training with SGLang rollouts, live NCCL weight synchronization, and optional MoE routing replay
 - [**slime**](https://github.com/THUDM/slime): Post-training framework combining Megatron and SGLang, used to train GLM-4.6
 - [**AReaL**](https://github.com/inclusionAI/AReaL): Fully asynchronous RL system achieving 2.77x speedup with SGLang backend for continuous rollout generation
 - [**ROLL**](https://github.com/alibaba/ROLL): ROLL is an efficient and user-friendly RL library designed for Large Language Models utilizing Large Scale GPU resources
