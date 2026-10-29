@@ -1426,7 +1426,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def _block_accept_lens(self, *, accept, folded_accept: bool, bs: int):
         in_graph = (
-            self._verify_epilogue.read_block_accept_lens(bs)
+            self._verify_epilogue.snapshot_block_accept_lens(bs)
             if folded_accept and self._verify_epilogue is not None
             else None
         )
