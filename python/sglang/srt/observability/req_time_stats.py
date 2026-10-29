@@ -83,13 +83,6 @@ def convert_realtime_to_time(realtime_value: float) -> float:
     return realtime_value - global_diff_realtime_monotonic
 
 
-def convert_time_cross_thread(
-    time_value: float, old_diff: float, new_diff: float
-) -> float:
-    # note: precision loss
-    return time_value + old_diff - new_diff
-
-
 @dataclass
 class RequestStageConfig:
     """Configuration for a request pipeline stage.
@@ -245,7 +238,6 @@ class ReqTimeStatsBase:
         default_factory=TraceNullContext
     )
     disagg_mode: DisaggregationMode = DisaggregationMode.NULL
-    diff_realtime_monotonic: float = 0.0
 
     @classmethod
     def new_from_obj(cls, obj: Optional[ReqTimeStatsBase], *args, **kwargs) -> Self:
@@ -345,7 +337,6 @@ class ReqTimeStatsBase:
             "disagg_mode": self.disagg_mode.value if self.disagg_mode else None,
             "enable_metrics": False,
             "trace_ctx": trace_ctx_state,
-            "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
 
     def __setstate__(self, state: object):
@@ -368,13 +359,6 @@ class ReqTimeStatsBase:
             else:
                 state["trace_ctx"] = TraceNullContext()
 
-        for key in state.keys():
-            if key.endswith("time") and state[key]:
-                state[key] = convert_time_cross_thread(
-                    state[key],
-                    state["diff_realtime_monotonic"],
-                    global_diff_realtime_monotonic,
-                )
         self.__dict__.update(state)
 
     def encode_json(self) -> Dict[str, Any]:
@@ -395,17 +379,6 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     api_server_dispatch_time: float = 0.0
     api_server_dispatch_finish_time: float = 0.0
     response_sent_to_client_time: float = 0.0
-
-    def __getstate__(self) -> object:
-        state = {}
-        # send to DP controller or Scheduler
-        # If necessary, can propagate the timestamp here, for example:
-        # state = {
-        #    "created_time": self.created_time,
-        #    "api_server_dispatch_time": self.api_server_dispatch_time,
-        # }
-        state.update(super().__getstate__())
-        return state
 
     def set_created_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -574,18 +547,6 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
     # new timestamp, get by time.perf_counter()
     dpc_dispatch_time: float = 0.0
     dpc_dispatch_finish_time: float = 0.0
-
-    def __getstate__(self) -> object:
-        state = {}
-        # send to Scheduler
-        # If necessary, can propagate the timestamp here, for example:
-        # state = {
-        #     "created_time": self.created_time,
-        #     "api_server_dispatch_time": self.api_server_dispatch_time,
-        #     "dpc_dispatch_time": self.dpc_dispatch_time,
-        # }
-        state.update(super().__getstate__())
-        return state
 
     def set_dp_dispatch_time(self, ts=None):
         ts = ts or time.perf_counter()
