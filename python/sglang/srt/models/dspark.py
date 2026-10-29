@@ -771,8 +771,8 @@ class DSparkDraftMixin:
                 return None
             if attn.k_norm.variance_epsilon != eps:
                 return None
-            k_buf = pool.get_key_buffer(attn.attn.layer_id)
-            v_buf = pool.get_value_buffer(attn.attn.layer_id)
+            k_buf = pool.layer_router.read(attn.attn.layer_id).key()
+            v_buf = pool.layer_router.read(attn.attn.layer_id).value()
             nh = kv_size // head_dim
             # A bf16 pool stores K/V unscaled (set_kv_buffer applies k/v scales
             # only when quantizing), so layer scales do not gate the fused write.
@@ -928,7 +928,7 @@ class DSparkDraftMixin:
             else:
                 # `cache_loc` comes from `TargetHiddenKvInjector.ids_for`,
                 # already in the ids the draft pool indexes.
-                pool.set_kv_buffer(
+                pool.layer_router.layer(attn.attn.layer_id).store(
                     attn.attn,
                     KVWriteLoc(cache_loc, physical=True),
                     k,

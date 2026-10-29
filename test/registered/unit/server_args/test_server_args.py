@@ -50,7 +50,10 @@ from sglang.srt.arg_groups.kv_shard_hook import (
     validate_kv_shard_attention_backend,
 )
 from sglang.srt.arg_groups.lora_hook import check_lora_server_args
-from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
+from sglang.srt.arg_groups.mamba_hook import (
+    handle_int8_mamba_checkpoint,
+    handle_mamba_backend,
+)
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
@@ -1110,6 +1113,26 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires SM100"):
             handle_mamba_backend(server_args)
+
+
+class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
+    def test_rejects_unified_memory(self):
+        """The unified pool has no int8 checkpoint pool; the flag used to be
+        accepted and then silently ignored."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_int8_mamba_checkpoint=True,
+            enable_unified_memory=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+            handle_int8_mamba_checkpoint(server_args)
+
+    def test_unified_memory_alone_is_accepted(self):
+        """An inverted condition here would reject every unified launch."""
+        handle_int8_mamba_checkpoint(
+            ServerArgs(model_path="dummy", enable_unified_memory=True)
+        )
 
 
 class TestKV4Compatibility(unittest.TestCase):
@@ -4788,6 +4811,37 @@ class TestRustServerDpAttentionControlBroadcast(unittest.TestCase):
                 server_args, "enable_dp_attention_local_control_broadcast", False
             )
         )
+
+
+class TestRustServerPrefillReplicaDp(CustomTestCase):
+    def test_prefill_rejects_replica_dp(self):
+        """A plain-DP prefill replica's listener must not advertise a KV
+        bootstrap registry its ranks never register with."""
+
+        def args(**kwargs):
+            return ServerArgs(
+                model_path="dummy",
+                served_model_name="dummy",
+                chunked_prefill_size=-1,
+                **kwargs,
+            )
+
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            self.assertRaisesRegex(ValueError, "prefill does not support"),
+        ):
+            args(disaggregation_mode="prefill", dp_size=2).check_server_args()
+
+        for rust_server, kwargs in (
+            (True, dict(disaggregation_mode="prefill", tp_size=2, attn_dp_size=2)),
+            (True, dict(disaggregation_mode="decode", dp_size=2)),
+            (False, dict(disaggregation_mode="prefill", dp_size=2)),
+        ):
+            with (
+                self.subTest(rust_server=rust_server, **kwargs),
+                envs.SGLANG_RUST_SERVER.override(rust_server),
+            ):
+                args(**kwargs).check_server_args()
 
 
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):

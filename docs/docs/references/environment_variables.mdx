@@ -138,6 +138,11 @@ SGLang supports various environment variables that can be used to configure its 
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the DSv4.1 DSpark and Qwen3.5 MTP runtime optimization groups accompanying NVIDIA megakernels, including EAGLE post-verify graphs and GDN prefill graphs. Unset child switches follow this value; explicitly set child values take precedence, including `0`. Existing backend and capability checks still apply. Simulation, fake/forced acceptance and skip-computation controls remain independent. This does not enable the megakernel backend itself.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_TORCH_INFERENCE_MODE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control whether to use torch.inference_mode</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>

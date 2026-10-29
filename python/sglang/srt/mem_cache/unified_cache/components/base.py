@@ -34,6 +34,7 @@ if TYPE_CHECKING:
         PoolBeliefPolicy,
     )
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.kv.plan import TreeSlot
     from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
@@ -171,8 +172,12 @@ def next_component_uuid(component_type: ComponentType) -> int:
 
 
 class TreeComponent(ABC):
-    def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
+    def __init__(
+        self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
+    ):
         self.cache = cache
+        # The tree slot this component keeps: its id, family and numbers.
+        self.slot = slot
         # Populated when the component passed to TreeCore constructor.
         self.tree_core: Optional[UnifiedTreeCore] = None
         self.is_evict_device_ongoing = False
@@ -855,6 +860,12 @@ class TreeComponent(ABC):
         Called by HostPoolGroup when the host pool is full.
         Default no-op for components without host storage."""
         pass
+
+    def storage_and_sub_pool(self):
+        """The storage this component's values are rows of, and the sub-pool
+        among them it holds."""
+        storage = self.cache.kv_storage()
+        return storage, storage.tree_sub_pool(self.component_type.name)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         """Apply a component-routed cache action; dispatched by the cache."""
