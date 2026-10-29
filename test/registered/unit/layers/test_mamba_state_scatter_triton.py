@@ -256,7 +256,7 @@ class TestMambaStateScatterCorrectness(unittest.TestCase):
 
 
 def _make_envelope_views(device="cpu"):
-    """Envelope-strided conv/temporal views, exactly as UnifiedMambaPool /
+    """Envelope-strided conv/temporal views, exactly as the unified state view /
     the page-major MambaPool serve them ((num_layers, max_slots, *inner) with
     slot stride = the multi-layer entry envelope). Mirrors
     test_flashkda_strided_state_access.py's setup."""
