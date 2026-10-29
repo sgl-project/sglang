@@ -205,15 +205,25 @@ class TokenSpaceSGLangProcessor:
         """
         input_ids = output["input_ids"].flatten()
         # Offsets are where locate_media put each media, inclusive, in list order.
-        offsets = {}
+        media_offsets = {}
         for modality, spans in zip(output["mm_modalities"], output["mm_spans"]):
-            offsets.setdefault(modality, []).extend(
-                (start, end - 1) for start, end in spans
+            media_offsets.setdefault(modality, []).append(
+                [(start, end - 1) for start, end in spans]
             )
         mm_items = self._collect_mm_items(output)
         for item in mm_items:
-            item.offsets = offsets[item.modality]
+            item.offsets = [
+                offset for offsets in media_offsets[item.modality] for offset in offsets
+            ]
         mm_items = self._serving_spec.split_mm_items(mm_items)
+        items_by_modality = {}
+        for item in mm_items:
+            items_by_modality.setdefault(item.modality, []).append(item)
+        for modality, items in items_by_modality.items():
+            # A modality the split left bundled keeps all its media's offsets.
+            if len(items) == len(media_offsets[modality]):
+                for item, offsets in zip(items, media_offsets[modality]):
+                    item.offsets = offsets
         # Hash the feature tensors themselves: transport may swap them for CUDA IPC handles.
         self._set_item_hashes(mm_items)
         mm_items = self._feature_transport.prepare_mm_items_for_transport(mm_items)
