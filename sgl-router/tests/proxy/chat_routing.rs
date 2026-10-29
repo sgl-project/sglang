@@ -1019,6 +1019,8 @@ async fn model_alias_routes_as_the_configured_model() {
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
     for (model, status) in [
         (ALIAS, StatusCode::OK),
+        // SGLang's `base:adapter` LoRA syntax on an alias.
+        ("/weights-repo/snapshots/d89b007b:my-lora", StatusCode::OK),
         ("tiny", StatusCode::OK),
         ("/weights-repo/snapshots/other", StatusCode::NOT_FOUND),
     ] {

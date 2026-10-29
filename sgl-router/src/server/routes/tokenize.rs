@@ -43,6 +43,7 @@ pub struct DetokenizeResponse {
 
 /// Distinguish a served model started with `--tokenizer-path none` from an unknown one.
 pub(crate) fn tokenizer_for(ctx: &AppContext, model: &str) -> Result<Arc<Tokenizer>, ApiError> {
+    let model = ctx.config.model.served_name(model);
     ctx.tokenizers.get(model).ok_or_else(|| {
         if model == ctx.config.model.id {
             ApiError::BadRequest(format!("tokenizer disabled for model {model}"))
@@ -164,6 +165,19 @@ mod tests {
             worker_registry,
             policies,
         ))
+    }
+
+    /// A `--model-alias` tokenizes as `--model-id`; another name stays not found.
+    #[test]
+    fn tokenizer_for_resolves_model_alias() {
+        let mut ctx = Arc::try_unwrap(ctx_with_tiny()).ok().unwrap();
+        ctx.config.model.aliases = vec!["/snapshots/tiny".into()];
+        assert!(tokenizer_for(&ctx, "/snapshots/tiny").is_ok());
+        assert!(tokenizer_for(&ctx, "tiny").is_ok());
+        assert!(matches!(
+            tokenizer_for(&ctx, "/snapshots/other"),
+            Err(ApiError::ModelNotFound(_))
+        ));
     }
 
     #[tokio::test]

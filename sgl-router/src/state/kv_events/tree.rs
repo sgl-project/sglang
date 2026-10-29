@@ -1572,12 +1572,14 @@ impl HashTree {
     /// When nothing matches from the root, the leading blocks may simply never
     /// have been announced to this router: an engine publishes a block once,
     /// when it stores it, so a router that subscribes after the engine cached a
-    /// shared prefix (the chat template's preamble, a coding agent's ~80-block
-    /// system prompt) never sees it, and every later chain arrives under an
+    /// shared prefix (the chat template's preamble, a coding agent's long system
+    /// prompt) never sees it, and every later chain arrives under an
     /// unknown parent and is rooted at its own first hash (`resolve_parent`).
     /// The root-anchored walk then misses at block 0 for every request. So on a
-    /// zero match from the root this re-anchors on the first query block that
-    /// starts a chain, however deep, and counts the skipped blocks as matched.
+    /// zero match from the root this re-anchors on each later query block that
+    /// starts a chain, however deep, counts the skipped blocks as matched, and
+    /// keeps the deepest match: one worker's short orphan chain early in the
+    /// query must not hide another's longer chain after it.
     /// That is exact: block hashes chain over the whole prefix, so a stored
     /// block equal to query block `s` means blocks `0..=s` are identical, and
     /// an engine holding a block holds its ancestors.
@@ -1591,16 +1593,20 @@ impl HashTree {
         if matched.matched_blocks > 0 || parent_hash.is_some() {
             return matched;
         }
-        match self.reanchor(block_hashes) {
-            Some((skip, shard)) => {
-                let mut matched = self.shards[shard]
-                    .read()
-                    .match_prefix(None, &block_hashes[skip..]);
-                matched.matched_blocks += skip;
-                matched
+        let mut best = matched;
+        for (skip, shard) in self.chain_roots(block_hashes) {
+            let mut candidate = self.shards[shard]
+                .read()
+                .match_prefix(None, &block_hashes[skip..]);
+            candidate.matched_blocks += skip;
+            if candidate.matched_blocks > best.matched_blocks {
+                best = candidate;
+                if best.matched_blocks == block_hashes.len() {
+                    break;
+                }
             }
-            None => matched,
         }
+        best
     }
 
     /// How many leading blocks of `block_hashes` each worker holds
@@ -1616,30 +1622,36 @@ impl HashTree {
         if block_hashes.is_empty() {
             return HashMap::new();
         }
-        let depths = self.descend_match_shard(parent_hash, block_hashes, |shard, parent| {
+        let mut depths = self.descend_match_shard(parent_hash, block_hashes, |shard, parent| {
             shard.prefix_depths(parent, block_hashes)
         });
         if !depths.is_empty() || parent_hash.is_some() {
             return depths;
         }
-        match self.reanchor(block_hashes) {
-            Some((skip, shard)) => self.shards[shard]
+        for (skip, shard) in self.chain_roots(block_hashes) {
+            let found = self.shards[shard]
                 .read()
-                .prefix_depths(None, &block_hashes[skip..])
-                .into_iter()
-                .map(|(worker, depth)| (worker, depth + skip))
-                .collect(),
-            None => depths,
+                .prefix_depths(None, &block_hashes[skip..]);
+            for (worker, depth) in found {
+                let depth = depth + skip;
+                depths
+                    .entry(worker)
+                    .and_modify(|deepest| *deepest = (*deepest).max(depth))
+                    .or_insert(depth);
+            }
         }
+        depths
     }
 
-    /// The first query block after the first that starts a chain, and the
-    /// shard holding that chain. A chain is rooted in the shard of its first
-    /// hash, so each candidate costs one shard read lock and one map probe;
-    /// this runs only on a zero root-anchored match, and a 1M-token prompt is
-    /// ~8k blocks.
-    fn reanchor(&self, block_hashes: &[i64]) -> Option<(usize, usize)> {
-        (1..block_hashes.len()).find_map(|skip| {
+    /// Each query block after the first that starts a chain, with the shard
+    /// holding that chain. A chain is rooted in the shard of its first hash,
+    /// so each block costs one shard read lock and one map probe; this runs
+    /// only on a zero root-anchored match.
+    fn chain_roots<'a>(
+        &'a self,
+        block_hashes: &'a [i64],
+    ) -> impl Iterator<Item = (usize, usize)> + 'a {
+        (1..block_hashes.len()).filter_map(move |skip| {
             let shard = shard_of(block_hashes[skip]);
             self.shards[shard]
                 .read()
@@ -1898,14 +1910,10 @@ mod tests {
     use super::test_support::{worker, workers};
     use super::*;
 
-    /// One descent answers for every worker at its *own* depth, where
-    /// `match_prefix` names only whoever sits at the deepest matched node.
-    /// Also pins that a `remove`d interior block stops the count at the hole.
     /// A router that subscribes after the engine cached the shared preamble
     /// (block 10 here) never sees that block: every later store names it as the
     /// parent, `resolve_parent` cannot find it, and the chain is rooted at its
-    /// own first hash. Without re-anchoring every request matched 0 (MiniMax-M3.1:
-    /// zero overlap across ~500 requests the engines served from cache).
+    /// own first hash, so without re-anchoring every request matched 0.
     #[test]
     fn match_reanchors_past_never_announced_preamble() {
         let tree = HashTree::new();
@@ -1936,6 +1944,25 @@ mod tests {
     /// Re-anchoring never overrides a root-anchored match, and reaches past a
     /// long unseen shared prefix: an 80-block system prompt the engine cached
     /// before the router subscribed (a coding agent's, on MiniMax-M3.1).
+    /// A short orphan chain early in the query does not hide a longer one that
+    /// starts later: `a` holds only block 11, `b` (subscribed later) holds 13..17.
+    #[test]
+    fn reanchor_keeps_the_deepest_orphan_chain() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        tree.insert(&a, Some(10), &[11]);
+        tree.insert(&b, Some(12), &[13, 14, 15, 16, 17]);
+
+        let query = [10, 11, 12, 13, 14, 15, 16, 17, 18];
+        let m = tree.match_prefix(None, &query);
+        assert_eq!(m.matched_blocks, 8);
+        assert_eq!(m.workers(), workers(&[&b]));
+        let depths = tree.prefix_depths(None, &query);
+        assert_eq!(depths.get(&a), Some(&2));
+        assert_eq!(depths.get(&b), Some(&8));
+    }
+
     #[test]
     fn reanchor_is_only_a_fallback_and_reaches_deep() {
         let tree = HashTree::new();
@@ -1960,6 +1987,9 @@ mod tests {
         assert_eq!(tree.match_prefix(None, &fresh).matched_blocks, 0);
     }
 
+    /// One descent answers for every worker at its *own* depth, where
+    /// `match_prefix` names only whoever sits at the deepest matched node.
+    /// Also pins that a `remove`d interior block stops the count at the hole.
     #[test]
     fn prefix_depths_answers_every_worker_at_its_own_depth() {
         let chain = [1i64, 2, 3, 4];

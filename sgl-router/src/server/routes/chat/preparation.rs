@@ -173,7 +173,7 @@ impl PreparedRequest {
     ) -> Result<Self, ApiError> {
         // MiniMax-M3.1's thinking contract, before anything renders or forwards the
         // body, so the engine and the router's render see the same request.
-        if path == CHAT_PATH && ctx.tokenizers.is_minimax_m3(&model.0) {
+        if path == CHAT_PATH && ctx.tokenizers.is_minimax_m31(&model.0) {
             if let Ok(mut value) = serde_json::from_slice::<Value>(&body) {
                 if enforce_minimax_m31_thinking(&mut value)? {
                     body = Bytes::from(serde_json::to_vec(&value).map_err(|_| invalid_request())?);

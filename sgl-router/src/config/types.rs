@@ -423,6 +423,17 @@ pub struct ModelConfig {
     pub default_chat_template_kwargs: crate::tokenizer::chat_formatter::ChatTemplateKwargs,
 }
 
+impl ModelConfig {
+    /// `model` as served: a `--model-alias` names `id`.
+    pub fn served_name<'a>(&'a self, model: &'a str) -> &'a str {
+        if self.aliases.iter().any(|alias| alias == model) {
+            &self.id
+        } else {
+            model
+        }
+    }
+}
+
 /// External KV Indexer client settings.
 #[derive(Debug, Clone)]
 pub struct KvIndexerEndpointConfig {

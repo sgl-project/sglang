@@ -45,6 +45,9 @@ pub struct ChatFormatter {
     /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3 and Qwen3.8 render through
     /// `sglang_processor`.
     processor: Option<ProcessorFormatter>,
+    /// MiniMax-M3.1: an M3 template with no `thinking_mode` switch, so thinking
+    /// is always adaptive (M3's template can turn it off).
+    minimax_m31: bool,
     /// Worker defaults, merged before model-specific effort conversion.
     worker_defaults: ChatTemplateKwargs,
 }
@@ -188,6 +191,8 @@ impl ChatFormatter {
                         | ProcessorFormatter::Qwen38 { .. }
                 )
             });
+        let minimax_m31 = matches!(processor, Some(ProcessorFormatter::MiniMaxM3(_)))
+            && !cfg["chat_template"].to_string().contains("thinking_mode");
         let template: ChatTemplate =
             serde_json::from_value(cfg).context("parse tokenizer_config.json")?;
         if template.chat_template.is_none() {
@@ -202,6 +207,7 @@ impl ChatFormatter {
             defaults,
             bos_token,
             processor,
+            minimax_m31,
             worker_defaults: ChatTemplateKwargs::new(),
         }))
     }
@@ -217,6 +223,7 @@ impl ChatFormatter {
             defaults: HashMap::new(),
             bos_token: Some("[BOS]".into()),
             processor: Some(ProcessorFormatter::KimiK3),
+            minimax_m31: false,
             worker_defaults: ChatTemplateKwargs::new(),
         })
     }
@@ -262,6 +269,7 @@ impl ChatFormatter {
             } else {
                 is_deepseek_v4.then_some(ProcessorFormatter::DeepSeekV4(None))
             },
+            minimax_m31: false,
             worker_defaults: ChatTemplateKwargs::new(),
         })
     }
@@ -295,10 +303,11 @@ impl ChatFormatter {
         matches!(self.processor, Some(ProcessorFormatter::KimiK3))
     }
 
-    /// MiniMax-M3 / M3.1 (`model_type == "minimax_m3_vl"`), whose thinking
-    /// contract the chat route enforces at ingress.
-    pub fn is_minimax_m3(&self) -> bool {
-        matches!(self.processor, Some(ProcessorFormatter::MiniMaxM3(_)))
+    /// MiniMax-M3.1, whose always-adaptive thinking contract the chat route
+    /// enforces at ingress. MiniMax-M3 shares its `model_type` but can disable
+    /// thinking, so it is told apart by the template's `thinking_mode` switch.
+    pub fn is_minimax_m31(&self) -> bool {
+        self.minimax_m31
     }
 
     /// The `sglang_processor` formatter, for models that render through it.
@@ -809,7 +818,11 @@ mod tests {
             "{# <mm:think> #}{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}";
         let enc = jinja(json!({ "chat_template": template }));
         assert_eq!(enc.forwarding_scope(), ForwardingScope::AllText);
-        assert!(enc.is_minimax_m3());
+        // No `thinking_mode` switch: M3.1, whose thinking cannot be disabled.
+        assert!(enc.is_minimax_m31());
+        let m3 = jinja(json!({ "chat_template": format!("{template}{{{{ thinking_mode }}}}") }));
+        assert_eq!(m3.forwarding_scope(), ForwardingScope::AllText);
+        assert!(!m3.is_minimax_m31(), "M3's template can disable thinking");
         let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "f", "arguments": "{}"}});
         let req = request(json!([
             {"role": "user", "content": "Q"},
@@ -825,7 +838,7 @@ mod tests {
         assert!(enc.render(&request(late_root)).is_err());
         let other = jinja(json!({ "chat_template": template.replace("<mm:think>", "") }));
         assert_eq!(other.forwarding_scope(), ForwardingScope::Guarded);
-        assert!(!other.is_minimax_m3());
+        assert!(!other.is_minimax_m31());
     }
 
     #[test]

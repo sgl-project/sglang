@@ -269,9 +269,13 @@ consecutive failures the worker is taken out of routing until a request already
 sent to it succeeds or, once `--cb-cool-down-secs` (default 30) has passed, a
 probe request does. Under `--worker-urls` it is the only thing that takes a
 dead or hung worker out of routing, since there is no active health check.
-`--disable-circuit-breaker` turns it off, for example when one worker serves a
-role and an open breaker would reject all of that role's requests; a worker
-that stops answering then keeps its share of traffic.
+A failure is a transport error, a timeout, or a 5xx other than 500 and 503: a
+500 (an exception raised for that one request) and backpressure (503, 429) mean
+the worker answered, so they never open the breaker. When every eligible
+worker's breaker is open the router fails open: it closes them all and routes
+to the whole pool rather than rejecting every request, and failures reopen
+them. `--disable-circuit-breaker` turns it off; a worker that stops answering
+then keeps its share of traffic.
 
 ### Engines with `--api-key`
 
@@ -606,14 +610,21 @@ With the cookbook's `kimi_k3` parsers, text chats are served through `/generate`
 ## MiniMax-M3
 
 MiniMax-M3 and M3.1 render with the checkpoint's `chat_template.jinja` through
-`rust/sglang-processor`, which picks them by their template and applies SGLang's M3
-request rules: the `thinking` type and the `root` message are validated, every tool
+`rust/sglang-processor`, which picks them by `config.json`'s `model_type`
+(`minimax_m3_vl`), or by the template when there is no `config.json`, and applies
+SGLang's M3 request rules: the `thinking` type and the `root` message are validated, every tool
 call must be answered, `thinking` and effort aliases map onto `thinking_mode` and
 `reasoning_effort`, and tool results render in tool-call order. Every text chat
 forwards `input_ids`. Media, `tool_reference` content in tool results, floats in tool
 schemas, `-0` in tool arguments, and a `chat_template` key in `chat_template_kwargs`
 render on the worker. The processor does not reproduce the `minimax-m3` reasoning and
 tool parsers yet, so chats keep the engine's route.
+
+MiniMax-M3.1, whose template has no `thinking_mode` switch, always thinks
+adaptively, and the router enforces that at ingress: `thinking: {"type":
+"disabled"}`, `chat_template_kwargs.thinking_mode: "disabled"` and a
+`reasoning_effort` of `none` are rejected with 400, and `minimal` is sent as `low`.
+MiniMax-M3 can disable thinking, so its requests pass through unchanged.
 
 ## HTTP/2
 

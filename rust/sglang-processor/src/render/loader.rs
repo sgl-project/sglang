@@ -71,7 +71,7 @@ pub fn load_chat_formatter(
             &mut config,
             Value::String(template.trim_matches('\n').replace("\\n", "\n")),
         )?;
-        return ChatFormatter::from_tokenizer_config(&config);
+        return ChatFormatter::from_tokenizer_config_with_type(&config, model_type);
     }
 
     let template_text = read_to_string(path, "chat template")?;
@@ -81,10 +81,10 @@ pub fn load_chat_formatter(
     // files carry Conversation fields and are translated below.
     if template.is_string() {
         set_chat_template(&mut config, template)?;
-        ChatFormatter::from_tokenizer_config(&config)
+        ChatFormatter::from_tokenizer_config_with_type(&config, model_type)
     } else if let Some(chat_template) = template.get("chat_template") {
         set_chat_template(&mut config, chat_template.clone())?;
-        ChatFormatter::from_tokenizer_config(&config)
+        ChatFormatter::from_tokenizer_config_with_type(&config, model_type)
     } else {
         Ok(ChatFormatter::Legacy(Box::new(LegacyFormatter {
             spec: parse_legacy_template(&template, path)?,
@@ -131,8 +131,7 @@ impl ChatFormatter {
     /// template text: a `minimax_m3_vl` checkpoint served with a foreign
     /// `--chat-template` still gets M3's rules, and a template that merely
     /// contains M3's tags does not. `None` falls back to template detection
-    /// for callers without the checkpoint config (a `--chat-template`
-    /// override, sgl-router's tokenizer files).
+    /// for callers without the checkpoint config.
     pub fn from_tokenizer_config_with_type(
         config: &Value,
         model_type: Option<&str>,
@@ -336,8 +335,8 @@ mod tests {
     /// MiniMax-M3 keys on `model_type`, not the template text (Python's
     /// `is_minimax_m3`): a `minimax_m3_vl` checkpoint with a template that lacks
     /// M3's tags still gets M3's rules, and a template carrying M3's tags under
-    /// another `model_type` does not. With no `model_type` (a `--chat-template`
-    /// override) the template is the only signal, so it falls back to detection.
+    /// another `model_type` does not. With no `model_type` (no `config.json`)
+    /// the template is the only signal, so it falls back to detection.
     #[test]
     fn minimax_m3_keys_on_model_type() {
         let foreign = r#"{"chat_template": "{{ messages }}"}"#;
@@ -369,5 +368,35 @@ mod tests {
             ChatFormatter::from_tokenizer_config(&serde_json::from_str(m3_template).unwrap())
                 .unwrap();
         assert!(matches!(formatter, ChatFormatter::MiniMaxM3(_)));
+    }
+
+    /// A `--chat-template` override keeps the checkpoint's `model_type`: a
+    /// `minimax_m3_vl` checkpoint served with a foreign template still gets M3's rules.
+    #[test]
+    fn chat_template_override_keeps_minimax_m3_model_type() {
+        let base = std::env::temp_dir().join(format!(
+            "sglang-openai-template-m3-{}-test.json",
+            std::process::id()
+        ));
+        let override_path = base.with_extension("jinja");
+        std::fs::write(&base, r#"{"chat_template": "{{ messages }}"}"#).unwrap();
+        std::fs::write(&override_path, "{{ messages }}").unwrap();
+        let load = |model_type| {
+            load_chat_formatter(
+                Some(base.to_str().unwrap()),
+                None,
+                model_type,
+                Some(override_path.to_str().unwrap()),
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            load(Some("minimax_m3_vl")),
+            ChatFormatter::MiniMaxM3(_)
+        ));
+        assert!(matches!(load(None), ChatFormatter::HuggingFace { .. }));
+
+        let _ = std::fs::remove_file(base);
+        let _ = std::fs::remove_file(override_path);
     }
 }

@@ -273,14 +273,10 @@ impl<'a> ModelRouting<'a> {
     /// resolves to `--model-id`, so workers, policy and metrics key on the served
     /// id while the body keeps the alias.
     fn lookup_openai(ctx: &'a AppContext, model: ModelId) -> Result<(ModelId, Self), ApiError> {
-        let model = if ctx.config.model.aliases.contains(&model.0) {
-            ModelId(ctx.config.model.id.clone())
-        } else {
-            model
-        };
+        let model = ModelId(ctx.config.model.served_name(&model.0).to_owned());
         match (Self::lookup(ctx, &model), model.0.split_once(':')) {
             (Err(error), Some((base, _))) => {
-                let base = ModelId(base.trim().to_owned());
+                let base = ModelId(ctx.config.model.served_name(base.trim()).to_owned());
                 let routing = Self::lookup(ctx, &base).map_err(|_| error)?;
                 Ok((base, routing))
             }

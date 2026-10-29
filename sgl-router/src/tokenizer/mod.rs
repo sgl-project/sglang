@@ -252,11 +252,11 @@ impl TokenizerRegistry {
         self.formatters.contains_key(model_id)
     }
 
-    /// Whether `model_id` is MiniMax-M3 / M3.1 (see [`ChatFormatter::is_minimax_m3`]).
-    pub fn is_minimax_m3(&self, model_id: &str) -> bool {
+    /// Whether `model_id` is MiniMax-M3.1 (see [`ChatFormatter::is_minimax_m31`]).
+    pub fn is_minimax_m31(&self, model_id: &str) -> bool {
         self.formatters
             .get(model_id)
-            .is_some_and(|e| e.formatter.is_minimax_m3())
+            .is_some_and(|e| e.formatter.is_minimax_m31())
     }
 
     pub fn forwarding_scope(&self, model_id: &str) -> ForwardingScope {

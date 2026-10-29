@@ -85,10 +85,9 @@ impl BreakerOutcome {
 /// `500 Internal Server Error` is Neutral too: the engine answered, so it is
 /// responsive. SGLang returns 500 for an exception raised while handling ONE
 /// request (a multimodal processor bug, a template error) and keeps serving
-/// everything else. Counting it let three replays of one bad request eject a
-/// healthy worker for the whole cool-down (MiniMax-M3.1: a video processor bug
-/// turned two healthy workers into `no_healthy_workers` for all traffic). A
-/// dead engine still trips the breaker through transport errors / timeouts.
+/// everything else. Counting it lets a client replaying one bad request eject
+/// a healthy worker for the whole cool-down. A dead engine still trips the
+/// breaker through transport errors / timeouts.
 ///
 /// Tradeoff: because 503 / 500 never open the breaker, a worker stuck returning
 /// them indefinitely (a wedged engine, not transient load or one bad request)
