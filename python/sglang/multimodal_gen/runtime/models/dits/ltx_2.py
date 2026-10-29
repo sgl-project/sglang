@@ -1283,14 +1283,24 @@ class LTX2TransformerBlock(nn.Module):
         indices: slice,
     ) -> tuple[torch.Tensor, ...]:
         num_ada_params = int(scale_shift_table.shape[0])
+        if batch_size == 1 and timestep.shape[1] == 1:
+            values = (
+                scale_shift_table[indices].to(
+                    device=timestep.device, dtype=timestep.dtype
+                )
+                + timestep.view(num_ada_params, -1)[indices]
+            )
+            return list(values.view(values.shape[0], 1, 1, -1).unbind(0))
         table = scale_shift_table[indices].to(
             device=timestep.device, dtype=timestep.dtype
         )
         temb = timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[
             :, :, indices, :
         ]
-        # value-major, so every returned [B, T, D] is contiguous and the modulate
-        # kernels take it without a copy (a [B, T, k, D] slice is strided for B > 1)
+        if timestep.shape[1] > 1:
+            # Per-token modulation does not use the broadcast-only fused kernels.
+            return list((table.view(1, 1, *table.shape) + temb).unbind(2))
+        # Batched broadcast values must be contiguous for the modulate kernels.
         ada_values = torch.empty(
             (table.shape[0], *temb.shape[:2], temb.shape[-1]),
             dtype=temb.dtype,

@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising import (
     LTX2DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -171,9 +172,14 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
 
     def parallelism_type_for(self, batch: Req | list[Req]) -> StageParallelismType:
         # stage 1 leaves the same latents on every CFG rank, so pure-CFG ranks
-        # can shard stage 2 as one Ulysses group once it is long enough
+        # can shard stage 2 as one Ulysses group once it is long enough on Hopper.
+        # Blackwell's faster compute does not amortize the additional collectives.
         cfg_sp_group = get_cfg_sequence_parallel_group()
-        if self.server_args.enable_cfg_parallel and cfg_sp_group is not None:
+        if (
+            self.server_args.enable_cfg_parallel
+            and cfg_sp_group is not None
+            and current_platform.is_hopper()
+        ):
             reqs = batch if isinstance(batch, list) else [batch]
             # packed stage-2 video latents [B, S, C], the same shape on every rank
             tokens = min(req.latents.shape[1] for req in reqs)

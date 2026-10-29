@@ -93,6 +93,8 @@ For latency-oriented LTX serving, prefer CFG parallel over sequence parallelism.
 
 Use `--enable-cfg-parallel` for degree-2 CFG parallel. Use `--cfg-parallel-size` only when you explicitly need a different CFG branch count. If `resident` exceeds available VRAM, keep the same parallelism preset and switch only the device mode to `original`.
 
+On Hopper GPUs, sufficiently long stage-2 sequences automatically reuse the CFG ranks for Ulysses. Other platforms keep stage 2 unsharded unless you explicitly configure sequence parallelism.
+
 On high-VRAM GPUs, add `--text-encoder-cpu-offload false` if text encoding latency matters and you have enough memory.
 
 On GPUs with at least 130 GiB (H200, B200, B300), `LTX2TwoStagePipeline` serving turns on breakable CUDA graphs by default when the DiTs stay resident (LTX-2.3: `resident` mode). Warmup captures the default 768x512, 121-frame **text-to-video** request; other resolutions or frame counts run eager, so pass `--warmup-resolutions` and `--warmup-num-frames` for the shape you serve (the OpenAI video API defaults to 4 seconds, which LTX rounds to 89 frames). Pass `--enable-breakable-cuda-graph false` to run eager.
