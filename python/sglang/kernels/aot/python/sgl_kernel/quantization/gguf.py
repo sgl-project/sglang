@@ -60,3 +60,21 @@ def ggml_moe_a8_vec(
 
 def ggml_moe_get_block_size(type: int) -> int:
     return torch.ops.sgl_kernel.ggml_moe_get_block_size.default(type)
+
+
+def ggml_moe_mmq(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    type: int,
+    row: int,
+    x_per_slot: bool,
+) -> torch.Tensor:
+    """MoE matmul with llama.cpp's MMQ (CUDA): returns fp32 [T, top_k, row] with
+    out[t, s] = weight[topk_ids[t, s], :row] @ x(t, s), where x(t, s) is input[t]
+    (gate / up) or input[t * top_k + s] (x_per_slot, the down projection). Slots
+    with an expert id < 0 (or >= the number of experts) give zero rows; the
+    experts of a token must be distinct (a repeated one also gives a zero row)."""
+    return torch.ops.sgl_kernel.ggml_moe_mmq.default(
+        input, weight, topk_ids, type, row, x_per_slot
+    )

@@ -20,16 +20,25 @@ quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int k
 
   const float xi = ix < kx ? static_cast<float>(x[iy * kx + ix]) : 0.0f;
   float amax = fabsf(xi);
-  float sum = xi;
 
 #pragma unroll
   for (int mask = 16; mask > 0; mask >>= 1) {
     amax = fmaxf(amax, SGLANG_SHFL_XOR_SYNC_WIDTH(uint32_t(-1), amax, mask, 32));
-    sum += SGLANG_SHFL_XOR_SYNC_WIDTH(uint32_t(-1), sum, mask, 32);
   }
 
   const float d = amax / 127;
   const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+  // The block sum is taken over the quantized values (times d): the kernels use it to
+  // apply a weight offset or min to the whole block (Q4_0's -8, Q5_0's -16, the mins of
+  // Q4_1 / Q5_1 / K-quants), and only the sum of what was actually multiplied cancels
+  // exactly; the sum of the unquantized inputs leaves their rounding error times the
+  // offset in the result.
+  int sumq = q;
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    sumq += SGLANG_SHFL_XOR_SYNC_WIDTH(uint32_t(-1), sumq, mask, 32);
+  }
 
   y[ib].qs[iqs] = q;
 
@@ -38,7 +47,7 @@ quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int k
   }
 
   y[ib].ds.x = __float2half(d);
-  y[ib].ds.y = __float2half(sum);
+  y[ib].ds.y = __float2half(d * sumq);
 }
 
 template <typename scalar_t>
