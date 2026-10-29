@@ -398,18 +398,16 @@ def run_bench_serving(
 ):
     """Run sglang.bench_serving against a live server and parse its metrics.
 
-    cache_report=True collects the server's --enable-cache-report hit rates
-    into the returned metrics dict without asserting anything:
-      - cache_hit_rate_pct: overall KV hit rate
-      - device_hit_rate_pct: L1 hit rate (device = GPU/NPU memory tier)
-      - host_hit_rate_pct: L2 hit rate (host = CPU memory / HiCache tier)
-    L3 (storage) is out of scope for now; the naming leaves room for a
-    future storage_hit_rate_pct entry.
-    min_*_hit_rate thresholds are fractions (0.1 = 10%) and can be combined
-    freely (min_cache_hit_rate / min_device_hit_rate / min_host_hit_rate);
-    each set threshold asserts its tier strictly greater than the value.
-    They all depend on the report: setting any threshold without
-    cache_report=True raises an error instead of silently skipping.
+    With cache_report=True the returned metrics dict additionally carries
+    the server's hierarchical KV hit rates:
+      - cache_hit_rate_pct: overall KV hit rate across all tiers
+      - device_hit_rate_pct: L1 tier hit rate (device = GPU/NPU memory)
+      - host_hit_rate_pct: L2 tier hit rate (host = CPU memory / HiCache)
+    Hit rates parse as percentages ("18.2") and pair with fraction
+    thresholds (0.1 = 10%): min_cache_hit_rate / min_device_hit_rate /
+    min_host_hit_rate each assert its tier strictly greater than the
+    threshold, in any combination. Thresholds depend on the report:
+    setting one without cache_report=True raises an error naming the fix.
     """
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_file = (
