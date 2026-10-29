@@ -1,6 +1,35 @@
 """Finalize statically deferred logits using the current request's policy."""
 
+import torch
+
 from sglang.srt.environ import envs
+
+
+def make_verify_softcap_ranks(device, softcap):
+    """Build an immutable comparison table using the actual device softcap.
+
+    This is model-owned warmup data, not a process-global cache. The table
+    represents exact FP32 output ordering/equality for all BF16 bit patterns;
+    it does not approximate or change logits. Unsanitized NaNs sort first.
+    """
+    from sglang.kernels.ops.activation.softcap import softcap_inplace_logits
+
+    raw = (
+        torch.arange(65536, device=device, dtype=torch.int32)
+        .to(torch.int16)
+        .view(torch.bfloat16)
+    )
+    values = raw.float()
+    if softcap:
+        softcap_inplace_logits(values, softcap)
+    bits = values.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    ranks = torch.where(
+        (bits & 0x80000000) != 0, (~bits) & 0xFFFFFFFF, bits ^ 0x80000000
+    )
+    # Argmax treats signed zeros as equal and selects the first NaN.
+    ranks = torch.where(values == 0, 0x80000000, ranks)
+    ranks = torch.where(torch.isnan(values), 0xFFFFFFFF, ranks)
+    return ranks.to(torch.int32).contiguous()
 
 
 def can_reduce_verify_logits(batch, grammar_mask=None):
@@ -47,7 +76,12 @@ def finalize_verify_logits(logits_output, batch, grammar_mask=None):
         from sglang.kernels.ops.sampling import softcap_argmax
 
         return softcap_argmax(
-            raw, softcap=logits_output.deferred_verify_softcap, sanitize=False
+            raw,
+            softcap=logits_output.deferred_verify_softcap,
+            sanitize=False,
+            comparison_ranks=getattr(
+                logits_output, "deferred_verify_comparison_ranks", None
+            ),
         )
 
     from sglang.kernels.ops.activation.softcap import softcap_inplace_logits

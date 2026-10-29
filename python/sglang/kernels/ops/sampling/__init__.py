@@ -147,8 +147,15 @@ register_kernel(
 )
 
 
-def softcap_argmax(logits: torch.Tensor, softcap=None, sanitize=False):
-    """Return first-token argmax without materializing FP32 vocabulary logits."""
+def softcap_argmax(
+    logits: torch.Tensor, softcap=None, sanitize=False, comparison_ranks=None
+):
+    """Return first-token argmax without materializing FP32 vocabulary logits.
+
+    Optional comparison_ranks is an exact unsanitized FP32 comparison table
+    for every BF16 bit pattern after the supplied softcap, on this device.
+    Its construction and immutable lifetime belong to the caller.
+    """
     return get_kernel("sampling.softcap_argmax", KernelBackend.TRITON)(
-        logits, softcap=softcap, sanitize=sanitize
+        logits, softcap=softcap, sanitize=sanitize, comparison_ranks=comparison_ranks
     )
