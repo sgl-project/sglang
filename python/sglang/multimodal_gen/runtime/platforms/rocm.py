@@ -24,7 +24,11 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils import is_gfx1250_supported
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_gfx942_supported,
+    is_gfx1250_supported,
+)
 
 logger = init_logger(__name__)
 
@@ -131,6 +135,26 @@ class RocmPlatform(Platform):
                     "AITER Sage backend only supports bf16/fp16 inputs but got dtype=%s.",
                     dtype,
                 )
+
+        elif selected_backend == AttentionBackendEnum.AITER_QUANT:
+            # Arch family only; whether the selected quant format has a kernel
+            # row on this arch is checked when the impl is constructed.
+            if not (is_gfx95_supported() or is_gfx942_supported()):
+                raise ValueError(
+                    "aiter_quant requires a gfx950- or gfx942-class arch, got "
+                    f"{cls.get_device_name()}."
+                )
+            if dtype is not torch.bfloat16:
+                # mha_v4 quantizes from BF16 operands and rejects every other
+                # input dtype, fp16 included.
+                logger.warning(
+                    "AITER quant backend takes BF16 inputs, which it quantizes "
+                    "to the selected format, but got dtype=%s. Proceeding "
+                    "anyway; aiter will reject the call.",
+                    dtype,
+                )
+            logger.info("Using aiter_quant attention backend on ROCm.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_quant.AITERQuantBackend"
 
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
