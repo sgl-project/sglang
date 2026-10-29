@@ -18,8 +18,8 @@ from sglang.kernels.ops.gemm.aiter_asm_blockscale import (
 @lru_cache(maxsize=4096)
 def asm_split_k_kernel(m: int, n: int, k: int) -> Optional[Tuple[str, int]]:
     """(kernel name, split-K) when aiter_w8a8_block_fp8_linear runs the [m, k] x [n, k]
-    bpreshuffle GEMM as aiter's asm split-K kernel, which accumulates into a zeroed output
-    and which we can launch; None otherwise."""
+    bpreshuffle GEMM as aiter's asm split-K kernel, which accumulates into a zeroed output,
+    and the prezeroed launcher takes that kernel and shape; None otherwise."""
     # fp8_utils imports this module while it initializes
     from sglang.srt.layers.quantization.fp8_utils import (
         use_aiter_triton_gemm_w8a8_tuned_gfx950,

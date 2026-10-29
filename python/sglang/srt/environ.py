@@ -967,9 +967,8 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
-    # gfx950 quick all-reduce at TP4 on the JIT build (quick_all_reduce_hip) instead of
-    # sgl-kernel's; INT4 runs INT8 below 64 MiB, and groups it does not serve, or other
-    # GPUs, keep sgl-kernel's
+    # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
+    # sgl-kernel's; off by default, MiniMax-M3.1 turns it on at TP4 INT4, where it was measured.
     SGLANG_ROCM_QUICK_ALL_REDUCE_JIT = EnvBool(False)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
@@ -2076,8 +2075,8 @@ class Envs:
     # gfx950 M3.1 main K/V and index-K cache layout: auto (the packed NVFP4 MSA-v1 pool
     # under DSPARK, fp8 otherwise) or fp8 (e4m3) everywhere
     SGLANG_MINIMAX_M3_AMD_KV_FORMAT = EnvStr("auto")
-    # gfx950 M3.1 raises ROCM_QUICK_REDUCE_QUANTIZATION from INT8, the ROCm images' default for
-    # every model, to INT4 (half the long-prefill all-reduce at TP4); 0 keeps a chosen INT8
+    # gfx950 M3.1 at TP4 raises ROCM_QUICK_REDUCE_QUANTIZATION from INT8 (the ROCm images'
+    # default for every model) to INT4, measured faster at equal GSM8K; 0 leaves the level alone
     SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4 = EnvBool(True)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)

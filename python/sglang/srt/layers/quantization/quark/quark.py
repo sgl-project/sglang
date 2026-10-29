@@ -449,9 +449,7 @@ class QuarkConfig(QuantizationConfig):
         ):
             return None
 
-        # Quark exports MXFP8 as fp8 per_block [1, 32] with
-        # scale_type=float8_e8m0fnu; the serialized scale is uint8 e8m0, not
-        # fp32, so it has to load through the MXFP8 path.
+        # Quark's [1, 32] float8_e8m0fnu scales are uint8 e8m0, not fp32, so they load as MXFP8
         use_mxfp8 = block_size == [1, 32] and "e8m0" in str(
             weight_config.get("scale_type") or ""
         )

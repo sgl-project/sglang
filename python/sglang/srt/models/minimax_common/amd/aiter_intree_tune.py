@@ -1,19 +1,10 @@
-"""aiter tuned rows for MiniMax-M3.1 at TP 4 on gfx950, applied through DeepSeek-V4's in-tree
-mechanism (``deepseek_common/amd/aiter_intree_tune``): the rows add shapes aiter has no row
-for, and where aiter has a row a measured kernel beats, the row carries aiter's kernel in
-``base_*`` columns and replaces it only while aiter still picks that kernel.
+"""aiter tuned rows for MiniMax-M3.1 at TP4 on gfx950, through DeepSeek-V4's in-tree mechanism.
 
-* a8w8 blockscale bpreshuffle: the block-fp8 copy of the MXFP8 projections above
-  ``MXFP8_DENSE_PTPC_DECODE_MAX_M`` rows, up to M = 32768.
-* a8w8 bpreshuffle: their rowwise-fp8 copy at decode sizes, (split-K) FlyDSL where >= 3%
-  faster than aiter's minimax_m3 rows with cold weights.
-* bf16: lm_head (50016 x 6144) and the DSpark fc (1536 x 30720) up to M = 1024. Its hipBLASLt
-  solution indices are ROCm 7.2's, which ROCm 10's hipBLASLt rejects, so other ROCm versions
-  install only its torch and FlyDSL rows.
-* fused MoE: the routed experts (128 x top-4, hidden 6144, intermediate 768, MXFP4,
-  SwiGLU-OAI).
-
-A table whose ``AITER_CONFIG_*`` variable the user set is left to that setting.
+The rows cover the block-fp8 copy of the MXFP8 projections above ``MXFP8_DENSE_PTPC_DECODE_MAX_M``
+rows, their rowwise-fp8 copy at decode sizes (FlyDSL where measured faster with cold weights), the
+bf16 lm_head and DSpark fc, and the MXFP4 routed experts. A row with ``base_*`` columns replaces
+aiter's only while aiter still picks that kernel, and a table whose ``AITER_CONFIG_*`` variable the
+user set keeps that setting.
 """
 
 from __future__ import annotations

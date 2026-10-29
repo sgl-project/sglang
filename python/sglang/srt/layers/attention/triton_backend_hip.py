@@ -24,7 +24,7 @@ def _windows_every_layer(hf_config) -> bool:
 
 def is_minimax_m31_dspark_draft(hf_config) -> bool:
     """The DSpark draft of an M3.1 target; the MXFP8 M3 base target shares its arch."""
-    # is_dspark_draft first, so other models never call get_model() here
+    # is_dspark_draft first, so other models never call get_model() here.
     return (
         is_dspark_draft(hf_config)
         and hf_config.architectures[0] == "DSparkMiniMaxDraftModel"
