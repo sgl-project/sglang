@@ -149,7 +149,12 @@ class KimiGridMMDataMixin:
             and all(item.format == MultimodalInputFormat.NORMAL for item in image_items)
         )
         for index, item in enumerate(image_items):
+            grid = _item_grid_thw(item)
             if not use_sources:
+                if item.feature is None and item.precomputed_embeddings is None:
+                    raise ValueError(
+                        "Kimi prepared image requires features or embeddings"
+                    )
                 # Recompute from the prepared input, not a caller's hash hint.
                 item.bind_processor_fingerprint(self._kimi_config_fingerprint())
                 item.clear_identity()
@@ -157,7 +162,7 @@ class KimiGridMMDataMixin:
                 continue
             item.set_identity(
                 kimi_image_identity(
-                    self.kimi_content_config_digest(images[index]), _item_grid_thw(item)
+                    self.kimi_content_config_digest(images[index]), grid
                 )
             )
 

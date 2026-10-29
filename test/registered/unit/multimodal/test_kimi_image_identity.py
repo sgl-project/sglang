@@ -198,8 +198,21 @@ class TestKimiImageIdentity(CustomTestCase):
             feature=feature.clone(),
             fmt=MultimodalInputFormat.PROCESSOR_OUTPUT,
         )
+        repeat.hash = 7
         processor.assign_kimi_image_identities([repeat], None)
         self.assertIs(cache.get_single(repeat.cache_key), cached)
+
+    def test_prepared_inputs_still_require_payload_and_grid(self):
+        processor = _IdentityOnly({})
+        missing_feature = _image_item([1, 2, 2])
+        missing_feature.feature = None
+        missing_grid = _image_item([1, 2, 2])
+        missing_grid.model_specific_data.clear()
+        malformed_grid = _image_item([1, 2, 2, 2])
+        for item in (missing_feature, missing_grid, malformed_grid):
+            with self.subTest(metadata=item.model_specific_data):
+                with self.assertRaises(ValueError):
+                    processor.assign_kimi_image_identities([item], None)
 
     def test_prepared_inputs_keep_deferred_preprocessing_config(self):
         processor = _IdentityOnly({})
