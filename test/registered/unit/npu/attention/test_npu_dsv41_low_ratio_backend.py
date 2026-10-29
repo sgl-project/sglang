@@ -52,12 +52,12 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     dsv41_quant,
     dsv41_row_layout,
 )
+from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV41_INDEX_PAGE_SIZE,
     get_dsv4_indexer_bytes_per_token,
 )
 from sglang.srt.mem_cache.registry import create_unified_radix_cache
-from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
 
 class _Ds41Stub(ModuleType):
@@ -1232,6 +1232,48 @@ class TestSeamBGuards(unittest.TestCase):
             backend._dsv41_index_k_store(layer, None)
 
 
+class TestNPUBlock32Dispatch(unittest.TestCase):
+    def test_native_dispatch_matches_the_load_time_mxfp8_gate(self):
+        native_linear = object()
+        backend = SimpleNamespace(is_auto=lambda: True, is_deep_gemm=lambda: False)
+        for arch35 in (False, True):
+            for ue8m0 in (False, True):
+                for requant in (False, True):
+                    with (
+                        self.subTest(arch35=arch35, ue8m0=ue8m0, requant=requant),
+                        patch.object(
+                            fp8_utils,
+                            "get_fp8_gemm_runner_backend",
+                            return_value=backend,
+                        ),
+                        patch.object(
+                            fp8_utils.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", False
+                        ),
+                        patch.object(fp8_utils, "is_npu_arch35", return_value=arch35),
+                        patch.object(
+                            fp8_utils.envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8,
+                            "get",
+                            return_value=requant,
+                        ),
+                        patch.object(
+                            fp8_utils,
+                            "npu_w8a8_mxfp8_linear",
+                            native_linear,
+                            create=True,
+                        ),
+                    ):
+                        linear = fp8_utils.dispatch_w8a8_block_fp8_linear(
+                            weight_block_size=[32, 32], act_scale_ue8m0=ue8m0
+                        )
+                    if arch35 and (ue8m0 or requant):
+                        self.assertIs(linear, native_linear)
+                    else:
+                        self.assertIs(
+                            linear.func, fp8_utils.triton_w8a8_block_fp8_linear
+                        )
+                        self.assertEqual(linear.keywords, {"act_scale_ue8m0": ue8m0})
+
+
 class TestC128ComponentGating(unittest.TestCase):
     """The C128 sidecar component must only attach where a C128 pool exists.
 
@@ -1247,14 +1289,19 @@ class TestC128ComponentGating(unittest.TestCase):
 
         class _StubCache:
             def __init__(self, params):
-                captured["tree_components"] = tuple(params.tree_components)
+                captured["components"] = tuple(
+                    slot.component for slot in params.tree_slots
+                )
 
         params = SimpleNamespace(
             req_to_token_pool=SimpleNamespace(
                 req_to_c128_sidecar=torch.zeros(1, 1, dtype=torch.int32)
             ),
+            token_to_kv_pool_allocator=SimpleNamespace(storage=None, size=1024),
+            sliding_window_size=128,
+            draft_swa_window=0,
             component_registry_override=None,
-            tree_components=(),
+            tree_slots=(),
         )
         ctx = SimpleNamespace(
             server_args=None,
@@ -1281,22 +1328,25 @@ class TestC128ComponentGating(unittest.TestCase):
             ),
         ):
             create_unified_radix_cache(ctx, cache_class=_StubCache)
-        return captured["tree_components"]
+        return captured["components"]
 
     def test_dsv4_keeps_the_c128_component(self):
         components = self._components_for((0, 0) + (4,) * 2 + (128,) * 2)
-        self.assertIn(ComponentType.C128, components)
+        self.assertIn("C128", components)
 
     def test_dsv41_drops_the_c128_component(self):
         components = self._components_for((0, 0) + (2,) * 2 + (1,) * 2)
-        self.assertNotIn(ComponentType.C128, components)
-        self.assertIn(ComponentType.SWA, components)
+        self.assertNotIn("C128", components)
+        self.assertIn("SWA", components)
 
     def test_missing_sidecar_pool_never_registers_the_component(self):
         params = SimpleNamespace(
             req_to_token_pool=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(storage=None, size=1024),
+            sliding_window_size=128,
+            draft_swa_window=0,
             component_registry_override=None,
-            tree_components=(),
+            tree_slots=(),
         )
         ctx = SimpleNamespace(
             server_args=None,
@@ -1311,7 +1361,7 @@ class TestC128ComponentGating(unittest.TestCase):
 
         class _StubCache:
             def __init__(self, params):
-                self.tree_components = tuple(params.tree_components)
+                self.tree_slots = tuple(params.tree_slots)
 
         with (
             patch(
@@ -1328,7 +1378,7 @@ class TestC128ComponentGating(unittest.TestCase):
             ),
         ):
             create_unified_radix_cache(ctx, cache_class=_StubCache)
-        self.assertNotIn(ComponentType.C128, params.tree_components)
+        self.assertNotIn("C128", tuple(slot.component for slot in params.tree_slots))
 
 
 class TestLowRatioCompressGuards(unittest.TestCase):
