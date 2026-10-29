@@ -172,7 +172,7 @@ class DecodeKVCacheOffloadManager:
             )
             return None
         pool = self.req_to_token_pool
-        new_slot = pool.mamba_allocator.alloc(1)
+        new_slot = self.token_to_kv_pool_allocator.state_slots.alloc(1)
         if new_slot is None:
             self._log_chunk_without_mamba_state("no free Mamba slot")
             return None
@@ -248,7 +248,7 @@ class DecodeKVCacheOffloadManager:
         if host_indices is None:
             logger.error(f"Not enough host memory for request {req.rid}")
             if new_mamba_slot is not None:
-                self.req_to_token_pool.mamba_allocator.free(new_mamba_slot)
+                self.token_to_kv_pool_allocator.state_slots.free(new_mamba_slot)
             return False
         if new_mamba_slot is not None:
             self._donate_mamba_state(req, new_mamba_slot)
@@ -345,7 +345,9 @@ class DecodeKVCacheOffloadManager:
     def _free_mamba_states(self, pool_transfers: list[PoolTransfer]) -> None:
         for transfer in pool_transfers:
             if transfer.name == PoolName.MAMBA:
-                self.req_to_token_pool.mamba_allocator.free(transfer.device_indices)
+                self.token_to_kv_pool_allocator.state_slots.free(
+                    transfer.device_indices
+                )
 
     def _release_finished_req(self, req: Req):
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,

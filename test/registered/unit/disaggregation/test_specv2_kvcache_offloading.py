@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.utils import get_hash_str, get_storage_hash_str
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -351,7 +352,7 @@ class TestMambaStateAcrossFailedHostWrite(CustomTestCase):
             origin_input_ids=array("q", [1, 2, 3, 4]),
             sampling_params=SamplingParams(max_new_tokens=8),
         )
-        pool.alloc([req])
+        acquire_rows(pool, pool.state, [req])
         req.output_ids.extend([5, 6, 7, 8, 9])
         # The decode tracked its state where the chunk [4, 8) ends.
         req.kv.mamba_last_track_seqlen = 8
@@ -360,6 +361,7 @@ class TestMambaStateAcrossFailedHostWrite(CustomTestCase):
 
         manager, _ = _make_manager(pool_size=32, page_size=4)
         manager.req_to_token_pool = pool
+        manager.token_to_kv_pool_allocator.state = pool.state
         manager.offload_stride = 4
         manager.request_counter = 0
         manager.writes_mamba = True
