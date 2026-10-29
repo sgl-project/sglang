@@ -232,8 +232,7 @@ def _can_batch_cross_request_image_misses(
     this optimization. On NPU, batching is limited to models that declare
     ``supports_batched_image_encoding`` — archs whose ``get_image_feature``
     has been validated to accept multiple items as one packed visual batch —
-    and stays opt-in via the patch budget plus the conservative guards on
-    unsupported dimensions (cuda graph, encoder DP).
+    and stays opt-in via the patch budget, with ViT CUDA graph guarded.
     """
     if _is_hip or _is_xpu:
         return False
@@ -247,7 +246,6 @@ def _can_batch_cross_request_image_misses(
         and getattr(owner, "supports_batched_image_encoding", False)
         and envs.SGLANG_NPU_VIT_MAX_BATCH_PATCHES.get() > 0
         and not envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
-        and not getattr(owner, "use_data_parallel", False)
     )
 
 

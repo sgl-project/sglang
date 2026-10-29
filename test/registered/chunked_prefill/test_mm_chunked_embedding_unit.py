@@ -450,9 +450,6 @@ def test_npu_batching_mode_guards(monkeypatch):
         assert not mm_schedule._can_batch_cross_request_image_misses(encoder)
     with get_parallel().override(tp_size=2, attn_tp_size=2, moe_tp_size=2):
         assert mm_schedule._can_batch_cross_request_image_misses(encoder)
-    setattr(owner, "use_data_parallel", True)
-    assert not mm_schedule._can_batch_cross_request_image_misses(encoder)
-    delattr(owner, "use_data_parallel")
     # Quantized ViT validated on w8a8s GLM-4.1V (byte-identical outputs):
     # quant_config no longer blocks batching.
     setattr(owner, "quant_config", object())
