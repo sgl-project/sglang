@@ -2341,8 +2341,10 @@ def cli_main():
             "mooncake",
             "longbench_v2",
             "speed-bench",
+            "timed-trace",
         ],
-        help="Name of the dataset to benchmark on.",
+        help="Name of the dataset to benchmark on. timed-trace is implemented "
+        "by the Rust client only (--rust-client).",
     )
     parser.add_argument(
         "--dataset-path", type=str, default="", help="Path to the dataset."
@@ -2426,6 +2428,45 @@ def cli_main():
         default=0.0,
         help="Range of sampled ratio of input/output length, "
         "used only for random and image dataset.",
+    )
+    # timed-trace dataset args (Rust client only; defaults mirror the Rust flags)
+    parser.add_argument(
+        "--timed-trace-chunk-hash-size",
+        type=int,
+        default=16,
+        help="Tokens per hash_ids entry of a timed trace; each hash expands to "
+        "a chunk this long, the last one partial.",
+    )
+    parser.add_argument(
+        "--timed-trace-sec-multiplier",
+        type=float,
+        default=1.0,
+        help="Multiplies a timed trace's timestamps into seconds "
+        "(0.001 for a trace in milliseconds).",
+    )
+    parser.add_argument(
+        "--timed-trace-label-timestamp",
+        type=str,
+        default="timestamp",
+        help="Field name of the timestamp in the timed trace.",
+    )
+    parser.add_argument(
+        "--timed-trace-label-input-length",
+        type=str,
+        default="input_length",
+        help="Field name of the input length in the timed trace.",
+    )
+    parser.add_argument(
+        "--timed-trace-label-output-length",
+        type=str,
+        default="output_length",
+        help="Field name of the output length in the timed trace.",
+    )
+    parser.add_argument(
+        "--timed-trace-label-hash-ids",
+        type=str,
+        default="hash_ids",
+        help="Field name of the hash ids in the timed trace.",
     )
     # image dataset args
     parser.add_argument(
@@ -2872,6 +2913,11 @@ def cli_main():
     args = parser.parse_args()
     if args.rust_worker_threads is not None and not args.rust_client:
         parser.error("--rust-worker-threads requires --rust-client")
+    if args.dataset_name == "timed-trace" and not args.rust_client:
+        parser.error(
+            "--dataset-name timed-trace is implemented by the Rust client only; "
+            "add --rust-client, or run `python -m sglang.benchmark.rust_client`"
+        )
     if args.rust_client:
         # Checked here so an unsupported combination is a usage error rather
         # than a traceback; `run_benchmark` still raises for a programmatic
