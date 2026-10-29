@@ -45,7 +45,7 @@ def unwrap_kimi_images(images):
 
 
 def kimi_image_identity(content_config_digest: str, grid_thw: Sequence[int]) -> bytes:
-    """Full SHA-256 image identity: content and preprocessing config, then grid."""
+    """Bind a full source/config digest to the image's token grid."""
     digest = parse_content_hash(content_config_digest)
     if digest is None:
         raise ValueError("Kimi image identity requires a content digest")
@@ -135,10 +135,10 @@ class KimiGridMMDataMixin:
     def assign_kimi_image_identities(
         self, mm_items: List[MultimodalDataItem], images: Optional[List[Any]]
     ) -> None:
-        """Give each image item a full content+config+grid identity.
+        """Identify raw images by source/config/grid, or prepared inputs by value.
 
-        Source images identify processor-computed items; preprocessed or
-        precomputed inputs are identified by their own tensor contents.
+        Prepared inputs use the common typed identity, including their format
+        and encoder metadata. Only digests, not full features, leave the GPU.
         """
         if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
             return
@@ -149,15 +149,15 @@ class KimiGridMMDataMixin:
             and all(item.format == MultimodalInputFormat.NORMAL for item in image_items)
         )
         for index, item in enumerate(image_items):
-            if use_sources:
-                source = images[index]
-            elif item.feature is not None:
-                source = item.feature
-            else:
-                source = item.precomputed_embeddings
+            if not use_sources:
+                # Recompute from the prepared input, not a caller's hash hint.
+                item.bind_processor_fingerprint(self._kimi_config_fingerprint())
+                item.clear_identity()
+                item.set_pad_value()
+                continue
             item.set_identity(
                 kimi_image_identity(
-                    self.kimi_content_config_digest(source), _item_grid_thw(item)
+                    self.kimi_content_config_digest(images[index]), _item_grid_thw(item)
                 )
             )
 
