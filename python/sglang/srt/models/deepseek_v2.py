@@ -82,6 +82,7 @@ from sglang.srt.layers.aux_hidden_states import (
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import (
     can_defer_cp_decode_attn_tp,
+    configure_cp_decode_attn_tp,
     get_cp_decode_attn_tp_ctx,
 )
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
@@ -97,6 +98,7 @@ from sglang.srt.layers.layer_boundary import (
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
 )
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -2180,6 +2182,10 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("o_proj", prefix),
             parallel_group="attn_tp",
         )
+        if self.q_lora_rank is not None:
+            configure_cp_decode_attn_tp(
+                self.o_proj, defer_all_reduce=self.defer_cp_decode_attn_tp
+            )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope and qk_rope_head_dim > 0:
@@ -2734,7 +2740,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         return (
             declare_attn(
                 output_transform=attn_output,
-                non_cp_tp_group=(
+                ordinary_tp_group=(
                     SumGroup.TP
                     if is_deepseek_dsa(config)
                     and getattr(config, "q_lora_rank", None) is not None
@@ -2775,6 +2781,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         attn, ffn = self.stage_facts(
             self.config, self.layer_id, is_nextn=self.is_nextn, **modules
         )
+        defer_decode_sum = getattr(self.self_attn, "defer_cp_decode_attn_tp", False)
+        if (attn.ordinary_tp_group is not None) != defer_decode_sum:
+            raise ValueError(
+                "CP decode attention TP deferral disagrees with the stage declaration"
+            )
+        if defer_decode_sum:
+            configure_cp_decode_attn_tp(self.self_attn.o_proj, defer_all_reduce=True)
         attn_boundary, ffn_boundary = append_stages(
             (
                 attn,
@@ -2848,6 +2861,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            if getattr(self.self_attn, "defer_cp_decode_attn_tp", False):
+                assert get_cp_decode_attn_tp_ctx().use_decode_attn_tp == (
+                    self.attn_boundary.plan.variant_for(forward_batch)
+                    is BatchVariant.ORDINARY
+                ), "CP decode weight dispatch disagrees with the boundary sum"
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,

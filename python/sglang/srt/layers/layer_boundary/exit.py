@@ -104,6 +104,7 @@ def exit_facts(kind, plan, variant, path) -> ExitFacts:
         return ExitFacts()
     output = path.output
     scattered = variant is BatchVariant.INPUT_SCATTERED
+    cp_active = variant is not BatchVariant.ORDINARY
     tp = get_parallel().tp_size > 1
     if kind is StageKind.ATTENTION:
         return ExitFacts(
@@ -114,7 +115,7 @@ def exit_facts(kind, plan, variant, path) -> ExitFacts:
                 plan,
                 output,
                 scattered=scattered,
-                cp_active=variant is not BatchVariant.ORDINARY,
+                cp_active=cp_active,
             )
         )
     sum_in_reduce_scatter = output.may_reduce_scatter and (
@@ -127,7 +128,7 @@ def exit_facts(kind, plan, variant, path) -> ExitFacts:
             plan,
             output,
             scattered=scattered,
-            cp_active=variant is not BatchVariant.ORDINARY,
+            cp_active=cp_active,
         )
         # Under attention DP the next layer must also run postprocess's
         # scatter back to this rank's tokens, and nothing more.

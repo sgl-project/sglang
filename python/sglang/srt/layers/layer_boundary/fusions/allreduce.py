@@ -14,7 +14,8 @@
 
 """Select fused completion and read kernels for each consumer."""
 
-from functools import partial
+import logging
+from functools import lru_cache, partial
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -36,6 +37,17 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=16)
+def _warn_cp_fusion_peer_mismatch(cp_ranks, fusion_ranks):
+    logger.warning(
+        "CP decode all-reduce/norm fusion declined: CP peers %s differ from "
+        "fusion workspace peers %s; using an unfused reduction.",
+        cp_ranks,
+        fusion_ranks,
+    )
 
 
 def attn_input_fusions(plan, read=NORM_QUANT_READOUT) -> Tuple[Callable, ...]:
@@ -123,19 +135,28 @@ def ffn_input_fusions(plan) -> Tuple["FfnInputFusion", ...]:
     # Reuse the already initialized MoE fusion workspace only when it has the
     # very same peers; equal group widths alone are not sufficient.
     cp_fusion = ()
-    if not _use_aiter and any(
-        edges.incoming.produced.group is SumGroup.ATTN_CP
-        and not edges.incoming.produced.layout.sharded
-        and not edges.incoming.need.layout.sharded
-        for edges in plan.edges.values()
+    if (
+        not _use_aiter
+        and getattr(plan.norm, "supports_non_attn_tp_allreduce", False)
+        and any(
+            edges.incoming.produced.group is SumGroup.ATTN_CP
+            and not edges.incoming.produced.layout.sharded
+            and not edges.incoming.need.layout.sharded
+            for edges in plan.edges.values()
+        )
     ):
         cp_group = get_parallel().attn_cp_group
-        if cp_group.ranks == post_experts_reduction_group().ranks:
+        fusion_group = post_experts_reduction_group()
+        if cp_group.ranks == fusion_group.ranks:
             cp_fusion = (
                 FfnInputFusion(
                     completes=SumGroup.ATTN_CP,
                     run=partial(fused_ffn_input, plan, use_attn_tp_group=False),
                 ),
+            )
+        else:
+            _warn_cp_fusion_peer_mismatch(
+                tuple(cp_group.ranks), tuple(fusion_group.ranks)
             )
     return (
         *given,

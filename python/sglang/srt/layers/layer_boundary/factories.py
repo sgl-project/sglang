@@ -337,7 +337,7 @@ class StageDeclaration:
     reduction: ProducerReduction = ProducerReduction.EXIT_SCOPED
     gathers_attn_tp_input: bool = False
     tp_group: SumGroup = SumGroup.ATTN_TP
-    non_cp_tp_group: Optional[SumGroup] = None
+    ordinary_tp_group: Optional[SumGroup] = None
     in_token_order: bool = False
     dense_tp_size: Optional[int] = None
     exit_rows: Optional[ExitRows] = None
@@ -439,7 +439,7 @@ def declare_attn(
     gathers_attn_tp_input=True,
     output_transform=None,
     tp_group=SumGroup.ATTN_TP,
-    non_cp_tp_group=None,
+    ordinary_tp_group=None,
     attn_tp_gather=None,
     in_token_order=False,
     sum_impl=None,
@@ -458,7 +458,7 @@ def declare_attn(
             stage's input runs it, so no fused add + norm takes that input.
             Requires ALWAYS_PARTIAL.
         tp_group: Head partition; ATTN_TP by default, TP for full-TP consumers.
-        non_cp_tp_group: Optional head partition on ordinary (unsharded)
+        ordinary_tp_group: Optional head partition on ordinary (unsharded)
             batches, e.g. replicated prefill attention dispatched to TP decode.
         attn_tp_gather: Implementation of the gather over attention TP into
             this stage, tried before the boundary's own (see StageDeclaration).
@@ -486,7 +486,7 @@ def declare_attn(
         reduction=reduction,
         gathers_attn_tp_input=gathers_attn_tp_input,
         tp_group=tp_group,
-        non_cp_tp_group=non_cp_tp_group,
+        ordinary_tp_group=ordinary_tp_group,
         attn_tp_gather=attn_tp_gather,
         in_token_order=in_token_order,
         sum_impl=sum_impl,
@@ -708,8 +708,8 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
     group = SumGroup.ATTN_TP
     compute_rows = attention
     tp_group = (
-        stage.non_cp_tp_group
-        if variant is BatchVariant.ORDINARY and stage.non_cp_tp_group is not None
+        stage.ordinary_tp_group
+        if variant is BatchVariant.ORDINARY and stage.ordinary_tp_group is not None
         else stage.tp_group
     )
     if tp_group is SumGroup.TP:

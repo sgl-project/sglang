@@ -70,6 +70,26 @@ def get_cp_decode_attn_tp_ctx() -> CpDecodeAttnTpContext:
     return _global_cp_decode_attn_tp_ctx
 
 
+def configure_cp_decode_attn_tp(linear, *, defer_all_reduce: bool = False) -> None:
+    """Validate the output projection before serving and guard its derived cache.
+
+    Clearing the Python shard cache on a weight update is insufficient: captured
+    CUDA graphs still reference the old copies. Until updates refresh those
+    buffers in place, use the existing model-owned update rejection protocol.
+    This is set at construction, not when a rank first populates its cache.
+    """
+    if defer_all_reduce and linear.reduce_results:
+        raise ValueError(
+            "CP decode attention TP deferral requires reduce_results=False"
+        )
+    if get_parallel().enable_cp_decode_attn_tp and get_parallel().attn_cp_size > 1:
+        linear._derived_weight_cache_error = (
+            "Online weight updates are not supported with CP decode attention TP: "
+            "cached weight/scale shards and captured CUDA graphs would retain old "
+            "weights. Restart without --enable-cp-decode-attn-tp to update weights."
+        )
+
+
 class CpDecodeAttnTpContext:
     """Slices replicated attention weights across CP ranks during decode."""
 
@@ -104,7 +124,15 @@ class CpDecodeAttnTpContext:
     def _slice(
         self, tensor: torch.Tensor, dim: int, *, is_scale: bool = False
     ) -> torch.Tensor:
-        assert dim in (0, 1)
+        if dim not in (0, 1) or tensor.ndim <= dim:
+            raise ValueError(
+                f"CP decode attn TP: cannot slice {tensor.shape=} at {dim=}"
+            )
+        if tensor.shape[dim] % self.decode_tp_size:
+            raise ValueError(
+                f"CP decode attn TP: shape[{dim}]={tensor.shape[dim]} "
+                f"not divisible by decode_tp_size={self.decode_tp_size}"
+            )
         chunk = tensor.shape[dim] // self.decode_tp_size
         sliced = tensor.narrow(dim, self.decode_tp_rank * chunk, chunk)
         if is_scale and tensor.dtype == torch.int32 and tensor.ndim == 2:
@@ -145,14 +173,11 @@ class CpDecodeAttnTpContext:
             return
         is_param = isinstance(tensor, torch.nn.Parameter)
         raw = tensor.data if is_param else tensor
-        assert isinstance(raw, torch.Tensor) and raw.dim() > dim, (
-            f"CP decode attn TP: {type(obj).__name__}.{attr_name} is not sliceable "
-            f"(type={type(tensor).__name__}, dim={raw.dim()}, required_dim>{dim})"
-        )
-        assert raw.shape[dim] % self.decode_tp_size == 0, (
-            f"CP decode attn TP: {type(obj).__name__}.{attr_name}.shape[{dim}]={raw.shape[dim]} "
-            f"not divisible by decode_tp_size={self.decode_tp_size}"
-        )
+        if not isinstance(raw, torch.Tensor) or raw.dim() <= dim:
+            raise ValueError(
+                f"CP decode attn TP: {type(obj).__name__}.{attr_name} "
+                f"is not sliceable along dimension {dim}"
+            )
 
         cache_key = (id(obj), attr_name)
         cache = self._slice_cache.get(cache_key)
@@ -201,7 +226,17 @@ class CpDecodeAttnTpContext:
 
         attrs = [(linear_instance, "weight", dim)]
         for scale_name in ("weight_scale_inv", "weight_scale"):
-            if getattr(linear_instance, scale_name, None) is not None:
+            scale = getattr(linear_instance, scale_name, None)
+            if scale is not None:
+                if dim == 1 and scale.dtype == torch.int32 and scale.ndim == 2:
+                    # DeepGEMM UE8M0 packs four 128-element K-block scales per
+                    # int32. Checking the padded scale shape alone misses a
+                    # logical K boundary inside one of these packed groups.
+                    if linear_instance.weight.shape[1] % (self.decode_tp_size * 512):
+                        raise ValueError(
+                            "CP decode attn TP: each packed UE8M0 K shard must "
+                            "contain a multiple of 512 weight columns"
+                        )
                 attrs.append((linear_instance, scale_name, dim))
         return attrs
 
@@ -256,8 +291,12 @@ class CpDecodeAttnTpContext:
                     row_parallel_decode_flags.append(
                         (linear, linear.use_decode_attn_tp)
                     )
-                    if defer_all_reduce:
-                        assert not linear.reduce_results
+                    if defer_all_reduce and linear.reduce_results:
+                        raise ValueError(
+                            "CP decode attention TP deferral requires reduce_results=False"
+                        )
+                    # This flag requests the *inline* row sum; deferred sums
+                    # are owned by the boundary even though weights are sliced.
                     linear.use_decode_attn_tp = not defer_all_reduce
 
             if tensor_attrs:
