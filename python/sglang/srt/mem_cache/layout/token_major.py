@@ -136,7 +136,7 @@ def build_dense_views(
         f"build_dense_views: {num_slots} slots of {layout.entry_bytes} B end at byte "
         f"{end} but the raw buffer holds only {raw.numel() * raw.itemsize} bytes"
     )
-    as_dtype_view = raw.view(part.dtype)
+    as_dtype_view = raw[: raw.numel() // itemsize * itemsize].view(part.dtype)
     stride = (layout.entry_bytes // itemsize, *_contiguous_strides(part.row_shape))
     views: List[torch.Tensor] = []
     for layer in range(part.layer_num):
@@ -209,7 +209,7 @@ def build_mamba_entry_views(
         f"misaligned mamba spec: anchor_bytes={anchor_bytes} is not a multiple "
         f"of the conv-state itemsize {conv_itemsize} B"
     )
-    as_conv_dtype = raw.view(conv_dtype)
+    as_conv_dtype = raw[: raw.numel() // conv_itemsize * conv_itemsize].view(conv_dtype)
     conv_slot_stride_elems = entry_bytes // conv_itemsize
 
     offset_bytes_within_entry = offset_bytes
@@ -257,7 +257,7 @@ def build_mamba_entry_views(
         f"temporal-state itemsize {itemsize} B"
     )
     offset_elems = (anchor_bytes + offset_bytes_within_entry) // itemsize
-    as_temporal_dtype = raw.view(temporal_dtype)
+    as_temporal_dtype = raw[: raw.numel() // itemsize * itemsize].view(temporal_dtype)
     stride = (
         inner_shape_bytes // itemsize,
         entry_bytes // itemsize,

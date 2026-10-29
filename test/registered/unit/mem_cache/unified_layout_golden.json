@@ -1,5 +1,5 @@
 {
- "source": "test/manual/mem_cache/gen_unified_layout_golden.py; total-budget sizing based on 68b10822ef",
+ "source": "test/manual/mem_cache/gen_unified_layout_golden.py at d130897266 with consistent state-slot sizing",
  "layouts": {
   "swa_p1": {
    "chain": [["swa", "up"], ["full", "down"]],
@@ -1926,7 +1926,7 @@
   "mamba_p16": {
    "terms": [["mamba_bs1_state_slots", 1056], ["sink", 1024]],
    "budget_at_floor": 7240,
-   "minimum_usable_budget": 7912
+   "minimum_usable_budget": 8264
   },
   "tri_p16": {
    "terms": [["mamba_bs1_state_slots", 1056], ["swa_window_kv", 3072], ["sink", 1024]],

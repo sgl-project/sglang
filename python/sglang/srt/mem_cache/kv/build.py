@@ -10,7 +10,6 @@ from typing import Any, Optional, Sequence
 
 import msgspec
 
-from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.decl import (
     KVLayerDecl,
@@ -34,6 +33,7 @@ from sglang.srt.mem_cache.kv.sizing import (
     SizedKVStorage,
     size_plan,
 )
+from sglang.srt.mem_cache.kv.state_policy import StateSlotStrategy
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.kv.storage import KVStorage
 from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
@@ -82,15 +82,15 @@ def _log_banner(*lines) -> None:
 
 
 def _build_request_table(
-    plan: KVStoragePlan, ctx: UnifiedBuildContext, reserved_rows: int
+    plan: KVStoragePlan, ctx: UnifiedBuildContext, sized: SizedKVStorage
 ) -> RequestTable:
     """The request table: a row per running request (and per preallocated
     transfer), with the state slot columns when the plan has a state sub-pool."""
     state = plan.of_lifetime(StateLifetime)
-    overlap = not ctx.disable_overlap_schedule
+    strategy = sized.state_strategy
     return RequestTable(
-        size=ctx.max_num_reqs,
-        reserved_rows=reserved_rows,
+        size=sized.max_running_requests,
+        reserved_rows=sized.request_rows,
         pre_alloc_size=ctx.decode_pre_alloc_size,
         max_context_len=ctx.model_context_len + ctx.extra_max_context_len,
         state_sub_pool=None if state is None else state.name,
@@ -98,16 +98,10 @@ def _build_request_table(
             None
             if state is None
             else StateTracking(
-                extra_buffer=ctx.enable_mamba_extra_buffer,
-                lazy=ctx.enable_mamba_extra_buffer_lazy,
-                track_slots=get_mamba_tracking_slots(
-                    extra_buffer=True, overlap=overlap
-                ),
-                initial_slots=get_mamba_tracking_slots(
-                    extra_buffer=ctx.enable_mamba_extra_buffer,
-                    overlap=overlap,
-                    lazy=ctx.enable_mamba_extra_buffer_lazy,
-                ),
+                extra_buffer=strategy.extra_buffer,
+                lazy=strategy.lazy,
+                track_slots=strategy.tracking_slots,
+                initial_slots=strategy.initial_tracking_slots,
             )
         ),
         device=ctx.device,
@@ -268,7 +262,7 @@ def build_kv_storage(
         head_dim=owner_spec.head_dim if owner_is_mha else ctx.head_dim,
         bs1_floor_terms=sized.bs1_floor_terms,
     )
-    req_to_token_pool = _build_request_table(plan, ctx, sized.request_rows)
+    req_to_token_pool = _build_request_table(plan, ctx, sized)
     state_storage = None
     if state is not None:
         state_storage = _build_state_storage(plan, arena, ctx, scratch, request_memory)
@@ -372,13 +366,15 @@ def build_unified_pools(
     sizing = msgspec.structs.replace(
         sizing,
         max_running_requests=ctx.max_num_reqs,
+        state_strategy=sizing.state_strategy
+        or StateSlotStrategy(
+            radix_cache=sizing.radix_cache,
+            extra_buffer=ctx.enable_mamba_extra_buffer,
+            overlap=not ctx.disable_overlap_schedule,
+            lazy=ctx.enable_mamba_extra_buffer_lazy,
+        ),
         pre_alloc_rows=ctx.decode_pre_alloc_size,
         extra_context_len=ctx.extra_max_context_len,
-        tracking_slots=get_mamba_tracking_slots(
-            extra_buffer=True, overlap=not ctx.disable_overlap_schedule
-        )
-        if ctx.enable_mamba_extra_buffer
-        else 0,
     )
     sized = size_plan(plan, sizing)
     return build_kv_storage(plan, sized, ctx)
