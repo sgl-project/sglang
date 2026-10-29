@@ -28,6 +28,7 @@ get_mm_processor -> TokenSpaceSGLangProcessor
   --allowed-media-domains / max file size -> the core's media URL policy
   adjacent images -> two offsets from mm_spans, not one scanned run
   equal features, different grids -> different item hashes
+  equal feature bytes, different feature shapes -> different item hashes
   chat turns' media + partially expanded IDs -> prefix kept, new turn expanded
 """
 
@@ -618,6 +619,28 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
         self.assertEqual(output.input_ids, [1] + [IMAGE] * 5 + [2])
         self.assertEqual([item.offsets for item in output.mm_items], [[(1, 2), (3, 5)]])
 
+    def _item_hash(self, strategy_class, size):
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            model_impl="sglang",
+            mm_process_config={},
+            enable_token_space_processor=True,
+            mm_processor_worker_num=1,
+        )
+        publish(server_args, role="test")
+        processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+            strategy_class, TokenSpaceServingSpec
+        )(None, server_args, _bare_tokenizer(), None)
+        self.addCleanup(processor.shutdown)
+        output = asyncio.run(
+            processor.process_mm_data_async(
+                image_data=[Image.new("RGB", size)], input_ids=[1, IMAGE, 2]
+            )
+        )
+        return output.mm_items[0].hash
+
     def test_items_with_equal_features_but_different_grids_hash_apart(self):
         """Equal patches with different grids must not share an embedding or KV cache key."""
 
@@ -635,31 +658,30 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                     "num_image_tokens": [2],
                 }
 
-        reset_context()
-        self.addCleanup(reset_context)
-        server_args = ServerArgs(
-            model_path="dummy",
-            model_impl="sglang",
-            mm_process_config={},
-            enable_token_space_processor=True,
-            mm_processor_worker_num=1,
+        self.assertNotEqual(
+            self._item_hash(_GridStrategy, (1, 2)),
+            self._item_hash(_GridStrategy, (2, 1)),
         )
-        publish(server_args, role="test")
-        processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
-            _GridStrategy, TokenSpaceServingSpec
-        )(None, server_args, _bare_tokenizer(), None)
-        self.addCleanup(processor.shutdown)
+        self.assertEqual(
+            self._item_hash(_GridStrategy, (1, 2)),
+            self._item_hash(_GridStrategy, (1, 2)),
+        )
 
-        def item_hash(size):
-            output = asyncio.run(
-                processor.process_mm_data_async(
-                    image_data=[Image.new("RGB", size)], input_ids=[1, IMAGE, 2]
-                )
-            )
-            return output.mm_items[0].hash
+    def test_features_laid_out_by_their_own_shape_hash_apart(self):
+        """Transposed solid images, e.g. Muse Spark's [3, H, W], must not share a cache key."""
 
-        self.assertNotEqual(item_hash((1, 2)), item_hash((2, 1)))
-        self.assertEqual(item_hash((1, 2)), item_hash((1, 2)))
+        class _PixelShapeStrategy(_ImageWidthStrategy):
+            def process_image(self, image, processor, preprocess_kwargs, **kwargs):
+                # Equal bytes for transposed sizes; only the shape tells them apart.
+                return {
+                    "pixel_values": torch.zeros(image.height, image.width),
+                    "num_image_tokens": [2],
+                }
+
+        self.assertNotEqual(
+            self._item_hash(_PixelShapeStrategy, (1, 2)),
+            self._item_hash(_PixelShapeStrategy, (2, 1)),
+        )
 
 
 if __name__ == "__main__":
