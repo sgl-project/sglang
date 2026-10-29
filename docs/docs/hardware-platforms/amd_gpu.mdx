@@ -228,7 +228,7 @@ docker run -it --rm \
 - Diffusion / DiT (e.g. Wan2.2): `--attention-backend torch_sdpa`, `--num-gpus 1`
 - Keep `SGLANG_USE_AITER=0` (already set in the official image)
 
-Pass `--attention-backend` explicitly. Without it, the server resolves the backend automatically and picks `aiter` on gfx1151, which targets wave64 CDNA hardware. Set both the flag and `SGLANG_USE_AITER=0`:
+**Set the attention backend explicitly.** Without `--attention-backend`, the server resolves the backend automatically and picks `aiter` on gfx1151, which targets wave64 CDNA hardware. Set both the flag and `SGLANG_USE_AITER=0`:
 
 ```bash
 SGLANG_USE_AITER=0 python3 -m sglang.launch_server \
@@ -240,31 +240,23 @@ SGLANG_USE_AITER=0 python3 -m sglang.launch_server \
 
 ### Memory model on an APU
 
-Strix Halo has no dedicated VRAM. Depending on the BIOS settings, `rocm-smi` may report only a small VRAM carve-out (for example 512 MB), while the memory SGLang actually allocates from is the GTT pool:
+The GPU carves its memory from system RAM, so the numbers reported for "VRAM" and for the pool SGLang allocates from differ. Depending on the BIOS settings, `rocm-smi` may report only a small VRAM carve-out (for example 512 MB), while the allocatable pool is GTT:
 
 ```bash
 rocm-smi --showmeminfo gtt | grep -E "Used|Total"
 ```
 
-PyTorch follows the same view: `torch.cuda.get_device_properties(0).total_memory` and `torch.cuda.mem_get_info()` both report the GTT pool (for example about 108 GiB on a 128 GB machine), not the carve-out. So `--mem-fraction-static` is a fraction of GTT, and the guidance for discrete GPUs ("leave head-room below 0.9 of VRAM") does not transfer.
+PyTorch follows the same view: `torch.cuda.get_device_properties(0).total_memory` and `torch.cuda.mem_get_info()` both report the GTT pool (for example about 108 GB on a 128 GB machine), not the carve-out. So `--mem-fraction-static` is a fraction of GTT, not of a separate VRAM budget.
 
 ### Hybrid (GDN) models and the mamba state cache
 
 Models that mix full attention with Gated DeltaNet layers (`Qwen3-Next`, `Qwen3.5`) keep a per-request SSM state in the mamba cache. On gfx1151 that state, rather than the KV pool, limits how many requests you can run at once, because the cache reserves five state slots per request. At startup SGLang reports the resulting cap:
 
-```text
+```text Startup log
 max_running_requests is capped to 99 by the mamba state cache
 (max_mamba_cache_size=498, 5 state slots per request)
 ```
 
-Raising `--max-running-requests` above that value has no effect, so check this line before sizing a deployment. `--mamba-ssm-dtype bfloat16` halves the state size and doubles the cap on the same pool, without changing the KV capacity:
-
-```bash
-SGLANG_USE_AITER=0 python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3.5-4B \
-  --attention-backend triton \
-  --num-gpus 1 \
-  --mamba-ssm-dtype bfloat16
-```
+Raising `--max-running-requests` above that value has no effect, so check this line before sizing a deployment. Adding `--mamba-ssm-dtype bfloat16` to the command above halves the state size and doubles the cap on the same pool, leaving the KV pool essentially unchanged.
 
 State size scales with the model config: for `Qwen3.5-4B`, each of the 24 linear-attention layers holds `32 × 128 × 128` elements per request — about 24 MiB in bfloat16, or 120 MiB of mamba-cache reservation at the default five slots per request.
