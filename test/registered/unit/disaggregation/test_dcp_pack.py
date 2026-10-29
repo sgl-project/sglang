@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
     init_dcp_pack_buffers,
+    try_pack_dcp_src,
 )
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
@@ -300,6 +301,54 @@ class TestTryDcpPack(CustomTestCase):
         pack_view = copy_mock.call_args.args[2]
         self.assertEqual(pack_view.storage_offset(), pack_offset)
         self.assertEqual(pack_view.numel(), src.size * item_len)
+
+    def test_try_pack_binds_pack_device_before_gather_stream(self):
+        """A transfer thread must not return to device 0 when the stream context exits."""
+        item_len = 16
+        pack = torch.zeros(4 * item_len, dtype=torch.uint8)
+        buf = type(
+            "Buf",
+            (),
+            {
+                "buffer": pack,
+                "fits": lambda self, n: n <= pack.numel(),
+                "get_ptr": lambda self: 0x1000,
+                "get_size": lambda self: pack.numel(),
+                "get_gather_stream": lambda self: Mock(),
+                "producer_stream": lambda self: Mock(),
+            },
+        )()
+        events = []
+        device_module = Mock()
+        device_module.set_device.side_effect = lambda device: events.append(
+            ("set_device", device)
+        )
+
+        def stream_context(stream):
+            events.append(("stream",))
+            return nullcontext()
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.torch.get_device_module",
+                return_value=device_module,
+            ) as get_device_module,
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.device_stream_context",
+                side_effect=stream_context,
+            ),
+            patch("sglang.srt.disaggregation.common.dcp_pack.copy_mla_rows_into_pack"),
+        ):
+            packed = try_pack_dcp_src(
+                pack_buffer=buf,
+                kv_data_ptrs=[0],
+                src_token_indices=np.array([0, 1], dtype=np.int64),
+                token_item_lens=[item_len],
+            )
+
+        self.assertIsNotNone(packed)
+        get_device_module.assert_called_once_with(pack.device)
+        self.assertEqual(events, [("set_device", pack.device), ("stream",)])
 
 
 if __name__ == "__main__":
