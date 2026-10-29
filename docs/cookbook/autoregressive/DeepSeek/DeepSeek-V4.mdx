@@ -402,6 +402,7 @@ MODEL_PATH=deepseek-ai/DeepSeek-V4-Flash
 sglang serve \
   --model-path "$MODEL_PATH" \
   --tp 8 \
+  --context-length 49152 \
   --disable-prefill-cuda-graph \
   --dsv4-prefill-backend cutedsl_h16
 ```
