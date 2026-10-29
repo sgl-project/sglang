@@ -400,6 +400,13 @@ class EagerRunner(BaseRunner):
                 forward_batch,
                 **model_kwargs,
             )
+        # A model with compact output rows must gather with its output layout and
+        # pass matching token indices and lengths to logits/aux-state consumers.
+        if model.pp_group.is_last_rank and (
+            postprocess_cp_output := getattr(model, "postprocess_cp_output", None)
+        ):
+            return postprocess_cp_output(hidden_states, forward_batch)
+
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
         if capture_aux_hidden_states:
