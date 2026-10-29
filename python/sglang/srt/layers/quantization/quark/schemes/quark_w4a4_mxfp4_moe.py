@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -126,11 +127,9 @@ OCP_MX_BLOCK_SIZE = 32
 # the AITER path cannot run there: its scales are laid out for gfx950 and its
 # kernels produce garbage. Run the MoE as W4A16 instead: keep the packed MXFP4
 # weights and upcast them inside triton_kernels' matmul, with bf16 activations.
-# SGLANG_QUARK_MXFP4_MOE_W4A16=0 opts out.
+# SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16=0 opts out.
 _is_gfx1151 = _is_hip and "gfx1151" in torch.cuda.get_device_properties(0).gcnArchName
-_use_triton_w4a16 = _is_gfx1151 and get_bool_env_var(
-    "SGLANG_QUARK_MXFP4_MOE_W4A16", "true"
-)
+_use_triton_w4a16 = _is_gfx1151 and envs.SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16.get()
 _TRITON_W4A16_NUM_WARPS = 8
 
 
