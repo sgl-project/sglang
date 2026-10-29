@@ -755,7 +755,12 @@ def dispatch_w8a8_block_fp8_linear(
             act_scale_ue8m0=act_scale_ue8m0,
         )
 
-    if weight_block_size == [32, 32] and is_npu_arch35():
+    if (
+        weight_block_size == [32, 32]
+        and is_npu_arch35()
+        # Match the load-time MXFP8 conversion gate in Fp8LinearMethod.
+        and (act_scale_ue8m0 or envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get())
+    ):
         return npu_w8a8_mxfp8_linear
 
     # Other non-128 layouts still require Triton or the separate MXFP8 route.
