@@ -1,8 +1,8 @@
-"""GSM8K accuracy for MiniMax-M3.1-Flash on the H200 balanced recipe.
+"""MiniMax-M3.1-Flash on the H200 balanced recipe with DSpark.
 
-Hopper serves the NVFP4 experts through Marlin W4A16 and runs the sparse
-attention without the Blackwell MSA kernels, so this recipe needs no extra
-install on the CI runner.
+Hopper serves the NVFP4 experts through Marlin W4A16, runs the sparse attention
+without the Blackwell MSA kernels, and verifies DSpark drafts as per-row decode
+queries, so this recipe needs no extra install on the CI runner.
 """
 
 import unittest
@@ -32,6 +32,9 @@ class TestMiniMaxM31FlashH200(GSM8KMixin, DefaultServerBase):
         "0.85",
         "--cuda-graph-max-bs-decode",
         "64",
+        "--speculative-algorithm",
+        "DSPARK",
+        "--speculative-use-block-verification",
     ]
 
     gsm8k_backend = "sgl_eval"
@@ -40,8 +43,9 @@ class TestMiniMaxM31FlashH200(GSM8KMixin, DefaultServerBase):
     gsm8k_max_tokens = 8192
     gsm8k_temperature = 1.0
     gsm8k_top_p = 0.95
-    # Measured 0.959 and 0.953 on 8x H200.
+    # Measured 0.9575 and accept length 3.87 on 8x H200.
     gsm8k_score_threshold = 0.93
+    gsm8k_accept_length_thres = 3.4
 
 
 if __name__ == "__main__":
