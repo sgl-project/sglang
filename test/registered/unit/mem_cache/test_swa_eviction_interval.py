@@ -24,8 +24,16 @@ class _SwaCache(RadixCache):
             req_to_token=torch.arange(1024).reshape(1, -1)
         )
         self.token_to_kv_pool_allocator = Mock(
-            spec=["free_swa_segment", "free_group_begin", "free_group_end"]
+            spec=[
+                "free_swa_segment",
+                "free_group_begin",
+                "free_group_end",
+                "page_size",
+                "storage",
+            ]
         )
+        self.token_to_kv_pool_allocator.page_size = 16
+        self.token_to_kv_pool_allocator.storage = None
         self.trim_calls = 0
         self.auxiliary = auxiliary
 
@@ -35,9 +43,10 @@ class _SwaCache(RadixCache):
     def supports_auxiliary_swa(self):
         return self.auxiliary
 
-    def evict_sliding_windows(self, req, pre_len, *, eviction_interval=1):
+    def swa_retain_floor(self, req):
+        # Read once per window retirement the scheduler runs.
         self.trim_calls += 1
-        super().evict_sliding_windows(req, pre_len, eviction_interval=eviction_interval)
+        return super().swa_retain_floor(req)
 
 
 class TestSWAEvictionInterval(unittest.TestCase):

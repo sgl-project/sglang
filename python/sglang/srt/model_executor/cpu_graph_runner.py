@@ -32,6 +32,7 @@ import tqdm
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1373,10 +1374,12 @@ class CPUGraphRunner:
 
     def _reset_mamba_cache_if_needed(self) -> None:
 
-        mamba_pool = getattr(self.model_runner.req_to_token_pool, "mamba_pool", None)
+        mamba_pool = self.model_runner.token_to_kv_pool.layer_router.part_view(
+            STATE_PART
+        )
         if mamba_pool is None:
             return
-        mamba_cache = getattr(mamba_pool, "mamba_cache", None)
+        mamba_cache = mamba_pool.mamba_cache
         if mamba_cache is None:
             return
 
@@ -1471,6 +1474,11 @@ class CPUGraphRunner:
             ),
             global_forward_mode=self.capture_forward_mode,
         )
+        if (
+            hasattr(self.model_runner, "runner_ids")
+            and self.model_runner.runner_ids is not None
+        ):
+            self.model_runner.runner_ids.bind_runner_slots(forward_batch)
         # Wrap all forward calls with capture_with_skip_cross_attention so that
         # mllama (and any other encoder-decoder model) sees the correct compile-
         # time constant for skip_cross_attention during tracing.

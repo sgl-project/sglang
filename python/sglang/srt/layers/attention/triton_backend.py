@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -22,7 +21,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+)
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
@@ -30,10 +31,8 @@ from sglang.srt.layers.dcp import (
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -42,12 +41,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
-from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+from sglang.srt.speculative.eagle_utils import draft_step_writes
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
+    fill_draft_window_rail,
     generate_draft_decode_kv_indices,
-    generate_draft_decode_window_kv_indices,
     resolve_draft_decode_window,
 )
 from sglang.srt.utils import (
@@ -72,7 +71,7 @@ if _is_cuda:
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -219,11 +218,14 @@ class TritonAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
-        self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
+        # Window layers read and write the window sub-pool's ids.
+        self.use_sliding_window_kv_pool = (
+            self.kv_layers.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+        )
         # Lets the Triton wrappers specialize on PAGE_SIZE; page_size=1 is
         # byte-identical to the slot-based envelope.
         self.page_size = getattr(model_runner, "page_size", 1) or 1
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.dllm_block_size = (
             model_runner.decode_num_tokens_per_req()
@@ -514,7 +516,7 @@ class TritonAttnBackend(AttentionBackend):
 
     def _fill_kv_indptr_and_indices(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         bs: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
@@ -524,7 +526,7 @@ class TritonAttnBackend(AttentionBackend):
         if kv_indptr is None:
             kv_indptr = self.kv_indptr[: bs + 1]
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
-        self.kv_index_translator.pack_read_stream(
+        self.runner_ids.pack_read_stream(
             plan,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens[:bs],
@@ -535,7 +537,7 @@ class TritonAttnBackend(AttentionBackend):
 
     def _update_decode_kv_buffers(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         bs: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
@@ -572,7 +574,7 @@ class TritonAttnBackend(AttentionBackend):
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             window_kv_indptr, _, window_kv_lens, _ = update_sliding_window_buffer(
                 self.window_kv_indptr,
-                self.kv_index_translator,
+                self.runner_ids,
                 plan,
                 req_pool_indices,
                 self.sliding_window_size,
@@ -591,7 +593,7 @@ class TritonAttnBackend(AttentionBackend):
 
     def _update_target_verify_buffers(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         bs: int,
         seq_lens: torch.Tensor,
         spec_info,
@@ -621,7 +623,7 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_indptr, window_kv_indices, _, window_kv_offsets[:bs] = (
                 update_sliding_window_buffer(
                     self.window_kv_indptr,
-                    self.kv_index_translator,
+                    self.runner_ids,
                     plan,
                     req_pool_indices,
                     self.sliding_window_size,
@@ -654,7 +656,7 @@ class TritonAttnBackend(AttentionBackend):
 
     def _update_dllm_buffers(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         bs: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
@@ -676,7 +678,7 @@ class TritonAttnBackend(AttentionBackend):
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             update_sliding_window_buffer(
                 self.window_kv_indptr,
-                self.kv_index_translator,
+                self.runner_ids,
                 plan,
                 req_pool_indices,
                 self.sliding_window_size,
@@ -688,7 +690,7 @@ class TritonAttnBackend(AttentionBackend):
 
     def _update_draft_extend_buffers(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         bs: int,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
@@ -732,7 +734,7 @@ class TritonAttnBackend(AttentionBackend):
             _, _, _, self.cuda_graph_window_kv_offsets[:bs] = (
                 update_sliding_window_buffer(
                     self.window_kv_indptr,
-                    self.kv_index_translator,
+                    self.runner_ids,
                     plan,
                     req_pool_indices,
                     self.sliding_window_size,
@@ -810,7 +812,7 @@ class TritonAttnBackend(AttentionBackend):
                 return
 
             self._apply_cuda_graph_metadata(
-                plan=forward_batch.kv_loc_plan,
+                plan=forward_batch.iteration_ids,
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -828,7 +830,7 @@ class TritonAttnBackend(AttentionBackend):
             )
         else:
             self._apply_cuda_graph_metadata(
-                plan=forward_batch.kv_loc_plan,
+                plan=forward_batch.iteration_ids,
                 bs=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -861,9 +863,7 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_swa_out_cache_loc[:n].zero_()
         else:
             self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                self.kv_index_translator.write_ids(
-                    forward_batch, IdSpaceKind.SLIDING_WINDOW
-                )
+                self.runner_ids.write_ids(forward_batch, IdSpaceKind.SLIDING_WINDOW)
             )
         return self.cuda_graph_swa_out_cache_loc[:n]
 
@@ -907,7 +907,7 @@ class TritonAttnBackend(AttentionBackend):
                         seq_lens_sum, dtype=torch.int64, device=self.device
                     )
                     kv_indptr = self._fill_kv_indptr_and_indices(
-                        forward_batch.kv_loc_plan,
+                        forward_batch.iteration_ids,
                         bs,
                         forward_batch.seq_lens,
                         forward_batch.req_pool_indices,
@@ -920,8 +920,8 @@ class TritonAttnBackend(AttentionBackend):
                     window_kv_indptr, window_kv_indices, window_kv_lens, _ = (
                         update_sliding_window_buffer(
                             self.window_kv_indptr,
-                            self.kv_index_translator,
-                            forward_batch.kv_loc_plan,
+                            self.runner_ids,
+                            forward_batch.iteration_ids,
                             forward_batch.req_pool_indices,
                             self.sliding_window_size,
                             forward_batch.seq_lens,
@@ -1022,7 +1022,7 @@ class TritonAttnBackend(AttentionBackend):
                 seq_lens_sum, dtype=torch.int64, device=self.device
             )
             kv_indptr = self._fill_kv_indptr_and_indices(
-                forward_batch.kv_loc_plan,
+                forward_batch.iteration_ids,
                 bs,
                 forward_batch.seq_lens,
                 forward_batch.req_pool_indices,
@@ -1038,8 +1038,8 @@ class TritonAttnBackend(AttentionBackend):
                     window_kv_offsets,
                 ) = update_sliding_window_buffer(
                     self.window_kv_indptr,
-                    self.kv_index_translator,
-                    forward_batch.kv_loc_plan,
+                    self.runner_ids,
+                    forward_batch.iteration_ids,
                     forward_batch.req_pool_indices,
                     self.sliding_window_size,
                     forward_batch.seq_lens,
@@ -1079,7 +1079,7 @@ class TritonAttnBackend(AttentionBackend):
                     device=self.device,
                 )
                 kv_indptr = self._fill_kv_indptr_and_indices(
-                    forward_batch.kv_loc_plan,
+                    forward_batch.iteration_ids,
                     bs,
                     forward_batch.extend_prefix_lens,
                     forward_batch.req_pool_indices,
@@ -1093,8 +1093,8 @@ class TritonAttnBackend(AttentionBackend):
                     window_kv_offsets,
                 ) = update_sliding_window_buffer(
                     self.window_kv_indptr,
-                    self.kv_index_translator,
-                    forward_batch.kv_loc_plan,
+                    self.runner_ids,
+                    forward_batch.iteration_ids,
                     forward_batch.req_pool_indices,
                     self.sliding_window_size,
                     forward_batch.extend_prefix_lens,
@@ -1128,7 +1128,7 @@ class TritonAttnBackend(AttentionBackend):
 
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.kv_index_translator.write_ids(
+            swa_out_cache_loc = self.runner_ids.write_ids(
                 forward_batch, IdSpaceKind.SLIDING_WINDOW
             )
 
@@ -1395,7 +1395,7 @@ class TritonAttnBackend(AttentionBackend):
 
     def _apply_cuda_graph_metadata(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -1660,9 +1660,9 @@ class TritonAttnBackend(AttentionBackend):
             loc = loc_info
             kwargs = {}
         if k_scale is None and v_scale is None:
-            self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v, **kwargs)
+            self.kv_layers.layer(layer.layer_id).store(layer, loc, k, v, **kwargs)
         else:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
@@ -1698,15 +1698,18 @@ class TritonAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if k is None and v is None:
-            pool = self.token_to_kv_pool
             cache_loc = forward_batch.out_cache_loc
-            if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
+            if (
+                self.use_sliding_window_kv_pool
+                and self.kv_layers.route(layer.layer_id).sub_pool
+                == IdSpaceKind.SLIDING_WINDOW
+            ):
                 assert self.forward_metadata.swa_out_cache_loc is not None, (
                     "window-layer read-back before the metadata carried a "
                     "sliding-window write loc"
                 )
                 cache_loc = self.forward_metadata.swa_out_cache_loc
-            k_buffer, v_buffer = pool.get_kv_buffer(layer.layer_id)
+            k_buffer, v_buffer = self.kv_layers.read(layer.layer_id).kv()
             k = k_buffer[cache_loc]
             v = v_buffer[cache_loc]
         elif k is None or v is None:
@@ -1725,7 +1728,7 @@ class TritonAttnBackend(AttentionBackend):
                     # doesn't accept scale parameters. Clone to protect k from mutation
                     # since it's used later in the attention kernel.
                     k_scaled = k.clone().div_(layer.k_scale)
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer,
                         loc_info,
                         k_scaled,
@@ -1863,8 +1866,8 @@ class TritonAttnBackend(AttentionBackend):
                 k.contiguous(),
                 v.contiguous(),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.kv_layers.read(layer.layer_id).key(),
+                self.kv_layers.read(layer.layer_id).value(),
                 self.forward_metadata.qo_indptr,
                 kv_indptr,
                 kv_indices,
@@ -1891,8 +1894,8 @@ class TritonAttnBackend(AttentionBackend):
             k.contiguous() if self.dllm_attention is None else k,
             v.contiguous() if self.dllm_attention is None else v,
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
@@ -2030,8 +2033,8 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        k_buffer = self.kv_layers.read(layer.layer_id).key()
+        v_buffer = self.kv_layers.read(layer.layer_id).value()
 
         current_out = torch.zeros(
             (total_tokens, local_heads, layer.v_head_dim),
@@ -2196,12 +2199,12 @@ class TritonAttnBackend(AttentionBackend):
             window_start_pos = None
 
         extend_kv_indices = forward_batch.out_cache_loc
-        pool = self.token_to_kv_pool
         if (
             layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
-            and isinstance(pool, SWAKVPool)
-            and pool.layers_mapping[layer.layer_id][1]
+            and self.use_sliding_window_kv_pool
+            and self.kv_layers.route(layer.layer_id).sub_pool
+            == IdSpaceKind.SLIDING_WINDOW
         ):
             extend_kv_indices = self.forward_metadata.swa_out_cache_loc
             assert extend_kv_indices is not None, (
@@ -2260,8 +2263,8 @@ class TritonAttnBackend(AttentionBackend):
         self.extend_attention_fwd_unified(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
             k_descale,
             v_descale,
             self.forward_metadata.qo_indptr,
@@ -2327,7 +2330,7 @@ class TritonAttnBackend(AttentionBackend):
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
                     # after this point in decode, so scale in place.
                     k.div_(layer.k_scale)
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc.for_batch(
                         forward_batch,
@@ -2438,8 +2441,8 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.attn_lse.fill_(-float("inf"))
             self.decode_attention_fwd(
                 q_for_decode,
-                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.kv_layers.read(layer.layer_id).key(),
+                self.kv_layers.read(layer.layer_id).value(),
                 o_for_decode,
                 kv_indptr,
                 kv_indices,
@@ -2471,8 +2474,8 @@ class TritonAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             kv_indptr,
             kv_indices,
@@ -2548,7 +2551,7 @@ class TritonMultiStepDraftBackend:
         self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
             model_runner
         )
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         # Each draft step's window layers read a window-clipped rail of their
         # own: the draft's chain is not part of the committed prefix yet.
@@ -2587,8 +2590,8 @@ class TritonMultiStepDraftBackend:
             # over-estimate is safe. Use a static UB to skip the per-iter .sum().item() D2H.
             seq_lens_sum = num_seqs * self.max_context_len
 
-        src = self.kv_index_translator.read_source(
-            forward_batch.kv_loc_plan,
+        src = self.runner_ids.read_source(
+            forward_batch.iteration_ids,
             req_pool_indices=forward_batch.req_pool_indices,
             bs=num_seqs,
         )
@@ -2615,7 +2618,16 @@ class TritonMultiStepDraftBackend:
             TRANSLATE=src.v2p is not None,
         )
         if self.window_rail:
-            self._fill_window_rail(forward_batch, window_kv_indices_buffer, bs)
+            fill_draft_window_rail(
+                self.runner_ids,
+                forward_batch,
+                window_kv_indices_buffer,
+                self.window_kv_indptr,
+                topk=self.topk,
+                num_steps=self.speculative_num_steps,
+                page_size=self.page_size,
+                window=self.sliding_window_size,
+            )
 
         if call_fn is None:
             return
@@ -2634,85 +2646,14 @@ class TritonMultiStepDraftBackend:
                 ]
             call_fn(i, forward_batch)
 
-    @contextlib.contextmanager
     def _step_writes(self, forward_batch, step: int):
-        """Bind draft step ``step``'s slice of the batch's write ids, as
-        `EagleWorkerV2.draft_forward` slices them, and its columns of the
-        iteration's write window, while a per-step backend derives its write
-        targets (the swa ids included) from the batch."""
-        loc, cols = forward_batch.out_cache_loc, forward_batch.kv_loc_cols
-        if loc is None or not self.attn_backends[step].use_sliding_window_kv_pool:
-            yield
-            return
-        num_steps = self.speculative_num_steps
-        if cols is None:
-            # The draft's own window, each row laid out (topk, num_steps).
-            step_cols = slice(step, None, num_steps)
-        else:
-            # A chain draft writes the leading columns of the verify window.
-            assert self.topk == 1 and isinstance(cols, slice) and cols.step is None
-            step_cols = slice(cols.start + step, cols.start + step + 1)
-        forward_batch.out_cache_loc = per_step_draft_out_cache_loc(
-            loc, forward_batch.batch_size, self.topk, num_steps
-        )[step]
-        forward_batch.kv_loc_cols = step_cols
-        try:
-            yield
-        finally:
-            forward_batch.out_cache_loc, forward_batch.kv_loc_cols = loc, cols
-
-    def _fill_window_rail(
-        self,
-        forward_batch: ForwardBatch,
-        window_kv_indices_buffer: torch.Tensor,
-        bs: int,
-    ) -> None:
-        """Emit every step's window-clipped read ids into the per-step rows
-        of ``window_kv_indices_buffer`` and their indptr into
-        ``self.window_kv_indptr``. The reader selects FULL or SWA storage;
-        the layer's window determines which positions to gather."""
-        num_seqs = forward_batch.batch_size
-        width = bs * self.sliding_window_size
-        assert window_kv_indices_buffer.shape[1] >= width, (
-            f"window rail row {window_kv_indices_buffer.shape[1]} < "
-            f"{bs} branch(es) x window {self.sliding_window_size}"
+        return draft_step_writes(
+            forward_batch,
+            step,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            enabled=self.attn_backends[step].use_sliding_window_kv_pool,
         )
-        src = self.kv_index_translator.read_source(
-            forward_batch.kv_loc_plan,
-            req_pool_indices=forward_batch.req_pool_indices,
-            bs=num_seqs,
-            kind=self.kv_index_translator.window_kv_kind,
-        )
-        generate_draft_decode_window_kv_indices[
-            (self.speculative_num_steps, num_seqs, self.topk)
-        ](
-            src.row_ids,
-            src.ids,
-            forward_batch.seq_lens,
-            window_kv_indices_buffer,
-            self.window_kv_indptr,
-            forward_batch.positions,
-            src.row_stride,
-            window_kv_indices_buffer.shape[1],
-            self.window_kv_indptr.shape[1],
-            next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps),
-            next_power_of_2(bs),
-            self.page_size,
-            self.sliding_window_size,
-            ENTRY_PAGE_SIZE=src.entry_page_size,
-            v2p=src.v2p,
-            TRANSLATE=src.v2p is not None,
-        )
-        if (
-            not src.is_translated
-            and self.kv_index_translator.window_kv_kind == IdSpaceKind.SLIDING_WINDOW
-        ):
-            # Static pool: the legacy full->swa translate, as
-            # update_sliding_window_buffer applies it to the target's window.
-            for i in range(self.speculative_num_steps):
-                row = window_kv_indices_buffer[i][:width]
-                row.copy_(self.token_to_kv_pool.translate_loc_from_full_to_swa(row))
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
@@ -2844,7 +2785,7 @@ class TritonMultiStepDraftBackend:
 
 def update_sliding_window_buffer(
     window_kv_indptr,
-    translator,
+    runner_ids,
     plan,
     req_pool_indices,
     sliding_window_size,
@@ -2879,24 +2820,25 @@ def update_sliding_window_buffer(
     window_kv_start_idx = seq_lens - window_kv_lens
     token_mapping = (
         token_to_kv_pool.full_to_swa_index_mapping
-        if isinstance(token_to_kv_pool, SWAKVPool)
+        if token_to_kv_pool is not None
+        and not runner_ids.is_translating
+        and token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+        is not None
         else None
     )
-    translated = translator.pack_read_stream(
+    translated = runner_ids.pack_read_stream(
         plan,
         req_pool_indices=req_pool_indices,
         seq_lens=window_kv_lens,
         indptr=window_kv_indptr,
         out=window_kv_indices,
         kv_start_idx=window_kv_start_idx,
-        kind=translator.window_kv_kind,
+        kind=runner_ids.window_kv_kind,
         token_mapping=token_mapping,
     )
-    if not translated and isinstance(token_to_kv_pool, BaseSWAKVPool):
+    if not translated and runner_ids.space(IdSpaceKind.SLIDING_WINDOW) is not None:
         kv_last_index = window_kv_indptr[-1]
-        window_kv_indices[:kv_last_index] = (
-            token_to_kv_pool.translate_loc_from_full_to_swa(
-                window_kv_indices[:kv_last_index]
-            )
+        window_kv_indices[:kv_last_index] = runner_ids.ids_in(
+            IdSpaceKind.SLIDING_WINDOW, window_kv_indices[:kv_last_index]
         )
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
