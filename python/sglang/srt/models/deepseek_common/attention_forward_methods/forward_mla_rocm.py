@@ -78,24 +78,6 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
-_HEAD_BMM_MAX_TOKENS = 288
-
-
-def _token_major_head_bmm(x, w, out):
-    """out[t, h] = x[t, h] @ w[h]; x and out are token-major [T, H, *]."""
-    if (
-        x.shape[0] <= _HEAD_BMM_MAX_TOKENS
-        and x.stride(2) == 1
-        and w.stride(2) == 1
-        and x.shape[2] % 64 == 0
-        and w.shape[2] % 64 == 0
-    ):
-        from sglang.kernels.ops.attention.dcp_kernels import head_bmm
-
-        head_bmm(x, w, out)
-    else:
-        torch.bmm(x.transpose(0, 1), w, out=out.transpose(0, 1))
-
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -706,7 +688,11 @@ class DeepseekMLARocmForwardMixin:
             q_nope_out = q_nope.new_empty(
                 q_nope.shape[0], q_nope.shape[1], self.kv_lora_rank
             )
-            _token_major_head_bmm(q_nope, self.w_kc_qrep, q_nope_out)
+            torch.bmm(
+                q_nope.transpose(0, 1),
+                self.w_kc_qrep,
+                out=q_nope_out.transpose(0, 1),
+            )
         elif q_replicate_active:
             q_nope_out = (
                 torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
@@ -1178,7 +1164,9 @@ class DeepseekMLARocmForwardMixin:
         projected = attn_output.new_empty(
             attn_output.shape[0], attn_output.shape[1], self.v_head_dim
         )
-        _token_major_head_bmm(attn_output, self.w_vc_qrep, projected)
+        torch.bmm(
+            attn_output.transpose(0, 1), self.w_vc_qrep, out=projected.transpose(0, 1)
+        )
         return projected
 
     def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
