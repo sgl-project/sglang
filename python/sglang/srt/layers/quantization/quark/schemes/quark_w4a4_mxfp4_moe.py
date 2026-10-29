@@ -1149,6 +1149,23 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         assert self.moe_runner_config.activation == "silu", (
             f"The W4A16 triton path only supports silu, got {self.moe_runner_config.activation}"
         )
+        # silu_and_mul below is plain SwiGLU on split gate/up halves; the clamped /
+        # alpha-scaled variants (e.g. gpt-oss, DeepSeek-V4) would be silently wrong.
+        cfg = self.moe_runner_config
+        unsupported = {
+            name: value
+            for name, value in (
+                ("gemm1_alpha", cfg.gemm1_alpha),
+                ("gemm1_beta", cfg.gemm1_beta),
+                ("gemm1_clamp_limit", cfg.gemm1_clamp_limit),
+                ("swiglu_limit", cfg.swiglu_limit or None),
+            )
+            if value is not None
+        }
+        if unsupported:
+            raise NotImplementedError(
+                f"The W4A16 triton path does not support SwiGLU variants: {unsupported}"
+            )
         logger.info_once(
             "Quark MXFP4 MoE on gfx1151: no FP4 hardware, running the W4A4 MXFP4 "
             "checkpoint as W4A16 (bf16 activations, MXFP4 weights upcast in "
