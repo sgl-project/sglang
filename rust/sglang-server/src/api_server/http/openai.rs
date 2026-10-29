@@ -6,26 +6,26 @@
 
 use axum::{Router, http::StatusCode, response::Response};
 use futures::StreamExt;
+use sglang_processor::ChatFormatterOptions;
 use std::sync::Arc;
 
 mod chat;
 mod completions;
+mod lowered;
 mod models;
 mod pd_routing;
 mod template;
-mod template_builtins;
-mod template_legacy;
-mod template_loader;
 mod tokenize;
 mod tools;
 
+pub(super) use lowered::OpenAiChat;
 pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
-use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput};
+use crate::api_server::core::{CoreError, CoreEvent, CoreOutput};
+use crate::api_server::handlers::CoreCall;
 use crate::message::config::ServerArgs;
 use crate::message::request::GenerateRequest;
-use crate::tokenizer_manager::tokenizer;
 use crate::utils::response::error_response;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
@@ -50,30 +50,16 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
         return None;
     }
-    let config_file = tokenizer::resolve_model_file(
-        &server_args.tokenizer_path,
-        server_args.revision.as_deref(),
-        "tokenizer_config.json",
-    );
-
-    match template::load_chat_formatter(
-        config_file.as_deref(),
-        (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
-        server_args.model_config.model_type.as_deref(),
-        server_args.chat_template.as_deref(),
-    ) {
-        Ok(formatter) => {
-            tracing::info!(
-                config = ?config_file.as_deref().unwrap_or("<built-in / inferred>"),
-                "loaded OpenAI chat template"
-            );
-            Some(formatter)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "OpenAI chat completions disabled");
-            None
-        }
+    let (formatter, error) = sglang_processor::select_chat_formatter(&ChatFormatterOptions {
+        tokenizer_path: server_args.tokenizer_path.clone(),
+        model_path: server_args.model_path.clone(),
+        revision: server_args.revision.clone(),
+        chat_template: server_args.chat_template.clone(),
+    });
+    if let Some(error) = error {
+        tracing::warn!(%error, "OpenAI chat completions disabled");
     }
+    formatter
 }
 
 fn unix_seconds() -> u64 {

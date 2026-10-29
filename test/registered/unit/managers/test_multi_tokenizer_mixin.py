@@ -25,8 +25,6 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BeamSearchOutput,
     ConfigureLoggingReq,
-    unwrap_from_pickle,
-    wrap_as_pickle,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
@@ -38,7 +36,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_batch_str_output() -> BatchStrOutput:
@@ -385,7 +383,6 @@ class TestMultiTokenizerMixin(CustomTestCase):
         output = _make_batch_embedding_output()
         output.retraction_counts = [0, 7]
         output.cached_tokens_details = [{"radix": 0}, {"radix": 2}]
-        output.time_stats = wrap_as_pickle(["stats-0", "stats-1"])
         output.pooled_hidden_states = [[1.0], [2.0]]
 
         split = _handle_output_by_index(output, 1)
@@ -394,7 +391,6 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(split.embeddings, [[0.3, 0.4]])
         self.assertEqual(split.retraction_counts, [7])
         self.assertEqual(split.cached_tokens_details, [{"radix": 2}])
-        self.assertEqual(unwrap_from_pickle(split.time_stats), ["stats-1"])
         self.assertEqual(split.pooled_hidden_states, [[2.0]])
 
     def test_embedding_split_takes_a_row_of_stacked_pooled_hidden_states(self):
@@ -411,7 +407,6 @@ class TestMultiTokenizerMixin(CustomTestCase):
 
         self.assertEqual(split.rids, ["embedding-rid-0"])
         self.assertIsNone(split.retraction_counts)
-        self.assertIsNone(split.time_stats)
         self.assertIsNone(split.pooled_hidden_states)
 
     def test_router_sends_embedding_output_per_request(self):

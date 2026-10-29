@@ -26,21 +26,23 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     TreeLock,
 )
+from sglang.srt.mem_cache.kv.alloc.interim import ChainAdmissionRules
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
+    ChainPrefillBudget,
     PrefillBudget,
     SWAPrefillBudget,
     estimate_swa_kv_tokens,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _RecordingDelayer:
@@ -96,6 +98,7 @@ class TestPrefillAdder(CustomTestCase):
         size_swa: int = 1_000_000,
     ) -> MagicMock:
         allocator = MagicMock()
+        allocator.has_window_pool = False
         allocator.full_available_size.return_value = full_available_size
         allocator.swa_available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
@@ -174,7 +177,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.supports_mamba.return_value = False
         self.mock_tree_cache.sliding_window_size = 8
         self.mock_tree_cache.supports_prefix_sharing.return_value = False
-        allocator = init_unified_swa_pools(
+        allocator = build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
             head_num=1,
@@ -972,6 +975,7 @@ class TestPrefillAdder(CustomTestCase):
         extend_len = 1024
         prefix_len = context_len - extend_len
         kvc = SimpleNamespace(
+            is_draft_worker=False,
             page_size=4,
             model_config=SimpleNamespace(context_len=context_len),
         )
@@ -1163,6 +1167,28 @@ class TestPrefillAdder(CustomTestCase):
                     self.assertEqual(
                         queue._check_if_req_exceed_kv_capacity(req), not fits
                     )
+
+    def test_sharded_admission_reserves_scratch_before_load_back(self):
+        """A queued H2D must be consumed by its own batch, whose prefix gather
+        waits on the load: a host hit the scratch cannot hold never loads."""
+        adder = self.create_sharded_adder()
+        first = self.create_sharded_req("first")
+        self.assertEqual(
+            adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.CONTINUE,
+        )
+        req = self.create_sharded_req("host-hit", prefix_len=0, extend_len=16)
+        req.host_hit_length = 12
+        req.needs_host_load_back = MagicMock(return_value=True)
+        req.best_match_node = req.last_node
+
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.mock_tree_cache.init_load_back.assert_not_called()
+        self.assertEqual(adder.can_run_list, [first])
+        self.assertEqual(adder.kv_shard_block_bound_pages, 2)
 
     def _build_hybrid_swa_chunked_req(
         self,
@@ -1357,9 +1383,12 @@ class TestPrefillAdder(CustomTestCase):
                 return delivered, req.last_node
 
             self.mock_tree_cache.init_load_back.side_effect = load_back
-            verdict = adder.add_one_req(
-                req, has_chunked_req=False, truncation_align_size=None
-            )
+            with patch.object(
+                adder, "_kv_shard_reserve_scratch", side_effect=AssertionError
+            ):
+                verdict = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
             return verdict, list(adder.can_run_list), req
 
         # Promise kept: only the 8-token tail is prefilled, which fits.
@@ -1398,6 +1427,7 @@ class TestPrefillAdder(CustomTestCase):
             size_swa=size_swa,
         )
         self.mock_token_allocator.mock_add_spec(SWATokenToKVPoolAllocator)
+        self.mock_token_allocator.has_window_pool = True
         self.mock_token_allocator.swa_req_ring = ring
         self.mock_token_allocator.swa_ring_cost_tokens = 4096
         self.mock_token_allocator.create_prefill_budget.side_effect = (
@@ -1579,9 +1609,17 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache = self.create_tree_cache()
         self.mock_tree_cache.mock_add_spec(schedule_policy.UnifiedRadixCache)
         self.mock_tree_cache.buffer_pipeline = MagicMock()
+        allocator = self.mock_token_allocator
+        allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
+            ChainPrefillBudget(
+                allocator,
+                tree_cache,
+                rules=ChainAdmissionRules(window="none", state_slot_cost=64),
+                **kwargs,
+            )
+        )
         adder = self.create_adder(self.create_running_batch())
-        adder._mamba_slot_cost = 64
-        adder.rem_mamba_slots = available_slots
+        adder.memory_budget.rem_state_slots = available_slots
         req = self._create_host_hit_req(host_hit=32, tail=8)
         req.mamba_host_hit_length = 1
         req.kv.holds_mamba = holds_state
@@ -1608,7 +1646,9 @@ class TestPrefillAdder(CustomTestCase):
                 self.mock_token_allocator.available_size.return_value = capacity
                 result = adder.add_one_req(req, False, None)
                 self.assertEqual(adder.can_run_list, [req] if admitted else [])
-                self.assertEqual(adder.rem_mamba_slots, 0 if admitted else slots)
+                self.assertEqual(
+                    adder.memory_budget.rem_state_slots, 0 if admitted else slots
+                )
                 if admitted:
                     self.mock_tree_cache.init_load_back.assert_called_once()
                     self.assertEqual(
@@ -1634,10 +1674,9 @@ class TestPrefillAdder(CustomTestCase):
         # Continuing chunks retain the original host-hit metadata.
         self.assertEqual(req.mamba_host_hit_length, 1)
         next_adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=4)
-        next_adder._mamba_slot_cost = 64
-        next_adder.rem_mamba_slots = 0
+        next_adder.memory_budget.rem_state_slots = 0
         self.assertIsNone(next_adder.add_chunked_req(req))
-        self.assertEqual(next_adder.rem_mamba_slots, 0)
+        self.assertEqual(next_adder.memory_budget.rem_state_slots, 0)
         self.assertEqual(next_adder.memory_budget.total_offset, 4 + 8 + 1)
 
     def test_successful_load_back_commits_the_selected_shape_once(self):

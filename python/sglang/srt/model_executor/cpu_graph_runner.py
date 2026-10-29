@@ -27,6 +27,7 @@ import tqdm
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -209,6 +210,10 @@ def register_fake_ops(tp_size: int):
         @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
+
+    @register_cpu_compile_fake("fused_dual_residual_rmsnorm_cpu")
+    def _(x, residual, w1, w2, eps):
+        return torch.empty_like(x), torch.empty_like(x)
 
     @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_cpu")
     def _(q, k, q_weight, k_weight, eps, head_dim):
@@ -411,6 +416,21 @@ def register_fake_ops(tp_size: int):
         return (
             torch.empty(shape, device=hidden_states.device, dtype=torch.float),
             torch.empty(shape, device=hidden_states.device, dtype=torch.int),
+        )
+
+    @register_cpu_compile_fake("fused_moe_router_cpu")
+    def _(
+        moe_softcapping,
+        hidden_states,
+        gating_output,
+        topk,
+        renormalize,
+        correction_bias=None,
+    ):
+        shape = (hidden_states.shape[0], topk)
+        return (
+            torch.empty(shape, device=hidden_states.device, dtype=torch.float32),
+            torch.empty(shape, device=hidden_states.device, dtype=torch.int32),
         )
 
     @register_cpu_compile_fake("topk_softmax_cpu")
@@ -778,10 +798,12 @@ class CPUGraphRunner:
 
     def _reset_mamba_cache_if_needed(self) -> None:
 
-        mamba_pool = getattr(self.model_runner.req_to_token_pool, "mamba_pool", None)
+        mamba_pool = self.model_runner.token_to_kv_pool.layer_router.part_view(
+            STATE_PART
+        )
         if mamba_pool is None:
             return
-        mamba_cache = getattr(mamba_pool, "mamba_cache", None)
+        mamba_cache = mamba_pool.mamba_cache
         if mamba_cache is None:
             return
 
@@ -840,7 +862,7 @@ class CPUGraphRunner:
             ),
             global_forward_mode=self.capture_forward_mode,
         )
-        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
+        self.model_runner.runner_ids.bind_runner_slots(forward_batch)
         # Wrap all forward calls with capture_with_skip_cross_attention so that
         # mllama (and any other encoder-decoder model) sees the correct compile-
         # time constant for skip_cross_attention during tracing.
@@ -1012,6 +1034,11 @@ class CPUGraphRunner:
             hidden_states=(
                 output.hidden_states[: self.raw_num_token]
                 if output.hidden_states is not None
+                else None
+            ),
+            last_hidden_states=(
+                output.last_hidden_states[: self.raw_num_token]
+                if output.last_hidden_states is not None
                 else None
             ),
         )

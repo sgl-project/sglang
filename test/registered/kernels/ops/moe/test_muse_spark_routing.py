@@ -76,6 +76,7 @@ def _post_expert_reference(x, scores, weight, eps, weight_first, ids):
     f = x.float()
     if ids is not None:
         f = torch.where((ids >= 0).unsqueeze(-1), f, torch.zeros_like(f))
+        scores = torch.where(ids >= 0, scores, torch.zeros_like(scores))
     w = weight.float()
     if weight_first:
         f = f * w
@@ -85,7 +86,7 @@ def _post_expert_reference(x, scores, weight, eps, weight_first, ids):
     return (y * scores.float().unsqueeze(-1)).sum(dim=1)
 
 
-@pytest.mark.parametrize("num_tokens", [5, 64])
+@pytest.mark.parametrize("num_tokens", [1, 31, 32])
 @pytest.mark.parametrize("weight_first", [True, False])
 @pytest.mark.parametrize("with_ids", [False, True])
 def test_post_expert_finalize_triton(num_tokens, weight_first, with_ids):
@@ -94,16 +95,85 @@ def test_post_expert_finalize_triton(num_tokens, weight_first, with_ids):
     x = torch.randn(num_tokens, topk, hidden, device="cuda", dtype=torch.bfloat16)
     scores = torch.rand(num_tokens, topk, device="cuda")
     weight = 1.0 + 0.1 * torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
-    ids = (
-        torch.randint(-1, 4, (num_tokens, topk), device="cuda", dtype=torch.int32)
-        if with_ids
-        else None
-    )
+    ids = None
+    if with_ids:
+        ids = (
+            torch.tensor([0, 1, -1, 2, -1, 3, 0, -1], device="cuda", dtype=torch.int32)
+            .expand(num_tokens, -1)
+            .clone()
+        )
+        ids[0].fill_(-1)
+        poison = torch.tensor(
+            [float("nan"), float("inf")] * (topk // 2), device="cuda"
+        ).expand(num_tokens, -1)
+        x = torch.where((ids < 0).unsqueeze(-1), poison.unsqueeze(-1), x).to(x.dtype)
+        scores = torch.where(ids < 0, poison, scores)
     out = fused_post_expert_norm_weighted_sum(
         x, scores, weight, eps=1e-6, weight_first=weight_first, slot_expert_ids=ids
     )
     ref = _post_expert_reference(x, scores, weight, 1e-6, weight_first, ids)
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+    assert torch.isfinite(out).all()
+    if with_ids:
+        assert torch.count_nonzero(out[0]) == 0
+
+
+@pytest.mark.parametrize("strided_input", ["ids", "weight"])
+def test_post_expert_finalize_preserves_input_layout(strided_input):
+    """Small-batch finalization respects transposed IDs and sliced norm weights."""
+    tokens, topk, hidden = 2, 2, 8
+    x = torch.ones((tokens, topk, hidden), device="cuda", dtype=torch.bfloat16)
+    scores = torch.ones((tokens, topk), device="cuda")
+    ids = torch.tensor([[0, 0], [-1, -1]], device="cuda", dtype=torch.int32)
+    weight = torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
+    if strided_input == "ids":
+        ids = ids.T.contiguous().T
+        assert not ids.is_contiguous()
+    else:
+        weight = torch.arange(1, 2 * hidden + 1, device="cuda", dtype=torch.bfloat16)[
+            ::2
+        ]
+        assert not weight.is_contiguous()
+    out = fused_post_expert_norm_weighted_sum(
+        x, scores, weight, eps=1e-6, slot_expert_ids=ids
+    )
+    ref = _post_expert_reference(x, scores, weight, 1e-6, True, ids)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+    assert torch.count_nonzero(out[1]) == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_post_expert_fallback_preserves_product_rounding(dtype):
+    """Fallback rounds each product before summing and ignores poisoned slots."""
+    from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import (
+        finalize_identity_with_post_expert_norm,
+    )
+
+    one = torch.ones((), device="cuda", dtype=dtype)
+    a = torch.nextafter(one, torch.full_like(one, float("inf")))
+    x = torch.empty((2, 3, 1), device="cuda", dtype=dtype)
+    x[0, :, 0] = torch.stack((a, -a, torch.full_like(a, float("nan"))))
+    x[1, :, 0] = torch.tensor(
+        [float("nan"), float("inf"), -float("inf")], device="cuda", dtype=dtype
+    )
+    scores = torch.empty((2, 3), device="cuda", dtype=dtype)
+    scores[0] = torch.stack((a, one, torch.full_like(a, float("nan"))))
+    scores[1] = x[1, :, 0]
+    ids = torch.tensor([[0, 1, -1], [-1, -1, -1]], device="cuda", dtype=torch.int32)
+
+    out = finalize_identity_with_post_expert_norm(
+        expert_outputs=x,
+        topk_scores=scores,
+        post_expert_norm=torch.nn.Identity(),
+        out_dtype=dtype,
+        slot_expert_ids=ids,
+    )
+    expected = torch.stack((a * a, -a)).sum()
+    unrounded = (a.float() * a.float() - a.float()).to(dtype)
+    assert expected != unrounded
+    torch.testing.assert_close(out[0, 0], expected, rtol=0, atol=0)
+    assert torch.isfinite(out).all()
+    assert torch.count_nonzero(out[1]) == 0
 
 
 if __name__ == "__main__":
