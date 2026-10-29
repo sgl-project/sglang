@@ -384,6 +384,7 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
     def test_strategies_keep_the_legacy_processor_defaults(self):
         """A token-space model loads and schedules media like the legacy processor it replaces."""
         import_processors("sglang.srt.multimodal.processors")
+        import_processors("sglang.srt.multimodal.token_space_mm_process.models")
         legacy = {
             model_cls.__name__: cls for model_cls, cls in PROCESSOR_MAPPING.items()
         }
