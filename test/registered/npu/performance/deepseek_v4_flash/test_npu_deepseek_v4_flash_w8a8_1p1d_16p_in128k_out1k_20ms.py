@@ -246,7 +246,7 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
     warmup_requests = 16
     pop_sglang_is_in_ci_for_gsp = True
     tpot = 20
-    output_token_throughput = 60.304
+    output_token_throughput = 964.864
     ttft = 7
 
     def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_20ms(self):
