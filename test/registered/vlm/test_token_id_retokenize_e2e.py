@@ -19,6 +19,8 @@ non-canonical prompt ("Describe" split into "D"+"escribe") plus one image:
     drift delta.
   * flag ON  -> no drift: prompt_tokens equals the original length (with the
     image placeholder expanded).
+  * --enable-token-space-processor with the flag OFF -> no drift either: the
+    token-space processor never decodes the IDs.
 """
 
 import base64
@@ -38,8 +40,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=92, stage="base-b", runner_config="1-gpu-large")
-register_cpu_ci(est_time=123, suite="stage-b-test-cpu-intel")
+register_cuda_ci(est_time=138, stage="base-b", runner_config="1-gpu-large")
+register_cpu_ci(est_time=185, suite="stage-b-test-cpu-intel")
 
 
 def _data_uri():
@@ -111,6 +113,28 @@ class TestQwenVLTokenIdRetokenize(CustomTestCase):
         # ON keeps the user's original tokens; OFF loses the drift_delta tokens.
         pt_off, pt_on = prompt_tokens["0"], prompt_tokens["1"]
         self.assertEqual(pt_on - pt_off, drift_delta, f"on={pt_on}, off={pt_off}")
+
+    def test_token_space_processor_keeps_input_ids_with_flag_off(self):
+        """Token-space must keep the client's IDs even with the legacy flag off."""
+        input_ids, drift_delta = _build_drift_prompt(self.model, self.image_token)
+        self.assertGreater(drift_delta, 0, "prompt is canonical; no drift to exercise")
+        processor = AutoProcessor.from_pretrained(self.model, trust_remote_code=True)
+        image_tokens = processor._get_num_multimodal_tokens(
+            image_sizes=[(64, 64)]
+        ).num_image_tokens[0]
+        process = popen_launch_server(
+            self.model,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=self.other_args + ["--enable-token-space-processor"],
+            env={"SGLANG_MM_AVOID_RETOKENIZE": "0"},
+        )
+        try:
+            prompt_tokens = _prompt_tokens(DEFAULT_URL_FOR_TEST, input_ids, _data_uri())
+        finally:
+            kill_process_tree(process.pid)
+        # Only the image placeholder is replaced by its image tokens.
+        self.assertEqual(prompt_tokens, len(input_ids) - 1 + int(image_tokens))
 
 
 if __name__ == "__main__":
