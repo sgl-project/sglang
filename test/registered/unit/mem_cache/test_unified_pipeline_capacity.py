@@ -96,6 +96,8 @@ def worker(rank, path):
             "microbatch",
             "resized_tokens",
             "resized_requests",
+            "initial_rows",
+            "resized_rows",
         ):
             assert results[0][key] == results[1][key], (key, results)
         assert record["initial_requests"] == 3, results

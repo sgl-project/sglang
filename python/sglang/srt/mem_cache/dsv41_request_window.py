@@ -232,6 +232,11 @@ class PackedWindowView(msgspec.Struct, frozen=True, kw_only=True):
     dtype: torch.dtype
     kv_buffer: tuple[torch.Tensor, ...]
 
+    @property
+    def kv_cache_total_dim(self) -> int:
+        """Packed bytes per token in the attention kernel's paged view."""
+        return self.kv_layout.bytes_per_token
+
 
 class RequestWindowSpec(msgspec.Struct, frozen=True, kw_only=True):
     """Request-owned ring and fixed workspace extents, including padding pages."""

@@ -149,6 +149,119 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
     def _post_capture_bundle(self, total_bytes=_RESERVED_BYTES):
         return _bundle(total_bytes=total_bytes, post_capture_active=True)
 
+    def test_auto_state_shrink_preserves_captured_buffers(self):
+        from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
+        from sglang.srt.mem_cache.kv.decl import (
+            MHAGeometry,
+            StateGeometry,
+            kv_layer_decls,
+        )
+        from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+
+        setup_allocator_context()
+        plan = plan_kv_storage(
+            kv_layer_decls(
+                full_layer_ids=(0,),
+                full_geometry=MHAGeometry(
+                    head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.float16
+                ),
+                state_layer_ids=(1,),
+                state_geometry=StateGeometry(
+                    conv_state_shapes=((8, 8),),
+                    conv_dtype=torch.float16,
+                    temporal_state_shape=(1, 4, 8),
+                    temporal_dtype=torch.float32,
+                ),
+            ),
+            page_size=4,
+            speculative_num_draft_tokens=3,
+        )
+        captured = size_plan(
+            plan,
+            KVSizingInputs(
+                budget_bytes=1 << 20,
+                max_running_requests=10,
+                radix_cache=False,
+                context_len=16,
+                alignment=1,
+            ),
+        )
+        storage = build_kv_storage(
+            plan,
+            captured,
+            UnifiedBuildContext(
+                device="cuda",
+                start_layer=0,
+                end_layer=2,
+                enable_memory_saver=False,
+                need_sort=False,
+                max_num_reqs=10,
+                model_context_len=16,
+                state_cache_params=SimpleNamespace(layers=(1,)),
+                speculative_num_draft_tokens=3,
+                post_capture_active=True,
+            ),
+        )
+        a = storage.allocator
+        buffers = [
+            a.arena.raw,
+            storage.requests.req_to_token,
+            *storage.scratch.tensors.values(),
+        ]
+        buffers.extend(
+            t
+            for b in a.members
+            for t in (b.ids.virtual_to_physical, b.ids.physical_to_virtual)
+        )
+        identities = [(t.data_ptr(), tuple(t.shape)) for t in buffers]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            a.arena.raw[:1].fill_(7)
+        # Only five state slots plus their minimum token demand fit now.
+        state_bytes = plan.sub_pool("mamba").spec.entry_bytes()
+        budget = (
+            captured.fixed_bytes
+            + plan.sink_bytes()
+            + 5 * state_bytes
+            + 16 * plan.owner().spec.entry_bytes()
+        )
+        final = size_plan(
+            plan,
+            KVSizingInputs(
+                budget_bytes=budget,
+                max_running_requests=10,
+                radix_cache=False,
+                context_len=16,
+                alignment=1,
+            ),
+            frozen=captured,
+        )
+        self.assertLess(final.max_running_requests, captured.max_running_requests)
+        self.assertGreater(final.max_running_requests, 0)
+        self.assertEqual(final.units("mamba"), final.max_running_requests)
+        self.assertEqual(final.fixed, captured.fixed)
+        config = SimpleNamespace(
+            unified_memory_pool_bytes=final.total_bytes,
+            unified_full_cap_tokens=final.full_cap_tokens,
+            full_max_total_num_tokens=final.full_tokens,
+            swa_max_total_num_tokens=final.window_tokens,
+        )
+        a.get_kvcache().finalize_backing(config)
+        a.resize(config)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(a.arena.raw[0].item(), 7)
+        self.assertEqual([(t.data_ptr(), tuple(t.shape)) for t in buffers], identities)
+        slots = a.alloc_state_slots(final.max_running_requests)
+        self.assertIsNotNone(slots)
+        tokens = a.alloc(
+            -(-2 * final.max_running_requests // a.page_size) * a.page_size
+        )
+        self.assertIsNotNone(tokens)
+        a.free(tokens)
+        a.state_slots.free(slots)
+        self.assertEqual(storage.accounting_violations(), [])
+
     def test_reservation_backs_only_the_sink_before_capture(self):
         """Before sizing, the arena is address space: the sink is resident and
         only it may be handed to transfer engines, not the reserved bound."""
