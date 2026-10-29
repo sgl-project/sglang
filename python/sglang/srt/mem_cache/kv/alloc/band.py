@@ -161,7 +161,10 @@ def _float_open_short_side(flt, demand) -> None:
             continue
         holes = len(band_alloc._free_phys_pages) if band_alloc.lazy_compaction else 0
         ext = max(0, pages - holes)
-        side = "high" if band_alloc.grow_direction == "down" else "low"
+        above = flt.high_peer
+        while above is not None and above is not band_alloc:
+            above = above.high_peer
+        side = "high" if above is band_alloc else "low"
         sides[side] += ext * band_alloc.entry_bytes_per_page
     band = {
         "low": max(
@@ -174,18 +177,35 @@ def _float_open_short_side(flt, demand) -> None:
     surplus = {side: band[side] - sides[side] for side in ("low", "high")}
     f_pages = demand.get(flt, 0)
     f_bytes = max(0, f_pages - flt._hole_pages()) * flt.entry_bytes_per_page
-    slack = max(b.entry_bytes_per_page for b, pages in demand.items() if pages > 0)
+
+    def open_side(side, raw_gap):
+        # The donor demand is measured from its raw frontier; make_room takes
+        # a gap measured from the float's aligned region boundary.
+        epp = flt.entry_bytes_per_page
+        lo, hi = flt._region_bounds_pages()
+        if side == "low":
+            frontier = flt._chain_high_frontier_below_bytes()
+            target = -(-(frontier + raw_gap) // epp)
+            gap = (target - lo) * epp
+        else:
+            frontier = flt._chain_low_frontier_above_bytes()
+            target = (frontier - raw_gap) // epp
+            gap = (hi - target) * epp
+        flt.make_room(side=side, min_bytes=max(0, gap))
+
     if surplus["low"] < 0 and surplus["high"] < 0:
-        return  # zero-sum: opening one side closes the other
+        # One-sided relief does not jointly compact/reposition interior holes
+        # when both peer gaps are deficient. This is not an impossibility proof.
+        return
     if surplus["low"] < 0 or surplus["high"] < 0:
         short, far = ("low", "high") if surplus["low"] < 0 else ("high", "low")
-        target = sides[short] + max(0, f_bytes - max(0, surplus[far])) + slack
+        target = sides[short] + max(0, f_bytes - max(0, surplus[far]))
         if target > band[short]:
-            flt.make_room(side=short, min_bytes=target)
+            open_side(short, target)
         return
     if f_bytes > max(surplus.values()):
         short = "low" if surplus["low"] >= surplus["high"] else "high"
-        flt.make_room(side=short, min_bytes=sides[short] + f_bytes + slack)
+        open_side(short, sides[short] + f_bytes)
 
 
 def relieve_for_alloc(short_pool, need_tokens: int) -> bool:
@@ -748,6 +768,16 @@ class Band:
         (neighbor,) = m[1]
         return epoch, _drains_on_urgent_flush(neighbor)
 
+    def _schedulable_physical_tokens(self) -> int:
+        """Physical room after neighbor flush, before the owner token quota."""
+        key = self._schedulable_capacity_key()
+        if self._sched_avail_memo_key != key:
+            self._sched_avail_memo_tokens = self._available_tokens(
+                extra_gap_bytes=self._peer_drainable_hole_bytes()
+            )
+            self._sched_avail_memo_key = key
+        return self._sched_avail_memo_tokens
+
     def schedulable_available_size(self) -> int:
         """Tokens allocatable after flushing a neighbor, including reclaimable holes.
 
@@ -772,6 +802,8 @@ class Band:
         _float_open_short_side(blocker, {self: -(-need_tokens // self.page_size)})
 
     # -- physical-slot / physical-page primitives --
+
+    _physical_take_scope = None
 
     def take_physical(self, need_size: int) -> Optional[torch.Tensor]:
         """Reserve `need_size` TOKENS (multiple of page_size), returning backing
@@ -907,11 +939,39 @@ class Band:
     def take_physical_pages(self, num_pages: int) -> Optional[torch.Tensor]:
         """Page-granular wrapper around ``take_physical``."""
         with record_function("Band.take_physical_pages"):
+            scope = self._physical_take_scope
+            if scope is not None and not scope.applying:
+                return scope.take(self, num_pages)
             if num_pages * self.page_size > self.cap_available(
                 num_pages * self.page_size
             ):
                 return None
             return self.take_physical(num_pages * self.page_size)
+
+    def take_planned_physical_pages(self, take) -> Optional[torch.Tensor]:
+        """Apply a no-relief take only while its source geometry still holds."""
+        from sglang.srt.mem_cache.kv.alloc.pricing import snapshot_band
+
+        current = snapshot_band(self)
+        if (
+            current.low_byte != take.low_byte
+            or current.high_byte != take.high_byte
+            or current.holes != take.holes
+            or current.live != take.live
+        ):
+            return None
+        if take.fresh is not None:
+            start, end = take.fresh
+            if (
+                start * self.entry_bytes_per_page
+                < self._chain_high_frontier_below_bytes()
+                or end * self.entry_bytes_per_page
+                > self._chain_low_frontier_above_bytes()
+            ):
+                return None
+        if self.grow_direction == "float":
+            return self.take_physical_pages(take.pages, placement=take.fresh)
+        return self.take_physical_pages(take.pages)
 
     def _sorted_free_phys_pages(self) -> torch.Tensor:
         """`_free_phys_pages` in ascending order. Sorts on the device, and only
@@ -954,6 +1014,12 @@ class Band:
         when holes exist. Returns physical page ids [N], or None on shortfall.
         """
         with record_function("Band.place_pages"):
+            if self._physical_take_scope is not None:
+                physical = self.take_physical_pages(N)
+                if physical is not None:
+                    self.ids.bind(v_pages, physical)
+                    self._maybe_zero_pages(physical)
+                return physical
             if N * self.page_size > self.cap_available(N * self.page_size):
                 return None
             if N == 0:
@@ -1927,16 +1993,6 @@ class Band:
             return
         self._compact_pending(physical_pages)
 
-    def _schedulable_physical_tokens(self) -> int:
-        """Physical room after neighbor flush, before the owner token quota."""
-        key = self._schedulable_capacity_key()
-        if self._sched_avail_memo_key != key:
-            self._sched_avail_memo_tokens = self._available_tokens(
-                extra_gap_bytes=self._peer_drainable_hole_bytes()
-            )
-            self._sched_avail_memo_key = key
-        return self._sched_avail_memo_tokens
-
 
 def chain_byte_accounting_violations(
     chain: List[Band],
@@ -2133,7 +2189,12 @@ class FloatBand(Band):
 
     # -- physical page primitives (holes-first) --
 
-    def take_physical_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+    def take_physical_pages(
+        self, num_pages: int, *, placement: Optional[Tuple[int, int]] = None
+    ) -> Optional[torch.Tensor]:
+        scope = self._physical_take_scope
+        if scope is not None and not scope.applying:
+            return scope.take(self, num_pages)
         if num_pages <= 0:
             return torch.empty(0, dtype=torch.int64, device=self.device)
         n_drain = min(num_pages, self._hole_pages())
@@ -2142,7 +2203,20 @@ class FloatBand(Band):
         fresh: Optional[torch.Tensor] = None
         if need_more > 0:
             lo, hi = self._region_bounds_pages()
-            if self._is_frontier_transparent():
+            if placement is not None:
+                start, end = placement
+                if end - start != need_more or start < lo or end > hi:
+                    return None
+                if self._is_frontier_transparent():
+                    self.low_wm_page, self.high_wm_page = start, end
+                elif end == self.low_wm_page:
+                    self.low_wm_page = start
+                elif start == self.high_wm_page:
+                    self.high_wm_page = end
+                else:
+                    return None
+                fresh = torch.arange(start, end, dtype=torch.int64, device=self.device)
+            elif self._is_frontier_transparent():
                 # Reposition-on-alloc-from-empty: collapse to the midpoint so
                 # free gap remains on BOTH sides.
                 if need_more > hi - lo:
@@ -2357,13 +2431,15 @@ class FloatBand(Band):
         live_pages_sorted = [p for p in span if p not in holes]
 
         if need_pages >= live:
-            # Whole-pool LEAPFROG: pack every live page flush against the far
-            # region edge; the capacity check above guarantees the resulting gap
-            # satisfies the ask.
+            # Pack only far enough to satisfy this side. Packing against the
+            # opposite edge would erase room reserved for that neighbour.
+            gap_pages = -(-min_bytes // epp)
             if side == "high":
-                final = list(range(lo, lo + live))
+                end = hi - gap_pages
+                final = list(range(end - live, end))
             else:
-                final = list(range(hi - live, hi))
+                start = lo + gap_pages
+                final = list(range(start, start + live))
             self._relocate_to_positions(live_pages_sorted, final)
             gap_low2, gap_high2 = self._gap_pages()
             return (gap_low2 if side == "low" else gap_high2) * epp
@@ -2447,9 +2523,13 @@ class FloatBand(Band):
                 self._move_pages_and_rebind(src_t, dst_t)
                 self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
             else:
-                # Overlapping shift: process toward the move direction so each
-                # destination is free by the time it is written.
-                ordered = pairs if final[0] <= live_sorted[0] else list(reversed(pairs))
+                # Interior packing can move pages in both directions. For an
+                # order-preserving mapping, leftward moves are safe in ascending
+                # source order and rightward moves in descending source order;
+                # the two groups cannot overwrite each other's unread sources.
+                ordered = [pair for pair in pairs if pair[1] < pair[0]] + [
+                    pair for pair in reversed(pairs) if pair[1] > pair[0]
+                ]
                 # Built ONCE: `torch.tensor(..., device=cuda)` in the loop is a
                 # pageable H2D per page, and a shift can span the whole pool.
                 src_all = torch.tensor(

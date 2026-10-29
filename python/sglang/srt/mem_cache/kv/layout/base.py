@@ -81,7 +81,9 @@ class SubPoolSpec(ABC):
             f"{type(self).__name__}.grow_direction must be one of "
             f"{self._allowed_grow_directions}; got {self.grow_direction!r}"
         )
-        assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
+        assert self.layer_num > 0 or (
+            self.layer_num == 0 and self.draft_region is not None
+        ), "an empty target band must carry declared draft parts"
 
     @abstractmethod
     def entry_bytes(self) -> int:
