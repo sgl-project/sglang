@@ -67,6 +67,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "need_wait_for_mm_inputs",
         "no_logs",
         "num_items_assigned",
+        "parent_session_id",
         "positional_embed_overrides",
         "received_time",
         "return_bytes",

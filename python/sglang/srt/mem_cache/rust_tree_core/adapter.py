@@ -791,6 +791,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return self._match_result_from_binding(result)
 
+    def refresh_lru_to_root(self, node_id: NodeId) -> bool:
+        return self._binding.refresh_lru_to_root(node_id)
+
     def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
         return self._binding.match_full_device_prefix(
             self._bindings.MatchParamsBinding(
@@ -1063,6 +1066,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         kv_xfer = _transfer_from_binding(kv_xfer)
         comp_xfers = _comp_xfers_from_binding(comp_xfers)
         return kv_xfer, comp_xfers
+
+    def split_full_load_back_spec(self, kv_xfer: PoolTransfer) -> list[PoolTransfer]:
+        return [
+            _transfer_from_binding(transfer)
+            for transfer in self._binding.split_full_load_back_spec(
+                _transfer_to_binding(kv_xfer)
+            )
+        ]
 
     def prefetch_anchor_info(
         self, node_id: NodeId
