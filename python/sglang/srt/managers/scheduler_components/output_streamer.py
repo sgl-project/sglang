@@ -506,7 +506,9 @@ class _GenerationStreamAccumulator:
         output_ids_ = req.output_ids_through_stop
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
-        self.reasoning_tokens.append(req.reasoning_tokens)
+        # A verified token block can extend past the stop position. Report
+        # reasoning usage only within the same prefix as completion usage.
+        self.reasoning_tokens.append(min(req.reasoning_tokens, len(output_ids_)))
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
