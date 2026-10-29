@@ -3061,6 +3061,7 @@ class KVCacheConfigurator:
         from sglang.srt.mem_cache.kv.plan import plan_kv_storage
         from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
         from sglang.srt.mem_cache.kv.state_policy import StateSlotStrategy
+        from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
         schedule = get_schedule()
         has_window, has_state = self._unified_window_and_state()
