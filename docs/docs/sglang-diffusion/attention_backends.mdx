@@ -605,8 +605,8 @@ Hybrid window attention constraints:
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`dense_backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`str`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Backend used for the dense prefix: `fa` (default) or `sage_attn`. `sage_attn` is approximate.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`fa`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Backend used for the dense prefix: `fa` (default), `sage_attn`, or `aiter_sage` (default on ROCm). `sage_attn` and `aiter_sage` are approximate.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`fa` (`aiter_sage` on ROCm)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`kv_splits`</td>
@@ -704,12 +704,12 @@ Hybrid window attention constraints:
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sol_attn`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>gfx1201</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only. Requires <code>sol-attn</code>. Install with <code>pip install git+https://github.com/NVlabs/Sana.git@sol-engine#subdirectory=techniques/sparse_backends</code>. Configure via <code>--attention-backend-config</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA: requires <code>sol-attn</code>. Install with <code>pip install git+https://github.com/NVlabs/Sana.git@sol-engine#subdirectory=techniques/sparse_backends</code>. Configure via <code>--attention-backend-config</code>. On ROCm, gfx1201 only: uses aiter's <code>gfx1201_sol_attention</code> (<code>thresh_type=diag</code>).</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`video_sparse_attn`</td>
@@ -1009,4 +1009,5 @@ sglang generate \
 ### Notes for ROCm / MPS
 
 - ROCm: use `--attention-backend torch_sdpa` or `fa` depending on what is available in your environment. On gfx1151 / Strix Halo (wave32), do **not** use `aiter` — prefer `torch_sdpa` (image sets `SGLANG_USE_AITER=0`).
+- ROCm gfx1201 (Radeon AI PRO R9700 / R9600D, Radeon RX 9070): `aiter_sage` runs aiter's `gfx1201_sage_attention` kernel (INT8 QK^T, FP8 PV) for non-causal BF16 attention with head dim 128; other calls, and aiter builds without that op, keep the Triton `fav3_sage` kernel. `sol_attn` runs aiter's `gfx1201_sol_attention` with `aiter_sage` as the default dense backend.
 - MPS: the platform implementation always uses `torch_sdpa`.
