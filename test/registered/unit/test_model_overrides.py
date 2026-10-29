@@ -3600,14 +3600,28 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     {},
                 )
 
-        self.assertEqual(
-            _a2a_ep_size(
-                ResolvedView(
-                    SimpleNamespace(moe_a2a_backend="deepep", ep_size=1, tp_size=8)
+        for backend in ("deepep", "mscclpp"):
+            with self.subTest(backend=backend):
+                self.assertEqual(
+                    _a2a_ep_size(
+                        ResolvedView(
+                            SimpleNamespace(
+                                moe_a2a_backend=backend, ep_size=1, tp_size=8
+                            )
+                        )
+                    ),
+                    {"ep_size": 8},
                 )
-            ),
-            {"ep_size": 8},
-        )
+                self.assertEqual(
+                    _a2a_ep_size(
+                        ResolvedView(
+                            SimpleNamespace(
+                                moe_a2a_backend=backend, ep_size=4, tp_size=8
+                            )
+                        )
+                    ),
+                    {"ep_size": 8},
+                )
         self.assertEqual(
             _a2a_ep_size(
                 ResolvedView(SimpleNamespace(moe_a2a_backend="none", tp_size=8))

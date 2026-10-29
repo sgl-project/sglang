@@ -487,6 +487,20 @@ def _default_speculative_moe_runner_backend(
     return target_runner_backend
 
 
+def _validate_mscclpp_ep_spanning(a2a_backend: MoeA2ABackend) -> None:
+    if not a2a_backend.is_mscclpp():
+        return
+
+    parallel = get_parallel()
+    if parallel.moe_ep_size != parallel.tp_size:
+        raise ValueError(
+            "MSCCL++ currently requires --ep-size to equal --tp-size because "
+            "the SGLang dispatcher uses the tensor-parallel process group for "
+            f"A2A communication. Got --ep-size {parallel.moe_ep_size} and "
+            f"--tp-size {parallel.tp_size}."
+        )
+
+
 def initialize_moe_config():
     """Seed the MoE runtime flags from the published configuration.
 
@@ -514,7 +528,14 @@ def initialize_moe_config():
     moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
     moe.mscclpp_mode = MSCCLPPMode(exec_moe.mscclpp_mode)
     moe.mscclpp_ep_layout = MSCCLPPEPLayout(exec_moe.mscclpp_ep_layout)
+    _validate_mscclpp_ep_spanning(moe.a2a_backend)
     if moe.a2a_backend.is_mscclpp():
+        if overlap.enable_two_batch_overlap or overlap.enable_single_batch_overlap:
+            raise ValueError(
+                "MSCCL++ MoE does not support TBO/SBO overlap. Disable "
+                "--enable-two-batch-overlap and --enable-single-batch-overlap "
+                "when using --moe-a2a-backend mscclpp."
+            )
         get_mscclpp_ep_layout()
         mscclpp_supported_configs = (
             (

@@ -278,7 +278,8 @@ class _MSCCLPPDispatcherImplLowLatency(_MSCCLPPDispatcherImplBase):
                 "MSCCL++ active capacity exceeds the shared allocation: "
                 f"active={active_capacity}, allocated={self._allocation_capacity}"
             )
-        return active_capacity
+        # MSCCL++ accepts zero actual tokens but requires positive buffer geometry.
+        return max(active_capacity, 1)
 
     def dispatch(
         self,

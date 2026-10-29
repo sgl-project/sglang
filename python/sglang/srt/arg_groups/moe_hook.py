@@ -395,6 +395,15 @@ def handle_a2a_moe(server_args: Any):
                 ),
             )
 
+    if a2a_backend == "mscclpp" and (
+        cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap
+    ):
+        raise ValueError(
+            "MSCCL++ MoE does not support TBO/SBO overlap. Disable "
+            "--enable-two-batch-overlap and --enable-single-batch-overlap "
+            "when using --moe-a2a-backend mscclpp."
+        )
+
     if a2a_backend == "deepep_v2":
         validate_deepep_v2_model_architecture(server_args)
         # ElasticBuffer requires CUMEM, but not NVLS or its preallocation.

@@ -870,6 +870,8 @@ class ExecMoe(msgspec.Struct):
     mscclpp_mode: A[
         Literal["latency", "throughput"],
         "Select the transport mode for the `mscclpp` MoE A2A backend. "
+        "The current SGLang integration requires `--ep-size` to equal "
+        "`--tp-size`. "
         "`throughput` is reserved for future support.",
     ] = "latency"
     mscclpp_ep_layout: A[

@@ -427,13 +427,6 @@ def _run_flashinfer_cutlass(
 
 
 class FlashInferCutlassRunnerCore(MoeRunnerCore):
-    """Non-fused FlashInfer CUTLASS runner interface.
-
-    This core allows dispatcher-specific pre/post-permute adapters to execute
-    FlashInfer CUTLASS through MoeRunner's dispatch-run-combine pipeline. It is
-    used by the MSCCL++ latency rank-major layout.
-    """
-
     def run(
         self,
         runner_input: FlashInferCutlassRunnerInput,
