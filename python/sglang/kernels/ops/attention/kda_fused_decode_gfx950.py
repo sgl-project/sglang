@@ -2,20 +2,19 @@
 """HIP Kimi-K3 fused KDA decode for gfx950 (MI350X / MI355X).
 
 Same fail-closed interface as ``kda_fused_decode_aiter_hip``: it serves
-``SGLANG_ROCM_K3_KDA_FUSED_BACKEND=gfx950`` (the default on ROCm), and inputs it
-does not cover keep the unfused KDA decode. The kernel is
+``SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND=gfx950`` (the default on ROCm), and inputs
+it does not cover keep the unfused KDA decode. The kernel is
 ``attention.kda_decode_gfx950`` (``KernelBackend.KDA``), implemented in
 ``sglang.kernels.kda_kernels.kda_decode_gfx950``.
 """
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import KernelBackend
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
 _HEADS = 12
@@ -24,8 +23,7 @@ _CHANNELS = 3 * _HEADS * _DIM
 
 
 def enabled() -> bool:
-    backend = os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "gfx950")
-    return backend.lower() == "gfx950"
+    return envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower() == "gfx950"
 
 
 def available(device: torch.device | None = None) -> bool:

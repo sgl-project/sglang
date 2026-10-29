@@ -1066,11 +1066,6 @@ class Envs:
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
-    # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
-    # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
-    # output columns ride along nearly free.
-    SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
-    SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
@@ -2204,11 +2199,43 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
-    # Use the ROCm radix-4 router for covered K3 top-k workloads.
-    SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+
+    # ===================================================================
+    # Kimi-K3 on ROCm (HIP)
+    # ===================================================================
+    # Pad the AITER MXFP4 MoE intermediate to 128, not 256 (Quark W4A4 keeps the
+    # checkpoint width), and skip the router-logits contiguous copy on HIP.
+    SGLANG_OPT_HIP_K3_AITER = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_AITER_K3_OPT"
+    )
+    # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
+    # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
+    # output columns ride along nearly free.
+    SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_ROCM_K3_FUSE_KDA_INPROJ"
+    )
+    # Largest batch (tokens) that takes the merged in-proj GEMM.
+    SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvIntWithAlias(
+        256, deprecated_name="SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS"
+    )
+    # Use the radix-4 HIP router for K3 top-k on the AITER path; other routing
+    # shapes keep AITER's kernel.
+    SGLANG_OPT_HIP_K3_RADIX4_TOPK = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_K3_RADIX4_TOPK"
+    )
+    # Fused KDA decode kernel: "gfx950" (SGLang HIP kernel) or "aiter" (AITER
+    # FlyDSL boundary); any other value keeps the unfused KDA decode.
+    SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND = EnvStrWithAlias(
+        "gfx950", deprecated_name="SGLANG_ROCM_K3_KDA_FUSED_BACKEND"
+    )
+    # FlyDSL module behind the "aiter" fused KDA decode: "auto" prefers SGLang's
+    # vendored copy and falls back to AITER, "sglang" or "aiter" pin one.
+    SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
+        "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
+    )
 
     # ===================================================================
     # Symmetric memory

@@ -7,11 +7,13 @@ import sys
 import unittest
 import warnings
 from contextlib import ExitStack
+from unittest.mock import patch
 
 from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 NV_MEGA_RUNTIME_CHILDREN = (
@@ -216,6 +218,88 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
 
         self._apply(old_name, _DeprecatedEnv(replacement=new_name, transform=str.upper))
         self.assertEqual(os.environ[new_name], "ABC")
+
+
+class TestKimiK3HipEnvAliases(CustomTestCase):
+    """Launch scripts and the Kimi-K3 cookbook still set the pre-rename Kimi-K3
+    ROCm names, so each must keep reaching its new descriptor."""
+
+    # (new name, deprecated name, old raw, old parsed, new raw, new parsed);
+    # the old value is non-default so a read that ignores the alias shows up.
+    ALIASES = [
+        ("SGLANG_OPT_HIP_K3_AITER", "SGLANG_AITER_K3_OPT", "1", True, "0", False),
+        (
+            "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ",
+            "SGLANG_ROCM_K3_FUSE_KDA_INPROJ",
+            "0",
+            False,
+            "1",
+            True,
+        ),
+        (
+            "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS",
+            "SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS",
+            "64",
+            64,
+            "512",
+            512,
+        ),
+        (
+            "SGLANG_OPT_HIP_K3_RADIX4_TOPK",
+            "SGLANG_K3_RADIX4_TOPK",
+            "1",
+            True,
+            "0",
+            False,
+        ),
+        (
+            "SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND",
+            "SGLANG_ROCM_K3_KDA_FUSED_BACKEND",
+            "aiter",
+            "aiter",
+            "gfx950",
+            "gfx950",
+        ),
+        (
+            "SGLANG_USE_HIP_K3_FLYDSL_SOURCE",
+            "SGLANG_K3_FLYDSL_SOURCE",
+            "sglang",
+            "sglang",
+            "aiter",
+            "aiter",
+        ),
+    ]
+
+    def _get(self, name):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            value = getattr(envs, name).get()
+        return value, [w for w in caught if w.category is DeprecationWarning]
+
+    def test_deprecated_name_is_read_with_warning(self):
+        for new_name, old_name, old_raw, old_value, _, _ in self.ALIASES:
+            # The old name has no descriptor, and patch.dict also drops the copy
+            # the alias fallback writes to the new name.
+            with self.subTest(new_name), patch.dict(os.environ):
+                getattr(envs, new_name).clear()
+                os.environ[old_name] = old_raw
+                value, deprecations = self._get(new_name)
+                self.assertEqual(value, old_value)
+                self.assertEqual(len(deprecations), 1)
+                self.assertIn(old_name, str(deprecations[0].message))
+                self.assertIn(new_name, str(deprecations[0].message))
+
+    def test_new_name_wins_over_deprecated_name(self):
+        for new_name, old_name, old_raw, _, new_raw, new_value in self.ALIASES:
+            with (
+                self.subTest(new_name),
+                patch.dict(os.environ),
+                getattr(envs, new_name).override(new_raw),
+            ):
+                os.environ[old_name] = old_raw
+                value, deprecations = self._get(new_name)
+                self.assertEqual(value, new_value)
+                self.assertEqual(deprecations, [])
 
 
 if __name__ == "__main__":

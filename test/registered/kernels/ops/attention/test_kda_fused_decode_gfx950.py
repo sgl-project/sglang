@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention import kda_fused_decode_gfx950
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -109,6 +110,7 @@ class TestGfx950KDAFusedDecode(CustomTestCase):
         actual_inputs = _clone_caches(inputs)
         # the default backend
         with patch.dict(os.environ):
+            envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.clear()
             os.environ.pop("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", None)
             self.assertTrue(
                 kda_fused_decode_gfx950.covered(

@@ -2119,7 +2119,7 @@ def biased_grouped_topk_gpu(
             route_logits = gating_output
             route_bias = correction_bias.to(dtype=gating_output.dtype)
 
-        if envs.SGLANG_K3_RADIX4_TOPK.get():
+        if envs.SGLANG_OPT_HIP_K3_RADIX4_TOPK.get():
             from sglang.kernels.ops.moe import moe_route_radix4
 
             # Gated on the routing shape. Kimi-K3 (896 experts, top-16,
