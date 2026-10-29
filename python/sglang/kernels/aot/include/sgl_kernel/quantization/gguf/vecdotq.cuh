@@ -1885,8 +1885,8 @@ vec_dot_iq3_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ 
   const int8_t* q8 = bq8_1[ib32].qs;
   int sumi = 0;
   for (int l = 0; l < 4; ++l) {
-    const uint32_t* grid1 = iq3xs_grid + (qs[2 * l + 0] | ((bq2->qh[ib32] << (8 - 2 * l)) & 256));
-    const uint32_t* grid2 = iq3xs_grid + (qs[2 * l + 1] | ((bq2->qh[ib32] << (7 - 2 * l)) & 256));
+    const uint32_t* grid1 = iq3s_grid + (qs[2 * l + 0] | ((bq2->qh[ib32] << (8 - 2 * l)) & 256));
+    const uint32_t* grid2 = iq3s_grid + (qs[2 * l + 1] | ((bq2->qh[ib32] << (7 - 2 * l)) & 256));
     uint32_t signs0 = __vcmpeq4(((bq2->signs[4 * ib32 + l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
     uint32_t signs1 = __vcmpeq4(((bq2->signs[4 * ib32 + l] >> 4) * 0x01010101) & 0x08040201, 0x08040201);
     const int grid_l = __vsub4(grid1[0] ^ signs0, signs0);
@@ -1895,8 +1895,8 @@ vec_dot_iq3_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ 
     sumi = __dp4a(grid_h, *((int*)q8 + 1), sumi);
     q8 += 8;
   }
-  const float d = __half2float(bq2->d) * (0.5f + ((bq2->scales[ib32 / 2] >> 4 * (ib32 % 2)) & 0xf)) *
-                  __low2float(bq8_1[ib32].ds) * 0.5f;
+  const float d =
+      __half2float(bq2->d) * (1 + 2 * ((bq2->scales[ib32 / 2] >> 4 * (ib32 % 2)) & 0xf)) * __low2float(bq8_1[ib32].ds);
   return d * sumi;
 #endif
 }
