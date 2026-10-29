@@ -54,6 +54,19 @@ _PERHEAD_NUM_WARPS = 8
 _PERHEAD_REGS_PER_THREAD = 255
 _STAGE1_SMEM_BYTES = 43008
 
+# How deep the stage-2 split loop is pipelined. Stage 2 is a latency-bound
+# reduction whose cost tracks MAX_KV_SPLITS alone: the loop-carried
+# e_max -> old_scale -> acc chain pays one load latency per split unless the
+# pipeliner can run several splits ahead, so this is the only knob that moves
+# it. Measured on SM120, bs=1, 24 heads, 85 splits, 100k context, cold L2:
+#   num_stages 1 -> 0.0147 ms, 2 -> 0.0178, 3 -> 0.0097, 4 -> 0.0080,
+#                  6 -> 0.0083, 8 -> 0.0096
+# Splitting the V dim over extra CTAs was also tried and does nothing (24 ->
+# 384 CTAs stayed within noise, and regressed below 64 dims per CTA): it
+# trades request size for CTA count at constant bytes in flight, so it cannot
+# raise memory concurrency. See .sweep_cold_stage2.py.
+_STAGE2_NUM_STAGES = 4
+
 
 def stage1_launch_config(kv_group_num: int, device=None) -> tuple[int, int]:
     """``(num_warps, ctas_per_sm)`` for the stage-1 path ``kv_group_num`` picks.
@@ -591,6 +604,7 @@ def _mxfp4_decode_stage2_kernel(
     MIN_BLOCK_KV: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
 ):
     # Codec-agnostic split merge; mirrors the stock ``_fwd_kernel_stage2``
     # (v_scale fixed at 1.0: MXFP4 scales are applied inline in stage 1).
@@ -615,24 +629,38 @@ def _mxfp4_decode_stage2_kernel(
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
 
-    for split_kv_id in tl.range(0, MAX_KV_SPLITS, num_stages=2):
+    for split_kv_id in tl.range(0, MAX_KV_SPLITS, num_stages=NUM_STAGES):
         split_kv_start = kv_len_per_split * split_kv_id
         split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
-        if split_kv_end > split_kv_start:
-            tv = tl.load(
-                Mid_O + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
-            )
-            tlogic = tl.load(Mid_O_1 + offs_logic + split_kv_id * stride_mid_os // Lv)
-            n_e_max = tl.maximum(tlogic, e_max)
+        # Predicated rather than branched: with the loads inside an `if` the
+        # pipeliner cannot hoist them, so every iteration paid a full load
+        # latency on the loop-carried e_max -> old_scale -> acc chain and
+        # num_stages had no effect at all. An out-of-range split contributes
+        # old_scale == 1 and exp_logic == 0, i.e. it leaves acc, e_sum and
+        # e_max exactly as they were, which is what the branch used to do.
+        valid = split_kv_end > split_kv_start
+        tv = tl.load(
+            Mid_O + offs_v + split_kv_id * stride_mid_os,
+            mask=mask_d & valid,
+            other=0.0,
+        )
+        tlogic = tl.load(
+            Mid_O_1 + offs_logic + split_kv_id * stride_mid_os // Lv,
+            mask=valid,
+            other=0.0,
+        )
+        n_e_max = tl.where(valid, tl.maximum(tlogic, e_max), e_max)
 
-            old_scale = tl.exp(e_max - n_e_max)
-            acc *= old_scale
-            exp_logic = tl.exp(tlogic - n_e_max)
-            acc += exp_logic * tv
+        # e_max - n_e_max is NaN on the first iteration if that split is empty
+        # (-inf - -inf), hence the select rather than a bare exp.
+        old_scale = tl.where(valid, tl.exp(e_max - n_e_max), 1.0)
+        acc *= old_scale
+        exp_logic = tl.where(valid, tl.exp(tlogic - n_e_max), 0.0)
+        acc += exp_logic * tv
 
-            e_sum = e_sum * old_scale + exp_logic
-            e_max = n_e_max
+        e_sum = e_sum * old_scale + exp_logic
+        e_max = n_e_max
 
     tl.store(
         O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
@@ -669,6 +697,7 @@ def mxfp4_decode_attention_fwd(
     num_kv_splits: torch.Tensor | None = None,
     block_n: int = _BLOCK_N,
     num_warps: int | None = None,
+    stage2_num_stages: int = _STAGE2_NUM_STAGES,
 ):
     """Native MXFP4 decode attention over packed paged KV.
 
@@ -879,4 +908,5 @@ def mxfp4_decode_attention_fwd(
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         BLOCK_DV=BLOCK_DV,
         Lv=logical_v,
+        NUM_STAGES=stage2_num_stages,
     )
