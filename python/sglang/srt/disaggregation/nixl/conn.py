@@ -8,7 +8,9 @@ import struct
 import threading
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from contextlib import nullcontext
+from queue import Full, Queue
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import msgspec
 import numpy as np
@@ -22,6 +24,7 @@ from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     ABORT_TAG,
     AbortNotification,
+    AckTarget,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -46,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    fail_stop,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
     slice_dsa_tail_dst_ptrs_for_pp,
@@ -371,6 +375,7 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     dst_state_data_lens: List[List[int]] = dataclasses.field(default_factory=list)
+    host_staging_config: Optional[dict] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -453,6 +458,7 @@ class KVArgsRegisterInfo:
                 if len(msg) > 23 and len(msg[23]) > 0
                 else []
             ),
+            host_staging_config=json.loads(msg[24]) if len(msg) > 24 else None,
         )
 
 
@@ -510,6 +516,10 @@ def repeat_indices_over_layers(
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
+    host_staging = None
+    _host_abort_acks = None
+    host_staging_bytes = 0
+
     # The decode control socket multiplexes tagged messages, so the status
     # message is tagged too. It is new to NIXL, hence free to carry the reason.
     kv_status_msg_tag = b"KV_STATUS"
@@ -528,6 +538,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        host_mb = envs.SGLANG_NIXL_HOST_STAGING_MB.get()
+        self.host_staging_bytes = host_mb * 1024 * 1024
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.kv_args.kv_data_mem_kinds = _normalize_kv_mem_kinds(
             getattr(self.kv_args, "kv_data_mem_kinds", None),
@@ -630,10 +642,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         self.register_buffer_to_engine()
 
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get() or bool(host_mb)
         self._prepared_state_plans: Dict[str, _PreparedStatePlan] = {}
         self._state_layout_rejections: Dict[str, str] = {}
         self.kv_buffer_tensors = None
+        # HOST prefill: WRITEs the transfer worker stopped waiting on, by room
+        # ([(handles, started, has_aux)]), and rooms whose aux WRITE may still
+        # read the metadata slot. Set before HostStaging's thread reaps them.
+        self._abandoned: Dict[int, List[Tuple[List[Any], float, bool]]] = {}
+        self._abandoned_lock = threading.Lock()
+        self._aux_in_flight: Set[int] = set()
+        if host_mb:
+            from sglang.srt.disaggregation.nixl.host_staging import HostStaging
+
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self._start_host_abort_ack_worker()
+            host = self.host_staging = HostStaging(self)
+            self._prep_xfer_dlist, self._post_write = host.prep_dlist, host.post_write
+            self._post_prepped, self._xfer_state = host.post_prepped, host.xfer_state
+            self.enable_deferred_decode_kv_release = True
         self.prep_handles: Dict[str, Any] = {}
         self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = (
             None  # (handle, num_groups, num_ptr_pairs, num_slots)
@@ -704,7 +731,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         peer_name = peer_info.agent_name
         self._prepared_state_plans.pop(peer_name, None)
         self._state_layout_rejections.pop(peer_name, None)
-        if not self._prepared_state_components:
+        if self.host_staging is not None or not self._prepared_state_components:
             return
         if peer_info.dst_dcp_size != 1 or peer_info.requires_dcp_relayout:
             reason = "dcp-peer"
@@ -950,6 +977,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._init_staging_allocator()
 
     def _init_staging_buffers(self, count: int):
+        if self.host_staging is not None:
+            return  # HOST owns its slots; no native GPU staging strategy.
         from sglang.srt.disaggregation.common.staging_handler import (
             init_staging_buffers,
         )
@@ -963,6 +992,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
 
     def _init_staging_allocator(self):
+        if self.host_staging is not None:
+            self._staging_ctx.allocator = self.host_staging.allocator
+            return
         from sglang.srt.disaggregation.common.staging_handler import (
             init_staging_allocator,
         )
@@ -975,8 +1007,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
     def _register_staging_memory(self, ptr: int, size: int):
         """Register a staging buffer with the NIXL agent."""
-        addrs = [(ptr, size, self.kv_args.gpu_id, "")]
-        descs = self.agent.register_memory(addrs, "VRAM")
+        kind = "DRAM" if self.host_staging_bytes else "VRAM"
+        addrs = [(ptr, size, _nixl_device_id(kind, self.kv_args.gpu_id), "")]
+        descs = self.agent.register_memory(addrs, kind)
         if not descs:
             raise RuntimeError(
                 f"NIXL memory registration failed for staging buffer "
@@ -1042,6 +1075,39 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         threading.Thread(target=decode_listener_thread, daemon=True).start()
 
+    def _handle_staging_req(self, msg):
+        if self.host_staging is not None:
+            self.host_staging.run(lambda: self._staging_handler.allocate(msg))
+            return
+        super()._handle_staging_req(msg)
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        handler = getattr(self, "_staging_handler", None)
+        if self.host_staging is None or status != KVPoll.Failed:
+            return super().update_status(bootstrap_room, status)
+        # A failure is fenced by the native ABORT -> drain -> ABORT_ACK: prefill
+        # drops unposted jobs and acks once posted WRITEs are DONE; decode holds
+        # the room until every ack (deferred release), so neither side exits.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            with self.host_staging.lock:
+                self.host_staging.fail_room(bootstrap_room)
+            self.host_staging.drain_gathers(bootstrap_room)
+            super().update_status(bootstrap_room, status)
+            return
+        if handler is None:
+            return super().update_status(bootstrap_room, status)
+        with handler.lock:
+            receiver = handler._room_to_receiver.get(bootstrap_room)
+            super().update_status(bootstrap_room, status)
+            if (
+                receiver is not None
+                and receiver.host_allowed is not None
+                and not receiver.abort_notified
+            ):
+                # The peer knows this room: ABORT makes it drain and ack.
+                receiver.abort_notified = True
+                receiver._send_abort_notification()
+
     def _prefetch_staging_reqs(self, room: int):
         """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -1049,6 +1115,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         fan-out (one STAGING_REQ per chunk per peer); subsequent calls return
         immediately, so the caller can invoke this on every chunk.
         """
+        if self.host_staging is not None:
+            return  # Host allocations follow actual wire chunks, not a scheduler grid.
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return
         if room in self._staging_ctx.prefetched_rooms:
@@ -1094,7 +1162,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise _NixlPostError(error_msg)
 
     def _await_handles(
-        self, handles: List[Any], *, failure_seen: bool
+        self, handles: List[Any], *, failure_seen: bool, started: Optional[float] = None
     ) -> Tuple[bool, bool]:
         """Poll until every handle settled. Returns ``(settled, any_failed)``.
 
@@ -1108,9 +1176,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         while True:
             all_settled = True
             any_failed = failure_seen
+            states = []
             try:
                 for handle in handles:
-                    state = self.agent.check_xfer_state(handle)
+                    state = self._xfer_state(handle)
+                    states.append(state)
                     if state == "ERR":
                         any_failed = True
                     elif state != "DONE":
@@ -1120,6 +1190,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 return False, True
             if all_settled:
                 return True, any_failed
+            if started is not None and self._native_write_overdue(
+                handles, states, started
+            ):
+                fail_stop(
+                    f"NIXL WRITE running past the writer deadline "
+                    f"({len(handles)} handles in batch)"
+                )
             if not any_failed:
                 time.sleep(0)
                 continue
@@ -1169,6 +1246,120 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self._expand_stride_descs(stride_descs), mem_kind
         )
         return self.agent.prep_xfer_dlist(peer_name, descs, mem_kind)
+
+    # Transport seam: every KV/state/aux WRITE is posted through _post_write or
+    # _post_prepped (and its dlists prepared by _prep_xfer_dlist) with its rows
+    # already planned. HOST staging binds its own versions over these, so it
+    # never registers GPU memory with NIXL and never sees the planners.
+    def _post_write(
+        self, peer_name, src_rows, src_mem_kind, dst_rows, dst_mem_kind, what
+    ):
+        """Post one WRITE of src rows onto dst rows."""
+        src_descs = self.agent.get_xfer_descs(src_rows, src_mem_kind)
+        dst_descs = self.agent.get_xfer_descs(dst_rows, dst_mem_kind)
+        handle = self.agent.initialize_xfer("WRITE", src_descs, dst_descs, peer_name)
+        return self._start_xfer(handle, what)
+
+    def _post_prepped(
+        self, peer_name, src_handle, src_indices, dst_handle, dst_indices, what
+    ):
+        """_post_write of the indexed rows of two _prep_xfer_dlist handles."""
+        handle = self.agent.make_prepped_xfer(
+            "WRITE", src_handle, src_indices, dst_handle, dst_indices
+        )
+        return self._start_xfer(handle, what)
+
+    def _xfer_state(self, handle) -> str:
+        return self.agent.check_xfer_state(handle)
+
+    def _start_xfer(self, handle, what: str):
+        if not handle:
+            raise RuntimeError(f"KVSender failed to create {what}")
+        try:
+            self._post_xfer(handle, f"KVSender failed to post {what}")
+        except _NixlPostError as e:
+            e.handle = handle  # A rejected post may still land; its caller owns it.
+            raise
+        return handle
+
+    def _start_host_abort_ack_worker(self) -> None:
+        # A contended endpoint lock or full ZMQ socket must not stall HOST's
+        # progress thread: it enforces the deadlines before decode reuses memory.
+        self._host_abort_acks = Queue(maxsize=1024)
+
+        def send_acks():
+            while True:
+                room, target = self._host_abort_acks.get()
+                super(NixlKVManager, self)._send_abort_ack(room, target)
+
+        threading.Thread(target=send_acks, daemon=True).start()
+
+    def _send_abort_ack(self, room: int, target: AckTarget) -> None:
+        if self._host_abort_acks is None:
+            return super()._send_abort_ack(room, target)
+        try:
+            self._host_abort_acks.put_nowait((room, target))
+        except Full:
+            # ACKs are best-effort. Bound memory if the sender stalls; decode
+            # falls back to its release timeout, after the writer deadlines.
+            pass
+
+    def _native_write_overdue(self, handles, states, started: float) -> bool:
+        """HOST: a native (unstaged, e.g. aux) WRITE still running past the
+        writer deadline. Decode reuses a failed room's memory once its drain-ack
+        wait expires, and the writer deadlines fit inside that wait; staged
+        parts enforce theirs in host_staging, native WRITEs only here."""
+        if self.host_staging is None:
+            return False
+        from sglang.srt.disaggregation.nixl import host_staging as H
+
+        if time.monotonic() - started < H.POST_DEADLINE_S + H.WRITE_DEADLINE_S:
+            return False
+        return any(
+            not isinstance(handle, H.HostWrite) and state not in ("DONE", "ERR")
+            for handle, state in zip(handles, states)
+        )
+
+    def _writes_in_flight(self, room: int) -> bool:
+        return self._staging_outstanding.get(room, 0) > 0 or (
+            self.host_staging is not None and room in self._abandoned
+        )
+
+    def _maybe_ack_drained_abort(self, room: int) -> None:
+        if self.host_staging is not None and room in self._abandoned:
+            return  # An abandoned WRITE may still land; the reaper acks.
+        super()._maybe_ack_drained_abort(room)
+
+    def _reap_abandoned(self) -> None:
+        """HOST prefill: settle WRITEs the transfer worker stopped waiting on.
+
+        Their room stays unacked, and its aux flag set, until they settle: the
+        decode keeps the room's pages and the prefill its metadata slot. A
+        native WRITE still running past the writer deadline fail-stops, before
+        decode's drain-ack wait could hand its memory to another request.
+        """
+        with self._abandoned_lock:
+            entries = [(r, e) for r, es in self._abandoned.items() for e in es]
+        for room, entry in entries:
+            handles, started, has_aux = entry
+            states = []
+            for handle in handles:
+                try:
+                    states.append(self._xfer_state(handle))
+                except Exception:
+                    states.append(None)  # Unreadable: may still be writing.
+            if not all(state in ("DONE", "ERR") for state in states):
+                if self._native_write_overdue(handles, states, started):
+                    fail_stop(f"Abandoned NIXL WRITE for room {room} past its deadline")
+                continue
+            with self._abandoned_lock:
+                left = self._abandoned[room]
+                left.remove(entry)
+                if not left:
+                    del self._abandoned[room]
+            if has_aux:
+                self._aux_in_flight.discard(room)
+            self._maybe_ack_drained_abort(room)
 
     def _prep_equal_tp_dlist(
         self,
@@ -1611,6 +1802,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             handles: List[Any] = []
             settle_timed_out = False
             room_transfer_infos = None
+            # Before anything is posted: native WRITEs are bounded from here.
+            started = time.monotonic()
+            aux_posted = False
+            if self.host_staging is not None:
+                # HOST's seam stages this batch's WRITEs under its room.
+                self.host_staging.batch.room = room
             try:
                 if room not in self.request_status:
                     logger.debug(
@@ -1721,6 +1918,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         #      or staging hard-failed for this chunk)
                         use_staging = (
                             self.enable_staging
+                            and self.host_staging is None
                             and staging_strategy is not None
                             and not self.is_mla_backend
                             and not self.is_hybrid_mla_backend
@@ -1864,6 +2062,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
+                        if self.host_staging is not None:
+                            # Flagged before posting: the scheduler must never
+                            # see the room failed with its aux unflagged.
+                            self._aux_in_flight.add(room)
+                            aux_posted = True
                         aux_xfer_handle = self.send_aux(
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
@@ -1876,13 +2079,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # first ERR: a sibling still in PROC keeps writing into the
                 # decode's KV pages, and the failure path below tells the decode
                 # those pages are free.
-                settled, any_failed = self._await_handles(handles, failure_seen=False)
+                settled, any_failed = self._await_handles(
+                    handles, failure_seen=False, started=started
+                )
                 if not settled:
                     settle_timed_out = True
                     raise RuntimeError(
                         f"NIXL transfer for room {room} left a handle running "
                         f"{NIXL_ERR_SETTLE_TIMEOUT_S}s after a peer handle failed"
                     )
+                if aux_posted:
+                    self._aux_in_flight.discard(room)
                 if any_failed:
                     raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
 
@@ -1935,9 +2142,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # An exception raised while the batch was still being built
                 # leaves the handles posted so far running, so settle here too
                 # rather than only after the barrier.
+                rejected = getattr(e, "handle", None)
+                if self.host_staging is not None and rejected is not None:
+                    # HOST bounds every native WRITE by the writer deadlines:
+                    # settle (or reap) the rejected one with the rest.
+                    handles.append(rejected)
                 notify = False
                 if not settle_timed_out:
-                    notify, _ = self._await_handles(handles, failure_seen=True)
+                    notify, _ = self._await_handles(
+                        handles, failure_seen=True, started=started
+                    )
+                if notify and aux_posted:
+                    self._aux_in_flight.discard(room)
                 if notify:
                     if (
                         isinstance(e, _NixlPostError)
@@ -1955,6 +2171,21 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         self._staging_outstanding[room] -= 1
                     if self.enable_deferred_decode_kv_release:
                         self._maybe_ack_drained_abort(room)
+                elif self.host_staging is not None:
+                    # HOST: hand the handles to the reaper, which acks (and
+                    # frees the aux flag) once they settle, and fail-stops
+                    # past the writer deadline. Tracked before the count
+                    # drops, so the room never looks drained in between.
+                    with self._abandoned_lock:
+                        self._abandoned.setdefault(room, []).append(
+                            (handles, started, aux_posted)
+                        )
+                    if kv_chunk.staging_counted:
+                        kv_chunk.staging_counted = False
+                        self._staging_outstanding[room] -= 1
+                    # Leave the room to the decode's waiting timeout.
+                    self.record_failure(room, str(e))
+                    self.update_status(room, KVPoll.Failed)
                 else:
                     # A handle can still write into the decode's KV pages, so
                     # leave the room to the decode's waiting timeout rather
@@ -1977,6 +2208,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args.kv_data_lens,
             self.kv_args.kv_data_mem_kinds,
         ):
+            if self.host_staging_bytes and kv_mem_kind == "VRAM":
+                continue  # HOST stages GPU KV through its registered host buffers.
             kv_addrs_by_mem_kind[kv_mem_kind].append(
                 (
                     kv_data_ptr,
@@ -2008,6 +2241,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
+        if self.host_staging_bytes:
+            return  # GPU state is staged through the registered pinned buffers too.
         state_addrs = []
         for comp_ptrs, comp_lens in zip(
             self.kv_args.state_data_ptrs or [],
@@ -2028,6 +2263,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 raise Exception("NIXL memory registration failed for state tensors")
 
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
+        if (
+            self.host_staging.config_mismatch(decode_kv_args)
+            if self.host_staging is not None
+            else decode_kv_args.host_staging_config is not None
+        ):
+            # Refuse only this peer (e.g. mid-rollout): its rooms fail at transfer.
+            logger.error(
+                "Refusing NIXL peer %s: host staging config %s differs from ours",
+                decode_kv_args.agent_name,
+                decode_kv_args.host_staging_config,
+            )
+            return
         agent_name = decode_kv_args.agent_name
         if agent_name in self.decode_kv_args_table:
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
@@ -2035,7 +2282,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
             decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
         )
-        if decode_kv_args.requires_dcp_relayout:
+        if decode_kv_args.requires_dcp_relayout and self.host_staging is None:
+            # HOST cannot register GPU pack buffers; DCP sends per-token rows.
             self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
@@ -2133,17 +2381,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_indices = repeat_indices_over_layers(
                 dst_data_indices, num_layers, num_slots_dst
             )
-            xfer_handle = self.agent.make_prepped_xfer(
-                "WRITE",
+            return self._post_prepped(
+                peer_name,
                 src_prep,
                 src_indices,
                 dst_prep,
                 dst_indices,
+                "prepped transfer",
             )
-            if not xfer_handle:
-                raise Exception("KVSender failed to create prepped transfer")
-            self._post_xfer(xfer_handle, "KVSender failed to post prepped transfer")
-            return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
         # Convert pointer lists to np.uint64 arrays up front.
@@ -2284,19 +2529,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         logger.debug(
             f"len(src_addrs): before group: {len(prefill_data_indices)}, after group: {len(src_addrs)}"
         )
-        src_descs = self.agent.get_xfer_descs(src_reqs, src_mem_kind)
-        dst_descs = self.agent.get_xfer_descs(dst_reqs, dst_mem_kind)
-        # Transfer data
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE",
-            src_descs,
-            dst_descs,
-            peer_name,
+        return self._post_write(
+            peer_name, src_reqs, src_mem_kind, dst_reqs, dst_mem_kind, "transfer"
         )
-        if not xfer_handle:
-            raise Exception("KVSender failed to create transfer")
-        self._post_xfer(xfer_handle, "KVSender failed to post transfer")
-        return xfer_handle
 
     def send_kvcache(
         self,
@@ -2447,19 +2682,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_indices = repeat_indices_over_layers(
                 dst_kv_indices, num_layers, seg.dst_num_slots
             )
-            xfer_handle = self.agent.make_prepped_xfer(
-                "WRITE",
-                seg.src_handle,
-                src_indices,
-                seg.dst_handle,
-                dst_indices,
+            handles.append(
+                self._post_prepped(
+                    peer_name,
+                    seg.src_handle,
+                    src_indices,
+                    seg.dst_handle,
+                    dst_indices,
+                    "mixed prepped transfer",
+                )
             )
-            if not xfer_handle:
-                raise Exception("KVSender failed to create mixed prepped transfer")
-            self._post_xfer(
-                xfer_handle, "KVSender failed to post mixed prepped transfer"
-            )
-            handles.append(xfer_handle)
         return handles
 
     def send_kvcache_slice(
@@ -2492,17 +2724,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             num_slots_dst,
             page_size,
         )
-        xfer_handle = self.agent.make_prepped_xfer(
-            "WRITE",
+        return self._post_prepped(
+            peer_name,
             src_handle,
             src_indices,
             dst_handle,
             dst_indices,
+            "prepped slice transfer",
         )
-        if not xfer_handle:
-            raise Exception("KVSender failed to create prepped slice transfer")
-        self._post_xfer(xfer_handle, "KVSender failed to post prepped slice transfer")
-        return xfer_handle
 
     def send_kvcache_staged(
         self,
@@ -2724,19 +2953,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_addrs.append((src_addr, length, 0))
             dst_addrs.append((dst_addr, length, 0))
 
-        src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
-        # Transfer data
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE",
-            src_descs,
-            dst_descs,
-            peer_name,
+        return self._post_write(
+            peer_name, src_addrs, "DRAM", dst_addrs, "DRAM", "aux transfer"
         )
-        if not xfer_handle:
-            raise Exception("KVSender failed to create transfer")
-        self._post_xfer(xfer_handle, "KVSender failed to post transfer")
-        return xfer_handle
 
     def _send_slot_state(
         self,
@@ -2779,15 +2998,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_addrs = [
             (dst_addr, length, dst_gpu_id) for _, dst_addr, length in transfer_blocks
         ]
-        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE", src_descs, dst_descs, peer_name
+        return self._post_write(
+            peer_name, src_addrs, "VRAM", dst_addrs, "VRAM", "dsa_tail transfer"
         )
-        if not xfer_handle:
-            raise Exception("KVSender failed to create dsa_tail transfer")
-        self._post_xfer(xfer_handle, "KVSender failed to post dsa_tail transfer")
-        return xfer_handle
 
     def _send_mamba_state(
         self,
@@ -2827,19 +3040,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_addrs.append((src_addr, length, self.kv_args.gpu_id))
             dst_addrs.append((dst_addr, length, dst_gpu_id))
 
-        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
-
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE",
-            src_descs,
-            dst_descs,
-            peer_name,
+        return self._post_write(
+            peer_name, src_addrs, "VRAM", dst_addrs, "VRAM", "Mamba state transfer"
         )
-        if not xfer_handle:
-            raise Exception("Failed to create Mamba state transfer")
-        self._post_xfer(xfer_handle, "Failed to post Mamba state transfer")
-        return xfer_handle
 
     def _send_mamba_state_slice(
         self,
@@ -2952,19 +3155,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 src_addrs.append((src_addr, bytes_to_send, self.kv_args.gpu_id))
                 dst_addrs.append((dst_addr, bytes_to_send, dst_gpu_id))
 
-        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
-
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE",
-            src_descs,
-            dst_descs,
+        return self._post_write(
             peer_name,
+            src_addrs,
+            "VRAM",
+            dst_addrs,
+            "VRAM",
+            "Mamba state slice transfer",
         )
-        if not xfer_handle:
-            raise Exception("Failed to create Mamba state slice transfer")
-        self._post_xfer(xfer_handle, "Failed to post Mamba state slice transfer")
-        return xfer_handle
 
     def _send_swa_state_slice(
         self,
@@ -3006,18 +3204,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         if not src_reqs:
             return None
-        src_descs = self.agent.get_xfer_descs(np.vstack(src_reqs), "VRAM")
-        dst_descs = self.agent.get_xfer_descs(np.vstack(dst_reqs), "VRAM")
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE",
-            src_descs,
-            dst_descs,
+        return self._post_write(
             peer_name,
+            np.vstack(src_reqs),
+            "VRAM",
+            np.vstack(dst_reqs),
+            "VRAM",
+            "SWA state slice transfer",
         )
-        if not xfer_handle:
-            raise Exception("Failed to create SWA state slice transfer")
-        self._post_xfer(xfer_handle, "Failed to post SWA state slice transfer")
-        return xfer_handle
 
     def maybe_send_extra(
         self,
@@ -3423,7 +3617,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 raise
 
-        threading.Thread(target=bootstrap_thread_guarded).start()
+        if self.host_staging is not None:
+            # A dead bootstrap thread would strand posted HOST parts unacked.
+            threading.Thread(
+                target=self.host_staging.run, args=(bootstrap_thread_guarded,)
+            ).start()
+        else:
+            threading.Thread(target=bootstrap_thread_guarded).start()
 
     def build_receiver_registration_message(self) -> List[bytes]:
         packed_kv_data_ptrs = b"".join(
@@ -3490,7 +3690,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             str(self.dcp_size).encode("ascii"),
             str(self.dcp_rank).encode("ascii"),
             packed_state_data_lens,
-        ]
+        ] + (
+            [json.dumps(self.host_staging.config).encode()]
+            if self.host_staging is not None
+            else []
+        )
 
     def build_receiver_metadata_message(
         self,
@@ -3527,11 +3731,137 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
 
 class NixlKVSender(CommonKVSender):
-    pass
+    # HOST: the forward (target and draft) event; set by the prefill scheduler.
+    _host_ready_event = None
+
+    def send(self, kv_indices, state_indices=None, num_kv_tokens=None, **kwargs):
+        host = self.kv_mgr.host_staging
+        if host is not None:
+            # HOST gathers after send() returns: behind this stream's work and
+            # the forward that produced the KV, both snapshotted here.
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(host.device))
+            host.ready[self.bootstrap_room] = (ready, self._host_ready_event)
+        super().send(kv_indices, state_indices, num_kv_tokens, **kwargs)
+
+    def stages_source_async(self) -> bool:
+        return self.kv_mgr.host_staging is not None
+
+    def is_aux_in_flight(self) -> bool:
+        return (
+            self.kv_mgr.host_staging is not None
+            and self.bootstrap_room in self.kv_mgr._aux_in_flight
+        )
+
+    def holds_failed_source(self) -> bool:
+        mgr, room = self.kv_mgr, self.bootstrap_room
+        if mgr.host_staging is None:
+            return False
+        # Fence before looking: the reduced poll can be Failed through another
+        # rank while this room still transfers here. The worker counts a chunk
+        # before it checks the room's status, so after this it either skips the
+        # chunk or the count shows it (and its aux) in flight.
+        if self.conclude_state is None and mgr.request_status.get(room) not in (
+            None,
+            KVPoll.Failed,
+        ):
+            mgr.update_status(room, KVPoll.Failed)
+        return mgr._writes_in_flight(room) or room in mgr._aux_in_flight
+
+    def is_source_pending(self) -> bool:
+        host = self.kv_mgr.host_staging
+        if host is None:
+            return False
+        # Only a HOST gather reads source pages after send() returns: pending
+        # while this room has a chunk in the native worker or a part still
+        # queued or gathering. Otherwise the pages are as free as under native.
+        room = self.bootstrap_room
+        # Failing the room dropped its unposted parts and drained its gathers
+        # (NixlKVManager.update_status). Our own Failed conclusion keeps that
+        # after clear() pops the room's status, so the release guards that
+        # follow failure_exception() don't read the cleared room as pending.
+        if (
+            self.conclude_state == KVPoll.Failed
+            or self.kv_mgr.request_status.get(room) == KVPoll.Failed
+        ):
+            return False
+        return self.kv_mgr._staging_outstanding.get(room, 0) > 0 or host.gathering(room)
+
+    def clear(self) -> None:
+        if self.is_source_pending():
+            self.failure_exception()
+        super().clear()
+        if self.kv_mgr.host_staging is not None:
+            # super() already fires the drain ack when nothing is outstanding;
+            # a room with posted parts still draining keeps its ack target.
+            self.kv_mgr.host_staging.forget_room(self.bootstrap_room)
+
+    def failure_exception(self):
+        if self.kv_mgr.host_staging is not None and (
+            self.is_source_pending() or self.is_aux_in_flight()
+        ):
+            fail_stop(f"Sender failure for room {self.bootstrap_room}")
+        super().failure_exception()
 
 
 class NixlKVReceiver(CommonKVReceiver):
-    pass
+    # HOST staging, decode side. host_allowed is set once metadata is sent:
+    # until then the peer has no destination in this room.
+    host_allowed = None
+    host_mapping_ready = None
+
+    def __init__(self, *args, **kwargs):
+        # (writer, seq) -> (alloc_id, offset, round, size)
+        self.host_allocs = {}
+        self.host_scatters = []  # (event, writer, seq)
+        super().__init__(*args, **kwargs)
+
+    def _host_lock(self):
+        handler = self.kv_mgr._staging_handler if self.kv_mgr.host_staging else None
+        return handler.lock if handler is not None else nullcontext()
+
+    def init(self, prefill_dp_rank: int):
+        super().init(prefill_dp_rank)
+        if self.kv_mgr.host_staging is not None:
+            self.require_staging = True
+
+    def send_metadata(
+        self, kv_indices, aux_index=None, state_indices=None, *args, **kwargs
+    ):
+        if self.kv_mgr.host_staging is not None and self.bootstrap_infos is not None:
+            # HOST WRITEs may only land in this room's own pages and state slots,
+            # and only after the pages' previous owner's work on this stream.
+            self.host_mapping_ready = torch.cuda.Event()
+            self.host_mapping_ready.record(
+                torch.cuda.current_stream(self.kv_mgr.host_staging.device)
+            )
+            self.host_allowed = self.kv_mgr._staging_handler.allowed_items(
+                kv_indices, state_indices
+            )
+        super().send_metadata(kv_indices, aux_index, state_indices, *args, **kwargs)
+
+    def _send_abort_notification(self, *, force_arm: bool = False):
+        # HOST: metadata (host_allowed) means the peer already holds
+        # destinations, so the ABORT must be fenced even before the native
+        # readiness clock (init_time) starts. Without metadata the peer has no
+        # destination and nothing to fence (a prealloc abort).
+        force_arm = force_arm or (
+            self.kv_mgr.host_staging is not None and self.host_allowed is not None
+        )
+        super()._send_abort_notification(force_arm=force_arm)
+
+    def clear(self) -> None:
+        # Under the allocation lock, so a later STAGING_REQ sees the cleared room
+        # and is dropped instead of reopening it.
+        with self._host_lock():
+            super().clear()
+
+    def failure_exception(self):
+        # Conclude under the allocation lock: a later STAGING_REQ sees Failed and
+        # is dropped; an earlier allocation is held by deferred release.
+        with self._host_lock():
+            self.conclude_state = KVPoll.Failed
+        super().failure_exception()
 
 
 class NixlKVBootstrapServer(CommonKVBootstrapServer):

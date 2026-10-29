@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -10,6 +11,7 @@ from typing import (
     Iterable,
     List,
     Literal,
+    NoReturn,
     Optional,
     Sequence,
     Tuple,
@@ -142,6 +144,19 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     if req_pool_idx is None:
         raise ValueError("QSA pending-state transfer requires an allocated request row")
     return np.array([int(req_pool_idx)], dtype=np.int32)
+
+
+def fail_stop(reason: str) -> NoReturn:
+    """Exit the process when a remote RDMA write into local memory is unfenced.
+
+    Neither a CUDA drain nor a timeout fences a peer's in-flight WRITE (including
+    aux), and an exception would let the scheduler reuse that memory. Exit the
+    process, not just the calling thread, before any allocator reuse.
+    """
+    try:
+        os.write(2, f"NIXL host staging fail-stop: {reason}\n".encode())
+    finally:
+        os._exit(70)
 
 
 class DisaggregationMode(Enum):
@@ -307,6 +322,17 @@ def poll_and_all_reduce(
     if decode_reqs is not None and metadata_buffers is not None:
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
     return _all_reduce_polls(polls, gloo_group)
+
+
+def all_reduce_min_attn_cp_tp_group(
+    values: List[int],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+) -> List[int]:
+    """MIN-reduce small ints over attn TP, then attn CP: equal on every rank."""
+    return _all_reduce_polls(
+        _all_reduce_polls(values, attn_tp_cpu_group), attn_cp_cpu_group
+    )
 
 
 def poll_and_all_reduce_attn_cp_tp_group(

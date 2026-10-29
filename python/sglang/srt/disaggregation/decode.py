@@ -458,8 +458,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # support aborting them we would need an additional fix in the
         # scheduler. In practice this shouldn't arise in the RL scenario.
         self.held_rebootstrap_reqs: List[Req] = []
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-        if self.enable_staging and self.is_mla_backend:
+        self.enable_staging = (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            or envs.SGLANG_NIXL_HOST_STAGING_MB.get() > 0
+        )
+        if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and self.is_mla_backend:
             raise RuntimeError(
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                 "(e.g. GQA, MHA). MLA models should not set this flag."
@@ -2632,10 +2635,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         # Prefill layouts whose digests cannot be compared, logged once each.
         self._skipped_checksum_signatures: set = set()
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_staging = (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            or envs.SGLANG_NIXL_HOST_STAGING_MB.get() > 0
+        )
         self.staging_handler = None
+        # HOST requires it: deferred release is what fences an unfinished room.
         self.enable_deferred_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+            or envs.SGLANG_NIXL_HOST_STAGING_MB.get() > 0
         )
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
@@ -2882,9 +2890,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             DecodeStagingHandler,
         )
 
-        self.staging_handler = DecodeStagingHandler.create(
-            kv_manager, self.scheduler, self.tp_rank
-        )
+        if envs.SGLANG_NIXL_HOST_STAGING_MB.get():
+            from sglang.srt.disaggregation.nixl.host_staging import (
+                HostDecodeStagingHandler,
+            )
+
+            self.staging_handler = HostDecodeStagingHandler(
+                kv_manager, self.scheduler, self.tp_rank
+            )
+        else:
+            self.staging_handler = DecodeStagingHandler.create(
+                kv_manager, self.scheduler, self.tp_rank
+            )
         kv_manager._staging_handler = self.staging_handler
 
     def _release_request(self, decode_req: DecodeRequest) -> None:
@@ -2937,6 +2954,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 continue
 
             if poll == KVPoll.Failed:
+                hicache_restore_status = decode_req.hicache_restore_status
+                if (
+                    hicache_restore_status == HiCacheRestoreResult.PENDING
+                    and decode_req.hicache_load_consumer_index >= 0
+                ):
+                    # A restore DMA still writes these pages. Wait for it here:
+                    # the poll is all-reduced, so every rank takes this branch
+                    # together; the restore state is rank-local.
+                    counter = self.tree_cache.cache_controller.layer_done_counter
+                    counter.events[
+                        decode_req.hicache_load_consumer_index
+                    ].finish_event.synchronize()
                 self._abort_failed_transfer(decode_req)
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
