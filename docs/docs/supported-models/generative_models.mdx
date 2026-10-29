@@ -313,5 +313,38 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>ai-sage/GigaChat3.5-432B-A28B</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>GigaChat's hybrid MoE model: per-layer mix of DeepSeek-style MLA full attention and Qwen3 Gated-Delta-Net (GDN) linear attention, DeepSeek-style routed + shared experts, and multiple multi-token-prediction (MTP) heads for speculative decoding. Emits tool calls in GCML format.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>SenseNova Loop</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Canonical HF checkpoint with <code>model_type: sensenova_loop</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-derived dense hybrid attention with shared-weight Loop and optional manifold-constrained hyper-connections (mHC). Text generation with unquantized weights.</td>
+    </tr>
 </tbody>
 </table>
+
+## SenseNova Loop
+
+Use the canonical, unexpanded checkpoint with `model_type: sensenova_loop`.
+The native implementation reads the existing `loop_settings`, `mhc`, and
+`text_config` fields. It shares the physical layers' parameters across Loop
+visits, while every execution slot owns its full-attention KV cache or GDN
+convolution and recurrent state. No weight expansion or custom Transformers
+code is required for SGLang serving.
+
+```shell Command
+sglang serve \
+  --model-path /path/to/canonical-checkpoint \
+  --dtype bfloat16 \
+  --tp-size 1 \
+  --context-length 4096 \
+  --max-running-requests 4 \
+  --mem-fraction-static 0.65
+```
+
+The initial implementation supports fixed-count, ungated Loop and optional
+two- or four-stream mHC, with FP32 router parameters and log-space Sinkhorn
+normalization. An mHC interval must stay within one Loop phase. Text positions
+use ordinary 1-D RoPE, equivalent to equal positions on all mRoPE axes.
+
+Vision input, pipeline parallelism, quantization, and speculative decoding are
+outside this implementation's support scope. The canonical checkpoint's vision
+weights are ignored by this text-generation entry point.

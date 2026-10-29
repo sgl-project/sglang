@@ -389,6 +389,7 @@ def is_qwen3_5(config) -> bool:
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5ForCausalLM",
         "Qwen3_5MoeForCausalLM",
+        "SenseNovaLoopForCausalLM",
     )
 
 
