@@ -1918,8 +1918,6 @@ class MultiModalityPreTrainedModel(PreTrainedModel):
 # Copied and adapted from:
 # https://github.com/deepseek-ai/Janus/tree/main/janus/models/modeling_vlm.py
 class MultiModalityCausalLM(MultiModalityPreTrainedModel):
-    supports_batched_image_encoding = True
-
     def __init__(
         self,
         config: MultiModalityConfig,

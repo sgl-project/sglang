@@ -738,16 +738,6 @@ def test_npu_phi4mm_batches_cross_request_image_misses(monkeypatch):
     _run_npu_cross_request_batch_case(monkeypatch, Phi4MMForCausalLM())
 
 
-def test_npu_janus_pro_batches_cross_request_image_misses(monkeypatch):
-    """Janus-Pro (MultiModalityCausalLM) on NPU shares the same packed
-    get_image_feature contract: one call for two requests' misses."""
-
-    class MultiModalityCausalLM(_PackedImageFeatureMock):
-        supports_batched_image_encoding = True
-
-    _run_npu_cross_request_batch_case(monkeypatch, MultiModalityCausalLM())
-
-
 def test_full_mismatched_cache_entry_is_reencoded(caplog):
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
