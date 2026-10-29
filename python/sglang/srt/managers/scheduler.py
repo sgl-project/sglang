@@ -3256,7 +3256,7 @@ class Scheduler(
         # Only a cache whose events are taken prunes the table.
         if (
             self.kv_events_publisher.enable_kv_cache_events
-            or getattr(self.tree_cache, "storage_kv_events_enabled", False) is True
+            or self.tree_cache.storage_kv_events_enabled is True
         ) and self.tree_cache.supports_prefix_sharing():
             self.kv_event_lora_names.register(req, lora_name)
 

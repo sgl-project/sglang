@@ -61,6 +61,13 @@ _TRAILING_POOLS = frozenset(
 )
 
 
+def _bool_option(options: dict, name: str) -> bool:
+    value = options.get(name, False)
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
 def _allocate_dram_pool(length):
     """Keep KVCR's private DRAM pool off THP without changing worker-wide THP."""
     if not hasattr(mmap, "MAP_PRIVATE") or not hasattr(mmap, "MAP_ANONYMOUS"):
@@ -121,9 +128,7 @@ class KVCRStore(HiCacheStorage):
         self._closed = False
         self._pinning = _NoFrameworkPinning()
         self._extra = dict(storage_config.extra_config or {})
-        self.publishes_kv_events = self._extra.get("publish_inventory", False)
-        if type(self.publishes_kv_events) is not bool:
-            raise ValueError("publish_inventory must be a boolean")
+        self.publishes_kv_events = _bool_option(self._extra, "publish_inventory")
         if self.publishes_kv_events and (
             self._extra.get("enable_remote_hint", True) is not True
             or self._extra.get("control_advertise_host") is None
@@ -148,28 +153,18 @@ class KVCRStore(HiCacheStorage):
             from sglang.srt.observability.metrics_collector import StorageMetrics
 
             self._metrics = StorageMetrics()
-        self._verify_transfer_bytes = self._extra.get("verify_transfer_bytes", False)
-        if type(self._verify_transfer_bytes) is not bool:
-            raise ValueError("verify_transfer_bytes must be a boolean")
-        self._align_storage_prefix = self._extra.get("align_storage_prefix", False)
-        if type(self._align_storage_prefix) is not bool:
-            raise ValueError("align_storage_prefix must be a boolean")
-        self._diagnostic_telemetry = self._extra.get("diagnostic_telemetry", False)
-        if type(self._diagnostic_telemetry) is not bool:
-            raise ValueError("diagnostic_telemetry must be a boolean")
-        self.supports_combined_page_reads = self._extra.get("combine_page_reads", False)
-        if type(self.supports_combined_page_reads) is not bool:
-            raise ValueError("combine_page_reads must be a boolean")
-        self.supports_combined_page_writes = self._extra.get(
-            "combine_page_writes", False
+        self._verify_transfer_bytes = _bool_option(self._extra, "verify_transfer_bytes")
+        self._align_storage_prefix = _bool_option(self._extra, "align_storage_prefix")
+        self._diagnostic_telemetry = _bool_option(self._extra, "diagnostic_telemetry")
+        self.supports_combined_page_reads = _bool_option(
+            self._extra, "combine_page_reads"
         )
-        if type(self.supports_combined_page_writes) is not bool:
-            raise ValueError("combine_page_writes must be a boolean")
+        self.supports_combined_page_writes = _bool_option(
+            self._extra, "combine_page_writes"
+        )
         self._diagnostic_epoch = time.monotonic()
         self._offset = rank_offset(storage_config)
-        self._share_replicated_mla = self._extra.get("share_replicated_mla", False)
-        if type(self._share_replicated_mla) is not bool:
-            raise ValueError("share_replicated_mla must be a boolean")
+        self._share_replicated_mla = _bool_option(self._extra, "share_replicated_mla")
         if self._share_replicated_mla and (
             not storage_config.is_mla_model
             or storage_config.pp_size != 1
@@ -635,13 +630,10 @@ class KVCRStore(HiCacheStorage):
             started = time.perf_counter() if self._metrics is not None else None
             sequence = None
             if is_set and self._align_storage_prefix:
-                # HiCache owns a different LRU. A reused parent may never be
-                # read from KVCR before its new tail is backed up. Refresh it
-                # BEFORE deposit can allocate/evict, and again after completion
-                # to give the new pages the same recency and tail-first order.
-                # This changes eviction preference, not residency or leases:
-                # align_sequence ignores absent/non-ready native blocks.
-                # Enable hicache_storage_pass_prefix_keys to include parents.
+                # HiCache reuse may not touch KVCR's LRU. Refresh parents before
+                # allocation/eviction and again after deposit for tail-first order.
+                # This does not claim absent or non-ready blocks. Parent keys
+                # require hicache_storage_pass_prefix_keys.
                 prefix = getattr(extra_info, "prefix_keys", None) or []
                 sequence = [
                     block_key(key, self._namespace, str(transfer.name))
