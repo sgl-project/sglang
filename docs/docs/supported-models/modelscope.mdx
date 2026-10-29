@@ -37,28 +37,32 @@ Each prefix selects that repository's source independently of
 
 ```bash
 sglang serve \
-    --model-path modelscope://LLM-Research/Meta-Llama-3.1-8B-Instruct \
+    --model-path modelscope://ZhipuAI/GLM-4.7-Flash \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path hf://lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B
+    --speculative-draft-model-path hf://thoughtworks/GLM-4.7-Flash-Eagle3
 ```
 
 Use the repository ID published by the selected Hub; the same weights can have
 different IDs on Hugging Face and ModelScope.
 
-The prefixes also work with `python -m sglang.launch_server` and Python `Engine`
-arguments. Omitted tokenizers use the target checkpoint; the default served
-model name is the target's `owner/repo`.
+The prefixes work with the LLM server (`sglang serve` or
+`python -m sglang.launch_server`) and Python `Engine`, not SGLang Diffusion.
+Omitted tokenizers use the target checkpoint; the default served model name is
+the target's `owner/repo`.
 
 Only repository roots are supported. Select versions with `--revision` or
 `--speculative-draft-model-revision`, not within the prefixed path. Each SDK
 handles authentication and caching (`--download-dir`); failed downloads do not
 switch Hubs. ModelScope sources require the `modelscope` package.
 
-Downloads select the requested weight format (`auto` prefers safetensors),
-without fetching alternate formats. Tokenizer-only and `dummy` loads fetch
-metadata only. Other supported load formats are `safetensors`, `fastsafetensors`,
-`instanttensor`, `pt`, `npcache`, and `mistral`; use a local snapshot for other loaders.
-With `--trust-remote-code`, cross-repository `auto_map` code uses the same Hub as
-its model or tokenizer, without modifying the cached repository files.
+Models download a complete repository snapshot, then use the existing loader;
+repositories containing multiple weight formats may download extra files.
+Tokenizer-only and `dummy` loads fetch metadata only. Supported weight loaders
+are `auto`, `safetensors`, `fastsafetensors`, `instanttensor`, `pt`, `npcache`, and
+`mistral`; use a local snapshot for other loaders.
+
+Custom code within the same repository still uses `--trust-remote-code`.
+Cross-repository `auto_map` references are not supported with explicit prefixes;
+prepare the model and its code locally instead.
 
 Unprefixed IDs, local paths, and existing remote-storage URLs are unchanged.
