@@ -49,7 +49,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     flatten_nested_list,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
@@ -404,6 +407,9 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
                 break
             else:
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
                     continue
                 if name not in params_dict:
                     continue
