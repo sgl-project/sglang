@@ -176,25 +176,26 @@ def _admission(allocator, input_tokens, max_requests):
     budget = allocator.create_prefill_budget(tree)
     admitted = 0
     for _ in range(max_requests):
-        state_tokens = budget.state_slot_cost
         fits, _ = budget.check_prefill(
             extend_input_len=input_tokens,
-            total_tokens=input_tokens + 1 + state_tokens,
+            total_tokens=input_tokens + 1,
             max_new_tokens=1,
             input_tokens=input_tokens,
             swa_host_hit_length=0,
             chunk_limit=None,
+            state_slots=1,
         )
-        if not fits or not budget.state_slots_fit(state_tokens):
+        if not fits or not budget.state_slots_fit(1):
             break
         if not budget.can_allocate_prefill(
             paged_input=budget.ceil_paged_tokens(input_tokens),
             extend_input_len=input_tokens,
             max_new_tokens=1,
             chunk_limit=None,
+            state_slots=1,
         ):
             break
-        budget.reserve(input_tokens, 1, state_slot_tokens=state_tokens)
+        budget.reserve(input_tokens, 1, state_slots=1)
         admitted += 1
     assert admitted > 0
     slots = allocator.alloc_state_slots(admitted)

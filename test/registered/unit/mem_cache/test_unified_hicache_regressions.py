@@ -60,6 +60,9 @@ class TestHostGateCapacity(unittest.TestCase):
     def test_schedulable_memo_tracks_gate_without_allocator_mutation(self):
         from test_unified_capacity_memo import _build
 
+        from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+        setup_allocator_context()
         inst, allocator, kvcache = _build(lazy=True)
         ids = inst._alloc(allocator, kvcache, 8)
         allocator.free_swa(ids[2:6])

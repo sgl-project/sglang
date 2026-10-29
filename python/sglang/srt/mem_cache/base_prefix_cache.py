@@ -158,6 +158,7 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
+    auxiliary_swa_num_tokens: int = 0
 
 
 @dataclasses.dataclass
@@ -167,6 +168,7 @@ class EvictResult:
     num_tokens_evicted: int = 0
     swa_num_tokens_evicted: int = 0
     mamba_num_evicted: int = 0
+    auxiliary_swa_num_tokens_evicted: int = 0
 
 
 @dataclasses.dataclass
@@ -219,6 +221,8 @@ class DecLockRefParams:
     A segment release requires its component's boundary entry; a missing
     entry must not be treated as a lock reaching the root. ``node_id`` is
     ``None`` only for legacy caches; the unified tree rejects such a receipt.
+    ``skipped_lock_components`` also records components released individually
+    before the remaining receipt is unlocked.
     """
 
     node_id: Optional[int] = None
@@ -320,6 +324,7 @@ class MatchResult(NamedTuple):
     # Reusable prefix length in FULL's device-value scan, before node-boundary
     # or auxiliary constraints. None means no shorter prefix was reported.
     full_device_match_len: Optional[int] = None
+    auxiliary_swa_host_hit_length: int = 0
 
 
 def zero_match_result(
@@ -336,6 +341,7 @@ def zero_match_result(
         best_match_node=root,
         host_hit_length=0,
         swa_host_hit_length=0,
+        auxiliary_swa_host_hit_length=0,
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
@@ -398,9 +404,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
-    # Tokens back from the committed length a fused draft reads in the swa
-    # sub-pool (CacheInitParams.draft_swa_window); 0 when it reads none.
-    draft_swa_window: int = 0
+    # Additional reader reaches keyed by actual storage band, not attention role.
+    draft_window_reaches: Optional[dict[str, int]] = None
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -685,7 +690,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # every other SWA rule uses sliding_window_size.
         if self.sliding_window_size is None:
             return None
-        return max(self.sliding_window_size, self.draft_swa_window)
+        return max(
+            self.sliding_window_size, (self.draft_window_reaches or {}).get("swa", 0)
+        )
 
     def swa_retain_floor(self, req) -> int | None:
         # A match lands on a state checkpoint rather than on the tail, so a cache

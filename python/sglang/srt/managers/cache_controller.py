@@ -783,11 +783,20 @@ class HiCacheController:
         # data. storage only needs rank 0 to write it back.
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-        is_mla_model = isinstance(self.mem_pool_device, MLAKVView)
+        router = self.mem_pool_device.layer_router
+        token_views = [router.view(p.name) for p in router.sub_pools()]
+        anchor = token_views[0] if token_views else self.mem_pool_device
+        is_mla_model = isinstance(anchor, MLAKVView)
         is_compressed_mla_model = isinstance(
             self.mem_pool_device, DeepSeekV4TokenToKVPool
         )
-        is_rank_replicated = is_mla_model or is_compressed_mla_model
+        is_rank_replicated = (
+            is_mla_model
+            and all(
+                isinstance(view, MLAKVView) and view.storage_rank_replicated
+                for view in token_views
+            )
+        ) or is_compressed_mla_model
         # Least Common Multiple among heterogeneous tp size
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
         should_split_heads = False
@@ -825,8 +834,8 @@ class HiCacheController:
             pp_size=parallel.pp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
-            # TODO(hzh): Rename is_mla_model to is_rank_replicated.
-            is_mla_model=is_rank_replicated,
+            is_mla_model=is_mla_model or is_compressed_mla_model,
+            rank_replicated=is_rank_replicated,
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,

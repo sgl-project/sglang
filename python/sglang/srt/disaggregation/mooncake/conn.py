@@ -247,7 +247,9 @@ def _uses_flat_entry_layout(
     even on an MHA backend.
     """
     is_single_region_swa = (
-        state_type == StateType.SWA and num_src_entries == 1 and num_dst_entries == 1
+        state_type in (StateType.SWA, StateType.AUXILIARY_SWA)
+        and num_src_entries == 1
+        and num_dst_entries == 1
     )
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
@@ -1914,6 +1916,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         (not the mamba-state path); subclasses extend for hardware components."""
         return st in (
             StateType.SWA,
+            StateType.AUXILIARY_SWA,
             StateType.DSA,
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
@@ -2095,7 +2098,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and not self.is_hybrid_mla_backend
                     and not is_qwen4_qsa_state
                 )
-                if slice_kv_heads and st != StateType.SWA:
+                if slice_kv_heads and st not in (
+                    StateType.SWA,
+                    StateType.AUXILIARY_SWA,
+                ):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )

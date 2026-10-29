@@ -599,10 +599,10 @@ class Scheduler(
                 if self.draft_worker is not None
                 else None
             ),
-            draft_swa_window=(
-                self.draft_worker.draft_swa_window
+            draft_window_reaches=(
+                self.draft_worker.draft_window_reaches
                 if self.draft_worker is not None
-                else 0
+                else None
             ),
         )
         self.is_hybrid_swa = result.is_hybrid_swa

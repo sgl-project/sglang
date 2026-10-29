@@ -1117,21 +1117,20 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
 
     @property
-    def draft_swa_window(self) -> int:
-        # The widened extend starts front rows below the committed length, and
-        # each depth reads its own window back from there.
+    def draft_window_reaches(self) -> dict[str, int]:
+        # Widened extend reads front rows before the committed length. The
+        # attention role "swa" may route to a different storage band per runner.
         draft = self._draft_worker
-        windows = [
-            runner.sliding_window_size
-            for runner in draft.draft_runner_list
-            if runner.runner_ids.is_fused_draft
-            and runner.token_to_kv_pool.layer_router.routes_to(
-                IdSpaceKind.SLIDING_WINDOW
-            )
-        ]
-        if not windows:
-            return 0
-        return max(windows) + draft.draft_extend_num_front_tokens
+        reaches = {}
+        for runner in draft.draft_runner_list:
+            if not runner.runner_ids.is_fused_draft:
+                continue
+            router = runner.token_to_kv_pool.layer_router
+            if router.routes_to(IdSpaceKind.SLIDING_WINDOW):
+                name = router.storage_name(IdSpaceKind.SLIDING_WINDOW)
+                reach = runner.sliding_window_size + draft.draft_extend_num_front_tokens
+                reaches[name] = max(reaches.get(name, 0), reach)
+        return reaches
 
     def forward_batch_generation(
         self,

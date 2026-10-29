@@ -3011,6 +3011,73 @@ class TestFloatBand(CustomTestCase):
         self.assertEqual(moved, 2)  # min(L_live, G) == L_live
         self._check_float_state(fla, kv)
 
+    def test_joint_relief_translates_donor_bytes_to_float_grid(self):
+        from sglang.srt.mem_cache.kv.alloc.band import _float_open_short_side
+
+        specs = [
+            _make_mha_spec("low", "up", layer_num=1, head_num=1, head_dim=128),
+            _make_mha_spec("middle", "float", layer_num=1, head_num=1, head_dim=96),
+            _make_mha_spec("high", "down", layer_num=1, head_num=1, head_dim=32),
+        ]
+        arena = arena_of(specs, total_bytes=1792, device="cpu")
+        low = Band(arena=arena, sub_pool_name="low", device="cpu", is_id_owner=True)
+        middle = FloatBand(
+            arena=arena, sub_pool_name="middle", device="cpu", is_id_owner=True
+        )
+        high = Band(arena=arena, sub_pool_name="high", device="cpu", is_id_owner=True)
+        low.bind_high_peer(middle)
+        middle.bind_low_peer(low)
+        middle.bind_high_peer(high)
+        high.bind_low_peer(middle)
+        kv = _FakeKVCache(arena, "middle")
+        self.assertIsNotNone(high.alloc(1))
+        v = middle.alloc(1)
+        self._stamp(middle, kv, v)
+        middle._relocate_to_positions([int(middle.ids.virtual_to_physical[v][0])], [2])
+        self.assertEqual(middle._region_bounds_pages(), (2, 4))
+        # Raw frontiers are 512/1664, while the float's own grid is 384.
+        # The requested 512-byte low gap needs only 384 aligned float bytes.
+        _float_open_short_side(middle, {low: 1, middle: 0, high: 1})
+        self.assertEqual(int(middle.ids.virtual_to_physical[v][0]), 3)
+        self._check_float_state(middle, kv)
+        self.assertIsNotNone(high.alloc(1))
+        self.assertIsNotNone(low.alloc(1))
+
+    def test_make_room_leapfrog_preserves_opposite_gap(self):
+        for side in ("low", "high"):
+            with self.subTest(side=side):
+                _, _, fla, _, kv = self._build_tri()
+                v = fla.alloc(1)
+                self._stamp(fla, kv, v)
+                epp = fla.entry_bytes_per_page
+                before = dict(zip(("low", "high"), fla._gap_pages()))
+                ask = (before[side] + 2) * epp
+                self.assertEqual(fla.make_room(side=side, min_bytes=ask), ask)
+                after = dict(zip(("low", "high"), fla._gap_pages()))
+                other = "high" if side == "low" else "low"
+                self.assertEqual(after[other], before[other] - 2)
+                self.assertGreater(after[other], 0)
+                self._check_float_state(fla, kv)
+
+    def test_interior_pack_preserves_payload_with_mixed_move_directions(self):
+        _, _, fla, _, kv = self._build_tri()
+        v = fla.alloc(13)
+        self._stamp(fla, kv, v)
+        physical = fla.ids.virtual_to_physical[v]
+        start = int(physical.min())
+        keep = (physical == start) | (physical >= start + 8)
+        fla.free(v[~keep])
+        live = sorted(int(x) for x in physical[keep].tolist())
+        final = list(range(start + 6, start + 12))
+        self.assertTrue(any(d < src for src, d in zip(live, final)))
+        self.assertTrue(any(d > src for src, d in zip(live, final)))
+        fla._relocate_to_positions(live, final)
+        self._check_float_state(fla, kv)
+        torch.testing.assert_close(
+            fla.ids.virtual_to_physical[v[keep]],
+            torch.tensor(final, dtype=physical.dtype, device=physical.device),
+        )
+
     def test_make_room_impossible_leaves_state_unchanged(self):
         _, _, fla, _, kv = self._build_tri(n_float=8)
         v = fla.alloc(6)

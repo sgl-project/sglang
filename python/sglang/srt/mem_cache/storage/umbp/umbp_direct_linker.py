@@ -316,7 +316,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 attn_cp_rank=params.attn_cp_rank,
                 pp_rank=params.pp_rank,
             )
-            self.storage.mla_suffix = rank_suffix
+            self.storage.kv_rank_suffix = rank_suffix
             self.storage.mha_suffix = rank_suffix
             self._register_buffers()
             # Report the mode rather than asserting it in the text: the line is

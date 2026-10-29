@@ -335,6 +335,7 @@ class StaticKVStorage:
         shares_prefixes: bool = False,
         eviction_interval: int = 1,
         tracking: Optional[TrackingAdvance] = None,
+        component_type=None,
     ) -> None:
         if tracking is not None:
             advance_tracking(self, req, tracking)
@@ -344,7 +345,9 @@ class StaticKVStorage:
             raise ValueError("window retirement needs a token frontier")
 
         from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
+        component_type = ComponentType.SWA if component_type is None else component_type
         free_swa_out_of_window_slots(
             req,
             frontier,
@@ -355,6 +358,7 @@ class StaticKVStorage:
             supports_prefix_sharing=shares_prefixes,
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
+            component_type=component_type,
         )
 
     def release_row(self, req: Req) -> None:
@@ -601,9 +605,15 @@ class StaticKVStorage:
     def sub_pool_names(self) -> Tuple[str, ...]:
         return (self.owner,)
 
-    def tree_slots(self, *, window_reach: int = 0) -> Tuple[TreeSlot, ...]:
+    def tree_slots(
+        self, *, window_reaches: Optional[Dict[str, int]] = None
+    ) -> Tuple[TreeSlot, ...]:
         shape = self._shape
-        window = max(shape.window, window_reach) if shape.window is not None else None
+        window = (
+            max(shape.window, (window_reaches or {}).get("swa", 0))
+            if shape.window is not None
+            else None
+        )
         return (
             (TreeSlot(component="FULL", family=TREE_TOKEN),)
             + (

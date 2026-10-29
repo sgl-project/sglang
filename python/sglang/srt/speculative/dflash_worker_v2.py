@@ -1988,6 +1988,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                             positions=positions,
                             hidden_states=layer_ctx_hidden,
                             cache_loc=cache_loc,
+                            swa_cache_loc=swa_cache_loc,
                             cache_loc_2d=cache_loc_2d,
                             commit_lens=commit_lens,
                         )
@@ -2059,6 +2060,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     positions=ctx_positions,
                     hidden_states=layer_ctx_hidden,
                     cache_loc=ctx_cache_loc,
+                    swa_cache_loc=ctx_swa_cache_loc,
                 )
                 continue
             if _is_npu:

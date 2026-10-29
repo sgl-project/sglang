@@ -1300,6 +1300,9 @@ class TestTransferLayerSpan(CustomTestCase):
 
 
 def _build_unified_swa_pool(page_size: int = 4, *, fused_draft=None):
+    from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+    setup_allocator_context()
     return build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
@@ -1337,7 +1340,7 @@ def _build_unified_host_pair(bundle):
 
 class TestFusedDraftHiCacheValidation(CustomTestCase):
     def test_fused_draft_binding_uses_its_host_sub_pool(self):
-        """A bound full draft passes HiCache admission; a window draft is refused."""
+        """Every fused band backs up its complete host entry."""
         region = DenseDraftRegion(
             lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
         )
@@ -1353,11 +1356,13 @@ class TestFusedDraftHiCacheValidation(CustomTestCase):
                     layer_lanes={0: 0},
                     page_size=bundle.token_to_kv_pool.page_size,
                 )
-                if host == "full":
-                    validate_fused_hicache_draft(draft_device_pools=(draft,))
-                else:
-                    with self.assertRaisesRegex(NotImplementedError, "full-attention"):
-                        validate_fused_hicache_draft(draft_device_pools=(draft,))
+                validate_fused_hicache_draft(draft_device_pools=(draft,))
+                layout = bundle.storage.host_layout(host)
+                self.assertEqual(
+                    layout.get_page_envelope_buffer().shape[1],
+                    bundle.storage.plan.sub_pool(host).spec.entry_bytes()
+                    * bundle.token_to_kv_pool.page_size,
+                )
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
@@ -1517,14 +1522,14 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
 
 
 class TestUnifiedPageEnvelopeSelection(CustomTestCase):
-    """Only no backend and Mori store the complete shared page, so only they
-    keep the page-envelope host arena."""
+    """Raw-page backends retain the complete page-envelope host arena."""
 
-    def test_only_no_backend_and_mori_select_the_envelope(self):
+    def test_raw_page_backends_select_the_envelope(self):
         storage = _build_unified_swa_pool().token_to_kv_pool_allocator.storage
         for backend, expected in (
             (None, "pair"),
             ("mori", "pair"),
+            ("file", "pair"),
             ("mooncake", "kv host"),
             ("dynamic", "kv host"),
         ):

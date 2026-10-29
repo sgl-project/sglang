@@ -17,6 +17,7 @@ import torch
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
 from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.host import page_envelope_pair
 from sglang.srt.mem_cache.kv.plan import (
@@ -29,7 +30,7 @@ from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 
 
 class StorageSubPool(msgspec.Struct, frozen=True, kw_only=True):
@@ -131,7 +132,33 @@ class KVStorage:
 
     def host_layout(self, name: str):
         """The sub-pool's host layout and persistent device buffers."""
-        return self.view(name).host_layout()
+        layout = self.view(name).host_layout()
+        # Native MLA hosts already translate widened DCP ids to rank-local rows.
+        # Fused entries select an envelope in the view and still need its page span.
+        if name == self._allocator.roles.state or isinstance(layout, MLAHostLayout):
+            return layout
+        band = (
+            self._allocator.full_attn_allocator
+            if name == self.owner
+            else self._band(name)
+        )
+        factor = band.page_size // band.pool_page_size
+        if factor != 1:
+            from sglang.srt.mem_cache.kv.layout.page import page_envelope_host_layout
+
+            view = self.view(name)
+            capacity = (
+                view.size
+                if view.host_capacity_tokens is None
+                else view.host_capacity_tokens
+            )
+            return page_envelope_host_layout(
+                self._allocator.arena,
+                name,
+                capacity * factor,
+                band.page_size,
+            )
+        return layout
 
     @property
     def request_memory(self):
@@ -148,6 +175,11 @@ class KVStorage:
     #
     # A take that may need room first calls ``make_room(num_tokens)``: the
     # caller evicts from its prefix tree there, before any id is taken.
+
+    def pending_state_slots(self, req: Req) -> int:
+        """Unallocated working/tracking slots required by acquire."""
+        state = self._allocator.state
+        return 0 if state is None else state.pending_request_slots(self.requests, req)
 
     def acquire(self, reqs: List[Req]) -> Optional[List[int]]:
         """Bind the requests' rows and, with a state sub-pool, their state and
@@ -254,6 +286,7 @@ class KVStorage:
         shares_prefixes: bool = False,
         eviction_interval: int = 1,
         tracking: Optional[TrackingAdvance] = None,
+        component_type=None,
     ) -> None:
         """Apply checkpoint tracking and retire rows outside the read window.
 
@@ -268,7 +301,14 @@ class KVStorage:
             raise ValueError("window retirement needs a token frontier")
 
         from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
+        component_type = ComponentType.SWA if component_type is None else component_type
+        sub_pool = next(
+            s.name
+            for s in self._plan.sub_pools
+            if s.external.tree_component == component_type.name
+        )
         free_swa_out_of_window_slots(
             req,
             frontier,
@@ -279,6 +319,10 @@ class KVStorage:
             supports_prefix_sharing=shares_prefixes,
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
+            component_type=component_type,
+            free_segment=lambda ids, start_pos: self._allocator.free_window_segment(
+                sub_pool, ids, start_pos=start_pos
+            ),
         )
 
     def release_row(self, req: Req) -> None:
@@ -310,8 +354,8 @@ class KVStorage:
         """The band that hands out ``sub_pool``'s rows on their own: the
         owner's when a window shares its token ids, the window's, or the
         whole allocator for an owner alone."""
-        if self._plan.sub_pool(sub_pool).external.tree_component == "SWA":
-            return self._allocator.swa_attn_allocator
+        if sub_pool in self._allocator.window_allocators:
+            return self._allocator.window_allocators[sub_pool]
         if self._allocator.has_window_pool:
             return self._allocator.full_attn_allocator
         return self._allocator
@@ -333,8 +377,8 @@ class KVStorage:
         """Give back a sub-pool's rows the tree held, as page-exact segments of
         owner token ids: the owner's rows alone, or a window's rows of those
         token ids."""
-        if self._plan.sub_pool(sub_pool).external.tree_component == "SWA":
-            self._allocator.free_swa_segment(ids, start_pos=0)
+        if sub_pool in self._allocator.window_allocators:
+            self._allocator.free_window_segment(sub_pool, ids, start_pos=0)
         else:
             self._band(sub_pool).free_segment(ids, start_pos=0)
 
@@ -350,15 +394,32 @@ class KVStorage:
     def window_ids(self, sub_pool: str, owner_ids: torch.Tensor) -> torch.Tensor:
         """The window's row ids of these owner token ids, as transfers and the
         tree's window values name them."""
-        return self._allocator.translate_swa_indices_for_transfer(owner_ids).to(
-            torch.int64
+        return self._host_token_ids(sub_pool, owner_ids).to(torch.int64)
+
+    def _host_token_ids(self, sub_pool: str, ids: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
+
+        band = (
+            self._allocator.full_attn_allocator
+            if sub_pool == self.owner
+            else self._band(sub_pool)
+        )
+        return translate_token_ids(
+            loc=ids,
+            v2p=band.ids.virtual_to_physical,
+            page_size=band.page_size,
+            dcp_size=1,
+            dcp_rank=0,
         )
 
     def bind_window(
         self, sub_pool: str, owner_ids: torch.Tensor, window_ids: torch.Tensor
     ) -> None:
         """Let these owner token ids name these window rows."""
-        self._allocator.set_full_to_swa_mapping(owner_ids, window_ids)
+        self._allocator.window_allocators[sub_pool].ids.bind(
+            owner_ids.to(torch.int64) // self._allocator.page_size,
+            window_ids.to(torch.int64) // self._allocator.page_size,
+        )
 
     def rehome_window(
         self, sub_pool: str, kept_ids: torch.Tensor, incoming_ids: torch.Tensor
@@ -367,7 +428,7 @@ class KVStorage:
         tokens, already cached under other ids) and return them by their new
         name. Nothing is allocated or freed: the window band rebinds the kept
         ids' pages to the incoming pages' memory and drops the incoming ones."""
-        window = self._allocator.swa_attn_allocator
+        window = self._allocator.window_allocators[sub_pool]
         kept_pages, incoming_pages = _page_pairs(
             kept_ids, incoming_ids, self._allocator.page_size
         )
@@ -499,11 +560,12 @@ class KVStorage:
         every sub-pool pins."""
         return tuple(s.name for s in self._sub_pools)
 
-    def tree_slots(self, *, window_reach: int = 0) -> Tuple[TreeSlot, ...]:
+    def tree_slots(
+        self, *, window_reaches: Optional[Dict[str, int]] = None
+    ) -> Tuple[TreeSlot, ...]:
         """The prefix tree's slot per sub-pool, in the order the tree drives
-        their eviction; ``window_reach`` widens the window a prefix keeps for a
-        reader beyond the window's own layers (a fused draft)."""
-        return self._plan.tree_slots(window_reach=window_reach)
+        their eviction. Extra reader reaches widen only their named storage band."""
+        return self._plan.tree_slots(window_reaches=window_reaches)
 
     def view(self, sub_pool: str) -> Any:
         return self._views[sub_pool]
@@ -528,6 +590,9 @@ class KVStorage:
     def page_envelope_pair(self) -> Optional[Tuple[str, str]]:
         """The two sub-pools whose host pools may share one page-envelope
         backing, owner first (kv/memory/host.py)."""
+        owner = self._allocator.full_attn_allocator
+        if owner.page_size != owner.pool_page_size:
+            return None
         return page_envelope_pair(self._plan)
 
     def wire_entries(self) -> Tuple[WireEntry, ...]:
@@ -624,8 +689,10 @@ class KVStorage:
 
     def device_room(self, sub_pool: str) -> int:
         """Free units a host load can take in the sub-pool now."""
-        if sub_pool == self._allocator.roles.window:
-            return self._allocator.swa_available_size()
+        if sub_pool in self._allocator.window_allocators:
+            return self._allocator.window_allocators[
+                sub_pool
+            ].schedulable_available_size()
         assert sub_pool == self._allocator.roles.state, sub_pool
         return self._allocator.state_slots.schedulable_available_size()
 
@@ -638,7 +705,10 @@ class KVStorage:
         stream; pins keep the rows in place until the copy is acknowledged."""
         roles = self._allocator.roles
         if sub_pool == roles.owner:
-            return self._allocator.full_attn_allocator.ids.translate
+            band = self._allocator.full_attn_allocator
+            if band.page_size == band.pool_page_size:
+                return band.ids.translate
+            return lambda ids: self._host_token_ids(sub_pool, ids)
         if sub_pool == roles.state:
             return self._allocator.state.slots.translate
         return None
@@ -659,18 +729,42 @@ class KVStorage:
         the ones it did not use, or None when loads take the owner's token
         ids. A window binds physical pages before the copy."""
         roles = self._allocator.roles
-        if sub_pool == roles.window:
-            window = self._allocator.swa_attn_allocator
+        if sub_pool in self._allocator.window_allocators:
+            window = self._allocator.window_allocators[sub_pool]
             return window.alloc_physical, window.cancel_physical_reservation
         if sub_pool == roles.state:
             slots = self._allocator.state_slots
             return slots.alloc, slots.free
         return None
 
-    def pending_state_slots(self, req: Req) -> int:
-        """Unallocated working/tracking slots required by acquire."""
-        state = self._allocator.state
-        return 0 if state is None else state.pending_request_slots(self.requests, req)
+
+    def free_row(self, kv: ReqKvInfo, ranges: list[tuple[int, int]]) -> None:
+        from sglang.srt.mem_cache.common import coalesce_ranges
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        row = self.requests.req_to_token[kv.req_pool_idx]
+        ranges = coalesce_ranges(ranges)
+        for sub_pool in self._sub_pools:
+            if sub_pool.name not in self._allocator.window_allocators:
+                continue
+            component = ComponentType[sub_pool.external.tree_component]
+            dead_lo = (
+                kv.swa_dead_lo(self._allocator.page_size)
+                if component == ComponentType.SWA
+                else kv.cache_protected_len
+            )
+            dead_hi = max(dead_lo, kv.get_evicted_seqlen(component))
+            for start, end in ranges:
+                lo = min(max(dead_lo, start), end)
+                hi = min(max(dead_hi, start), end)
+                for left, right in ((start, lo), (hi, end)):
+                    if left < right:
+                        self._allocator.free_window_segment(
+                            sub_pool.name, row[left:right], start_pos=left
+                        )
+        self._allocator.free_full_segments(
+            [(row[start:end], start) for start, end in ranges]
+        )
 
 
 def _page_pairs(

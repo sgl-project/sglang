@@ -909,6 +909,7 @@ class DSparkDraftMixin:
                     positions=positions,
                     hidden_states=ctx_hidden,
                     cache_loc=cache_loc,
+                    swa_cache_loc=swa_loc,
                     cache_loc_2d=cache_loc_2d,
                     commit_lens=commit_lens,
                 )

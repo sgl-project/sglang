@@ -178,6 +178,7 @@ class TreeComponent(ABC):
         self.cache = cache
         # The tree slot this component keeps: its id, family and numbers.
         self.slot = slot
+        self.component_type = ComponentType[slot.component]
         # Populated when the component passed to TreeCore constructor.
         self.tree_core: Optional[UnifiedTreeCore] = None
         self.is_evict_device_ongoing = False

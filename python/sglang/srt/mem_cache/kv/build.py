@@ -120,10 +120,6 @@ def _build_state_storage(
     chain allocator's state band (`_wire_mamba_slot_allocator`)."""
     state = plan.of_lifetime(StateLifetime)
     layer_ids = list(state.layer_ids)
-    assert len(ctx.state_cache_params.layers) >= len(layer_ids), (
-        f"cache_params.layers ({len(ctx.state_cache_params.layers)}) cannot supply "
-        f"{len(layer_ids)} mamba layer ids"
-    )
     pool = StateView(
         arena=arena,
         spec=state.spec,
@@ -140,7 +136,7 @@ def _build_state_storage(
                 scratch.tensors[f"{state.name}.intermediate_conv_window.{i}"]
                 for i in range(len(state.spec.conv_state_shapes))
             ]
-            if ctx.speculative_num_draft_tokens is not None
+            if ctx.speculative_num_draft_tokens is not None and layer_ids
             else None
         ),
     )
@@ -279,6 +275,9 @@ def build_kv_storage(
             owner=owner.name,
             window=None if window is None else window.name,
             state=None if state is None else state.name,
+            windows=tuple(
+                s.name for s in plan.sub_pools if isinstance(s.lifetime, WindowLifetime)
+            ),
         ),
         kvcache=token_to_kv_pool,
         views=views,

@@ -70,10 +70,270 @@ def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
 def _cache():
     return SimpleNamespace(
         sliding_window_size=8,
+        window_retain_size=lambda component: 32,
         full_evictable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
         supports_prefix_sharing=lambda: True,
     )
+
+
+def _multi_window_state_allocator(
+    *, lazy_compaction=False, extra_buffer=False, lazy_tracking=False
+):
+    from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
+    from sglang.srt.mem_cache.kv.decl import MHAGeometry, StateGeometry, kv_layer_decls
+    from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+    from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+    from sglang.srt.mem_cache.kv.state_policy import StateSlotStrategy
+    from sglang.srt.mem_cache.layout.fused_draft import (
+        DenseDraftRegion,
+        DraftBand,
+        FusedDraftPlacement,
+    )
+
+    setup_allocator_context()
+    placement = FusedDraftPlacement.from_counts(
+        counts={"draft_swa": [1]},
+        regions={
+            "draft_swa": DenseDraftRegion(
+                lane_num=1,
+                head_num=1,
+                head_dim=8,
+                store_dtype=torch.float16,
+            )
+        },
+        new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+    )
+    plan = plan_kv_storage(
+        kv_layer_decls(
+            full_layer_ids=(0,),
+            full_geometry=MHAGeometry(
+                head_num=1,
+                head_dim=8,
+                v_head_dim=8,
+                kv_cache_dtype=torch.float16,
+            ),
+            window_layer_ids=(1,),
+            window_geometry=MHAGeometry(
+                head_num=1,
+                head_dim=32,
+                v_head_dim=32,
+                kv_cache_dtype=torch.float16,
+            ),
+            window=16,
+            state_layer_ids=(2,),
+            state_geometry=StateGeometry(
+                conv_state_shapes=((1, 1023),),
+                conv_dtype=torch.float16,
+                temporal_state_shape=(1, 1, 1),
+                temporal_dtype=torch.float16,
+            ),
+            checkpoint_interval=4,
+        ),
+        page_size=4,
+        fused_draft=placement,
+    )
+    strategy = StateSlotStrategy(
+        radix_cache=False, extra_buffer=extra_buffer, overlap=True, lazy=lazy_tracking
+    )
+    sized = size_plan(
+        plan,
+        KVSizingInputs(
+            full_tokens=16,
+            window_tokens=16,
+            state_slots=4 * (1 + strategy.initial_tracking_slots),
+            state_strategy=strategy,
+            max_running_requests=4,
+            context_len=32,
+            alignment=1,
+        ),
+    )
+    storage = build_kv_storage(
+        plan,
+        sized,
+        UnifiedBuildContext(
+            device="cpu",
+            start_layer=0,
+            end_layer=3,
+            enable_memory_saver=False,
+            need_sort=False,
+            max_num_reqs=4,
+            model_context_len=32,
+            lazy_compaction=lazy_compaction,
+            state_cache_params=SimpleNamespace(layers=(2,)),
+        ),
+    )
+    return storage
+
+
+class TestJointStatePrefillMemoryBudget(unittest.TestCase):
+    def test_pending_state_slots_share_the_actual_token_envelope(self):
+        for lazy, tracking in (
+            (False, False),
+            (True, False),
+            (False, True),
+            (True, True),
+        ):
+            with self.subTest(lazy=lazy, tracking=tracking):
+                storage = _multi_window_state_allocator(
+                    lazy_compaction=lazy,
+                    extra_buffer=tracking,
+                    lazy_tracking=lazy,
+                )
+                allocator = storage.allocator
+                cache = _cache()
+                cache.sliding_window_size = 16
+                cache.supports_mamba = lambda: True
+                cache.mamba_evictable_size = lambda: 0
+                budget = allocator.create_prefill_budget(cache)
+                prompt_tokens = 28 if tracking else 8
+                reserved_tokens = prompt_tokens + 4
+                requests = [
+                    Req(
+                        str(i),
+                        None,
+                        array("q", range(prompt_tokens)),
+                        SamplingParams(max_new_tokens=0),
+                    )
+                    for i in range(4)
+                ]
+                slots_per_request = 1 + storage.requests.mamba_initial_tracking_slots
+                self.assertEqual(
+                    budget.request_state_slots(requests[0]), slots_per_request
+                )
+                request = dict(
+                    extend_input_len=prompt_tokens,
+                    total_tokens=reserved_tokens,
+                    max_new_tokens=0,
+                    input_tokens=prompt_tokens,
+                    swa_host_hit_length=0,
+                    chunk_limit=None,
+                    state_slots=slots_per_request,
+                )
+                self.assertEqual(allocator.mamba_allocator.entry_bytes, 2080)
+                admitted = 0
+                while (
+                    budget.state_slots_fit(slots_per_request)
+                    and budget.check_prefill(**request)[0]
+                ):
+                    budget.reserve(prompt_tokens, 0, state_slots=slots_per_request)
+                    admitted += 1
+                self.assertGreater(admitted, 0)
+                self.assertLess(admitted, 4)
+                slots = admitted * slots_per_request
+                self.assertEqual(budget.pending_state_slots, slots)
+                self.assertEqual(budget.total_offset, admitted * reserved_tokens)
+                self.assertFalse(budget.check_prefill(**request)[0])
+                self.assertTrue(
+                    allocator.can_reserve(
+                        admitted * reserved_tokens,
+                        admitted * reserved_tokens,
+                        state_slots=slots,
+                    )
+                )
+                self.assertIsNone(
+                    allocator.reclaim_plan(
+                        (admitted + 1) * reserved_tokens,
+                        (admitted + 1) * reserved_tokens,
+                        state_slots=slots + slots_per_request,
+                    )
+                )
+                self.assertTrue(
+                    allocator.ensure_capacity(
+                        admitted * reserved_tokens,
+                        admitted * reserved_tokens,
+                        state_slots=slots,
+                    )
+                )
+                # Real request acquisition takes working AND initial tracking
+                # state before the token bands consume their shared bytes.
+                selected = requests[:admitted]
+                self.assertLessEqual(len(selected), storage.requests.available_size())
+                self.assertIsNotNone(storage.acquire(selected))
+                self.assertTrue(
+                    all(storage.pending_state_slots(req) == 0 for req in selected)
+                )
+                tokens = allocator.alloc(admitted * reserved_tokens)
+                self.assertIsNotNone(tokens)
+                self.assertEqual(storage.accounting_violations(), [])
+                allocator.free(tokens)
+                for req in selected:
+                    storage.release_state(allocator.roles.state, req)
+                    storage.requests.free(req)
+
+    def test_chunk_and_load_back_keep_candidate_and_pending_state(self):
+        storage = _multi_window_state_allocator()
+        allocator = storage.allocator
+        cache = _cache()
+        cache.sliding_window_size = 16
+        cache.supports_mamba = lambda: True
+        cache.mamba_evictable_size = lambda: 0
+        budget = allocator.create_prefill_budget(cache)
+        budget.reserve(8, 0, state_slots=1)
+        # Two more slots represent the next request and its host checkpoint.
+        # Their placement must be checked even when token demand alone fits.
+        with unittest.mock.patch.object(
+            allocator, "can_reserve", wraps=allocator.can_reserve
+        ) as fit:
+            budget.can_allocate_prefill(
+                paged_input=12,
+                extend_input_len=8,
+                max_new_tokens=0,
+                chunk_limit=None,
+                state_slots=2,
+            )
+            self.assertEqual(fit.call_args.kwargs["state_slots"], 3)
+            budget.fit_chunk(
+                extend_input_len=8,
+                max_new_tokens=0,
+                chunk_limit=8,
+                state_slots=2,
+            )
+            self.assertTrue(
+                all(call.kwargs["state_slots"] == 3 for call in fit.call_args_list)
+            )
+        with unittest.mock.patch.object(
+            allocator, "reclaim_for_prealloc", return_value=None
+        ) as reclaim:
+            self.assertTrue(
+                budget.prepare_load_back(
+                    full_tokens=12,
+                    extend_input_len=8,
+                    max_new_tokens=0,
+                    swa_host_hit_length=0,
+                    chunk_limit=None,
+                    state_slots=2,
+                )
+            )
+            self.assertEqual(reclaim.call_args.kwargs["state_slots"], 3)
+
+    def test_fractional_decode_reservation_rounds_after_summing(self):
+        storage = _multi_window_state_allocator()
+        allocator = storage.allocator
+        cache = _cache()
+        cache.supports_mamba = lambda: True
+        cache.mamba_evictable_size = lambda: 0
+        budget = allocator.create_prefill_budget(cache)
+        # Running decode estimates can be fractional under new_token_ratio.
+        budget.total_offset = 0.5
+        budget.swa_offset = 0.5
+        budget.auxiliary_swa_offset = 0.5
+        with unittest.mock.patch.object(
+            allocator._policy, "_demands", wraps=allocator._policy._demands
+        ) as demands:
+            self.assertTrue(budget._fits(4, 4, auxiliary_swa_tokens=4, state_slots=1))
+        pages = dict(
+            allocator._policy._demands(
+                *demands.call_args.args, **demands.call_args.kwargs
+            )
+        )
+        self.assertEqual(pages[allocator.roles.state], 1)
+        self.assertEqual(pages[allocator.roles.owner], 2)
+        for band in allocator._windows:
+            self.assertEqual(pages[band.sub_pool_name], 2)
+        self.assertIsNotNone(allocator.alloc_state_slots(1))
+        self.assertIsNotNone(allocator.alloc(8))
+        self.assertEqual(storage.accounting_violations(), [])
 
 
 class TestSharedPrefillMemoryBudget(unittest.TestCase):
@@ -94,15 +354,8 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
         self.assertEqual(self.budget.check_prefill(**self.request), (True, 16))
         self.budget.reserve(12, 4, chunk_limit=16)
         # Each side separately has room, but their combined reservation does not.
-        self.assertGreater(
-            self.allocator.full_attn_allocator.available_size()
-            - self.budget.total_offset,
-            20,
-        )
-        self.assertGreater(
-            self.allocator.swa_attn_allocator.available_size() - self.budget.swa_offset,
-            16,
-        )
+        self.assertGreater(self.budget.remaining_total, 20)
+        self.assertGreater(self.budget.remaining_swa, 16)
         self.assertEqual(self.budget.check_prefill(**self.request), (False, None))
         self.assertEqual(self.allocator.full_attn_allocator.allocated_count(), 0)
         self.assertEqual(self.allocator.swa_attn_allocator.allocated_count(), 0)
@@ -351,6 +604,7 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         allocator.swa_attn_allocator = SimpleNamespace(
             entry_bytes=64, entry_bytes_per_page=64 * allocator.page_size
         )
+        allocator.window_allocators = {"swa": allocator.swa_attn_allocator}
         allocator.mamba_allocator = SimpleNamespace(
             entry_bytes_per_page=256, schedulable_available_size=lambda: 8
         )
@@ -370,12 +624,6 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
             ),
             19,
         )
-        budget.reserve(4, 0, state_slots=2)
-        self.assertEqual(budget.pending_state_slots, 2)
-        self.assertEqual(budget.total_offset, 8)
-        self.assertEqual(budget.rem_state_slots, 6)
-        self.assertTrue(budget.state_slots_fit(6))
-        self.assertFalse(budget.state_slots_fit(7))
 
     def test_tri_pool_eviction_does_not_reenter_common(self):
         from array import array
@@ -392,10 +640,10 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         self.addCleanup(reset_context)
         bundle, allocator, cache = build_tri_cache(state_cache=False)
         states = allocator.state_slots.alloc(8)
-        slots = allocator.alloc(allocator.available_size())
+        slots = allocator.alloc(96)
         self.assertIsNotNone(states)
         self.assertIsNotNone(slots)
-        for i in range(slots.numel()):
+        for i in range(96):
             cache.insert(
                 InsertParams(key=RadixKey(array("q", [i])), value=slots[i : i + 1])
             )

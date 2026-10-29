@@ -18,9 +18,12 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
 )
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_unified_pools
 from sglang.srt.mem_cache.kv.decl import (
+    FullLifetime,
     MHAGeometry,
     MLAGeometry,
     StateGeometry,
+    StateLifetime,
+    WindowLifetime,
     kv_layer_decls,
 )
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
@@ -33,7 +36,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import mamba_cache_chunk_size, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.tree_slots import tree_slots_of
 
@@ -257,7 +260,14 @@ def plan_stand_in(arena: SpecArena, fused_draft=None) -> SimpleNamespace:
     """What draft binding reads of a plan, over a test arena's specs."""
     return SimpleNamespace(
         fused_draft=fused_draft,
-        sub_pool=lambda name: SimpleNamespace(spec=arena.spec(name)),
+        sub_pool=lambda name: SimpleNamespace(
+            spec=arena.spec(name),
+            lifetime=FullLifetime()
+            if name == "full"
+            else StateLifetime()
+            if name == "mamba"
+            else WindowLifetime(window=64),
+        ),
     )
 
 
@@ -529,6 +539,7 @@ def build_test_unified_pools(
         state_geometry=(
             StateGeometry.of(mamba2_cache_params) if mamba_layer_ids else None
         ),
+        checkpoint_interval=mamba_cache_chunk_size() if mamba_layer_ids else None,
     )
     sizing = KVSizingInputs(
         budget_bytes=total_bytes if total_bytes is not None else unified_total_bytes,
@@ -613,6 +624,7 @@ def build_unified_bundle(geometry: UnifiedGeometry):
         state_geometry=(
             StateGeometry.of(cache_params) if cache_params is not None else None
         ),
+        checkpoint_interval=mamba_cache_chunk_size() if g.state_layer_ids else None,
     )
     by_tokens = g.byte_budget is None or bool(g.state_layer_ids)
     sizing = KVSizingInputs(

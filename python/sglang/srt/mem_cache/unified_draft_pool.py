@@ -11,16 +11,18 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import msgspec
 
+from sglang.srt.mem_cache.kv.decl import WindowLifetime
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
+from sglang.srt.mem_cache.kv.layout.mla import DraftMLAView
 from sglang.srt.mem_cache.kv.layout.state import DraftStateView, MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.kv.plan import KVStoragePlan
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.layout.fused_draft import (
-    HOST_KINDS,
     LAYER_WINDOW,
     FusedDraftPlacement,
+    MLADraftRegion,
     draft_state_layer_ids,
     draft_swa_layer_ids,
 )
@@ -83,7 +85,7 @@ class BindContext(msgspec.Struct, frozen=True, kw_only=True):
         return tuple(
             host
             for host in self.placement.hosts()
-            if HOST_KINDS[host].family == family
+            if self.placement.host_kind(host).family == family
             and len(self.placement.lanes_for(self.runner, host)) > 0
         )
 
@@ -130,7 +132,7 @@ def bind_fused_draft(
     )
     families: List[str] = []
     for host in placement.hosts():
-        family = HOST_KINDS[host].family
+        family = ctx.placement.host_kind(host).family
         if family not in families and len(placement.lanes_for(runner, host)) > 0:
             families.append(family)
     assert families, f"draft runner {runner} holds no lane in any host"
@@ -149,8 +151,8 @@ def bind_fused_draft(
 def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBinding:
     """Bind draft model layer ids to the lanes sized from its configuration.
 
-    Reject count mismatches to prevent aliasing. Window layers use their host's
-    lanes when present, otherwise full storage whose lifetime covers the window.
+    Reject count mismatches to prevent aliasing. Window layers use the band
+    whose retention matches their declared lifetime.
     Owner-only drafts use that view directly; other drafts route each layer to
     its host view and id space.
     """
@@ -166,7 +168,8 @@ def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
             host: [
                 layer_id
                 for layer_id in kv_layer_ids
-                if (layer_id in window) == (HOST_KINDS[host].serves == LAYER_WINDOW)
+                if (layer_id in window)
+                == (ctx.placement.host_kind(host).serves == LAYER_WINDOW)
             ]
             for host in hosts
         }
@@ -177,7 +180,9 @@ def _bind_dense(ctx: BindContext, binding: FusedDraftBinding) -> FusedDraftBindi
         f"draft runner {ctx.runner}: layers {layers_by_host} vs placed lanes "
         f"{ {host: list(lanes) for host, lanes in lanes_by_host.items()} }"
     )
-    if hosts == (ctx.owner,):
+    if hosts == (ctx.owner,) and not isinstance(
+        ctx.placement.region(ctx.owner), MLADraftRegion
+    ):
         pool = DraftMHAView(
             arena=ctx.arena,
             host_spec=ctx.plan.sub_pool(ctx.owner).spec,
@@ -213,7 +218,12 @@ def routed_draft_pool(
     layer_maps = []
     for host, layer_lanes in lanes_by_host.items():
         layer_ids = sorted(layer_lanes)
-        view = DraftMHAView(
+        view_type = (
+            DraftMLAView
+            if isinstance(plan.sub_pool(host).spec.draft_region, MLADraftRegion)
+            else DraftMHAView
+        )
+        view = view_type(
             arena=arena,
             host_spec=plan.sub_pool(host).spec,
             layer_lanes={
@@ -221,8 +231,17 @@ def routed_draft_pool(
             },
             page_size=page_size,
         )
+        # Backends name the runner's window role "swa". Its view still names
+        # the actual storage band, which RunnerIds resolves to that band's ids.
+        route_name = (
+            "swa" if isinstance(plan.sub_pool(host).lifetime, WindowLifetime) else host
+        )
         layer_maps.append(
-            (host, view, {layer_id: idx for idx, layer_id in enumerate(layer_ids)})
+            (
+                route_name,
+                view,
+                {layer_id: idx for idx, layer_id in enumerate(layer_ids)},
+            )
         )
     layer_ids = [layer_id for _, _, indices in layer_maps for layer_id in indices]
     lead = layer_maps[0][1]

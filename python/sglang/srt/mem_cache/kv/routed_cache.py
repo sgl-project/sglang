@@ -69,7 +69,9 @@ class RoutedKVCache(KVCache):
         self.device = arena.device
         self.dtype = self._owner_view.dtype
         self.store_dtype = self._owner_view.store_dtype
-        for name, view in views.items():
+        for name, view, indices in self._layer_maps:
+            if not indices:
+                continue
             assert (view.dtype, view.store_dtype) == (self.dtype, self.store_dtype), (
                 f"sub-pool {name!r} stores {view.store_dtype} for {view.dtype}; the "
                 f"owner stores {self.store_dtype} for {self.dtype}"
@@ -186,6 +188,13 @@ class RoutedKVCache(KVCache):
     ):
         self.layer_router.layer(layer.layer_id).store_mla(
             layer, loc_info, cache_k_nope, cache_k_rope
+        )
+
+    def set_mla_kv_buffer_prefix_valid(
+        self, layer, loc_info, commit_lens, cache_k_nope, cache_k_rope
+    ):
+        self.layer_router.layer(layer.layer_id).store_mla_prefix(
+            layer, loc_info, commit_lens, cache_k_nope, cache_k_rope
         )
 
     def get_mla_kv_buffer(

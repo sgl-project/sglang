@@ -435,6 +435,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._family_slot_ids: dict[str, ComponentType] = {}
         for slot in params.tree_slots:
             self._family_slot_ids.setdefault(slot.family, ComponentType[slot.component])
+            if slot.component == "SWA":
+                self._family_slot_ids[slot.family] = ComponentType.SWA
+        self._independent_windows = sum(
+            slot.family == TREE_WINDOW for slot in params.tree_slots
+        ) > 1
         self.is_eagle = params.is_eagle and TREE_STATE not in self._family_slot_ids
         self.enable_hicache = False
         self.is_host_memory_buffer_only = False
@@ -1355,7 +1360,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             consumed_from = min(consumed_from, comp_consumed_from)
 
         dup_start = max(0, state.params.prev_prefix_len - state.total_prefix_length)
-        if dup_start < consumed_from:
+        if dup_start < consumed_from and self._independent_windows:
+            # Each window component released its duplicate slices or rehomed them.
+            state.pending_actions.append(
+                FreeDeviceKVFullOnly([value_slice[dup_start:consumed_from]])
+            )
+        elif dup_start < consumed_from:
             # Below the request's SWA eviction floor only FULL is still ours.
             dup = value_slice[dup_start:consumed_from]
             abs_start = state.total_prefix_length + dup_start

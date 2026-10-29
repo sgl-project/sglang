@@ -597,6 +597,7 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         cache_loc: torch.Tensor,
+        swa_cache_loc: Optional[torch.Tensor] = None,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
@@ -604,11 +605,24 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         k_nope, k_pe = self.project_context_kv(positions, hidden_states)
         if cache_loc_2d is None:
             pool.set_mla_kv_buffer(
-                self.attn_mqa, KVWriteLoc(cache_loc, physical=True), k_nope, k_pe
+                self.attn_mqa,
+                KVWriteLoc(cache_loc, swa_loc=swa_cache_loc, physical=True),
+                k_nope,
+                k_pe,
             )
         else:
-            pool.set_mla_kv_buffer_prefix_valid(
-                self.attn_mqa, cache_loc_2d, commit_lens, k_nope, k_pe
+            pool.layer_router.layer(self.attn_mqa.layer_id).store_mla_prefix(
+                self.attn_mqa,
+                KVWriteLoc(
+                    cache_loc_2d,
+                    swa_loc=None
+                    if swa_cache_loc is None
+                    else swa_cache_loc.view_as(cache_loc_2d),
+                    physical=True,
+                ),
+                commit_lens,
+                k_nope,
+                k_pe,
             )
 
 

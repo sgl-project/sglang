@@ -82,6 +82,7 @@ _PREPARED_STATE_TYPES = frozenset(
     (
         StateType.MAMBA,
         StateType.SWA,
+        StateType.AUXILIARY_SWA,
         StateType.DSA,
         StateType.QSA_PENDING,
         StateType.QSA_COMPRESSED,
@@ -3164,7 +3165,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     force_flat=True,
                 )
             elif (
-                st == StateType.SWA
+                st in (StateType.SWA, StateType.AUXILIARY_SWA)
                 and not self.is_mla_backend
                 and self.attn_tp_size != decode_tp_size
             ):
@@ -3182,6 +3183,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             elif st in (
                 StateType.SWA,
+                StateType.AUXILIARY_SWA,
                 StateType.BLOCK_SCALE,
                 StateType.BLOCK_SCALE_SWA,
                 StateType.QSA_PENDING,

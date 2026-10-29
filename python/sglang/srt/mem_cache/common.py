@@ -258,6 +258,9 @@ def match_kv_cache(
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
+    req.matched_auxiliary_swa_host_hit_length = (
+        match_result.auxiliary_swa_host_hit_length
+    )
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
     req.swa_branching_seqlen = match_result.swa_branching_seqlen

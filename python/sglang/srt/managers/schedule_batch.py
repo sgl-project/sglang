@@ -1238,6 +1238,7 @@ class Req(ReqDllmMixin):
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
+        self.matched_auxiliary_swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
         # The branching point seqlen to track mamba state. If set, given by prefix
         # match, it will be the tracked seqlen in the ping pong buffer for the
@@ -1529,7 +1530,9 @@ class Req(ReqDllmMixin):
     def auxiliary_swa_host_hit_length(self) -> int:
         plan = self.staged_prefetch_plan
         return (
-            plan.window_tokens(ComponentType.AUXILIARY_SWA) if plan is not None else 0
+            plan.window_tokens(ComponentType.AUXILIARY_SWA)
+            if plan is not None
+            else self.matched_auxiliary_swa_host_hit_length
         )
 
     def needs_host_load_back(self) -> bool:
@@ -4116,7 +4119,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
                     # Past the retain window the request no longer reads its prefill's
                     # SWA; release that part of the tree lock so SWA LRU can reclaim it.
-                    if release_leaf_lock and req.decode_batch_idx >= retain_window:
+                    if release_leaf_lock and (
+                        has_auxiliary_swa or req.decode_batch_idx >= retain_window
+                    ):
                         self.tree_cache.release_swa_prefix_lock(req)
                 elif (
                     self.forward_mode.is_extend()
