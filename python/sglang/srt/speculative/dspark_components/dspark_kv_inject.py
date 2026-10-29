@@ -8,7 +8,8 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_ring_commit_inject_layout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
 from sglang.srt.model_executor.forward_batch_info import compute_position
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import is_pin_memory_available
@@ -54,10 +55,12 @@ class TargetHiddenKvInjector:
             self.draft_model_runner.token_to_kv_pool, "swa_req_ring_size", None
         )
 
-    def ids_for(self, plan: KVLocPlan, *, cols: Optional[Cols] = None) -> torch.Tensor:
+    def ids_for(
+        self, plan: IterationIds, *, cols: Optional[Cols] = None
+    ) -> torch.Tensor:
         """The plan's write ids as the draft pool indexes them: the target's
         physical ids for a fused draft, the virtual ids for a private one."""
-        return plan.write_ids(self.draft_model_runner.kv_index_translator, cols=cols)
+        return plan.write_ids(self.draft_model_runner.runner_ids, cols=cols)
 
     def place_prefill(self, batch: ScheduleBatch) -> PrefillPlacement:
         """Where a prefill's target hidden goes in the draft pool. It reads
@@ -101,7 +104,7 @@ class TargetHiddenKvInjector:
                 output_size=num_tokens,
             )
         # The draft KV goes to the slots the target prefill writes.
-        cache_loc = self.ids_for(self.model_runner.kv_index_translator.own_plan(batch))
+        cache_loc = self.ids_for(self.model_runner.runner_ids.own_plan(batch))
         pool = self.draft_model_runner.token_to_kv_pool
         swa_loc = None
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
@@ -301,7 +304,9 @@ class TargetHiddenKvInjector:
                 cache_loc_2d.shape[1],
             )
         else:
-            swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+            swa_loc = self.draft_model_runner.runner_ids.ids_in(
+                IdSpaceKind.SLIDING_WINDOW, cache_loc
+            ).to(torch.int32)
             if commit_lens is not None and cache_loc_2d is not None:
                 bs, verify_len = cache_loc_2d.shape
                 col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
@@ -359,7 +364,7 @@ class TargetHiddenKvInjector:
         hidden_strided: torch.Tensor,
         commit_lens: torch.Tensor,
         bs: int,
-        kv_loc_plan: KVLocPlan,
+        iteration_ids: IterationIds,
     ) -> None:
         stride = self.verify_num_draft_tokens
         prefix_lens = batch.seq_lens
@@ -398,7 +403,7 @@ class TargetHiddenKvInjector:
             return
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
-        verify_cache_loc = self.ids_for(kv_loc_plan)
+        verify_cache_loc = self.ids_for(iteration_ids)
         verify_cache_loc_2d = verify_cache_loc.view(bs, stride)
         self.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),

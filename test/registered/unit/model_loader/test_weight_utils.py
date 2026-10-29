@@ -1,7 +1,10 @@
 """Unit tests for srt/model_loader/weight_utils.py shard-index consistency."""
 
+import io
 import json
 import os
+import pickle
+import tarfile
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -12,6 +15,7 @@ import torch
 
 from sglang.srt.model_loader import weight_utils
 from sglang.srt.model_loader.weight_utils import (
+    _load_pt_file,
     filter_duplicate_safetensors_files,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
@@ -257,6 +261,50 @@ class TestMaybeAddMtpSafetensors(CustomTestCase):
                     [model, mtp],
                 )
                 listing.assert_not_called()
+
+
+class _OpenOnUnpickle:
+    def __init__(self, marker):
+        self.marker = marker
+
+    def __reduce__(self):
+        return (open, (self.marker, "w"))
+
+
+def _write_legacy_tar_checkpoint(path, payload):
+    members = {
+        "storages": pickle.dumps(0) + pickle.dumps([]),
+        "tensors": pickle.dumps(0),
+        "pickle": pickle.dumps(payload),
+    }
+    with tarfile.open(path, "w") as tar:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+
+class TestLoadPtFile(CustomTestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.folder = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_tensor_state_dict_loads(self):
+        path = os.path.join(self.folder, "pytorch_model.bin")
+        torch.save({"w": torch.arange(4)}, path)
+        loaded = _load_pt_file(path)
+        self.assertTrue(torch.equal(loaded["w"], torch.arange(4)))
+
+    def test_legacy_tar_pickle_payload_is_not_executed(self):
+        marker = os.path.join(self.folder, "pwned")
+        path = os.path.join(self.folder, "pytorch_model.bin")
+        _write_legacy_tar_checkpoint(path, _OpenOnUnpickle(marker))
+        with self.assertRaises(RuntimeError):
+            _load_pt_file(path)
+        self.assertFalse(os.path.exists(marker))
 
 
 class TestInitializeDummyWeights(CustomTestCase):
