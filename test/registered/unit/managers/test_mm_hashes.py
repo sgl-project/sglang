@@ -29,6 +29,8 @@ from sglang.srt.managers.schedule_batch import (
     MM_PAD_SHIFT_VALUE,
     Modality,
     MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
 )
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -38,6 +40,14 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestMmHashesContract(CustomTestCase):
+    def test_processor_output_rejects_item_without_offsets(self):
+        output = MultimodalProcessorOutput(
+            mm_items=[MultimodalDataItem(modality=Modality.IMAGE, hash=1)],
+        )
+
+        with self.assertRaisesRegex(ValueError, "missing token offsets"):
+            MultimodalInputs.from_processor_output(output)
+
     def test_batched_hashes_follow_each_request(self):
         req = GenerateReqInput(
             text=["one", "two"],

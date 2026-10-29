@@ -772,6 +772,15 @@ class MultimodalInputs:
         assert isinstance(mm_items, list)
         mm_items = [item for item in mm_items if item.is_valid()]
 
+        missing_offsets = [
+            item.modality.name.lower() for item in mm_items if not item.offsets
+        ]
+        if missing_offsets:
+            modalities = ", ".join(sorted(set(missing_offsets)))
+            raise ValueError(
+                f"Invalid multimodal input: missing token offsets for {modalities} item(s)"
+            )
+
         # try reconstructing from cuda-ipc
         reconstruct_device = None
         try:
