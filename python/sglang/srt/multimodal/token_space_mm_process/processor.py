@@ -66,6 +66,17 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             return None
         return functools.partial(torch.cuda.set_device, self._worker_thread_device)
 
+    async def _run_mm_processor(self, function, **kwargs):
+        # Without a worker pool the function runs inline on the caller's thread,
+        # where bare "cuda" (e.g. video frame decode) is still cuda:0.
+        if (
+            self.mm_processor_executor is None
+            and self._worker_thread_device is not None
+        ):
+            with torch.cuda.device(self._worker_thread_device):
+                return function(processor=self._processor, **kwargs)
+        return await super()._run_mm_processor(function, **kwargs)
+
     async def process(
         self,
         image_data=None,
