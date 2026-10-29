@@ -1,6 +1,6 @@
-// JIT copy of sgl-kernel's kernels/aot/csrc/allreduce/quick_all_reduce.cuh restructured for latency, cut to the
-// INT4 and INT8 codecs at TP4 on bf16 data reduced in fp16; same buffer sizes, flags and arithmetic, so its outputs
-// are bit-identical.
+// Lower-latency JIT copy of sgl-kernel's kernels/aot/csrc/allreduce/quick_all_reduce.cuh, cut to the
+// INT4 and INT8 codecs at TP4 on bf16 data reduced in fp16; same buffer sizes, flags and arithmetic, so
+// its outputs are bit-identical.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -17,27 +17,20 @@ struct CodecBase {
   }
 };
 
-// Int4 symmetric quantization codec at TP4.
-// We quantize the FP16 data to block-scaled Int4 in blocks of 4 *
-// kThreadGroupSize.
+// Int4 symmetric quantization codec at TP4, block-scaled over 4 * kThreadGroupSize fp16 values.
 struct CodecQ4 : public CodecBase {
   static constexpr int kWorldSize = 4;
   // Atoms (16B) per thread in a block's tile, and the tile's bytes.
   static constexpr int kAtoms = 8;
   static constexpr int kTileSize = kBlockSize * kAtoms * sizeof(int32x4_t);
 
-  // Codec tile size process by this workgroup.
-  // Each threads processes a fragment of fp16x8_t (16B),
-  // into a int4x8_t (4B) and a fp16 scale shared among 32 values.
+  // Each thread encodes an fp16x8_t (16B) into an int4x8_t (4B) and a fp16 scale shared among 32 values.
   static constexpr int kRankAtoms = kAtoms / kWorldSize;
   static constexpr int kRankTileStride = 1152;
   static constexpr int kRankTransmittedTileSize = kRankTileStride * kRankAtoms;
   static_assert(kRankTransmittedTileSize % 16 == 0, "kRankTransmittedTileSize must be 16B aligned.");
 
-  // Total tile size for the collective communication.
   static constexpr int kTransmittedTileSize = kRankTransmittedTileSize * kWorldSize;
-
-  // Constants configuration
 
   // {-1/8.0h, -1/8.0h}, f16x2_t
   static constexpr int kScaleFactor = 0xB000B000;
@@ -65,18 +58,15 @@ struct CodecQ4 : public CodecBase {
     for (int k = 0; k < kRankAtoms; k++) {
       int32x4_t const atom = data[k];
 
-      // Compute the absolute maximum of the atom in the thread group
-      // In 2 blocks of values, upper/lower halves of the f16x2_t
+      // Absolute maximum over the thread group for each block: the upper and lower f16x2_t halves.
       int wblockmax = group_abs_max<half>(atom);
 
-      // Derive scales
       int decoding_scale;
       int encoding_scale;
       decoding_scale = packed_mul<half>(wblockmax, kScaleFactor);
       encoding_scale = packed_add<half>(decoding_scale, kScaleEpsilon);
       encoding_scale = packed_rcp<half>(encoding_scale);
 
-      // Apply scales to get quantized values
       int32x4_t w;
       for (int i = 0; i < 4; i++) {
         w[i] = packed_mul<half>(atom[i], encoding_scale);
@@ -159,7 +149,6 @@ struct CodecQ4 : public CodecBase {
         }
       }
 
-      // Apply decoding scales
       for (int i = 0; i < 4; i++) {
         w[i] = packed_mul<half>(w[i], qs);
       }
@@ -169,27 +158,20 @@ struct CodecQ4 : public CodecBase {
   }
 };
 
-// Int8 symmetric quantization codec at TP4.
-// We quantize the FP16 data to block-scaled Int8 in blocks of 4 *
-// kThreadGroupSize.
+// Int8 symmetric quantization codec at TP4, block-scaled over 4 * kThreadGroupSize fp16 values.
 struct CodecQ8 : public CodecBase {
   static constexpr int kWorldSize = 4;
   // Atoms (16B) per thread in a block's tile, and the tile's bytes.
   static constexpr int kAtoms = 8;
   static constexpr int kTileSize = kBlockSize * kAtoms * sizeof(int32x4_t);
 
-  // Codec tile size process by this workgroup.
-  // Each threads processes a fragment of f16x8_t (16B),
-  // into a int8x8_t (8B) and a f16 scale shared among 32 values.
+  // Each thread encodes an f16x8_t (16B) into an int8x8_t (8B) and a f16 scale shared among 32 values.
   static constexpr int kRankAtoms = kAtoms / kWorldSize;
   static constexpr int kRankTileStride = 2176;
   static constexpr int kRankTransmittedTileSize = kRankTileStride * kRankAtoms;
   static_assert(kRankTransmittedTileSize % 16 == 0, "kRankTransmittedTileSize must be 16B aligned.");
 
-  // Total tile size for the collective communication.
   static constexpr int kTransmittedTileSize = kRankTransmittedTileSize * kWorldSize;
-
-  // Constants configuration
 
   // {-1/128.0h, -1/128.0h}, f16x2_t
   static constexpr int kScaleFactor = 0xA000A000;
@@ -217,18 +199,15 @@ struct CodecQ8 : public CodecBase {
     for (int k = 0; k < kRankAtoms; k++) {
       int32x4_t const atom = data[k];
 
-      // Compute the absolute maximum of the atom in the thread group
-      // In 2 blocks of values, upper/lower halves of the f16x2_t
+      // Absolute maximum over the thread group for each block: the upper and lower f16x2_t halves.
       int wblockmax = group_abs_max<half>(atom);
 
-      // Derive scales
       int decoding_scale;
       int encoding_scale;
       decoding_scale = packed_mul<half>(wblockmax, kScaleFactor);
       encoding_scale = packed_add<half>(decoding_scale, kScaleEpsilon);
       encoding_scale = packed_rcp<half>(encoding_scale);
 
-      // Apply scales to get quantized values
       int32x4_t w;
       for (int i = 0; i < 4; i++) {
         w[i] = packed_mul<half>(atom[i], encoding_scale);
@@ -314,7 +293,6 @@ struct CodecQ8 : public CodecBase {
         }
       }
 
-      // Apply decoding scales
       for (int i = 0; i < 4; i++) {
         w[i] = packed_mul<half>(w[i], qs);
       }
@@ -373,9 +351,9 @@ struct AllReduceTwoshot {
   __device__ static void
   run(half const* __restrict__ input,
       half* __restrict__ output,
-      uint32_t const N,            // number of elements
-      int const block,             // block index
-      int const rank,              // rank index
+      uint32_t const N,  // number of elements
+      int const block,
+      int const rank,
       uint8_t* const* peer,        // [kWorldSize] communication buffers, held in registers
       uint32_t const data_offset,  // offset to start of the data buffer
       uint32_t flag_color,
@@ -384,8 +362,6 @@ struct AllReduceTwoshot {
     uint8_t* rank_buffer = lane_peer(peer, rank);
     Codec codec(thread, rank);
     int block_id = blockIdx.x;
-    // --------------------------------------------------------
-    // Read input into registers
     int32x4_t tA[kAtoms];
 
     BufferResource src_buffer(const_cast<half*>(input), N * sizeof(half));
@@ -413,9 +389,7 @@ struct AllReduceTwoshot {
     uint32_t comm_flags0_offset = block_id * (kWorldSize * sizeof(uint32_t));
     uint32_t comm_flags1_offset = (data_offset / 2) + comm_flags0_offset;
 
-    // --------------------------------------------------------
-    // Phase-1A: Write segment data into the communication buffer of the target
-    // rank responsible for this segment.
+    // Phase-1A: Write each segment into the communication buffer of the rank responsible for it.
     for (int r = 0; r < kWorldSize; r++) {
       typename Codec::Packed packed[Codec::kRankAtoms];
       codec.encode(&tA[r * Codec::kRankAtoms], packed);
@@ -423,7 +397,6 @@ struct AllReduceTwoshot {
     }
     raise_flags(peer, comm_flags0_offset, rank, flag_color);
 
-    // --------------------------------------------------------
     // Phase-1B: Reduce the segment data from the communication buffers, in rank order.
     int32x4_t tR[Codec::kRankAtoms] = {};
     {
@@ -435,7 +408,7 @@ struct AllReduceTwoshot {
           flag_color,
           packed);
       for (int r = 0; r < kWorldSize; r++) {
-        // note: we reuse tA as temp buffer here
+        // tA is dead after Phase-1A, so it holds the decoded segment.
         codec.decode(packed[r], tA);
         for (int i = 0; i < Codec::kRankAtoms; i++) {
           packed_assign_add<half>(&tR[i], &tA[i]);
@@ -443,7 +416,7 @@ struct AllReduceTwoshot {
       }
     }
 
-    // Phase-2: Write the reduced segment to every other rank, encoded once.
+    // Phase-2: Write the reduced segment to every rank.
     {
       typename Codec::Packed packed[Codec::kRankAtoms];
       codec.encode(tR, packed);
@@ -463,13 +436,10 @@ struct AllReduceTwoshot {
           flag_color,
           packed);
       for (int r = 0; r < kWorldSize; r++) {
-        // Gather all reduced and final rank segments into tA.
         codec.decode(packed[r], &tA[r * Codec::kRankAtoms]);
       }
     }
 
-    // --------------------------------------------------------
-    // Write the result to output.
     BufferResource dst_buffer(output, N * sizeof(half));
     uint32_t dst_offset = block * kTileSize + thread * sizeof(int32x4_t);
 

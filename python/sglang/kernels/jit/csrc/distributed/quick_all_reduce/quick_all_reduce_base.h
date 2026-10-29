@@ -23,7 +23,6 @@ using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
 #error "QR_MAX_BLOCKS is set by the JIT loader"
 #endif
 
-// We use a workgroup of 256 threads
 static constexpr int kBlockSize = 256;
 static constexpr int kAtomStride = kBlockSize;
 
@@ -33,14 +32,11 @@ static constexpr int kMaxNumBlocks = QR_MAX_BLOCKS;
 // Standard CDNA wavefront size.
 static constexpr int kWavefront = 64;
 
-// 256 thread, 4 wavefronts.
 static dim3 constexpr kBlockTwoShot = {kWavefront, kBlockSize / kWavefront, 1};
 
-// Number of threads in a group for quantization
-// It corresponds to 32 F16 elements in quantization block
+// Threads in a quantization group; each of its block scales covers 32 fp16 values.
 static constexpr int kThreadGroupSize = 8;
 
-// Methods
 __quickreduce_device_inline__ __host__ unsigned long divceil(unsigned long x, unsigned long y) {
   return ((x + y - 1) / y);
 }
@@ -53,8 +49,7 @@ union BufferResource {
 
   int32x4_t descriptor;
   struct {
-    void* address;  // 8B, out of which first 48b is address, and 16b is stride
-    // (unused)
+    void* address;    // 8B: a 48b address and a 16b stride (unused)
     uint32_t range;   // Byte range for the buffer resource
     uint32_t config;  // Constant, DFMT=32b
   };
@@ -161,14 +156,13 @@ __quickreduce_device_inline__ int packed_rcp<half>(int a) {
   return __builtin_bit_cast(int, h2rcp(__builtin_bit_cast(half2, a)));
 }
 
-// changes dtype
 __quickreduce_device_inline__ float T2float_cast(half a) {
   return __half2float(a);
 }
 
 // Max and min over each 8-lane group, combined by packed_abs_max, in every lane of the group.
-// DPP lane moves (pairs, quads, then the two halves of each 8-lane half-row) instead of LDS
-// permutes; max/min are exact, so the result equals the AOT reduce-to-leader-and-broadcast.
+// DPP lane moves (pairs, quads, then the two halves of each 8-lane half-row); max and min are
+// exact, so the result equals the AOT reduce-to-leader-and-broadcast.
 template <typename T>
 __quickreduce_device_inline__ int group_abs_max(int32x4_t atom) {
   int a = packed_max<T>(atom[0], atom[1]);

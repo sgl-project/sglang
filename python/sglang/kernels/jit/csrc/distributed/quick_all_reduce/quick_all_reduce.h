@@ -1,5 +1,5 @@
 // JIT copy of sgl-kernel's kernels/aot/csrc/allreduce/quick_all_reduce.h: the same DeviceComms and
-// buffers, launching the restructured INT4 / INT8 TP4 two-shot of quick_all_reduce.cuh.
+// buffers, launching the INT4 / INT8 TP4 two-shot of quick_all_reduce.cuh.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -37,9 +37,7 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
   int block = blockIdx.x;
   int grid = gridDim.x;
 
-  // Read this block's counter from device memory and bump it here in the
-  // kernel. Keeping the value in device memory (instead of a host scalar
-  // baked into the launch) lets every CUDA-graph replay see a fresh color.
+  // Kept in device memory, not a launch argument, so every CUDA-graph replay sees a fresh color.
   uint32_t flag_color = d_flag_counters[blockIdx.x];
 
   // Loaded once, before any remote store: on CDNA one vmcnt covers loads and stores, so a pointer
@@ -89,28 +87,23 @@ struct DeviceComms {
     }
     // Allocate buffer size for worst case: F16 2-stage buffer.
     uint32_t flags_buffer_size = 2 * world_size * kMaxNumBlocks * sizeof(uint32_t);
-    // per communicator, not function-static: communicators may ask for different sizes
     int64_t data_buffer_size = 2 * this->kMaxProblemSize;
     int64_t total_buffer_size = flags_buffer_size + data_buffer_size;
     data_offset = flags_buffer_size;
     HIP_CHECK(hipExtMallocWithFlags((void**)&dbuffer, total_buffer_size, hipDeviceMallocUncached));
 
-    // Clear the flags buffer.
     HIP_CHECK(hipMemset(dbuffer, 0, flags_buffer_size));
 
-    // A per-block color counter that the kernel advances itself. Seed it with
-    // 1 rather than 0 so it never matches the freshly zeroed flags buffer.
+    // Seeded with 1 so the first color never matches the zeroed flags.
     HIP_CHECK(hipMalloc(&d_flag_counters, kMaxNumBlocks * sizeof(uint32_t)));
     {
       std::vector<uint32_t> init_color(kMaxNumBlocks, 1u);
       HIP_CHECK(hipMemcpy(d_flag_counters, init_color.data(), kMaxNumBlocks * sizeof(uint32_t), hipMemcpyHostToDevice));
     }
 
-    // Device-side list of IPC buffers.
     buffer_list.assign(world_size, nullptr);
     HIP_CHECK(hipMalloc(&dbuffer_list, world_size * sizeof(uint8_t*)));
 
-    // Create IPC handles for rank's communication buffer.
     all_buffer_ipc_handles.resize(world_size);
     HIP_CHECK(hipIpcGetMemHandle(&buffer_ipc_handle, dbuffer));
 
@@ -124,14 +117,13 @@ struct DeviceComms {
   }
 
   void destroy() {
-    // This buffer is created before `initialized` becomes true, so release it
-    // on its own check to keep a half-finished init from leaking it.
+    // Allocated before initialized is set, so freed on its own check after a failed init.
     if (d_flag_counters) {
       HIP_CHECK(hipFree(d_flag_counters));
       d_flag_counters = nullptr;
     }
     if (initialized) {
-      // the host copy: dbuffer_list is device memory, and a peer may never have been opened
+      // The host copy: dbuffer_list is device memory, and a peer may never have been opened.
       for (int i = 0; i < world_size; i++) {
         if (i != rank && buffer_list[i] != nullptr) {
           HIP_CHECK(hipIpcCloseMemHandle(buffer_list[i]));
@@ -151,8 +143,6 @@ struct DeviceComms {
       all_buffer_ipc_handles[i] = ipc_handles[i];
     }
 
-    // Open device memory access to the IPC communication buffers.
-    // Note: For our own rank, we do not need to open a handle.
     for (int i = 0; i < world_size; i++) {
       if (i != rank) {
         HIP_CHECK(
@@ -187,7 +177,6 @@ struct DeviceComms {
         d_flag_counters,
         this->kMaxProblemSize);
     HIP_CHECK(hipGetLastError());
-    // The color now advances on-device inside the kernel; no host-side bump.
   }
 };
 
