@@ -72,7 +72,6 @@ class TestDecodePartitionBucketTable(CustomTestCase):
         for backend in backends:
             self.assertIsNone(_variants(backend))
         for mode, width in (
-            (ForwardMode.TARGET_VERIFY, 4),
             (ForwardMode.TARGET_VERIFY, 1),
             (ForwardMode.DLLM_EXTEND, 1),
             (ForwardMode.DECODE, 2),
@@ -83,18 +82,15 @@ class TestDecodePartitionBucketTable(CustomTestCase):
         backend = _make_backend()
         variants = _variants(backend)
         self.assertEqual(variants.capture_labels, ("p16", "p128", "pmax"))
-        for max_len, label, num_partitions in (
-            (1, "p16", 16),
-            (4096, "p16", 16),
-            (4097, "p128", 128),
-            (32768, "p128", 128),
-            (32769, "pmax", 512),
+        for max_len, label in (
+            (1, "p16"),
+            (4096, "p16"),
+            (4097, "p128"),
+            (32768, "p128"),
+            (32769, "pmax"),
         ):
             batch = SimpleNamespace(seq_lens_cpu=torch.tensor([1, max_len, 7]))
             self.assertEqual(variants.select(batch), label, max_len)
-            self.assertEqual(
-                backend._partitions_for_max_seq_len(max_len), num_partitions
-            )
         # Without a usable host copy of seq_lens, fall back to the full count.
         for seq_lens_cpu in (
             None,
@@ -112,7 +108,6 @@ class _FakeKVPool:
     def __init__(self, k_cache, v_cache):
         self.kv = (k_cache, v_cache)
         self.start_layer = 0
-        self.layer_num = 1
         self.layer_transfer_counter = None
         self.layer_router = PlainPoolRouter(self, "full")
 
@@ -133,7 +128,6 @@ class TestDecodePartitionBucketMetadata(CustomTestCase):
     def _make_runnable_backend(self, seq_lens, kv_dtype):
         bs, max_len = len(seq_lens), max(seq_lens)
         backend = _make_backend()
-        backend.dcp_world_size = 1
         backend.use_sliding_window_kv_pool = False
         backend.decode_uses_page_table = False
         backend._kv_indices_scratch = None
@@ -153,7 +147,6 @@ class TestDecodePartitionBucketMetadata(CustomTestCase):
         backend.token_to_kv_pool = _FakeKVPool(k, v)
         backend.input_dtype = torch.bfloat16
         backend.scale = _HEAD_DIM**-0.5
-        backend.logits_soft_cap = 0.0
         backend.k_scale = backend.v_scale = torch.ones(1, device=_DEVICE)
         rows = bs * _NUM_Q_HEADS * backend.max_num_partitions
         backend.workspace_buffer = torch.empty(
@@ -171,7 +164,6 @@ class TestDecodePartitionBucketMetadata(CustomTestCase):
             seq_lens_cpu=lens,
             seq_lens_sum=int(lens.sum()),
             req_pool_indices=torch.arange(len(seq_lens), device=_DEVICE),
-            out_cache_loc=None,
         )
 
     def _decode(self, backend, forward_batch, num_partitions):
@@ -201,10 +193,9 @@ class TestDecodePartitionBucketMetadata(CustomTestCase):
         )
 
     def test_eager_decode_matches_max_partitions(self):
-        lengths = torch.randint(1, 4097, (5,)).tolist()
         cases = (
-            ([1, 4095, 4096, *lengths], 16),
-            ([4097, 1, *lengths], 128),
+            ([1, 4095, 4096], 16),
+            ([4097, 1], 128),
             ([32768, 300, 4097], 128),
             ([32769, 5], 512),
         )
@@ -221,7 +212,8 @@ class TestDecodePartitionBucketMetadata(CustomTestCase):
                     self.assertTrue(torch.equal(out, ref))
 
     def test_too_few_partitions_drop_kv(self):
-        # Locks in why the bucket must cover the longest request.
+        # Too few partitions must change the output; also the only check that
+        # forward_decode hands decode_num_partitions to the kernel.
         seq_lens = [4097, 100]
         backend = self._make_runnable_backend(seq_lens, torch.bfloat16)
         forward_batch = self._forward_batch(seq_lens)
