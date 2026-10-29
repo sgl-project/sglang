@@ -393,7 +393,7 @@ class SanaVideoTransformerBlock(nn.Module):
         ).unbind(dim=2)
 
         norm_hidden_states = sana_ln_modulate(
-            self.norm1, hidden_states, scale_msa, shift_msa
+            self.norm1, hidden_states, scale_msa, shift_msa, allow_eager=True
         )
         hidden_states = sana_residual_gate_add(
             hidden_states,
@@ -405,7 +405,7 @@ class SanaVideoTransformerBlock(nn.Module):
         )
 
         norm_hidden_states = sana_ln_modulate(
-            self.norm2, hidden_states, scale_mlp, shift_mlp
+            self.norm2, hidden_states, scale_mlp, shift_mlp, allow_eager=True
         )
         norm_hidden_states = norm_hidden_states.unflatten(1, (frames, height, width))
         ff_output = self.ff(norm_hidden_states).flatten(1, 3)
@@ -426,7 +426,9 @@ class SanaVideoModulatedNorm(nn.Module):
         shift, scale = (
             scale_shift_table[None, None] + embedded_timestep[:, :, None]
         ).unbind(dim=2)
-        return sana_ln_modulate(self.norm, hidden_states, scale, shift)
+        return sana_ln_modulate(
+            self.norm, hidden_states, scale, shift, allow_eager=True
+        )
 
 
 class SanaVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
