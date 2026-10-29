@@ -301,7 +301,8 @@ def _raise_failed_ranges(failed: Sequence[tuple[str, int, int]]) -> NoReturn:
     """``failed`` holds (part key, get_into_ranges result, size) of each failed range.
 
     OutputStore already checked each range against its field and the destination, so
-    -600 here is not the size mismatch ``_raise_failed_reads`` reports for it.
+    -600 here is Mooncake rejecting the range, for example a stored part shorter than
+    its ref says; it is not the oversized part ``_raise_failed_reads`` reports.
     """
     for key, got, _ in failed:
         if got == _OBJECT_NOT_FOUND:

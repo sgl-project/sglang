@@ -95,8 +95,9 @@ class OutputStore:
         """Read byte ranges of stored fields into ``into``, memory the caller owns.
 
         Only identity-coded fields. Fails before reading when ``into`` is read-only, a
-        field is missing or not identity coded, or a range falls outside its field or
-        ``into``.
+        field is missing or not identity coded, a range is empty, or a range falls
+        outside its field or ``into``. A read that fails after starting may leave
+        ``into`` partly written.
         """
         if not reads:
             return
