@@ -78,17 +78,17 @@ class KVArena:
         backed_after_capture: bool = False,
     ):
         names = [b.name for b in bands]
-        assert len(bands) >= 2, f"an arena needs >= 2 bands; got {names}"
+        assert bands, "an arena needs at least one band"
         assert len(set(names)) == len(names), f"band names must be unique: {names}"
         up = [b for b in bands if b.grow_direction == "up"]
         down = [b for b in bands if b.grow_direction == "down"]
-        assert len(up) == 1 and len(down) == 1, (
+        assert len(down) == 1 and len(up) == (0 if len(bands) == 1 else 1), (
             "an arena needs exactly one grow-up and one grow-down end band; got "
             f"{[b.grow_direction for b in bands]}"
         )
         floats = [b for b in bands if b.grow_direction == "float"]
         # Low byte end -> high: the grow-up end, the floats, the grow-down end.
-        self.bands: Tuple[ArenaBand, ...] = (up[0], *floats, down[0])
+        self.bands: Tuple[ArenaBand, ...] = (*up, *floats, down[0])
         self._by_name: Dict[str, ArenaBand] = {b.name: b for b in self.bands}
         self.device = device
         self.total_bytes = total_bytes

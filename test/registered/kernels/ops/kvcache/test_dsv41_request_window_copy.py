@@ -1,16 +1,16 @@
 """Request-window copies preserve data, scales, padding and graph addresses."""
 
 import unittest
-from types import SimpleNamespace
 
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.mem_cache.dsv41_request_window import (
-    RequestWindow,
+    RequestWindowSpec,
     copy_packed_tokens,
     window_layout,
 )
+from sglang.srt.mem_cache.kv.memory.request_window import RequestWindowMemory
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -110,29 +110,16 @@ class TestRequestWindowCopy(CustomTestCase):
     def _check_commit(self, fmt, lens, graph):
         page, capacity = 64, 256
 
-        def factory(size, layers):
-            width = fmt.page_bytes(page)
-            return SimpleNamespace(
-                size=size,
-                kv_layout=fmt,
-                kv_buffer=[
-                    torch.empty(
-                        ((size + page - 1) // page, width + 64),
-                        dtype=torch.uint8,
-                        device="cuda",
-                    )[:, :width]
-                    for _ in range(layers)
-                ],
-            )
-
-        window = RequestWindow(
-            factory,
+        spec = RequestWindowSpec.create(
             num_slots=8,
             layers=2,
             page_size=page,
             capacity=capacity,
             workspace_rows=sum(lens) + len(lens) * 128,
+            kv_layout=fmt,
         )
+        memory = RequestWindowMemory(spec, dtype=torch.uint8, device="cuda")
+        window = memory.view
 
         def metadata(lengths, shift):
             req = torch.cat(

@@ -17,7 +17,6 @@ from sglang.srt.mem_cache.layout.fused_draft import DraftStateRegion
 from sglang.srt.mem_cache.layout.token_major import (
     align_entry_bytes,
     align_part_offset,
-    build_mamba_entry_views,
 )
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.platforms import current_platform
@@ -134,16 +133,15 @@ class MambaSubPoolSpec(SubPoolSpec):
         assert isinstance(region, DraftStateRegion), (
             f"sub-pool {self.name!r} carries no fused draft state region"
         )
-        return build_mamba_entry_views(
+        views = region.entry_layout().views(
             arena.raw,
-            layer_num=region.lane_num,
-            conv_state_shapes=region.state.conv_state_shapes,
-            conv_dtype=region.state.conv_dtype,
-            temporal_state_shape=region.state.temporal_state_shape,
-            temporal_dtype=region.state.temporal_dtype,
-            max_slots=arena.extent_entries(self.name),
+            arena.extent_entries(self.name),
             entry_bytes=self.entry_bytes(),
             offset_bytes=self.draft_offset_in_entry(),
+        )
+        return (
+            [views[f"conv.{i}"] for i in range(len(region.state.conv_state_shapes))],
+            views["temporal"],
         )
 
 

@@ -206,11 +206,6 @@ def build_kv_storage(
     owner = plan.owner()
     window = plan.of_lifetime(WindowLifetime)
     state = plan.of_lifetime(StateLifetime)
-    if len(plan.sub_pools) < 2:
-        raise ValueError(
-            "--enable-unified-memory has no pool stack for sub-pools "
-            f"{[s.name for s in plan.sub_pools]}"
-        )
     for s in plan.sub_pools:
         expected = None if plan.fused_draft is None else plan.fused_draft.region(s.name)
         assert s.spec.draft_region is expected, (

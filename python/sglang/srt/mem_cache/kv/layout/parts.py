@@ -23,14 +23,22 @@ class TensorEntryLayout:
         alignment = max(p.dtype.itemsize for p in self.parts)
         self.entry_bytes = -(-offset // alignment) * alignment
 
-    def views(self, raw: torch.Tensor, rows: int, *, entry_bytes: int | None = None):
+    def views(
+        self,
+        raw: torch.Tensor,
+        rows: int,
+        *,
+        entry_bytes: int | None = None,
+        offset_bytes: int = 0,
+    ):
         stride_bytes = self.entry_bytes if entry_bytes is None else entry_bytes
-        if stride_bytes < self.entry_bytes or rows * stride_bytes > raw.numel():
+        end = offset_bytes + max(0, rows - 1) * stride_bytes + self.entry_bytes
+        if stride_bytes < self.entry_bytes or end > raw.numel():
             raise ValueError("entry parts exceed their backing")
         views = {}
         for part in self.parts:
             itemsize = part.dtype.itemsize
-            if stride_bytes % itemsize:
+            if stride_bytes % itemsize or offset_bytes % itemsize:
                 raise ValueError(f"entry stride is not aligned for {part.name!r}")
             inner_strides = tuple(
                 math.prod(part.shape[i + 1 :]) for i in range(len(part.shape))
@@ -42,6 +50,6 @@ class TensorEntryLayout:
                 raw[: raw.numel() // itemsize * itemsize].view(part.dtype),
                 size=part.tensor_shape(rows),
                 stride=strides,
-                storage_offset=self.offsets[part.name] // itemsize,
+                storage_offset=(offset_bytes + self.offsets[part.name]) // itemsize,
             )
         return views

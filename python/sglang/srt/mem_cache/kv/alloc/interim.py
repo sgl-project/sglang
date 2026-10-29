@@ -146,8 +146,8 @@ class _InterimPolicy:
         raise NotImplementedError
 
 
-class _TokenAndSlotEndsPolicy(_InterimPolicy):
-    """A token end (the owner) and a slot end (per-request state)."""
+class _OwnerEndPolicy(_InterimPolicy):
+    """The token owner, optionally opposite a per-request state end."""
 
     prices_before_take = False
 
@@ -156,7 +156,7 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
 
     @property
     def unit_name(self) -> str:
-        return "token-and-slot ends"
+        return "owner end with optional state"
 
     def size(self, c: ChainAllocator) -> int:
         # TOKENS. MUST use the SAME available view as `available_size()`, so the
@@ -179,12 +179,12 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
         return (c.full_attn_allocator.max_slots - 1) * get_parallel().attn_dcp_size
 
     def mamba_full_cache_donor(self, c: ChainAllocator):
-        return c
+        return c if c.roles.state is not None else None
 
     def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
         return {
             c.roles.owner: (c.size, c.available_size()),
-            **_state_usage(c),
+            **(_state_usage(c) if c.roles.state is not None else {}),
         }
 
     def prepare_mamba_allocation(self, c: ChainAllocator, target_size: int) -> None:
@@ -197,7 +197,10 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
 
     def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
         return ChainAdmissionRules(
-            window="none", state_slot_cost=self._state_slot_cost(c)
+            window="none",
+            state_slot_cost=self._state_slot_cost(c)
+            if c.roles.state is not None
+            else 0,
         )
 
     def _state_slot_cost(self, c: ChainAllocator) -> int:
@@ -1032,8 +1035,8 @@ def interim_policy_for(
             full_max_total_num_tokens=full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
         )
-    if not has_window and has_slots and not has_float:
-        return _TokenAndSlotEndsPolicy(c)
+    if not has_window and not has_float:
+        return _OwnerEndPolicy(c)
     raise ValueError(
         "unified memory has no capacity policy for a chain of "
         f"{[band.sub_pool_name for band in c.bands]}"

@@ -92,11 +92,11 @@ class DenseEntryLayout(msgspec.Struct, frozen=True, kw_only=True):
             assert (
                 p.offset_bytes % ROW_ALIGN_BYTES == 0
                 and p.layer_stride_bytes % ROW_ALIGN_BYTES == 0
-                and row % ROW_ALIGN_BYTES == 0
+                and row % p.dtype.itemsize == 0
             ), (
                 f"part {p.name!r}: offset {p.offset_bytes}, layer stride "
-                f"{p.layer_stride_bytes} and row {row} B must all be multiples of "
-                f"{ROW_ALIGN_BYTES} (vector stores)"
+                f"{p.layer_stride_bytes} must be {ROW_ALIGN_BYTES}-byte aligned; "
+                f"the {row}-byte payload must fit its dtype"
             )
             for l in range(p.layer_num):
                 lo = p.layer_offset_bytes(l)

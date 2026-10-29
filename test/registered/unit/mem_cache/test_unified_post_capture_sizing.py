@@ -29,7 +29,13 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
+)
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.unified_allocator_fixtures import (
@@ -44,7 +50,9 @@ _FINAL_BYTES = 16 << 20
 _PAGE_SIZE = 4
 
 
-def _bundle(*, total_bytes: int, post_capture_active: bool, chain="swa"):
+def _bundle(
+    *, total_bytes: int, post_capture_active: bool, chain="swa", fused_draft=None
+):
     has_state = chain in ("state", "tri")
     has_window = chain in ("swa", "tri")
     return build_test_unified_pools(
@@ -72,6 +80,7 @@ def _bundle(*, total_bytes: int, post_capture_active: bool, chain="swa"):
         speculative_num_draft_tokens=2 if has_state else None,
         full_attention_layer_ids=[0, 2],
         total_bytes=total_bytes,
+        fused_draft=fused_draft,
         enable_memory_saver=False,
         post_capture_active=post_capture_active,
         need_sort=False,
@@ -194,6 +203,7 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
 
     def test_every_chain_retains_captured_and_fixed_addresses(self):
         for chain, dcp in (
+            ("full", 1),
             ("swa", 1),
             ("state", 1),
             ("tri", 1),
@@ -242,6 +252,58 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
                     )
                     view = allocator.views[band.sub_pool_name]
                     self.assertEqual(view.size, band.max_slots - band.pool_page_size)
+
+    def test_short_draft_rows_store_and_replay_without_touching_host(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                region = DenseDraftRegion(
+                    lane_num=2, head_num=1, head_dim=3, v_head_dim=5, store_dtype=dtype
+                )
+                bundle = _bundle(
+                    total_bytes=1 << 20,
+                    post_capture_active=False,
+                    fused_draft=FusedDraftPlacement.from_counts(
+                        counts={"full": [2]}, regions={"full": region}
+                    ),
+                )
+                arena = bundle.arena
+                spec = bundle.storage.plan.owner().spec
+                view = DraftMHAView(
+                    arena=arena,
+                    host_spec=spec,
+                    layer_lanes={0: 0, 1: 1},
+                    page_size=_PAGE_SIZE,
+                )
+                arena.raw.fill_(11)
+                before = arena.raw.clone()
+                loc = torch.tensor([8, 13], device="cuda", dtype=torch.int64)
+                k = (
+                    torch.arange(6, device="cuda", dtype=torch.float32)
+                    .view(2, 1, 3)
+                    .to(dtype)
+                )
+                v = (
+                    torch.arange(10, device="cuda", dtype=torch.float32)
+                    .view(2, 1, 5)
+                    .to(dtype)
+                )
+                layer = SimpleNamespace(layer_id=1)
+                view.set_kv_buffer(layer, KVWriteLoc(loc, physical=True), k, v)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    view.set_kv_buffer(layer, KVWriteLoc(loc, physical=True), k, v)
+                k.add_(3)
+                v.add_(5)
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(view.k_buffer[1][loc], k)
+                torch.testing.assert_close(view.v_buffer[1][loc], v)
+                changed = torch.zeros_like(arena.raw, dtype=torch.bool)
+                for part in region.parts(spec.draft_offset_in_entry()):
+                    for row in (8, 13):
+                        lo = row * spec.entry_bytes() + part.layer_offset_bytes(1)
+                        changed[lo : lo + part.row_bytes()] = True
+                self.assertTrue(torch.equal(arena.raw[~changed], before[~changed]))
 
     def test_sizing_contract_is_enforced(self):
         bundle = self._post_capture_bundle()

@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import msgspec
 import torch
 
-from sglang.srt.mem_cache.layout.token_major import ROW_ALIGN_BYTES, DensePart
+from sglang.srt.mem_cache.layout.token_major import DensePart, align_part_offset
 
 LAYER_FULL = "full"
 LAYER_WINDOW = "window"
@@ -86,12 +86,17 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
 
     def entry_bytes(self) -> int:
         """Draft bytes per slot, before the host entry's alignment."""
-        return self.lane_num * (self.k_row_bytes() + self.v_row_bytes())
+        return self.lane_num * (
+            align_part_offset(self.k_row_bytes())
+            + align_part_offset(self.v_row_bytes())
+        )
 
     def parts(self, offset_bytes: int) -> Tuple[DensePart, DensePart]:
         """The draft's K and V parts, laid out from ``offset_bytes`` inside
         the host entry."""
-        layer_stride = self.k_row_bytes() + self.v_row_bytes()
+        layer_stride = align_part_offset(self.k_row_bytes()) + align_part_offset(
+            self.v_row_bytes()
+        )
         return (
             DensePart(
                 name="draft_k",
@@ -103,7 +108,7 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
             ),
             DensePart(
                 name="draft_v",
-                offset_bytes=offset_bytes + self.k_row_bytes(),
+                offset_bytes=offset_bytes + align_part_offset(self.k_row_bytes()),
                 layer_stride_bytes=layer_stride,
                 layer_num=self.lane_num,
                 row_shape=(self.head_num, self.resolved_v_head_dim()),
@@ -159,7 +164,32 @@ class DraftStateRegion(msgspec.Struct, frozen=True, kw_only=True):
 
     def entry_bytes(self) -> int:
         """Draft state bytes per slot, before the host entry's alignment."""
-        return self.lane_num * self.state.layer_bytes()
+        return self.entry_layout().entry_bytes
+
+    def entry_layout(self):
+        from sglang.srt.mem_cache.kv.decl import TensorPartDecl
+        from sglang.srt.mem_cache.kv.layout.parts import TensorEntryLayout
+
+        layers = tuple(range(self.lane_num))
+        return TensorEntryLayout(
+            (
+                *(
+                    TensorPartDecl(
+                        name=f"conv.{i}",
+                        shape=shape,
+                        dtype=self.state.conv_dtype,
+                        layer_ids=layers,
+                    )
+                    for i, shape in enumerate(self.state.conv_state_shapes)
+                ),
+                TensorPartDecl(
+                    name="temporal",
+                    shape=self.state.temporal_state_shape,
+                    dtype=self.state.temporal_dtype,
+                    layer_ids=layers,
+                ),
+            )
+        )
 
 
 DraftRegion = Union[DenseDraftRegion, DraftStateRegion]
@@ -561,20 +591,6 @@ def _runner_layer_counts(
     }, None
 
 
-def _kv_rows_declined(geometry: Any, *, store_dtype: torch.dtype) -> Optional[str]:
-    """Why one kind's K/V rows cannot be fused entry parts, or None."""
-    if not isinstance(geometry, DraftKVGeometry):
-        return None
-    for dim in (geometry.head_dim, geometry.v_head_dim):
-        row_bytes = geometry.head_num * dim * store_dtype.itemsize
-        if row_bytes % ROW_ALIGN_BYTES:
-            return (
-                f"the draft's K/V rows are {row_bytes} B, not a multiple of "
-                f"the {ROW_ALIGN_BYTES}-B row alignment a fused entry part needs"
-            )
-    return None
-
-
 def _fold_refused(
     profile: DraftKVProfile, *, kind: str, into: HostKind
 ) -> Optional[str]:
@@ -602,7 +618,7 @@ def place_fused_draft(
     """Assign every draft layer of every runner to a host sub-pool through the
     registry: a layer kind goes to the host that serves it, else to that
     host's fallback under the fold rule. A kind no host takes declines the
-    whole draft, as do rows off the entry-part alignment."""
+    whole draft. Dense parts reserve padding between their row payloads."""
     counts, reason = _runner_layer_counts(profile, num_runners)
     if counts is None:
         return FusedDraftDecision(declined=reason)
@@ -611,9 +627,6 @@ def place_fused_draft(
         host = host_for(kind)
         if host is None:
             return FusedDraftDecision(declined=f"{what}: no host kind serves them")
-        reason = _kv_rows_declined(layers.geometry, store_dtype=store_dtype)
-        if reason is not None:
-            return FusedDraftDecision(declined=reason)
 
     host_counts: Dict[str, List[int]] = {}
     host_layers: Dict[str, DraftLayerSet] = {}

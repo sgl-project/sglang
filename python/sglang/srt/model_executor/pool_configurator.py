@@ -1237,6 +1237,41 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 * draft_ring_layers
                 * self.kv_bytes
             )
+            # Keep the separate metadata/scratch reserve, but bound the budget
+            # below by the exact packed pages, tags and capture workspace.
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                select_dsv4_kv_layout,
+            )
+            from sglang.srt.mem_cache.dsv41_request_window import (
+                RequestWindowSpec,
+                request_window_workspace_rows,
+            )
+
+            request_slots = self._get_num_req_slots(
+                self.requested_max_running_requests_per_worker
+            )
+            window_layout, _ = select_dsv4_kv_layout()
+            window_spec = RequestWindowSpec.create(
+                num_slots=request_slots,
+                layers=layers,
+                page_size=self.page_size,
+                capacity=self.sliding_window_size
+                + self.online_c128_mtp_max_draft_tokens,
+                workspace_rows=request_window_workspace_rows(
+                    request_slots,
+                    self.sliding_window_size,
+                    self.online_c128_mtp_max_draft_tokens,
+                ),
+                kv_layout=window_layout,
+            )
+            draft_ring_bytes = (
+                (request_slots * draft_ring_size + self.page_size)
+                * draft_ring_layers
+                * self.kv_bytes
+            )
+            self.request_window_bytes = max(
+                self.request_window_bytes, window_spec.nbytes + draft_ring_bytes
+            )
             if not self.paged_draft_layers:
                 self.swa_ratio = 0
         self.swa_prefix_tails = self._resolve_swa_prefix_tails()

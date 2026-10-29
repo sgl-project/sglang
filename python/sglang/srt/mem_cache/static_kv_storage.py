@@ -588,7 +588,7 @@ class StaticKVStorage:
             return states.owner_view
         return states.views[sub_pool]()
 
-    def regions(self, sub_pool: str) -> Region:
+    def regions(self, sub_pool: str, *, part: Optional[str] = None) -> Region:
         if sub_pool == self.owner:
             if self._owner_region is None:
                 self._owner_region = _static_owner_region(self._allocator.get_kvcache())

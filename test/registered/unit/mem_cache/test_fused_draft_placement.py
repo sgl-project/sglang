@@ -260,11 +260,12 @@ class TestPlaceFusedDraft(CustomTestCase):
                 self.assertIsNone(decision.placement)
                 self.assertIn(f"1 {noun} layer(s)", decision.declined)
 
-    def test_misaligned_rows_decline(self):
-        # 4 heads x 5 dims x 2 B = 40 B: not a 16-B-aligned entry part.
-        decision = _place(_profile(head_dim=5, v_head_dim=5))
-        self.assertIsNone(decision.placement)
-        self.assertIn("40 B", decision.declined)
+    def test_short_rows_reserve_padding_between_parts(self):
+        region = _place(_profile(head_dim=5, v_head_dim=5)).placement.region("full")
+        self.assertEqual(region.entry_bytes(), 96)
+        k, v = region.parts(64)
+        self.assertEqual((k.row_bytes(), v.row_bytes()), (40, 40))
+        self.assertEqual((k.offset_bytes, v.offset_bytes), (64, 112))
 
     def test_asymmetric_rows_fuse_with_their_v_width(self):
         placement = _place(_profile(head_dim=64, v_head_dim=32)).placement
@@ -272,12 +273,9 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertEqual(placement.region("full").resolved_v_head_dim(), 32)
         self.assertEqual(placement.region("full").entry_bytes(), 4 * (64 + 32) * 2)
 
-    def test_a_misaligned_v_row_declines(self):
-        # K rows are 4 x 64 x 2 B = 512 B; V rows 4 x 5 x 2 B = 40 B are not a
-        # 16-B-aligned entry part.
-        decision = _place(_profile(head_dim=64, v_head_dim=5))
-        self.assertIsNone(decision.placement)
-        self.assertIn("40 B", decision.declined)
+    def test_short_v_rows_have_their_own_padding(self):
+        region = _place(_profile(head_dim=64, v_head_dim=5)).placement.region("full")
+        self.assertEqual(region.entry_bytes(), 512 + 48)
 
     def test_region_carries_the_profile_geometry(self):
         placement = _place(_profile()).placement
@@ -513,7 +511,10 @@ class TestMambaHostPricing(CustomTestCase):
 
     def test_a_mamba_region_prices_this_runners_state_layers(self):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        self.enterContext(published_topology())
         cfg.sliding_window_size = None
+        cfg.hybrid_gdn_config = None
+        cfg.hybrid_kda_config = None
         self.enterContext(patch.object(kcc, "mamba_cache_chunk_size", return_value=64))
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = False
@@ -527,8 +528,11 @@ class TestMambaHostPricing(CustomTestCase):
             full_attention_layer_ids=[4],
             mamba2_cache_params=SimpleNamespace(
                 layers=[0, 1, 2, 3],
-                shape=SimpleNamespace(conv=[(2, 2)], temporal=(2, 2)),
+                shape=SimpleNamespace(
+                    conv=[(2, 2)], temporal=(2, 2), num_k_heads_per_tp=2
+                ),
                 dtype=SimpleNamespace(conv=_DTYPE, temporal=_DTYPE),
+                is_kda=False,
             ),
         )
         state = DraftStateRegion(
