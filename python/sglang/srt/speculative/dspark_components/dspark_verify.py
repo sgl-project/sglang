@@ -190,6 +190,7 @@ class TargetVerifyExecutor:
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         simulate_bonus_sampling_info=None,
+        compact_padding: bool = False,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
@@ -214,6 +215,7 @@ class TargetVerifyExecutor:
             fused_argmax=self._fused_argmax,
             block_verification=self._block_verification,
             rejection_noise=self._rejection_noise,
+            compact_padding=compact_padding,
         )
         greedy_bonus = simulate_bonus_sampling_info is None and (
             sampling_info is None or sampling_info.is_all_greedy
@@ -1293,6 +1295,17 @@ def _draft_probs(draft_block: DraftBlockResult, vocab: int, device) -> torch.Ten
     return draft_probs
 
 
+def _may_have_padding_rows(
+    layout: Optional[RaggedVerifyLayout], verify_num_draft_tokens: int
+) -> bool:
+    # Host-side lengths avoid a sync; without them, assume padding.
+    if layout is None:
+        return False
+    if layout.verify_lens_cpu is None:
+        return True
+    return min(layout.verify_lens_cpu) < verify_num_draft_tokens
+
+
 def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
@@ -1306,6 +1319,7 @@ def accept_draft_tokens(
     fused_argmax: bool = False,
     block_verification: bool = False,
     rejection_noise: Optional[RejectionNoise] = None,
+    compact_padding: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -1352,6 +1366,13 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
         )
     else:
+        padding_verify_lens = (
+            cutoff_verify_lens
+            if compact_padding
+            and verify_logits_adjustments_are_noop(sampling_info)
+            and _may_have_padding_rows(cutoff_layout, verify_num_draft_tokens)
+            else None
+        )
         sampled = AcceptSampling.execute(
             candidates=candidates,
             target_logits=target_logits,
@@ -1364,6 +1385,7 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             block_verification=block_verification,
+            padding_verify_lens=padding_verify_lens,
         )
     if not sampling_info.is_any_greedy:
         return sampled
