@@ -39,20 +39,27 @@ _NPU_ARCH35_KV_TILE_SIZE = 64
 _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
 
 
-def _sparse_attn_ops():
+def _sparse_attn_ops(is_dspark=False):
     """(metadata op, attention op) for the DSV4 shared-KV sparse attention.
 
     A5 reads a quantized KV cache, which is a different kernel rather than a
     flag on the pre-A5 one.
     """
     if is_npu_arch35():
+        if is_dspark:
+            return (
+                torch.ops.npu.kv_quant_sparse_attn_sharedkv_metadata_host,
+                torch.ops.npu.kv_quant_sparse_attn_sharedkv,
+            )
         return (
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata,
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv,
         )
     return (
         torch.ops.custom.npu_sparse_attn_sharedkv_metadata,
-        torch.ops.custom.npu_sparse_attn_sharedkv,
+        torch.ops.custom.npu_sparse_attn_sharedkv
+        if not is_dspark
+        else torch.ops.npu.sparse_attn_sharedkv,
     )
 
 
@@ -2004,13 +2011,27 @@ class DeepseekV4AscendAttnBackend(
         c1a_kwargs = base_kwargs | common
         if self._is_dspark_draft_worker:
             cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
-            if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
+            seq_kv_cpu = fm.seq_lens_cpu_int
+            if (
+                cu_q_cpu is None
+                or seq_kv_cpu is None
+                or cu_q_cpu.device.type != "cpu"
+                or seq_kv_cpu.device.type != "cpu"
+            ):
+                raise RuntimeError(
+                    "DSpArk host metadata requires CPU query and KV length mirrors"
+                )
+            if cu_q_cpu.numel() > bs + 1:
                 cu_q_cpu = cu_q_cpu[: bs + 1]
-            host_inputs = {"seqused_kv": fm.seq_lens_cpu_int[:bs].int()}
-            if cu_q_cpu is not None:
-                host_inputs["cu_seqlens_q"] = cu_q_cpu
+            host_inputs = {
+                "seqused_kv": seq_kv_cpu[:bs].to(dtype=torch.int32).contiguous(),
+                "cu_seqlens_q": cu_q_cpu.to(dtype=torch.int32).contiguous(),
+            }
             c1a_kwargs = c1a_kwargs | host_inputs
-            metadata_op = torch.ops.npu.sparse_attn_sharedkv_metadata_host
+            if is_npu_arch35():
+                metadata_op, _ = _sparse_attn_ops(is_dspark=True)
+            else:
+                metadata_op = torch.ops.npu.sparse_attn_sharedkv_metadata_host
         else:
             c1a_kwargs = c1a_kwargs | {
                 "cu_seqlens_q": actual_seq_lengths_q_pa,
@@ -2121,14 +2142,42 @@ class DeepseekV4AscendAttnBackend(
             softmax_scale=layer.scaling,
             cmp_ratio=1,
         )
-        _, attn_op = _sparse_attn_ops()
+        _, attn_op = _sparse_attn_ops(self._is_dspark_draft_worker)
         if self._is_dspark_draft_worker:
             attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
-            attn_op = torch.ops.npu.sparse_attn_sharedkv
         ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
+        if self._is_dspark_draft_worker and is_npu_arch35():
+            if (
+                q_arg.dtype != torch.bfloat16
+                or q_arg.ndim != 3
+                or q_arg.shape[1] not in (64, 128)
+                or q_arg.shape[2] != 512
+            ):
+                raise RuntimeError(
+                    "DSpArk A5 sparse attention requires BF16 TND queries with "
+                    "64 or 128 heads and head dimension 512"
+                )
+            if ori_kv.dtype != torch.float8_e4m3fn or ori_kv.shape[-1] != 640:
+                raise RuntimeError(
+                    "DSpArk A5 sparse attention requires packed FP8 KV rows of 640 bytes"
+                )
+            if (
+                attn_sink is None
+                or attn_sink.dtype != torch.float32
+                or attn_sink.numel() != q_arg.shape[1]
+            ):
+                raise RuntimeError(
+                    "DSpArk A5 sparse attention requires one FP32 sink per query head"
+                )
+            c1a_metadata = fm.kernel_metadata["c1a_metadata"]
+            if c1a_metadata.dtype != torch.int32 or c1a_metadata.numel() != 1024:
+                raise RuntimeError(
+                    "DSpArk A5 sparse attention requires int32[1024] metadata"
+                )
+            q_arg = q_arg.contiguous()
         out, _ = attn_op(q_arg, **attn_kwargs)
         return out
 
