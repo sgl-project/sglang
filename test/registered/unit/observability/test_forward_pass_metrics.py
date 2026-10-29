@@ -7,6 +7,7 @@ import math
 import queue
 import types
 import unittest
+from array import array
 from collections import deque
 from contextlib import nullcontext
 from functools import partial
@@ -19,7 +20,7 @@ import torch
 
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -45,6 +46,9 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
 )
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval, device_timer_ctx
 from sglang.test.test_utils import CustomTestCase, enter_scope
@@ -172,6 +176,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
             SpeculativeAlgorithm.EAGLE3,
             SpeculativeAlgorithm.DFLASH,
             SpeculativeAlgorithm.DSPARK,
+            SpeculativeAlgorithm.STANDALONE,
         ):
             with self.subTest(algorithm=algorithm):
                 reporter = _make_reporter(self, types.SimpleNamespace())
@@ -232,6 +237,202 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                 types.SimpleNamespace(spec_algorithm=algorithm), result
             )
             self.assertIsNone(result.fpm_scheduled_requests)
+
+    def test_standalone_ordinary_decode_keeps_pre_settle_snapshot(self):
+        """STANDALONE overlap decode must publish pre-settle KV, not post-accept lengths.
+
+        Settlement appends accept_lens 2/3 onto origin 16/23 plus one output token.
+        Host lengths then become 19/27 (sum 46). The scheduled-request snapshot is
+        Req.seqlen - 1 before that mutation (16/23, sum 39). Original product leaves
+        result.fpm_scheduled_requests unset: a present CPU mirror would report its
+        raw cached bases, and a None mirror raises while walking seq_lens_cpu.
+        """
+        model_config = types.SimpleNamespace(
+            is_encoder_decoder=False,
+            self_opened_think_start_ids=[],
+        )
+        for right_mirror in ([23], None):
+            with self.subTest(right_seq_lens_cpu=right_mirror):
+                reporter = _make_reporter(self, types.SimpleNamespace())
+                reporter.scheduler.enable_fpm = True
+                left_req = _ordinary_standalone_req("standalone-left", 16)
+                right_req = _ordinary_standalone_req("standalone-right", 23)
+                left = _ordinary_standalone_batch(
+                    left_req, 1, 7, [16], _NoPenaltyMergeSink(), model_config
+                )
+                right = _ordinary_standalone_batch(
+                    right_req,
+                    2,
+                    9,
+                    right_mirror,
+                    _NoPenaltyMergeSink(),
+                    model_config,
+                )
+                left.merge_batch(right)
+                self.assertIs(left.reqs[0], left_req)
+                self.assertIs(left.reqs[1], right_req)
+                self.assertEqual(
+                    [req.rid for req in left.reqs],
+                    ["standalone-left", "standalone-right"],
+                )
+                self.assertEqual(left.req_pool_indices.tolist(), [1, 2])
+                self.assertEqual(left.spec_info.future_indices.tolist(), [1, 2])
+                self.assertEqual(left.sampling_info.sampling_seed.tolist(), [7, 9])
+                self.assertEqual(left.seq_lens.tolist(), [16, 23])
+                self.assertEqual([req.seqlen for req in left.reqs], [17, 24])
+                self.assertEqual(
+                    [req.kv.kv_committed_len for req in left.reqs], [16, 23]
+                )
+                if right_mirror is None:
+                    self.assertIsNone(left.seq_lens_cpu)
+                else:
+                    self.assertEqual(left.seq_lens_cpu.tolist(), [16, 23])
+
+                result = GenerationBatchResult(
+                    next_token_ids=torch.tensor(
+                        [11, 12, 13, 14, 15, 21, 22, 23, 24, 25],
+                        dtype=torch.int64,
+                    ),
+                    accept_lens=torch.tensor([2, 3], dtype=torch.int64),
+                    speculative_output_stride=5,
+                )
+                processor = _NamedNoResourceFinishSink(
+                    is_generation=True,
+                    disaggregation_mode=DisaggregationMode.NULL,
+                    enable_overlap=True,
+                    enable_overlap_mlx=False,
+                    model_config=model_config,
+                    token_to_kv_pool_allocator=_NamedAllocatorBoundary(),
+                    tree_cache=None,
+                    hisparse_coordinator=None,
+                    req_to_token_pool=None,
+                    decode_offload_manager=None,
+                    metrics_collector=None,
+                    metrics_reporter=reporter,
+                    draft_worker=None,
+                    model_worker=_NamedVerifyCompleteWorker(),
+                    logprob_result_processor=None,
+                    output_streamer=_NamedStreamerBoundary(),
+                    beam_coordinator=None,
+                    abort_request=_named_abort_request,
+                )
+                processor.process_batch_result_decode(left, result)
+                metrics = reporter._build_scheduled_request_metrics(left, result)
+
+                self.assertEqual([len(req.output_ids) for req in left.reqs], [3, 4])
+                self.assertEqual([req.seqlen for req in left.reqs], [19, 27])
+                self.assertEqual(
+                    [req.kv.kv_committed_len for req in left.reqs], [18, 26]
+                )
+                self.assertFalse(left.reqs[0].finished())
+                self.assertFalse(left.reqs[1].finished())
+                self.assertEqual(metrics.num_decode_requests, 2)
+                self.assertEqual(metrics.sum_decode_kv_tokens, 39)
+                self.assertAlmostEqual(metrics.var_decode_kv_tokens, 12.25)
+                self.assertIs(metrics, result.fpm_scheduled_requests)
+
+
+class _NoPenaltyMergeSink:
+    def merge(self, other):
+        pass
+
+
+class _NamedAllocatorBoundary:
+    def free_group_begin(self):
+        pass
+
+    def free_group_end(self):
+        pass
+
+
+class _NamedStreamerBoundary:
+    def stream_output(self, reqs, return_logprob):
+        pass
+
+
+class _NamedVerifyCompleteWorker:
+    def on_verify_complete_cpu(self, correct_drafts, batch_size):
+        pass
+
+
+class _NamedNoResourceFinishSink(SchedulerBatchResultProcessor):
+    # External resource/streaming boundaries stay named sinks. This subclass
+    # still runs real host settlement and Req.finish, not physical KV release.
+    def _handle_finish_state_updated_req(self, req, batch, result, i, logits_output):
+        return
+
+
+def _named_abort_request(*args, **kwargs):
+    raise AssertionError("ordinary STANDALONE decode should not abort")
+
+
+def _ordinary_standalone_req(rid, prefix_len):
+    params = SamplingParams(max_new_tokens=16, min_new_tokens=0, temperature=0.0)
+    params.normalize(tokenizer=None)
+    req = Req(
+        rid=rid,
+        origin_input_text="",
+        origin_input_ids=array("q", [1] * prefix_len),
+        sampling_params=params,
+        return_logprob=False,
+        return_sampling_mask=False,
+        eos_token_ids=frozenset(),
+        vocab_size=10000,
+    )
+    req.output_ids = array("q", [1])
+    req.kv.kv_committed_len = prefix_len
+    return req
+
+
+def _ordinary_standalone_batch(
+    req, slot, seed, seq_lens_cpu, orchestrator, model_config
+):
+    cached_prefix = req.seqlen - 1
+    batch = ScheduleBatch(
+        reqs=[req],
+        enable_overlap=True,
+        device="cpu",
+        is_prefill_only=False,
+        has_grammar=False,
+        return_logprob=False,
+        return_hidden_states=False,
+        model_config=model_config,
+        sampling_info=SamplingBatchInfo(
+            temperatures=torch.tensor([0.0], dtype=torch.float32).view(-1, 1),
+            top_ps=torch.tensor([1.0], dtype=torch.float32),
+            top_ks=torch.tensor([1], dtype=torch.int32),
+            min_ps=torch.tensor([0.0], dtype=torch.float32),
+            sampling_seed=torch.tensor([seed], dtype=torch.int64),
+            is_all_greedy=True,
+            is_any_greedy=True,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=10000,
+            device="cpu",
+            penalizer_orchestrator=orchestrator,
+            has_custom_logit_processor=False,
+            logit_bias=None,
+            return_sampling_masks=None,
+        ),
+        spec_info=EagleDraftInput(
+            future_indices=torch.tensor([slot], dtype=torch.int64)
+        ),
+        spec_algorithm=SpeculativeAlgorithm.STANDALONE,
+        forward_mode=ForwardMode.DECODE,
+        multimodal_inputs=None,
+        beam_tail=None,
+    )
+    batch.req_pool_indices = torch.tensor([slot], dtype=torch.int64)
+    batch.req_pool_indices_cpu = torch.tensor([slot], dtype=torch.int64)
+    batch.seq_lens = torch.tensor([cached_prefix], dtype=torch.int64)
+    batch.orig_seq_lens = torch.tensor([cached_prefix], dtype=torch.int32)
+    batch.seq_lens_cpu = (
+        None if seq_lens_cpu is None else torch.tensor(seq_lens_cpu, dtype=torch.int64)
+    )
+    batch.input_ids = None
+    batch.out_cache_loc = None
+    return batch
 
 
 class _FakeReq:
