@@ -558,39 +558,3 @@ register_kernel(
         ),
     )
 )
-
-
-# Ascend implementations are inventoried lazily; importing this group does not
-# import torch_npu or compile Triton kernels.
-register_kernel(
-    KernelSpec(
-        op="attention.expand_causal_seqlens",
-        backend=KernelBackend.TRITON,
-        target="sgl_kernel_npu.operators.indexer:expand_causal_seqlens",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="attention.expand_pool_topk_and_append_tail_batched_npu",
-        backend=KernelBackend.TRITON,
-        target="sgl_kernel_npu.operators.indexer:expand_pool_topk_and_append_tail_batched_npu",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="attention.fused_decode_prepare_indexer",
-        backend=KernelBackend.TRITON,
-        target="sgl_kernel_npu.operators.indexer:fused_decode_prepare_indexer",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="attention.build_pooled_page_table",
-        backend=KernelBackend.TORCH,
-        target="sgl_kernel_npu.operators.attention:build_pooled_page_table_64",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)

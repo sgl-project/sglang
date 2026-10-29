@@ -218,8 +218,7 @@ def test_import_stays_metadata_only():
         "'sglang.kernels.ops.attention.flash_attention_v4', "
         "'sglang.kernels.ops.attention.gemma_qkv_norm_rope', "
         "'sglang.kernels.ops.layernorm.rmsnorm_fanout', "
-        "'sglang.kernels.ops.speculative.row_argmax', "
-        "'sgl_kernel_npu')) or any("
+        "'sglang.kernels.ops.speculative.row_argmax')) or any("
         "m.startswith('sglang.kernels.jit') for m in sys.modules) else 'CLEAN')"
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
@@ -508,24 +507,6 @@ def test_deep_select_spec_matches_wrapper_architectures():
     assert spec.capabilities == frozenset(
         Cap.cuda(min_sm=sm, max_sm=sm) for sm in deep_select.SUPPORTED_CUDA_ARCHS
     )
-
-
-@pytest.mark.parametrize(
-    "op,backend",
-    [
-        ("attention.expand_causal_seqlens", KernelBackend.TRITON),
-        ("attention.build_pooled_page_table", KernelBackend.TORCH),
-    ],
-)
-def test_ascend_kernel_inventory_is_npu_only(op, backend):
-    """Inventory tooling must not offer these Ascend implementations on CUDA/CPU."""
-    spec = K.registry.get_backend(op, backend)
-    # NPU operators all called by sgl_kernel_npu.operators
-    assert spec.target.startswith("sgl_kernel_npu.operators.")
-    assert spec.capabilities == frozenset({Cap.NPU})
-    assert K.capabilities_satisfied(spec.capabilities, PlatformInfo(device_type="npu"))
-    for platform in (_CPU, _SM90, _HIP):
-        assert not K.capabilities_satisfied(spec.capabilities, platform)
 
 
 if __name__ == "__main__":

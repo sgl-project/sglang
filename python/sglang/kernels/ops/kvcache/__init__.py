@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+from sglang.kernels.spec import KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
@@ -82,41 +82,5 @@ register_kernel(
         target=(
             "sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache:store_fp4_index_k_cache"
         ),
-    )
-)
-
-
-# Ascend implementations are inventoried lazily; importing this group does not
-# import torch_npu or compile Triton kernels.
-register_kernel(
-    KernelSpec(
-        op="kvcache.kpool_decode_update_and_maybe_write_cache_bf16",
-        backend=KernelBackend.TRITON,
-        target="sgl_kernel_npu.operators.mem_cache:kpool_decode_update_and_maybe_write_cache_bf16",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="kvcache.kpool_assemble_softmax_write_cache_npu",
-        backend=KernelBackend.TRITON,
-        target="sgl_kernel_npu.operators.mem_cache:kpool_assemble_softmax_write_cache_npu",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="kvcache.kpool_write_tail_and_maybe_compress_npu",
-        backend=KernelBackend.TRITON,
-        target="sgl_kernel_npu.operators.mem_cache:kpool_write_tail_and_maybe_compress_npu",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="kvcache.scatter_kpool_tail_updates_npu",
-        backend=KernelBackend.TRITON,
-        target="sgl_kernel_npu.operators.mem_cache:scatter_kpool_tail_updates_npu",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
     )
 )
