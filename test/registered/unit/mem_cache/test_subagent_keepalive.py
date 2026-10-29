@@ -21,6 +21,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 TURN_LEN = 4
 PARENT_TOKENS = [10, 11, 12, 13]
@@ -62,7 +63,7 @@ def make_cache(allow_subagent_keepalive: bool, tree_core_backend: str):
         page_size=1,
         eviction_policy="lru",
         allow_subagent_keepalive=allow_subagent_keepalive,
-        tree_components=(ComponentType.FULL,),
+        tree_slots=tree_slots_of((ComponentType.FULL,)),
         tree_core_backend=tree_core_backend,
     )
     cache = UnifiedRadixCache(params)

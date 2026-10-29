@@ -30,7 +30,6 @@ from typing import Optional
 
 import msgspec
 import torch
-from unified_tree_core_inspector import UnifiedTreeCoreInspector
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import (
@@ -53,8 +52,12 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REG
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.kits.unified_radix_cache.unified_tree_core_inspector import (
+    UnifiedTreeCoreInspector,
+)
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 FULL = ComponentType.FULL
 
@@ -300,7 +303,9 @@ def _inspector_registry():
         return UnifiedTreeCoreInspector(params, components)
 
     def rust_factory(params, _components):
-        from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+        from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
+            RustUnifiedTreeCoreInspector,
+        )
 
         return RustUnifiedTreeCoreInspector(params)
 
@@ -374,7 +379,7 @@ class HiCacheFixture:
             token_to_kv_pool_allocator=self.allocator,
             page_size=page_size,
             eviction_policy="lru",
-            tree_components=(FULL,),
+            tree_slots=tree_slots_of((FULL,)),
             hicache_serialize_load_back=serialize_load_back,
             allow_subagent_keepalive=allow_subagent_keepalive,
             tree_core_backend=tree_core_backend,
