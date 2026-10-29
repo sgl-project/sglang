@@ -539,8 +539,8 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
 
 class TestStoredRequestStats(CustomTestCase):
     def test_rows_without_request_stats_read_the_latest_request_stats(self):
-        """The scheduler sends a request's stats only when they change; a row
-        without any reports the latest received, and a row before any is dropped."""
+        """A row without request stats reports the latest received, and a row
+        before any is dropped."""
         tm = _make_tokenizer_manager(self)
         rid = "request_stats_rid"
         state = _make_req_state(rid)
