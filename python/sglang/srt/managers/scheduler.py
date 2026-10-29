@@ -4146,6 +4146,27 @@ class Scheduler(
 
         return res
 
+    def _admit_chunked_req(self, adder: PrefillAdder) -> None:
+        self.chunked_req.init_next_round_input()
+        budget = adder.rem_chunk_tokens or 0
+        if (
+            not get_parallel().dcp_enabled
+            and not adder.kv_shard_granule
+            and not is_cp_sharded_padded()
+        ):
+            # Both budgets are charged by the continuation. Reserving only
+            # from the chunk budget can leave no input for waiting requests.
+            budget = min(budget, max(adder.rem_input_tokens, 0))
+        # Keep DCP and padded/sharded scheduling unchanged: a shortened cap
+        # must be reconciled with their boundaries after other chunk limits.
+        adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+            self.chunked_req,
+            self.waiting_queue,
+            budget,
+            self.page_size,
+        )
+        self.chunked_req = adder.add_chunked_req(self.chunked_req)
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -4276,14 +4297,7 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
-                self.chunked_req,
-                self.waiting_queue,
-                adder.rem_chunk_tokens or 0,
-                self.page_size,
-            )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self._admit_chunked_req(adder)
 
         if self.enable_lora:
             running_reqs = running_batch.reqs
