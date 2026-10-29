@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import importlib.util
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -34,6 +36,26 @@ def _gfx950_flydsl_available() -> bool:
 pytestmark = pytest.mark.skipif(
     not _gfx950_flydsl_available(),
     reason="gfx950 FlyDSL required",
+)
+
+
+def _aiter_kda_state_dtypes() -> tuple[torch.dtype, ...]:
+    """State dtypes of the ROCm/aiter#6026 decode; empty when AITER predates it."""
+    try:
+        from aiter.ops.flydsl.linear_attention_kernels import (
+            flydsl_kda_decode_with_f_b,
+        )
+    except ImportError:
+        return ()
+    return tuple(flydsl_kda_decode_with_f_b.state_dtypes)
+
+
+_requires_aiter_kda = pytest.mark.skipif(
+    not _aiter_kda_state_dtypes(), reason="AITER without ROCm/aiter#6026"
+)
+_requires_aiter_bf16_state = pytest.mark.skipif(
+    torch.bfloat16 not in _aiter_kda_state_dtypes(),
+    reason="AITER KDA decode without a BF16 recurrent state",
 )
 
 _DEVICE = torch.device("cuda")
@@ -171,6 +193,16 @@ def _copy_inputs(inputs: Inputs) -> Inputs:
 
 
 def _reference(inputs: Inputs) -> torch.Tensor:
+    if inputs.state.dtype != torch.float32:
+        # A narrow state widens on load, updates in FP32,
+        # and rounds to nearest even on store.
+        stored = inputs.state
+        inputs.state = stored.float()
+        output = _reference(inputs)
+        stored.copy_(inputs.state)
+        inputs.state = stored
+        return output
+
     batch = inputs.x.shape[0]
     output = torch.zeros(
         (1, batch, _HEADS, _DIM),
@@ -453,7 +485,214 @@ def test_fused_kda_backend_is_opt_in(monkeypatch):
     assert kda_fused_decode_aiter_hip.enabled()
 
 
+def _select_fused_backend(monkeypatch, source: str):
+    from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+
+    monkeypatch.setenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "aiter")
+    monkeypatch.setenv("SGLANG_K3_FLYDSL_SOURCE", source)
+    return kda_fused_decode_aiter_hip
+
+
+def _adapter_covers(adapter, f_a, f_b_weight, inputs: Inputs) -> bool:
+    return adapter.covered(
+        f_a,
+        f_b_weight,
+        inputs.x,
+        inputs.raw_beta,
+        inputs.conv_state,
+        inputs.state,
+        inputs.state_indices,
+        inputs.output_gate,
+        inputs.norm_weight,
+    )
+
+
+def _adapter_run(adapter, f_a, f_b_weight, inputs: Inputs) -> torch.Tensor:
+    return adapter.run(
+        f_a=f_a,
+        f_b_weight=f_b_weight,
+        mixed_qkv=inputs.x,
+        conv_weight=inputs.conv_weight,
+        conv_state=inputs.conv_state,
+        raw_beta=inputs.raw_beta,
+        A_log=inputs.A_log,
+        dt_bias=inputs.dt_bias,
+        lower_bound=_LOWER_BOUND,
+        state=inputs.state,
+        state_indices=inputs.state_indices,
+        output_gate=inputs.output_gate,
+        norm_weight=inputs.norm_weight,
+        norm_eps=_NORM_EPS,
+    )
+
+
+def _bf16_state(inputs: Inputs) -> None:
+    # SGLang's --mamba-ssm-dtype bfloat16 pool: dense [cache, 12, 128, 128].
+    inputs.state = inputs.state.to(torch.bfloat16).contiguous()
+
+
+@pytest.mark.parametrize(
+    "source,names",
+    [
+        pytest.param(
+            "aiter",
+            ("flydsl_kda_decode_with_f_b", "is_flydsl_kda_decode_supported"),
+            marks=_requires_aiter_kda,
+        ),
+        (
+            "sglang",
+            (
+                "flydsl_kimi_k3_kda_decode_with_f_b",
+                "is_flydsl_kimi_k3_kda_decode_supported",
+            ),
+        ),
+    ],
+)
+def test_source_binds_its_kda_decode(monkeypatch, source, names) -> None:
+    """SGLANG_K3_FLYDSL_SOURCE=aiter must call the kernel ROCm/aiter#6026 publishes."""
+    import importlib
+
+    adapter = _select_fused_backend(monkeypatch, source)
+    module = importlib.import_module(
+        adapter._AITER_MODULE if source == "aiter" else adapter._SGLANG_MODULE
+    )
+    run, supported, _ = adapter._ops()
+    assert (run, supported) == tuple(getattr(module, name) for name in names)
+
+
+def test_aiter_module_without_kda_decode_fails_closed(monkeypatch) -> None:
+    """AITER builds before ROCm/aiter#6026 ship the module with only GDR ops."""
+    from sglang.kernels.ops.attention.kda_flydsl import source
+
+    adapter = _select_fused_backend(monkeypatch, "aiter")
+    monkeypatch.setattr(
+        source,
+        "load_module",
+        lambda local, aiter: SimpleNamespace(__name__=aiter),
+    )
+    warn = mock.Mock()
+    monkeypatch.setattr(adapter, "print_warning_once", warn)
+    assert adapter._ops() == (None, None, ())
+    assert "ROCm/aiter#6026" in warn.call_args.args[0]
+    assert not adapter.available(_DEVICE, state_dtype=torch.float32)
+
+
+@_requires_aiter_bf16_state
+@pytest.mark.parametrize("batch", [1, 2, 8])
+def test_aiter_bf16_state_matches_reference(monkeypatch, batch: int) -> None:
+    adapter = _select_fused_backend(monkeypatch, "aiter")
+    f_a, f_b_weight, seed = _make_fb_inputs(batch)
+    _bf16_state(seed)
+    reference_inputs = _copy_inputs(seed)
+    actual_inputs = _copy_inputs(seed)
+
+    assert _adapter_covers(adapter, f_a, f_b_weight, actual_inputs)
+    out = _adapter_run(adapter, f_a, f_b_weight, actual_inputs)
+    torch.cuda.synchronize()
+    reference = _reference(reference_inputs)
+
+    assert actual_inputs.state.dtype == torch.bfloat16
+    assert _relative_rmse(reference, out) < 1e-3
+    assert _relative_rmse(reference_inputs.state, actual_inputs.state) < 1e-3
+    # Only elements whose FP32 update lands on a BF16 rounding tie may differ;
+    # a truncating store or a misread load flips far more.
+    mismatched = reference_inputs.state.view(torch.int16) != actual_inputs.state.view(
+        torch.int16
+    )
+    assert mismatched.float().mean().item() <= 1e-3
+    assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
+
+
+@_requires_aiter_bf16_state
+def test_aiter_covers_sglang_cache_pool_layouts(monkeypatch) -> None:
+    """covered() must accept the pools SGLang allocates, not only test tensors."""
+    adapter = _select_fused_backend(monkeypatch, "aiter")
+    cache = 673
+    f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
+    inputs.state = torch.empty(
+        (cache, _HEADS, _DIM, _DIM), dtype=torch.bfloat16, device=_DEVICE
+    )
+    # SGLang's [cache, 3, 4608] conv cache viewed through transpose(-1, -2).
+    inputs.conv_state = torch.empty(
+        (cache, _CONV_WIDTH - 1, _CHANNELS), dtype=torch.bfloat16, device=_DEVICE
+    ).transpose(-1, -2)
+
+    assert _adapter_covers(adapter, f_a, f_b_weight, inputs)
+    fp16_state = replace(inputs, state=inputs.state.to(torch.float16))
+    assert not _adapter_covers(adapter, f_a, f_b_weight, fp16_state)
+
+
+def test_sglang_source_does_not_cover_bf16_state(monkeypatch) -> None:
+    """The vendored kernel takes an FP32 state only; BF16 must fall back."""
+    adapter = _select_fused_backend(monkeypatch, "sglang")
+    f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
+
+    assert _adapter_covers(adapter, f_a, f_b_weight, inputs)
+    _bf16_state(inputs)
+    assert not _adapter_covers(adapter, f_a, f_b_weight, inputs)
+    with pytest.raises(ValueError, match="`state` must have dtype"):
+        _run_with_f_b(f_a, f_b_weight, inputs)
+
+
+def test_sglang_source_is_not_armed_for_a_bf16_pool(monkeypatch) -> None:
+    """A BF16 pool never reaches the FP32-only vendored kernel,
+    so the layer must not arm (or log armed) and must warn that decode stays unfused."""
+    adapter = _select_fused_backend(monkeypatch, "sglang")
+    warn = mock.Mock()
+    monkeypatch.setattr(adapter, "print_warning_once", warn)
+
+    assert adapter.available(_DEVICE, state_dtype=torch.float32)
+    warn.assert_not_called()
+    assert not adapter.available(_DEVICE, state_dtype=torch.bfloat16)
+    assert "torch.bfloat16" in warn.call_args.args[0]
+
+
+@_requires_aiter_bf16_state
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_aiter_warmup_builds_the_pool_state_dtype(monkeypatch, state_dtype) -> None:
+    """A pool state dtype left cold would compile during CUDA graph capture."""
+    adapter = _select_fused_backend(monkeypatch, "aiter")
+    _, f_b_weight, inputs = _make_fb_inputs(batch=1)
+    warmed = []
+    real_run = adapter.run
+
+    def recording_run(**kwargs):
+        warmed.append(kwargs["state"].dtype)
+        return real_run(**kwargs)
+
+    monkeypatch.setattr(adapter, "run", recording_run)
+    monkeypatch.setattr(adapter, "_WARMED", set())
+    adapter.warmup(
+        f_b_weight=f_b_weight,
+        conv_weight=inputs.conv_weight,
+        A_log=inputs.A_log,
+        dt_bias=inputs.dt_bias,
+        lower_bound=_LOWER_BOUND,
+        norm_weight=inputs.norm_weight,
+        norm_eps=_NORM_EPS,
+        state_dtype=state_dtype,
+    )
+    assert warmed == [state_dtype]
+
+
+@_requires_aiter_kda
+@pytest.mark.parametrize("batch", [1, 8, 16])
+def test_vendored_and_aiter_kda_decode_agree(monkeypatch, batch: int) -> None:
+    adapter = _select_fused_backend(monkeypatch, "aiter")
+    f_a, f_b_weight, seed = _make_fb_inputs(batch)
+    vendored_inputs = _copy_inputs(seed)
+    aiter_inputs = _copy_inputs(seed)
+
+    vendored = _run_with_f_b(f_a, f_b_weight, vendored_inputs)
+    aiter_out = _adapter_run(adapter, f_a, f_b_weight, aiter_inputs)
+    torch.cuda.synchronize()
+
+    assert _relative_rmse(vendored, aiter_out) < 1e-3
+    assert _relative_rmse(vendored_inputs.state, aiter_inputs.state) < 1e-3
+    assert torch.equal(vendored_inputs.conv_state, aiter_inputs.conv_state)
+
+
 if __name__ == "__main__":
     import sys
 
-    sys.exit(pytest.main([__file__, "-v"]))
+    sys.exit(pytest.main([__file__]))

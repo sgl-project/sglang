@@ -141,6 +141,18 @@ class TestGfx950KDAFusedDecode(CustomTestCase):
             torch.equal(actual_inputs["conv_state"], expected_inputs["conv_state"])
         )
 
+    def test_bf16_pool_is_not_armed(self):
+        """The kernel takes an FP32 state only, so a BF16 pool must not arm it."""
+        with patch.dict(os.environ):
+            os.environ.pop("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", None)
+            device = torch.device("cuda")
+            self.assertTrue(
+                kda_fused_decode_gfx950.available(device, state_dtype=torch.float32)
+            )
+            self.assertFalse(
+                kda_fused_decode_gfx950.available(device, state_dtype=torch.bfloat16)
+            )
+
     @torch.inference_mode()
     def test_non_positive_slots_are_skipped(self):
         inputs = _inputs([0, -1, 4])

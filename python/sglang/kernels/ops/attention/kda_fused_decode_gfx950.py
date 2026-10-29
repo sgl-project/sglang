@@ -16,7 +16,7 @@ import torch
 
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import KernelBackend
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, print_warning_once
 
 _HEADS = 12
 _DIM = 128
@@ -28,11 +28,21 @@ def enabled() -> bool:
     return backend.lower() == "gfx950"
 
 
-def available(device: torch.device | None = None) -> bool:
+def available(device: torch.device | None, state_dtype: torch.dtype) -> bool:
+    """Whether the kernel runs on ``device`` over a ``state_dtype`` pool."""
     if not is_hip() or not enabled() or not torch.cuda.is_available():
         return False
     arch = torch.cuda.get_device_properties(device).gcnArchName
-    return arch.split(":", 1)[0] == "gfx950"
+    if arch.split(":", 1)[0] != "gfx950":
+        return False
+    if state_dtype != torch.float32:
+        print_warning_once(
+            "Kimi-K3 fused KDA decode not armed: the gfx950 kernel takes a "
+            f"torch.float32 recurrent state, the pool holds {state_dtype}; "
+            "decode runs the unfused chain"
+        )
+        return False
+    return True
 
 
 def warmup(**_: object) -> None:
@@ -52,7 +62,7 @@ def covered(
     output_gate: torch.Tensor,
     norm_weight: torch.Tensor,
 ) -> bool:
-    if not available(f_a.device) or f_a.ndim != 2:
+    if not available(f_a.device, state_dtype=state.dtype) or f_a.ndim != 2:
         return False
     batch = f_a.shape[0]
     return (
