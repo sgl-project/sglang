@@ -102,6 +102,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
+    dcp_size: int = 1
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32

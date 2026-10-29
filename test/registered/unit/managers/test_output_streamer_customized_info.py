@@ -271,6 +271,21 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             {key: [[], [386.25]]},
         )
 
+    def test_rust_egress_takes_each_steps_values_unpickled(self):
+        """Each step sends the values for its new tokens; the Rust egress
+        encodes the lists itself."""
+        probed = _FakeReq("r0", [20, 21], customized_info={"probe": [200, 201]})
+        steps = []
+        for _ in range(2):
+            accumulator = _accumulator(rust_server_mode=True)
+            accumulator.accept(req=probed)
+            payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+            steps.append(payload.customized_info)
+            probed.output_ids.append(22)
+            probed.customized_info["probe"].append(202)
+
+        self.assertEqual(steps, [{"probe": [[200, 201]]}, {"probe": [[202]]}])
+
     def test_additional_customized_info_uses_the_existing_payload(self):
         class Streamer(SchedulerOutputStreamer):
             has_additional_customized_info = True
@@ -463,7 +478,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         class Streamer(SchedulerOutputStreamer):
             has_additional_customized_info = True
 
-        with self.assertRaisesRegex(ValueError, "Rust egress"):
+        with self.assertRaisesRegex(ValueError, "Rust frontend does not run"):
             Streamer(
                 send_to_detokenizer=SimpleNamespace(),
                 tree_cache=None,
