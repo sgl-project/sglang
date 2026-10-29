@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+from collections.abc import Callable
 from functools import lru_cache
 
 import torch
@@ -13,11 +14,98 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     trailing_padding_used_len,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
+
+# head dims accepted by Intel ARK's sagev1 (auto-round-lib 0.16.0)
+_ARK_HEAD_DIMS = (64, 128)
+
+
+@lru_cache(maxsize=1)
+def _load_ark_sagev1() -> Callable[..., torch.Tensor] | None:
+    try:
+        import auto_round_kernel as ark
+        from auto_round_kernel.version import __version__ as ark_version
+    except ImportError:
+        logger.info(
+            "auto-round-lib is not installed; XPU SageAttention runs SGLang's Triton kernel"
+        )
+        return None
+    # ARK only prints when its XPU library fails to load, then every call raises
+    if ark.xpu_lib is None:
+        logger.warning(
+            "auto-round-lib could not load its XPU library (see ARK's 'unable to load "
+            "XPU lib' message; it usually needs <env>/lib on LD_LIBRARY_PATH); "
+            "XPU SageAttention runs SGLang's Triton kernel"
+        )
+        return None
+    logger.info(
+        "XPU SageAttention runs Intel ARK sagev1 from auto-round-lib %s",
+        ark_version,
+    )
+    return ark.sagev1
+
+
+def _as_dense_nhd(x: torch.Tensor) -> torch.Tensor:
+    # ARK checks every stride, including those of size-1 dims that contiguous() keeps
+    x = x.contiguous()
+    _, seq_len, num_heads, head_dim = x.shape
+    return x.as_strided(
+        x.shape, (seq_len * num_heads * head_dim, num_heads * head_dim, head_dim, 1)
+    )
+
+
+@torch.compiler.disable
+def _xpu_sage_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    ark_sagev1: Callable[..., torch.Tensor] | None,
+    causal: bool,
+    sm_scale: float,
+    return_lse: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if ark_sagev1 is not None:
+        head_dim = query.shape[-1]
+        if return_lse:
+            # auto-round-lib 0.16.0 returns one LSE per 16 query rows
+            logger.warning_once(
+                "Intel ARK SageAttention does not return a per-row LSE; calls that "
+                "need it (ring attention) run SGLang's Triton kernel instead"
+            )
+        elif head_dim in _ARK_HEAD_DIMS:
+            return ark_sagev1(
+                _as_dense_nhd(query),
+                _as_dense_nhd(key),
+                _as_dense_nhd(value),
+                is_causal=causal,
+                scale=sm_scale,
+                tensor_layout="NHD",
+            )
+        else:
+            logger.info_once(
+                "Intel ARK SageAttention supports head_dim 64 and 128; "
+                "head_dim %d runs SGLang's Triton kernel",
+                head_dim,
+            )
+
+    from sglang.kernels.ops.diffusion import sage_attn_qk_int8_pv_fp16
+
+    return sage_attn_qk_int8_pv_fp16(
+        query,
+        key,
+        value,
+        causal=causal,
+        sm_scale=sm_scale,
+        return_lse=return_lse,
+    )
 
 
 @torch.compiler.disable
@@ -70,6 +158,7 @@ class SageAttentionImpl(AttentionImpl):
         self.packed_trailing_padding = extra_impl_args.get(
             "packed_trailing_padding", False
         )
+        self._ark_sagev1 = _load_ark_sagev1() if current_platform.is_xpu() else None
 
     def forward(
         self,
@@ -81,13 +170,12 @@ class SageAttentionImpl(AttentionImpl):
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
         if query.device.type == "xpu":
-            # the sageattention package is CUDA-only; XPU runs SGLang's Triton kernel
-            from sglang.kernels.ops.diffusion import sage_attn_qk_int8_pv_fp16
-
-            return sage_attn_qk_int8_pv_fp16(
+            # sageattention is CUDA-only; XPU runs Intel ARK or SGLang's Triton kernel
+            return _xpu_sage_attn(
                 query,
                 key,
                 value,
+                ark_sagev1=self._ark_sagev1,
                 causal=self.causal,
                 sm_scale=self.softmax_scale,
                 return_lse=return_softmax_lse,

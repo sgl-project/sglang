@@ -78,6 +78,7 @@ dependencies = [
 checkpoint-engine = ["checkpoint-engine @ git+https://github.com/MoonshotAI/checkpoint-engine.git@f772d1858204fa82bdb0436fdfec137f5de2972c"]
 diffusion = [
   "addict==2.4.0",
+  "auto-round-lib==0.16.0",
   "av==16.1.0",
   "cache-dit==1.3.0",
   "cloudpickle==3.1.2",
