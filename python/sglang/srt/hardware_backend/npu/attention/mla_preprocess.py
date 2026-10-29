@@ -110,7 +110,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
         self.is_npu_arch35 = is_npu_arch35()
         self.no_rope_mlaprolog = None
-        if self.is_npu_arch35 and rotary_emb is None:
+        if rotary_emb is None:
             # MLAProlog V4 supports no-RoPE with BF16 or FP8 KV.
             from sgl_kernel_npu.operators.attention import mla_prolog_norope
 
