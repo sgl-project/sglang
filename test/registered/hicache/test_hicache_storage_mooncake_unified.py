@@ -12,6 +12,7 @@ Usage:
 import json
 import random
 import unittest
+import uuid
 from types import SimpleNamespace
 
 import requests
@@ -40,12 +41,14 @@ def run_gsm8k(*, base_url, model, num_examples):
     )["score"]
 
 
-def storage_hit_tokens(base_url):
+def l3_loaded_tokens(base_url):
+    # Tokens actually transferred from L3. Every attention-TP rank logs the same
+    # rank-agreed count, so read rank 0 alone.
     metrics = requests.get(f"{base_url}/metrics", timeout=10).text
     return sum(
         float(line.rsplit(" ", 1)[1])
         for line in metrics.splitlines()
-        if line.startswith("sglang:storage_prefetch_hit_tokens_total")
+        if line.startswith("sglang:prefetched_tokens_total{") and 'tp_rank="0"' in line
     )
 
 
@@ -53,6 +56,8 @@ class HiCacheMooncakeUnifiedMixin(HiCacheStorageMooncakeBackendBaseMixin):
     """Mooncake L3 under --hicache-storage-key-scheme unified, at TP2."""
 
     unified_server_args = {}
+    # test_l3_reload_is_bit_exact covers the same backup and reload, more strictly.
+    test_basic_backup_and_prefetch = None
 
     @classmethod
     def _get_additional_server_args_and_env(cls):
@@ -77,7 +82,7 @@ class HiCacheMooncakeUnifiedMixin(HiCacheStorageMooncakeBackendBaseMixin):
         env_vars["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = str(16 << 30)
         return server_args, env_vars
 
-    def _generate_greedy(self, input_ids):
+    def _generate_greedy(self, input_ids, cache_salt):
         response = requests.post(
             f"{self.base_url}/generate",
             json={
@@ -88,6 +93,7 @@ class HiCacheMooncakeUnifiedMixin(HiCacheStorageMooncakeBackendBaseMixin):
                     "ignore_eos": True,
                 },
                 "return_logprob": True,
+                "cache_salt": cache_salt,
             },
             timeout=120,
         )
@@ -104,11 +110,17 @@ class HiCacheMooncakeUnifiedMixin(HiCacheStorageMooncakeBackendBaseMixin):
         rng = random.Random(20261021)
         # One token past a page boundary: both hits reuse exactly 12 full pages.
         input_ids = [rng.randint(1000, 30000) for _ in range(12 * PAGE_SIZE + 1)]
+        # CI retries a failed method on the same server and store; a fresh salt
+        # keeps the retry from taking its reference from the failed reload.
+        salt = uuid.uuid4().hex
 
-        self._generate_greedy(input_ids)
-        device_hit = self._generate_greedy(input_ids)
+        computed = self._generate_greedy(input_ids, salt)
+        self.assertEqual(computed["meta_info"]["cached_tokens"], 0)
+        device_hit = self._generate_greedy(input_ids, salt)
+        device_details = device_hit["meta_info"]["cached_tokens_details"]
+        self.assertEqual(device_details["device"], 12 * PAGE_SIZE, device_details)
         self.trigger_offloading_and_flush()
-        storage_hit = self._generate_greedy(input_ids)
+        storage_hit = self._generate_greedy(input_ids, salt)
 
         meta = storage_hit["meta_info"]
         details = meta.get("cached_tokens_details") or {}
@@ -136,11 +148,11 @@ class TestMooncakeUnifiedMHA(HiCacheMooncakeUnifiedMixin, CustomTestCase):
         """GSM8K holds when its prompt pages come back from mooncake chunks."""
         first = run_gsm8k(base_url=self.base_url, model=self.model, num_examples=200)
         self.flush_cache()
-        hits_before = storage_hit_tokens(self.base_url)
+        loaded_before = l3_loaded_tokens(self.base_url)
         reloaded = run_gsm8k(base_url=self.base_url, model=self.model, num_examples=200)
-        hit_tokens = storage_hit_tokens(self.base_url) - hits_before
-        print(f"{first=:.3f} {reloaded=:.3f} {hit_tokens=:.0f}")
-        self.assertGreaterEqual(hit_tokens, 100 * PAGE_SIZE)
+        loaded_tokens = l3_loaded_tokens(self.base_url) - loaded_before
+        print(f"{first=:.3f} {reloaded=:.3f} {loaded_tokens=:.0f}")
+        self.assertGreaterEqual(loaded_tokens, 100 * PAGE_SIZE)
         self.assertGreater(first, 0.6)
         self.assertGreater(reloaded, 0.6)
         self.assertLess(abs(first - reloaded), 0.03)
