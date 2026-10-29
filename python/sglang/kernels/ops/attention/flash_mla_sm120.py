@@ -14,7 +14,7 @@ separate region at the end of each page.
 import logging
 import math
 from functools import lru_cache
-from typing import FrozenSet, Optional, Tuple
+from typing import Container, Optional, Tuple
 
 import torch
 import triton
@@ -267,8 +267,13 @@ def _flash_mla_sm120_prefill(
     return (output.unsqueeze(1), None)
 
 
+# DeepSeek-V4's index top-k. FlashInfer 0.6 lists every DSV4 decode head count
+# at this top-k, and 0.7 accepts any top-k >= 1 for the DSV4 family.
+_DSV4_DECODE_PROBE_TOPK = 512
+
+
 @lru_cache(maxsize=1)
-def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, FrozenSet[int]]:
+def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, Container[Tuple[int, int]]]:
     """Read the installed FlashInfer DSV4 decode capabilities once."""
     try:
         from flashinfer.mla._sparse_mla_sm120 import (
@@ -278,9 +283,9 @@ def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, FrozenSet[int]]:
     except (AttributeError, ImportError):
         return 0, frozenset()
 
-    return int(_DECODE_MAX_TOKENS), frozenset(
-        heads for heads, _ in _DECODE_DSV4_DISPATCH
-    )
+    # A set of (num_heads, topk) pairs up to FlashInfer 0.6, a membership
+    # envelope from 0.7 that cannot be iterated; both answer `in`.
+    return int(_DECODE_MAX_TOKENS), _DECODE_DSV4_DISPATCH
 
 
 def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -> bool:
@@ -291,8 +296,11 @@ def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -
     The padded 64-head decode path remains the safe fallback for older builds.
     Prefill head selection is handled separately by the caller.
     """
-    decode_max_tokens, supported_heads = _flashinfer_dsv4_decode_capabilities()
-    return num_tokens <= decode_max_tokens and num_heads in supported_heads
+    decode_max_tokens, dispatch = _flashinfer_dsv4_decode_capabilities()
+    return (
+        num_tokens <= decode_max_tokens
+        and (num_heads, _DSV4_DECODE_PROBE_TOPK) in dispatch
+    )
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
