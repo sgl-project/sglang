@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.common import get_device
 from sglang.test.test_utils import CustomTestCase
 
@@ -136,6 +137,10 @@ def check_kv_indices(forward_batch, req_to_token_pool):
 )
 class TestPrefixChunkInfo(CustomTestCase):
     def setUp(self):
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
         # Common test parameters
         self.num_local_heads = 128
         self.kv_lora_rank = 512
@@ -207,6 +212,7 @@ class TestPrefixChunkInfo(CustomTestCase):
             # attn_backend that carries the pools (Pattern A invariant).
             from types import SimpleNamespace
 
+            from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
             from sglang.srt.model_executor.forward_context import (
                 ForwardContext,
                 set_forward_context,
@@ -215,6 +221,13 @@ class TestPrefixChunkInfo(CustomTestCase):
             mock_backend = SimpleNamespace(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool=self.token_to_kv_pool,
+                runner_ids=RunnerIds(
+                    req_to_token=self.req_to_token_pool.req_to_token,
+                    token_to_kv_pool_allocator=None,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    page_size=1,
+                    device=self.device,
+                ),
             )
             set_forward_context(ForwardContext(attn_backend=mock_backend))
 
