@@ -236,7 +236,7 @@ class TokenSpaceSGLangProcessor:
         )
 
     def _set_item_hashes(self, mm_items: list[MultimodalDataItem]) -> None:
-        """Hash each item's feature scoped by its other strategy fields, e.g. grids.
+        """Hash each item's feature scoped by its shape and other fields, e.g. grids.
 
         Features carry no layout: a solid 448x896 and 896x448 image give equal
         patches and differ only in image_grid_thw, so a feature-only hash would let
@@ -316,18 +316,20 @@ class TokenSpaceSGLangProcessor:
 
 
 def _layout_digest(item: MultimodalDataItem, field_names: list[str]) -> str:
-    """SHA-256 identity of the named fields an item holds, in the given order."""
-    hasher = hashlib.sha256()
+    """SHA-256 identity of the feature shape and the named fields an item holds."""
+    parts = [b"feature", str(tuple(item.feature.shape)).encode()]
     for name in field_names:
         if name not in item.model_specific_data:
             continue
         value = torch.as_tensor(item.model_specific_data[name]).detach().cpu()
-        for part in (
+        parts += [
             name.encode(),
             str(value.dtype).encode(),
             str(tuple(value.shape)).encode(),
             value.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes(),
-        ):
-            hasher.update(len(part).to_bytes(8, "big"))
-            hasher.update(part)
+        ]
+    hasher = hashlib.sha256()
+    for part in parts:
+        hasher.update(len(part).to_bytes(8, "big"))
+        hasher.update(part)
     return CONTENT_HASH_PREFIX + hasher.hexdigest()
