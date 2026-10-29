@@ -12,7 +12,6 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-# These wrapper checks use CPU tensors and do not invoke the AITER kernel.
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
