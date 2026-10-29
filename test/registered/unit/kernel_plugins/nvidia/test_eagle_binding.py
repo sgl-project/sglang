@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, call, patch
 import msgspec
 import torch
 
+from sglang.kernels.plugin_kernels.nvidia import spec
 from sglang.kernels.plugin_kernels.nvidia.spec import Step
 from sglang.srt.kernel_plugins.nvidia import binding as runtime
 from sglang.srt.kernel_plugins.nvidia import eagle_binding as eb
@@ -614,6 +615,28 @@ class TestEagleEntries(CustomTestCase):
         begin("a", "b")
         self.assertEqual(len(rounds), calls)  # batch size 2 is not served
         self.assertIsNone(served_extend("a", "b"))  # SGLang's top-1 there
+
+
+class TestSpeculativeRuntimeContract(CustomTestCase):
+
+
+    def test_strategy_passes_the_local_policy_to_runtime(self):
+        output = spec.PostVerifyOutput(
+            token_ids=torch.tensor([1]),
+            accepted_lengths=torch.tensor([1]),
+            accepted_indices=torch.tensor([0]),
+        )
+        local_keys = lambda view: view.values.argmax(-1)
+        calls = []
+
+        def run(io, policy):
+            calls.append((io, policy))
+            return output
+
+        io = object()
+        strategy = spec.PostVerifyStrategy(run=run, local_keys=local_keys)
+        self.assertIs(strategy(io), output)
+        self.assertEqual(calls, [(io, local_keys)])
 
 
 if __name__ == "__main__":
