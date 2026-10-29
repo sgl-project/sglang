@@ -110,6 +110,8 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -612,6 +614,9 @@ class Scheduler(
         self.swa_tokens_per_layer = result.swa_tokens_per_layer
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.logical_page_size = self.page_size
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
         self.kv_shard_widening = page_interleave_shard_size(
             self.token_to_kv_pool_allocator
         )
@@ -2523,6 +2528,9 @@ class Scheduler(
         )
 
     def init_pool_stats_observer(self) -> None:
+        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        if is_cp_sharded_padded():
+            global_tokens = from_cp_sharded(global_tokens)
         storage = kv_storage_of(
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
@@ -2530,7 +2538,7 @@ class Scheduler(
                 has_window=self.is_hybrid_swa,
                 has_state=self.is_hybrid_ssm,
                 # Match the allocator and radix counters' logical units.
-                token_capacity=self.max_total_num_tokens * self.kv_shard_widening,
+                token_capacity=global_tokens,
                 full_tokens_per_layer=self.full_tokens_per_layer,
                 swa_tokens_per_layer=self.swa_tokens_per_layer,
             ),
@@ -2547,7 +2555,7 @@ class Scheduler(
     def init_invariant_checker(self) -> None:
         self.invariant_checker = SchedulerInvariantChecker(
             disaggregation_mode=self.disaggregation_mode,
-            page_size=self.page_size,
+            page_size=self.logical_page_size,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
@@ -2607,11 +2615,14 @@ class Scheduler(
             maxlen=PAUSE_WINDOWS_MAX
         )
         self._pause_started_at: Optional[float] = None
+        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        if is_cp_sharded_padded():
+            global_tokens = from_cp_sharded(global_tokens)
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             server_args=self.server_args,
             # The worker reports logical DCP capacity; add KV shard widening.
-            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
+            max_total_num_tokens=global_tokens,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,
             tp_worker=self.tp_worker,
@@ -2796,6 +2807,16 @@ class Scheduler(
             self.max_total_num_tokens * self.kv_shard_widening
             - self.page_size * (self.kv_shard_widening - 1)
         )
+        if is_cp_sharded_padded():
+            token_capacity = from_cp_sharded(token_capacity)
+            # (-input_len) % size is padding to the next multiple of size.
+            # Replace physical-page padding and decode headroom with a CP group.
+            group_size = self.logical_page_size
+            group_padding = (-input_len) % group_size
+            page_padding = (-input_len) % self.page_size
+            extra_padding = group_padding - page_padding
+            extra_headroom = group_size - self.page_size
+            token_capacity -= extra_padding + extra_headroom
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
@@ -4261,16 +4282,28 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            running_loras = {
-                req.lora_id for req in running_batch.reqs if not req.finished()
-            }
+            running_reqs = running_batch.reqs
+            if get_parallel().pp_size > 1:
+                running_reqs = [*running_reqs, *self._get_all_pp_reqs()]
+            running_loras = {req.lora_id for req in running_reqs if not req.finished()}
+
             # Account for LoRAs that are already loaded in the adder, such as chunked requests
             running_loras.update(req.lora_id for req in adder.can_run_list)
 
             if self.lora_drainer:
+                lora_manager = self.tp_worker.model_runner.lora_manager
                 self.lora_drainer.update_draining_state(
                     self.waiting_queue,
-                    running_batch.reqs,
+                    [*running_reqs, *adder.can_run_list],
+                    pinned_loras=(
+                        {
+                            uid
+                            for uid, ref in lora_manager.lora_refs.items()
+                            if ref.pinned
+                        }
+                        if lora_manager.num_pinned_loras
+                        else None
+                    ),
                 )
 
         mamba_allocator = self.token_to_kv_pool_allocator.state_slots
@@ -4434,7 +4467,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.kv.swa_evict_floor = req.extend_end
+                req.kv.shield_swa_prefill(req.extend_end)
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -4516,6 +4549,15 @@ class Scheduler(
             return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
                 new_lora_set
             )
+
+    def _get_all_pp_reqs(self) -> List[Req]:
+        return [
+            req
+            for batch in (*self.running_mbs, *self.mbs)
+            if batch is not None
+            for req in batch.reqs
+            if not req.finished()
+        ]
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose queued result commits their last output by length."""
@@ -4940,6 +4982,10 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                if self.enable_lora and get_parallel().pp_size > 1:
+                    kwargs["pp_loras"] = {
+                        req.lora_id for req in self._get_all_pp_reqs()
+                    }
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs

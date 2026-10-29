@@ -3,6 +3,10 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import (
+    get_cp_sharded_padded_allocation_tokens,
+)
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
     get_context,
@@ -631,6 +635,9 @@ class PrefillAdder:
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.logical_page_size = self.page_size
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
@@ -700,7 +707,7 @@ class PrefillAdder:
         self.per_req_token_overhead = (
             kv_shard_size * self.kv_shard_granule
             if self.kv_shard_granule
-            else self.page_size
+            else self.logical_page_size
         )
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
@@ -881,17 +888,25 @@ class PrefillAdder:
         """
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         raw_extend_input_len = extend_input_len
-        extend_input_len = self.ceil_paged_tokens(extend_input_len)
+        rounded_extend_input_len = self.ceil_paged_tokens(extend_input_len)
         compute_charge = (
-            raw_extend_input_len if self.exact_chunk_fill else extend_input_len
+            raw_extend_input_len if self.exact_chunk_fill else rounded_extend_input_len
         ) + replay_len
+        if is_cp_sharded_padded():
+            extend_input_len = get_cp_sharded_padded_allocation_tokens(
+                raw_extend_input_len, prefix_tokens=prefix_len
+            )
+        else:
+            extend_input_len = rounded_extend_input_len
 
         self.memory_budget.reserve(
             extend_input_len,
             max_new_tokens,
             # reserve() already charges one page; add the remaining shard pages.
             extra_tokens=(
-                request_slot_reserve + self.per_req_token_overhead - self.page_size
+                request_slot_reserve
+                + self.per_req_token_overhead
+                - self.logical_page_size
             ),
             # Debits every reserved state slot, including the load-back checkpoint.
             state_slot_tokens=state_slot_reserve,
@@ -907,6 +922,10 @@ class PrefillAdder:
 
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
+        if is_chunked_continuation:
+            # Earlier chunks already accounted for this prefix; do not log
+            # it again as prefix-cache hits. KV reservation above keeps it.
+            prefix_len = 0
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += raw_extend_input_len
         self.log_replay_tokens += replay_len
@@ -1134,6 +1153,10 @@ class PrefillAdder:
             _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        prefix_tokens = 0
+        if is_cp_sharded_padded():
+            # Existing prefix padding can supply part of this chunk's KV rows.
+            prefix_tokens = req.prefix_len
         _rem_tokens = self.memory_budget.fit_chunk(
             extend_input_len=cand_extend_input_len,
             max_new_tokens=self._swa_new_tokens(req),
@@ -1168,7 +1191,7 @@ class PrefillAdder:
         req.extend_end = req.prefix_len + new_len
         self.can_run_list.append(req)
         self._update_prefill_budget(
-            0,
+            prefix_tokens,
             req.extend_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
@@ -1203,9 +1226,14 @@ class PrefillAdder:
 
     def add_one_req_ignore_eos(self, req: Req):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
-        paged_input = (
-            self.ceil_paged_tokens(cand_extend_input_len) + self.per_req_token_overhead
-        )
+        if is_cp_sharded_padded():
+            # One physical page on each rank reserves a complete logical group.
+            storage_input_len = get_cp_sharded_padded_allocation_tokens(
+                cand_extend_input_len, prefix_tokens=0
+            )
+        else:
+            storage_input_len = self.ceil_paged_tokens(cand_extend_input_len)
+        paged_input = storage_input_len + self.per_req_token_overhead
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._state_slot_reserve_for_req(req)
@@ -1531,7 +1559,7 @@ class PrefillAdder:
                         return admission
                 req.prefix_len += req.host_loaded_length
                 if self.tree_cache.load_back_is_cache_owned():
-                    req.kv.cache_protected_len = req.prefix_len
+                    req.kv.protect_prefix(req.prefix_len)
 
             if (
                 self.kv_shard_scratch_spec is not None
