@@ -27,6 +27,9 @@ from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import
     all_gather_norm_residual,
     all_gather_norm_residual_supported,
 )
+from sglang.kernels.ops.communication.muse_spark_all_reduce_norm_residual import (
+    FusedAllReducePostNormResidualPreNorm,
+)
 from sglang.kernels.ops.gemm.muse_spark_router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
@@ -406,6 +409,7 @@ class MuseSpark1xAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_all_reduce: bool = False,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -433,7 +437,7 @@ class MuseSpark1xAttention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
         output = self.attn(q, k, v, forward_batch, save_kv_cache=kv_store is None)
         output = self._fused_o_norm_gate(output, o_gate)
-        output, _ = self.o_proj(output)
+        output, _ = self.o_proj(output, skip_all_reduce=skip_all_reduce)
         return output
 
 
@@ -987,6 +991,11 @@ class MuseSpark1xDecoderLayer(nn.Module):
             self.post_attention_residual_gate,
             self.pre_feedforward_layernorm,
         )
+        self._ar_fused_attn_boundary = FusedAllReducePostNormResidualPreNorm(
+            self._fused_attn_boundary,
+            hidden_size=config.hidden_size,
+            branch_dtype=self.operator_dtype,
+        )
         self._fused_ffn_boundary = None
 
     @staticmethod
@@ -1014,11 +1023,17 @@ class MuseSpark1xDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Returns the updated residual stream and the next layer's attention input."""
-        attn_output = self.self_attn(positions, attn_input, forward_batch)
+        ar_fused = self._ar_fused_attn_boundary.applicable(attn_input.shape[0])
+        attn_output = self.self_attn(
+            positions, attn_input, forward_batch, skip_all_reduce=ar_fused
+        )
         router_dtype = self._router_dtype
         if router_dtype is not None and _use_split_bf16_router(attn_output.shape[0]):
             router_dtype = None
-        ffn_input, stream, router_input = self._fused_attn_boundary(
+        boundary = (
+            self._ar_fused_attn_boundary if ar_fused else self._fused_attn_boundary
+        )
+        ffn_input, stream, router_input = boundary(
             stream,
             attn_output,
             branch_dtype=self.operator_dtype,

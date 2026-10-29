@@ -71,6 +71,8 @@ SGL_DEVICE fp32x2_t round_bf16(fp32x2_t v) {
 // `kPrefetchWeights` additionally issues the gate / pre-norm weight loads before
 // the first reduction, so a small-M launch costs one DRAM round trip instead of
 // three; at large M the register cost of that outweighs the latency it hides.
+// `branch_at(pack, index)` returns the row's bf16 branch vector `index`: a load
+// here, the all-reduced row in all_reduce_norm_residual.cuh.
 template <
     int64_t kHidden,
     int kNumThreads,
@@ -79,9 +81,9 @@ template <
     bool kPostNormIsInputScale,
     bool kHasRouter,
     bool kPostWeight,
-    bool kGate>
-__global__ void __launch_bounds__(kNumThreads)
-    muse_spark_norm_residual_kernel(const __grid_constant__ NormResidualParams params) {
+    bool kGate,
+    typename BranchAt>
+SGL_DEVICE void norm_residual_row(const NormResidualParams& params, int row, BranchAt branch_at) {
   using namespace device;
   using namespace device::norm_residual;
 
@@ -93,8 +95,7 @@ __global__ void __launch_bounds__(kNumThreads)
   using BF16Vec = AlignedVector<bf16x2_t, kPairs>;
   using F32Vec = AlignedVector<fp32x2_t, kFPairs>;
 
-  const int64_t base = static_cast<int64_t>(blockIdx.x) * kHidden;
-  const auto branch = static_cast<const bf16_t*>(params.branch) + base;
+  const int64_t base = static_cast<int64_t>(row) * kHidden;
   const auto stream = static_cast<const fp32_t*>(params.stream) + base;
   const auto out = static_cast<bf16_t*>(params.output) + base;
   const auto new_stream = static_cast<fp32_t*>(params.new_stream) + base;
@@ -124,8 +125,7 @@ __global__ void __launch_bounds__(kNumThreads)
 #pragma unroll
   for (int p = 0; p < kPacks; ++p) {
     const int idx = threadIdx.x + p * kNumThreads;
-    BF16Vec branch_v;
-    branch_v.load(branch, idx);
+    const BF16Vec branch_v = branch_at(p, idx);
 #pragma unroll
     for (int j = 0; j < kFParts; ++j)
       stream_v[p][j].load(stream, idx * kFParts + j);
@@ -271,6 +271,34 @@ __global__ void __launch_bounds__(kNumThreads)
   PDLTriggerSecondary<kUsePDL>();
 }
 
+// Kernel entry point: one CTA per row, branch loaded from params.branch.
+template <
+    int64_t kHidden,
+    int kNumThreads,
+    bool kUsePDL,
+    bool kPrefetchWeights,
+    bool kPostNormIsInputScale,
+    bool kHasRouter,
+    bool kPostWeight,
+    bool kGate>
+__global__ void __launch_bounds__(kNumThreads)
+    muse_spark_norm_residual_kernel(const __grid_constant__ NormResidualParams params) {
+  const auto branch = static_cast<const bf16_t*>(params.branch) + static_cast<int64_t>(blockIdx.x) * kHidden;
+  norm_residual_row<
+      kHidden,
+      kNumThreads,
+      kUsePDL,
+      kPrefetchWeights,
+      kPostNormIsInputScale,
+      kHasRouter,
+      kPostWeight,
+      kGate>(params, blockIdx.x, [branch](int, int idx) {
+    device::AlignedVector<bf16x2_t, device::norm_residual::kPairs> v;
+    v.load(branch, idx);
+    return v;
+  });
+}
+
 // Multi-CTA path partitions each row and exchanges FP32 partials through DSM.
 // Kept separate to leave the single-CTA throughput path unchanged.
 
@@ -401,7 +429,7 @@ SGL_DEVICE void dsmem_reduce(
 
 }  // namespace device::norm_residual_cluster
 
-// Multiple CTAs per row exchange partial RMS statistics through DSM.
+// Multiple CTAs per row exchange partial RMS statistics through DSM; `branch_at` as in norm_residual_row.
 template <
     int64_t kHidden,
     int kNumThreads,
@@ -411,9 +439,9 @@ template <
     bool kPostNormIsInputScale,
     bool kHasRouter,
     bool kPostWeight,
-    bool kGate>
-__global__ void __launch_bounds__(kNumThreads)
-    muse_spark_norm_residual_cluster(const __grid_constant__ NormResidualParams params) {
+    bool kGate,
+    typename BranchAt>
+SGL_DEVICE void norm_residual_cluster_row(const NormResidualParams& params, int row, BranchAt branch_at) {
   using namespace device;
   using namespace device::norm_residual;
   using namespace device::norm_residual_cluster;
@@ -430,9 +458,7 @@ __global__ void __launch_bounds__(kNumThreads)
   using F32Vec = AlignedVector<fp32x2_t, kFPairs>;
 
   const int cluster_rank = cooperative_groups::this_cluster().block_rank();
-  const int row = static_cast<int>(blockIdx.x) / kClusterSize;
   const int64_t base = static_cast<int64_t>(row) * kHidden;
-  const auto branch = static_cast<const bf16_t*>(params.branch) + base;
   const auto stream = static_cast<const fp32_t*>(params.stream) + base;
   const auto out = static_cast<bf16_t*>(params.output) + base;
   const auto new_stream = static_cast<fp32_t*>(params.new_stream) + base;
@@ -475,12 +501,11 @@ __global__ void __launch_bounds__(kNumThreads)
 #pragma unroll
   for (int pack = 0; pack < kPacks; ++pack) {
     const int index = cluster_rank * kNumThreads + threadIdx.x + pack * kTotalThreads;
-    BF16Vec branch_values;
+    const BF16Vec branch_values = branch_at(pack, index);
     BF16Vec post_weights;
     F32Vec stream_values[kFParts];
     F32Vec alpha_values[kFParts];
     F32Vec beta_vector[kFParts];
-    branch_values.load(branch, index);
     if constexpr (kPostWeight) post_weights.load(post_weight, index);
     if constexpr (kPrefetchWeights) {
       if (has_pre_weight) pre_w_pf[pack].load(pre_weight, index);
@@ -607,6 +632,37 @@ __global__ void __launch_bounds__(kNumThreads)
       if constexpr (kHasRouter) router_values[part].store(router, float_index);
     }
   }
+}
+
+// Kernel entry point: one cluster per row, branch loaded from params.branch.
+template <
+    int64_t kHidden,
+    int kNumThreads,
+    int kClusterSize,
+    bool kUsePDL,
+    bool kPrefetchWeights,
+    bool kPostNormIsInputScale,
+    bool kHasRouter,
+    bool kPostWeight,
+    bool kGate>
+__global__ void __launch_bounds__(kNumThreads)
+    muse_spark_norm_residual_cluster(const __grid_constant__ NormResidualParams params) {
+  const int row = static_cast<int>(blockIdx.x) / kClusterSize;
+  const auto branch = static_cast<const bf16_t*>(params.branch) + static_cast<int64_t>(row) * kHidden;
+  norm_residual_cluster_row<
+      kHidden,
+      kNumThreads,
+      kClusterSize,
+      kUsePDL,
+      kPrefetchWeights,
+      kPostNormIsInputScale,
+      kHasRouter,
+      kPostWeight,
+      kGate>(params, row, [branch](int, int index) {
+    device::AlignedVector<bf16x2_t, device::norm_residual::kPairs> v;
+    v.load(branch, index);
+    return v;
+  });
 }
 
 template <
