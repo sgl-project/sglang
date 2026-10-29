@@ -1465,7 +1465,6 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
-    full_attention_layer_ids: Optional[List[int]] = None,
 ) -> None:
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -1481,7 +1480,6 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
-    npu_kv_pool = None
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
@@ -1604,20 +1602,9 @@ def setup_state_kv_args(
                 if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
                 else None
             )
-            full_kv_pool = token_to_kv_pool.full_kv_pool
-            kv_args.is_hybrid_mla_backend = is_mla_backend(full_kv_pool)
-            if (
-                isinstance(full_kv_pool, NPUMLATokenToKVPool)
-                and full_kv_pool.index_head_dim is None
-            ):
-                npu_kv_pool = full_kv_pool
-                kv_layer_count = len(full_attention_layer_ids)
-                draft_kv_pool = draft_token_to_kv_pool
-                if isinstance(draft_kv_pool, HybridLinearKVPool):
-                    draft_kv_pool = draft_kv_pool.full_kv_pool
-                draft_layer_count = (
-                    draft_kv_pool.layer_num if kv_args.num_draft_entries else 0
-                )
+            kv_args.is_hybrid_mla_backend = is_mla_backend(
+                token_to_kv_pool.full_kv_pool
+            )
             conv_shard_groups = (
                 token_to_kv_pool.get_state_conv_shard_groups()
                 if hasattr(token_to_kv_pool, "get_state_conv_shard_groups")
@@ -1736,9 +1723,11 @@ def setup_state_kv_args(
                 tail_lens = tail_lens + draft_tail_lens
                 tail_item_lens = tail_item_lens + draft_tail_item_lens
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
-                npu_kv_pool = token_to_kv_pool
-                kv_layer_count = total_kv_layers
-                draft_layer_count = (
+                kv_args.kv_buf_groups = (
+                    3 if token_to_kv_pool.index_head_dim is not None else 2
+                )
+                kv_args.hidden_kv_layers = total_kv_layers
+                kv_args.draft_kv_layers = (
                     draft_token_to_kv_pool.layer_num if draft_token_to_kv_pool else 0
                 )
             else:
@@ -1753,11 +1742,6 @@ def setup_state_kv_args(
                         tail_lens,
                         tail_item_lens,
                     )
-
-    if npu_kv_pool is not None:
-        kv_args.kv_buf_groups = 3 if npu_kv_pool.index_head_dim is not None else 2
-        kv_args.hidden_kv_layers = kv_layer_count
-        kv_args.draft_kv_layers = draft_layer_count
 
     if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
         from sglang.srt.disaggregation.ascend.conn import AscendStateType

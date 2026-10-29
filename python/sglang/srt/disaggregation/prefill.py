@@ -356,11 +356,6 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
-            full_attention_layer_ids=getattr(
-                self.scheduler.model_config.hf_text_config,
-                "full_attention_layer_ids",
-                None,
-            ),
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)

@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -448,11 +449,22 @@ class AscendKVManager(MooncakeKVManager):
             )
 
         src_kv_ptrs = self.kv_args.kv_data_ptrs
-        _, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
-        if dst_kv_item_lens:
-            _, dst_kv_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
-                self.kv_args.kv_item_lens, dst_kv_item_lens
+        if self.is_hybrid_mla_backend:
+            dst_indices = resolve_dcp_dst_entry_indices(
+                self.kv_args.kv_layer_ids,
+                dst_layer_ids,
+                len(src_kv_ptrs),
+                len(dst_kv_ptrs),
             )
+            dst_kv_ptrs = [dst_kv_ptrs[j] for j in dst_indices]
+            if dst_kv_item_lens:
+                dst_kv_item_lens = [dst_kv_item_lens[j] for j in dst_indices]
+        else:
+            _, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
+            if dst_kv_item_lens:
+                _, dst_kv_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                    self.kv_args.kv_item_lens, dst_kv_item_lens
+                )
 
         layout = self._get_dcp_remote_decode_layout()
         num_entries = len(src_kv_ptrs)

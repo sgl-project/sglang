@@ -679,11 +679,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
-            full_attention_layer_ids=getattr(
-                self.scheduler.model_config.hf_text_config,
-                "full_attention_layer_ids",
-                None,
-            ),
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
