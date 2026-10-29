@@ -143,6 +143,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             images_config=getattr(request, "images_config", None),
+            mm_processor_kwargs=request.mm_processor_kwargs,
         )
 
         return adapted_request, request
@@ -173,6 +174,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,
             "sampling_seed": request.seed,
+            "watermark": request.watermark,
         }
 
         # Handle response_format constraints
@@ -370,8 +372,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         raise_pre_stream_abort(abort_status, message)
                     error = self.create_streaming_error_response(
                         message,
-                        abort_status.name,
-                        abort_status.value,
+                        getattr(abort_status, "name", str(abort_status)),
+                        int(abort_status),
                     )
                     yield f"data: {error}\n\n"
                     break

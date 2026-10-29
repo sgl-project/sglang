@@ -13,7 +13,15 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
-from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.fixup_zero_kv import (
+    _jit_fixup_module,
+    fixup_zero_kv_rows,
+)
+from sglang.kernels.ops.attention.kv_indices import (
+    create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
+    get_num_page_per_block_flashmla,
+)
 from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
 )
@@ -38,11 +46,6 @@ from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
     mla_quantize_without_rope_for_fp8,
-)
-from sglang.kernels.ops.kvcache.kv_indices import (
-    create_flashmla_kv_indices_triton,
-    get_num_kv_index_blocks_flashmla,
-    get_num_page_per_block_flashmla,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
@@ -79,7 +82,7 @@ if is_flashinfer_available():
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -244,6 +247,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.backend = backend
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
+        # Prebuild: the first zero-KV prefix chunk otherwise JITs ~6s mid-serving.
+        _jit_fixup_module(self.q_data_type)
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._kv_shard_pool = get_kv_shard_pool(model_runner.token_to_kv_pool)
@@ -383,7 +388,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         parallel = get_parallel()
         pages_per_block = get_num_page_per_block_flashmla(self.page_size)
         # None on a static pool, whose collapsed page is already physical.
-        v2p = self.kv_index_translator.full_v2p_table
+        v2p = self.runner_ids.full_v2p_table
         create_mla_kv_page_table_for_dcp[
             (
                 block_kv_indices.shape[0],
@@ -408,7 +413,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def _create_block_kv_indices(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         batch_size: int,
         max_blocks: int,
         req_pool_indices: torch.Tensor,
@@ -429,7 +434,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             Block KV indices tensor
         """
         dcp_enabled = get_parallel().dcp_enabled
-        translated = self.kv_index_translator.is_translating and not dcp_enabled
+        translated = self.runner_ids.is_translating and not dcp_enabled
         # A translated table holds the plan's page ids and reads the sink past
         # them: a draft extend pads every row's key length to its widest row,
         # and the padded queries (whose outputs are dropped) read that far.
@@ -449,7 +454,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             return block_kv_indices
 
         if translated:
-            self.kv_index_translator.copy_page_table(plan, out=block_kv_indices)
+            self.runner_ids.copy_page_table(plan, out=block_kv_indices)
         else:
             create_flashmla_kv_indices_triton[
                 (
@@ -598,7 +603,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def _apply_cuda_graph_metadata(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -637,11 +642,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(seq_lens[:bs])
 
         # Update block indices for new sequences.
-        if self.kv_index_translator.is_translating:
+        if self.runner_ids.is_translating:
             # The plan's table reaches a verify's draft tail.
-            self.kv_index_translator.copy_page_table(
-                plan, out=metadata.block_kv_indices[:bs]
-            )
+            self.runner_ids.copy_page_table(plan, out=metadata.block_kv_indices[:bs])
         else:
             create_flashmla_kv_indices_triton[
                 (
@@ -750,7 +753,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.seq_lens.device,
             )
             self._apply_cuda_graph_metadata(
-                plan=forward_batch.kv_loc_plan,
+                plan=forward_batch.iteration_ids,
                 bs=bs,
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
@@ -758,7 +761,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
         else:
             self._apply_cuda_graph_metadata(
-                plan=forward_batch.kv_loc_plan,
+                plan=forward_batch.iteration_ids,
                 bs=bs,
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
@@ -864,7 +867,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             max_seqlen_pad = self._calc_padded_blocks(max_seq)
             block_kv_indices = self._create_block_kv_indices(
-                forward_batch.kv_loc_plan,
+                forward_batch.iteration_ids,
                 bs,
                 max_seqlen_pad,
                 forward_batch.req_pool_indices,
@@ -1012,8 +1015,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             raise NotImplementedError(
                 "trtllm_mla cannot forward a global causal bound to its decode "
                 "kernel, which is required for DCP with q_len > 1 (speculative "
-                "target-verify / draft-extend); select cutedsl_mla or "
-                "tokenspeed_mla for a DCP speculative run"
+                "target-verify / draft-extend); select cutedsl_mla "
+                "for a DCP speculative run"
             )
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
@@ -1068,10 +1071,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         o_sf_scale: float = 1.0,
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
-        in model-native dtype; subclasses do any kernel-specific quantization.
+        in model-native dtype, or already FP8 from a model-side prefill hook;
+        subclasses do any kernel-specific quantization.
         Returns the output tensor or (output, lse) if return_lse."""
         q_scale = k_scale = v_scale = 1.0
-        if self.data_type == torch.float8_e4m3fn:
+        if self.data_type == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
@@ -1120,7 +1124,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Same raw per-layer buffer the decode kernel reads below (bf16-only
         # gate means store_dtype == dtype, so no view); get_key_buffer applies
         # the hybrid pool's full-attention layer-id mapping.
-        kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_raw = self.kv_layers.read(layer.layer_id).key()
         kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
         if not set_mla_kv_concat_q_covered(
             kv_buffer=kv_2d,
@@ -1163,7 +1167,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         # fp8 view of the pool's uint8 store; same buffer the decode kernel
         # reads below.
-        kv_raw = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_raw = self.kv_layers.read(layer.layer_id).key()
         kv_2d = kv_raw.view(kv_raw.shape[0], -1) if kv_raw.dim() != 2 else kv_raw
         if not set_mla_kv_concat_q_fp8_covered(
             kv_buffer=kv_2d,
@@ -1178,7 +1182,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # `loc` is WIDENED: the kernel resolves the owner rule itself, and that
         # is also its only skip. A DCP-resolved loc never reaches here -- see
         # the `_fused_set_kv_concat_q_fp8` gate.
-        assert not (parallel.dcp_enabled and self.kv_index_translator.is_translating), (
+        assert not (parallel.dcp_enabled and self.runner_ids.is_translating), (
             "fused fp8 KV write reached with a DCP-resolved loc"
         )
         return set_mla_kv_concat_q_fp8(
@@ -1290,7 +1294,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     q_rope=q_rope,
                 )
             if query is None:
-                self.token_to_kv_pool.set_mla_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store_mla(
                     layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
                 )
 
@@ -1318,7 +1322,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             query = query.unsqueeze(1)
 
         # Prepare KV cache inline
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.kv_layers.read(layer.layer_id).key()
         kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
         # Get metadata
@@ -1484,7 +1488,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert k is not None and k_rope is not None, (
                 "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             )
-            self.token_to_kv_pool.set_mla_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store_mla(
                 layer, KVWriteLoc.for_batch(forward_batch), k, k_rope
             )
 
@@ -1529,7 +1533,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Ensure query has shape [bs, num_draft_tokens, num_q_heads, head_dim]
             bs = forward_batch.batch_size
 
-            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            k_cache = self.kv_layers.read(layer.layer_id).key()
             kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
             q = q.to(self.data_type)
@@ -1540,7 +1544,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq_len = metadata.max_seq_len_k + (
                     0 if dcp_enabled else draft_token_num
                 )
-                ragged_layout = forward_batch.spec_info.ragged_verify_layout
+                ragged_layout = forward_batch.ragged_verify_layout
                 if ragged_layout is None or dcp_enabled:
                     q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
                     needs_unpad = False

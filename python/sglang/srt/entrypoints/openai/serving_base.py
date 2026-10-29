@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def error_abort_status(finish_reason: Optional[dict]) -> Optional[HTTPStatus]:
+def error_abort_status(finish_reason: Optional[dict]) -> Optional[int]:
     """Return the HTTP status of an abort that carries an error ``status_code``.
 
     Returns None for any other finish, including a graceful abort without a
@@ -42,12 +43,17 @@ def error_abort_status(finish_reason: Optional[dict]) -> Optional[HTTPStatus]:
     if code is None:
         return None
     try:
-        return HTTPStatus(int(code))
+        code = int(code)
     except (TypeError, ValueError):
         return None
+    try:
+        return HTTPStatus(code)
+    except ValueError:
+        # Preserve non-standard 4xx/5xx codes, as the non-streaming path does.
+        return code if code in HTTP_ERROR_ABORT_STATUSES else None
 
 
-def raise_pre_stream_abort(status: HTTPStatus, message: str) -> None:
+def raise_pre_stream_abort(status: int, message: str) -> None:
     """Raise an error abort that arrived before a stream yielded its first chunk.
 
     Streaming handlers wait for the generator's first chunk before sending the
@@ -64,7 +70,7 @@ def raise_pre_stream_abort(status: HTTPStatus, message: str) -> None:
         return
     if status == HTTPStatus.BAD_REQUEST:
         raise ValueError(message)
-    raise HTTPException(status_code=status.value, detail=message)
+    raise HTTPException(status_code=int(status), detail=message)
 
 
 # Base class for specific endpoint handlers
@@ -83,17 +89,24 @@ class OpenAIServingBase(ABC):
     def _parse_model_parameter(self, model: str) -> Tuple[str, Optional[str]]:
         """Parse 'base-model:adapter-name' syntax to extract LoRA adapter.
 
-        Returns (base_model, adapter_name) or (model, None) if no colon present.
+        Returns (base_model, adapter_name), preserving an exact served model
+        name even when it contains colons (e.g. an object-storage URI).
         """
         if ":" not in model:
             return model, None
 
-        # Split on first colon only to handle model paths with multiple colons
-        parts = model.split(":", 1)
-        base_model = parts[0].strip()
-        adapter_name = parts[1].strip() or None
+        served_model_name = self.tokenizer_manager.served_model_name
+        if model == served_model_name:
+            return model, None
 
-        return base_model, adapter_name
+        # Match the full served name before splitting URI schemes like s3://.
+        if model.startswith(f"{served_model_name}:"):
+            base_model = served_model_name
+            adapter_name = model[len(served_model_name) + 1 :]
+        else:
+            base_model, adapter_name = model.split(":", 1)
+
+        return base_model.strip(), adapter_name.strip() or None
 
     def _resolve_lora_path(
         self,
@@ -132,9 +145,11 @@ class OpenAIServingBase(ABC):
             if request_logger.log_requests and request_logger.log_requests_level >= 2:
                 request_logger.log_openai_received_request(request, request=raw_request)
 
-            # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
+            # Convert off-loop: jinja render + full-prompt tokenization blocks
+            # the loop on long prompts, and the rust tokenizer releases the GIL.
+            loop = asyncio.get_running_loop()
+            adapted_request, processed_request = await loop.run_in_executor(
+                None, self._convert_to_internal_request, request, raw_request
             )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):

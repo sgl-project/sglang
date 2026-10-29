@@ -25,7 +25,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _spec_result(index):
@@ -338,8 +338,16 @@ class ServingCompletionTestCase(unittest.TestCase):
             # (status_code as sent by the engine, expected status, expected type)
             (HTTPStatus.SERVICE_UNAVAILABLE, 503, "503"),
             (HTTPStatus.BAD_REQUEST, 400, "BadRequestError"),
+            (HTTPStatus.INTERNAL_SERVER_ERROR, 500, "500"),
+            (HTTPStatus.TOO_MANY_REQUESTS, 429, "429"),
+            (HTTPStatus.BAD_GATEWAY, 502, "502"),
+            (HTTPStatus.GATEWAY_TIMEOUT, 504, "504"),
             # msgpack IPC decodes HTTPStatus to a plain int.
+            (400, 400, "BadRequestError"),
             (503, 503, "503"),
+            # Non-standard 4xx/5xx statuses match the non-streaming path too.
+            (499, 499, "499"),
+            (599, 599, "599"),
         ]
         for sent_code, want_status, want_type in cases:
             with self.subTest(sent_code=sent_code):

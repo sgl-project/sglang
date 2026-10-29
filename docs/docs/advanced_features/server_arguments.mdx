@@ -307,6 +307,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-http-worker-reuseport`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Give each Uvicorn HTTP worker its own SO_REUSEPORT listener.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-http2`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
@@ -464,6 +470,18 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--chunked-prefill-size`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--prefill-decode-interval`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--prefill-decode-interval-min-bs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Apply `--prefill-decode-interval` only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to always apply the interval.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
         <tr>
@@ -668,7 +686,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dcp-comm-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Communication backend for the DCP attention reduction: AllGather + ReduceScatter, fused NCCL All-to-All, or FlashInfer MNNVL All-to-All. Unset resolves to <code>fi_a2a</code> where the DCP group shares an MNNVL domain on Blackwell, else <code>a2a</code> on CUDA/ROCm, else <code>ag_rs</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Communication backend for the DCP attention reduction: AllGather + ReduceScatter, one All-to-All exchange, or FlashInfer MNNVL All-to-All. Unset resolves to <code>fi_a2a</code> where the DCP group shares an MNNVL domain on Blackwell, else <code>a2a</code> on CUDA/ROCm/XPU, else <code>ag_rs</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>ag_rs</code>, <code>a2a</code>, <code>fi_a2a</code></td>
     </tr>
@@ -1382,7 +1400,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--lora-drain-wait-threshold`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For LoRA adapters whose requests wait longer than this threshold (seconds) and need a slot, selectively drain unpinned running adapters to make room. Draining is best effort: freed slots are not reserved and waiting time is not bounded. Set to 0 to disable draining (default).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0.0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>
@@ -1441,6 +1459,24 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Choose the kernels for decode attention layers (have priority over --attention-backend).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>torch_native</code>, <code>flex_attention</code>, <code>dsa</code>, <code>nsa</code>, <code>dsv4</code>, <code>compressed</code>, <code>fa3</code>, <code>fa4</code>, <code>flashinfer</code>, <code>flashmla</code>, <code>trtllm_mla</code>, <code>cutedsl_mla</code>, <code>tokenspeed_mla</code>, <code>trtllm_mha</code>, <code>aiter</code>, <code>wave</code>, <code>intel_amx</code>, <code>ascend</code>, <code>intel_xpu</code></td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-nvidia-megakernel`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the NVIDIA megakernel from the sgl-nvidia-mega package, or for MiniMax-M3.1 from the SGLang plugin of the MSA package. Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-amd-monokernel`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the AMD monokernels from the sgl-amd-mono package. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--monokernel-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>Deprecated.</strong> Use <code>--enable-amd-monokernel</code> instead of <code>--monokernel-backend amd</code>, and <code>--enable-nvidia-megakernel</code> instead of <code>--monokernel-backend msa</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>amd</code>, <code>msa</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--sampling-backend`</td>
@@ -1644,9 +1680,9 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-moe-a2a-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MOE A2A backend for EAGLE speculative decoding, see `--moe-a2a-backend` for options. Same as moe a2a backend if unset.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MOE A2A backend for EAGLE speculative decoding, see `--moe-a2a-backend` for options. Same as moe a2a backend if unset. The experimental `ascend_ops` backend is supported on Ascend NPU and uses `--moe-ascend-ops-config`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>none</code>, <code>deepep</code>, <code>mooncake</code>, <code>nixl</code>, <code>mori</code>, <code>ascend_fuseep</code>, <code>flashinfer</code>, <code>megamoe</code>, <code>pplx</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>none</code>, <code>deepep</code>, <code>mooncake</code>, <code>nixl</code>, <code>mori</code>, <code>ascend_fuseep</code>, <code>flashinfer</code>, <code>megamoe</code>, <code>pplx</code>, <code>ascend_ops</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-enable-w4a4-mxfp4-megamoe`</td>
@@ -1752,12 +1788,6 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-skip-dp-mlp-sync`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip the extra MLP sync that the scheduler performs before merging a new batch when speculative decoding + DP attention are both enabled.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
-    </tr>
 </tbody>
 </table>
 
@@ -1814,7 +1844,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--moe-a2a-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the backend for all-to-all communication for expert parallelism.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`none`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>none</code>, <code>deepep</code>, <code>mooncake</code>, <code>nixl</code>, <code>mori</code>, <code>ascend_fuseep</code>, <code>flashinfer</code>, <code>megamoe</code>, <code>pplx</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>none</code>, <code>deepep</code>, <code>mooncake</code>, <code>nixl</code>, <code>mori</code>, <code>ascend_fuseep</code>, <code>flashinfer</code>, <code>megamoe</code>, <code>pplx</code>, <code>ascend_ops</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--moe-runner-backend`</td>
@@ -1929,6 +1959,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>` None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--moe-ascend-ops-config`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON configuration for the experimental `ascend_ops` MoE backend on the main or speculative draft model. `prefill` accepts `allgather` or `alltoallv` (default `alltoallv`); `decode` accepts `low_latency` or `fused_op` (default `low_latency`). Requires both the main and speculative backends to be `ascend_ops` when a speculative draft model is enabled; the backend is supported on an Ascend NPU. Example: `--moe-a2a-backend ascend_ops --speculative-moe-a2a-backend ascend_ops --moe-ascend-ops-config '{"prefill":"allgather","decode":"low_latency"}'`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON str</td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--moe-dense-tp-size`</td>
@@ -2091,10 +2127,28 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
   </thead>
   <tbody>
         <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-hierarchical-cache`</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-hierarchical-cache`<br/>`--enable-hicache`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable hierarchical cache</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-unified-cache-external-linker`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Link UnifiedRadixCache directly to an external KV store, with no host cache tier.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--unified-cache-external-linker-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the external linker backend. Use <code>dynamic</code> for an installed out-of-tree linker and specify its class and module in <code>--unified-cache-external-linker-config</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`mooncake`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>mooncake</code>, <code>mori</code>, <code>dynamic</code></td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--unified-cache-external-linker-config`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>JSON object configuring the selected backend. For <code>dynamic</code>, provide <code>linker</code> (class name), <code>linker_module_path</code> (Python module), and optional <code>linker_extra_config</code> (object). Built-in backends accept storage options directly; when supplied, this config replaces <code>--hicache-storage-backend-extra-config</code>, even when empty. You can supply config while the linker is disabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON object</td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-ratio`</td>
@@ -2124,13 +2178,31 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-mem-layout`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The layout of host memory pool for hierarchical cache.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`page_first`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>layer_first</code>, <code>page_first</code>, <code>page_first_direct</code>, <code>page_first_kv_split</code>, <code>page_head</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>layer_first</code>, <code>page_first</code>, <code>page_first_direct</code>, <code>page_first_kv_split</code>, <code>page_head</code>, <code>page_unified</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-storage-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>file</code>, <code>mooncake</code>, <code>hf3fs</code>, <code>nixl</code>, <code>aibrix</code>, <code>dynamic</code>, <code>eic</code>, <code>simm</code></td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-storage-key-scheme`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How L3 storage object keys encode what an object holds. 'rank-suffix' (legacy): keys carry the writer's tp/pp/cp rank, so only a bit-identical topology can reuse the cache. 'unified': keys carry topology-free grid coordinates (a namespace digest plus absolute layer and head-group indices), so any topology whose shards tile the same grid shares one cache. Implies --hicache-mem-layout page_unified and --hicache-io-backend kernel. Currently supported by the file backend for a single MHA/MLA pool. To reuse L3 across different TP and PP splits, set the same --hicache-storage-head-partition and --hicache-storage-layer-partition on all instances so each local shard tiles the shared chunk grid. The file backend stores each chunk separately and reassembles the reader's local pages; a page is a cache hit only when all of its chunks are present. Composite caches (including GLM-5.2 indexer and DeepSeek-V4 pools), draft sidecars, and decode context parallelism (DCP) are not supported.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`rank-suffix`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>rank-suffix</code>, <code>unified</code></td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-storage-head-partition`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>KV heads per L3 chunk under --hicache-storage-key-scheme unified. A FLEET-WIDE agreement, not a local tuning knob: it fixes chunk boundaries, and the boundaries are part of the key namespace. Set it to total_kv_heads divided by the lcm of the attention-TP sizes in the fleet, so every member's local head count is a whole number of chunks. Unset, each deployment keys to its own head count and shares only with its own TP size. MLA-family models replicate KV across ranks and ignore it.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-storage-layer-partition`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Layers per L3 chunk under --hicache-storage-key-scheme unified; the pipeline-parallel counterpart of --hicache-storage-head-partition and equally fleet-wide. Every stage must START on a multiple of it; only the final stage may end short, and that remainder forms the last chunk. Unset, each stage stores its own layer range and shares only with an identical split.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-storage-prefetch-policy`</td>
@@ -2207,6 +2279,38 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to the LMCache YAML configuration file</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+  </tbody>
+</table>
+
+## Paged experts
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Argument</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Defaults</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Options</th>
+    </tr>
+  </thead>
+  <tbody>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-paged-experts`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep only `--paged-experts-num-resident` routed experts per MoE layer on the GPU and page the rest from pinned host memory on demand. Single GPU; the experts must run on the triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill graphs must be breakable or disabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--paged-experts-num-resident`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of routed experts per MoE layer kept resident on the GPU. Required with `--enable-paged-experts`; at least the router's top-k.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
   </tbody>
 </table>
@@ -2370,6 +2474,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Mode of offloading.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`cpu`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--engram-config`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Where the DeepSeek-V4.1 Engram tables live, as a JSON object; omitted keys keep their defaults. `placement`: `gpu` (default) or `cpu` (pinned host memory, leaving the HBM to the KV cache). `replication`: `none` (default; one table split across the TP group) or `per_node` (each node holds the whole table; needs `cpu` and one node). `lookup`, with `replication` `none`: `auto` (default; SGLang picks the collective), `all_reduce`, `reduce_scatter`, `all_to_all`, or `peer_read` (read rows from the owning GPU's shard; needs `gpu` and CUDA). Replaces the deprecated `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE`, `SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT` and `SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS`. See [Engram tables](./engram).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: JSON object</td>
     </tr>
   </tbody>
 </table>
@@ -2708,6 +2818,18 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-watermark`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable Aaronson-Gumbel text watermarking.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--watermark-config`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Watermark settings as a JSON file path or an inline JSON object with optional key, key_b, context_window, mixing_probability, max_probability, default_enabled, and enforce_all fields.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: Optional[str]</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--flashinfer-mla-disable-ragged`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Not using ragged prefill wrapper when running flashinfer mla</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
@@ -2750,6 +2872,18 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>last</code>, <code>full</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-return-aux-hidden-states`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Capture auxiliary hidden states on the target model without running a speculative draft. `--speculative-algorithm` then only names the capture convention (EAGLE3, DFLASH or DSPARK) and is reset to `None`, so no draft is loaded. Requests with `return_hidden_states` receive the concatenated aux hidden states in place of the last-layer hidden states. Sets `--return-hidden-states-mode` to `full` when unset. Requires `pp_size == 1`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--return-aux-hidden-state-layer-ids`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Target-model layer ids for the selected capture convention. Required for DFLASH and DSPARK; EAGLE3 defaults to the model's EAGLE3 layers. Draft-checkpoint ids can differ: DFLASH uses zero-based layer-output ids for Llama and Qwen3, but layer-input ids for Muse Glimmer. For a Muse `DFlash2DraftModel` or `MuseGlimmerAssistantModel` draft, output-layer id 4 becomes capture id 5; this conversion is not automatic.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>List[int]</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-return-routed-experts`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable returning routed experts of each layer with responses.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
@@ -2786,8 +2920,20 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-layernorm-sp`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable sequence parallelism for prefill LayerNorm and residual regions under pure tensor parallelism. Supports Qwen3 dense and Muse Spark. Muse Spark requires TP4/EP4 or TP8/EP8, NVLink/NVSwitch, and <code>--moe-runner-backend flashinfer_trtllm</code>. Use ModelOpt NVFP4 with <code>--moe-a2a-backend flashinfer</code>, or enable MegaMoE for NVFP4 or BF16. Attention DP and pipeline parallelism are unsupported; speculative decoding is supported only for Muse Spark DFLASH.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-megamoe-for-layernorm-sp`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use MegaMoE for Muse Spark LayerNorm SP prefill, including BF16 excluded layers. Requires <code>--enable-layernorm-sp</code> and DeepGEMM with post-expert normalization (release/v0.2.3). Prefill and decode share TRT-LLM expert weights; decode uses FlashInfer TRT-LLM and all-reduce. FlashInfer A2A is optional. Mixed chunking is unsupported.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-prefill-cp`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable context parallelism for the prefill phase. Select the layout with <code>--cp-strategy</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable context parallelism for the prefill phase. Select the compute strategy with <code>--cp-strategy</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
@@ -2798,16 +2944,22 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>zigzag</code>, <code>interleave</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cp-kv-layout`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>KV storage layout for prefill CP; omitted keeps replicated KV storage.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Registered KV layout names</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-kv-cache-sharding`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Shard at-rest KV cache storage at page granularity across the group that currently replicates it (attention-CP ranks for GQA models under prefill CP; attention-TP ranks for MLA models), multiplying the group's unique KV capacity. Prefill workers of PD disaggregation only.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Shard KV cache pages across GPUs to reduce duplication and increase cache capacity. Only supported on P/D prefill workers. See <a href="/docs/advanced_features/kv_cache_sharing">KV cache sharing</a> for requirements and examples.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-fused-qk-norm-rope`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable fused qk normalization and rope rotary embedding.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse q/k normalization and rope rotary embedding into one kernel. Enabled by default on XPU and disabled elsewhere; `--no-enable-fused-qk-norm-rope` disables it.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: bool</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-precise-embedding-interpolation`</td>
@@ -2847,7 +2999,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enforce-shared-experts-fusion`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). Mutually exclusive with --disable-shared-experts-fusion.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). On a Quark MXFP4 Qwen3.5/Qwen3.8 checkpoint that excludes its shared expert from quantization, this also quantizes that shared expert to MXFP4 while loading so it can be fused, which runs its weights and its input activations at MXFP4 where the standalone path ran in BF16 - validate accuracy before using it. Mutually exclusive with --disable-shared-experts-fusion.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
@@ -3039,7 +3191,7 @@ This option does not disable required attention or MoE collectives, including ex
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-decode-enable-radix-cache`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, --disaggregation-transfer-backend fake, and speculative algorithms other than EAGLE, EAGLE3, and DSPARK.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>

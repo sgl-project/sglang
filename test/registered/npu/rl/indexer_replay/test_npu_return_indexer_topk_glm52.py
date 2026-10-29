@@ -44,6 +44,12 @@ class TestNPUGLM52ReturnIndexerTopk(CustomTestCase):
             GLM_5_2_BF16_MODEL_PATH,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env={
+                **os.environ,
+                "PYTORCH_NPU_ALLOC_CONF": (
+                    "expandable_segments:True,pin_memory_expandable_segments:True"
+                ),
+            },
             other_args=[
                 "--device",
                 "npu",
@@ -62,7 +68,7 @@ class TestNPUGLM52ReturnIndexerTopk(CustomTestCase):
                 "--disable-cuda-graph",
                 "--enable-return-indexer-topk",
                 "--json-model-override-args",
-                '{"num_hidden_layers": 6}',
+                '{"num_hidden_layers": 6, "quantization_config": null}',
             ],
         )
         try:

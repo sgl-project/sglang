@@ -33,8 +33,9 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
+    EmbeddingReqInput,
     GenerateReqInput,
-    wrap_as_pickle,
+    RequestOutputStats,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -46,7 +47,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
 )
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
@@ -62,11 +63,8 @@ _NOT_FINISHED = object()  # Sentinel: request has not finished yet
 
 _PER_REQUEST_INT_FIELDS = frozenset(
     {
-        "prompt_tokens",
         "completion_tokens",
         "reasoning_tokens",
-        "cached_tokens",
-        "retraction_counts",
         # Speculative-decoding int-scalar fields (current and historical names)
         "spec_verify_ct",
         "spec_accepted_drafts",
@@ -177,6 +175,20 @@ def _make_abort_req(rid: str, abort_message: str = "Aborted") -> AbortReq:
     )
 
 
+def _request_stats(**overrides) -> RequestOutputStats:
+    fields = dict(
+        prompt_tokens=0,
+        cached_tokens=0,
+        cached_tokens_details=None,
+        retraction_count=0,
+        image_tokens=0,
+        audio_tokens=0,
+        video_tokens=0,
+        time_stats=None,
+    )
+    return RequestOutputStats(**{**fields, **overrides})
+
+
 def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     """Create a minimal BatchStrOutput for a single request.
 
@@ -201,6 +213,8 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [fr]
         elif f.name == "output_strs":
             kwargs[f.name] = ["hello"]
+        elif f.name == "request_stats":
+            kwargs[f.name] = [_request_stats()]
         elif f.name in _PER_REQUEST_INT_FIELDS:
             kwargs[f.name] = [0]
         elif f.name in _PER_REQUEST_FLOAT_FIELDS:
@@ -260,6 +274,42 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(StopAsyncIteration):
                 await anext(stream)
 
+    async def test_cumulative_stream_backlog_preserves_customized_info(self):
+        """Cumulative streaming returns only the last queued output.
+
+        A customized_info key that arrived on an earlier queued output must
+        still reach the client through the accumulated state.
+        """
+        self.tm.incremental_streaming_output = False
+        key = "request_score"
+        hidden_key = "hidden_metric"
+        stream = self.tm._wait_one_response(self.state.obj)
+        first_meta_info = {"finish_reason": None}
+        self.tm.update_request_meta_info(
+            first_meta_info, self.state, {key: [[386.25]]}, 0, None
+        )
+        # Accumulated without being written to meta_info, as a subclass may do.
+        self.state.customized_info_accumulated[hidden_key] = [1.0, 2.0]
+        self.state.out_list.extend(
+            [
+                {"output_ids": [1], "meta_info": first_meta_info},
+                {
+                    "output_ids": [1, 2],
+                    "meta_info": {"finish_reason": {"type": "length"}},
+                },
+            ]
+        )
+        self.state.finished = True
+        self.state.event.set()
+
+        out = await anext(stream)
+
+        self.assertEqual(out["output_ids"], [1, 2])
+        self.assertEqual(out["meta_info"][key], [386.25])
+        self.assertNotIn(hidden_key, out["meta_info"])
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+
     async def test_cancelling_pending_wait_removes_event_waiter(self):
         stream = self.tm._wait_one_response(self.state.obj)
         pending = asyncio.create_task(anext(stream))
@@ -297,6 +347,29 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
                 with self.assertRaises(StopAsyncIteration):
                     await anext(stream)
+
+    async def test_non_stream_abort_with_gateway_error_is_raised(self):
+        """All 4xx/5xx aborts become HTTP errors, including non-standard codes."""
+        for status_code in (429, 499, 502, 504, 599):
+            with self.subTest(status_code=status_code):
+                state = _make_req_state(f"gateway_abort_{status_code}")
+                state.obj.stream = False
+                self.tm.rid_to_state[state.obj.rid] = state
+                out = {
+                    "meta_info": {
+                        "finish_reason": {
+                            "type": "abort",
+                            "status_code": status_code,
+                            "message": "encoder dispatch failed",
+                        }
+                    }
+                }
+                with self.assertRaises(HTTPException) as ctx:
+                    await self.tm._handle_abort_finish_reason(
+                        out, state, is_stream=False
+                    )
+                self.assertEqual(ctx.exception.status_code, status_code)
+                self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
 
     async def test_http_timeout_still_checks_disconnection(self):
         request = Mock()
@@ -468,6 +541,44 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
 
+class TestStoredRequestStats(CustomTestCase):
+    def test_rows_without_request_stats_read_the_latest_request_stats(self):
+        """A row without request stats reports the latest received, and a row
+        before any is dropped."""
+        tm = _make_tokenizer_manager(self)
+        rid = "request_stats_rid"
+        state = _make_req_state(rid)
+        state.obj.stream = True
+        tm.rid_to_state[rid] = state
+        first = _request_stats(prompt_tokens=5, cached_tokens=2)
+        retracted = _request_stats(prompt_tokens=5, cached_tokens=3, retraction_count=1)
+        for request_stats, finished_reason in (
+            ([first], _NOT_FINISHED),
+            (None, _NOT_FINISHED),
+            ([retracted], _NOT_FINISHED),
+            ([None], None),
+        ):
+            batch_output = _make_batch_str_output(rid, finished_reason)
+            batch_output.request_stats = request_stats
+            asyncio.run(tm._handle_batch_output(batch_output))
+
+        self.assertEqual(
+            [
+                (m["prompt_tokens"], m["cached_tokens"], m["num_retractions"])
+                for m in (out["meta_info"] for out in state.out_list)
+            ],
+            [(5, 2, 0), (5, 2, 0), (5, 3, 1), (5, 3, 1)],
+        )
+
+        # A late row of an aborted request whose rid a new request reused.
+        reused = tm.rid_to_state[rid] = _make_req_state(rid)
+        batch_output = _make_batch_str_output(rid, _NOT_FINISHED)
+        batch_output.request_stats = None
+        asyncio.run(tm._handle_batch_output(batch_output))
+        self.assertEqual(reused.out_list, [])
+        self.assertIs(tm.rid_to_state[rid], reused)
+
+
 class TestRequestTpotGating(CustomTestCase):
     """Request TPOT is observed once, only for requests with a real decode
     interval that ran to completion on a non-prefill worker."""
@@ -499,7 +610,9 @@ class TestRequestTpotGating(CustomTestCase):
         for completion_tokens, finished_reason in batches:
             batch_output = _make_batch_str_output(rid, finished_reason)
             batch_output.completion_tokens = [completion_tokens]
-            batch_output.time_stats = wrap_as_pickle([sched_stats])
+            batch_output.request_stats = [
+                _request_stats(time_stats=sched_stats.to_output_time_stats())
+            ]
             asyncio.run(tm._handle_batch_output(batch_output))
         (call,) = tm.metrics_collector.observe_one_finished_request.call_args_list
         return call.kwargs["time_per_output_token"]
@@ -550,7 +663,9 @@ class TestNonStreamingFirstTokenTime(CustomTestCase):
             enable_metrics=True, prefill_finished_time=prefill_finished_time
         )
         batch_output = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
-        batch_output.time_stats = wrap_as_pickle([sched_stats])
+        batch_output.request_stats = [
+            _request_stats(time_stats=sched_stats.to_output_time_stats())
+        ]
         arrival = time.perf_counter()
         asyncio.run(tm._handle_batch_output(batch_output))
         return state.time_stats, arrival
@@ -606,6 +721,164 @@ class TestInitReqStateDuplicateDetection(CustomTestCase):
 
         tm._init_req_state(obj)
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestInitReqStateAtomicity(CustomTestCase):
+    def assert_map_unchanged(self, tm, original_map, original_states):
+        self.assertIs(tm.rid_to_state, original_map)
+        self.assertEqual(set(tm.rid_to_state), set(original_states))
+        for rid, state in original_states.items():
+            self.assertIs(tm.rid_to_state[rid], state)
+
+    def test_live_collision_preserves_map_and_adapter_references(self):
+        for request_type in (GenerateReqInput, EmbeddingReqInput):
+            for collision_index in range(3):
+                with self.subTest(
+                    request_type=request_type.__name__, position=collision_index
+                ):
+                    tm = _make_tm_for_generate(self, enable_lora=True)
+                    tm.enable_trace = True
+                    live_state = _make_req_state("live")
+                    tm.rid_to_state = {"live": live_state}
+                    original_map = tm.rid_to_state
+                    original_states = dict(original_map)
+                    tm.abort_request = Mock()
+                    tm._release_lora_once = Mock()
+                    tm._tokenize_one_request = AsyncMock()
+                    tm._send_one_request = AsyncMock()
+                    rids = ["fresh0", "fresh1", "fresh2"]
+                    rids[collision_index] = "live"
+                    obj = request_type(
+                        text=["a", "b", "c"], rid=rids, lora_path="adapter"
+                    )
+
+                    async def drive():
+                        live_state.obj.lora_path = "adapter"
+                        live_state.obj.lora_id = await tm.lora_registry.acquire(
+                            "adapter"
+                        )
+                        with self.assertRaisesRegex(
+                            ValueError, "Duplicate request ID detected: live"
+                        ):
+                            await tm.generate_request(obj).__anext__()
+                        self.assertEqual(
+                            tm.lora_registry._counters["adapter"].value(), 1
+                        )
+
+                    with patch.object(APIServerReqTimeStats, "init_trace_ctx") as trace:
+                        asyncio.run(drive())
+                    self.assert_map_unchanged(tm, original_map, original_states)
+                    trace.assert_not_called()
+                    tm.abort_request.assert_not_called()
+                    tm._release_lora_once.assert_not_called()
+                    tm._tokenize_one_request.assert_not_called()
+                    tm._send_one_request.assert_not_called()
+                    tm.send_to_scheduler.send_pyobj.assert_not_called()
+                    self.assertFalse(live_state.abort_sent)
+                    self.assertFalse(live_state.lora_released)
+
+    def test_initialization_exceptions_preserve_map(self):
+        targets = (
+            "ReqState",
+            "APIServerReqTimeStats",
+            "APIServerReqTimeStats.init_trace_ctx",
+            "APIServerReqTimeStats.set_created_time",
+        )
+        for target in targets:
+            for failure_index in range(2):
+                with self.subTest(target=target, failure_index=failure_index):
+                    tm = _make_tokenizer_manager(self)
+                    tm.enable_trace = True
+                    tm.rid_to_state = {"live": _make_req_state("live")}
+                    original_map = tm.rid_to_state
+                    original_states = dict(original_map)
+                    obj = GenerateReqInput(text=["a", "b"], rid=["fresh0", "fresh1"])
+                    obj.normalize_batch_and_arguments()
+                    first_result = {
+                        "ReqState": _make_req_state("fresh0"),
+                        "APIServerReqTimeStats": APIServerReqTimeStats(),
+                    }.get(target)
+                    effects = [first_result] * failure_index + [
+                        RuntimeError("initialization failed")
+                    ]
+                    with patch(
+                        f"sglang.srt.managers.tokenizer_manager.{target}",
+                        side_effect=effects,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "initialization failed"
+                        ):
+                            tm._init_req_state(obj)
+                    self.assert_map_unchanged(tm, original_map, original_states)
+
+    def test_valid_single_and_batch_requests(self):
+        for request_type in (GenerateReqInput, EmbeddingReqInput):
+            for single in (True, False):
+                with self.subTest(request_type=request_type.__name__, single=single):
+                    tm = _make_tokenizer_manager(self)
+                    live_state = _make_req_state("live")
+                    tm.rid_to_state = {"live": live_state}
+                    obj = request_type(
+                        text="a" if single else ["a", "b"],
+                        rid="fresh" if single else ["fresh0", "fresh1"],
+                        received_time=123.0,
+                    )
+                    obj.normalize_batch_and_arguments()
+                    tm._init_req_state(obj)
+                    items = [obj] if single else [obj[i] for i in range(len(obj.rid))]
+                    self.assertEqual(len(tm.rid_to_state), len(items) + 1)
+                    self.assertIs(tm.rid_to_state["live"], live_state)
+                    for item in items:
+                        state = tm.rid_to_state[item.rid]
+                        self.assertIs(state.obj, item)
+                        self.assertEqual(state.time_stats.created_time, 123.0)
+                        self.assertFalse(state.dispatched)
+                        self.assertFalse(state.event.is_set())
+
+    def test_within_batch_duplicates_preserve_map(self):
+        for request_type in (GenerateReqInput, EmbeddingReqInput):
+            with self.subTest(request_type=request_type.__name__):
+                tm = _make_tm_for_generate(self)
+                tm.rid_to_state = {"live": _make_req_state("live")}
+                original_map = tm.rid_to_state
+                original_states = dict(original_map)
+                obj = request_type(text=["a", "b"], rid=["duplicate", "duplicate"])
+
+                async def drive():
+                    with self.assertRaisesRegex(ValueError, "Duplicate"):
+                        await tm.generate_request(obj).__anext__()
+
+                asyncio.run(drive())
+                self.assert_map_unchanged(tm, original_map, original_states)
+
+    def test_direct_initialization_rejects_duplicate_ids(self):
+        tm = _make_tokenizer_manager(self)
+        obj = GenerateReqInput(text=["a", "b"], rid=["fresh0", "fresh1"])
+        obj.normalize_batch_and_arguments()
+        obj.rid = ["duplicate", "duplicate"]
+        with self.assertRaisesRegex(ValueError, "Duplicate request ID"):
+            tm._init_req_state(obj)
+        self.assertFalse(tm.rid_to_state)
+
+    def test_trace_metadata_is_preserved(self):
+        tm = _make_tokenizer_manager(self)
+        tm.enable_trace = True
+        obj = GenerateReqInput(
+            text=["a", "b"],
+            rid=["fresh0", "fresh1"],
+            bootstrap_room=[10, 11],
+            received_time=123.0,
+        )
+        obj.normalize_batch_and_arguments()
+        request = Mock(headers={"traceparent": "parent", "unrelated": "ignored"})
+        with patch.object(APIServerReqTimeStats, "init_trace_ctx") as trace:
+            tm._init_req_state(obj, request)
+        self.assertEqual(trace.call_count, 2)
+        for i, trace_call in enumerate(trace.call_args_list):
+            self.assertEqual(
+                trace_call.args, (obj.rid[i], 10 + i, {"traceparent": "parent"})
+            )
+            self.assertEqual(tm.rid_to_state[obj.rid[i]].time_stats.created_time, 123.0)
 
 
 class TestResubmitAfterCompletion(CustomTestCase):
@@ -1031,6 +1304,7 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
             return_value=[]
         )
+        tm.positional_embeds_transport = Mock()
         tm._dispatch_to_scheduler = Mock()
         rid = "disconnect_zombie"
         obj = _make_generate_obj(rid, is_single=True)
@@ -1189,6 +1463,49 @@ class TestLoRARequestLifecycle(CustomTestCase):
     def test_second_parallel_warmup_failure_releases_all_references(self):
         """A failed warmup must return references even after earlier warmups finish."""
         asyncio.run(self._drive_parallel_request(fail_second_warmup=True))
+
+
+class TestPriorityRange(CustomTestCase):
+    """Request priorities reach the radix cache as signed 64-bit integers, so an
+    out-of-range value is rejected before dispatch instead of failing inside
+    the scheduler, and the boundary values themselves pass through unchanged."""
+
+    INT64_MIN = -(1 << 63)
+    INT64_MAX = (1 << 63) - 1
+
+    def test_int64_boundaries_are_preserved(self):
+        tm = _make_tokenizer_manager(self)
+        tm.enable_priority_scheduling = True
+        tm.default_priority_value = 0
+        for priority in (self.INT64_MIN, self.INT64_MAX):
+            with self.subTest(priority=priority):
+                obj = GenerateReqInput(input_ids=[1], priority=priority)
+                tm._set_default_priority(obj)
+                self.assertEqual(obj.priority, priority)
+
+    def test_out_of_range_priority_is_rejected_before_dispatch(self):
+        for enabled in (False, True):
+            for priority in (self.INT64_MIN - 1, self.INT64_MAX + 1):
+                for source in ("body", "default"):
+                    if source == "default" and not enabled:
+                        continue
+                    with self.subTest(
+                        enabled=enabled, priority=priority, source=source
+                    ):
+                        tm = _make_tm_for_generate(self)
+                        del tm._set_default_priority  # the real one is under test
+                        tm.enable_priority_scheduling = enabled
+                        tm.default_priority_value = (
+                            priority if source == "default" else 0
+                        )
+                        tm._init_req_state = Mock()
+                        obj = GenerateReqInput(
+                            input_ids=[1],
+                            priority=priority if source == "body" else None,
+                        )
+                        with self.assertRaisesRegex(ValueError, "signed 64-bit"):
+                            asyncio.run(tm.generate_request(obj).__anext__())
+                        tm._init_req_state.assert_not_called()
 
 
 if __name__ == "__main__":

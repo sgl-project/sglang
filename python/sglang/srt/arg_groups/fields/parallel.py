@@ -12,6 +12,10 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
     Derived,
 )
+from sglang.srt.arg_groups.choices import (
+    CP_KV_LAYOUT_CHOICES,
+    CP_STRATEGY_CHOICES,
+)
 
 
 class Parallel(msgspec.Struct):
@@ -129,10 +133,10 @@ class Parallel(msgspec.Struct):
         Arg(
             help="Communication backend for the decode context-parallel (DCP) "
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
-            "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
-            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
+            "(one All-to-All exchange of output+LSE, then a local LSE combine), "
+            "or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
             "Blackwell and a DCP group within one MNNVL domain). Unset resolves "
-            "to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm, else 'ag_rs'.",
+            "to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm/XPU, else 'ag_rs'.",
             choices=["ag_rs", "a2a", "fi_a2a"],
             resolvable=True,
         ),
@@ -152,13 +156,20 @@ class Parallel(msgspec.Struct):
     ] = None
     enable_prefill_cp: A[
         bool,
-        "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
+        "Enable context parallelism for the prefill phase. Select the compute strategy with --cp-strategy.",
     ] = False
     cp_strategy: A[
         Optional[str],
         Arg(
             help="Sharding strategy for prefill CP. 'zigzag' assigns each rank one early and one late sequence block; 'interleave' assigns token indices modulo the CP size.",
-            choices=("zigzag", "interleave"),
+            choices=CP_STRATEGY_CHOICES,
+        ),
+    ] = None
+    cp_kv_layout: A[
+        Optional[str],
+        Arg(
+            help="KV storage layout for prefill CP; omitted keeps replicated KV storage.",
+            choices=CP_KV_LAYOUT_CHOICES,
         ),
     ] = None
     enable_cp_tp_group_sharing: A[
@@ -245,7 +256,19 @@ class Parallel(msgspec.Struct):
         "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
         "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
         "sequence-sharded activations with no extra communication volume. "
-        "Prefill only; Qwen3 dense; requires tp_size > 1 and NVLink/NVSwitch.",
+        "Prefill only; supports Qwen3 dense and Muse Spark ModelOpt NVFP4 with "
+        "TP4/EP4 or TP8/EP8 with FlashInfer A2A or MegaMoE. "
+        "Muse Spark requires the FlashInfer TRT-LLM MoE runner and "
+        "NVLink/NVSwitch.",
+    ] = False
+    enable_megamoe_for_layernorm_sp: A[
+        bool,
+        "Use fused MegaMoE for Muse Spark NVFP4 TP4/EP4 or TP8/EP8 LayerNorm-SP prefill, "
+        "including BF16 excluded layers. Decode retains the FlashInfer TRT-LLM "
+        "MoE runner and all-reduce, sharing expert weights with prefill. "
+        "Requires --enable-layernorm-sp, DeepGEMM with post-expert normalization, "
+        "and NVLink/NVSwitch. "
+        "No FlashInfer A2A backend is required when enabled.",
     ] = False
     disable_attn_tp_gather: A[
         bool,

@@ -10,7 +10,6 @@ import asyncio
 import json
 import logging
 import uuid
-from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, Union
 
 from fastapi import HTTPException, Request
@@ -48,6 +47,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionStreamResponse,
+    ResponseFormat,
     StreamOptions,
     Tool,
     ToolChoice,
@@ -627,6 +627,15 @@ class AnthropicServing:
         # is still the hard cap).
         if anthropic_request.output_config is not None:
             oc = anthropic_request.output_config
+            if oc.format is not None:
+                chat_request.response_format = ResponseFormat(
+                    type="json_schema",
+                    json_schema={
+                        "name": "response",
+                        "schema": oc.format.schema_,
+                        "strict": True,
+                    },
+                )
             if oc.effort is not None:
                 chat_request.reasoning_effort = (
                     "max" if oc.effort == "xhigh" else oc.effort
@@ -680,6 +689,7 @@ class AnthropicServing:
                             "name": tool.name,
                             "description": tool.description or "",
                             "parameters": tool.input_schema,
+                            "strict": tool.strict,
                         },
                     )
                 )
@@ -693,6 +703,9 @@ class AnthropicServing:
         # no tool the model could call. Silently downgrading to "no tool"
         # would deceive the caller, so raise an explicit 400.
         if anthropic_request.tool_choice is not None:
+            chat_request.parallel_tool_calls = (
+                not anthropic_request.tool_choice.disable_parallel_tool_use
+            )
             tc_type = anthropic_request.tool_choice.type
             if tc_type == "none":
                 chat_request.tool_choice = "none"
@@ -767,6 +780,21 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
+        except HTTPException as e:
+            logger.warning(
+                "Non-streaming request rejected: %s %s", e.status_code, e.detail
+            )
+            return self._error_response(
+                status_code=e.status_code,
+                error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
+                message=_scrub_error_message(str(e.detail), e.status_code),
+            )
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(
@@ -812,6 +840,12 @@ class AnthropicServing:
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
@@ -835,20 +869,16 @@ class AnthropicServing:
         except asyncio.CancelledError:
             raise
         except HTTPException as e:
-            # An engine-side rejection (raise_pre_stream_abort). Its overload
-            # message is safe to forward; other 5xx details are scrubbed.
+            # Preserve the same status and message scrubbing as non-streaming.
             logger.warning(
                 "Streaming request rejected before first chunk: %s %s",
                 e.status_code,
                 e.detail,
             )
-            message = str(e.detail)
-            if e.status_code != HTTPStatus.SERVICE_UNAVAILABLE:
-                message = _scrub_error_message(message, e.status_code)
             return self._error_response(
                 status_code=e.status_code,
                 error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
-                message=message,
+                message=_scrub_error_message(str(e.detail), e.status_code),
             )
         except ValueError as e:
             return self._error_response(
@@ -1466,6 +1496,7 @@ class AnthropicServing:
                 thinking=request.thinking,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                output_config=request.output_config,
             )
             chat_request = self._convert_to_chat_completion_request(messages_request)
         except asyncio.CancelledError:
@@ -1500,6 +1531,12 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error counting tokens: %s", e)
             return self._error_response(

@@ -198,8 +198,7 @@ class SchedulerDllmMixin:
             ]
             self.token_to_kv_pool_allocator.free_segment(slots, start_pos=free_start)
 
-        req.kv.kv_committed_len = context_len
-        req.kv.kv_allocated_len = context_len
+        req.kv.set_row_len(context_len)
         assert req.kv.max_evicted_seqlen <= context_len
         req.extend_end = context_len
         self.stash_chunked_request(req)
@@ -376,7 +375,10 @@ class SchedulerDllmMixin:
         for req in reqs:
             # Check if batch is full
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs, num_held_rows=num_held_rows
+            ):
                 running_batch.batch_is_full = True
 
             # Try preemption if batch is full
