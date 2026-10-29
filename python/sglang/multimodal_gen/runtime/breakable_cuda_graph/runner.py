@@ -64,17 +64,6 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        logger.warning("[BCG] ignoring invalid float %s=%r", name, raw)
-        return default
-
-
 def _map_tensors(obj, fn):
     """Rebuild ``obj`` applying ``fn`` to every tensor leaf, recursing into
     list/tuple/dict containers; everything else passes through unchanged."""
@@ -567,9 +556,13 @@ class BaseBreakableCudaGraphRunner:
 
         # Warm up on the capture stream so cuBLAS/cuDNN/Triton workspaces and
         # any lazy JIT are materialized before capture (mirrors the LLM runner
-        # and torch.cuda.make_graphed_callables).
+        # and torch.cuda.make_graphed_callables). The BCG flag makes the warmup
+        # take the branches the capture records.
         self.device_module.synchronize()
-        with self.device_module.stream(self._capture_stream):
+        with (
+            self.device_module.stream(self._capture_stream),
+            enable_breakable_cuda_graph(),
+        ):
             for _ in range(2):
                 self.transformer(**static_kwargs)
         self._capture_stream.synchronize()

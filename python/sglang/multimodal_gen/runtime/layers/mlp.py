@@ -77,7 +77,7 @@ class MLP(nn.Module):
                 and x.is_cuda
                 and x.dtype in (torch.float16, torch.bfloat16)
             ):
-                from sglang.kernels.ops.elementwise.bias_gelu import bias_gelu_tanh
+                from sglang.kernels.ops.activation.bias_gelu import bias_gelu_tanh
 
                 return bias_gelu_tanh(x, bias)
             return self.act(x + bias)
