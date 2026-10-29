@@ -972,9 +972,11 @@ class KVCacheConfigurator:
             layer_ids = tuple(i for i in cache_params.layers if start <= i < end)
             geometry = StateGeometry.of(cache_params)
             mamba = get_exec().mamba
+            replay_spec = mamba.enable_linear_replayssm_spec and (
+                self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
+            )
             if (
-                mamba.enable_linear_replayssm_spec
-                and self.hybrid_kda_config is not None
+                replay_spec
                 and cache_params.is_kda
                 and get_disagg().disaggregation_mode != "null"
             ):
@@ -984,26 +986,23 @@ class KVCacheConfigurator:
                     "entry layouts. Disable --enable-linear-replayssm-spec "
                     "or --enable-unified-memory."
                 )
-            geometry = with_state_replay(
-                geometry,
-                StateReplay(
-                    decode=mamba.enable_linear_replayssm,
-                    speculative=mamba.enable_linear_replayssm_spec
-                    and (
-                        self.hybrid_gdn_config is not None
-                        or self.hybrid_kda_config is not None
+            if mamba.enable_linear_replayssm or replay_spec:
+                geometry = with_state_replay(
+                    geometry,
+                    StateReplay(
+                        decode=mamba.enable_linear_replayssm,
+                        speculative=replay_spec,
+                        is_kda=cache_params.is_kda,
+                        cache_len=mamba.linear_replayssm_cache_len,
+                        key_heads=cache_params.shape.num_k_heads_per_tp,
                     ),
-                    is_kda=cache_params.is_kda,
-                    cache_len=mamba.linear_replayssm_cache_len,
-                    key_heads=cache_params.shape.num_k_heads_per_tp,
-                ),
-                layer_ids=layer_ids,
-                speculative_num_draft_tokens=(
-                    None
-                    if _pd_prefill_skips_mamba_spec_state()
-                    else max_speculative_num_draft_tokens()
-                ),
-            )
+                    layer_ids=layer_ids,
+                    speculative_num_draft_tokens=(
+                        None
+                        if _pd_prefill_skips_mamba_spec_state()
+                        else max_speculative_num_draft_tokens()
+                    ),
+                )
             geometry = with_state_ple(
                 geometry,
                 **self._get_ple_req_pool_kwargs(),

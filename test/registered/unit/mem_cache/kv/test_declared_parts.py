@@ -324,6 +324,52 @@ class TestDeclaredParts(CustomTestCase):
                 regions.update(zip(pointers, lengths))
             self.assertEqual(regions, {(arena.raw.data_ptr(), prefix)})
 
+    def test_ordinary_conv_state_does_not_require_replay_head_geometry(self):
+        """Inkling must construct storage without GDN-only metadata when replay is off."""
+        from sglang.srt.configs.inkling import (
+            InklingConvCacheParams,
+            InklingConvStateShape,
+        )
+        from sglang.srt.mem_cache.kv.decl import StateLifetime
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        setup_allocator_context()
+        params = InklingConvCacheParams(
+            layers=[1],
+            shape=InklingConvStateShape(conv=[(3, 8)], temporal=(1, 1, 1)),
+        )
+        cfg = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        cfg.mambaish_config = SimpleNamespace(
+            mamba2_cache_params=params, full_attention_layer_ids=[0]
+        )
+        cfg.is_hybrid_swa = False
+        cfg.use_mla_backend = True
+        cfg.model_config = SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=4)
+        cfg.kv_cache_dtype = torch.bfloat16
+        cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
+        cfg.hybrid_gdn_config = cfg.hybrid_kda_config = None
+        decls = cfg._kv_layer_decls()
+        state = next(
+            part.geometry
+            for layer in decls
+            for part in layer.parts
+            if isinstance(part.lifetime, StateLifetime)
+        )
+        self.assertIsNone(state.replay)
+        self.assertEqual(state.conv_state_shapes, ((3, 8),))
+        self.assertEqual(state.temporal_state_shape, (1, 1, 1))
+        plan = plan_kv_storage(decls, page_size=4)
+        sized = size_plan(
+            plan,
+            KVSizingInputs(
+                budget_bytes=65536,
+                max_running_requests=2,
+                context_len=64,
+                alignment=1,
+            ),
+        )
+        self.assertGreater(sized.max_running_requests, 0)
+
     def test_reserved_request_backing_is_not_allocatable_capacity(self):
         """Capped concurrency must satisfy idle accounting even with larger backing."""
         from sglang.srt.mem_cache.kv.requests import RequestTable
