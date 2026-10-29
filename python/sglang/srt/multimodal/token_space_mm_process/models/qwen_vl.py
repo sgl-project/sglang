@@ -4,9 +4,6 @@ from types import MappingProxyType
 
 import torch
 from transformers import BatchFeature
-from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
-    Qwen3VLVideoProcessor,
-)
 
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.mrope_rope_index import (
@@ -106,6 +103,12 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
     # token IDs go to mm_token_expansion_params instead of MultimodalSpecialTokens.
     def __init__(self, hf_config, processor, *, mm_process_config=None):
         self.model_type = hf_config.model_type
+        # Qwen3-VL and later: the models with HF's Qwen3VLVideoProcessor.
+        self._qwen3_vl_family = self.model_type not in {
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_omni_moe",
+        }
         if self.model_type == "qwen3_omni_moe":
             hf_config = hf_config.thinker_config
 
@@ -132,8 +135,7 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             "spatial_merge_size": vision_config.spatial_merge_size,
             "temporal_patch_size": vision_config.temporal_patch_size,
             # Qwen3-VL and later prefix every frame with a timestamp and vision markers.
-            "frame_timestamps": self.model_type
-            not in {"qwen2_vl", "qwen2_5_vl", "qwen3_omni_moe"},
+            "frame_timestamps": self._qwen3_vl_family,
         }
 
     def resolve_media_options(
@@ -186,9 +188,9 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         kwargs.pop("seconds_per_chunk", None)
         kwargs.pop("position_id_per_seconds", None)
         # This family takes frames that qwen-vl-utils already sampled and resized.
-        qwen3_vl_video = isinstance(
-            processor.video_processor, Qwen3VLVideoProcessor
-        ) and isinstance(video, VideoDecoderWrapper)
+        qwen3_vl_video = self._qwen3_vl_family and isinstance(
+            video, VideoDecoderWrapper
+        )
         pixel_limits = None
         if qwen3_vl_video:
             image_factor = (
