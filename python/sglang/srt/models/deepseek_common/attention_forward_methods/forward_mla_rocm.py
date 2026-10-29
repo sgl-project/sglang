@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -77,6 +78,24 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+_HEAD_BMM_MAX_TOKENS = 288
+
+
+def _token_major_head_bmm(x, w, out):
+    """out[t, h] = x[t, h] @ w[h]; x and out are token-major [T, H, *]."""
+    if (
+        x.shape[0] <= _HEAD_BMM_MAX_TOKENS
+        and x.stride(2) == 1
+        and w.stride(2) == 1
+        and x.shape[2] % 64 == 0
+        and w.shape[2] % 64 == 0
+    ):
+        from sglang.kernels.ops.attention.dcp_kernels import head_bmm
+
+        head_bmm(x, w, out)
+    else:
+        torch.bmm(x.transpose(0, 1), w, out=out.transpose(0, 1))
+
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -681,7 +700,14 @@ class DeepseekMLARocmForwardMixin:
             and _can_fuse_bmm_rope_cat_and_cache(self)
         )
 
-        if q_replicate_active:
+        if q_replicate_active and not is_in_tc_piecewise_cuda_graph():
+            # Write token-major directly; a head-major result would need a full
+            # [T, H, kv_lora_rank] transpose copy before attention.
+            q_nope_out = q_nope.new_empty(
+                q_nope.shape[0], q_nope.shape[1], self.kv_lora_rank
+            )
+            _token_major_head_bmm(q_nope, self.w_kc_qrep, q_nope_out)
+        elif q_replicate_active:
             q_nope_out = (
                 torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
                 .transpose(0, 1)
@@ -1023,6 +1049,23 @@ class DeepseekMLARocmForwardMixin:
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
+                if self._dcp_project_before_merge():
+                    # Project-before-merge: the LSE merge is linear in the
+                    # partial output, so V-project every group head first and
+                    # exchange v_head_dim instead of kv_lora_rank per head.
+                    attn_bmm_output = dcp_a2a_lse_reduce(
+                        self._dcp_project_partials(attn_output),
+                        lse.contiguous(),
+                        get_parallel().dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                        comm_backend=dcp_comm_backend,
+                    ).flatten(1, 2)
+                    output, _ = self.o_proj(attn_bmm_output)
+                    if self.next_skip_topk is None:
+                        return output
+                    if not self.next_skip_topk:
+                        return output, None
+                    return output, topk_indices
                 if dcp_comm_backend in ("a2a", "fi_a2a"):
                     # A2A exchange of head partials + LSE, then local Triton combine.
                     attn_output = dcp_a2a_lse_reduce(
@@ -1119,6 +1162,24 @@ class DeepseekMLARocmForwardMixin:
         if dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
             return None
         return dtype
+
+    def _dcp_project_before_merge(self: DeepseekV2AttentionMLA) -> bool:
+        return (
+            get_parallel().dcp_comm_backend == "a2a"
+            and self.w_vc_qrep is not None
+            and isinstance(self.o_proj.quant_method, UnquantizedLinearMethod)
+            and not is_kv_b_lora_active(self)
+            and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+        )
+
+    def _dcp_project_partials(
+        self: DeepseekV2AttentionMLA, attn_output: torch.Tensor
+    ) -> torch.Tensor:
+        projected = attn_output.new_empty(
+            attn_output.shape[0], attn_output.shape[1], self.v_head_dim
+        )
+        _token_major_head_bmm(attn_output, self.w_vc_qrep, projected)
+        return projected
 
     def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
         """

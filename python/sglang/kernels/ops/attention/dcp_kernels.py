@@ -728,3 +728,87 @@ def dcp_lse_combine_triton(
         RETURN_LSE=return_lse,
     )
     return out, (out_lse if return_lse else None)
+
+
+@triton.jit
+def _head_bmm_kernel(
+    x_ptr,
+    w_ptr,
+    o_ptr,
+    T,
+    stride_xt,
+    stride_xh,
+    stride_wh,
+    stride_wk,
+    stride_ot,
+    stride_oh,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    h = tl.program_id(0)
+    nb = tl.program_id(1)
+    mb = tl.program_id(2)
+    offs_n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_m = mb * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = offs_m < T
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        a = tl.load(
+            x_ptr
+            + offs_m[:, None] * stride_xt
+            + h * stride_xh
+            + (k0 + offs_k)[None, :],
+            mask=m_mask[:, None],
+            other=0.0,
+        )
+        b = tl.load(
+            w_ptr + h * stride_wh + (k0 + offs_k)[:, None] * stride_wk + offs_n[None, :]
+        )
+        acc += tl.dot(a, b)
+    tl.store(
+        o_ptr + offs_m[:, None] * stride_ot + h * stride_oh + offs_n[None, :],
+        acc.to(o_ptr.dtype.element_ty),
+        mask=m_mask[:, None],
+    )
+
+
+def head_bmm(
+    x: torch.Tensor, w: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """out[t, h] = x[t, h] @ w[h] for token-major x [T, H, K] and w [H, K, N].
+
+    Grid is (head, N-block, M-block) so small-T decode batches still fill the
+    device and each weight tile is read once per M-block.
+    """
+    T, H, K = x.shape
+    N = w.shape[2]
+    assert x.stride(2) == 1 and w.stride(2) == 1
+    if out is None:
+        out = x.new_empty(T, H, N)
+    BLOCK_M = 64
+    BLOCK_N = 64 if T <= 160 else 128
+    BLOCK_K = 64
+    grid = (H, N // BLOCK_N, triton.cdiv(T, BLOCK_M))
+    _head_bmm_kernel[grid](
+        x,
+        w,
+        out,
+        T,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        out.stride(0),
+        out.stride(1),
+        K=K,
+        N=N,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+    )
+    return out

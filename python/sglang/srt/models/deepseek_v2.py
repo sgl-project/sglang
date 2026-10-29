@@ -2242,6 +2242,9 @@ class DeepseekV2AttentionMLA(
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
         self.q_b_proj_qrep = None
+        # Full-head bf16 w_vc for project-before-merge: the V up-projection runs
+        # on every group head before the DCP a2a, so the wire carries v_head_dim.
+        self.w_vc_qrep = None
 
         self.w_scale_k = None
         self.w_scale_v = None
