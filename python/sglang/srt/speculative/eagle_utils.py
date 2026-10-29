@@ -302,7 +302,6 @@ def preflight_verify_sampling_ops() -> None:
     )
 
 
-
 def per_step_draft_out_cache_loc(
     out_cache_loc: torch.Tensor,
     batch_size: int,
