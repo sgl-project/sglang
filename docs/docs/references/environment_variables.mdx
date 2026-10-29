@@ -1938,6 +1938,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_MLA_FP8_Q_ASM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>gfx950, 12-head FP8 MLA with both <code>SGLANG_AITER_MLA_DECODE_BACKEND</code> and <code>SGLANG_AITER_MLA_VERIFY_BACKEND</code> on <code>asm</code> and no DCP: cast the query to FP8 and run decode and a verify window of at most 4 tokens on the persistent FP8-query ASM kernel. Under <code>SGLANG_AITER_MLA_PERSIST=0</code> this turns persistence on for that decode and verify only, with the <code>SGLANG_AITER_MLA_PERSIST=1</code> schedule; draft extend and other attention backends keep <code>PERSIST=0</code>. KV splits follow <code>SGLANG_AITER_MLA_AUTO_KV_SPLITS</code>. A wider window keeps the previous routing. Keep this off for now: on current AITER the FP8-query kernels it selects return wrong output (<a href="https://github.com/ROCm/aiter/issues/7007">ROCm/aiter#7007</a>).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx95x with <code>SGLANG_USE_AITER=1</code>, quantize the BF16 GDN <code>in_proj_qkvz</code> and <code>out_proj</code> of Qwen3.5 / Qwen3.8 to MXFP4 after load. Projections with N or K not a multiple of 256 stay BF16. Batches of up to 64 rows run the AITER preshuffled MXFP4 GEMM if AITER has a tuned config for the shape. All other batches run the ASM <code>gemm_a4w4</code>. Set to <code>0</code> to keep the BF16 projections.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
