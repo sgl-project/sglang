@@ -367,6 +367,18 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 )
                 self._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
 
+            if (
+                pp_proxy_tensors is not None
+                and self.buffers.pp_proxy_tensors is not None
+            ):
+                # PP verify was pre-planned without the incoming proxy in
+                # eagle_prepare_for_verify. Refresh the graph-bound storage
+                # before replay, without re-planning attention metadata.
+                for k, v in pp_proxy_tensors.tensors.items():
+                    buf = self.buffers.pp_proxy_tensors.get(k)
+                    if buf is not None:  # skip transport markers like __msg_type__
+                        buf[: v.shape[0]].copy_(v)
+
         graph_key = self._make_graph_key(self.bs)
 
         if not (
@@ -455,4 +467,11 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # PP exchanges token rows: a verify request spans captured_req_width
+            # tokens, whereas ordinary decode has width 1. Match the base runner.
+            return PPProxyTensors(
+                {
+                    k: v[: self.bs * self.captured_req_width]
+                    for k, v in output.tensors.items()
+                }
+            )
