@@ -6,6 +6,7 @@ from sglang.kernels.ops.embeddings.ngram_embedding import compute_n_gram_ids
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import get_device
 
 
 class NgramEmbedding(torch.nn.Module):
@@ -40,6 +41,7 @@ class NgramEmbedding(torch.nn.Module):
         self.exclusive_oe_embedder_size_sums = torch.zeros(
             [over_embedding_k * (over_embedding_n - 1) + 1],
             dtype=torch.int32,
+            device=get_device(),
         )
         for i in range(over_embedding_k * (over_embedding_n - 1)):
             self.exclusive_oe_embedder_size_sums[i + 1] = (
