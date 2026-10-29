@@ -98,7 +98,11 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     _incomplete_tool_call_indices,
 )
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
-from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.entrypoints.openai.utils import (
+    _is_byte_level_tokenizer,
+    to_openai_style_logprobs,
+    token_id_to_bytes,
+)
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -126,24 +130,48 @@ class _MediaInputValidationError(ValueError):
     pass
 
 
-def _build_output_text_logprobs(meta_info: dict) -> list[Logprob]:
+def _build_output_text_logprobs(
+    meta_info: dict, tokenizer: Any = None
+) -> list[Logprob]:
     """Reshape decoded ``meta_info`` logprobs into the Responses logprob type,
     covering every generated token."""
+    output_token_logprobs = meta_info.get("output_token_logprobs")
+    output_top_logprobs = meta_info.get("output_top_logprobs")
     decoded = to_openai_style_logprobs(
-        output_token_logprobs=meta_info.get("output_token_logprobs"),
-        output_top_logprobs=meta_info.get("output_top_logprobs"),
+        output_token_logprobs=output_token_logprobs,
+        output_top_logprobs=output_top_logprobs,
     )
+    is_byte_level = tokenizer is not None and _is_byte_level_tokenizer(tokenizer)
+
+    # A byte-level fragment token (part of a multi-byte character) displays as
+    # U+FFFD, so its bytes must come from the id, as in Chat.
+    def token_bytes(token_id, token: str) -> list[int]:
+        raw = token_id_to_bytes(tokenizer, token_id) if is_byte_level else None
+        return raw if raw is not None else list(token.encode("utf-8"))
+
+    raw_tops = output_top_logprobs or []
     top_lists = decoded.top_logprobs or []
     logprobs: list[Logprob] = []
     for index, (token, logprob) in enumerate(
         zip(decoded.tokens, decoded.token_logprobs)
     ):
         top_entry = top_lists[index] if index < len(top_lists) else None
+        raw_top = raw_tops[index] if index < len(raw_tops) else None
+        # Same key and last-wins rule as the text-keyed ``top_entry``, so each
+        # entry gets the id whose logprob it kept.
+        top_ids = (
+            {
+                (top_text if top_text is not None else ""): top_id
+                for _, top_id, top_text in (raw_top or [])
+            }
+            if is_byte_level
+            else {}
+        )
         top_logprobs = [
             LogprobTopLogprob(
                 token=top_token,
                 logprob=top_logprob,
-                bytes=list(top_token.encode("utf-8")),
+                bytes=token_bytes(token_id=top_ids.get(top_token), token=top_token),
             )
             for top_token, top_logprob in (top_entry or {}).items()
         ]
@@ -151,7 +179,9 @@ def _build_output_text_logprobs(meta_info: dict) -> list[Logprob]:
             Logprob(
                 token=token,
                 logprob=logprob,
-                bytes=list(token.encode("utf-8")),
+                bytes=token_bytes(
+                    token_id=output_token_logprobs[index][1], token=token
+                ),
                 top_logprobs=top_logprobs,
             )
         )
@@ -891,7 +921,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 meta_info = final_res.meta_info
 
             output_logprobs = (
-                _build_output_text_logprobs(meta_info)
+                _build_output_text_logprobs(meta_info, tokenizer=tokenizer)
                 if request.is_include_output_logprobs() and isinstance(meta_info, dict)
                 else None
             )
