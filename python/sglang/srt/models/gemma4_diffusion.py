@@ -529,8 +529,9 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
                 input_ids, forward_batch.dllm_input_preparation_state
             )
         if is_context_encoding and forward_batch.contains_image_inputs():
+            # HF DiffusionGemma ORs image blocks into every layer, full ones included.
             Gemma4ForConditionalGeneration.prepare_attn_masks(
-                self, forward_batch, input_ids, torch.bool
+                self, forward_batch, input_ids, torch.bool, sliding_layers_only=False
             )
 
         # Image soft tokens are injected only on the encoder (causal-context) pass.

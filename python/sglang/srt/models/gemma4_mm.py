@@ -327,20 +327,29 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         forward_batch: ForwardBatch,
         input_ids: torch.Tensor,
         mask_dtype: torch.dtype,
+        sliding_layers_only: bool = True,
     ):
         """Prepare bidirectional attention masks for image tokens.
 
         Gemma 4 uses bidirectional attention for image soft tokens
         during prefill. Following the HF implementation, bidirectional attention
         is only enabled within each individual image group (same-item
-        tokens), not across items.
+        tokens), not across items, and only for checkpoints with
+        ``use_bidirectional_attention == "vision"``; E2B/E4B keep it causal.
         Triton and FA4 use causal attention for image spans split across chunks.
         XPU passes Gemma 3's per-token image-block ids to the sgl-kernel-xpu
-        prefill, which has no sliding-window variant of that mask: sliding layers
-        keep causal image attention once the KV length exceeds the window.
+        prefill, on sliding-window layers only when ``sliding_layers_only`` (HF
+        Gemma 4 keeps full-attention layers causal; DiffusionGemma does not).
+        That mask has no sliding-window variant, so sliding layers keep causal
+        image attention once the KV length exceeds the window.
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
+        if (
+            getattr(self.config.text_config, "use_bidirectional_attention", None)
+            != "vision"
+        ):
+            return
         attn_backend = get_attn_backend()
         prefill_backend = getattr(attn_backend, "prefill_backend", attn_backend)
         if getattr(prefill_backend, "fa_impl_ver", None) == 4:
@@ -395,6 +404,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                         forward_batch=forward_batch, device=input_ids.device
                     )
                 )
+                prefill_backend.bidirectional_sliding_layers_only = sliding_layers_only
                 return
         if not isinstance(prefill_backend, TritonAttnBackend):
             logger.warning_once(
