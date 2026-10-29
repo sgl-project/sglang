@@ -110,7 +110,8 @@ def _build_server_args(
         "rust_server_endpoints": scheduler.rust_server_endpoints,
     }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
-    # snapshots directly; the ZMQ transport (multi-node DP) has no file to read.
+    # snapshots directly, from the file on this node even under multi-node DP;
+    # only a forced ZMQ transport leaves no file to read.
     shm_writer = scheduler.load_snapshot_writer
     if not isinstance(shm_writer, ShmLoadSnapshotWriter):
         shm_writer = None
