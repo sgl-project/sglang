@@ -471,6 +471,17 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
                     EAGLEDraftCudaGraphRunner,
                 )
+                from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+                    EAGLEDraftExtendCudaGraphRunner,
+                )
+
+                if isinstance(runner, EAGLEDraftExtendCudaGraphRunner):
+                    cpu_update_input = self._eagle_draft_extend_update_lengths(
+                        runner, static_forward_batch
+                    )
+                    return self.replay_with_input_update(
+                        shape_key, seq_lens=None, cpu_update_input=cpu_update_input
+                    )
                 if isinstance(runner, EAGLEDraftCudaGraphRunner):
                     cpu_update_input = self._build_eagle_draft_update_payload(
                         static_forward_batch
@@ -486,6 +497,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 )
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
+
+    def _eagle_draft_extend_update_lengths(self, runner, forward_batch):
+        seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
+            runner.bs - runner.raw_bs
+        )
+        return [{self.get_update_attr_name(): seq_lens}]
 
     def _build_eagle_draft_update_payload(self, forward_batch):
         runner = self._decode_runner
