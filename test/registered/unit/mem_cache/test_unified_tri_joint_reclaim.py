@@ -130,7 +130,10 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertIsNotNone(outside)
                     self.stamp(b, a, torch.cat((slots, outside)), states)
                     records = self.insert_parts(c, slots, states)
-                    demand = 4 if count == 8 else a.available_size() + 1
+                    # Keep the request fixed when placement becomes tighter;
+                    # available_size()+1 would turn a no-eviction case into a
+                    # genuinely over-capacity request.
+                    demand = 4 if count == 8 else 9
                     if count == 24:
                         demand = min(a.full_available_size(), a.swa_available_size())
                     with patch.object(
@@ -941,6 +944,10 @@ class TestTriJointReclaim(CustomTestCase):
 
 
 class TestTriGeometry(CustomTestCase):
+    def setUp(self):
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+
     def check_saved(self, a, saved):
         for member, buf, ids, values in saved:
             self.assertTrue(
