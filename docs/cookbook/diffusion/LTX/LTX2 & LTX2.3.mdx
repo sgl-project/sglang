@@ -93,7 +93,7 @@ For latency-oriented LTX serving, prefer CFG parallel over sequence parallelism.
 
 Use `--enable-cfg-parallel` for degree-2 CFG parallel. Use `--cfg-parallel-size` only when you explicitly need a different CFG branch count. If `resident` exceeds available VRAM, keep the same parallelism preset and switch only the device mode to `original`.
 
-On Hopper GPUs, sufficiently long stage-2 sequences automatically reuse the CFG ranks for Ulysses. Other platforms keep stage 2 unsharded unless you explicitly configure sequence parallelism.
+On Hopper GPUs, and on Blackwell when breakable CUDA graphs are enabled, sufficiently long stage-2 sequences automatically reuse the CFG ranks for Ulysses. Other configurations keep stage 2 unsharded unless you explicitly configure sequence parallelism.
 
 On high-VRAM GPUs, add `--text-encoder-cpu-offload false` if text encoding latency matters and you have enough memory.
 

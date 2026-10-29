@@ -163,18 +163,32 @@ def _check_folded_topology(rank, rendezvous):
     assert ps.get_cfg_sequence_parallel_group() is None
 
 
-@pytest.mark.parametrize("hopper", [False, True])
+@pytest.mark.parametrize("platform", ["hopper", "blackwell", "other"])
+@pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize("tokens_per_rank", [2303, 2304])
-def test_auto_cfg_sp_is_limited_to_measured_platform(hopper, tokens_per_rank):
+def test_auto_cfg_sp_is_limited_to_measured_execution_mode(
+    platform, graph, tokens_per_rank
+):
     stage = object.__new__(LTX2RefinementStage)
-    stage.server_args = SimpleNamespace(enable_cfg_parallel=True)
+    stage.server_args = SimpleNamespace(
+        enable_cfg_parallel=True, enable_breakable_cuda_graph=graph
+    )
     stage.vae = None
     batch = Req(
         sampling_params=SamplingParams(),
         latents=torch.empty(1, 2 * tokens_per_rank, 1),
     )
     with (
-        patch.object(denoising_av.current_platform, "is_hopper", return_value=hopper),
+        patch.object(
+            denoising_av.current_platform,
+            "is_hopper",
+            return_value=platform == "hopper",
+        ),
+        patch.object(
+            denoising_av.current_platform,
+            "is_blackwell",
+            return_value=platform == "blackwell",
+        ),
         patch.object(
             denoising_av,
             "get_cfg_sequence_parallel_group",
@@ -184,7 +198,8 @@ def test_auto_cfg_sp_is_limited_to_measured_platform(hopper, tokens_per_rank):
         result = stage.parallelism_type_for(batch)
     expected = (
         StageParallelismType.SEQUENCE_PARALLEL_OVER_CFG_RANKS
-        if hopper and tokens_per_rank >= CFG_SP_MIN_TOKENS_PER_RANK
+        if (platform == "hopper" or (platform == "blackwell" and graph))
+        and tokens_per_rank >= CFG_SP_MIN_TOKENS_PER_RANK
         else StageParallelismType.MAIN_RANK_ONLY
     )
     assert result is expected

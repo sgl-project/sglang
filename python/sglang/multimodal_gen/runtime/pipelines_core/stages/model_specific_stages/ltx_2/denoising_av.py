@@ -172,13 +172,19 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
 
     def parallelism_type_for(self, batch: Req | list[Req]) -> StageParallelismType:
         # stage 1 leaves the same latents on every CFG rank, so pure-CFG ranks
-        # can shard stage 2 as one Ulysses group once it is long enough on Hopper.
-        # Blackwell's faster compute does not amortize the additional collectives.
+        # can shard stage 2 as one Ulysses group once it is long enough.
+        # Blackwell only amortizes the additional dispatch under CUDA graphs.
         cfg_sp_group = get_cfg_sequence_parallel_group()
         if (
             self.server_args.enable_cfg_parallel
             and cfg_sp_group is not None
-            and current_platform.is_hopper()
+            and (
+                current_platform.is_hopper()
+                or (
+                    current_platform.is_blackwell()
+                    and self.server_args.enable_breakable_cuda_graph
+                )
+            )
         ):
             reqs = batch if isinstance(batch, list) else [batch]
             # packed stage-2 video latents [B, S, C], the same shape on every rank
