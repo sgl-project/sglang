@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Iterable, Optional
 
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
@@ -15,11 +15,86 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
+
+_NVFP4_PREFILL_BACKEND = {
+    "fp8_e4m3": "flashinfer",
+    "nvfp4": "trtllm_mha",
+}
+_NVFP4_PREFILL_DEQUANT_DTYPE = {
+    backend: dtype for dtype, backend in _NVFP4_PREFILL_BACKEND.items()
+}
+
+
+def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
+    """Resolve the public prefill dequantization dtype to attention backends."""
+
+    cfg = resolving_view(server_args)
+    requested_dtype = cfg.prefill_kv_cache_dequant_dtype
+    if cfg.kv_cache_dtype != "nvfp4":
+        if requested_dtype != "auto":
+            raise ValueError(
+                "--prefill-kv-cache-dequant-dtype applies only with "
+                "--kv-cache-dtype=nvfp4."
+            )
+        return
+
+    if requested_dtype == "auto":
+        explicit_backend = cfg.prefill_attention_backend or cfg.attention_backend
+        if explicit_backend in _NVFP4_PREFILL_DEQUANT_DTYPE:
+            requested_dtype = _NVFP4_PREFILL_DEQUANT_DTYPE[explicit_backend]
+        else:
+            if explicit_backend is not None:
+                raise ValueError(
+                    "NVFP4 prefill supports an FP8 E4M3 workspace or native "
+                    f"NVFP4, but backend {explicit_backend!r} provides neither."
+                )
+            requested_dtype = "nvfp4" if get_platform().is_sm100 else "fp8_e4m3"
+
+    if requested_dtype == "nvfp4" and not get_platform().is_sm100:
+        raise ValueError(
+            "Native NVFP4 prefill currently requires SM100; use "
+            "--prefill-kv-cache-dequant-dtype=fp8_e4m3 on this platform."
+        )
+
+    target_prefill_backend = _NVFP4_PREFILL_BACKEND[requested_dtype]
+    explicit_prefill_backend = cfg.prefill_attention_backend
+    if (
+        explicit_prefill_backend is not None
+        and explicit_prefill_backend != target_prefill_backend
+    ):
+        raise ValueError(
+            f"--prefill-kv-cache-dequant-dtype={requested_dtype} requires prefill "
+            f"backend {target_prefill_backend!r}, but "
+            f"--prefill-attention-backend={explicit_prefill_backend!r} was set. "
+            "Remove the backend option and select the KV dtype only."
+        )
+
+    explicit_decode_backend = cfg.decode_attention_backend
+    if explicit_decode_backend not in (None, "trtllm_mha"):
+        raise ValueError(
+            "NVFP4 decode requires --decode-attention-backend=trtllm_mha; got "
+            f"{explicit_decode_backend!r}. Remove the backend option; NVFP4 "
+            "selects the supported decode implementation automatically."
+        )
+
+    updates = {
+        "prefill_attention_backend": target_prefill_backend,
+        "decode_attention_backend": "trtllm_mha",
+    }
+    if cfg.prefill_kv_cache_dequant_dtype == "auto":
+        updates["prefill_kv_cache_dequant_dtype"] = requested_dtype
+    declare_resolution(server_args, "_handle_nvfp4_prefill_kv_dequant_dtype", **updates)
+    logger.info(
+        "NVFP4 prefill dequant dtype: %s; prefill input: %s; decode input: nvfp4.",
+        requested_dtype,
+        requested_dtype,
+    )
 
 
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
@@ -54,14 +129,149 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                 "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
                 "Use --kv-cache-dtype=fp4_mx_block16 for the block-size-16 FP4 recipe."
             )
-        if (
-            prefill_backend != decode_backend and prefill_backend != "fa4"
-        ):  # Take care of prefill=fa4 later
-            logger.warning(
-                f"Attention: Using KV4 with PREFILL = {prefill_backend} "
-                f"and DECODE = {decode_backend}. "
-                f"Compatibility issues are unlikely, but may occur in rare edge cases."
+        if cfg.enable_unified_memory:
+            raise ValueError(
+                "FP4 KV cache does not yet support --enable-unified-memory: "
+                "the unified MHA pool does not allocate FP4 block scales or "
+                "the prefill dequant workspace."
             )
+
+        # SM100 trtllm_mha owns physical, kernel-native NVFP4 scales. The
+        # transfer and host-tier pools do not preserve that layout yet. Keep
+        # these combinations fail-fast while allowing target verification to
+        # reuse the same monolithic cache and GenMHA kernels.
+        uses_sm100_trtllm_nvfp4 = (
+            cfg.kv_cache_dtype == "nvfp4"
+            and get_platform().is_sm100
+            and "trtllm_mha" in (prefill_backend, decode_backend)
+        )
+        uses_mixed_nvfp4 = (
+            cfg.kv_cache_dtype == "nvfp4"
+            and prefill_backend == "flashinfer"
+            and decode_backend == "trtllm_mha"
+        )
+        uses_sm100_mixed_nvfp4 = uses_sm100_trtllm_nvfp4 and uses_mixed_nvfp4
+        speculative_algorithm = (
+            cfg.speculative_algorithm.upper()
+            if cfg.speculative_algorithm is not None
+            else None
+        )
+        supported_native_spec_algorithms = {
+            "EAGLE",
+            "EAGLE3",
+            "NEXTN",
+            "NGRAM",
+        }
+        if uses_sm100_trtllm_nvfp4 and speculative_algorithm in (
+            "DFLASH",
+            "DSPARK",
+        ):
+            # These workers commit only a prefix of a dense candidate block
+            # through set_kv_buffer_prefix_valid(). That specialized writer
+            # does not produce GenMHA's physical K/V scale layout yet.
+            raise ValueError(
+                "SM100 native NVFP4 speculative decoding does not yet support "
+                f"{speculative_algorithm}; use EAGLE/NEXTN or NGRAM."
+            )
+        if (
+            uses_sm100_trtllm_nvfp4
+            and speculative_algorithm is not None
+            and speculative_algorithm not in supported_native_spec_algorithms
+        ):
+            # Do not silently treat STANDALONE, FROZEN_KV_MTP, or a custom
+            # plugin algorithm as EAGLE. Their draft/cache-commit contracts may
+            # differ, and none currently has native-layout coverage here.
+            raise ValueError(
+                "SM100 native NVFP4 speculative decoding supports EAGLE, "
+                "EAGLE3, NEXTN, and breadth-1 NGRAM; got "
+                f"{speculative_algorithm}."
+            )
+        if (
+            uses_sm100_trtllm_nvfp4
+            and speculative_algorithm == "NGRAM"
+            and cfg.speculative_ngram_max_bfs_breadth != 1
+        ):
+            # TRT-LLM MHA's target-verify metadata supports a linear chain
+            # only. NGRAM defaults to a breadth-10 tree, so reject that default
+            # explicitly rather than reaching the later generic paged-backend
+            # assertion with a misleading compatibility message.
+            raise ValueError(
+                "SM100 native NVFP4 NGRAM speculative decoding requires "
+                "--speculative-ngram-max-bfs-breadth=1 because trtllm_mha "
+                "supports linear target verification only; got "
+                f"{cfg.speculative_ngram_max_bfs_breadth}."
+            )
+        uses_draft_model = speculative_algorithm not in (None, "NGRAM")
+        if uses_sm100_trtllm_nvfp4 and uses_draft_model:
+            # A draft worker owns another physical KV pool. It cannot inherit a
+            # target-only hybrid pair: draft-extend would then select the
+            # prefill child even though the draft pool and its block scales use
+            # the native GenMHA layout. Give every draft phase one layout and
+            # one backend, including prefill-graph capture and multi-step
+            # decode. This also covers explicit hybrid target configurations,
+            # for which the model-default hook intentionally does not choose a
+            # draft backend.
+            draft_backend = cfg.speculative_draft_attention_backend
+            if draft_backend is None:
+                logger.warning(
+                    "SM100 native NVFP4 speculative decoding uses trtllm_mha "
+                    "for the draft worker."
+                )
+                declare_resolution(
+                    server_args,
+                    "_handle_kv4_compatibility",
+                    speculative_draft_attention_backend="trtllm_mha",
+                )
+            elif draft_backend != "trtllm_mha":
+                raise ValueError(
+                    "SM100 native NVFP4 speculative decoding requires "
+                    "--speculative-draft-attention-backend=trtllm_mha so the "
+                    "draft worker consumes its physical NVFP4 KV layout; got "
+                    f"{draft_backend!r}."
+                )
+        if (
+            uses_sm100_mixed_nvfp4
+            and cfg.speculative_algorithm is not None
+            and cfg.speculative_attention_mode == "prefill"
+        ):
+            # FlashInfer prefill reads a transient FP8 dequant workspace. Its
+            # host-built page layout cannot be refreshed inside a target-verify
+            # CUDA graph, whereas the decode child consumes the physical NVFP4
+            # cache directly for both eager and graph execution.
+            logger.warning(
+                "SM100 mixed NVFP4 speculative decoding routes target verify "
+                "to trtllm_mha; overriding --speculative-attention-mode=prefill "
+                "to decode."
+            )
+            declare_resolution(
+                server_args,
+                "_handle_kv4_compatibility",
+                speculative_attention_mode="decode",
+            )
+        if uses_sm100_trtllm_nvfp4 and cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "SM100 native NVFP4 with trtllm_mha does not yet support PD "
+                "disaggregation because its physical block-scale layout is not "
+                "implemented by the KV transfer path."
+            )
+        if uses_sm100_trtllm_nvfp4 and (
+            cfg.enable_hierarchical_cache or cfg.enable_lmcache
+        ):
+            raise ValueError(
+                "SM100 native NVFP4 with trtllm_mha does not yet support "
+                "hierarchical KV cache or LMCache because their host pools do "
+                "not preserve the physical block-scale layout."
+            )
+
+        if prefill_backend != decode_backend and prefill_backend != "fa4":
+            # NVFP4 with FP8 prefill is a supported mixed-storage recipe.
+            if not uses_mixed_nvfp4:
+                logger.warning(
+                    f"Attention: Using KV4 with PREFILL = {prefill_backend} "
+                    f"and DECODE = {decode_backend}. "
+                    "Compatibility issues are unlikely, but may occur in rare "
+                    "edge cases."
+                )
         else:
             if prefill_backend == "fa4":
                 if uses_mla:  # FA4 + MLA
@@ -162,6 +372,23 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disaggregation-decode-retraction-backup=host_pool requires "
             "--disable-priority-preemption when priority scheduling is enabled."
         )
+    if cfg.radix_eviction_policy == "tlru":
+        tlru_config = cfg.radix_eviction_policy_config or {}
+        threshold = tlru_config.get("threshold", 0)
+        next_prompt_estimate = tlru_config.get("next_prompt_estimate", 0)
+        if threshold < 0 or next_prompt_estimate < 0:
+            raise ValueError(
+                "--radix-eviction-policy tlru requires non-negative 'threshold' and "
+                "'next_prompt_estimate' in --radix-eviction-policy-config, got "
+                f"{threshold} and {next_prompt_estimate}."
+            )
+        if threshold <= next_prompt_estimate:
+            raise ValueError(
+                "--radix-eviction-policy tlru needs 'threshold' greater than "
+                f"'next_prompt_estimate' in --radix-eviction-policy-config, got "
+                f"{threshold} <= {next_prompt_estimate}; otherwise no tokens are "
+                "ever TEL-safe and T-LRU is exactly LRU."
+            )
 
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
@@ -185,6 +412,13 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "both build a decode host pool."
             )
 
+    if cfg._swa_full_tokens_ratio_explicitly_set is None:
+        declare_resolution(
+            server_args,
+            "_handle_cache_compatibility",
+            _swa_full_tokens_ratio_explicitly_set=cfg.swa_full_tokens_ratio is not None,
+        )
+
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
     # the user input before it ever takes effect.
@@ -192,6 +426,52 @@ def handle_cache_compatibility(server_args: Any) -> None:
     # claimed the field, and the value to range-check is the effective one.
     if not (0 < resolution_result(server_args, "swa_full_tokens_ratio") <= 1.0):
         raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+    prefix_tails = resolved_view(server_args).swa_prefix_tails
+    if prefix_tails is not None and prefix_tails < 0:
+        raise ValueError("--swa-prefix-tails should be a non-negative integer.")
+
+    if cfg.enable_lmcache:
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-lmcache and --enable-hierarchical-cache are "
+                "mutually exclusive"
+            )
+        if cfg.enable_unified_cache_external_linker:
+            raise ValueError(
+                "--enable-lmcache and --enable-unified-cache-external-linker "
+                "are mutually exclusive"
+            )
+        if cfg.disable_radix_cache:
+            raise ValueError("--enable-lmcache requires radix cache to be enabled")
+
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if SpeculativeAlgorithm.from_string(cfg.speculative_algorithm).is_speculative():
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support speculative decoding"
+            )
+        if attn_dp_enabled_of(cfg):
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support DP attention"
+            )
+        if cfg.dcp_size > 1:
+            raise NotImplementedError(
+                "--enable-lmcache with --dcp-size > 1 is not supported: "
+                "LMCache has no DCP-aware index translation"
+            )
+        if cfg.enable_streaming_session:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support streaming sessions"
+            )
+        if cfg.hicache_host_memory_mode == "buffer_only":
+            raise ValueError(
+                "--hicache-host-memory-mode=buffer_only is a HiCache-only mode"
+            )
+        if cfg.disaggregation_mode != "null":
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache currently supports colocated "
+                "prefill/decode scheduling only"
+            )
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:
@@ -200,17 +480,25 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     if not cfg.enable_unified_memory:
         return
     if cfg.disaggregation_mode != "null":
-        # Constraints of the whole-envelope transfer; see
-        # UnifiedMLATokenToKVPool.get_contiguous_buf_infos.
-        assert cfg.disaggregation_transfer_backend == "mooncake", (
-            "--enable-unified-memory with PD disaggregation supports only "
-            "the mooncake transfer backend; got "
+        # Constraints of the whole-envelope transfer; see the unified MHA and
+        # MLA pool get_contiguous_buf_infos implementations.
+        supported_backends = server_args._unified_memory_pd_transfer_backends()
+        assert cfg.disaggregation_transfer_backend in supported_backends, (
+            "--enable-unified-memory with PD disaggregation supports only these "
+            f"transfer backends: {', '.join(sorted(supported_backends))}; got "
             f"{cfg.disaggregation_transfer_backend!r}."
         )
         assert cfg.pp_size == 1, (
             "--enable-unified-memory with PD disaggregation does not support "
             "pipeline parallelism (whole-envelope transfer has no per-layer "
             "entries to subset)."
+        )
+        assert not (
+            cfg.disaggregation_transfer_backend == "mooncake"
+            and cfg.speculative_algorithm is not None
+        ), (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "speculative decoding with the Mooncake transfer backend."
         )
         assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
             "--enable-unified-memory with PD disaggregation requires lazy "
@@ -222,43 +510,92 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
         )
-    assert cfg.speculative_algorithm in (None, "DSPARK"), (
+        if cfg.disaggregation_decode_enable_offload_kvcache:
+            assert cfg.hicache_storage_backend == "file", (
+                "--enable-unified-memory with decode KV offload currently "
+                "supports --hicache-storage-backend=file only."
+            )
+            model_config = model_config_of(server_args)
+            assert not use_mla_backend(server_args), (
+                "--enable-unified-memory decode KV offload does not support "
+                "MLA models yet."
+            )
+            assert mambaish_config(model_config) is None, (
+                "--enable-unified-memory decode KV offload does not support "
+                "hybrid-Mamba models."
+            )
+            assert not model_config.is_hybrid_swa, (
+                "--enable-unified-memory decode KV offload does not support "
+                "hybrid-SWA H2D/D2H transfers yet."
+            )
+        if cfg.disaggregation_decode_retraction_backup == "host_pool":
+            model_config = model_config_of(server_args)
+            assert mambaish_config(model_config) is None, (
+                "--enable-unified-memory host-pool decode retraction does not "
+                "support hybrid-Mamba models."
+            )
+    assert cfg.speculative_algorithm in (
+        None,
+        "DSPARK",
+        "EAGLE",
+        "EAGLE3",
+        "DFLASH",
+    ), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft); other speculative algorithms are not yet "
-        "audited for the unified pool's virtual/kernel-facing loc translation. Got "
+        "DSPARK, DFLASH, EAGLE and EAGLE3; other speculative algorithms are "
+        "not yet audited for the unified pool's virtual-to-physical loc "
+        "translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
-    if cfg.speculative_algorithm == "DSPARK":
-        assert cfg.speculative_eagle_topk in (None, 1), (
-            "--enable-unified-memory + DSPARK supports a linear draft "
-            "chain only (--speculative-eagle-topk in {None, 1}); tree "
-            "verify is not audited for the unified pool. Got "
-            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
-        )
-        # Both roles: verify routes to either backend depending on
-        # --speculative-attention-mode.
-        spec_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
-        spec_backends = set(attention_backends_of(resolved_view(server_args)))
-        spec_backends.discard(None)
-        assert spec_backends <= spec_allowed, (
-            "--enable-unified-memory + DSPARK requires spec-verify-audited "
-            f"attention backends {sorted(spec_allowed)} for both prefill "
-            f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
-            "not translate speculative verify indices to the unified "
-            "pool's kernel-facing space yet."
+    assert cfg.speculative_eagle_topk in (None, 1), (
+        "--enable-unified-memory supports a linear draft chain only "
+        "(--speculative-eagle-topk in {None, 1}); tree verify relocates "
+        "accepted tokens one at a time inside the target pool, which the "
+        "unified pool's page-granular move_kv_cache cannot express. Got "
+        f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+    )
+    if cfg.speculative_algorithm in ("EAGLE", "EAGLE3"):
+        from sglang.srt.mem_cache.kv.decl import declares_lifetime_beside_full
+
+        # A unified target: its plan has a sub-pool beside the full one.
+        assert declares_lifetime_beside_full(model_config_of(server_args)), (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
+            "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
+            "fused inside the target's sub-pool entries."
         )
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
-        "TBO's replay split hands each child a view without the pre-translate "
-        "write loc, so a captured decode replay raises. "
-        "TODO(ch-wan): carry out_cache_loc_virtual into the child view."
+        "the iteration's read tables are indexed by the whole batch's rows, and "
+        "a TBO child's readers do not offset into them."
     )
-    assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
-        "--enable-unified-memory is not yet compatible with hierarchical / "
-        "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
-        "the unified-memory-pool init wires up no host pools, and its device mamba / "
-        "full-attention slots are VIRTUAL — the host-offload path does not "
-        "translate them to physical."
+    assert not cfg.enable_lmcache, (
+        "--enable-unified-memory is not yet compatible with --enable-lmcache: "
+        "the LMCache offload path indexes the device buffers with the ids it "
+        "is handed, and under the unified pool those are VIRTUAL."
+    )
+    assert not cfg.enable_unified_cache_external_linker, (
+        "--enable-unified-memory does not support "
+        "--enable-unified-cache-external-linker: direct L3 transfers do not "
+        "preserve unified page-envelope indices and compaction lifetimes. "
+        "Use --enable-hierarchical-cache for supported L2/L3 transfers."
+    )
+    assert not (
+        cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+        and cfg.disaggregation_decode_retraction_backup == "host_pool"
+    ), (
+        "--enable-unified-memory + EAGLE/EAGLE3 does not support "
+        "--disaggregation-decode-retraction-backup=host_pool: the backup builds "
+        "the draft's host pool off the draft's own device pool, which a fused "
+        "EAGLE draft does not have."
+    )
+    assert not (
+        cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+        and cfg.enable_hierarchical_cache
+    ), (
+        "--enable-unified-memory + EAGLE/EAGLE3 does not support "
+        "--enable-hierarchical-cache: HiCache keeps the draft on a private "
+        "pool, and would pack an MTP head's KV into the target's "
+        "page-envelope host pool, which refuses per-layer draft loads."
     )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
@@ -303,14 +640,13 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
     assert use_mla_backend(server_args), (
         "--enable-unified-memory with decode context parallelism "
         "(--dcp-size > 1) supports MLA models only (e.g. kimi-linear): the "
-        "MHA unified pool has no DCP-aware masked write path "
-        "(UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None)."
+        "MHA unified pool has no DCP-aware masked write path."
     )
     assert not model_config_of(server_args).is_hybrid_swa, (
         "--enable-unified-memory with decode context parallelism "
         "(--dcp-size > 1) does not support hybrid sliding-window models: "
-        "UnifiedSWATokenToKVPoolAllocator does not widen its virtual id "
-        "space, and the full->swa mapping is not DCP-sharded."
+        "the unified allocator does not widen a sliding-window chain's virtual "
+        "id space, and the full->swa mapping is not DCP-sharded."
     )
     cfg = resolving_view(server_args)
     assert cfg.disaggregation_mode == "null", (
@@ -324,7 +660,7 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
     # The trtllm_mla family builds its DCP block table through the pool's v2p
     # gather (create_mla_kv_page_table_for_dcp), so it speaks the same
     # two-stage contract as flashinfer.
-    dcp_allowed = {"flashinfer", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
+    dcp_allowed = {"flashinfer", "trtllm_mla", "cutedsl_mla"}
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= dcp_allowed, (
@@ -335,12 +671,50 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
         "page ids and do not translate them through the unified pool's "
         "virtual->physical page table."
     )
+    # flashinfer's speculative verify gathers its read ids without the DCP
+    # collapse (`translate_dcp_read_ids`); the MLA verify family builds its DCP
+    # block table itself.
+    assert not (
+        cfg.speculative_algorithm in ("DSPARK", "DFLASH") and "flashinfer" in backends
+    ), (
+        "--enable-unified-memory with decode context parallelism "
+        f"(--dcp-size > 1) and {cfg.speculative_algorithm} does not support "
+        "flashinfer: its speculative verify reads DCP-widened ids. Use "
+        "trtllm_mla or cutedsl_mla."
+    )
+
+
+# Unified-memory backends that carry v_head_dim through to the kernel, so a
+# V row narrower than K (MiMoV2: 192 / 128) reads correctly. FlashInfer's
+# paged_kv_t compiles ONE head_dim for both; trtllm_mha refuses unequal dims.
+ASYMMETRIC_KV_BACKENDS = frozenset({"triton", "fa3", "fa4"})
+
+
+def draft_rows_refusal(
+    *, has_asymmetric_kv: bool, uses_mla: bool, backends: Iterable[Optional[str]]
+) -> Optional[str]:
+    """Why a draft runner's attention backends cannot read its K/V rows on the
+    page-major layout, or None. The rows have the draft model's geometry, fused
+    into the target's entries or not; with asymmetric rows every backend the
+    draft runs on must carry v_head_dim (`ASYMMETRIC_KV_BACKENDS`). MLA rows are
+    one latent per layer and exempt, as the target's are."""
+    if uses_mla or not has_asymmetric_kv:
+        return None
+    unreadable = sorted(set(backends) - {None} - ASYMMETRIC_KV_BACKENDS)
+    if not unreadable:
+        return None
+    return (
+        "--enable-page-major-kv-layout: the draft model's K/V rows are "
+        f"asymmetric, and the draft attention backends {unreadable} do not "
+        f"carry v_head_dim through to the kernel "
+        f"({sorted(ASYMMETRIC_KV_BACKENDS)} do). Pass one of them as "
+        "--speculative-draft-attention-backend."
+    )
 
 
 def handle_page_major_kv_layout(server_args: Any):
-    # The unified pool stores state in the page-major envelope-strided layout, so
-    # enabling it implies --enable-page-major-kv-layout — routing it through the
-    # single page-major path + stride-aware Triton asserts (set before the guard).
+    # --enable-unified-memory implies --enable-page-major-kv-layout, so the
+    # unified pool goes through this one gate (declared before the guard).
 
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:
@@ -358,42 +732,29 @@ def handle_page_major_kv_layout(server_args: Any):
         "reimplementation. Run with --enable-unified-memory, or drop "
         "--enable-page-major-kv-layout."
     )
-    from sglang.srt.mem_cache.unified_memory_pool import (
-        unified_memory_supported_for_model,
-    )
-
     model_config = model_config_of(server_args)
-    assert unified_memory_supported_for_model(
-        model_config, use_mla_backend=use_mla_backend(server_args)
-    ), (
-        "--enable-unified-memory requires uniform K/V rows "
-        "(head_dim == v_head_dim); this model has "
-        f"head_dim={model_config.head_dim}, "
-        f"v_head_dim={model_config.v_head_dim}, "
-        f"swa_head_dim={model_config.swa_head_dim}, "
-        f"swa_v_head_dim={model_config.swa_v_head_dim}. The unified "
-        "pool's per-layer views require a uniform row width; run "
-        "this model without --enable-unified-memory."
-    )
-    # Allow-list. Every backend below reads through the translator, so what
-    # gates one is only whether its kernels can address the per-layer views:
+    # Allow-list. Every backend below reads through the `RunnerIds`, so what
+    # gates one is only whether its kernels address the per-layer views by
+    # their strides (the slot stride is the whole entry, not one row):
     #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
     #     snap).
     #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
     #     Triton. fa4 is the fa3 class.
-    #   * Without the unified pool, plain page-major stays Triton-only.
+    #   * MHA/SWA models with asymmetric K/V rows: only the backends that
+    #     carry v_head_dim through to the kernel (ASYMMETRIC_KV_BACKENDS).
     # Names are the RESOLVED ids from attention_backends_of.
-    if cfg.enable_unified_memory and use_mla_backend(server_args):
+    if use_mla_backend(server_args):
         allowed_full = {
             "triton",
             "fa3",
             "trtllm_mla",
             "flashinfer",
             "cutedsl_mla",
-            "tokenspeed_mla",
             "flashmla",
         }
-    elif cfg.enable_unified_memory:
+    elif model_config.has_asymmetric_kv:
+        allowed_full = set(ASYMMETRIC_KV_BACKENDS)
+    else:
         allowed_full = {
             "triton",
             "fa3",
@@ -401,32 +762,32 @@ def handle_page_major_kv_layout(server_args: Any):
             "flashinfer",
             "trtllm_mha",
         }
-    else:
-        allowed_full = {"triton"}
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed_full, (
         "--enable-page-major-kv-layout: the resolved attention backends "
         f"{sorted(backends)} are not in the allowed set "
-        f"{sorted(allowed_full)} for this configuration (unified memory "
-        "allows the per-layer-view families; plain page-major keeps the "
-        "envelope-strided views only Triton reads). Pass a compatible "
+        f"{sorted(allowed_full)} for this configuration. Pass a compatible "
         "--attention-backend."
     )
+    # A draft's rows have its own model's geometry, which can differ from the
+    # target's (an external draft), so its backends are judged where the draft
+    # runner is configured (`draft_rows_refusal`), not here.
     # The Mamba/KDA state is stored in envelope-strided views; only
     # stride-audited kernels may read it (Stage 4 audit, per slot):
     # - decode: triton; flashinfer (recurrent_kda compiles the state slot
     #   stride as a free int64); helion (specializes KDA state strides 0-3
     #   and rejects a non-unit innermost stride); cutedsl (KDA fused sigmoid-
     #   gating update is stride-safe) on KDA-hybrid models only.
-    # - prefill: triton; flashkda (the wrapper gathers/scatters a contiguous
-    #   per-slot copy); helion; cutedsl (kernel_h compiles h0/ht with dynamic
+    # - prefill: triton; flashinfer (GDN gathers/scatters contiguous state);
+    #   flashkda (the wrapper gathers/scatters a contiguous per-slot copy);
+    #   helion; cutedsl (kernel_h compiles h0/ht with dynamic
     #   int64 strides), with the same KDA-only caveat.
     # - mamba (mamba2/short-conv state): triton only.
     # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
     # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
     decode_allowed = {"triton", "flashinfer"}
-    prefill_allowed = {"triton", "flashkda"}
+    prefill_allowed = {"triton", "flashkda", "flashinfer"}
     if use_mla_backend(server_args):
         decode_allowed.update({"cutedsl", "helion"})
         prefill_allowed.update({"cutedsl", "helion"})

@@ -14,18 +14,20 @@
 """`--enable-page-major-kv-layout` full-attention backend allowlist.
 
 `handle_page_major_kv_layout` gates two ways, because the per-layer views the
-unified pool exposes are all the allowlisted backends can read: an MLA arm
-(`build_mla_views`), an MHA/SWA arm (`build_mha_views`), and no page-major arm
-at all without the unified pool. `fa3` is the resolved default on pre-Blackwell
-hosts, so its absence from an arm makes `--enable-unified-memory` fail to boot
-under its own default configuration.
+unified pool exposes are all the allowlisted backends can read: an MLA arm, an
+MHA/SWA arm, and no page-major arm at all without the unified pool. `fa3` is
+the resolved default on pre-Blackwell hosts, so its absence from an arm makes
+`--enable-unified-memory` fail to boot under its own default configuration.
 
-The same handler screens the pool itself: the MHA/SWA per-layer views need
-uniform K/V rows, so an asymmetric-K/V model (MiMoV2: head_dim 192 !=
-v_head_dim 128) is rejected on EVERY backend, Triton included. MLA models are
-exempt -- their sub-pool keeps one latent row per layer, and real MLA configs
-(Kimi-Linear: head_dim 72, v_head_dim 128) report asymmetric dims while running
-the unified pool today.
+The same handler narrows the MHA arm for asymmetric K/V rows (MiMoV2:
+head_dim 192 != v_head_dim 128) to `ASYMMETRIC_KV_BACKENDS`, the backends
+that carry v_head_dim through to the kernel; flashinfer's `paged_kv_t`
+compiles one head_dim for both K and V, and trtllm_mha refuses unequal QK/V
+dims outright. `fa4` is the resolved default for such a model on SM100, so
+that arm keeps it for the same reason. MLA models are exempt -- their
+sub-pool keeps one latent row per layer, and real MLA configs (Kimi-Linear:
+head_dim 72, v_head_dim 128) report asymmetric dims while running the
+unified pool today.
 """
 
 import unittest
@@ -33,12 +35,16 @@ from types import SimpleNamespace
 
 import msgspec
 
-from sglang.srt.arg_groups.kv_cache_hook import handle_page_major_kv_layout
+from sglang.srt.arg_groups.kv_cache_hook import (
+    ASYMMETRIC_KV_BACKENDS,
+    draft_rows_refusal,
+    handle_page_major_kv_layout,
+)
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _accepts(
@@ -49,6 +55,7 @@ def _accepts(
     linear_decode: str | None = None,
     linear_prefill: str | None = None,
     has_asymmetric_kv: bool = False,
+    draft_backend: str | None = None,
 ) -> bool:
     """Run just `handle_page_major_kv_layout` against a minimal stand-in, since
     ServerArgs' real constructor pulls in a model config."""
@@ -65,6 +72,7 @@ def _accepts(
         "linear_attn_decode_backend": linear_decode,
         "linear_attn_prefill_backend": linear_prefill,
         "mamba_backend": "triton",
+        "speculative_draft_attention_backend": draft_backend,
     }.items():
         msgspec.Struct.__setattr__(sa, name, value)
     setattr(
@@ -93,24 +101,26 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
         "trtllm_mla",
         "flashinfer",
         "cutedsl_mla",
-        "tokenspeed_mla",
         "flashmla",
     )
-    # Wired for the per-layer MHA/SWA views (uniform-row models).
+    # Wired for the per-layer MHA/SWA views.
     PER_LAYER_VIEW_MHA_BACKENDS = ("fa3", "fa4", "flashinfer", "trtllm_mha")
     # MLA-family kernels that must never leak into the MHA arm.
-    MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "tokenspeed_mla", "flashmla")
-    # No kernel-facing-id wiring anywhere: must stay rejected until they get one.
+    MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "flashmla")
+    # No virtual-to-physical id wiring anywhere: must stay rejected until they get one.
     UNWIRED_BACKENDS = ("aiter",)
+
+    def test_explicit_flashinfer_gdn_prefill_matches_the_default(self):
+        """Pinning the automatically selected GDN prefill backend must not
+        make an otherwise valid unified-memory configuration fail at startup."""
+        self.assertTrue(_accepts("triton", use_mla=False, linear_prefill="flashinfer"))
 
     def test_triton_allowed_on_every_arm(self):
         """Triton reads both view families, so it is the one backend neither
         the MLA nor the MHA arm can narrow away."""
         for use_mla in (True, False):
             self.assertTrue(_accepts("triton", use_mla=use_mla))
-        # The uniform-row screen is a property of the model, not of the
-        # backend, so it rejects even Triton.
-        self.assertFalse(_accepts("triton", use_mla=False, has_asymmetric_kv=True))
+        self.assertTrue(_accepts("triton", use_mla=False, has_asymmetric_kv=True))
 
     def test_per_layer_view_mla_backends_allowed_under_unified_mla(self):
         for backend in self.PER_LAYER_VIEW_MLA_BACKENDS:
@@ -119,11 +129,11 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 f"{backend} should be allowed with the unified-memory MLA pool",
             )
 
-    def test_per_layer_view_mha_backends_allowed_for_uniform_row_models(self):
+    def test_per_layer_view_mha_backends_allowed_under_unified_mha(self):
         for backend in self.PER_LAYER_VIEW_MHA_BACKENDS:
             self.assertTrue(
                 _accepts(backend, use_mla=False),
-                f"{backend} should be allowed for a uniform-row MHA model",
+                f"{backend} should be allowed with the unified-memory MHA pool",
             )
 
     def test_mla_only_backends_rejected_for_mha(self):
@@ -133,15 +143,68 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 f"{backend} is an MLA kernel and must stay out of the MHA arm",
             )
 
-    def test_asymmetric_kv_mha_model_cannot_use_unified_memory(self):
-        """The rejection is the POOL's, not a backend's, so it must fire on
-        every backend -- Triton included."""
-        for backend in ("triton",) + self.PER_LAYER_VIEW_MHA_BACKENDS:
-            self.assertFalse(
+    def test_asymmetric_kv_mha_model_narrows_to_v_head_dim_backends(self):
+        """head_dim != v_head_dim (MiMoV2): the token-major entry holds the
+        two row widths at different offsets, so admission is per backend --
+        exactly the ones that carry v_head_dim through to the kernel.
+
+        `fa4` must stay admitted: it is the resolved default for an
+        asymmetric-K/V model on SM100, so dropping it makes such a model
+        unbootable under its own default configuration."""
+        for backend in ASYMMETRIC_KV_BACKENDS:
+            self.assertTrue(
                 _accepts(backend, use_mla=False, has_asymmetric_kv=True),
-                f"--enable-unified-memory + {backend} must be rejected for an "
+                f"{backend} carries v_head_dim through and must admit an "
                 "asymmetric-K/V model",
             )
+        one_head_dim = set(self.PER_LAYER_VIEW_MHA_BACKENDS) - ASYMMETRIC_KV_BACKENDS
+        self.assertEqual(one_head_dim, {"flashinfer", "trtllm_mha"})
+        for backend in one_head_dim:
+            self.assertFalse(
+                _accepts(backend, use_mla=False, has_asymmetric_kv=True),
+                f"{backend} reads V at K's head_dim (or refuses unequal dims) "
+                "and must stay rejected for an asymmetric-K/V model",
+            )
+
+    def test_the_gate_judges_the_target_backends_only(self):
+        """An external draft has its own K/V geometry, so the gate does not
+        judge a draft backend by the target's: an asymmetric target on fa3
+        with a symmetric DFLASH draft on flashinfer passes it."""
+        self.assertTrue(
+            _accepts(
+                "fa3",
+                use_mla=False,
+                has_asymmetric_kv=True,
+                draft_backend="flashinfer",
+            )
+        )
+
+    def test_draft_rows_are_judged_by_the_draft_geometry(self):
+        """The draft runner's check reads the draft model's rows: asymmetric
+        rows need backends that carry v_head_dim, whether set for the draft or
+        inherited from the target; symmetric rows and MLA rows need none."""
+        cases = [
+            # (draft rows asymmetric, draft uses MLA, draft backends, refused)
+            (
+                False,
+                False,
+                ("flashinfer",),
+                False,
+            ),  # asymmetric target, symmetric draft
+            (True, False, ("flashinfer",), True),  # symmetric target, asymmetric draft
+            (True, False, ("trtllm_mha",), True),
+            (True, False, ("fa3",), False),
+            (True, False, ("triton", "fa3"), False),  # inherited from the target
+            (True, False, ("triton", "flashinfer"), True),
+            (True, False, (None, "fa4"), False),
+            (True, True, ("flashinfer",), False),
+        ]
+        for asymmetric, mla, backends, refused in cases:
+            with self.subTest(asymmetric=asymmetric, mla=mla, backends=backends):
+                reason = draft_rows_refusal(
+                    has_asymmetric_kv=asymmetric, uses_mla=mla, backends=backends
+                )
+                self.assertEqual(reason is not None, refused, reason)
 
     def test_asymmetric_dims_do_not_screen_out_mla(self):
         """Screening on `has_asymmetric_kv` alone would lock every real MLA
@@ -170,7 +233,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
             for use_mla in (True, False):
                 self.assertFalse(
                     _accepts(backend, use_mla=use_mla),
-                    f"{backend} has no kernel-facing-id wiring and must be rejected",
+                    f"{backend} has no virtual-to-physical id wiring and must be rejected",
                 )
 
     def test_helion_linear_attention_is_kda_only(self):

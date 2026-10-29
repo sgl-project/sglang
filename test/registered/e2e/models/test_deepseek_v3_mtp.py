@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=386, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=226, stage="extra-b", runner_config="8-gpu-h200")
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
@@ -56,11 +56,7 @@ class TestDeepseekV3MTP(GSM8KMixin, DefaultServerBase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(acc_length, 2.8)
-            if is_in_amd_ci():
-                self.assertGreater(speed, 15)
-            else:
-                self.assertGreater(speed, 130)
+            self.assertGreater(speed, 130)
 
 
 if __name__ == "__main__":

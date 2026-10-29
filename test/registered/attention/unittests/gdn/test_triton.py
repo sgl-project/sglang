@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -8,6 +8,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
+from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -28,8 +29,8 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=13, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 
 
@@ -315,6 +316,24 @@ class TestTritonGDNBackendCorrectness(CustomTestCase):
                 spec_kind=spec_kind,
             ):
                 run_gdn_eagle_verify_case(self, case, topk=topk, spec_kind=spec_kind)
+
+    def test_triton_target_verify_skips_prefill_qkv_materialization(self):
+        case, topk, spec_kind = self.EAGLE_VERIFY_CASES[0]
+        with patch.object(
+            gdn_backend,
+            "fused_qkv_split_gdn_prefill",
+            side_effect=AssertionError,
+        ):
+            run_gdn_eagle_verify_case(self, case, topk=topk, spec_kind=spec_kind)
+
+    def test_triton_prefill_keeps_contiguous_qkv_materialization(self):
+        with patch.object(
+            gdn_backend,
+            "fused_qkv_split_gdn_prefill",
+            wraps=gdn_backend.fused_qkv_split_gdn_prefill,
+        ) as split_spy:
+            run_gdn_attention_case(self, self.CASES[0])
+        split_spy.assert_called()
 
     def test_runner_mode_eagle_verify_cuda_graph_cases(self):
         for case, topk, spec_kind in self.EAGLE_VERIFY_CUDA_GRAPH_CASES:

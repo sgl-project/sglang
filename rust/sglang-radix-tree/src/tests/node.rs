@@ -54,8 +54,8 @@ impl ChildKeyType for CountedKey {
         Cow::Owned(Self::from(token_ids.into_owned()))
     }
 
-    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u32> {
-        std::iter::once(*atom as u32)
+    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u64> {
+        std::iter::once(*atom as u64)
     }
 
     fn raw_token_ids(atoms: &[Self::Atom]) -> Cow<'_, [i64]> {
@@ -67,6 +67,7 @@ impl ChildKeyType for CountedKey {
 fn evicted_only_for_attached_nodes_without_full_device_value() {
     let mut parent: Node<Vec<i64>> = Node::new_root(/* id = */ 0);
     assert!(!parent.evicted());
+    assert_eq!(parent.device_reclaimable_value_len(FULL), 0);
     let mut child = Node::new_child(
         /* id = */ 1,
         /* key = */ vec![7],
@@ -78,8 +79,12 @@ fn evicted_only_for_attached_nodes_without_full_device_value() {
         .attach_child(&mut child, /* page_size = */ 1)
         .unwrap();
     assert!(child.evicted());
+    assert_eq!(child.device_reclaimable_value_len(FULL), 0);
     child.set_device_value(FULL, Tensor::from_slice(&[1i64]));
     assert!(!child.evicted());
+    assert_eq!(child.device_reclaimable_value_len(FULL), 1);
+    let _ = child.take_device_value(FULL);
+    assert_eq!(child.device_reclaimable_value_len(FULL), 0);
 }
 
 #[test]
@@ -470,6 +475,10 @@ fn present_but_empty_tensor_has_value_true_len_zero() {
     node.state_mut_(ValueSlotIdx::device(FULL)).value = Some(Tensor::from_slice(&empty));
     assert!(node.has_device_value(FULL));
     assert_eq!(node.device_value_len(FULL), 0);
+    assert_eq!(node.device_reclaimable_value_len(FULL), 0);
+    node.state_mut_(ValueSlotIdx::device(FULL)).value = Some(Tensor::from_slice(&[1i64]));
+    assert_eq!(node.device_value_len(FULL), 1);
+    assert_eq!(node.device_reclaimable_value_len(FULL), 0);
 }
 
 #[test]
@@ -880,13 +889,15 @@ fn empty_key_yields_no_pages() {
 }
 
 #[test]
-#[should_panic(expected = "token id does not fit in uint32")]
-fn oversized_token_id_is_rejected() {
-    get_hash_str::<Vec<i64>>(&[1 << 33], None, 2);
+fn wide_token_ids_keep_their_high_bits() {
+    assert_ne!(
+        get_hash_str::<Vec<i64>>(&[1 << 33], None, 2),
+        get_hash_str::<Vec<i64>>(&[0], None, 2)
+    );
 }
 
 #[test]
-#[should_panic(expected = "token id does not fit in uint32")]
+#[should_panic(expected = "token id must be a non-negative int64")]
 fn negative_token_id_is_rejected() {
     get_hash_str::<Vec<i64>>(&[-1], None, 2);
 }
@@ -1839,111 +1850,183 @@ fn id_map_stays_consistent_across_free_and_realloc() -> Result<(), TreeCoreRunti
     Ok(())
 }
 
-// Eviction-eligible node set.
+// One insertion-ordered membership collection for leaves and host duplicates.
 
 #[test]
-fn add_then_contains_and_len() {
-    let mut set = EvictableNodeSet::new();
-    assert!(!set.contains(NodeIdx_(3)));
-    assert!(set.is_empty());
-    set.add(NodeIdx_(3));
-    assert!(set.contains(NodeIdx_(3)));
-    assert_eq!(set.len(), 1);
-    assert!(!set.is_empty());
+fn node_set_empty_singleton_and_reinsertion() {
+    for mut set in [NodeSet::new(), NodeSet::default()] {
+        assert!(set.is_empty());
+        assert_eq!(set.len(), 0);
+        assert_eq!(set.iter().next(), None);
+        assert!(!set.contains(NodeIdx_(3)));
+        set.discard(NodeIdx_(3));
+        for _ in 0..2 {
+            set.add(NodeIdx_(3));
+            set.add(NodeIdx_(3));
+            assert!(set.contains(NodeIdx_(3)));
+            assert!(!set.is_empty());
+            assert_eq!(set.len(), 1);
+            assert_eq!(set.iter().collect::<Vec<_>>(), [NodeIdx_(3)]);
+            set.discard(NodeIdx_(3));
+            set.discard(NodeIdx_(3));
+            assert!(!set.contains(NodeIdx_(3)));
+            assert!(set.is_empty());
+            assert_eq!(set.iter().next(), None);
+        }
+    }
 }
 
 #[test]
-fn add_is_idempotent() {
-    let mut set = EvictableNodeSet::new();
+fn node_set_preserves_order_across_sequential_and_sparse_slots() {
+    let mut set = NodeSet::new();
+    for slot in [0, 1, 2, 4096, 17] {
+        set.add(NodeIdx_(slot));
+        assert!(set.contains(NodeIdx_(slot)));
+    }
+    assert_eq!(set.len(), 5);
+    assert_eq!(
+        set.iter().collect::<Vec<_>>(),
+        [0, 1, 2, 4096, 17].map(NodeIdx_)
+    );
+    for absent in [3, 4095, 8192] {
+        assert!(!set.contains(NodeIdx_(absent)));
+        set.discard(NodeIdx_(absent));
+    }
+    set.discard(NodeIdx_(1));
+    set.add(NodeIdx_(1));
+    assert_eq!(
+        set.iter().collect::<Vec<_>>(),
+        [0, 2, 4096, 17, 1].map(NodeIdx_)
+    );
+    assert_eq!(set.len(), 5);
+}
+
+#[test]
+fn node_set_preserves_survivors_through_head_middle_tail_removal() {
+    let mut set = NodeSet::new();
+    for slot in [10, 20, 30, 40, 20] {
+        set.add(NodeIdx_(slot));
+    }
+    assert_eq!(
+        set.iter().collect::<Vec<_>>(),
+        [10, 20, 30, 40].map(NodeIdx_)
+    );
+    set.discard(NodeIdx_(10));
+    set.discard(NodeIdx_(30));
+    set.discard(NodeIdx_(99));
+    set.add(NodeIdx_(10));
+    assert_eq!(set.iter().collect::<Vec<_>>(), [20, 40, 10].map(NodeIdx_));
+    assert!(!set.contains(NodeIdx_(30)));
+    for slot in [10, 20, 40] {
+        assert!(set.contains(NodeIdx_(slot)));
+        set.discard(NodeIdx_(slot));
+        assert!(!set.contains(NodeIdx_(slot)));
+    }
+    assert_eq!(set.iter().next(), None);
     set.add(NodeIdx_(5));
-    set.add(NodeIdx_(5));
-    assert_eq!(set.len(), 1);
     assert_eq!(set.iter().collect::<Vec<_>>(), vec![NodeIdx_(5)]);
 }
 
 #[test]
-fn discard_removes_the_member() {
-    let mut set = EvictableNodeSet::new();
-    set.add(NodeIdx_(2));
-    set.discard(NodeIdx_(2));
-    assert!(!set.contains(NodeIdx_(2)));
-    assert_eq!(set.len(), 0);
-    assert!(set.is_empty());
-}
-
-#[test]
-fn add_sequential_ids_grows_the_slot_table_one_by_one() {
-    // Arena NodeIds are sequential, so add(node_id == slots.len()) is the common case.
-    let mut set = EvictableNodeSet::new();
-    set.add(NodeIdx_(0));
-    set.add(NodeIdx_(1));
-    set.add(NodeIdx_(2));
-    assert!(set.contains(NodeIdx_(0)));
-    assert!(set.contains(NodeIdx_(1)));
-    assert!(set.contains(NodeIdx_(2)));
-    assert_eq!(set.len(), 3);
-}
-
-#[test]
-fn discard_absent_is_noop() {
-    let mut set = EvictableNodeSet::new();
-    set.add(NodeIdx_(1));
-    set.discard(NodeIdx_(9));
-    set.discard(NodeIdx_(0));
-    assert!(set.contains(NodeIdx_(1)));
-    assert_eq!(set.len(), 1);
-}
-
-#[test]
-fn discard_fixes_up_the_swapped_member_slot() {
-    let mut set = EvictableNodeSet::new();
-    set.add(NodeIdx_(10));
-    set.add(NodeIdx_(20));
-    set.add(NodeIdx_(30));
-    // Removing the first member swap-moves the tail (30) into its slot.
-    set.discard(NodeIdx_(10));
-    assert!(!set.contains(NodeIdx_(10)));
-    assert!(set.contains(NodeIdx_(20)));
-    assert!(set.contains(NodeIdx_(30)));
-    assert_eq!(set.len(), 2);
-    // The moved member's slot stays consistent for a follow-up discard.
-    set.discard(NodeIdx_(30));
-    assert!(!set.contains(NodeIdx_(30)));
-    assert!(set.contains(NodeIdx_(20)));
-    assert_eq!(set.len(), 1);
-}
-
-#[test]
-fn discard_the_tail_member() {
-    let mut set = EvictableNodeSet::new();
-    set.add(NodeIdx_(10));
-    set.add(NodeIdx_(20));
+fn node_set_iterator_preserves_order_and_remaining_length_after_skips() {
+    let mut set = NodeSet::new();
+    for slot in [10, 20, 30, 40] {
+        set.add(NodeIdx_(slot));
+    }
     set.discard(NodeIdx_(20));
-    assert!(set.contains(NodeIdx_(10)));
-    assert!(!set.contains(NodeIdx_(20)));
-    assert_eq!(set.len(), 1);
-}
-
-#[test]
-fn re_add_after_discard() {
-    let mut set = EvictableNodeSet::new();
-    set.add(NodeIdx_(4));
-    set.discard(NodeIdx_(4));
-    set.add(NodeIdx_(4));
-    assert!(set.contains(NodeIdx_(4)));
-    assert_eq!(set.len(), 1);
-}
-
-#[test]
-fn iter_yields_all_members() {
-    let mut set = EvictableNodeSet::new();
-    set.add(NodeIdx_(10));
     set.add(NodeIdx_(20));
-    set.add(NodeIdx_(30));
-    set.discard(NodeIdx_(20));
-    let mut members = set.iter().collect::<Vec<_>>();
-    members.sort_unstable();
-    assert_eq!(members, vec![NodeIdx_(10), NodeIdx_(30)]);
+    assert_eq!(set.iter().last(), Some(NodeIdx_(20)));
+    assert_eq!(
+        set.iter().skip(2).collect::<Vec<_>>(),
+        [NodeIdx_(40), NodeIdx_(20)]
+    );
+
+    let mut iter = set.iter();
+    assert_eq!(iter.size_hint(), (4, Some(4)));
+    assert_eq!(iter.nth(1), Some(NodeIdx_(30)));
+    assert_eq!(iter.len(), 2);
+    assert_eq!(iter.size_hint(), (2, Some(2)));
+    assert_eq!(iter.next(), Some(NodeIdx_(40)));
+    assert_eq!(iter.next(), Some(NodeIdx_(20)));
+    assert_eq!(iter.size_hint(), (0, Some(0)));
+    assert_eq!(iter.next(), None);
+    assert_eq!(iter.next(), None);
+}
+
+fn assert_node_set_matches_reference(set: &NodeSet, expected: &[NodeIdx_], universe: &[NodeIdx_]) {
+    // Bound the iterator read so a broken cycle reports an order failure
+    // rather than hanging this test in collect() or the test-only len().
+    assert_eq!(
+        set.iter().take(expected.len() + 1).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(set.len(), expected.len());
+    assert_eq!(set.is_empty(), expected.is_empty());
+    for &slot in universe {
+        assert_eq!(
+            set.contains(slot),
+            expected.contains(&slot),
+            "slot {slot:?}"
+        );
+    }
+}
+
+#[test]
+fn node_set_matches_vec_reference_through_deterministic_mixed_updates() {
+    let universe: Vec<NodeIdx_> = (0usize..64)
+        .map(|i| NodeIdx_(if i.is_multiple_of(9) { i * 97 } else { i }))
+        .collect();
+    for mut state in [0x5eed_u64, 0x1234_5678_abcd_u64] {
+        let mut set = NodeSet::new();
+        let mut expected = Vec::new();
+        for &slot in universe.iter().rev() {
+            set.add(slot);
+            expected.push(slot);
+            assert_node_set_matches_reference(&set, &expected, &universe);
+        }
+        for step in 0..2048 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let chosen = universe[((state >> 32) as usize) % universe.len()];
+            let operation = step % 8;
+            let slot = match operation {
+                3 if !expected.is_empty() => expected[0],
+                4 if !expected.is_empty() => expected[expected.len() - 1],
+                5 if !expected.is_empty() => expected[expected.len() / 2],
+                6 if !expected.is_empty() => expected[((state >> 16) as usize) % expected.len()],
+                _ => chosen,
+            };
+            if matches!(operation, 0..=2 | 6) {
+                set.add(slot);
+                if !expected.contains(&slot) {
+                    expected.push(slot);
+                }
+            } else {
+                set.discard(slot);
+                expected.retain(|&member| member != slot);
+            }
+            assert_node_set_matches_reference(&set, &expected, &universe);
+            if operation == 7 {
+                // Reuse the same arena slot immediately, after checking the
+                // intermediate removal. It must append behind all survivors.
+                set.add(slot);
+                expected.push(slot);
+                assert_node_set_matches_reference(&set, &expected, &universe);
+            }
+        }
+        while !expected.is_empty() {
+            let index = if expected.len().is_multiple_of(2) {
+                0
+            } else {
+                expected.len() - 1
+            };
+            let removed = expected.remove(index);
+            set.discard(removed);
+            assert_node_set_matches_reference(&set, &expected, &universe);
+        }
+        set.add(universe[63]);
+        expected.push(universe[63]);
+        assert_node_set_matches_reference(&set, &expected, &universe);
+    }
 }
 
 // Pin Python/Rust storage hashes across a parent-child boundary.

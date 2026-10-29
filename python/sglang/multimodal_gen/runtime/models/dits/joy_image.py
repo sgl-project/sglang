@@ -8,8 +8,16 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
+from sglang.kernels.ops import diffusion as diffusion_kernels
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
+from sglang.kernels.ops.diffusion.sites.fused_linear_gelu_site import (
+    can_use_linear_gelu_static,
+    fused_linear_gelu_tanh,
+)
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_double_blocks
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -28,6 +36,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -47,6 +56,140 @@ from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 logger = init_logger(__name__)
 _MODULATION_FACTOR = 6
+_JOY_QKV_CAT = BitExactFusionGate(
+    "Joy image/text QKV concatenation", per_signature=True
+)
+_JOY_IMAGE_QK_ROPE = BitExactFusionGate("Joy strided image QK RoPE", per_signature=True)
+
+
+def _joy_image_qk_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    cache: torch.Tensor,
+    complex_freqs: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    def reference():
+        return apply_qk_norm_with_optional_rope(
+            q=q.contiguous(),
+            k=k.contiguous(),
+            q_norm=q_norm,
+            k_norm=k_norm,
+            head_dim=q.shape[-1],
+            cos_sin_cache=cache,
+            freqs_complex=complex_freqs,
+            is_neox=False,
+            allow_inplace=True,
+        )
+
+    # Read the packed projection directly, using the same CUDA arithmetic as
+    # the original contiguous in-place operation; apply_qk_norm_rope only fuses
+    # in place, so it needs the contiguous copies. Keep unmeasured paths native.
+    if (
+        not q.is_cuda
+        or torch.version.hip
+        or torch.compiler.is_compiling()
+        or q.ndim != 4
+        or q.shape != k.shape
+        or q.shape[2:] != (32, 128)
+        or q.numel() < 16 * 1024 * 1024
+        or q.dtype != torch.bfloat16
+        or k.dtype != q.dtype
+        or k.device != q.device
+        or torch.cuda.get_device_capability(q.device) != (9, 0)
+        or any(x.stride() != (q.shape[1] * 12288, 12288, 128, 1) for x in (q, k))
+        or cache.ndim != 2
+        or cache.shape[1] != 128
+        or cache.shape[0] < q.shape[1]
+        or cache.dtype != torch.float32
+        or cache.device != q.device
+        or not cache.is_contiguous()
+        or q_norm.variance_epsilon != k_norm.variance_epsilon
+        or any(
+            norm.weight.shape != (128,)
+            or norm.weight.dtype != q.dtype
+            or norm.weight.device != q.device
+            or not norm.weight.is_contiguous()
+            for norm in (q_norm, k_norm)
+        )
+        or (
+            torch.is_grad_enabled()
+            and any(
+                x.requires_grad for x in (q, k, q_norm.weight, k_norm.weight, cache)
+            )
+        )
+        or not envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
+    ):
+        return reference()
+    if not diffusion_kernels.can_use_fused_inplace_qknorm_rope(
+        128, 128, False, q.dtype, cache.dtype
+    ):
+        return reference()
+
+    def fused():
+        q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+        k_out = torch.empty_like(q_out)
+        positions = torch.arange(q.shape[1], device=q.device, dtype=torch.int64)
+        if q.shape[0] != 1:
+            positions = positions.repeat(q.shape[0])
+        diffusion_kernels.fused_qknorm_rope_out_of_place(
+            q.view(-1, 32, 128),
+            k.view(-1, 32, 128),
+            q_out.view(-1, 32, 128),
+            k_out.view(-1, 32, 128),
+            q_norm.weight,
+            k_norm.weight,
+            cache,
+            positions,
+            is_neox=False,
+            eps=q_norm.variance_epsilon,
+            head_dim=128,
+            rope_dim=128,
+        )
+        return q_out, k_out
+
+    # The out-of-place kernel leaves packed Q/K/V pristine, including when it
+    # has written part of an output before raising, so a failure falls back.
+    return _JOY_IMAGE_QK_ROPE.run(
+        fused,
+        reference,
+        sig=(q.device, tuple(q.shape), tuple(q.stride()), q_norm.variance_epsilon),
+        equal=lambda actual, expected: all(
+            torch.equal(a.view(torch.int16), b.view(torch.int16))
+            for a, b in zip(actual, expected, strict=True)
+        ),
+        logger=logger,
+    )
+
+
+def _joy_joint_qkv(*inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def reference():
+        return tuple(torch.cat((inputs[i], inputs[i + 3]), dim=1) for i in range(3))
+
+    # Below 32 MiB per image tensor, eager dispatch costs more than the copy
+    # saves. Keep small resolutions and short sequence-parallel shards native.
+    if (
+        inputs[0].numel() < 16 * 1024 * 1024
+        or not inputs[0].is_cuda
+        or torch.version.hip
+        or torch.compiler.is_compiling()
+        or inputs[0].dtype not in (torch.float16, torch.bfloat16)
+        or inputs[0].shape[-2] * inputs[0].shape[-1] > 8192
+        or any(x.requires_grad for x in inputs)
+    ):
+        return reference()
+    return _JOY_QKV_CAT.run(
+        lambda: diffusion_kernels.joint_qkv_cat(*inputs),
+        reference,
+        sig=(inputs[0].device, inputs[0].dtype)
+        + tuple((tuple(x.shape), tuple(x.stride())) for x in inputs),
+        equal=lambda actual, expected: all(
+            torch.equal(a.view(torch.int16), b.view(torch.int16))
+            for a, b in zip(actual, expected, strict=True)
+        ),
+        logger=logger,
+    )
 
 
 def fused_add_gate(
@@ -105,6 +248,39 @@ class ModulateWan(nn.Module):
         return [
             o.squeeze(1) for o in (self.modulate_table + x).chunk(self.factor, dim=1)
         ]
+
+
+def _joy_image_mlp(mlp: MLP, x: torch.Tensor, fuse_gelu: bool) -> torch.Tensor:
+    """Use the SM120 image epilogue when eligible; retain the original MLP otherwise."""
+    fc_in = mlp.fc_in
+    # SM120's epilogue wins for the large image projection, but regresses the
+    # smaller text projection. It also removes the intermediate BF16 rounding.
+    # Native single-reference image buckets have at least 7168 image tokens.
+    if (
+        not fuse_gelu
+        or torch.compiler.is_compiling()
+        or not x.is_cuda
+        or torch.version.hip
+        or x.ndim != 3
+        or x.shape[0] != 1
+        or x.shape[1] < 7168
+        or x.shape[2] != 4096
+        or x.dtype != torch.bfloat16
+        or not x.is_contiguous()
+        or torch.cuda.get_device_capability(x.device) != (12, 0)
+        or not isinstance(mlp.act, nn.GELU)
+        or mlp.act.approximate != "tanh"
+        or (isinstance(fc_in, BaseLayerWithLoRA) and fc_in.lora_active)
+        or not can_use_linear_gelu_static(fc_in)
+        or fc_in.weight.shape != (16384, 4096)
+        or fc_in.weight.dtype != x.dtype
+        or fc_in.weight.device != x.device
+        or fc_in.bias.device != x.device
+    ):
+        return mlp(x)
+    hidden = fused_linear_gelu_tanh(x, fc_in.weight, fc_in.bias)
+    # Keep the output projection wrapper, including LoRA and TP reduction.
+    return mlp.fc_out(hidden)[0]
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -233,6 +409,7 @@ class MMDoubleStreamBlock(nn.Module):
         vis_complex_freqs: Optional[torch.Tensor] = None,
         txt_complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_suffix: int = 0,
+        fuse_image_gelu: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through multimodal double stream block."""
         (
@@ -271,18 +448,13 @@ class MMDoubleStreamBlock(nn.Module):
             raise ValueError(
                 f"Fused QK-Norm + RoPE kernel only supports float16/bfloat16, but got {img_q.dtype}"
             )
-        img_q = img_q.contiguous()
-        img_k = img_k.contiguous()
-        img_q, img_k = apply_qk_norm_with_optional_rope(
-            q=img_q,
-            k=img_k,
-            q_norm=self.img_attn_q_norm,
-            k_norm=self.img_attn_k_norm,
-            head_dim=img_q.shape[-1],
-            cos_sin_cache=vis_freqs_cis,
-            freqs_complex=vis_complex_freqs,
-            is_neox=False,
-            allow_inplace=True,
+        img_q, img_k = _joy_image_qk_rope(
+            img_q,
+            img_k,
+            self.img_attn_q_norm,
+            self.img_attn_k_norm,
+            vis_freqs_cis,
+            vis_complex_freqs,
         )
         img_q, img_k = img_q.to(img_v), img_k.to(img_v)
 
@@ -315,9 +487,9 @@ class MMDoubleStreamBlock(nn.Module):
         txt_q, txt_k = txt_q.to(txt_v), txt_k.to(txt_v)
 
         # Attention
-        joint_query = torch.cat([img_q, txt_q], dim=1)
-        joint_key = torch.cat([img_k, txt_k], dim=1)
-        joint_value = torch.cat([img_v, txt_v], dim=1)
+        joint_query, joint_key, joint_value = _joy_joint_qkv(
+            img_q, img_k, img_v, txt_q, txt_k, txt_v
+        )
         attn = self.attn(
             joint_query,
             joint_key,
@@ -333,10 +505,12 @@ class MMDoubleStreamBlock(nn.Module):
         img = fused_add_gate(img, self.img_attn_proj(img_attn)[0], img_mod1_gate)
         img = fused_add_gate(
             img,
-            self.img_mlp(
+            _joy_image_mlp(
+                self.img_mlp,
                 self.fused_modulate_img_norm2(
                     img, shift=img_mod2_shift, scale=img_mod2_scale
-                )
+                ),
+                fuse_image_gelu,
             ),
             img_mod2_gate,
         )
@@ -491,6 +665,9 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ) -> torch.Tensor:
         """Forward pass through JoyImage Transformer."""
         forward_batch = get_forward_context().forward_batch
+        fuse_image_gelu = forward_batch is not None and quality_allows(
+            forward_batch.sampling_params.quality, "high"
+        )
         sequence_shard_enabled = (
             forward_batch is not None
             and getattr(forward_batch, "enable_sequence_shard", False)
@@ -583,6 +760,7 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 vis_complex_freqs=vis_complex_freqs,
                 txt_complex_freqs=txt_complex_freqs,
                 num_replicated_suffix=txt_suffix_len,
+                fuse_image_gelu=fuse_image_gelu,
             )
 
         if sequence_shard_enabled:

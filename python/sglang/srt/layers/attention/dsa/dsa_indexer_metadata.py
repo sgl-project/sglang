@@ -32,6 +32,10 @@ class BaseIndexerMetadata(ABC):
                 The page size of the table is 64.
         """
 
+    def get_logical_page_table(self) -> torch.Tensor:
+        """Page IDs for pool-managed reads, before any pool address translation."""
+        return self.get_page_table_64()
+
     @abstractmethod
     def get_page_table_1(self) -> torch.Tensor:
         """
@@ -98,12 +102,17 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
+    dcp_size: int = 1
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
 
     def get_page_table_64(self) -> torch.Tensor:
         return self.attn_metadata.real_page_table
+
+    def get_logical_page_table(self) -> torch.Tensor:
+        logical = self.attn_metadata.indexer_logical_page_table
+        return self.get_page_table_64() if logical is None else logical
 
     def get_page_table_1(self) -> torch.Tensor:
         return self.attn_metadata.page_table_1

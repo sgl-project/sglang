@@ -3,7 +3,7 @@ import threading
 import warnings
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import orjson
 import partial_json_parser
@@ -476,3 +476,40 @@ def get_json_schema_constraint(
         return json_schema
 
     return None
+
+
+def strip_structural_tag_excludes(structural_tag: Any, tokens: Iterable[str]) -> None:
+    """Remove ``tokens`` from every free-text ``excludes`` list in a structural
+    tag, in place.
+
+    xgrammar's builtin tags forbid the model's think tokens in free text. When
+    SGLang's reasoning parser owns the reasoning section that exclusion only
+    fights the model (e.g. an empty ``</think>`` emitted before prose).
+    """
+    tokens = set(tokens)
+    if not tokens:
+        return
+
+    def visit(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if isinstance(node, dict):
+            excludes = node.get("excludes")
+            if isinstance(excludes, list):
+                node["excludes"] = [s for s in excludes if s not in tokens]
+            for key in ("format", "content", "tags", "elements"):
+                if key in node:
+                    visit(node[key])
+            return
+        if not hasattr(node, "__dict__"):
+            return
+        excludes = getattr(node, "excludes", None)
+        if isinstance(excludes, list):
+            node.excludes = [s for s in excludes if s not in tokens]
+        for key in ("format", "content", "tags", "elements"):
+            if hasattr(node, key):
+                visit(getattr(node, key))
+
+    visit(structural_tag)

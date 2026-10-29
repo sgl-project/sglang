@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -46,7 +46,7 @@ class TestPureTP(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreater(metrics["score"], 0.5)
 
 
@@ -64,9 +64,8 @@ class TestDPAttn(unittest.TestCase):
                     "--trust-remote-code",
                     "--tp",
                     "2",
-                    "--dp",
+                    "--attn-dp-size",
                     "2",
-                    "--enable-dp-attention",
                     "--moe-a2a-backend",
                     "deepep",
                     "--deepep-mode",
@@ -108,7 +107,7 @@ class TestDPAttn(unittest.TestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreater(metrics["score"], 0.5)
 
 

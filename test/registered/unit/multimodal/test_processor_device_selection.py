@@ -17,7 +17,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 BASE = "sglang.srt.multimodal.processors.base_processor"
 
@@ -51,10 +51,16 @@ class TestFastImageProcessorDevice(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
 
-    def _device(self, processor, **platform):
+    def _device(self, processor, cuda_alike=True, device_type="cuda", **platform):
         flags = {"_is_cpu": False, "_is_xpu": False, "_is_npu": False}
         flags.update(platform)
-        with patch.multiple(BASE, **flags):
+        platforms = SimpleNamespace(
+            current_platform=SimpleNamespace(
+                is_cuda_alike=lambda: cuda_alike,
+                device_type=device_type,
+            )
+        )
+        with patch.multiple(BASE, platforms=platforms, **flags):
             return processor._fast_image_processor_device(_Processor())
 
     def test_device_follows_the_instance_base_gpu_id(self):
@@ -91,6 +97,23 @@ class TestFastImageProcessorDevice(CustomTestCase):
         with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True):
             device = processor._fast_image_processor_device(Glm4vProcessor())
         self.assertIsNone(device)
+
+    def test_platform_respects_cuda_compatibility(self):
+        processor = _make(base_gpu_id=3)
+        for cuda_alike, device_type, expected in (
+            (False, "other", None),
+            (True, "cuda", "cuda:3"),
+            (True, "musa", "musa:3"),
+        ):
+            with self.subTest(cuda_alike=cuda_alike, device_type=device_type):
+                self.assertEqual(
+                    self._device(
+                        processor,
+                        cuda_alike=cuda_alike,
+                        device_type=device_type,
+                    ),
+                    expected,
+                )
 
 
 class TestFastImageProcessorMemoryPool(CustomTestCase):
@@ -161,6 +184,18 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
                 events.append("exit")
 
         with (
+            patch.multiple(
+                BASE,
+                _is_cpu=False,
+                _is_xpu=False,
+                _is_npu=False,
+                platforms=SimpleNamespace(
+                    current_platform=SimpleNamespace(
+                        is_cuda_alike=lambda: True,
+                        device_type="cuda",
+                    )
+                ),
+            ),
             patch(f"{BASE}.BaseImageProcessor", ImageProcessor),
             patch(f"{BASE}.torch.cuda.device", return_value=nullcontext()),
             patch(f"{BASE}.torch.cuda.MemPool", return_value="pool"),

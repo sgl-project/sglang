@@ -20,7 +20,7 @@ class TestCompressStateWritePad(CustomTestCase):
     def test_pad_is_zero_without_speculation(self):
         """A non-speculative ring is exactly one window wide: nothing rolls back."""
         for compress_ratio in (4, 128):
-            ring_size = get_compress_state_ring_size(compress_ratio, False)
+            ring_size = get_compress_state_ring_size(compress_ratio)
             with self.subTest(cr=compress_ratio, ring=ring_size):
                 self.assertEqual(
                     get_compress_state_write_pad(compress_ratio, ring_size), 0
@@ -29,7 +29,7 @@ class TestCompressStateWritePad(CustomTestCase):
     def test_pad_matches_speculative_ring_capacity(self):
         """`ring_size - window_size + 2`, with window = 2*cr for the overlapping c4."""
         for compress_ratio, expected in ((4, 10), (128, 130)):
-            ring_size = get_compress_state_ring_size(compress_ratio, True)
+            ring_size = get_compress_state_ring_size(compress_ratio, num_draft_tokens=4)
             with self.subTest(cr=compress_ratio, ring=ring_size):
                 self.assertEqual(
                     get_compress_state_write_pad(compress_ratio, ring_size), expected

@@ -12,15 +12,14 @@ import logging
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
-from sglang.srt.runtime_context import (
-    describe_kv_events_publisher,
-    get_lora,
-    get_serving,
-)
+from sglang.srt.runtime_context import get_lora, get_serving
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.utils.common import build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -58,6 +57,21 @@ class _GrpcRequest:
         return bool(self._is_disconnected_fn())
 
 
+def _media_input_features(mm_processor) -> List[str]:
+    if mm_processor is None or mm_processor.mm_tokens is None:
+        return []
+    tokens = mm_processor.mm_tokens
+    return [
+        feature
+        for feature, token in (
+            ("image_inputs", tokens.image_token),
+            ("video_inputs", tokens.video_token),
+            ("audio_inputs", tokens.audio_token),
+        )
+        if token
+    ]
+
+
 class RuntimeHandle:
     """Thin Python handle that the Rust gRPC server calls into.
 
@@ -83,6 +97,9 @@ class RuntimeHandle:
 
         self.tokenizer_manager.auto_create_handle_loop()
         self._event_loop = self.tokenizer_manager.event_loop
+
+    def set_engine_state_changed_callback(self, callback) -> None:
+        self.tokenizer_manager.set_engine_state_changed_callback(callback)
 
     @property
     def _tm_loop(self):
@@ -235,9 +252,7 @@ class RuntimeHandle:
             return self._openai_serving_classes
 
         from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-        from sglang.srt.entrypoints.openai.serving_classify import (
-            OpenAIServingClassify,
-        )
+        from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
         from sglang.srt.entrypoints.openai.serving_completions import (
             OpenAIServingCompletion,
         )
@@ -411,6 +426,9 @@ class RuntimeHandle:
             "load_format": self.tokenizer_manager.config_value("load_format"),
             "reasoning_parser": self.tokenizer_manager.config_value("reasoning_parser"),
             "tool_call_parser": self.tokenizer_manager.config_value("tool_call_parser"),
+            "disaggregation_mode": self.tokenizer_manager.config_value(
+                "disaggregation_mode"
+            ),
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
@@ -424,27 +442,30 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
-        # `resolved_dict` answers with what resolution decided; the launch
-        # command answers with what was asked for, and the two are not
-        # derivable from each other. The HTTP and in-process readbacks both
-        # carry it, so this one does too.
-        result["launch_command"] = self.tokenizer_manager.server_args.launch_command
-        result.update(self.scheduler_info)
-        result["kv_events"] = describe_kv_events_publisher(
-            self.tokenizer_manager.server_args
+        return json.dumps(
+            msgspec_to_builtins(
+                {
+                    **redact_watermark_secrets(
+                        build_server_info(
+                            self.tokenizer_manager.server_args, self.scheduler_info
+                        )
+                    ),
+                    # Older servers and processors without a modality's placeholder
+                    # drop that media silently, so clients check this list first.
+                    "grpc_features": _media_input_features(
+                        self.tokenizer_manager.mm_processor
+                    ),
+                }
+            ),
+            default=str,
         )
-        return json.dumps(msgspec_to_builtins(result), default=str)
 
     def health_check(self) -> bool:
-        from sglang.srt.managers.tokenizer_manager import ServerStatus
+        return self.tokenizer_manager.is_healthy()
 
-        if self.tokenizer_manager.gracefully_exit:
-            return False
-        return self.tokenizer_manager.server_status not in (
-            ServerStatus.Starting,
-            ServerStatus.UnHealthy,
-        )
+    def is_pause(self) -> bool:
+        """Return the tokenizer manager's authoritative generation pause state."""
+        return self.tokenizer_manager.is_pause
 
     def tokenize(self, text: str, add_special_tokens: bool = True) -> str:
         tokenizer = self.tokenizer_manager.tokenizer
@@ -793,7 +814,8 @@ class RuntimeHandle:
                 elif hasattr(result, "body"):
                     resp_bytes = result.body
                 elif isinstance(result, (dict, list)):
-                    resp_bytes = json.dumps(result).encode("utf-8")
+                    # As FastAPI encodes it over HTTP; rerank returns a list of models.
+                    resp_bytes = json.dumps(jsonable_encoder(result)).encode("utf-8")
                 else:
                     resp_bytes = str(result).encode("utf-8")
                 status_code = int(

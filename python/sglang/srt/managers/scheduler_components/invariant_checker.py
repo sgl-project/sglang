@@ -16,11 +16,15 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
+    kv_private_swa_tokens,
+    kv_private_tokens,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -37,6 +41,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
 
 
@@ -48,13 +53,9 @@ BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 
 @dataclass(kw_only=True, slots=True)
 class SchedulerInvariantChecker:
-    is_hybrid_swa: bool
-    is_hybrid_ssm: bool
     disaggregation_mode: DisaggregationMode
+    # Logical token page width; CP KV sharding uses CP size * physical page_size.
     page_size: int
-    full_tokens_per_layer: Optional[int]
-    swa_tokens_per_layer: Optional[int]
-    max_total_num_tokens: int
     tree_cache: BasePrefixCache
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     req_to_token_pool: ReqToTokenPool
@@ -63,7 +64,7 @@ class SchedulerInvariantChecker:
     get_running_batch: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
     # The chunked-prefill request parked between chunks is in neither batch;
-    # its uncached tokens must still be counted.
+    # it still owns its KV row.
     get_chunked_req: Callable = field(default=lambda: None)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
@@ -92,54 +93,71 @@ class SchedulerInvariantChecker:
 
     def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator
-        if self.is_hybrid_swa and not ps.full_capacity:
+        if ps.is_hybrid_swa and not ps.full_capacity:
             return False, ""
-        if self.is_hybrid_swa:
+        # The token sub-pool's capacity as the stats report it: the sized cap
+        # with a window, the schedulable token count with state.
+        total = ps.full_capacity
+        session_held = self.pool_stats_observer.session_held_tokens()
+        if ps.is_hybrid_swa or ps.is_hybrid_ssm:
             protected = self.tree_cache.full_protected_size()
-            session_held = self.pool_stats_observer.session_held_full_tokens()
-            total = ps.full_capacity
-        elif self.is_hybrid_ssm:
-            # Branch on cache type for the protected accessor (MambaRadixCache
-            # splits full/mamba; ChunkCache only has the single protected_size).
-            # Use the allocator's `.size` for `total`: static max_total_num_tokens for
-            # non-unified pools, the dynamic byte-coordinated cap (matching
-            # `available_size`) for the unified pool.
-            if self.tree_cache.supports_mamba():
-                protected = self.tree_cache.full_protected_size()
-            else:
-                protected = self.tree_cache.protected_size()
-            session_held = self.pool_stats_observer.session_held_tokens()
-            total = self.req_to_token_pool.schedulable_token_capacity(
-                self.token_to_kv_pool_allocator.size
-            )
         else:
             protected = self.tree_cache.protected_size()
-            session_held = self.pool_stats_observer.session_held_tokens()
-            total = self.max_total_num_tokens
         full_evictable_size = ps.full_evictable_size
-        if get_parallel().dcp_enabled and allocator.page_size > 1:
-            # DCP stores logical tokens in widened physical pages.  Prefix cache
-            # counters are logical-token based, while the allocator frees whole
-            # physical pages, so round cached tokens up to physical page units.
-            full_evictable_size = (
-                (full_evictable_size + allocator.page_size - 1)
-                // allocator.page_size
-                * allocator.page_size
+        full_available = ps.full_available_size
+        class_watermark_msg = ""
+        kv_shard_size = page_interleave_shard_size(allocator)
+        dcp_page_alloc = (
+            kv_shard_size == 1
+            and get_parallel().dcp_enabled
+            and allocator.page_size > 1
+        )
+        if kv_shard_size > 1:
+            # Conservation needs every free page, not the min-class capacity
+            # floor used for admission. Sharding keeps the tree and allocator
+            # page sizes equal, so cached counts must already be page-aligned.
+            full_available = allocator.aggregate_free_size()
+            class_watermark_msg = (
+                f", class_free_pages={allocator.class_free_page_counts()}"
             )
+        elif dcp_page_alloc:
+            # Preserve the existing DCP-only accounting adjustment. DCP widens
+            # allocator pages; its scheduler counters still use per-rank units.
+            full_evictable_size = ceil_align(full_evictable_size, allocator.page_size)
         leak, msg = self._check_pool_invariant(
             "full",
-            ps.full_available_size,
+            full_available,
             full_evictable_size,
             protected,
             session_held,
             total,
             uncached,
         )
-        if leak and get_parallel().dcp_enabled and allocator.page_size > 1:
-            # Radix/Mamba cache accounting is logical-token based while DCP full
-            # KV allocation is physical-page based. Partial physical pages can
-            # leave a small page-level slack even when all pages are owned by
-            # either the allocator or the prefix cache.
+        msg += class_watermark_msg
+        if kv_shard_size > 1:
+            # Partial active pages are already rounded in
+            # _get_total_uncached_sizes. Rounding cached counts or accepting
+            # arbitrary slack here would hide corruption and lost pages.
+            unaligned = {
+                name: value
+                for name, value in (
+                    ("available", full_available),
+                    ("evictable", full_evictable_size),
+                    ("protected", protected),
+                    ("session_held", session_held),
+                    ("uncached", uncached),
+                    ("total", total),
+                )
+                if value % allocator.page_size != 0
+            }
+            if unaligned:
+                return True, (
+                    f"{msg}, unaligned_sharded_counts={unaligned}, "
+                    f"page_size={allocator.page_size}"
+                )
+        if leak and dcp_page_alloc:
+            # Legacy DCP counters use different page/capacity units. Keep that
+            # compatibility path separate from exact KV-shard conservation.
             return False, f"{msg}, dcp_physical_page_slack_allowed=True"
         return leak, msg
 
@@ -152,7 +170,7 @@ class SchedulerInvariantChecker:
                 "[swa] unified ring (leak-check skipped): "
                 f"available={ps.swa_available_size}, "
                 f"evictable={ps.swa_evictable_size}, "
-                f"total={self.swa_tokens_per_layer}"
+                f"total={ps.swa_capacity}"
             )
         return self._check_pool_invariant(
             "swa",
@@ -165,7 +183,7 @@ class SchedulerInvariantChecker:
         )
 
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
-        ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
+        ckpt_pool = self.token_to_kv_pool_allocator.state.ckpt_pool
         if ckpt_pool is not None:
             return self._check_mamba_pool_with_int8(ps, ckpt_pool)
         leak, msg = self._check_pool_invariant(
@@ -174,7 +192,7 @@ class SchedulerInvariantChecker:
             ps.mamba_evictable_size,
             self.tree_cache.mamba_protected_size(),
             self.pool_stats_observer.session_held_mamba_slots(),
-            self.req_to_token_pool.mamba_pool.size,
+            ps.mamba_capacity,
         )
         if leak:
             # Pools without a page free list return None; skip the census rather
@@ -198,7 +216,7 @@ class SchedulerInvariantChecker:
                     expected_full_pages - free_full_pages - cached_full_pages
                 )
                 full_page_msg = f", leaked_full_pages={leaked_full_pages or None}"
-            mamba_allocator = self.req_to_token_pool.mamba_allocator
+            mamba_allocator = self.token_to_kv_pool_allocator.state_slots
             free_mamba_pages = set(mamba_allocator.free_slots.tolist())
             cached_mamba_pages = set(
                 self.tree_cache.all_mamba_values_flatten().tolist()
@@ -230,7 +248,7 @@ class SchedulerInvariantChecker:
             ps.mamba_evictable_size,  # 0 in int8 mode (radix owns no active slots)
             0,
             self.pool_stats_observer.session_held_mamba_slots(),
-            self.req_to_token_pool.mamba_pool.size,
+            ps.mamba_capacity,
         )
         int8_leak, int8_msg = self._check_pool_invariant(
             "mamba-int8",
@@ -242,54 +260,38 @@ class SchedulerInvariantChecker:
         )
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
-    def _get_total_uncached_sizes(
-        self,
-    ) -> Tuple[int, int]:
-        """Sum uncached tokens for full and SWA pools across all active batches.
-
-        Returns (full_uncached, swa_uncached). For non-SWA models, swa_uncached is 0.
-
-        For full pool: uncached = allocated - cache_protected_len
-        For SWA pool:  uncached = allocated - max(cache_protected_len, swa_evicted_seqlen)
-        """
-        # After decode: running_batch IS last_batch (same object), count once.
-        # After prefill: they differ, both hold uncached tokens.
-        # Use identity (is / is not), not membership or ==: ScheduleBatch's
-        # dataclass __eq__ compares tensor fields and raises on ambiguous bools.
+    def _requests_owning_rows(self) -> List[Req]:
         last_batch = self.get_last_batch()
         running_batch = self.get_running_batch()
-        batches = [last_batch]
-        if (
-            running_batch is not None
-            and running_batch is not last_batch
-            and not running_batch.is_empty()
-        ):
-            batches.append(running_batch)
-
-        full_uncached = 0
-        swa_uncached = self.tree_cache.swa_transient_size()
-        counted: set[int] = set()
-        reqs = [req for batch in batches for req in batch.reqs]
+        reqs = [] if last_batch is None else list(last_batch.reqs)
+        # After decode running_batch IS last_batch. Compare by identity:
+        # ScheduleBatch's dataclass __eq__ compares tensors and raises.
+        if running_batch is not None and running_batch is not last_batch:
+            reqs += running_batch.reqs
         chunked_req = self.get_chunked_req()
         if chunked_req is not None:
             reqs.append(chunked_req)
+
+        # A request running on a session's record does not own that row.
+        session_kvs = {id(kv) for kv in self.tree_cache.session_records().values()}
+        owners, seen = [], set()
         for req in reqs:
-            if id(req) in counted:
+            if id(req) in seen:
                 continue
-            counted.add(id(req))
-            if not req.kv.holds_kv:
-                continue
+            seen.add(id(req))
+            if req.kv.holds_kv and id(req.kv) not in session_kvs:
+                owners.append(req)
+        return owners
 
-            allocated_len = req.kv.kv_allocated_len
-            if self.page_size > 1:
-                allocated_len = ceil_align(allocated_len, self.page_size)
-                assert req.kv.cache_protected_len % self.page_size == 0
-
-            full_uncached += allocated_len - req.kv.cache_protected_len
-            if self.is_hybrid_swa:
-                swa_uncached += allocated_len - max(
-                    req.kv.cache_protected_len, req.kv.swa_evicted_seqlen
-                )
+    def _get_total_uncached_sizes(self, has_window: bool) -> Tuple[int, int]:
+        """(full, swa) footprint of the KV rows requests own; 0 swa without a window."""
+        full_uncached = 0
+        swa_uncached = self.tree_cache.swa_transient_size()
+        for req in self._requests_owning_rows():
+            assert req.kv.cache_protected_len % self.page_size == 0
+            full_uncached += kv_private_tokens(req.kv, self.page_size)
+            if has_window:
+                swa_uncached += kv_private_swa_tokens(req.kv, self.page_size)
 
             if req.beam_group is not None:
                 full_uncached += req.beam_group.extra_uncached_tokens()
@@ -302,12 +304,12 @@ class SchedulerInvariantChecker:
             return
 
         ps = self.pool_stats_observer.get_pool_stats()
-        full_uncached, swa_uncached = self._get_total_uncached_sizes()
+        full_uncached, swa_uncached = self._get_total_uncached_sizes(ps.is_hybrid_swa)
 
         full_leak, full_msg = self._check_full_pool(ps, uncached=full_uncached)
 
         swa_leak, swa_msg = False, ""
-        if self.is_hybrid_swa:
+        if ps.is_hybrid_swa:
             swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
 
         level = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
@@ -342,34 +344,16 @@ class SchedulerInvariantChecker:
         rtt = self.req_to_token_pool.req_to_token
         row_width = rtt.shape[1]
 
-        def _add_owner(req_or_slot, label, rpi, committed, allocated):
-            assert 0 <= committed <= allocated <= row_width
-            owners.append((label, rpi, allocated))
+        def _add_owner(label, kv):
+            assert 0 <= kv.kv_committed_len <= kv.kv_allocated_len <= row_width
+            owners.append((label, kv.req_pool_idx, kv.kv_allocated_len))
 
         owners: list[tuple[str, Optional[int], int]] = []
-        batch = self.get_last_batch()
-        if batch is not None:
-            for req in batch.reqs:
-                if not req.kv.holds_kv:
-                    continue
-                _add_owner(
-                    req,
-                    f"req {req.rid}",
-                    req.kv.req_pool_idx,
-                    req.kv.kv_committed_len,
-                    req.kv.kv_allocated_len,
-                )
-        sess = getattr(self.tree_cache, "slots", None)
-        if sess:
-            for sid, slot in sess.items():
-                if slot.kv.holds_kv:
-                    _add_owner(
-                        slot,
-                        f"slot {sid[:8]}",
-                        slot.kv.req_pool_idx,
-                        slot.kv.kv_committed_len,
-                        slot.kv.kv_allocated_len,
-                    )
+        for req in self._requests_owning_rows():
+            _add_owner(f"req {req.rid}", req.kv)
+        for sid, kv in self.tree_cache.session_records().items():
+            if kv.holds_kv:
+                _add_owner(f"slot {sid[:8]}", kv)
 
         active = [
             (label, rpi, al) for label, rpi, al in owners if rpi is not None and al > 0
@@ -380,14 +364,17 @@ class SchedulerInvariantChecker:
         idx = torch.as_tensor([rpi for _, rpi, _ in active], device=rtt.device)
         allocs = torch.as_tensor([al for _, _, al in active], device=rtt.device)
         mask = torch.arange(row_width, device=rtt.device)[None, :] < allocs[:, None]
-        owner_pages = rtt[idx][mask] // self.page_size
+        owner_locs = rtt[idx][mask]
 
         # Sub-allocators to check: a flat allocator is its own single sub; a
-        # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator.
+        # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator;
+        # the classed sharding allocator keeps per-class lists instead of a
+        # flat free_pages and exposes them through get_all_free_pages().
         alloc = self.token_to_kv_pool_allocator
         sub_allocs = (
             [alloc]
             if getattr(alloc, "free_pages", None) is not None
+            or page_interleave_shard_size(alloc) > 1
             else [
                 sub
                 for n in ("full_attn_allocator", "swa_attn_allocator")
@@ -398,6 +385,16 @@ class SchedulerInvariantChecker:
         if not sub_allocs:
             return
 
+        # Page ids in the ALLOCATOR's page units (== the physical page for
+        # the classed sharding allocator, whose free lists hold logical page
+        # ids in the same unit).
+        owner_pages = owner_locs // sub_allocs[0].page_size
+        if is_cp_sharded_padded():
+            cp_size = get_cp_strategy().cp_size
+            # Cache page zero reserves one page rather than one CP group.
+            owner_pages = torch.where(
+                owner_pages > 0, (owner_pages + cp_size - 1) // cp_size, owner_pages
+            )
         # Check B: every sub-pool's free set has no duplicate pages.
         for i, sub in enumerate(sub_allocs):
             free = sub.get_all_free_pages()
@@ -424,12 +421,13 @@ class SchedulerInvariantChecker:
             )
 
     def _check_req_pool(self):
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            req_total_size = (
-                self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
-            )
-        else:
-            req_total_size = self.req_to_token_pool.size
+        # Account for pre-alloc headroom whenever the pool has it. The decode
+        # pool always does; with runtime P<->D role switching a prefill instance
+        # may also hold a decode-flavored (pre-alloc) pool, so key off the pool
+        # itself rather than the current role.
+        req_total_size = (
+            self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
+        )
 
         session_req_count = self.pool_stats_observer.session_held_req_count()
         if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
@@ -466,12 +464,12 @@ class SchedulerInvariantChecker:
         has_leak |= full_leak
         messages.append(full_msg)
 
-        if self.is_hybrid_swa:
+        if ps.is_hybrid_swa:
             swa_leak, swa_msg = self._check_swa_pool(ps)
             has_leak |= swa_leak
             messages.append(swa_msg)
 
-        if self.is_hybrid_ssm and self.tree_cache.supports_mamba():
+        if ps.is_hybrid_ssm and self.tree_cache.supports_mamba():
             mamba_leak, mamba_msg = self._check_mamba_pool(ps)
             has_leak |= mamba_leak
             messages.append(mamba_msg)
@@ -481,10 +479,10 @@ class SchedulerInvariantChecker:
     def _check_tree_cache(self):
         if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():
             return
-        if (
-            self.tree_cache.is_tree_cache()
-            and (self.is_hybrid_swa and self.tree_cache.supports_swa())
-            or (self.is_hybrid_ssm and self.tree_cache.supports_mamba())
+        ps = self.pool_stats_observer.get_pool_stats()
+        if self.tree_cache.supports_prefix_sharing() and (
+            (ps.is_hybrid_swa and self.tree_cache.supports_swa())
+            or (ps.is_hybrid_ssm and self.tree_cache.supports_mamba())
         ):
             self.tree_cache.sanity_check()
 
@@ -493,15 +491,25 @@ def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
 ) -> WatchdogRaw:
     def dump_info() -> str:
-        if scheduler.is_initializing:
-            return ""
-        _, messages = scheduler.invariant_checker._check_all_pools(
-            scheduler.pool_stats_observer.get_pool_stats(),
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            describe_registration_in_progress,
         )
-        return (
-            f"{scheduler.cur_batch_for_debug.batch_size()=}\n"
-            f"{scheduler.cur_batch_for_debug.reqs=}\n" + "\n".join(messages)
-        )
+
+        parts = []
+        # Checked before is_initializing: CUDA graph capture registers too, and
+        # only the soft watchdog runs that early.
+        if (registration := describe_registration_in_progress()) is not None:
+            parts.append(f"symmetric-memory registration in progress: {registration}")
+        if not scheduler.is_initializing:
+            _, messages = scheduler.invariant_checker._check_all_pools(
+                scheduler.pool_stats_observer.get_pool_stats(),
+            )
+            parts += [
+                f"{scheduler.cur_batch_for_debug.batch_size()=}",
+                f"{scheduler.cur_batch_for_debug.reqs=}",
+                *messages,
+            ]
+        return "\n".join(parts)
 
     return WatchdogRaw(
         debug_name="Scheduler",

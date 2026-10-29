@@ -7,9 +7,12 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_hip = is_hip()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -146,6 +149,39 @@ class DSATopKBackend(Enum):
         ):
             return _topk_transform_v2_ragged(
                 logits, lengths, topk, topk_indices_offset, row_starts
+            )
+
+        # Packed PAGED extend (GLM DSA prefill), ROCm-only: CUDA gets the same
+        # fusion from RAGGED above. Unsupported shapes fall back, not raise.
+        # The row -> request map is `token_to_batch_idx` for a whole-forward call
+        # and the chunk's own `batch_idx_list` when the indexer split the logits.
+        if batch_idx_list is None:
+            row_to_batch = attn_metadata.token_to_batch_idx
+        elif isinstance(batch_idx_list, torch.Tensor):
+            row_to_batch = batch_idx_list
+        else:
+            # The prefill-CP list selects requests, not rows: leave it on legacy.
+            row_to_batch = None
+        if (
+            _is_hip
+            and self.should_use_topk_v2()
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and 0 < topk <= 2048
+            and lengths.shape[0] == logits.shape[0]
+            and logits.dtype == torch.float32
+            and logits.stride(1) == 1
+            and logits.stride(0) % 4 == 0
+            and row_starts is not None
+            and row_to_batch is not None
+            and row_to_batch.shape[0] == logits.shape[0]
+        ):
+            return _topk_transform_v2_packed(
+                logits,
+                lengths,
+                topk,
+                attn_metadata,
+                row_starts=row_starts,
+                row_to_batch=row_to_batch,
             )
 
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
@@ -291,6 +327,9 @@ def _topk_transform_v2_paged(
     typically 64) yields the same physical slots as gathering the page_size=1
     table, without materializing that wide table.
 
+    For DSA extend's packed batch-global scores see
+    :func:`_topk_transform_v2_packed`.
+
     This is a committed contract, not a best-effort path: ``topk_transform`` routes
     here only for the decode-shaped PAGED case, and the fused-decode CUDA graph
     drops the page_size=1 table for exactly this case (see
@@ -338,6 +377,54 @@ def _topk_transform_v2_paged(
     page_size = attn_metadata.page_size
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
     topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
+    return out
+
+
+def _topk_transform_v2_packed(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    attn_metadata,
+    row_starts: torch.Tensor,
+    row_to_batch: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused packed-row top-k + page-table transform (DSA extend prefill).
+
+    Same output contract as :func:`_topk_transform_v2_paged` -- ``(num_rows,
+    topk)`` int32 physical KV slots, ``-1`` padded -- but the scores are packed:
+    row ``i`` owns the window at ``row_starts[i]`` of one batch-global buffer and
+    maps through page-table row ``row_to_batch[i]`` (prefill expands one request
+    into many query-token rows). Selected indices stay row-local.
+
+    Being a prefill-only path it dispatches per row inside the kernel, so unlike
+    the paged entry point it needs no ``topk_v2_plan``.
+
+    NOTE: ``logits`` is MODIFIED IN PLACE (the <= 3 columns ahead of each window
+    are masked); the caller must not reuse it. ``lengths`` must be NON-NEGATIVE,
+    for the same reason as in :func:`_topk_transform_v2_paged`.
+    """
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_packed_v2
+
+    num_rows = logits.shape[0]
+    assert (
+        logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+    ), (
+        f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+    )
+    assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
+
+    out = logits.new_empty((num_rows, topk), dtype=torch.int32)
+    topk_transform_packed_v2(
+        logits,
+        lengths,
+        attn_metadata.real_page_table,
+        out,
+        attn_metadata.page_size,
+        row_starts=row_starts.to(torch.int32),
+        row_to_batch=(None if row_to_batch is None else row_to_batch.to(torch.int32)),
+    )
     return out
 
 

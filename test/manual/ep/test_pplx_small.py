@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -28,8 +28,7 @@ class TestPureDP(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-a2a-backend",
                 "pplx",
@@ -43,7 +42,7 @@ class TestPureDP(CustomTestCase):
                 "0.5",
             ],
             # Per-rank dispatch cap must cover the per-rank prefill chunk
-            # (chunked_prefill_size // dp_size = 8192 // 4 = 2048 on H100).
+            # (chunked_prefill_size // attn_dp_size = 8192 // 4 = 2048 on H100).
             env={"SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096"},
         )
 
@@ -57,12 +56,11 @@ class TestPureDP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.60)
@@ -77,12 +75,11 @@ class TestPureDP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=40,
             num_threads=1,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.50)
@@ -101,8 +98,7 @@ class TestHybridDPTP(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "2",
                 "--moe-a2a-backend",
                 "pplx",
@@ -116,7 +112,7 @@ class TestHybridDPTP(CustomTestCase):
                 "0.5",
             ],
             # Per-rank dispatch cap must cover the per-rank prefill chunk
-            # (chunked_prefill_size // dp_size = 8192 // 2 = 4096 on H100).
+            # (chunked_prefill_size // attn_dp_size = 8192 // 2 = 4096 on H100).
             env={"SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096"},
         )
 
@@ -130,12 +126,11 @@ class TestHybridDPTP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.60)

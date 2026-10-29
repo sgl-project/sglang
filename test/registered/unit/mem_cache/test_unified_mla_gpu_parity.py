@@ -11,14 +11,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""GPU parity of the per-layer-view `UnifiedMLATokenToKVPool` against the stock
+"""GPU parity of the typed `MLAView` against the stock
 `MLATokenToKVPool` on real K3 MLA geometry (L=24, D=512+64).
 
-The unified pool receives kernel-facing locs (kernel_id(t) = (t//ps)*(ps*L) +
-t%ps) where the reference pool receives raw token ids; every (layer, token)
-cell must hold identical bytes afterwards. The TMA JIT fast path (n_loc >= 768)
-flattens the buffer via `.view(shape[0], -1)`, which is legal only because the
-per-layer views are contiguous.
+Both pools receive the same token ids: under the token-major views a token's
+physical id is its own id, so the unified pool needs no re-numbering. Every
+(layer, token) cell must hold identical bytes afterwards. The TMA JIT fast path
+(n_loc >= 768) flattens the buffer via `.view(shape[0], -1)`, which only needs
+each row to be contiguous, as it is in a per-layer view.
 """
 
 import types
@@ -29,8 +29,9 @@ import torch
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.unified_allocator_fixtures import arena_of
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 _HAS_CUDA = torch.cuda.is_available()
 _DEV = "cuda"
@@ -43,17 +44,20 @@ _DTYPE = torch.bfloat16
 
 
 def _kernel_id(t: torch.Tensor, ps: int) -> torch.Tensor:
-    return (t // ps) * (ps * _L) + t % ps
+    return t  # token-major views: the physical id is the token id
+
+
+def _marked(loc: torch.Tensor):
+    # The unified doors take a KVWriteLoc marked physical.
+    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+    return KVWriteLoc(loc, physical=True)
 
 
 def _make_pools(ps: int, n_tokens: int = 4096):
+    from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
+    from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-    from sglang.srt.mem_cache.unified_memory_pool import (
-        MambaSubPoolSpec,
-        MLASubPoolSpec,
-        UnifiedKVPool,
-        UnifiedMLATokenToKVPool,
-    )
 
     full = MLASubPoolSpec(
         name="full",
@@ -73,20 +77,20 @@ def _make_pools(ps: int, n_tokens: int = 4096):
         grow_direction="up",
     )
     total = full.entry_bytes() * n_tokens + mamba.entry_bytes() * 16
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=total,
         sub_pool_specs=[full, mamba],
         device=_DEV,
         enable_memory_saver=False,
         page_size=ps,
     )
-    unified = UnifiedMLATokenToKVPool(
-        unified_buffer=pool,
-        sub_pool_name="full",
+    unified = MLAView(
+        arena=pool,
+        spec=pool.spec("full"),
         kv_cache_dtype=_DTYPE,
         page_size=ps,
     )
-    max_tokens = pool.max_slots("full")
+    max_tokens = pool.num_entries("full")
     ref = MLATokenToKVPool(
         size=max_tokens - ps,
         page_size=ps,
@@ -129,7 +133,7 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             layer = types.SimpleNamespace(layer_id=l)
             nope = torch.randn(n_loc, 1, _LORA, dtype=_DTYPE, device=_DEV)
             rope = torch.randn(n_loc, 1, _ROPE, dtype=_DTYPE, device=_DEV)
-            unified.set_mla_kv_buffer(layer, _kernel_id(locs, ps), nope, rope)
+            unified.set_mla_kv_buffer(layer, _marked(_kernel_id(locs, ps)), nope, rope)
             ref.set_mla_kv_buffer(layer, locs, nope, rope)
         torch.cuda.synchronize()
         self._assert_parity(unified, ref, locs, ps)
@@ -150,7 +154,7 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             for l in (0, _L // 2, _L - 1):
                 layer = types.SimpleNamespace(layer_id=l)
                 k = torch.randn(n_loc, 1, _D, dtype=_DTYPE, device=_DEV)
-                unified.set_kv_buffer(layer, _kernel_id(locs, ps), k, None)
+                unified.set_kv_buffer(layer, _marked(_kernel_id(locs, ps)), k, None)
                 ref.set_kv_buffer(layer, locs, k, None)
             torch.cuda.synchronize()
             self._assert_parity(unified, ref, locs, ps, layers=(0, _L // 2, _L - 1))
@@ -164,11 +168,19 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             layer = types.SimpleNamespace(layer_id=3)
             nope = torch.randn(n_loc, 1, _LORA, dtype=_DTYPE, device=_DEV)
             rope = torch.randn(n_loc, 1, _ROPE, dtype=_DTYPE, device=_DEV)
-            unified.set_mla_kv_buffer(layer, _kernel_id(locs, ps), nope, rope)
+            unified.set_mla_kv_buffer(layer, _marked(_kernel_id(locs, ps)), nope, rope)
             got_nope, got_rope = unified.get_mla_kv_buffer(layer, _kernel_id(locs, ps))
             torch.cuda.synchronize()
             torch.testing.assert_close(got_nope, nope, rtol=0, atol=0)
             torch.testing.assert_close(got_rope, rope, rtol=0, atol=0)
+
+    def test_per_slot_move_is_refused_gpu(self):
+        """The arena moves whole page envelopes; a per-slot move on the view
+        would corrupt the entries, so the view refuses it."""
+        unified, _, _ = _make_pools(1)
+        ids = torch.arange(2, device=_DEV, dtype=torch.int64)
+        with self.assertRaises(NotImplementedError):
+            unified.move_kv_cache(ids + 2, ids)
 
 
 if __name__ == "__main__":

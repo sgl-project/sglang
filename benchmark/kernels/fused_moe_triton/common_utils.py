@@ -78,6 +78,7 @@ def get_model_config(
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
     elif architecture in [
+        "BeamForCausalLM",
         "Qwen2MoeForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
@@ -107,6 +108,7 @@ def get_model_config(
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "KimiVLForConditionalGeneration",
         "MistralLarge3ForCausalLM",
     ]:
@@ -320,8 +322,6 @@ def get_config_filename(
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
     # is the intermediate size after silu_and_mul.
     N = shard_intermediate_size // 2
-    if use_int4_w4a16:
-        N = N // 2
 
     filename = get_config_file_name(
         num_experts,

@@ -159,7 +159,7 @@ class C128SidecarComponent(TreeComponent):
         # endpoint, so constrain that candidate to the nearest C128 boundary.
         group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
         branching_seqlen = branching_seqlen // group_tokens * group_tokens
-        current_boundary = len(result.device_indices) + result.host_hit_length
+        current_boundary = result.device_prefix_len + result.host_hit_length
         return result._replace(
             swa_branching_seqlen=(
                 branching_seqlen if branching_seqlen > current_boundary else None
@@ -285,6 +285,7 @@ class C128SidecarComponent(TreeComponent):
         node: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         cd = node.component_data[self.component_type]
@@ -329,6 +330,14 @@ class C128SidecarComponent(TreeComponent):
         ].clone()
         return cache_len + 1 if self.tree_core.is_eagle and cache_len > 0 else cache_len
 
+    def floor_cache_len(self, cache_len: int) -> int:
+        logical_len = cache_len
+        if self.tree_core.is_eagle and logical_len > 0:
+            logical_len -= 1
+        group_tokens = 128 * self.allocator.c128_attn_allocator.page_size
+        floored = logical_len // group_tokens * group_tokens
+        return floored + 1 if self.tree_core.is_eagle and floored > 0 else floored
+
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, FreeComponentDeviceSlot):
             for page_ids in action.indices:
@@ -344,7 +353,7 @@ class C128SidecarComponent(TreeComponent):
     def _evict_device_start(self, request_cnt):
         pass
 
-    def _evict_device_next_node(self, tracker, device_frees, host_frees):
+    def _evict_device_next_node(self, tracker, device_frees, host_frees, cache_actions):
         return None
 
     def _evict_device_end(self) -> None:

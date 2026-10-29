@@ -4,7 +4,6 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/layernorm.py
 """Custom normalization layers."""
 
-import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -13,8 +12,10 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    can_use_fused_scale_residual_norm_scale_shift_triton,
     fuse_scale_shift_kernel,
     fused_inplace_qknorm_rope,
+    fused_scale_residual_norm_scale_shift_triton,
     triton_one_pass_rms_norm,
 )
 from sglang.kernels.ops.diffusion.modulate.scale_shift_triton import (
@@ -24,6 +25,11 @@ from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm,
     fused_inplace_qknorm,
 )
+from sglang.kernels.ops.layernorm.rmsnorm_hf import (
+    is_supported_rmsnorm_hf_hidden_size,
+    rmsnorm_hf,
+)
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -33,11 +39,18 @@ from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     RotaryEmbedding,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import rope_positions
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+from sglang.srt.utils.custom_op import register_custom_op
+
+# An opaque op to torch.compile, as srt.models.utils registers it: a bare JIT
+# launch graph-breaks every layer that normalizes q/k.
+fused_inplace_qknorm = register_custom_op(fused_inplace_qknorm, mutates_args=["q", "k"])
 
 _is_cuda = current_platform.is_cuda()
+_is_rocm = current_platform.is_rocm()
 _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
@@ -78,6 +91,11 @@ if USE_AITER:
 if _is_xpu:
     from sgl_kernel import fused_inplace_qknorm_rope
 
+    from sglang.kernels.ops.diffusion import (
+        can_use_fused_scale_residual_norm_scale_shift_sycl,
+        fused_scale_residual_norm_scale_shift_sycl,
+    )
+
 if not _is_cpu:
     from sglang.kernels.ops.diffusion import norm_infer, rms_norm_fn
 
@@ -99,11 +117,13 @@ class RMSNorm(CustomOp):
         eps: float = 1e-6,
         dtype: torch.dtype = torch.float32,
         var_hidden_size: Optional[int] = None,
+        cast_x_before_out_mul: bool = False,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
+        self.cast_x_before_out_mul = cast_x_before_out_mul
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
@@ -123,6 +143,22 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         shape = x.shape
+        if self.cast_x_before_out_mul:
+            if residual is not None or self.variance_size_override is not None:
+                return self.forward_native(x, residual)
+            x_2d = x.contiguous().reshape(-1, shape[-1])
+            if (
+                x_2d.dtype in (torch.float16, torch.bfloat16)
+                and self.weight.dtype == x_2d.dtype
+                and is_supported_rmsnorm_hf_hidden_size(x_2d.shape[-1])
+            ):
+                return rmsnorm_hf(
+                    x_2d,
+                    self.weight.data,
+                    self.variance_epsilon,
+                ).view(shape)
+            return self.forward_native(x)
+
         x = x.reshape(-1, shape[-1])
         if residual is not None:
             residual_shape = residual.shape
@@ -197,10 +233,13 @@ class RMSNorm(CustomOp):
 
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
-        weight = self.weight
-        if x.device.type == "mps" and weight.dtype != x.dtype:
-            weight = weight.to(dtype=x.dtype)
-        x = (x * weight).to(orig_dtype)
+        if self.cast_x_before_out_mul:
+            x = self.weight * x.to(orig_dtype)
+        else:
+            weight = self.weight
+            if x.device.type == "mps" and weight.dtype != x.dtype:
+                weight = weight.to(dtype=x.dtype)
+            x = (x * weight).to(orig_dtype)
         if residual is None:
             return x
         else:
@@ -380,20 +419,6 @@ class LayerNorm(CustomOp):
         else:
             self.register_parameter("weight", None)
             self.register_parameter("bias", None)
-            # Lazy cache for ones vector (not a registered buffer to avoid FSDP/meta issues)
-            self._weight_fallback_cache = None
-
-    def _get_weight_fallback(self, x: torch.Tensor) -> torch.Tensor:
-        wf = getattr(self, "_weight_fallback_cache", None)
-        if (
-            wf is None
-            or wf.device != x.device
-            or wf.dtype != x.dtype
-            or wf.numel() != self.hidden_size
-        ):
-            wf = torch.ones(self.hidden_size, device=x.device, dtype=x.dtype)
-            self._weight_fallback_cache = wf
-        return wf
 
     def forward_triton(self, x: torch.Tensor):
         # Fast inference kernel without residual/dropout branches
@@ -534,6 +559,22 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
             impl_mode=0,
         )
         return output.to(origin_dtype)
+
+    def forward_xpu(self, inputs: torch.Tensor) -> torch.Tensor:
+        def matches_input(param: torch.Tensor | None) -> bool:
+            return param is None or (
+                param.dtype == inputs.dtype and param.device == inputs.device
+            )
+
+        if not (matches_input(self.weight) and matches_input(self.bias)):
+            return self.forward_native(inputs)
+        return F.layer_norm(
+            inputs,
+            self.normalized_shape,
+            self.weight,
+            self.bias,
+            self.eps,
+        )
 
 
 ################################################################################
@@ -681,10 +722,56 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    def forward_xpu(self, *args, **kwargs):
-        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_xpu(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.norm_type == "layer":
+            weight = self.norm.weight
+            bias = self.norm.bias
+            if can_use_fused_scale_residual_norm_scale_shift_sycl(
+                residual=residual,
+                x=x,
+                gate=gate,
+                shift=shift,
+                scale=scale,
+                weight=weight,
+                bias=bias,
+            ):
+                return fused_scale_residual_norm_scale_shift_sycl(
+                    residual=residual,
+                    x=x,
+                    gate=gate,
+                    shift=shift,
+                    scale=scale,
+                    weight=weight,
+                    bias=bias,
+                    eps=self.eps,
+                )
+            if can_use_fused_scale_residual_norm_scale_shift_triton(
+                residual=residual,
+                x=x,
+                gate=gate,
+                shift=shift,
+                scale=scale,
+                weight=weight,
+                bias=bias,
+            ):
+                return fused_scale_residual_norm_scale_shift_triton(
+                    residual=residual,
+                    x=x,
+                    gate=gate,
+                    shift=shift,
+                    scale=scale,
+                    weight=weight,
+                    bias=bias,
+                    eps=self.eps,
+                )
+        return self.forward_native(residual, x, gate, shift, scale)
 
     @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
     def forward_native(
@@ -883,10 +970,21 @@ class _NormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    def forward_xpu(self, *args, **kwargs):
-        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_xpu(
+        self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        normalized = self.norm(x)
+        if scale.dim() == 4:
+            # scale/shift: [batch_size, num_frames, 1, inner_dim]
+            num_frames = scale.shape[1]
+            frame_seqlen = normalized.shape[1] // num_frames
+            modulated = (
+                normalized.unflatten(1, (num_frames, frame_seqlen)) * (1 + scale)
+                + shift
+            ).flatten(1, 2)
+        else:
+            modulated = normalized * (1 + scale) + shift
+        return modulated.to(x.dtype)
 
     @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
     def forward_native(
@@ -953,10 +1051,10 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
-    # Only try fused path on CUDA and when it won't introduce implicit copies.
+    # Only try fused path on CUDA/ROCm and when it won't introduce implicit copies.
     # The in-place kernel needs a real view (no copy), so it also requires contiguity.
     if (
-        _is_cuda
+        (_is_cuda or _is_rocm)
         and allow_inplace
         and (q_eps == k_eps)
         and q.dtype in (torch.float16, torch.bfloat16)
@@ -997,6 +1095,7 @@ def apply_qk_norm_with_optional_rope(
     positions: Optional[torch.Tensor] = None,
     position_offset: int = 0,
     allow_inplace: bool = True,
+    allow_strided_qk: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply QK RMSNorm and optionally RoPE when a cos/sin cache is provided."""
 
@@ -1022,6 +1121,7 @@ def apply_qk_norm_with_optional_rope(
         positions=positions,
         position_offset=position_offset,
         allow_inplace=allow_inplace,
+        allow_strided_qk=allow_strided_qk,
     )
 
 
@@ -1080,12 +1180,7 @@ def apply_qk_norm_rope(
         raise ValueError(
             f"cos_sin_cache width must be even and <= head_dim, got {rope_dim} vs {head_dim}"
         )
-    fused_enabled = os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
+    fused_enabled = envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
     q_has_supported_layout = q.is_contiguous()
     k_has_supported_layout = k.is_contiguous()
     if allow_strided_qk:
@@ -1099,13 +1194,7 @@ def apply_qk_norm_rope(
         ) == seq_len * k.stride(1)
 
     if positions is None:
-        pos_1d = torch.arange(
-            position_offset,
-            position_offset + seq_len,
-            device=q.device,
-            dtype=torch.int64,
-        )
-        positions = pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
+        positions = rope_positions(position_offset, seq_len, batch_size, q.device)
     else:
         if positions.dim() != 1 or positions.numel() != batch_size * seq_len:
             raise ValueError(
@@ -1115,8 +1204,7 @@ def apply_qk_norm_rope(
 
     if (
         fused_enabled
-        and _is_cuda
-        and not torch.compiler.is_compiling()
+        and (_is_cuda or _is_rocm)
         and allow_inplace
         and (q_eps == k_eps)
         and q.dtype in (torch.float16, torch.bfloat16)

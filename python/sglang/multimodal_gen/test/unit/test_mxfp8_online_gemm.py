@@ -11,20 +11,6 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _init_parallel() -> None:
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        maybe_init_distributed_environment_and_model_parallel,
-        model_parallel_is_initialized,
-    )
-    from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-        ensure_distributed_env_defaults,
-    )
-
-    if not model_parallel_is_initialized():
-        ensure_distributed_env_defaults()
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
-
-
 def _layer(
     in_f: int, out_f: int, bias: bool, params_dtype: torch.dtype = torch.bfloat16
 ):
@@ -41,10 +27,10 @@ def _layer(
     ).to("cuda")
 
 
-def test_mxfp8_linear_matches_bf16_and_accepts_prequantized() -> None:
+def test_mxfp8_linear_matches_bf16_and_accepts_prequantized(request) -> None:
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("cuBLASLt MXFP8 block scaling requires Blackwell or newer")
-    _init_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     from sglang.kernels.ops.diffusion import silu_mul_mxfp8
 
     in_f, out_f, rows = 512, 384, 200
@@ -72,7 +58,6 @@ def test_mxfp8_linear_matches_bf16_and_accepts_prequantized() -> None:
 
 
 def _assert_aligned_layer_falls_back(params_dtype: torch.dtype) -> None:
-    _init_parallel()
     layer = _layer(512, 384, bias=False, params_dtype=params_dtype)
     g = torch.Generator(device="cpu").manual_seed(1)
     weight = (torch.randn(384, 512, generator=g) * 0.02).to("cuda", params_dtype)
@@ -87,23 +72,25 @@ def _assert_aligned_layer_falls_back(params_dtype: torch.dtype) -> None:
     assert rel < 0.05, rel
 
 
-def test_pre_blackwell_aligned_layer_falls_back_to_channelwise() -> None:
+def test_pre_blackwell_aligned_layer_falls_back_to_channelwise(request) -> None:
     if torch.cuda.get_device_capability()[0] >= 10:
         pytest.skip("requires a pre-Blackwell GPU")
+    request.getfixturevalue("single_process_model_parallel")
     _assert_aligned_layer_falls_back(torch.bfloat16)
 
 
-def test_fp16_layer_falls_back_to_channelwise() -> None:
+def test_fp16_layer_falls_back_to_channelwise(request) -> None:
     """The swizzled quantizer takes bf16 only; an fp16 layer must not fail at load."""
+    request.getfixturevalue("single_process_model_parallel")
     _assert_aligned_layer_falls_back(torch.float16)
 
 
-def test_unaligned_layer_falls_back_to_channelwise() -> None:
+def test_unaligned_layer_falls_back_to_channelwise(request) -> None:
     """The block-scaled GEMM needs K % 32 == 0; such a layer keeps the
     per-channel fp8 path and still answers a forward. K is 16 rather than a
     smaller odd size because the fallback's scaled GEMM still wants K % 16 == 0
     (ROCm rejects anything else outright)."""
-    _init_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     layer = _layer(16, 128, bias=True)
     layer.quant_method.process_weights_after_loading(layer)
     assert not layer.mxfp8 and not layer.quant_method.accepts_mxfp8_input(layer)

@@ -9,7 +9,7 @@ This document describes the attention backends available in sglang diffusion (`s
 
 Attention backends are defined by `AttentionBackendEnum` (`sglang.multimodal_gen.runtime.platforms.interface.AttentionBackendEnum`) and selected via the CLI flag `--attention-backend`.
 
-Backend selection is performed by the shared attention layers (e.g. `LocalAttention` / `USPAttention` / `UlyssesAttention` in `sglang.multimodal_gen.runtime.layers.attention.layer`). `--attention-backend` is strict for the diffusion transformer / DiT. Auxiliary components such as encoders and VAEs use it when compatible, then fall back to a component default or a platform-compatible backend. Use `--component-attention-backends` when an auxiliary component must use a specific backend; incompatible overrides, including an override for a component that constructs no SGLang attention layer, fail unless a sparse backend is being replaced for cross-attention.
+Backend selection is performed by the shared attention layers (e.g. `LocalAttention` / `USPAttention` / `UlyssesAttention` in `sglang.multimodal_gen.runtime.layers.attention.layer`). `--attention-backend` is strict for the diffusion transformer / DiT. Auxiliary components such as encoders and VAEs use it when compatible, then fall back to a component default or a platform-compatible backend. Use `--component-attention-backends` when an auxiliary component must use a specific backend; incompatible overrides, including an override for a component that constructs no SGLang attention layer, fail unless a sparse backend is being replaced for cross-attention. A component key may carry a `.self` or `.cross` role suffix to override just one kind of attention; see [Per-role overrides](#per-role-overrides).
 
 When using the diffusers backend, `--attention-backend` is passed through to diffusers'
 `set_attention_backend` (e.g., `flash`, `_flash_3_hub`, `sage`, `xformers`, `native`).
@@ -87,7 +87,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`video_sparse_attn_h3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`VIDEO_SPARSE_ATTN_H3`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Video Sparse Attention for MiniMax-H3 / FastH3 (VSA-H3). In-tree Triton block-sparse kernel (SM90 / SM100 / SM103); no external package. Configure via <code>--attention-backend-config</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Video Sparse Attention for MiniMax-H3 / FastH3 (VSA-H3). In-tree kernels, no external package: FastVideo's native tcgen05 block-sparse forward on SM100 / SM103, the Triton tile-64 kernel on SM90. Configure via <code>--attention-backend-config</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`hybrid_window_attn_h3`</td>
@@ -108,6 +108,11 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>aiter_sage</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}><code>AITER_SAGE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires <code>aiter</code>.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>aiter_quant</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}><code>AITER_QUANT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantized AITER MHA v4 family. Requires <code>SGLANG_USE_AITER=1</code> and an <code>aiter</code> that ships <code>aiter.ops.mha_v4</code>. gfx950 (gfx942 supports <code>i8fp8</code> / <code>fp8</code> only). head_dim 128, non-causal. Pick the quant format with <code>--attention-backend-config format=&lt;name&gt;</code>: <code>bf16fp8</code>, <code>i8fp8</code>, <code>fp8</code>, <code>mxfp8</code>, <code>mxfp6</code>, <code>mxfp4</code> (default <code>fp8</code>); see <a href="#supported-configuration-parameters">Configuration</a> for what each one does.</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>sla_attn</code></td>
@@ -139,6 +144,11 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}><code>RAIN_FUSION_ATTN</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires <code>attentions</code> which can be installed with <code>sgl_kernel_npu</code>; available only for NPU.</td>
     </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>fp8_fa_sm120</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}><code>FP8_FA_SM120</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8 (E4M3) dense attention for SM120 GPUs (GeForce RTX 50, RTX PRO Blackwell), written in CuTe-DSL. Q/K/V are quantized per head on the fly; the output stays BF16. Non-causal, batch 1, head dim 128, BF16 inputs; other calls use <code>torch_cudnn_sdpa</code>. Opt-in only: outputs differ from BF16 attention by about 5% relative RMS per call. Each new sequence length compiles once (about 10 s).</td>
+    </tr>
 </tbody>
 </table>
 
@@ -147,16 +157,42 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
 The selection order in `runtime/layers/attention/selector.py` is:
 
 1. `global_force_attn_backend(...)` / `global_force_attn_backend_context_manager(...)`
-2. Component override from `--component-attention-backends` while that component is being constructed
-3. CLI `--attention-backend` (`ServerArgs.attention_backend`)
-4. Layer or component default, when declared
-5. Auto selection (platform capability, dtype, and installed packages)
+2. Component *and role* override from `--component-attention-backends.<component>.<role>` while that component is being constructed
+3. Component override from `--component-attention-backends` while that component is being constructed
+4. CLI `--attention-backend` (`ServerArgs.attention_backend`)
+5. Layer or component default, when declared
+6. Auto selection (platform capability, dtype, and installed packages)
 
 An explicit global backend mismatch fails for DiT self-attention. Auxiliary
 components may fall back to their declared default or another compatible backend.
 Sparse backends selected for self-attention similarly fall back to a compatible
 dense backend for cross-attention. Explicit component overrides are otherwise
 strict.
+
+### Per-role overrides
+
+A role is the kind of attention a layer performs: `self` or `cross`. Appending
+a role to a component key selects a backend for just that role, which is useful
+when a quantized or otherwise expensive backend pays off for self-attention but
+not for the much lighter cross-attention:
+
+```bash Command
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --component-attention-backends.transformer.self sage_attn \
+  --component-attention-backends.transformer.cross fa
+```
+
+A role override outranks the component-wide backend for layers of that role and
+leaves the other role alone. Layers of a role with no override fall through to
+the component-wide backend as usual, and `<component>_2` inherits
+`<component>`'s role overrides unless it declares its own.
+
+Role overrides are as strict as component-wide ones: a role override that never
+reaches a layer fails the load, including when the component builds no layers of
+that role at all. The one tolerated divergence is the shared sparse rule above —
+a sparse backend named for `cross` is replaced by a compatible dense backend and
+logged, rather than failing.
 
 Model and layer backend sets guide automatic selection; they are not positive
 allowlists for explicit requests. A backend selected with
@@ -167,6 +203,15 @@ cross-attention, packed variable-length attention, or ring-attention LSE.
 Model paths that require one backend for correctness declare it as required;
 those layers keep that backend even when the surrounding component is
 overridden.
+
+For an automatic, measurement-based choice, pass
+`--enable-attention-backend-autotune true`. On each layer's first sufficiently
+large input, the native runtime times compatible candidates and switches only
+when the output remains within its numerical guard and the measured gain exceeds
+the noise margin. The tuner is disabled by default and currently validated on
+SM90 and SM12x. It does not replace a backend selected explicitly through
+`--attention-backend` or `--component-attention-backends`, or a backend required
+by the model for correctness.
 
 ## Configuration
 
@@ -274,8 +319,8 @@ end-to-end latency on the target model and resolution before deployment.
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`VSA_sparsity`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`float`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Fraction of video tiles excluded from the top-k selection (0.0 - 1.0). `0.9` is the FastH3 trained policy.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`0.9`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Fraction of video tiles excluded from the top-k selection (0.0 - 1.0). FastH3 defaults to its trained `0.8`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`0.8` (FastH3), `0.9` (base H3)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`vsa_mode`</td>
@@ -577,6 +622,114 @@ Hybrid window attention constraints:
   </tbody>
 </table>
 
+**AITER Quant (`aiter_quant`)**
+
+The backend passes raw BF16 Q/K/V to `aiter.ops.mha_v4`, which applies the
+canonical quantizer for the requested operand pair and launches the matching ASM
+row. No calibration pass and no extra checkpoint weights are involved: the
+format is purely a runtime choice.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "20%"}} />
+    <col style={{width: "16%"}} />
+    <col style={{width: "46%"}} />
+    <col style={{width: "18%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Default</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`format`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`str`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Quant format for the `mha_v4` call, one of the names in the table below. An unknown name, or one with no kernel row on the active arch, raises at construction rather than falling back.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`fp8`</td>
+    </tr>
+  </tbody>
+</table>
+
+Variants, from widest operands to narrowest. Q and K always share an encoding;
+only V varies independently.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "13%"}} />
+    <col style={{width: "17%"}} />
+    <col style={{width: "13%"}} />
+    <col style={{width: "16%"}} />
+    <col style={{width: "41%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Variant</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Q/K format</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>V format</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Architectures</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`bf16fp8`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>gfx950</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Quantizes only PV, preserving BF16 attention scores for conservative quality.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`i8fp8`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>INT8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>gfx950, gfx942</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Uniform 8-bit Q/K quantization; effective for well-conditioned values but sensitive to outliers.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`fp8`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FP8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>gfx950, gfx942</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Default native FP8: E4M3 on gfx950 and E4M3FNUZ on gfx942.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`mxfp8`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MXFP8 E4M3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>gfx950</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Per-1x32 E8M0 Q/K scales and a per-tensor V scale improve outlier handling.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`mxfp6`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MXFP6 E2M3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>gfx950</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Block-scaled 6-bit Q/K balances compression, throughput, and quality.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`mxfp4`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MXFP4 E2M1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MXFP4 E2M1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>gfx950</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The most compact block-scaled Q/K/V format; validate quality for the target workload.</td>
+    </tr>
+  </tbody>
+</table>
+
+AITER quant constraints:
+
+- Every row targets full-MHA `head_dim == 128` and non-causal attention; a
+  causal layer or another head dim raises rather than falling back. Varlen
+  attention is not supported.
+- gfx942 ships only the `i8fp8` and `fp8` kernel rows. Every other format is
+  gfx950-only and is rejected at construction on gfx942.
+- Requires `SGLANG_USE_AITER=1` and an `aiter` build that ships
+  `aiter.ops.mha_v4`.
+
 ## Platform support matrix
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -689,7 +842,7 @@ Hybrid window attention constraints:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only (SM90 / SM100 / SM103). In-tree Triton kernel, no external dependency. Configure via <code>--attention-backend-config</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only (SM90 / SM100 / SM103). In-tree kernels (native tcgen05 forward on Blackwell, Triton on Hopper), no external dependency. Configure via <code>--attention-backend-config</code>.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>sla_attn</code></td>
@@ -742,6 +895,16 @@ Hybrid window attention constraints:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Requires <code>aiter</code>.</td>
     </tr>
 <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>aiter_quant</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Requires <code>SGLANG_USE_AITER=1</code> and an <code>aiter</code> that ships <code>aiter.ops.mha_v4</code>; gfx950 (gfx942 supports <code>i8fp8</code> / <code>fp8</code> only). Select the quant format via <code>--attention-backend-config</code>.</td>
+    </tr>
+<tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sparse_video_gen_2_attn`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
@@ -780,6 +943,16 @@ Hybrid window attention constraints:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>NPU-only. Requires <code>attentions</code> from <code>sgl_kernel_npu</code> Configuration via <code>--attention-backend-config</code>.</td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>fp8_fa_sm120</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA SM120 only; falls back to <code>torch_cudnn_sdpa</code> on other devices and for unsupported calls.</td>
     </tr>
 </tbody>
 </table>
@@ -958,5 +1131,5 @@ sglang generate \
 
 ### Notes for ROCm / MPS
 
-- ROCm: use `--attention-backend torch_sdpa` or `fa` depending on what is available in your environment.
+- ROCm: use `--attention-backend torch_sdpa` or `fa` depending on what is available in your environment. On gfx1151 / Strix Halo (wave32), do **not** use `aiter` — prefer `torch_sdpa` (image sets `SGLANG_USE_AITER=0`).
 - MPS: the platform implementation always uses `torch_sdpa`.

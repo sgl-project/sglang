@@ -16,6 +16,7 @@ import logging
 import time
 import uuid
 from array import array
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -157,7 +158,7 @@ class Session:
             or carry_fill is input_ids_unpadded
         ):
             # Unexpected type or aliased with an origin array (extending it
-            # below would double-append): let _refresh_fill_ids rebuild.
+            # below would double-append): let refresh_fill_ids rebuild.
             carry_fill = None
         else:
             del carry_fill[self.committed_fill_len :]
@@ -208,6 +209,7 @@ class Session:
         vocab_size: int,
         eos_token_ids=None,
         disagg_mode: Optional[DisaggregationMode] = None,
+        req_factory: Callable[..., Req] = Req,
     ):
         assert req.session_params is not None
         session_params = req.session_params
@@ -296,7 +298,7 @@ class Session:
                 "A session request must contain input tokens after restoring history."
             )
 
-        new_req = Req(
+        new_req = req_factory(
             rid=req.rid,
             origin_input_text=None,
             origin_input_ids=input_ids,
@@ -310,6 +312,7 @@ class Session:
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
             return_sampling_mask=req.return_sampling_mask,
+            sampling_logprobs_mode=req.sampling_logprobs_mode,
             vocab_size=vocab_size,
             eos_token_ids=eos_token_ids,
             require_reasoning=req.require_reasoning,
@@ -331,6 +334,9 @@ class Session:
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
+            # An offset can truncate inherited media.
+            if not abort and not session_params.offset:
+                new_req.inherit_mm_token_counts(last_req)
         new_req.tokenizer = tokenizer
         if carry_fill is not None:
             new_req.full_untruncated_fill_ids = carry_fill
@@ -422,7 +428,7 @@ class SessionController:
             # An in-flight request is still decoding on this session's KV
             # memory. Freeing now would corrupt the scheduler. Mark the
             # session for deferred cleanup: the request keeps its session
-            # reference so cache_finished_req takes the streaming path,
+            # reference so release_kv_cache takes the streaming path,
             # and we schedule release_session for after it completes.
             session.close_on_finish = True
             logger.info(

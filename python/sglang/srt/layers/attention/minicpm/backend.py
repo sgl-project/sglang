@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-from sglang.kernels.ops.minicpm_sala import get_block_table
+from sglang.kernels.ops.attention.minicpm_sala import get_block_table
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
     CompressionLevelMetadata,
     MiniCPMSparseMetadata,
@@ -639,7 +639,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     forward_batch.out_cache_loc,
                     k,
@@ -772,7 +772,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     forward_batch.out_cache_loc,
                     k,
