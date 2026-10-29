@@ -275,7 +275,12 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
-    if not req.skip_radix_cache_insert:
+    if req.disagg_kv_sender is not None and req.disagg_kv_sender.stages_source_async():
+        # Insertion may free pages a HOST gather still reads. Decide by
+        # config: gather state differs per TP rank, so a rank-local gather
+        # predicate would diverge the TP radix trees.
+        pass
+    elif not req.skip_radix_cache_insert:
         tree_cache.checkpoint(req, up_to=req.extend_end)
     # The next extend resumes after this one, published or not.
     req.prefix_len = req.extend_end
@@ -419,6 +424,8 @@ def discard_kv_cache_backup(
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
     what it can key."""
+    if req.disagg_kv_sender is not None and req.disagg_kv_sender.is_source_pending():
+        req.disagg_kv_sender.failure_exception()
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:

@@ -336,6 +336,7 @@ class TestAllocationIntegration(CustomTestCase):
             storage_prefetch_retry_attempts=3,
             storage_prefetch_last_match_len=8,
             metadata_buffer_index=0,
+            disagg_kv_sender=None,
             reset_for_retract=Mock(),
             advance_cache_request_handle=Mock(),
             time_stats=MagicMock(),
