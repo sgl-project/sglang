@@ -210,6 +210,14 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
+def _embedding_as_list(embedding):
+    # The scheduler sends embeddings as float32 ndarrays (numpy scalars for 1-D
+    # pooled outputs such as reward scores); responses take lists and floats.
+    if isinstance(embedding, (np.ndarray, np.generic)):
+        return embedding.tolist()
+    return embedding
+
+
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
     watermark = sampling_params.watermark
     features = get_exec().features
@@ -2714,7 +2722,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
                 out_dict = {
-                    "embedding": recv_obj.embeddings[i],
+                    "embedding": _embedding_as_list(recv_obj.embeddings[i]),
                     "meta_info": meta_info,
                 }
                 # Unpack pooled hidden states (PHS).

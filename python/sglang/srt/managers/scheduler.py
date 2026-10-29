@@ -6495,6 +6495,7 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+            scheduler.output_streamer.close_embedding_worker_sockets()
             # Stop the async D2H copy worker thread if any.
             if scheduler.async_d2h_worker is not None:
                 scheduler.async_d2h_worker.shutdown()

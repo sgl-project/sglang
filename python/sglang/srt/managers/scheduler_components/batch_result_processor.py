@@ -83,6 +83,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# msgpack IPC (SGLANG_USE_PICKLE_IPC=0) has no array type for embeddings.
+_USE_PICKLE_IPC = envs.SGLANG_USE_PICKLE_IPC.get()
+
 
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     """Return the padded per-request width in flattened speculative output."""
@@ -528,7 +531,16 @@ class SchedulerBatchResultProcessor:
             for i in range(batch_ids.shape[0]):
                 embeddings[batch_ids[i].item()][token_ids[i].item()] = values[i].item()
         else:
-            if isinstance(embeddings, torch.Tensor):
+            if isinstance(embeddings, torch.Tensor) and _USE_PICKLE_IPC:
+                # One array per request, pickled as a raw buffer; the tokenizer
+                # workers turn them into lists for the response, so the
+                # conversion stays off the scheduler loop. Half precision goes
+                # to float32 (numpy has no bfloat16), as tolist() did.
+                embeddings = embeddings.detach()
+                if embeddings.dtype in (torch.bfloat16, torch.float16):
+                    embeddings = embeddings.float()
+                embeddings = list(embeddings.cpu().numpy())
+            elif isinstance(embeddings, torch.Tensor):
                 embeddings = embeddings.tolist()
             else:
                 embeddings = [tensor.tolist() for tensor in embeddings]

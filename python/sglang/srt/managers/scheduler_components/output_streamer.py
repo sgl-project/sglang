@@ -8,6 +8,7 @@ from typing import (
     Any,
     Callable,
     ClassVar,
+    Dict,
     List,
     Optional,
 )
@@ -25,6 +26,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
     CachedTokensDetails,
+    sock_send,
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -36,6 +38,7 @@ from sglang.srt.runtime_context import get_observability, get_parallel, get_serv
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
@@ -81,6 +84,8 @@ class SchedulerOutputStreamer:
     # Set when the scheduler first defers a response; see deferred_output.
     defer_outputs: bool = False
     _test_stream_output_count: int = 0
+    # PUSH sockets to the tokenizer workers, by ipc name, for embedding outputs.
+    _embedding_worker_sockets: Optional[Dict[str, zmq.Socket]] = None
 
     def __post_init__(self) -> None:
         if self.has_additional_customized_info and self.rust_server is not None:
@@ -321,22 +326,56 @@ class SchedulerOutputStreamer:
                 # Non-stacked: some requests don't have PHS (None entries).
                 stacked_phs = phs_list
 
-        self.send_to_detokenizer.send_output(
-            BatchEmbeddingOutput(
-                rids=rids,
-                http_worker_ipcs=http_worker_ipcs,
-                time_stats=wrap_as_pickle(time_stats),
-                finished_reasons=finished_reasons,
-                embeddings=embeddings,
-                prompt_tokens=prompt_tokens,
-                cached_tokens=cached_tokens,
-                cached_tokens_details=cached_tokens_details,
-                placeholder_tokens_idx=None,
-                placeholder_tokens_val=None,
-                retraction_counts=retraction_counts,
-                pooled_hidden_states=stacked_phs,
-            )
+        fields = dict(
+            rids=rids,
+            http_worker_ipcs=http_worker_ipcs,
+            time_stats=time_stats,
+            finished_reasons=finished_reasons,
+            embeddings=embeddings,
+            prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
+            cached_tokens_details=cached_tokens_details,
+            retraction_counts=retraction_counts,
         )
+        if stacked_phs is None and self._sends_to_tokenizer_workers(http_worker_ipcs):
+            # Several tokenizer workers: the detokenizer would only regroup this
+            # batch by worker, so do that here, one message per worker, and skip
+            # a process hop.
+            for ipc, indices in _indices_by_worker(http_worker_ipcs).items():
+                worker_fields = {k: [v[i] for i in indices] for k, v in fields.items()}
+                sock_send(self._worker_socket(ipc), _embedding_output(worker_fields))
+        else:
+            self.send_to_detokenizer.send_output(
+                _embedding_output(fields, pooled_hidden_states=stacked_phs)
+            )
+
+    def _sends_to_tokenizer_workers(
+        self, http_worker_ipcs: List[Optional[str]]
+    ) -> bool:
+        """Whether embedding outputs go straight to the tokenizer workers: on the
+        output rank, when every request came through a tokenizer worker (several
+        workers), on one node (worker sockets are local to the head node)."""
+        return (
+            self.send_to_detokenizer.socket is not None
+            and bool(http_worker_ipcs)
+            and all(ipc is not None for ipc in http_worker_ipcs)
+            and getattr(self.server_args, "nnodes", 1) == 1
+        )
+
+    def close_embedding_worker_sockets(self) -> None:
+        """Close the PUSH sockets to the tokenizer workers (scheduler exit)."""
+        for socket in (self._embedding_worker_sockets or {}).values():
+            socket.close(linger=0)
+        self._embedding_worker_sockets = None
+
+    def _worker_socket(self, ipc_name: str) -> zmq.Socket:
+        if self._embedding_worker_sockets is None:
+            self._embedding_worker_sockets = {}
+        socket = self._embedding_worker_sockets.get(ipc_name)
+        if socket is None:
+            socket = get_zmq_socket(zmq.Context.instance(), zmq.PUSH, ipc_name, False)
+            self._embedding_worker_sockets[ipc_name] = socket
+        return socket
 
 
 @dataclass(slots=True, kw_only=True)
@@ -811,3 +850,20 @@ class _GenerationStreamAccumulator:
             ),
             dp_ranks=dp_ranks,
         )
+
+
+def _indices_by_worker(http_worker_ipcs: List[str]) -> Dict[str, List[int]]:
+    indices: Dict[str, List[int]] = {}
+    for index, ipc in enumerate(http_worker_ipcs):
+        indices.setdefault(ipc, []).append(index)
+    return indices
+
+
+def _embedding_output(fields: dict, pooled_hidden_states=None) -> BatchEmbeddingOutput:
+    return BatchEmbeddingOutput(
+        time_stats=wrap_as_pickle(fields["time_stats"]),
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
+        pooled_hidden_states=pooled_hidden_states,
+        **{k: v for k, v in fields.items() if k != "time_stats"},
+    )
