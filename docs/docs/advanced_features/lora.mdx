@@ -17,7 +17,7 @@ The following server arguments are relevant for multi-LoRA serving:
 
 * `lora_paths`: The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: &lt;PATH&gt; | &lt;NAME&gt;=&lt;PATH&gt; | JSON with schema &#123;"lora_name":str,"lora_path":str,"pinned":bool&#125;.
 
-* `max_loras_per_batch`: Maximum number of adaptors used by each batch. This argument can affect the amount of GPU memory reserved for multi-LoRA serving, so it should be set to a smaller value when memory is scarce. Defaults to be 8.
+* `max_loras_per_batch`: GPU pool capacity in distinct adapter IDs, including `None` for base-model requests. With pipeline parallelism, this capacity is shared across all in-flight microbatches. More slots reserve more GPU memory. Defaults to 8.
 
 * `max_loaded_loras`: If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `max-loras-per-batch`.
 
@@ -411,6 +411,14 @@ server_process, port = launch_server_cmd(
 ```python Example
 terminate_process(server_process)
 ```
+
+## LoRA with pipeline parallelism
+
+With `--pp-size > 1`, each stage shares its LoRA GPU pool across all in-flight microbatches. `--max-loras-per-batch` limits the union of their adapter IDs, including one slot for `None` when base-model requests are present.
+
+Each stage allocates transformer-layer LoRA buffers only for its local modules. For balanced partitions of homogeneous layers at the same slot count and LoRA rank, these buffers use approximately `1 / pp_size` of their unpartitioned size per stage. Embedding and output-head buffers follow the LoRA-enabled modules present on each stage. This ratio does not describe total GPU memory usage. You can increase `--max-loras-per-batch` if your actual GPU memory budget permits.
+
+When requests target more adapters than fit in the pool, requests for additional adapters wait for a slot. To improve fairness under skewed traffic, set [`--lora-drain-wait-threshold`](/docs/advanced_features/lora#arguments-for-lora-serving) to a positive value. Its default, `0`, disables draining.
 
 ## LoRA with DP attention
 

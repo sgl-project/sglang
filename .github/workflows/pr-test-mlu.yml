@@ -2,16 +2,12 @@ name: PR Test (MLU)
 
 # Label-gated MLU CI workflow. The PR must carry BOTH `run-ci` (basic-CI
 # prerequisite) and `run-ci-mlu` (explicit opt-in) for the MLU test job to
-# run. Without `run-ci-mlu`, the workflow skips the gate and MLU suites.
+# run. The shared gate reads current labels, including on explicit reruns.
 
 on:
   # Run the reviewed base-branch workflow, never workflow code from the PR.
   pull_request_target:
     branches: [ main ]
-    # `labeled` lets the workflow re-fire when `run-ci-mlu` (or `run-ci`)
-    # is added after the latest push. See call-gate.if for the matching guard
-    # that prevents unrelated label additions from dispatching a full run.
-    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       ref:
@@ -26,43 +22,11 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: pr-test-mlu-${{ github.event.pull_request.number || inputs.ref || github.ref }}-${{ (github.event.action == 'labeled' && github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-mlu') && github.run_id || 'main' }}
+  group: pr-test-mlu-${{ github.event.pull_request.number || inputs.ref || github.ref }}-main
   cancel-in-progress: true
 
 jobs:
-  check-mlu-opt-in:
-    runs-on: ubuntu-latest
-    outputs:
-      enabled: ${{ github.event_name != 'pull_request_target' || steps.labels.outputs.enabled == 'true' }}
-    steps:
-      - name: Check current PR labels
-        if: github.event_name == 'pull_request_target'
-        id: labels
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const pr = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-            });
-            core.setOutput(
-              "enabled",
-              String(pr.data.labels.some((label) => label.name === "run-ci-mlu")),
-            );
-
-  # Filter unrelated label additions, then let the reusable gate enforce
-  # run-ci and the remaining PR policies after opt-in.
   call-gate:
-    needs: [check-mlu-opt-in]
-    if: |
-      needs.check-mlu-opt-in.outputs.enabled == 'true' &&
-      (
-        github.event_name != 'pull_request_target' ||
-        github.event.action != 'labeled' ||
-        github.event.label.name == 'run-ci' ||
-        github.event.label.name == 'run-ci-mlu'
-      )
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true
@@ -71,8 +35,8 @@ jobs:
 
   pr-test-mlu:
     name: MLU / ${{ matrix.suite }}
-    needs: [check-mlu-opt-in, call-gate]
-    if: ${{ !cancelled() && needs.check-mlu-opt-in.outputs.enabled == 'true' && needs.call-gate.result == 'success' }}
+    needs: [call-gate]
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:

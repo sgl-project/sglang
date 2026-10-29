@@ -41,6 +41,8 @@ if _HAS_MLX:
     from sglang.srt.hardware_backend.mlx.model_runner_stub import (
         MlxModelRunnerStub,
     )
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+    from sglang.test.tree_slots import tree_slots_of
 
 
 def _arch(hybrid):
@@ -281,6 +283,7 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
+            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
         )
         aux_capacity = pool.auxiliary_state_pool.available_size()
         for _ in range(3 * aux_capacity):
