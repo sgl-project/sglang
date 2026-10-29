@@ -666,6 +666,20 @@ class ServerArgs(DisaggServerArgsMixin):
     def broker_port(self) -> int:
         return self.port + 1
 
+    @property
+    def cancel_endpoint(self) -> str | None:
+        # the HTTP server publishes cancelled request ids here to every replica driver
+        if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
+            return None
+        return f"ipc://{tempfile.gettempdir()}/sglang-diffusion-cancel-{self.port}"
+
+    @property
+    def progress_endpoint(self) -> str | None:
+        # replica drivers send video progress here; ipc only reaches this node
+        if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
+            return None
+        return f"ipc://{tempfile.gettempdir()}/sglang-diffusion-progress-{self.port}"
+
     def _adjust_path(self):
         expand_path_fields(self)
         self._adjust_save_paths()
@@ -3347,6 +3361,15 @@ class ServerArgs(DisaggServerArgsMixin):
             help="JSON config file for an external SRT prompt enhancer, used by HTTP requests with enhance_prompt=true.",
         )
 
+        # use argparse's destinations so new aliases need no second registry
+        parser.set_defaults(
+            _sglang_cli_destinations={
+                option[2:].replace("-", "_"): action.dest
+                for action in parser._actions
+                for option in action.option_strings
+                if option.startswith("--")
+            }
+        )
         return parser
 
     def url(self):
@@ -3665,6 +3688,8 @@ class ServerArgs(DisaggServerArgsMixin):
         args: argparse.Namespace,
         unknown_args: list[str] | None = None,
         default_args: dict[str, Any] | None = None,
+        *,
+        argv: list[str] | None = None,
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
@@ -3690,7 +3715,7 @@ class ServerArgs(DisaggServerArgsMixin):
         if remaining:
             raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
 
-        provided_args = cls.get_provided_args(args, unknown_args)
+        provided_args = cls.get_provided_args(args, unknown_args, argv=argv)
         explicit_arg_names = set(provided_args)
 
         # Handle config file
@@ -3848,32 +3873,26 @@ class ServerArgs(DisaggServerArgsMixin):
 
     @staticmethod
     def get_provided_args(
-        args: argparse.Namespace, unknown_args: list[str]
+        args: argparse.Namespace,
+        unknown_args: list[str],
+        *,
+        argv: list[str] | None = None,
     ) -> dict[str, Any]:
         """Get the arguments provided by the user."""
         provided_args = {}
         # We need to check against the raw command-line arguments to see what was
         # explicitly provided by the user, vs. what's a default value from argparse.
-        raw_argv = sys.argv + unknown_args
+        raw_argv = (sys.argv[1:] if argv is None else argv) + unknown_args
 
         # Create a set of argument names that were present on the command line.
         # This handles both styles: '--arg=value' and '--arg value'.
-        provided_arg_names = set(getattr(args, "_sglang_explicit_arg_names", ()))
+        provided_arg_names = set(vars(args).get("_sglang_explicit_arg_names", ()))
+        destinations = vars(args).get("_sglang_cli_destinations", {})
         for arg in raw_argv:
             if arg.startswith("--"):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
-                provided_arg_names.add(arg_name)
-        cli_aliases = {
-            "cfg_parallel_size": "cfg_parallel_degree",
-            "data_parallel_size": "dp_size",
-            "dp": "dp_size",
-            "layerwise_offload_modules": "layerwise_offload_components",
-            "mode": "performance_mode",
-        }
-        for alias_name, dest_name in cli_aliases.items():
-            if alias_name in provided_arg_names:
-                provided_arg_names.add(dest_name)
+                provided_arg_names.add(destinations.get(arg_name, arg_name))
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
@@ -4259,7 +4278,7 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args, unknown_args = parser.parse_known_args(argv)
-    server_args = ServerArgs.from_cli_args(raw_args, unknown_args)
+    server_args = ServerArgs.from_cli_args(raw_args, unknown_args, argv=argv)
     return server_args
 
 

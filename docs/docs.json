@@ -955,9 +955,11 @@
               "docs/advanced_features/reasoning_aware_compression",
               "docs/advanced_features/dp_dpa_smg_guide",
               "docs/advanced_features/prefill_cp",
+              "docs/advanced_features/kv_cache_sharing",
               "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
               "docs/advanced_features/paged_experts",
+              "docs/advanced_features/engram",
               "docs/advanced_features/lora",
               "docs/advanced_features/pd_disaggregation",
               "docs/advanced_features/epd_disaggregation",
@@ -1371,6 +1373,7 @@
                   {
                     "group": "LiquidAI",
                     "pages": [
+                      "cookbook/autoregressive/LiquidAI/LFM3",
                       "cookbook/autoregressive/LiquidAI/LFM2.5"
                     ]
                   },
@@ -1469,6 +1472,7 @@
                   {
                     "group": "Mistral",
                     "pages": [
+                      "cookbook/autoregressive/Mistral/Mistral-Large-4",
                       "cookbook/autoregressive/Mistral/Ministral-3",
                       "cookbook/autoregressive/Mistral/Mistral-Small-4",
                       "cookbook/autoregressive/Mistral/Mistral-Medium-3.5",
@@ -1690,6 +1694,12 @@
                     "group": "SANA-WM",
                     "pages": [
                       "cookbook/diffusion/SANA-WM/SANA-WM"
+                    ]
+                  },
+                  {
+                    "group": "HY-Nomas",
+                    "pages": [
+                      "cookbook/diffusion/HY-Nomas/HY-Nomas"
                     ]
                   }
                 ]
