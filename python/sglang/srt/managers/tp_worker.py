@@ -437,6 +437,13 @@ class TpModelWorker(BaseTpWorker):
         )
         for mr in self.model_runner_list[1:]:
             mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
+        if envs.SGLANG_SDAR_REFRESH_PAIR.get():
+            from sglang.srt.dllm.refresh_pair_serving import RefreshPairServing
+
+            self._sdar_refresh_pair = RefreshPairServing(
+                self.model_runner, self.dllm_algorithm
+            )
+            self._sdar_refresh_pair.initialize()
 
     def ensure_decode_cuda_graphs(self, capture_bs: Optional[List[int]] = None):
         """Idempotently capture decode cuda graphs for all model runners (used
@@ -599,13 +606,35 @@ class TpModelWorker(BaseTpWorker):
         if self.dllm_algorithm.fdfo and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]
 
+        paired_output = None
+        if envs.SGLANG_SDAR_REFRESH_PAIR.get():
+            if batch is None:
+                raise RuntimeError(
+                    "Refresh pairing requires scheduler request metadata"
+                )
+            paired_output = self._sdar_refresh_pair.run(forward_batch, batch.reqs)
+
+        if paired_output is None:
+            result = self.dllm_algorithm.run(
+                self.model_runner, forward_batch, algo_states
+            )
+        else:
+            from sglang.srt.dllm.refresh_pair_serving import finish_paired_step
+
+            result = finish_paired_step(
+                self.dllm_algorithm,
+                forward_batch,
+                paired_output,
+                algo_states,
+            )
+
         (
             logits_output,
             next_token_ids,
             accept_length_per_req_cpu,
             dllm_algo_state,
             can_run_cuda_graph,
-        ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
+        ) = result
 
         return GenerationBatchResult(
             logits_output=logits_output,

@@ -2075,6 +2075,9 @@ class Req(ReqDllmMixin):
         self.swa_branching_seqlen = None
         self.extend_end = None
         self.dllm_initialized = False
+        self.dllm_pair_pending = None
+        self.dllm_pair_applied_offset = None
+        self.dllm_pair_future_width = None
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None

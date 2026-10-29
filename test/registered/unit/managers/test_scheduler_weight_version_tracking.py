@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
@@ -81,6 +83,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
 
 def _runner(result=(True, "ok")):
     runner = Mock()
+    runner.model = torch.nn.Module()
     for method in (
         "update_weights_from_disk",
         "update_weights_from_tensor",
@@ -114,7 +117,7 @@ def _request(**fields):
 class _WeightUpdaterManagerTestBase(CustomTestCase):
     def setUp(self):
         patcher = patch("torch.distributed.barrier")
-        patcher.start()
+        self.barrier = patcher.start()
         self.addCleanup(patcher.stop)
         self.recorded = []
 
@@ -216,6 +219,32 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
 
 class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
+    def test_begin_checks_all_runners_before_any_weight_mutation(self):
+        target, draft = _runner(), _runner()
+        draft.model._derived_weight_cache_error = "derived cache requires restart"
+        manager = self._manager(target, draft, session=False)
+
+        output = manager.begin_weight_update(BeginWeightUpdateReqInput())
+
+        self.assertFalse(output.success)
+        self.assertEqual(output.message, draft.model._derived_weight_cache_error)
+        self.assertIsNone(manager._session)
+        target.weight_updater.begin_weight_update.assert_not_called()
+        draft.weight_updater.begin_weight_update.assert_not_called()
+        self.barrier.assert_not_called()
+
+    def test_begin_without_derived_cache_opens_session(self):
+        target, draft = _runner(), _runner()
+        manager = self._manager(target, draft, session=False)
+
+        output = manager.begin_weight_update(BeginWeightUpdateReqInput())
+
+        self.assertTrue(output.success)
+        self.assertEqual(manager._session, _WeightUpdateSession(selector="all"))
+        target.weight_updater.begin_weight_update.assert_called_once_with()
+        draft.weight_updater.begin_weight_update.assert_called_once_with()
+        self.barrier.assert_called_once_with(group=manager.tp_cpu_group)
+
     def test_distributed_update_receives_once_on_target_loads_into_each(self):
         """A draft runner that received its own broadcast would deadlock the update group."""
         target, draft = _runner(), _runner()

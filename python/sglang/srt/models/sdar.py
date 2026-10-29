@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -29,6 +30,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -51,6 +53,42 @@ from sglang.srt.utils import add_prefix, is_cuda, make_pp_layers
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+
+
+def _paired_projections(linear, left, right):
+    """Run independent projections with their original matrix dimensions."""
+    if (
+        not left.is_cuda
+        or left.dtype != torch.bfloat16
+        or getattr(linear, "tp_size", 1) != 1
+        or not isinstance(linear.quant_method, UnquantizedLinearMethod)
+    ):
+        return linear(left)[0], linear(right)[0]
+    current = torch.cuda.current_stream()
+    alternate = get_stream("alt")
+    alternate.wait_stream(current)
+    first = linear(left)[0]
+    with torch.cuda.stream(alternate):
+        second = linear(right)[0]
+    current.wait_stream(alternate)
+    # The concatenation consumes this allocation on the current stream.
+    second.record_stream(current)
+    return first, second
+
+
+def _block_pair_linear(linear, hidden_states, forward_batch):
+    """Keep each block's original row count in a paired forward."""
+    block = forward_batch.dllm_block_pair_size if forward_batch is not None else None
+    if block is None:
+        return linear(hidden_states)[0]
+    # Changing the row count can change BF16 rounding and later token decisions.
+    batch = forward_batch.batch_size
+    rows = hidden_states.view(batch, 2, block, -1)
+    inputs = [rows[:, i].contiguous().view(batch * block, -1) for i in range(2)]
+    parts = [
+        part.view(batch, block, -1) for part in _paired_projections(linear, *inputs)
+    ]
+    return torch.cat(parts, dim=1).reshape(batch * 2 * block, -1)
 
 
 class SDARMLP(nn.Module):
@@ -79,11 +117,12 @@ class SDARMLP(nn.Module):
         )
         self.act_fn = SiluAndMul()
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+    ):
         gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
-        hidden_states, _ = self.down_proj(hidden_states)
-        return hidden_states
+        return _block_pair_linear(self.down_proj, hidden_states, forward_batch)
 
 
 class SDARAttention(nn.Module):
@@ -171,7 +210,7 @@ class SDARAttention(nn.Module):
         self.alt_stream = alt_stream
 
     def forward_prepare_native(self, positions, hidden_states, forward_batch):
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = _block_pair_linear(self.qkv_proj, hidden_states, forward_batch)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
             q=q,
@@ -206,7 +245,7 @@ class SDARAttention(nn.Module):
         if get_exec().deterministic.rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = _block_pair_linear(self.qkv_proj, hidden_states, forward_batch)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(
             q=q,
@@ -242,7 +281,7 @@ class SDARAttention(nn.Module):
             forward_batch,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
-        out, _ = self.o_proj(context_layer)
+        out = _block_pair_linear(self.o_proj, context_layer, forward_batch)
         return out
 
 
@@ -329,7 +368,7 @@ class SDARBlock(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
@@ -429,6 +468,12 @@ class SDARForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        if envs.SGLANG_SDAR_REFRESH_PAIR.get():
+            self._derived_weight_cache_error = (
+                "Online weight updates are not supported with SDAR refresh sharing: "
+                "paired graphs and pending predictions are qualified for the loaded "
+                "weights. Restart with SGLANG_SDAR_REFRESH_PAIR=0 to update weights."
+            )
         self.pp_group = get_parallel().pp_group
         assert self.pp_group.world_size == 1, (
             f"SDARMoeForCausalLM does not support pipeline parallel (pp_size={self.pp_group.world_size}). "
