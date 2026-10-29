@@ -1296,6 +1296,10 @@ class Envs:
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
     # Small-batch CSGMV split-K changes rounding. Disabled in deterministic mode.
     SGLANG_ENABLE_LORA_CSGMV_SPLIT_K = EnvBool(False)
+    # Opt in to the dual decode graph for triton_v2 LoRA: a base-only graph for
+    # adapter-free batches next to the adapter graph (two graphs per batch
+    # size); off by default.
+    SGLANG_ENABLE_LORA_DUAL_GRAPH = EnvBool(False)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
