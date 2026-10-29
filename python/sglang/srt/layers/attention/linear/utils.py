@@ -113,6 +113,10 @@ def select_verify_intermediate_state_indices(
 ):
     if not pp_spec_stable_rows_enabled():
         return default_indices
+    # A callable `valid` is evaluated only here, so per-layer callers launch no
+    # mask kernel when stable rows are off.
+    if callable(valid):
+        valid = valid()
 
     import torch
 

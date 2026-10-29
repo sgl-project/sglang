@@ -1243,7 +1243,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_state_indices = select_verify_intermediate_state_indices(
                 self.verify_intermediate_state_indices,
                 forward_batch.req_pool_indices,
-                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                lambda: cache_indices[: query_start_loc.shape[0] - 1] >= 0,
                 self.req_to_token_pool.size,
             )
             mamba_pool = self.state_pool
