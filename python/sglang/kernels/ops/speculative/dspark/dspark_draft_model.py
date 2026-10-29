@@ -197,10 +197,8 @@ class CommitKvProj:
         wkv_linears: list[torch.nn.Module],
         allow_strided_output: bool = False,
     ) -> list[torch.Tensor]:
-        if (
-            main_x.is_cuda
-            and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears)
-            and not is_npu_arch35()
+        if main_x.is_cuda and _fused_commit_kv_proj_supported(
+            wkv_linears=wkv_linears
         ):
             return cls.triton(
                 main_x=main_x,
@@ -352,6 +350,10 @@ def _dequant_supported(linear: torch.nn.Module) -> bool:
 def _fused_commit_kv_proj_supported(*, wkv_linears: list[torch.nn.Module]) -> bool:
     """Whether _build_stacked_wkv_weight can handle these weights; unsupported
     quant schemes fall back to the per-linear torch path in execute()."""
+    # NPU arch35 serves these linears through its own quant methods, which the
+    # Triton fused path below does not handle.
+    if is_npu_arch35():
+        return False
     if _block_quant_stack_applies(wkv_linears=wkv_linears):
         return True
     return all(_dequant_supported(linear) for linear in wkv_linears)

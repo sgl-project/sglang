@@ -1212,9 +1212,6 @@ class DeepseekV4AscendAttnBackend(
             bs=local_t,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
             actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
-            block_tables=fm.block_tables,
-            max_seqlen_q=1,
-            is_nextn=False,
         )
         if self._dsv4_has_c4:
             fm.c4_topk_indices = torch.full(
@@ -1825,9 +1822,6 @@ class DeepseekV4AscendAttnBackend(
             bs=ctx.bs,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
             actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
-            block_tables=fm.block_tables,
-            max_seqlen_q=ctx.tokens_per_bs,
-            is_nextn=False,
         )
         for key in (
             "c1a_metadata",
@@ -1962,24 +1956,10 @@ class DeepseekV4AscendAttnBackend(
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
-            max_seqlen_q = (
-                int(forward_batch.spec_info.draft_token_num)
-                if forward_batch.forward_mode.is_target_verify()
-                else self.speculative_num_draft_tokens
-            )
-        else:
-            max_seqlen_q = 1
         return self._kernel_metadata_from_parts(
             bs=forward_batch.batch_size,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
             actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
-            block_tables=fm.block_tables,
-            max_seqlen_q=max_seqlen_q,
-            is_nextn=False,
         )
 
     def _kernel_metadata_from_parts(
@@ -1988,9 +1968,6 @@ class DeepseekV4AscendAttnBackend(
         bs: int,
         actual_seq_lengths_q_pa: torch.Tensor,
         actual_seq_lengths_kv: torch.Tensor,
-        block_tables: torch.Tensor,
-        max_seqlen_q: int,
-        is_nextn: bool,
     ) -> dict:
         fm = self.forward_metadata
         common = {
@@ -2142,16 +2119,10 @@ class DeepseekV4AscendAttnBackend(
             softmax_scale=layer.scaling,
             cmp_ratio=1,
         )
-        if self._is_dspark_draft_worker and not is_npu_arch35():
-            attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
         ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
-        if self._is_dspark_draft_worker and is_npu_arch35():
-            # The quantized kernel's C++ entry requires contiguous Q. This is
-            # a no-op for the usual padded query tensor.
-            q_arg = q_arg.contiguous()
         _, attn_op = _sparse_attn_ops(self._is_dspark_draft_worker)
         out, _ = attn_op(q_arg, **attn_kwargs)
         return out
