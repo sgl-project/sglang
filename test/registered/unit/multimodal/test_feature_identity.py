@@ -3,15 +3,11 @@
 import asyncio
 import itertools
 import pickle
+import runpy
 import unittest
 from array import array
 from dataclasses import dataclass, replace
-from test.registered.unit.mem_cache.test_rust_tree_core_integration import (
-    _insert,
-    _key,
-    _pump_insert,
-    _tree_core,
-)
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -53,6 +49,18 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+_TREE_HELPERS = runpy.run_path(
+    str(
+        Path(__file__).resolve().parents[1]
+        / "mem_cache"
+        / "test_rust_tree_core_integration.py"
+    )
+)
+_insert = _TREE_HELPERS["_insert"]
+_key = _TREE_HELPERS["_key"]
+_pump_insert = _TREE_HELPERS["_pump_insert"]
+_tree_core = _TREE_HELPERS["_tree_core"]
 
 
 def _item(value, **kwargs):
