@@ -292,10 +292,15 @@ class BufferModePipeline:
         # Metadata-only pending-write backlog cap, measured in unique FULL
         # snapshot spans; beyond it new spans are dropped at admission.
         self.write_backlog_cap = write_backlog_cap
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
         kvcache = cache.token_to_kv_pool_allocator.get_kvcache()
-        full_pool = kvcache.full_kv_pool if isinstance(kvcache, SWAKVPool) else kvcache
+        router = kvcache.layer_router
+        full_pool = (
+            router.view(IdSpaceKind.FULL)
+            if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+            else kvcache
+        )
         # Clamp by admission headroom: pins must leave room for the largest
         # allowed request, else a queued hold can wedge admission permanently
         # (pool full, nothing retractable). No-headroom pools take no pins.
