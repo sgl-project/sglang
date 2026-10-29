@@ -24,6 +24,10 @@ from ..common.utils import (
 # kernel on XPU, else _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
 _JIT_TOPK_MAX_NUM_BLOCKS = 4096 if is_xpu() else 16384
 
+# Cap on verify rows x index heads per K head in one packed dot tile;
+# the per-row kernel's minimum BLOCK_SIZE_H, so packing adds no MMA rows.
+_PACKED_SCORE_MAX_ROWS = 16
+
 
 def _prune_decode_configs(configs, named_args, **kwargs):
     """Drop autotune configs whose token tile is smaller than a sparse block.
@@ -371,6 +375,168 @@ def _decode_score_paged_kernel(
             s_base + blk * stride_s_n,
             score.to(score_ptr.dtype.element_ty),
             mask=h_mask,
+        )
+
+
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_H": lambda args: max(
+            16, triton.next_power_of_2(args["PACK"] * args["gqa_group_size"])
+        ),
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+    }
+)
+@triton.jit
+def _decode_score_packed_kernel(
+    q_ptr,  # Q: (groups * PACK) x qh x d
+    k_cache_ptr,  # K paged: max_slots x kh x d
+    req_to_token_ptr,  # req_to_token: max_reqs x max_kv_len
+    score_ptr,  # Score: qh x (groups * PACK) x max_seqblock
+    seq_lens,
+    slot_ids,
+    # shape
+    max_slots,
+    num_groups,
+    gqa_group_size,
+    head_dim,
+    block_size: tl.constexpr,
+    topk: tl.constexpr,
+    sm_scale,
+    # per-tensor K dequant scale (1.0 when the cache is unit-scaled)
+    k_scale,
+    init_blocks,
+    local_blocks,
+    # stride
+    stride_q_b,
+    stride_q_h,
+    stride_q_d,
+    stride_k_s,
+    stride_k_h,
+    stride_k_d,
+    stride_r2t_b,
+    stride_s_h,
+    stride_s_b,
+    stride_s_n,
+    # META parameters
+    PACK: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    NUM_KV_CHUNKS: tl.constexpr,
+    SCORE_TYPE: tl.constexpr,
+    SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
+    IS_FP8: tl.constexpr,
+):
+    tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
+    sm_scale_log2e = sm_scale * 1.4426950409
+    tl.static_assert(BLOCK_SIZE_N >= block_size)
+    BLOCKS_PER_K_BLOCK: tl.constexpr = BLOCK_SIZE_N // block_size
+    pid_gc, pid_kh = tl.program_id(0), tl.program_id(1)
+    pid_g = pid_gc % num_groups
+    pid_c = pid_gc // num_groups
+    pid_h = pid_kh * gqa_group_size
+    # Tile rows are the group's (verify row, head) pairs, so K is read once per group.
+    off_t = tl.arange(0, BLOCK_SIZE_H)
+    sub = off_t // gqa_group_size
+    head = off_t % gqa_group_size
+    in_tile = sub < PACK
+    rows = pid_g * PACK + sub
+    seq_len = tl.load(seq_lens + rows, mask=in_tile, other=0).to(tl.int32)
+    num_blocks = (seq_len + block_size - 1) // block_size
+    # the group's longest row bounds the K range every row reads from
+    group_len = tl.max(seq_len, axis=0)
+    group_blocks = (group_len + block_size - 1) // block_size
+    if SKIP_TRIVIAL_TOPK_SCORE:
+        if group_blocks <= topk:
+            return
+    chunk_size_blocks = tl.cdiv(group_blocks, NUM_KV_CHUNKS)
+    chunk_start_block = pid_c * chunk_size_blocks
+    chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, group_blocks)
+    chunk_start = chunk_start_block * block_size
+    chunk_end = tl.minimum(chunk_end_block * block_size, group_len)
+    if chunk_start_block >= chunk_end_block:
+        return
+    # caller contract: the PACK rows of a group share one request
+    sid = (tl.load(slot_ids + pid_g * PACK).to(tl.int64) + max_slots) % max_slots
+    off_n = tl.arange(0, BLOCK_SIZE_N)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    off_bpk = tl.arange(0, BLOCKS_PER_K_BLOCK)
+    dim_mask = off_d < head_dim
+    q = tl.load(
+        q_ptr
+        + rows[:, None] * stride_q_b
+        + (pid_h + head)[:, None] * stride_q_h
+        + off_d[None, :] * stride_q_d,
+        mask=in_tile[:, None] & dim_mask[None, :],
+        other=0.0,
+    )
+    s_base = (
+        score_ptr + rows[:, None] * stride_s_b + (pid_h + head)[:, None] * stride_s_h
+    )
+    # per-row bounds: a row reads its own prefix of the group's range
+    row_end = tl.minimum(seq_len, chunk_end)
+    local_start = tl.maximum(0, num_blocks - local_blocks)
+    r2t_base = req_to_token_ptr + sid * stride_r2t_b
+    prefetch_pos = chunk_start + off_n
+    prefetch_mask = prefetch_pos < group_len
+    prefetched_slots = tl.load(
+        r2t_base + prefetch_pos,
+        mask=prefetch_mask,
+        other=0,
+    ).to(tl.int64)
+    for i in range(chunk_start, chunk_end, BLOCK_SIZE_N):
+        pos_mask = prefetch_mask
+        slots = prefetched_slots
+        next_i = i + BLOCK_SIZE_N
+        if next_i < chunk_end:
+            next_pos = next_i + off_n
+            prefetch_mask = next_pos < group_len
+            prefetched_slots = tl.load(
+                r2t_base + next_pos,
+                mask=prefetch_mask,
+                other=0,
+            ).to(tl.int64)
+        slots = (slots + max_slots) % max_slots
+        k_off = (
+            slots[None, :] * stride_k_s
+            + pid_kh * stride_k_h
+            + off_d[:, None] * stride_k_d
+        )
+        k = tl.load(
+            k_cache_ptr + k_off,
+            mask=dim_mask[:, None] & pos_mask[None, :],
+            other=0.0,
+        )
+        if IS_FP8:
+            k = k.to(q.dtype)
+        qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
+        qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
+        # Past its own length a row sees the group's later draft tokens;
+        # mask them with tl.where, as adding -inf to a non-finite dot gives NaN.
+        qk = tl.where((i + off_n)[None, :] < row_end[:, None], qk, float("-inf"))
+        score = tl.reshape(
+            qk,
+            (BLOCK_SIZE_H, BLOCKS_PER_K_BLOCK, block_size),
+            can_reorder=False,
+        )
+        sub_max = tl.max(score, axis=2)
+        if SCORE_TYPE == "max":
+            score = sub_max
+        else:  # "lse"
+            score = sub_max + tl.log2(
+                tl.sum(tl.exp2(score - sub_max[:, :, None]), axis=2)
+            )
+            score = tl.where(score != score, float("-inf"), score)
+        curr_block_idx = i // block_size + off_bpk
+        is_init = curr_block_idx[None, :] < init_blocks
+        is_local = (curr_block_idx[None, :] >= local_start[:, None]) & (
+            curr_block_idx[None, :] < num_blocks[:, None]
+        )
+        score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
+        tl.store(
+            s_base + curr_block_idx[None, :] * stride_s_n,
+            score.to(score_ptr.dtype.element_ty),
+            mask=in_tile[:, None] & (curr_block_idx[None, :] < chunk_end_block),
         )
 
 
@@ -970,6 +1136,82 @@ def _topk_index_merge_kernel(
     )
 
 
+def _num_kv_chunks(rows: int, num_kv_heads: int, max_chunks: int = 256) -> int:
+    # NUM_KV_CHUNKS controls how many parallel chunks each (row, kv_head) gets.
+    # Total CTAs = rows * NUM_KV_CHUNKS * num_kv_heads.
+    # TARGET_GRID is the desired total CTA count; NUM_KV_CHUNKS is derived by:
+    #   NUM_KV_CHUNKS = clamp(TARGET_GRID // (rows * num_kv_heads), 1, max_chunks)
+    # then rounded down to the nearest power of 2 (merge kernel requires it).
+    # Must only depend on cuda-graph-constant quantities (rows, num_kv_heads), not seq_len.
+    # Empty chunks early-return cheaply, so over-chunking is nearly free.
+    # E.g. with num_kv_heads=1: rows=1 -> NKC=256, CTAs=256; rows=32 -> NKC=128, CTAs=4096.
+    TARGET_GRID = 4096
+    target = max(1, min(max_chunks, TARGET_GRID // max(1, rows * num_kv_heads)))
+    return 1 << (target.bit_length() - 1)
+
+
+def _launch_decode_score_packed(
+    *,
+    q,
+    k_cache,
+    req_to_token,
+    score,
+    seq_lens,
+    slot_ids,
+    packed_queries,
+    block_size,
+    topk,
+    sm_scale,
+    k_scale,
+    init_blocks,
+    local_blocks,
+    score_type,
+    skip_trivial_topk_score,
+    is_fp8,
+):
+    num_groups = q.shape[0] // packed_queries
+    num_kv_heads = k_cache.shape[1]
+    num_chunks = _num_kv_chunks(num_groups, num_kv_heads)
+    _decode_score_packed_kernel[(num_groups * num_chunks, num_kv_heads)](
+        q,
+        k_cache,
+        req_to_token,
+        score,
+        seq_lens,
+        slot_ids,
+        k_cache.shape[0],
+        num_groups,
+        q.shape[1] // num_kv_heads,
+        q.shape[2],
+        block_size,
+        topk,
+        sm_scale,
+        k_scale,
+        init_blocks,
+        local_blocks,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        req_to_token.stride(0),
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
+        PACK=packed_queries,
+        # Fixed config, within 13% of the best BLOCK_SIZE_N x warps x stages on GB300;
+        # autotune would pick per rank from the verify graph warm-up's 1-token rows.
+        BLOCK_SIZE_N=max(128, block_size),
+        NUM_KV_CHUNKS=num_chunks,
+        SCORE_TYPE=score_type,
+        SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
+        IS_FP8=is_fp8,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
 @torch.no_grad()
 def flash_decode_with_topk_idx(
     q: torch.Tensor,  # [batch_size, num_heads, head_dim]
@@ -993,6 +1235,7 @@ def flash_decode_with_topk_idx(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    packed_queries: int = 1,  # consecutive rows sharing one request (EAGLE verify)
 ) -> torch.Tensor:
     assert score_type in (
         "max",
@@ -1022,21 +1265,7 @@ def flash_decode_with_topk_idx(
     # the QK dot AND the sink logit — unlike k_scale, which must not touch the
     # sink term and therefore stays a separate kernel argument.
     sm_scale = sm_scale * unit_scale(q_scale)
-    # NUM_KV_CHUNKS controls how many parallel chunks each (batch, kv_head) gets.
-    # Total CTAs = batch_size * NUM_KV_CHUNKS * num_kv_heads.
-    # TARGET_GRID is the desired total CTA count; NUM_KV_CHUNKS is derived by:
-    #   NUM_KV_CHUNKS = clamp(TARGET_GRID // (BS * num_kv_heads), 1, MAX_NUM_KV_CHUNKS)
-    # then rounded down to the nearest power of 2 (merge kernel requires it).
-    # Must only depend on cuda-graph-constant quantities (BS, num_kv_heads), not seq_len.
-    # Empty chunks early-return cheaply, so over-chunking is nearly free.
-    # E.g. with num_kv_heads=1: BS=1→NKC=256,CTAs=256; BS=32→NKC=128,CTAs=4096.
-    TARGET_GRID = 4096
-    MAX_NUM_KV_CHUNKS = 256
-    target = max(
-        1,
-        min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, batch_size * num_kv_heads)),
-    )
-    NUM_KV_CHUNKS = 1 << (target.bit_length() - 1)
+    NUM_KV_CHUNKS = _num_kv_chunks(batch_size, num_kv_heads)
     score_kv_len = min(max_seqlen, max_kv_len)
     # The score producers below write every valid block column
     # [0, ceil(seq_len / block_size)) for each (head, batch) row. All consumers
@@ -1061,14 +1290,21 @@ def flash_decode_with_topk_idx(
     # skip these writes.
     skip_trivial_topk_score = use_dense_main_attn or use_jit_topk
 
+    # EAGLE verify rows of one request share its index K: score them in one pass
+    # (CUDA; SM90 keeps its paged and per-row kernels, ROCm its fixed per-row
+    # config and its own indexer CP path).
+    use_packed = (
+        q.is_cuda
+        and not _ON_HIP
+        and not get_platform().is_sm90
+        and disable_index_value
+        and packed_queries > 1
+        and batch_size % packed_queries == 0
+        and packed_queries * gqa_group_size <= _PACKED_SCORE_MAX_ROWS
+    )
     grid = (batch_size * NUM_KV_CHUNKS, num_kv_heads)
     if disable_index_value and page_size % block_size == 0 and get_platform().is_sm90:
-        paged_chunks = 1 << (
-            max(
-                1, min(1024, TARGET_GRID // max(1, batch_size * num_kv_heads))
-            ).bit_length()
-            - 1
-        )
+        paged_chunks = _num_kv_chunks(batch_size, num_kv_heads, max_chunks=1024)
         _decode_score_paged_kernel[(batch_size * paged_chunks, num_kv_heads)](
             q,
             k_cache,
@@ -1104,6 +1340,25 @@ def flash_decode_with_topk_idx(
             IS_FP8=is_fp8,
             num_warps=4 if batch_size <= 2 else 2,
             num_stages=3,
+        )
+    elif use_packed:
+        _launch_decode_score_packed(
+            q=q,
+            k_cache=k_cache,
+            req_to_token=req_to_token,
+            score=score,
+            seq_lens=seq_lens,
+            slot_ids=slot_ids,
+            packed_queries=packed_queries,
+            block_size=block_size,
+            topk=topk,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            score_type=score_type,
+            skip_trivial_topk_score=skip_trivial_topk_score,
+            is_fp8=is_fp8,
         )
     elif disable_index_value:
         _decode_score_kernel[grid](
