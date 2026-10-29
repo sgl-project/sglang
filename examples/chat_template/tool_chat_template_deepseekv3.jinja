@@ -22,9 +22,12 @@
         '```json\n{"param1": "value1", "param2": "value2"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>\n\n'
         'Make sure the JSON is valid.'
         '## Tools\n\n### Function\n\nYou have the following functions available:\n\n') %}
-    {% for tool in tools %}
-        {% set tool_ns.text = tool_ns.text + '\n```json\n' + (tool | tojson) + '\n```\n' %}
-    {% endfor %}
+    {% set tool_text %}
+        {%- for tool in tools -%}
+            {{- '\n```json\n' + (tool | tojson) + '\n```\n' -}}
+        {%- endfor -%}
+    {% endset %}
+    {% set tool_ns.text = tool_ns.text + tool_text %}
     {% set ns.system_prompt = ns.system_prompt + '\n\n' + tool_ns.text %}
 {% endif %}
 
