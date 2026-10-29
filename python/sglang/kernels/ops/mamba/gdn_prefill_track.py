@@ -92,6 +92,104 @@ def _gdn_track_ssm_kernel(
     tl.store(ssm_pool + dst * stride_ssm_slot + offs, val, mask=mask)
 
 
+@triton.jit
+def _gdn_cp_tail_kernel(
+    q,
+    k,
+    v,
+    alpha,
+    beta,
+    cu_seqlens,
+    num_rows,
+    stride_q,
+    stride_k,
+    stride_v,
+    stride_alpha,
+    stride_beta,
+    QK: tl.constexpr,
+    V: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_QK: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    end = tl.load(cu_seqlens + 1)
+    row = end + tl.program_id(0)
+    if row >= tl.minimum((end + 63) // 64 * 64, num_rows):
+        return
+    row = row.to(tl.int64)
+
+    offsets = tl.arange(0, BLOCK_QK)
+    mask = offsets < QK
+    tl.store(
+        q + row * stride_q + offsets,
+        tl.zeros([BLOCK_QK], q.dtype.element_ty),
+        mask=mask,
+    )
+    tl.store(
+        k + row * stride_k + offsets,
+        tl.zeros([BLOCK_QK], k.dtype.element_ty),
+        mask=mask,
+    )
+
+    offsets = tl.arange(0, BLOCK_V)
+    tl.store(
+        v + row * stride_v + offsets,
+        tl.zeros([BLOCK_V], v.dtype.element_ty),
+        mask=offsets < V,
+    )
+
+    offsets = tl.arange(0, BLOCK_H)
+    mask = offsets < H
+    tl.store(
+        alpha + row * stride_alpha + offsets,
+        tl.full([BLOCK_H], 1.0, alpha.dtype.element_ty),
+        mask=mask,
+    )
+    tl.store(
+        beta + row * stride_beta + offsets,
+        tl.zeros([BLOCK_H], beta.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def gdn_cp_tail_neutralize(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> None:
+    """Neutralize bucket padding loaded by FlashInfer's one-sequence CP path."""
+    rows = q.shape[0]
+    assert q[0].is_contiguous() and k[0].is_contiguous() and v[0].is_contiguous()
+    assert alpha.stride(-1) == 1 and beta.stride(-1) == 1
+    qk_elements = q[0].numel()
+    value_elements = v[0].numel()
+    num_heads = alpha.shape[-1]
+    _gdn_cp_tail_kernel[(64,)](
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        cu_seqlens,
+        rows,
+        q.stride(0),
+        k.stride(0),
+        v.stride(0),
+        alpha.stride(0),
+        beta.stride(0),
+        QK=qk_elements,
+        V=value_elements,
+        H=num_heads,
+        BLOCK_QK=triton.next_power_of_2(qk_elements),
+        BLOCK_V=triton.next_power_of_2(value_elements),
+        BLOCK_H=triton.next_power_of_2(num_heads),
+    )
+
+
 def gdn_track_conv_window(
     conv_pool: torch.Tensor,
     x: torch.Tensor,

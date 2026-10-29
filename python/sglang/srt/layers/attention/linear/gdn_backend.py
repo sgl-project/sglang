@@ -67,6 +67,7 @@ if is_cuda() or is_hip() or is_xpu():
     )
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
+_FLASHINFER_GRAPH_MAX_SEQS = 8
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
@@ -577,40 +578,112 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.prefill_graph_max_seqs = min(
             self.req_to_token_pool.size, envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get()
         )
+        self.prefill_graph_flashinfer = False
+        self._flashinfer_graph_output: Optional[torch.Tensor] = None
+        self._flashinfer_graph_output_dtype = model_runner.dtype
+        self._flashinfer_graph_cp_single = True
 
     def supports_prefill_graph_extend(self) -> bool:
-        # Read here, not in __init__: the support check reads model_config.
+        enabled = envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
         return (
-            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
+            enabled
             # drafts keep their eager GDN extend; only the target's is captured
             and not self.is_draft_worker
-            and self._prefill_graph_extend_supported()
+            and self._prefill_graph_extend_supported(enable_flashinfer=enabled)
         )
 
-    def _prefill_graph_extend_supported(self) -> bool:
+    def _prefill_graph_extend_supported(
+        self, *, enable_flashinfer: bool = False
+    ) -> bool:
         from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
             get_prefill_num_tokens_to_capture,
         )
 
         mamba_cache = self.state_pool.mamba_cache
-        capture_tokens = get_exec().graph.cuda_graph_config.prefill.bs or []
-        supported = (
+        capture_tokens = get_prefill_num_tokens_to_capture(
+            get_exec().graph.cuda_graph_config.prefill.bs or []
+        )
+        common = (
             is_cuda()
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
             and not self.enable_mis
             # The track plan's h rows assume the delta-rule chunk size.
             and self.mamba_chunk_size == FLA_CHUNK_SIZE
             and all(conv.is_contiguous() for conv in mamba_cache.conv)
             and mamba_cache.temporal.is_contiguous()
-            and buckets_keep_chunk_o_block_size(
-                get_prefill_num_tokens_to_capture(capture_tokens)
-            )
         )
+        self.prefill_graph_flashinfer = False
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        if isinstance(extend_kernel, TritonGDNKernel):
+            supported = common and buckets_keep_chunk_o_block_size(capture_tokens)
+            backend = "Triton"
+        elif enable_flashinfer and common:
+            unsupported = self._flashinfer_graph_unsupported_reason(capture_tokens)
+            supported = unsupported is None
+            backend = "FlashInfer"
+            if supported:
+                self._enable_flashinfer_graph(capture_tokens)
+        else:
+            supported = False
+            backend = type(extend_kernel).__name__
         rank0_log(
             "GDN prefill extend inside breakable prefill CUDA graphs: "
-            + ("on" if supported else "unsupported here, layers keep breaking")
+            + (
+                f"on ({backend})"
+                if supported
+                else "unsupported here, layers keep breaking"
+            )
         )
         return supported
+
+    def _flashinfer_graph_unsupported_reason(
+        self, capture_tokens: list[int]
+    ) -> Optional[str]:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+            is_flashinfer_gdn_cp_prefill_available,
+        )
+
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        temporal = self.state_pool.mamba_cache.temporal
+        if not isinstance(extend_kernel, FlashInferGDNKernel):
+            return f"extend kernel is {type(extend_kernel).__name__}"
+        if torch.cuda.get_device_capability()[0] != 10:
+            return "validated on SM100 only"
+        if temporal.dtype != torch.bfloat16:
+            return f"SSM state dtype {temporal.dtype}, expected bfloat16"
+        layer_bytes = temporal.stride(0) * temporal.element_size()
+        if temporal.data_ptr() % 32 or layer_bytes % 32:
+            return "SSM pool is not 32-byte aligned per layer"
+        if (
+            get_exec().mamba.enable_mamba_extra_buffer
+            and mamba_cache_chunk_size() != FLA_CHUNK_SIZE
+        ):
+            return "prefix-cache checkpoints do not use 64-token chunks"
+        if not capture_tokens:
+            return "no prefill capture sizes"
+        num_v_heads = temporal.shape[-3]
+        cp_single = num_v_heads * 4 < torch.cuda.get_device_properties(
+            self.device
+        ).multi_processor_count
+        if cp_single and not is_flashinfer_gdn_cp_prefill_available():
+            return "FlashInfer CP prefill kernel is unavailable"
+        return None
+
+    def _enable_flashinfer_graph(self, capture_tokens: list[int]) -> None:
+        self.prefill_graph_flashinfer = True
+        self.prefill_graph_max_seqs = min(
+            self.req_to_token_pool.size, _FLASHINFER_GRAPH_MAX_SEQS
+        )
+        num_v_heads, head_v_dim = self.state_pool.mamba_cache.temporal.shape[-3:-1]
+        self._flashinfer_graph_cp_single = (
+            num_v_heads * 4
+            < torch.cuda.get_device_properties(self.device).multi_processor_count
+        )
+        self._flashinfer_graph_output = torch.zeros(
+            (max(capture_tokens), num_v_heads, head_v_dim),
+            dtype=self._flashinfer_graph_output_dtype,
+            device=self.device,
+        )
 
     def prefill_graph_extend_active(self) -> bool:
         return self.prefill_graph_metadata is not None
@@ -627,6 +700,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             track=get_exec().mamba.enable_mamba_extra_buffer,
             cache_index_dtype=cache_indices.dtype,
             device=self.device,
+            flashinfer=self.prefill_graph_flashinfer,
+            flashinfer_cp_single=self._flashinfer_graph_cp_single,
         )
         self._fill_prefill_graph_metadata(
             meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
@@ -1168,6 +1243,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)
         query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
         g, beta = self._prefill_gates(layer, a, b)
+        if meta.flashinfer is not None:
+            return self._flashinfer_core_in_graph(
+                meta=meta,
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                ssm_states=ssm_states,
+            )
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=query,
             k=key,
@@ -1190,6 +1275,53 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=meta.cache_indices,
             )
         return core_attn_out
+
+    def _flashinfer_core_in_graph(
+        self,
+        *,
+        meta: GDNPrefillGraphMetadata,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_states: torch.Tensor,
+    ) -> torch.Tensor:
+        tables = meta.flashinfer
+        assert tables is not None
+        num_tokens = query.shape[1]
+        if meta.track:
+            gdn_track_ssm_state(
+                ssm_pool=ssm_states,
+                h=ssm_states.unsqueeze(0),
+                track_mode=tables.pre_track_mode,
+                track_h_row=tables.track_h_row,
+                track_dst=meta.track_dst,
+                cache_indices=meta.cache_indices,
+            )
+        output = self._flashinfer_graph_output[:num_tokens]
+        checkpoints = self.kernel_dispatcher.extend_kernel.extend_in_graph(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            tables=tables,
+            output=output,
+            checkpoint_rows=num_tokens // FLA_CHUNK_SIZE if meta.track else 0,
+            checkpoint_every_n_tokens=FLA_CHUNK_SIZE,
+        )
+        if meta.track:
+            gdn_track_ssm_state(
+                ssm_pool=ssm_states,
+                h=(checkpoints if checkpoints is not None else ssm_states.unsqueeze(0)),
+                track_mode=tables.track_mode,
+                track_h_row=tables.track_h_row,
+                track_dst=meta.track_dst,
+                cache_indices=meta.cache_indices,
+            )
+        return output.view(1, num_tokens, *output.shape[1:])
 
     def forward_extend(
         self,

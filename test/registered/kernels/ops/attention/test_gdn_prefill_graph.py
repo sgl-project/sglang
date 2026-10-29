@@ -12,15 +12,23 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
+from sglang.kernels.ops.mamba.gdn_prefill_track import (
+    TRACK_CHUNK_STATE,
+    TRACK_FINAL_STATE,
+    gdn_cp_tail_neutralize,
+)
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
 )
 from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
+    GDNFlashInferGraphTables,
     GDNPrefillGraphMetadata,
 )
+from sglang.srt.layers.attention.linear.kda_prefill_graph import KDAPrefillTrackRows
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
@@ -141,6 +149,75 @@ def _batch(extend_lens, prefix_lens, track=None):
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestGDNPrefillGraph(CustomTestCase):
+    def test_flashinfer_cp_tail_matches_out_of_bounds_inputs(self):
+        rows = 160
+        q = torch.ones(rows, HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        k = q.clone()
+        v = torch.ones(rows, V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        alpha = torch.full((rows, V_HEADS), 2.0, device="cuda")
+        beta = torch.ones(rows, V_HEADS, device="cuda")
+        gdn_cp_tail_neutralize(
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            torch.tensor([0, 65], dtype=torch.int64, device="cuda"),
+        )
+        torch.cuda.synchronize()
+
+        for tensor in (q, k, v, beta):
+            self.assertTrue(bool((tensor[65:128] == 0).all()))
+            self.assertTrue(bool((tensor[:65] == 1).all()))
+            self.assertTrue(bool((tensor[128:] == 1).all()))
+        self.assertTrue(bool((alpha[65:128] == 1).all()))
+        self.assertTrue(bool((alpha[:65] == 2).all()))
+        self.assertTrue(bool((alpha[128:] == 2).all()))
+
+    def test_flashinfer_tables_route_single_and_multi_sequence_batches(self):
+        tables = GDNFlashInferGraphTables.allocate(
+            max_seqs=4, cp_single=True, device=torch.device("cuda")
+        )
+        single_track = KDAPrefillTrackRows(
+            chunk_rows=[(0, 0)],
+            final_rows=[],
+            conv_rows=[],
+            conv_len=3,
+            dst=torch.tensor([12], device="cuda"),
+        )
+        tables.fill(
+            lens=np.array([130], dtype=np.int64),
+            cache_indices=torch.tensor([5], dtype=torch.int32, device="cuda"),
+            track_rows=single_track,
+        )
+        torch.cuda.synchronize()
+        self.assertEqual(tables.cp_cu_seqlens.tolist(), [0, 130])
+        self.assertEqual(tables.cp_checkpoint_cu.tolist(), [0, 2])
+        self.assertEqual(tables.cp_state_indices.tolist(), [5])
+        self.assertEqual(tables.pre_track_mode[0].item(), TRACK_FINAL_STATE)
+
+        multi_track = KDAPrefillTrackRows(
+            chunk_rows=[(0, 2)],
+            final_rows=[1],
+            conv_rows=[],
+            conv_len=3,
+            dst=torch.tensor([12, 13], device="cuda"),
+        )
+        tables.fill(
+            lens=np.array([130, 64], dtype=np.int64),
+            cache_indices=torch.tensor([-1, 7], dtype=torch.int32, device="cuda"),
+            track_rows=multi_track,
+        )
+        torch.cuda.synchronize()
+        self.assertEqual(tables.cp_cu_seqlens.tolist(), [0, 0])
+        self.assertEqual(tables.non_cp_cu_seqlens.tolist(), [0, 130, 194, 194, 194])
+        self.assertEqual(tables.non_cp_checkpoint_cu.tolist(), [0, 2, 3, 3, 3])
+        self.assertEqual(tables.non_cp_state_indices.tolist(), [0, 7, 0, 0])
+        self.assertEqual(
+            tables.track_mode[:2].tolist(), [TRACK_CHUNK_STATE, TRACK_FINAL_STATE]
+        )
+        self.assertEqual(tables.track_h_row[0].item(), 1)
+
     def _setup(self, ssm_dtype):
         self.layer = _layer()
         g = torch.Generator(device="cuda").manual_seed(11)
