@@ -175,6 +175,31 @@ class TestTokenSpaceDevices(CustomTestCase):
             ):
                 self.assertEqual(wrapper._serving_image_processor_device(), expected)
 
+    def test_wrapper_media_threads_start_on_the_instance_gpu(self):
+        """Pool threads otherwise decode media on cuda:0 whatever base_gpu_id is."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            base_gpu_id=3,
+            mm_process_config={},
+            enable_token_space_processor=True,
+            mm_processor_worker_num=1,
+        )
+        publish(server_args, role="test")
+        with patch(
+            "sglang.srt.multimodal.token_space_mm_process.sglang.is_cuda_alike",
+            return_value=True,
+        ):
+            wrapper = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+                TokenSpaceProcessStrategy, TokenSpaceServingSpec
+            )(
+                None,
+                server_args,
+                PreTrainedTokenizerFast(tokenizer_object=_empty_tokenizer()),
+                None,
+            )
+        self.addCleanup(wrapper.shutdown)
+        self.assertEqual(wrapper._core.io_executor._initializer.args, (3,))
+
     def test_video_requests_use_the_configured_video_device(self):
         # As in process_mm_data: a video request runs all its media on that device.
         for config_device, spec_device, expected in (
