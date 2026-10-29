@@ -752,13 +752,7 @@ class PrefillAdder:
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         # Fixed-length requests cannot benefit from the early-EOS estimate.
         ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
-        return (
-            min(
-                (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                CLIP_MAX_NEW_TOKENS,
-            )
-            * ratio
-        )
+        return self._remaining_new_tokens(req) * ratio
 
     @property
     def rem_total_tokens(self):
@@ -768,11 +762,9 @@ class PrefillAdder:
     def cur_rem_tokens(self):
         return self.memory_budget.remaining_current
 
-    def _swa_new_tokens(self, req: Req) -> int:
-        """Tokens a request may still decode, for SWA headroom sizing. Mirrors
-        the remaining-then-clip order of add_one_req's max_new: clip-then-subtract
-        would zero out a request that has already generated >= CLIP tokens but
-        still has a long decode ahead, under-reserving its window."""
+    def _remaining_new_tokens(self, req: Req) -> int:
+        """Decode headroom every admission site reserves. A retracted request
+        re-prefills its output, so subtract that before clipping."""
         return min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
@@ -790,7 +782,7 @@ class PrefillAdder:
         return self.memory_budget.check_prefill(
             extend_input_len=extend_input_len,
             total_tokens=total_tokens,
-            max_new_tokens=self._swa_new_tokens(req),
+            max_new_tokens=self._remaining_new_tokens(req),
             input_tokens=len(req.full_untruncated_fill_ids),
             swa_host_hit_length=swa_host_hit_length,
             chunk_limit=chunk_limit,
@@ -1080,11 +1072,7 @@ class PrefillAdder:
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
-        max_new_tokens = (
-            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-            if not truncated
-            else 0
-        )
+        max_new_tokens = self._remaining_new_tokens(req) if not truncated else 0
         self._update_prefill_budget(
             0,
             req.extend_len,
@@ -1136,7 +1124,7 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         _rem_tokens = self.memory_budget.fit_chunk(
             extend_input_len=cand_extend_input_len,
-            max_new_tokens=self._swa_new_tokens(req),
+            max_new_tokens=self._remaining_new_tokens(req),
             chunk_limit=_rem_tokens,
         )
         if _rem_tokens is None:
@@ -1155,7 +1143,7 @@ class PrefillAdder:
                 + request_slot_reserve
             ),
             extend_input_len=new_len,
-            max_new_tokens=self._swa_new_tokens(req),
+            max_new_tokens=self._remaining_new_tokens(req),
             chunk_limit=self.rem_chunk_tokens,
         ):
             return req
@@ -1170,11 +1158,7 @@ class PrefillAdder:
         self._update_prefill_budget(
             0,
             req.extend_len,
-            (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if not truncated
-                else 0
-            ),
+            self._remaining_new_tokens(req) if not truncated else 0,
             req.retracted_stain,
             state_slot_reserve=self._state_slot_reserve_for_req(req),
             request_slot_reserve=request_slot_reserve,
@@ -1213,7 +1197,7 @@ class PrefillAdder:
         fits = self.memory_budget.can_allocate_prefill(
             paged_input=paged_input,
             extend_input_len=cand_extend_input_len,
-            max_new_tokens=self._swa_new_tokens(req),
+            max_new_tokens=self._remaining_new_tokens(req),
             chunk_limit=self.rem_chunk_tokens,
         )
         if not fits:
@@ -1307,7 +1291,7 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                self._remaining_new_tokens(req),
                 req.retracted_stain,
                 state_slot_reserve=self._state_slot_reserve_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(req),
@@ -1367,10 +1351,7 @@ class PrefillAdder:
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
         # _update_prefill_budget also deducts.
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
-        )
+        max_new = self._remaining_new_tokens(req)
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
         # Reserve request and load-back state slots before init_load_back binds
@@ -1507,9 +1488,7 @@ class PrefillAdder:
                     )
                     max_new_tokens = admission.max_new_tokens
                     if admission.is_chunked and not is_chunked:
-                        max_new_tokens = min(
-                            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
-                        )
+                        max_new_tokens = self._remaining_new_tokens(req)
                     admission = _PrefillAdmission(
                         prefix_len,
                         extend_len,
@@ -1596,7 +1575,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         is_chunked = False
-        max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+        max_new_tokens = self._remaining_new_tokens(req)
         tile_tokens = input_tokens
         if self.dllm_config is not None:
             assert truncation_align_size is None, (
@@ -1699,7 +1678,7 @@ class PrefillAdder:
         min_tokens_to_remove = (
             len(req.full_untruncated_fill_ids)
             - req.prefix_len
-            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            + self._remaining_new_tokens(req)
             + self._request_slot_reserve_for_req(req)
             - self.rem_total_tokens
         )
