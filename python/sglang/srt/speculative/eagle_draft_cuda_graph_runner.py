@@ -47,6 +47,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+from sglang.srt.speculative.prepared_next_draft import prepared_next_draft_enabled
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -83,6 +84,11 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     dsa_seed_topk: Optional[torch.Tensor] = None
+
+
+_PREPARED_INPUTS = frozenset(
+    {"req_pool_indices", "seq_lens", "out_cache_loc", "positions", "mrope_positions"}
+)
 
 
 class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
@@ -134,6 +140,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             else speculative_num_steps
         )
         self.topk = get_spec().speculative_eagle_topk
+        self._prepared_next_draft = prepared_next_draft_enabled()
         self.draft_attn_backend = draft_attn_backend or model_runner.draft_attn_backend
 
         # Patch_model in parent's capture() needs an attn_backend reference.
@@ -284,7 +291,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk=dsa_seed_topk,
         )
-        self.buffers.share_buffers()
+        # Inputs written by the preceding post-verify graph must remain private
+        # to this runner's static buffers until replay consumes them.
+        self.buffers.share_buffers(
+            exclude=_PREPARED_INPUTS if self._prepared_next_draft else frozenset()
+        )
         # the batch sizes whose graphs run the draft megakernel's draft_loop, captured
         # once per label of the graph variants it offers this runner
         self.megakernel = eagle_worker.megakernel
@@ -596,7 +607,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     # Replay
     # -----------------------------------------------------------------
-    def execute(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch, inputs_prepared: bool = False):
+        """Replay, optionally reusing fixed inputs prepared by post-verify."""
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
@@ -616,6 +628,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
         else:
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+
+        inputs_prepared = inputs_prepared and bs == raw_bs
 
         if bs != raw_bs:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
@@ -653,23 +667,25 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # foreach copy (one foreach call per dtype pair) to cut launch overhead.
         # hidden_states is handled separately below (see note), and seq_lens_cpu
         # is handled further down since it lives on host.
-        copy_dsts = [
-            buffers.seq_lens[:raw_bs],
-            buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
-            buffers.positions[:raw_num_token],
-            buffers.topk_p[:raw_bs],
-            buffers.topk_index[:raw_bs],
-            buffers.req_pool_indices[:raw_bs],
-        ]
+        copy_dsts = [buffers.topk_p[:raw_bs], buffers.topk_index[:raw_bs]]
         copy_srcs = [
-            forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
-            forward_batch.positions,
             forward_batch.spec_info.topk_p,
             forward_batch.spec_info.topk_index,
-            forward_batch.req_pool_indices,
         ]
-        if self.model_runner.model_config.model_is_mrope:
+        if not inputs_prepared:
+            copy_dsts += [
+                buffers.seq_lens[:raw_bs],
+                buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
+                buffers.positions[:raw_num_token],
+                buffers.req_pool_indices[:raw_bs],
+            ]
+            copy_srcs += [
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
+                forward_batch.positions,
+                forward_batch.req_pool_indices,
+            ]
+        if self.model_runner.model_config.model_is_mrope and not inputs_prepared:
             if bs != raw_bs or forward_batch.mrope_positions is None:
                 buffers.mrope_positions.zero_()
             if forward_batch.mrope_positions is not None:

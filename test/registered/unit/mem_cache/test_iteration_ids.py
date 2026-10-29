@@ -274,6 +274,34 @@ class TestIterationIds(CustomTestCase):
                 self.assertIs(plan.write_ids(self.fused_draft), plan.write_physical)
                 self.assertIs(plan.write_ids(self.private_draft), self.window)
 
+    def test_prepared_columns_keep_the_staged_tensor_and_full_window(self):
+        """A prepared draft reuses its staged columns by identity while all
+        other column selections still resolve from the complete write window."""
+        plan = self._plan(self.private_draft, read_extent=2)
+        first = slice(0, 1)
+        staged = plan.write_ids(self.private_draft, cols=first).clone()
+        plan.use_prepared_cols(first, staged)
+
+        batch = SimpleNamespace()
+        plan.bind(batch, self.private_draft, cols=first)
+        self.assertIs(batch.out_cache_loc, staged)
+        self.assertIsNone(batch.out_cache_loc_virtual)
+        self.assertTrue(
+            torch.equal(
+                plan.write_ids(self.private_draft, cols=slice(1, 2)),
+                self.window.view(2, -1)[:, 1:2].reshape(-1),
+            )
+        )
+        self.assertIs(plan.write_ids(self.private_draft), self.window)
+
+        derived = plan.reads_from(
+            self.private_draft,
+            seq_lens=self.seq_lens,
+            seq_lens_cpu=self.seq_lens.clone(),
+            read_extent=2,
+        )
+        self.assertIs(derived.write_ids(self.private_draft, cols=first), staged)
+
     def test_cols_slice_names_a_split_batch_s_tokens(self):
         """Two-batch overlap splits a forward's tokens; each half writes its
         own tokens of the window, whatever the forward's own columns were."""

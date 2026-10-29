@@ -668,6 +668,53 @@ def test_combined_verify_commit_metadata(bs, width, interval):
             assert tracking is None
 
 
+@pytest.mark.parametrize("bs", [0, 1, 7, 128, 257])
+@pytest.mark.parametrize("width", [1, 4, 7])
+@pytest.mark.parametrize("mrope", [False, True])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_verify_commit_outputs_write_the_extend_layout(bs, width, mrope, dtype):
+    """Commit preparation writes the same draft-extend layout as the
+    standalone kernel without changing its other outputs."""
+    from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_layout
+
+    seq = (torch.arange(bs * 2, device="cuda", dtype=dtype)[::2] * 37 + 509) % 131071
+    accepted = torch.ones(bs * 2, device="cuda", dtype=torch.int32)[::2]
+    predict = torch.arange(bs * width * 2, device="cuda", dtype=torch.int32)[::2]
+    accept = torch.arange(bs * width, device="cuda", dtype=torch.int64).reshape(
+        bs, width
+    )
+
+    def both():
+        return (
+            prepare_verify_commit_outputs(
+                predict, accept, accepted, seq, width, 16, True, mrope
+            ),
+            prepare_verify_commit_outputs(predict, accept, accepted, seq, width, 16),
+            prepare_draft_extend_layout(seq, width, mrope),
+        )
+
+    both()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got, plain, want = both()
+    for n in range(1, width + 1):
+        accepted.fill_(n)
+        seq.add_(n)
+        predict.add_(13)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert len(got[3]) == 4 and len(plain[3]) == 3
+        for a, b in zip(got[:2] + got[2] + got[3][:3], plain[:2] + plain[2] + plain[3]):
+            assert (a is None) == (b is None)
+            if a is not None:
+                assert torch.equal(a, b)
+        layout = got[3][3]
+        for a, b in zip(layout[:3] + layout[3], want[:3] + want[3]):
+            assert (a is None) == (b is None)
+            if a is not None:
+                assert a.dtype == b.dtype and torch.equal(a, b)
+
+
 @pytest.mark.parametrize(
     "operation",
     ["cache", "commit", "commit_basic", "inputs", "lengths", "layout", "tree"],

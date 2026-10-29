@@ -25,6 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.speculative import prepared_next_draft
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -124,6 +125,7 @@ def prepare_for_draft_extend(
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
     iteration_ids: Optional[IterationIds] = None,
+    prepared_layout: Optional[tuple] = None,
 ):
     """``iteration_ids``: the iteration's plan, whose window the draft extend
     writes again (the verify window); a widened window plans its own."""
@@ -170,13 +172,20 @@ def prepare_for_draft_extend(
     fused_lengths = gpu_only and batch.seq_lens.is_cuda
     extend_position_info = None
     if fused_lengths and not widen and draft_extend_input.positions is None:
-        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
-            prepare_draft_extend_layout(
-                batch.seq_lens,
-                num_draft_tokens,
-                draft_model_runner.model_config.model_is_mrope
-                and all(x is None for x in batch.multimodal_inputs),
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        if (
+            prepared_layout is not None
+            and (prepared_layout[3][2] is not None) == with_mrope
+        ):
+            layout = prepared_layout
+        else:
+            layout = prepare_draft_extend_layout(
+                batch.seq_lens, num_draft_tokens, with_mrope
             )
+        batch.prefix_lens, batch.extend_lens, post_seq_lens, extend_position_info = (
+            layout
         )
     elif fused_lengths:
         batch.prefix_lens, batch.extend_lens, post_seq_lens = (
@@ -252,11 +261,13 @@ def prepare_for_draft(
     *,
     target_translator: Optional[RunnerIds] = None,
     num_draft_tokens: Optional[int] = None,
+    prepared: Any = None,
 ) -> tuple[ForwardBatch, bool, Optional[IterationIds]]:
     """The draft-decode batch. With ``target_translator``, a chain draft plans
     the iteration's whole write window (the ``num_draft_tokens`` slots past
     ``seq_lens`` that verify and draft extend also write) and writes its first
-    ``num_steps`` columns; that plan is returned, else None."""
+    ``num_steps`` columns; that plan is returned, else None. ``prepared`` carries
+    those slots and positions when the preceding post-verify graph produced them."""
     prepared_positions = None
     prepared_mrope_positions = None
     iteration_ids = None
@@ -275,7 +286,33 @@ def prepare_for_draft(
         # A chain draft's slots lead the iteration's window: gather the whole
         # window in the same launch.
         window_cols = num_draft_tokens if plans_window else num_steps
-        if page_size == 1 or topk == 1:
+        with_mrope = draft_model_runner.model_config.model_is_mrope and all(
+            x is None for x in batch.multimodal_inputs
+        )
+        if (
+            prepared is not None
+            and prepared_next_draft.can_use_prepared_next_draft_inputs(
+                prepared,
+                num_requests=bs,
+                plans_window=plans_window,
+                with_mrope=with_mrope,
+            )
+        ):
+            batch.out_cache_loc = prepared.write_window
+            prepared_positions = prepared.positions
+            prepared_mrope_positions = prepared.mrope_positions
+            iteration_ids = target_translator.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                write_virtual=batch.out_cache_loc,
+                read_extent=num_draft_tokens,
+            )
+            # The same launch wrote these from the write window's first columns.
+            iteration_ids.use_prepared_cols(
+                slice(0, num_steps), prepared.draft_out_cache_loc
+            )
+        elif page_size == 1 or topk == 1:
             batch.out_cache_loc = torch.empty(
                 (bs * topk * window_cols,),
                 dtype=torch.int64,
@@ -780,6 +817,14 @@ def run_eagle_verify(
         )
     else:
         new_seq_lens = batch.seq_lens + accept_lens
+    if post_verify_graphs is not None:
+        # A graph miss (grammar, sampling metadata, target graph miss, ...) uses
+        # the same bound producer as a captured post-verify round.  Unsupported
+        # dtype/shape/device combinations simply publish no prepared inputs.
+        post_verify_graphs.prepare_next_eager(
+            req_pool_indices=batch.req_pool_indices,
+            scheduler_sequence_lengths=new_seq_lens,
+        )
     if batch.hisparse_coordinator is not None:
         batch.hisparse_coordinator.commit_spec_accept_tokens(
             batch=batch,

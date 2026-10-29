@@ -115,6 +115,15 @@ def _verify_commit_outputs_kernel(
     ids,
     DRAFT_WIDTH: tl.constexpr,
     TRACK_INTERVAL: tl.constexpr,
+    prefix=None,
+    extend=None,
+    post_lens=None,
+    positions=None,
+    start_locs=None,
+    mrope=None,
+    MROPE_STRIDE=0,
+    EXTEND_LAYOUT: tl.constexpr = False,
+    EXTEND_MROPE: tl.constexpr = False,
 ):
     row = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     valid = row < BS
@@ -150,6 +159,23 @@ def _verify_commit_outputs_kernel(
                 - row * DRAFT_WIDTH
             )
             tl.store(track_steps + row, tl.where(crossing, track, -1), valid)
+    if EXTEND_LAYOUT:
+        # prepare_draft_extend_layout of the pre-verify lengths (the draft extend's window)
+        tl.store(prefix + row, tl.maximum(length, 0), valid)
+        tl.store(extend + row, DRAFT_WIDTH, valid)
+        tl.store(post_lens + row, length + DRAFT_WIDTH, valid)
+        tl.store(start_locs + row, row * DRAFT_WIDTH, valid)
+        tokens = row < BS * DRAFT_WIDTH
+        base = tl.load(seq_lens + (row // DRAFT_WIDTH) * SEQ_STRIDE, tokens, other=0)
+        position = tl.maximum(base.to(tl.int64), 0).to(tl.int32) + (
+            row % DRAFT_WIDTH
+        ).to(tl.int32)
+        tl.store(positions + row, position.to(tl.int64), tokens)
+        if EXTEND_MROPE:
+            for axis in tl.static_range(3):
+                tl.store(
+                    mrope + axis * MROPE_STRIDE + row, position.to(tl.int64), tokens
+                )
     idx = tl.where(idx < 0, idx + PREDICT_SIZE, idx)
     token = tl.load(predict + idx * PREDICT_STRIDE, valid, other=0)
     tl.store(new_seq_lens + row, length + accepted, valid)
@@ -163,7 +189,10 @@ def prepare_verify_commit_outputs(
     seq_lens,
     num_draft_tokens=0,
     mamba_track_interval=0,
+    extend_layout=False,
+    extend_mrope=False,
 ):
+    """Prepare commit outputs and optionally the subsequent draft layout."""
     bs = accept_lens.numel()
     new_seq_lens = torch.empty(
         (bs,),
@@ -179,8 +208,28 @@ def prepare_verify_commit_outputs(
         correct = torch.empty_like(accept_lens, memory_format=torch.contiguous_format)
         select = torch.empty_like(last_steps)
         ids = torch.empty((predict.numel(),), device=predict.device, dtype=torch.int64)
+    layout = None
+    if num_draft_tokens and extend_layout:
+        tokens = bs * num_draft_tokens
+        device = seq_lens.device
+        layout = (
+            torch.empty((bs,), dtype=torch.int32, device=device),
+            torch.empty((bs,), dtype=torch.int32, device=device),
+            torch.empty((bs,), dtype=seq_lens.dtype, device=device),
+            (
+                torch.empty((tokens,), dtype=torch.int64, device=device),
+                torch.empty((bs,), dtype=torch.int32, device=device),
+                (
+                    torch.empty((3, tokens), dtype=torch.int64, device=device)
+                    if extend_mrope
+                    else None
+                ),
+            ),
+        )
     if bs:
         size = max(bs, predict.numel()) if num_draft_tokens else bs
+        if layout is not None:
+            size = max(size, bs * num_draft_tokens)
         _verify_commit_outputs_kernel[(triton.cdiv(size, 128),)](
             predict,
             accept_index,
@@ -203,9 +252,25 @@ def prepare_verify_commit_outputs(
             ids=ids,
             DRAFT_WIDTH=num_draft_tokens,
             TRACK_INTERVAL=mamba_track_interval,
+            **(
+                dict(
+                    prefix=layout[0],
+                    extend=layout[1],
+                    post_lens=layout[2],
+                    positions=layout[3][0],
+                    start_locs=layout[3][1],
+                    mrope=layout[3][2],
+                    MROPE_STRIDE=bs * num_draft_tokens,
+                    EXTEND_LAYOUT=True,
+                    EXTEND_MROPE=layout[3][2] is not None,
+                )
+                if layout is not None
+                else {}
+            ),
         )
     if num_draft_tokens:
-        return new_seq_lens, bonus, (last_steps, track_steps), (correct, select, ids)
+        draft = (correct, select, ids) + (() if layout is None else (layout,))
+        return new_seq_lens, bonus, (last_steps, track_steps), draft
     return new_seq_lens, bonus
 
 

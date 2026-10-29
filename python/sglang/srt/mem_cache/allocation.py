@@ -868,6 +868,10 @@ def alloc_for_spec_decode(
             len(reqs),
         )
 
-    nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
-    for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):
+    update_spec_decode_allocated_lens(reqs, nxt_kv_lens_cpu.tolist())
+
+
+def update_spec_decode_allocated_lens(reqs: list[Req], nxt_kv_lens: list[int]) -> None:
+    """Set host allocation watermarks when a speculative step needs no pages."""
+    for req, nxt_kv_len in zip(reqs, nxt_kv_lens, strict=True):
         req.kv.allocate_spec_decode(nxt_kv_len)
