@@ -23,6 +23,18 @@ class GPTQIntelAMXLinearKernel:
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer._amx_output_size = layer.qweight.shape[-1]
+        output_padding = -layer._amx_output_size % 32
+        if output_padding:
+            layer.qweight.data = torch.nn.functional.pad(
+                layer.qweight.data, (0, output_padding)
+            )
+            layer.qzeros.data = torch.nn.functional.pad(
+                layer.qzeros.data, (0, output_padding // 8)
+            )
+            layer.scales.data = torch.nn.functional.pad(
+                layer.scales.data, (0, output_padding)
+            )
         _amx_process_weight_after_loading(
             layer, ["qweight", "qzeros", "scales"], None, "gptq"
         )
@@ -36,12 +48,19 @@ class GPTQIntelAMXLinearKernel:
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
-            x,
+        output_size = layer._amx_output_size
+        output_padding = -output_size % 32
+        if bias is not None and output_padding:
+            bias = torch.nn.functional.pad(bias, (0, output_padding))
+        output = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            x.reshape(-1, x.shape[-1]),
             layer.qweight,
             layer.qzeros,
             layer.scales,
             bias,
+        )
+        return (
+            output[..., :output_size].reshape(*x.shape[:-1], output_size).contiguous()
         )
 
 
