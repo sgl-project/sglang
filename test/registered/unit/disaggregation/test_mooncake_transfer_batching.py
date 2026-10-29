@@ -580,6 +580,74 @@ class TestMooncakeEarlySend(CustomTestCase):
         manager.send_kvcache.assert_called_once()
 
 
+class TestMooncakeTransferDrain(CustomTestCase):
+    """A failed write must not let its caller release a still-running peer."""
+
+    def test_failure_waits_for_remaining_writes(self):
+        for enabled in (False, True):
+            for raises in (False, True):
+                with self.subTest(deferred_release=enabled, raises=raises):
+                    first = concurrent.futures.Future()
+                    error = RuntimeError("write failed")
+                    if raises:
+                        first.set_exception(error)
+                    else:
+                        first.set_result(-1)
+                    running = concurrent.futures.Future()
+                    running.set_running_or_notify_cancel()
+
+                    def completion_order(futures):
+                        # Deterministic executor boundary: the second write
+                        # finishes only after the failed first write is handled.
+                        yield first
+                        running.set_result(0)
+                        yield running
+
+                    manager = SimpleNamespace(enable_deferred_decode_kv_release=enabled)
+                    reported = None
+                    with patch(
+                        "sglang.srt.disaggregation.mooncake.conn.concurrent.futures.as_completed",
+                        side_effect=completion_order,
+                    ):
+                        try:
+                            result = MooncakeKVManager._await_transfer_futures(
+                                manager, [first, running]
+                            )
+                        except RuntimeError as exception:
+                            reported = exception
+                    self.assertTrue(
+                        running.done(), "caller regained ownership before write drained"
+                    )
+                    if raises:
+                        self.assertIs(reported, error)
+                    else:
+                        self.assertIsNone(reported)
+                        self.assertEqual(result, -1)
+
+    def test_first_exception_survives_later_failure(self):
+        first_error = RuntimeError("first failure")
+        first, later = concurrent.futures.Future(), concurrent.futures.Future()
+        first.set_exception(first_error)
+        later.set_running_or_notify_cancel()
+
+        def completion_order(futures):
+            yield first
+            later.set_exception(ValueError("later failure"))
+            yield later
+
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.concurrent.futures.as_completed",
+            side_effect=completion_order,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                MooncakeKVManager._await_transfer_futures(
+                    SimpleNamespace(enable_deferred_decode_kv_release=True),
+                    [first, later],
+                )
+        self.assertIs(raised.exception, first_error)
+        self.assertTrue(later.done())
+
+
 class TestMooncakeStagingDeviceType(unittest.TestCase):
     """Staging init must receive the runtime's device, not a hardcoded "cuda".
 
