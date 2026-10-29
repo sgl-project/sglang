@@ -1107,7 +1107,7 @@ def build_deepseek_v4_hicache_stack(
         if c4_rope_entry is not None:
             entries.append(c4_rope_entry)
 
-        if not is_unified_kv:
+        if has_paged_swa:
             c4_state_host_pool = DeepSeekV4StateHostPool(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
                 state_pools=[
