@@ -88,6 +88,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.distributed import utils as dist_utils
+from sglang.srt.layers.attention.vision_sink import apply_first_key_sink, first_key_sdpa
 from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -289,6 +290,45 @@ def resolve_precomputed_max_seqlen(
     return int(max_seqlen)
 
 
+def _first_key_flash_attention(
+    q, k, v, cu_seqlens, bsz, seq_len, softmax_scale, forward_metadata, kwargs, ver
+):
+    if not _is_cuda:
+        raise NotImplementedError("MiMo first-key flash attention requires CUDA")
+    if forward_metadata is not None:
+        cu = forward_metadata.cu_seqlens
+        max_seqlen = forward_metadata.max_seqlen
+    elif isinstance(cu_seqlens, list):
+        # FA3's precomputed CUDA-graph metadata format.
+        cu, max_seqlen = cu_seqlens
+    else:
+        cu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+        cu = cu.to(device=q.device, dtype=torch.int32)
+        max_seqlen = resolve_precomputed_max_seqlen(cu, kwargs.get("max_seqlen"))
+    scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+    window = kwargs.get("window_size", (-1, -1))
+    # The wrapper calls this return_softmax_lse; return_lse is silently ignored.
+    # Never pass MiMo's first-key bias to the kernel's denominator-only sinks.
+    result = flash_attn_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        softmax_scale=scale,
+        window_size=window,
+        causal=kwargs.get("causal", False),
+        return_softmax_lse=True,
+        ver=ver,
+    )
+    output, lse = result[:2]  # FA3 can return additional auxiliary tensors.
+    return apply_first_key_sink(
+        q, k, v, output, lse, kwargs["s_aux"], cu, window, scale
+    )
+
+
 class VisionSdpaAttention(nn.Module):
     r"""
     Scaled Dot Product Attention inner product
@@ -397,6 +437,31 @@ class VisionSdpaAttention(nn.Module):
         assert q.dim() == 3, q.shape
 
         s = q.shape[0] // bsz
+
+        if kwargs.get("sink_mode") == "first_key":
+            if bsz != 1:
+                raise NotImplementedError(
+                    "First-key SDPA expects packed segments with bsz=1"
+                )
+            metadata = kwargs.get("forward_metadata")
+            if metadata is not None:
+                cu = metadata.cu_seqlens
+            elif isinstance(cu_seqlens, list):
+                cu = cu_seqlens[0]
+            else:
+                cu = resolve_seqlens(cu_seqlens, bsz, s, device=q.device)
+            return first_key_sdpa(
+                q,
+                k,
+                v,
+                cu,
+                sinks=kwargs.get("s_aux"),
+                window_size=kwargs.get("window_size", (-1, -1)),
+                scale=self.scale,
+                attention_mask=attention_mask,
+                softmax_in_single_precision=self.softmax_in_single_precision,
+                dropout=self.dropout,
+            )
 
         # [b, 1, s, s]
         if attention_mask is None:
@@ -552,6 +617,20 @@ class VisionFlash3Attention(nn.Module):
         window_size = kwargs.get("window_size", (-1, -1))
         s_aux = kwargs.get("s_aux", None)
 
+        if kwargs.get("sink_mode") == "first_key" and kwargs.get("s_aux") is not None:
+            return _first_key_flash_attention(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                bsz,
+                seq_len,
+                softmax_scale,
+                forward_metadata,
+                kwargs,
+                ver=3,
+            )
+
         if forward_metadata is not None:
             cu_seqlens_gpu = forward_metadata.cu_seqlens
             max_seqlen = forward_metadata.max_seqlen
@@ -609,6 +688,20 @@ class VisionFlash4Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        if kwargs.get("sink_mode") == "first_key" and kwargs.get("s_aux") is not None:
+            return _first_key_flash_attention(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                bsz,
+                seq_len,
+                softmax_scale,
+                forward_metadata,
+                kwargs,
+                ver=4,
+            )
+
         if forward_metadata is not None:
             cu_seqlens_gpu = forward_metadata.cu_seqlens
             max_seqlen = forward_metadata.max_seqlen
@@ -1109,6 +1202,7 @@ class VisionAttention(nn.Module):
         aux_stream: Optional[torch.cuda.Stream] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
         use_sink: bool = False,
+        sink_mode: str = "virtual",
         window_size: Tuple[int, int] = (-1, -1),
         **kwargs,
     ):
@@ -1162,6 +1256,21 @@ class VisionAttention(nn.Module):
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
+        if sink_mode not in ("virtual", "first_key"):
+            raise ValueError(f"Unknown vision sink mode: {sink_mode}")
+        if (
+            sink_mode == "first_key"
+            and use_sink
+            and not (
+                qkv_backend == "sdpa" or (_is_cuda and qkv_backend in ("fa3", "fa4"))
+            )
+        ):
+            print_info_once(
+                f"{qkv_backend} does not support first-key vision sinks. "
+                "Using sdpa for correctness."
+            )
+            qkv_backend = "sdpa"
+        self.sink_mode = sink_mode
         self.qkv_backend_name: str = qkv_backend
 
         self.customized_position_embedding_applier = (
@@ -1554,6 +1663,7 @@ class VisionAttention(nn.Module):
             softmax_scale=self.softmax_scale,
             window_size=effective_window_size,
             s_aux=s_aux,
+            sink_mode=self.sink_mode,
         )
 
         assert output.dim() == 3, output.shape
