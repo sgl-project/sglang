@@ -1,6 +1,6 @@
 import logging
 from functools import partial
-from typing import Iterable, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -73,7 +73,7 @@ class Spark2_5MLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             reduce_results=reduce_results,
         )
-        self.act_fn = GeluAndMul()
+        self.act_fn = GeluAndMul("none")
 
     def forward(
         self,
@@ -342,6 +342,9 @@ class Spark2_5Model(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
+        self.layers_to_capture: List[int] = []
+        self.capture_aux_hidden_states = False
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
@@ -352,7 +355,7 @@ class Spark2_5Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[torch.Tensor, PPProxyTensors]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -365,13 +368,26 @@ class Spark2_5Model(nn.Module):
                 pp_proxy_tensors, forward_batch
             )
 
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
-            hidden_states = self.layers[i](positions, hidden_states, forward_batch)
+            layer = self.layers[i]
+            hidden_states = layer(positions, hidden_states, forward_batch)
+            if self.capture_aux_hidden_states and i in self.layers_to_capture:
+                # Complete outstanding TP work for the snapshot and add the
+                # residual without consuming the live stream's pending update.
+                hidden_states, snapshot = layer.ffn_boundary.capture_output(
+                    hidden_states, forward_batch, skip_empty=True
+                )
+                if snapshot is not None:
+                    aux_hidden_states.append(snapshot)
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
-        return residual_batch.final_norm(
+        hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True
         )
+        if self.capture_aux_hidden_states and aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class Spark2_5ForCausalLM(nn.Module):
@@ -405,6 +421,7 @@ class Spark2_5ForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -426,12 +443,17 @@ class Spark2_5ForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             return self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
+                aux_hidden_states=aux_hidden_states,
             )
         else:
             return hidden_states
@@ -492,6 +514,11 @@ class Spark2_5ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             original_name = name
+            # A bundled Spark2.5 DSpark checkpoint contains draft weights in
+            # the same safetensor index. They belong to the draft runner and
+            # must not be interpreted as target parameters.
+            if name.startswith("draft_model."):
+                continue
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -544,6 +571,20 @@ class Spark2_5ForCausalLM(nn.Module):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if self.pp_group.world_size > 1:
+            raise NotImplementedError("Spark2.5 DSpark requires PP=1.")
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        layer_ids = [int(layer_id) for layer_id in layer_ids]
+        self.capture_aux_hidden_states = True
+        self.model.capture_aux_hidden_states = True
+        self.model.layers_to_capture = layer_ids
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight

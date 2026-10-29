@@ -262,7 +262,11 @@ def uses_kda_attention(config) -> bool:
 
 
 def is_dspark_draft(config) -> bool:
-    return _hf_arch(config) in ("DSparkDraftModel", "DSparkMiniMaxDraftModel")
+    return _hf_arch(config) in (
+        "DSparkDraftModel",
+        "DSparkMiniMaxDraftModel",
+        "SparkX25DsparkDraftModel",
+    )
 
 
 # The decision_config.json attention mode whose full-attention layers read the whole prompt.
@@ -1127,6 +1131,26 @@ class ModelConfig:
         ):
             self.hf_config = self.hf_text_config
             self.hf_config.architectures = ["Step3p5MTP"]
+        if is_draft_model and self.hf_config.architectures[0] == "Spark2_5ForCausalLM":
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                checkpoint_bundles_dspark_draft,
+            )
+
+            if checkpoint_bundles_dspark_draft(self.hf_config) and (
+                self.speculative_algorithm in (None, "DSPARK")
+            ):
+                draft_num_layers = getattr(self.hf_config, "num_draft_layers", None)
+                draft_num_layers = int(draft_num_layers)
+
+                self.hf_config.num_hidden_layers = draft_num_layers
+                self.hf_config.layer_types = ["sliding_attention"] * draft_num_layers
+                self.hf_config.hybrid_layer_pattern = [1] * draft_num_layers
+                self.hf_config.is_hybrid_swa = True
+                self.hf_config.architectures[0] = "SparkX25DsparkDraftModel"
+                logger.info(
+                    "Draft checkpoint bundles Spark2.5 DSpark weights; loading "
+                    "SparkX25DsparkDraftModel."
+                )
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
