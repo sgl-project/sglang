@@ -322,6 +322,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.state_layout_rejections: Dict[str, str] = {}
             # Peers already cleared at registration; skip the per-transfer check.
             self.state_strides_validated: Set[str] = set()
+            self.session_failure_threshold = (
+                envs.SGLANG_MOONCAKE_SESSION_FAILURE_THRESHOLD.get()
+            )
             self.session_lock = threading.Lock()
             self.start_prefill_thread()
             # Determine the number of threads to use for kv sender
@@ -2494,6 +2497,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if self.enable_deferred_decode_kv_release:
             self.poison_deferred_ack_room(room)
 
+    def _record_session_failure(self, session_id: str) -> None:
+        """Count a send failure; blacklist the session after N consecutive failures.
+
+        A single send failure does not prove the session is dead: a sync
+        transfer can also time out because the transfer queue is stalled by
+        another (dead) peer. The configurable threshold avoids blacklisting a
+        healthy session on such transient timeouts.
+        """
+        with self.session_lock:
+            self.session_failures[session_id] += 1
+            if self.session_failures[session_id] >= self.session_failure_threshold:
+                self.failed_sessions.add(session_id)
+                logger.error(f"Session {session_id} failed.")
+
+    def _clear_session_failures(self, session_id: str) -> None:
+        """Reset the failure streak of a session after a successful send."""
+        if session_id in self.session_failures:
+            with self.session_lock:
+                self.session_failures.pop(session_id, None)
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -2747,14 +2770,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_kv_layer_ids,
                             )
                         if ret != 0:
-                            with self.session_lock:
-                                self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self.failed_sessions.add(req.mooncake_session_id)
-                                    logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
-                                    )
+                            self._record_session_failure(req.mooncake_session_id)
                             self._poison_unsettled_send(kv_chunk.room)
                             self.conclude_failure(
                                 bootstrap_room=kv_chunk.room,
@@ -2764,6 +2780,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 ),
                             )
                             break
+
+                        self._clear_session_failures(req.mooncake_session_id)
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices and not skip_state:
@@ -2785,13 +2803,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 ):
                                     break
                                 if state_rc != 0:
-                                    with self.session_lock:
-                                        self.session_failures[
-                                            req.mooncake_session_id
-                                        ] += 1
-                                        self.failed_sessions.add(
-                                            req.mooncake_session_id
-                                        )
+                                    self._record_session_failure(
+                                        req.mooncake_session_id
+                                    )
                                     self.conclude_failure(
                                         bootstrap_room=kv_chunk.room,
                                         failure_reason=(
