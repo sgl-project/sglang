@@ -204,6 +204,8 @@ def handle_crash_dump_env(server_args: Any):
 def handle_media_url_security(server_args: Any):
     """Normalize and publish the media URL policy before workers start."""
     cfg = resolving_view(server_args)
+    if cfg.audio_transcription_max_file_size_mb < 0:
+        raise ValueError("audio_transcription_max_file_size_mb must be non-negative")
     declare_resolution(
         server_args,
         "_handle_media_url_security",

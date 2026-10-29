@@ -528,6 +528,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_lora,
+    get_mm,
     get_model,
     get_observability,
     get_parallel,
@@ -706,6 +707,46 @@ async def validate_json_request(raw_request: Request):
                 }
             ]
         )
+
+
+_UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+
+
+async def _read_upload_with_limit(file: UploadFile, max_bytes: int):
+    """Read an upload in bounded chunks, None once it exceeds ``max_bytes``.
+
+    Starlette spools an UploadFile to a temp file past a small in-memory
+    threshold, but ``await file.read()`` then buffers the whole thing in host
+    memory before any validation runs (sglang#43709) — a cheap way for a
+    client to exhaust the host. Reading in chunks enforces the cap while
+    streaming, mirroring how the remote-media limit is enforced.
+    """
+    chunks = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _transcription_upload_too_large(max_bytes: int) -> ORJSONResponse:
+    return ORJSONResponse(
+        content={
+            "error": {
+                "message": (
+                    "Transcription upload exceeds the configured "
+                    f"{max_bytes // (1024 * 1024)} MiB limit "
+                    "(--audio-transcription-max-file-size-mb)"
+                )
+            }
+        },
+        status_code=413,
+    )
 
 
 ##### Native API endpoints #####
@@ -1963,7 +2004,19 @@ async def openai_v1_audio_transcriptions(
             status_code=400,
         )
 
-    audio_data = await file.read()
+    max_upload_bytes = get_mm().audio_transcription_max_file_size_mb * 1024 * 1024
+    if max_upload_bytes > 0:
+        # The declared-size precheck catches honest clients before any
+        # buffering; the chunked read enforces the cap even when the
+        # declared size is missing or lies (sglang#43709).
+        declared_size = getattr(file, "size", None)
+        if declared_size is not None and declared_size > max_upload_bytes:
+            return _transcription_upload_too_large(max_upload_bytes)
+        audio_data = await _read_upload_with_limit(file, max_upload_bytes)
+        if audio_data is None:
+            return _transcription_upload_too_large(max_upload_bytes)
+    else:
+        audio_data = await file.read()
 
     return (
         await raw_request.app.state.openai_serving_transcription.create_transcription(
