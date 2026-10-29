@@ -850,6 +850,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
+        if _is_hip and isinstance(mixed_qkv, tuple) and mixed_qkv[0].shape[0] == 0:
+            projected_qkvz = mixed_qkv[0]
+            return (
+                projected_qkvz.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim)),
+                projected_qkvz.new_empty((0, layer.num_v_heads, layer.head_v_dim)),
+            )
 
         layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
