@@ -85,7 +85,9 @@ def _kernel_name(total_tp: int, ep_size: int, is_nextn: bool, m: int) -> str:
     elif is_nextn:
         if 1 <= m <= 8 or m in (12, 16):
             return "fused_moe_tp8_m1_16"
-        if m <= 17:
+        # The low-M router writes 16 rows and its expert membership mask has
+        # four bits per token in a uint64. M=17 needs the tiled family.
+        if m <= 16:
             return "fused_moe_tp8_m1_16_mtp"
         if m <= 1023:
             return "fused_moe_tp8_m32_256_mtp"

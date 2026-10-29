@@ -279,6 +279,52 @@ def test_gluon_backend_accepts_serialized_quark_mxfp4(monkeypatch):
     _validate_gluon_quant_method(layer, quant_method)
 
 
+def test_glm_dispatch_targets_existing_kernel_modules():
+    from importlib.util import find_spec
+
+    from sglang.srt.layers.moe.glm_mxfp4_gluon import (
+        _KERNEL_PACKAGE,
+        _kernel_name,
+    )
+
+    cases = (
+        (4, 1, False, 1),
+        (4, 1, False, 17),
+        (4, 1, False, 65),
+        (4, 4, False, 4193),
+        (4, 1, False, 16769),
+        (8, 1, False, 1),
+        (8, 1, True, 9),
+        (8, 1, False, 17),
+        (8, 1, True, 18),
+        (8, 1, False, 256),
+        (8, 1, False, 1024),
+        (8, 1, True, 1024),
+        (8, 1, False, 4193),
+    )
+    names = {
+        _kernel_name(total_tp, ep_size, is_nextn, m)
+        for total_tp, ep_size, is_nextn, m in cases
+    }
+    assert names == {
+        "fused_moe_tp4_m1_16",
+        "fused_moe_tp4_m32_64",
+        "fused_moe_tp4_m128_4192",
+        "fused_moe_tp4_m4193_16768_shared",
+        "fused_moe_tp4_m16769_32768_shared",
+        "fused_moe_tp8_m1_16",
+        "fused_moe_tp8_m1_16_mtp",
+        "fused_moe_tp8_m32_128",
+        "fused_moe_tp8_m32_256_mtp",
+        "fused_moe_tp8_m256",
+        "fused_moe_tp8_m1024_4192",
+        "fused_moe_tp8_m1024_4192_mtp",
+        "fused_moe_tp8_m4193_16768",
+    }
+    for name in names:
+        assert find_spec(f"{_KERNEL_PACKAGE}.{name}") is not None
+
+
 @pytest.mark.parametrize(
     ("ep_size", "tp_size", "local_experts", "intermediate"),
     (
@@ -503,8 +549,9 @@ def test_glm_nextn_low_m_reuses_three_kernel_target_schedule():
 
     for m in (*range(1, 9), 12, 16):
         assert _kernel_name(8, 1, True, m) == "fused_moe_tp8_m1_16"
-    for m in (9, 10, 11, 13, 14, 15, 17):
+    for m in (9, 10, 11, 13, 14, 15):
         assert _kernel_name(8, 1, True, m) == "fused_moe_tp8_m1_16_mtp"
+    assert _kernel_name(8, 1, True, 17) == "fused_moe_tp8_m32_256_mtp"
     assert _kernel_name(8, 1, True, 24) == "fused_moe_tp8_m32_256_mtp"
 
 
