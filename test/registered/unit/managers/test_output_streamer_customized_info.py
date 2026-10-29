@@ -673,6 +673,21 @@ class TestOutputStreamerRequestStats(unittest.TestCase):
         self.assertEqual(finished.retraction_count, 1)
         self.assertEqual(finished.time_stats.queue_time, 0.5)
 
+    def test_take_request_stats_due(self):
+        """Request stats are due on the first call, the first call after each
+        retraction, and every call once the request finished."""
+        req = _metered_req()
+        self.assertTrue(req.take_request_stats_due())
+        self.assertFalse(req.take_request_stats_due())
+
+        req.retraction_count += 1
+        self.assertTrue(req.take_request_stats_due())
+        self.assertFalse(req.take_request_stats_due())
+
+        req.finished_reason = FINISH_LENGTH(length=1)
+        self.assertTrue(req.take_request_stats_due())
+        self.assertTrue(req.take_request_stats_due())
+
     def test_embedding_rows_carry_their_request_stats(self):
         """An embedding request is output once, finished, and its row carries
         its stats; embedding outputs carry no time stats even with metrics on."""
