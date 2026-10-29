@@ -80,6 +80,17 @@ _NORMAL_CONFIGS: Dict[Tuple[torch.dtype, int], Tuple[_Config, ...]] = {
 }
 SUPPORTED_CUDA_ARCHS = ((9, 0), (10, 0), (10, 3))
 
+# A third, denser tier for the paged-indexer path. One row is one CTA, so the kernel runs
+# ceil(rows / (SMs * occupancy)) rounds; raising occupancy to 3 moves that grid and can remove a
+# whole round. Paying for it means fitting the plan under (opt-in smem)/3, which caps
+# reconstruct_threshold at 2048 and so costs per-CTA throughput -- `TopkNormal` therefore takes
+# this tier only when it saves a round. The smaller threshold also shrinks the window-delta table,
+# which needs MAX_VOCAB_SIZE below the vendored 8 M; 4 M still covers any paged row.
+_DENSE_MAX_VOCAB_SIZE = 1 << 22
+_DENSE_CONFIGS: Dict[Tuple[torch.dtype, int], _Config] = {
+    (torch.bfloat16, 512): _Config(512, 256, 3, 4096, 2048, 2),
+}
+
 
 # (max rows, cluster size), widest first: the most rows each cluster size runs in one wave
 @cache_once
@@ -130,6 +141,9 @@ def _jit_deep_select_module(
     if cluster_size == 1:
         configs = _NORMAL_CONFIGS[(value_dtype, max_topk)]
         host_dispatch = "TopkNormal"
+        dense = _DENSE_CONFIGS.get((value_dtype, max_topk)) if page_transform else None
+        if dense is not None and len(configs) == 2:
+            configs = (*configs, dense)
     else:
         # Upstream tunes the cluster kernel for bf16 at max_topk 1024 alone, so
         # the 512 and 1024 buckets share this module.
@@ -178,6 +192,11 @@ def _jit_deep_select_module(
             "--use_fast_math",
             "--ftz=false",
             "-Xptxas=--register-usage-level=10",
+            *(
+                [f"-DTOPK_SELECT_MAX_VOCAB_SIZE={_DENSE_MAX_VOCAB_SIZE}u"]
+                if len(configs) == 3
+                else []
+            ),
         ],
     )
 

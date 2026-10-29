@@ -38,6 +38,12 @@ namespace deep_select {
 
 namespace details {
 
+/// Shared memory one CTA of `Config` needs. Only the bf16 one-CTA-per-row kernel is ever
+/// weighed this way; `TopkNormal` static_asserts that before using it.
+template <typename Config>
+inline constexpr std::size_t plan_smem_bytes =
+    sizeof(typename topk_select_bf16_normal::TopkSelectKernelBF16Normal<Config>::SharedMemoryPlan);
+
 /// The two families of one-CTA-per-row kernels live in separate namespaces.
 template <typename Config>
 inline auto run_normal(const TopkSelectArgs& args) -> void {
@@ -204,9 +210,16 @@ auto make_plan(
  *         leaves it defaulted; one kernel is then instantiated and the SM-count
  *         query drops out.
  */
-template <typename ConfigWave1, typename ConfigWaves = ConfigWave1>
+template <typename ConfigWave1, typename ConfigWaves = ConfigWave1, typename ConfigMoreCtas = ConfigWaves>
 struct TopkNormal {
   static_assert(ConfigWave1::cluster_size == 1 && ConfigWaves::cluster_size == 1);
+  static_assert(ConfigMoreCtas::cluster_size == 1);
+  static_assert(ConfigMoreCtas::max_topk == ConfigWaves::max_topk);
+  static_assert(ConfigMoreCtas::page_transform == ConfigWaves::page_transform);
+  static constexpr bool HAS_DENSER_TIER = !std::is_same_v<ConfigWaves, ConfigMoreCtas>;
+  static_assert(
+      !HAS_DENSER_TIER || (std::is_same_v<typename ConfigMoreCtas::ValueT, nv_bfloat16> &&
+                           ConfigMoreCtas::target_occupancy > ConfigWaves::target_occupancy));
   static_assert(std::is_same_v<typename ConfigWave1::ValueT, typename ConfigWaves::ValueT>);
   static_assert(std::is_same_v<typename ConfigWave1::OutIdxT, typename ConfigWaves::OutIdxT>);
   static_assert(ConfigWave1::max_topk == ConfigWaves::max_topk);
@@ -250,6 +263,20 @@ struct TopkNormal {
       const auto num_sm = host::runtime::get_sm_count(plan.device.device_id);
       if (plan.args.batch_size <= num_sm) {
         details::run_normal<ConfigWave1>(plan.args);
+      } else if constexpr (HAS_DENSER_TIER) {
+        // One row is one CTA, so the kernel runs ceil(rows / (SMs * occupancy)) rounds. A denser
+        // tier buys residency by shrinking each CTA's plan, which costs per-CTA throughput; it is
+        // only worth it when the extra residency removes a whole round.
+        const auto rounds = [&](uint32_t occupancy) {
+          return div_ceil(uint64_t{plan.args.batch_size}, uint64_t{num_sm} * occupancy);
+        };
+        const bool fits = details::plan_smem_bytes<ConfigMoreCtas> * ConfigMoreCtas::target_occupancy <=
+                          plan.args.shared_memory_size_per_sm;
+        if (fits && rounds(ConfigMoreCtas::target_occupancy) < rounds(ConfigWaves::target_occupancy)) {
+          details::run_normal<ConfigMoreCtas>(plan.args);
+        } else {
+          details::run_normal<ConfigWaves>(plan.args);
+        }
       } else {
         details::run_normal<ConfigWaves>(plan.args);
       }
