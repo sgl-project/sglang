@@ -383,6 +383,7 @@ def _token_space_defaults(strategy_class, hf_config):
     # Serving takes the IO thread default from the serving spec, not the core.
     serving_spec = serving_spec_for(hf_config)(hf_config)
     defaults["auto_mm_io_worker_num"] = serving_spec.auto_mm_io_worker_num
+    defaults["video_preprocessing_device"] = strategy_class.video_preprocessing_device
     return defaults
 
 
