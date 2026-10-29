@@ -6,8 +6,8 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.minimax_sparse.common.nvfp4 import Nvfp4Cache
-from sglang.kernels.ops.attention.minimax_sparse.decode import nvfp4_decode
 from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
+    _use_nvfp4_decode_gfx950,
     flash_decode_with_gqa_share_sparse,
 )
 from sglang.srt.utils import is_gfx95_supported
@@ -69,7 +69,7 @@ def test_nvfp4_decode_matches_dequantized_cache(bs):
     torch.manual_seed(0)
     q, kv, req_to_token, seq_lens, slot_ids, topk_idx = _inputs(bs)
     (k_nvfp4, k_ref), (v_nvfp4, v_ref) = _nvfp4(kv[0]), _nvfp4(kv[1])
-    assert nvfp4_decode._use_nvfp4_decode_gfx950(q, k_nvfp4, v_nvfp4, topk_idx, BLK)
+    assert _use_nvfp4_decode_gfx950(q, k_nvfp4, v_nvfp4, topk_idx, BLK)
     common = dict(
         q=q,
         sink=None,
