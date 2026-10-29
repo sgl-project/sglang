@@ -84,6 +84,11 @@ jobs:
       - name: Test PR health action
         run: node --test .github/actions/check-pr-test-health/action.test.cjs
 
+      - name: Test AMD CI wiring and PR status reporting
+        run: |
+          python -m unittest scripts.ci.test_amd_ci_wiring
+          node --test .github/scripts/pr-states.test.cjs
+
       - name: Cache mint
         uses: actions/cache@v4
         with:
