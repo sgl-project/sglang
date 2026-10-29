@@ -34,8 +34,6 @@ class TestTransformersBackendEval(DefaultServerBase):
         other_args += [
             "--mem-fraction-static",
             "0.3",
-            "--max-total-tokens",
-            "32768",
         ]
 
     def test_gsm8k(self):
