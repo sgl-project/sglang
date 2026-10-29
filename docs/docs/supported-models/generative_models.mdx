@@ -330,15 +330,15 @@ visits, while every execution slot owns its full-attention KV cache or GDN
 convolution and recurrent state. No weight expansion or custom Transformers
 code is required for SGLang serving.
 
+On NVIDIA CUDA, launch the checkpoint with:
+
 ```shell Command
-sglang serve \
-  --model-path /path/to/canonical-checkpoint \
-  --dtype bfloat16 \
-  --tp-size 1 \
-  --context-length 4096 \
-  --max-running-requests 4 \
-  --mem-fraction-static 0.65
+sglang serve --model-path /path/to/canonical-checkpoint
 ```
+
+SGLang derives the context length and dtype from the checkpoint and uses its
+default memory and concurrency settings. Set `--context-length` only if you
+want to override the checkpoint's context length.
 
 The initial implementation supports fixed-count, ungated Loop and optional
 two- or four-stream mHC, with FP32 router parameters and log-space Sinkhorn
