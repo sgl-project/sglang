@@ -378,7 +378,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], "detok-a")
         self.assertEqual(sent[0][1].rids, ["token-rid-0", "token-rid-1"])
-        self.assertEqual(sent[0][1].prompt_tokens, [10, 20])
+        self.assertEqual(sent[0][1].output_ids, [[1], [2]])
         self.assertIsNone(sent[0][1].spec_verify_ct)
 
     def test_embedding_split_preserves_per_request_fields(self):
