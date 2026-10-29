@@ -30,7 +30,14 @@ from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.router import KV_PART, STATE_PART
-from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
+from sglang.srt.mem_cache.layout.fused_draft import (
+    LAYER_STATE,
+    LAYER_WINDOW,
+    DenseDraftRegion,
+    DraftStateRegion,
+    FusedDraftPlacement,
+    MLADraftRegion,
+)
 
 # The draft placement and the id spaces name sub-pools by these.
 _SUB_POOL_NAMES: Dict[Type, str] = {
@@ -70,6 +77,7 @@ _WIRE_ORDER = (
     "minimax_index_k",
     "minimax_dense_kv",
     "swa",
+    "auxiliary_swa",
     "block_scale",
     "block_scale_swa",
     "swa_ring",
@@ -141,6 +149,15 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
     request_parts: Tuple[RequestPartDecl, ...] = ()
     derived_parts: Tuple[DerivedPartDecl, ...] = ()
 
+    def storage_format_tag(self) -> Optional[str]:
+        """Separate persisted payloads by their layout and producer identity."""
+        if self.fused_draft is None:
+            return None
+        import hashlib
+
+        descriptor = repr((self.page_size, self.sub_pools, self.fused_draft.source))
+        return "declared-" + hashlib.sha256(descriptor.encode()).hexdigest()[:24]
+
     def sub_pool(self, name: str) -> PlannedSubPool:
         for sub_pool in self.sub_pools:
             if sub_pool.name == name:
@@ -161,6 +178,8 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
 
     def of_lifetime(self, lifetime_type: Type) -> Optional[PlannedSubPool]:
         found = [s for s in self.sub_pools if isinstance(s.lifetime, lifetime_type)]
+        if lifetime_type is WindowLifetime and len(found) > 1:
+            return next(s for s in found if s.name == "swa")
         assert len(found) <= 1, f"more than one {lifetime_type.__name__} sub-pool"
         return found[0] if found else None
 
@@ -348,18 +367,49 @@ def plan_kv_storage(
     groups = _group_parts(decls, page_size)
     if not any(isinstance(lt, FullLifetime) for lt, _ in groups):
         raise ValueError("unified storage needs a FULL virtual-id owner")
-    windows = {lt for lt, _ in groups if isinstance(lt, WindowLifetime)}
-    if len(windows) > 1:
-        raise ValueError(
-            "--enable-unified-memory supports one sliding-window size per model; "
-            f"this model declares {sorted(w.window for w in windows)}"
-        )
+    if len({lt for lt, _ in groups if isinstance(lt, WindowLifetime)}) > 1:
+        raise ValueError("multiple target windows require named model declarations")
+    names_by_key = {key: _SUB_POOL_NAMES[type(key[0])] for key in groups}
+    if fused_draft is not None:
+        for name, band in fused_draft.new_bands.items():
+            region = fused_draft.region(name)
+            if band.kind == LAYER_WINDOW:
+                lifetime = WindowLifetime(window=band.window)
+                assert isinstance(region, (DenseDraftRegion, MLADraftRegion))
+                geometry = (
+                    MLAGeometry(
+                        kv_lora_rank=region.kv_lora_rank,
+                        qk_rope_head_dim=region.qk_rope_head_dim,
+                        kv_cache_dtype=region.resolved_kv_dtype(),
+                    )
+                    if isinstance(region, MLADraftRegion)
+                    else MHAGeometry(
+                        head_num=region.head_num,
+                        head_dim=region.head_dim,
+                        v_head_dim=region.resolved_v_head_dim(),
+                        kv_cache_dtype=region.resolved_kv_dtype(),
+                    )
+                )
+            else:
+                assert band.kind == LAYER_STATE and isinstance(region, DraftStateRegion)
+                lifetime = StateLifetime()
+                geometry = StateGeometry(
+                    conv_state_shapes=region.state.conv_state_shapes,
+                    conv_dtype=region.state.conv_dtype,
+                    temporal_state_shape=region.state.temporal_state_shape,
+                    temporal_dtype=region.state.temporal_dtype,
+                )
+            key = (lifetime, _unit(lifetime, page_size))
+            if key in groups:
+                raise ValueError(f"draft band {name!r} duplicates a target lifetime")
+            groups[key] = ([], geometry)
+            names_by_key[key] = name
     chain = sorted(groups, key=_chain_key)
     sub_pools = []
     for i, key in enumerate(chain):
         lifetime, unit = key
         layer_ids, geometry = groups[key]
-        name = _SUB_POOL_NAMES[type(lifetime)]
+        name = names_by_key[key]
         grow_direction = "down" if i == len(chain) - 1 else "up" if i == 0 else "float"
         sub_pools.append(
             PlannedSubPool(
@@ -375,7 +425,16 @@ def plan_kv_storage(
                     grow_direction=grow_direction,
                     fused_draft=fused_draft,
                 ),
-                external=_EXTERNAL[type(lifetime)],
+                external=(
+                    SubPoolExternal(
+                        host_pool="auxiliary_swa",
+                        tree_component="AUXILIARY_SWA",
+                        metrics="swa",
+                        wire="auxiliary_swa",
+                    )
+                    if name == "draft_swa"
+                    else _EXTERNAL[type(lifetime)]
+                ),
             )
         )
     request_parts = list(request_parts)
@@ -399,7 +458,10 @@ def plan_kv_storage(
     ]
     if speculative_num_draft_tokens is not None:
         for sub_pool in sub_pools:
-            if not isinstance(sub_pool.geometry, StateGeometry):
+            if (
+                not isinstance(sub_pool.geometry, StateGeometry)
+                or not sub_pool.layer_ids
+            ):
                 continue
             geometry = sub_pool.geometry
             for name, shape, dtype in (

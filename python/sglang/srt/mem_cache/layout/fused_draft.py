@@ -26,9 +26,8 @@ A draft LAYER kind (`LAYER_*`) is what the draft checkpoint has; a HOST kind
 (`HostKind`, keyed by sub-pool name) is what a sub-pool can carry in its
 entries. `place_fused_draft` consults the `HOST_KINDS` registry, and the draft
 worker binds each host through its family's binder
-(`unified_draft_pool.DRAFT_BINDERS`). When a kind's host turns it away, its
-layers FOLD into that host's `fallback_host` if the one-region-one-geometry
-rule allows.
+(`unified_draft_pool.DRAFT_BINDERS`). A matching lifetime shares the host's
+entries; an unmatched lifetime owns a separately priced band.
 """
 
 import math
@@ -64,8 +63,10 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
     # The KV cache dtype the rows hold, where it differs from how they are
     # stored: fp8 rows are stored as uint8.
     kv_dtype: Optional[torch.dtype] = None
+    token_replicas: int = 1
 
     def validate(self) -> None:
+        assert self.token_replicas >= 1
         assert self.lane_num > 0, f"lane_num must be positive; got {self.lane_num}"
         assert self.head_num > 0, f"head_num must be positive; got {self.head_num}"
         assert self.head_dim > 0, f"head_dim must be positive; got {self.head_dim}"
@@ -115,6 +116,47 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
                 dtype=self.store_dtype,
             ),
         )
+
+
+class MLADraftRegion(msgspec.Struct, frozen=True, kw_only=True):
+    """A draft latent row, including its RoPE suffix, in each token entry."""
+
+    lane_num: int
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+    store_dtype: torch.dtype
+    kv_dtype: Optional[torch.dtype] = None
+    token_replicas: int = 1
+
+    def validate(self):
+        assert self.lane_num > 0 and self.token_replicas > 0
+        assert self.kv_lora_rank > 0 and self.qk_rope_head_dim > 0
+
+    def resolved_kv_dtype(self):
+        return self.store_dtype if self.kv_dtype is None else self.kv_dtype
+
+    def entry_bytes(self):
+        return self.lane_num * align_part_offset(
+            (self.kv_lora_rank + self.qk_rope_head_dim) * self.store_dtype.itemsize
+        )
+
+    def parts(self, offset_bytes):
+        width = self.kv_lora_rank + self.qk_rope_head_dim
+        return (
+            DensePart(
+                name="draft_kv",
+                offset_bytes=offset_bytes,
+                layer_stride_bytes=align_part_offset(width * self.store_dtype.itemsize),
+                layer_num=self.lane_num,
+                row_shape=(1, width),
+                dtype=self.store_dtype,
+            ),
+        )
+
+
+class DraftMLAGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    kv_lora_rank: int
+    qk_rope_head_dim: int
 
 
 class DraftKVGeometry(msgspec.Struct, frozen=True, kw_only=True):
@@ -192,7 +234,7 @@ class DraftStateRegion(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
-DraftRegion = Union[DenseDraftRegion, DraftStateRegion]
+DraftRegion = Union[DenseDraftRegion, MLADraftRegion, DraftStateRegion]
 
 
 class DraftLayerSet(msgspec.Struct, frozen=True, kw_only=True):
@@ -227,21 +269,20 @@ class PlacementContext(msgspec.Struct, frozen=True, kw_only=True):
 
     host_names: Tuple[str, ...]
     target_window: Optional[int] = None
+    dcp_size: int = 1
 
 
 class HostKind(msgspec.Struct, frozen=True, kw_only=True):
     """A unified sub-pool that carries one kind of draft layer in its entries.
 
     ``serves`` is the layer kind this host is the first choice for and
-    ``family`` picks the draft worker's binder. ``fallback_host`` carries
-    ``serves`` when this host cannot, under the one-region-one-geometry fold
-    rule.
+    ``family`` picks the draft worker's binder. Geometry describes the parts;
+    lifetime decides whether those parts share an existing band.
     """
 
     name: str
     serves: str
     family: str
-    fallback_host: Optional[str] = None
 
     def admits(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> Optional[str]:
         """None when this host's entries can carry ``layers``, else why not."""
@@ -276,6 +317,14 @@ class DenseHostKind(HostKind):
         kv_dtype: Optional[torch.dtype],
     ) -> DenseDraftRegion:
         geometry = layers.geometry
+        if isinstance(geometry, DraftMLAGeometry):
+            return MLADraftRegion(
+                lane_num=lane_num,
+                kv_lora_rank=geometry.kv_lora_rank,
+                qk_rope_head_dim=geometry.qk_rope_head_dim,
+                store_dtype=store_dtype,
+                kv_dtype=kv_dtype,
+            )
         assert isinstance(geometry, DraftKVGeometry), geometry
         return DenseDraftRegion(
             lane_num=lane_num,
@@ -287,6 +336,12 @@ class DenseHostKind(HostKind):
         )
 
     def describe(self, *, region: DraftRegion, lanes: Sequence[Tuple[int, ...]]) -> str:
+        if isinstance(region, MLADraftRegion):
+            return (
+                f"fused draft latent region in {self.name!r}: {region.lane_num} lanes "
+                f"of {region.kv_lora_rank}+{region.qk_rope_head_dim} elements "
+                f"@ {region.resolved_kv_dtype()}; {region.entry_bytes()} B/token"
+            )
         kv_dtype = region.resolved_kv_dtype()
         stored = (
             kv_dtype
@@ -319,10 +374,6 @@ def register_host_kind(kind: HostKind) -> HostKind:
     assert primary is None, (
         f"layer kind {kind.serves!r} is already served by host {primary.name!r}"
     )
-    assert kind.fallback_host is None or kind.fallback_host in HOST_KINDS, (
-        f"host kind {kind.name!r} falls back to unregistered host "
-        f"{kind.fallback_host!r}"
-    )
     HOST_KINDS[kind.name] = kind
     return kind
 
@@ -344,18 +395,13 @@ class WindowHostKind(DenseHostKind):
             return "the draft declares no sliding window size"
         if ctx.target_window is None:
             return "the target declares no sliding window size"
-        if layers.window > ctx.target_window:
-            return (
-                f"its window {layers.window} exceeds the target's window "
-                f"{ctx.target_window}"
-            )
+        if layers.window != ctx.target_window:
+            return f"its window {layers.window} differs from the target's window {ctx.target_window}"
         return None
 
 
 SWA_HOST = register_host_kind(
-    WindowHostKind(
-        name="swa", serves=LAYER_WINDOW, family="dense", fallback_host="full"
-    )
+    WindowHostKind(name="swa", serves=LAYER_WINDOW, family="dense")
 )
 
 
@@ -400,6 +446,13 @@ class RunnerLanes(msgspec.Struct, frozen=True, kw_only=True):
         return range(start, start + count)
 
 
+class DraftBand(msgspec.Struct, frozen=True, kw_only=True):
+    """A draft lifetime with no matching target band."""
+
+    kind: str
+    window: Optional[int] = None
+
+
 class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
     """Where every draft runner's layers live inside the host sub-pools.
 
@@ -411,13 +464,21 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
 
     runners: Tuple[RunnerLanes, ...]
     regions: Dict[str, DraftRegion] = {}
+    new_bands: Dict[str, DraftBand] = {}
+    source: Optional[Tuple[str, Optional[str]]] = None
+
+    def host_kind(self, name: str) -> HostKind:
+        declared = self.new_bands.get(name)
+        if declared is not None:
+            return host_for(declared.kind)
+        return HOST_KINDS[name]
 
     def __post_init__(self):
         assert len(self.runners) > 0, "a placement needs at least one draft runner"
         hosts = set(self.regions).union(*(r.ranges for r in self.runners))
         for host in sorted(hosts):
-            assert host in HOST_KINDS, (
-                f"no host kind is registered for sub-pool {host!r}"
+            assert host in HOST_KINDS or host in self.new_bands, (
+                f"no layout family is declared for sub-pool {host!r}"
             )
             region = self.regions.get(host)
             lanes = [s for r in self.runners for s in r.range_for(host)]
@@ -434,7 +495,9 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
 
     def hosts(self) -> Tuple[str, ...]:
         """The hosts carrying draft lanes, in registry order."""
-        return tuple(h for h in HOST_KINDS if h in self.regions)
+        return tuple(h for h in HOST_KINDS if h in self.regions) + tuple(
+            h for h in self.new_bands if h not in HOST_KINDS and h in self.regions
+        )
 
     def lanes_for(self, runner: int, host: str) -> range:
         return self.runners[runner].range_for(host)
@@ -445,6 +508,7 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
         *,
         counts: Mapping[str, Sequence[int]],
         regions: Mapping[str, DraftRegion],
+        new_bands: Optional[Mapping[str, DraftBand]] = None,
     ) -> "FusedDraftPlacement":
         """Tile each host's region with the runners' layer counts, in runner order."""
         num_runners = {len(per_runner) for per_runner in counts.values()}
@@ -464,6 +528,7 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
         return cls(
             runners=tuple(RunnerLanes(ranges=r) for r in ranges),
             regions=dict(regions),
+            new_bands={} if new_bands is None else dict(new_bands),
         )
 
 
@@ -507,6 +572,7 @@ def draft_kv_profile(
     the target divides its own (drafts never join the DCP group).
     ``num_depths`` overrides the config's `num_nextn_predict_layers`."""
     from sglang.srt.configs.hybrid_arch import mambaish_config
+    from sglang.srt.configs.model_config import AttentionArch
 
     mc = draft_model_config
     if num_depths is None:
@@ -522,7 +588,12 @@ def draft_kv_profile(
     if full_ids:
         kinds[LAYER_FULL] = DraftLayerSet(
             layer_ids=full_ids,
-            geometry=DraftKVGeometry(
+            geometry=DraftMLAGeometry(
+                kv_lora_rank=int(mc.kv_lora_rank),
+                qk_rope_head_dim=int(mc.qk_rope_head_dim),
+            )
+            if mc.attention_arch == AttentionArch.MLA
+            else DraftKVGeometry(
                 head_num=int(mc.get_num_kv_heads(attn_tp_size)),
                 head_dim=int(mc.head_dim),
                 v_head_dim=int(mc.v_head_dim),
@@ -591,22 +662,6 @@ def _runner_layer_counts(
     }, None
 
 
-def _fold_refused(
-    profile: DraftKVProfile, *, kind: str, into: HostKind
-) -> Optional[str]:
-    """One region holds one row geometry: ``kind`` folds into ``into`` only
-    when the draft has no layers of the kind ``into`` serves, or both kinds
-    share a geometry."""
-    own = profile.kinds.get(into.serves)
-    if own is None or own.geometry == profile.kinds[kind].geometry:
-        return None
-    return (
-        f"its {_LAYER_KIND_NOUN[kind]} layers' rows differ from its "
-        f"{_LAYER_KIND_NOUN[into.serves]} layers' rows, so they cannot share the "
-        f"{into.name!r} sub-pool"
-    )
-
-
 def place_fused_draft(
     *,
     profile: DraftKVProfile,
@@ -616,61 +671,46 @@ def place_fused_draft(
     kv_dtype: Optional[torch.dtype] = None,
 ) -> FusedDraftDecision:
     """Assign every draft layer of every runner to a host sub-pool through the
-    registry: a layer kind goes to the host that serves it, else to that
-    host's fallback under the fold rule. A kind no host takes declines the
-    whole draft. Dense parts reserve padding between their row payloads."""
+    registry: equal lifetimes share an entry; an unmatched lifetime gets
+    its own planned band. Dense parts reserve padding between row payloads."""
     counts, reason = _runner_layer_counts(profile, num_runners)
     if counts is None:
         return FusedDraftDecision(declined=reason)
     for kind, layers in profile.kinds.items():
+        if kind == LAYER_WINDOW and (layers.window is None or layers.window <= 0):
+            raise ValueError("draft window layers require a positive window length")
         what = f"the draft's {len(layers.layer_ids)} {_LAYER_KIND_NOUN[kind]} layer(s)"
         host = host_for(kind)
         if host is None:
             return FusedDraftDecision(declined=f"{what}: no host kind serves them")
 
     host_counts: Dict[str, List[int]] = {}
-    host_layers: Dict[str, DraftLayerSet] = {}
-    notes: List[str] = []
+    regions = {}
+    new_bands = {}
     for kind, layers in profile.kinds.items():
         host = host_for(kind)
-        what = f"the draft's {len(layers.layer_ids)} {_LAYER_KIND_NOUN[kind]} layer(s)"
-        reason = host.admits(layers=layers, ctx=ctx)
-        if reason is not None:
-            fallback = (
-                None if host.fallback_host is None else HOST_KINDS[host.fallback_host]
-            )
-            fold = None
-            if fallback is not None:
-                fold = _fold_refused(profile, kind=kind, into=fallback)
-                if fold is None:
-                    fold = fallback.admits(layers=layers, ctx=ctx)
-            if fallback is None or fold is not None:
-                if fold is not None:
-                    reason = f"{reason}, and {fold}"
-                return FusedDraftDecision(
-                    declined=(
-                        f"{what} cannot ride in the {host.name!r} sub-pool: {reason}"
-                    )
-                )
-            notes.append(f"{what} ride in the {fallback.name!r} sub-pool: {reason}")
-            host = fallback
-        per_runner = host_counts.setdefault(host.name, [0] * num_runners)
-        for runner, count in enumerate(counts[kind]):
-            per_runner[runner] += count
-        # The fold rule made every kind sharing a host share its geometry.
-        host_layers.setdefault(host.name, layers)
-
-    placed = {host: c for host, c in host_counts.items() if sum(c) > 0}
-    regions = {
-        host: HOST_KINDS[host].region_for(
-            layers=host_layers[host],
-            lane_num=sum(c),
+        name = host.name
+        if host.admits(layers=layers, ctx=ctx) is not None:
+            # Distinct lifetimes retain and retire independently, even when
+            # their row geometry happens to match.
+            name = f"draft_{host.name}" if host.name in ctx.host_names else host.name
+            new_bands[name] = DraftBand(kind=kind, window=layers.window)
+        per_runner = counts[kind]
+        if sum(per_runner) == 0:
+            continue
+        host_counts[name] = per_runner
+        regions[name] = host.region_for(
+            layers=layers,
+            lane_num=sum(per_runner),
             store_dtype=store_dtype,
             kv_dtype=kv_dtype,
         )
-        for host, c in placed.items()
-    }
+        if kind in (LAYER_FULL, LAYER_WINDOW) and ctx.dcp_size > 1:
+            regions[name] = msgspec.structs.replace(
+                regions[name], token_replicas=ctx.dcp_size
+            )
     return FusedDraftDecision(
-        placement=FusedDraftPlacement.from_counts(counts=placed, regions=regions),
-        note="; ".join(notes) or None,
+        placement=FusedDraftPlacement.from_counts(
+            counts=host_counts, regions=regions, new_bands=new_bands
+        ),
     )

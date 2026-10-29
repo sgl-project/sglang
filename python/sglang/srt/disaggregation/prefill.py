@@ -1593,16 +1593,16 @@ class SchedulerDisaggregationPrefillMixin:
                     .numpy()
                 ]
 
-            def _swa_payload():
+            def _swa_payload(sub_pool="swa", window=self.sliding_window_size):
                 storage = kv_storage_of(
                     self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
                 resume = storage.resume_units(
-                    "swa",
+                    sub_pool,
                     req,
                     token_start=req.disagg_decode_prefix_len,
                     token_boundary=seq_len,
-                    window=self.sliding_window_size,
+                    window=window,
                 )
                 return resume.unit_ids.cpu().numpy()
 
@@ -1674,6 +1674,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
+                StateType.AUXILIARY_SWA: lambda: _swa_payload("draft_swa", None),
                 StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _minimax_payload,

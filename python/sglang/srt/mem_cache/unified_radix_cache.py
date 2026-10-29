@@ -252,7 +252,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # Required cache history, shared by retention, budgeting and transfers:
         # the window slot's.
         self._sliding_window_size = next(
-            (slot.window for slot in params.tree_slots if slot.family == TREE_WINDOW),
+            (
+                slot.window
+                for slot in params.tree_slots
+                if ComponentType[slot.component] == self.slot_id(TREE_WINDOW)
+            ),
             None,
         )
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
@@ -804,6 +808,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return {
             ComponentType.FULL: params.num_tokens,
             ComponentType.SWA: params.swa_num_tokens,
+            ComponentType.AUXILIARY_SWA: params.auxiliary_swa_num_tokens,
             ComponentType.MAMBA: params.mamba_num,
             ComponentType.C128: 0,
         }
@@ -824,6 +829,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return (
                 self.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
             )
+        if component_type == ComponentType.AUXILIARY_SWA:
+            storage, sub_pool = self.components[component_type].storage_and_sub_pool()
+            return storage.device_room(sub_pool)
         raise ValueError(f"Unsupported cache component: {component_type}")
 
     def _evict(
@@ -860,6 +868,9 @@ class UnifiedRadixCache(BasePrefixCache):
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(self.slot_id(TREE_WINDOW), 0),
             mamba_num_evicted=tracker.get(self.slot_id(TREE_STATE), 0),
+            auxiliary_swa_num_tokens_evicted=tracker.get(
+                ComponentType.AUXILIARY_SWA, 0
+            ),
         )
 
     def _free_values(
@@ -3876,13 +3887,13 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return swa.sliding_window_size
 
-    def swa_retain_floor(self, req) -> int | None:
+    def swa_retain_floor(self, req, *, window=None) -> int | None:
         if not self.is_mamba_enabled or self._sliding_window_size is None:
             return None
         checkpoint = req.kv.mamba_last_track_seqlen
         if checkpoint is None:
             return None
-        return checkpoint - self._sliding_window_size
+        return checkpoint - (self._sliding_window_size if window is None else window)
 
     def kv_storage(self):
         """The storage the tree's values are rows of, and its effects go to."""
@@ -3896,6 +3907,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._family_slot_ids: dict[str, ComponentType] = {}
         for slot in tree_slots:
             self._family_slot_ids.setdefault(slot.family, ComponentType[slot.component])
+            if slot.component == "SWA":
+                self._family_slot_ids[slot.family] = ComponentType.SWA
 
     def slot_id(self, family: str) -> Optional[ComponentType]:
         """The id of the tree's slot of ``family``; None when it has none."""

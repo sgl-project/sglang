@@ -1704,19 +1704,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     .numpy()
                 ]
 
-            def _swa_payload():
-                window_size = self.scheduler.sliding_window_size
-                window_start = max(total_prefix_len, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.kv.req_pool_idx, window_start:seq_len
-                ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
-                        window_kv_indices_full
-                    )
+            def _swa_payload(sub_pool="swa", window=self.scheduler.sliding_window_size):
+                storage = kv_storage_of(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                resume = storage.resume_units(
+                    sub_pool,
+                    decode_req.req,
+                    token_start=total_prefix_len,
+                    token_boundary=seq_len,
+                    window=window,
+                )
+                return resume.unit_ids.cpu().numpy()
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1790,6 +1789,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
+                StateType.AUXILIARY_SWA: lambda: _swa_payload("draft_swa", None),
                 StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _minimax_payload,

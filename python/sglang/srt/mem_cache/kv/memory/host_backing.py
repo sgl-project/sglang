@@ -113,7 +113,9 @@ class _SharedPageEnvelopeHostBacking:
         elif host_size > 0:
             total_bytes = max(nominal_view_bytes)
         else:
-            device_total_bytes = next(iter(shared_regions))[1]
+            device_total_bytes = (
+                next(iter(shared_regions))[1] if len(device_pools) > 1 else 0
+            )
             total_bytes = max(
                 int(device_total_bytes * host_to_device_ratio) + max(page_bytes),
                 *nominal_view_bytes,

@@ -327,4 +327,12 @@ class IterationIds:
         sub-pool. A pass-through reader (a static pool, a private draft pool)
         indexes the virtual ids."""
         full = reader.space(IdSpaceKind.FULL)
-        return full.write is not None and full.key == self._full_key
+        return full.write is not None and (
+            full.key == self._full_key
+            or (
+                reader.is_translating
+                and self._source.is_translating
+                and reader._token_to_kv_pool_allocator
+                is self._source._token_to_kv_pool_allocator
+            )
+        )

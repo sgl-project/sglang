@@ -56,6 +56,7 @@ from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     chain_snapshot,
     float_chain,
+    setup_allocator_context,
     stand_in_views,
     tri_sub_pool_specs,
 )
@@ -71,7 +72,15 @@ _DEV = "cpu"
 _TAKE_NEW_PAGES = "sglang.srt.mem_cache.kv.alloc.chain.take_new_pages"
 
 
-class TestUnifiedTriPool(unittest.TestCase):
+class _PoolTestCase(unittest.TestCase):
+    def setUp(self):
+        from sglang.srt.runtime_context import reset_context
+
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+
+
+class TestUnifiedTriPool(_PoolTestCase):
     def _build(
         self,
         n_full=32,
@@ -446,7 +455,7 @@ class TestUnifiedTriPool(unittest.TestCase):
                 self.assertEqual(allocator.verify_byte_accounting(), [])
 
 
-class TestTriPagedFreeGroup(unittest.TestCase):
+class TestTriPagedFreeGroup(_PoolTestCase):
     """The tri composite at PAGE SIZE > 1, driven through the production free
     path: free_group_begin -> free_segment -> free_group_end.
 
@@ -538,7 +547,7 @@ class TestTriPagedFreeGroup(unittest.TestCase):
         self.assertEqual(allocator.verify_byte_accounting(), [])
 
 
-class TestTriFreeSwaNoHostSync(unittest.TestCase):
+class TestTriFreeSwaNoHostSync(_PoolTestCase):
     """The tri's swa side is the FLOAT, which can never run the lazy event
     pipeline: unless the per-step frees carry caller-derived page ids, the tri
     reintroduces the host syncs the sync-free free path removed. Fixtures run
@@ -589,7 +598,7 @@ class TestTriFreeSwaNoHostSync(unittest.TestCase):
         self.assertEqual(a2.verify_byte_accounting(), [])
 
 
-class TestGeneralizedRebalance(unittest.TestCase):
+class TestGeneralizedRebalance(_PoolTestCase):
     """The float must yield to WHICHEVER end is short, with the direction
     derived from the caller's growth direction rather than hard-coded to the
     token path's side. `make_room` was always side-agnostic; these pin the
@@ -663,7 +672,7 @@ class TestGeneralizedRebalance(unittest.TestCase):
             ma._ask_float_for_room(huge)
 
 
-class TestComputedShortSide(unittest.TestCase):
+class TestComputedShortSide(_PoolTestCase):
     """`_ask_float_for_room` must open the side that MEASURES short -- never
     "the side facing full" -- including the shape with coupled ends on BOTH
     sides of the float.
@@ -823,7 +832,7 @@ class TestComputedShortSide(unittest.TestCase):
             alloc._ask_float_for_room(1)
 
 
-class TestFloatPolicyTotalTarget(unittest.TestCase):
+class TestFloatPolicyTotalTarget(_PoolTestCase):
     """`make_room`'s min_bytes is a TARGET for the whole band, not a delta.
 
     Regression: an ask shaped as `deficit + one page` lands BELOW the current
@@ -855,7 +864,7 @@ class TestFloatPolicyTotalTarget(unittest.TestCase):
         self.assertEqual(alloc.verify_byte_accounting(), [])
 
 
-class TestTriDeferredAbsorption(unittest.TestCase):
+class TestTriDeferredAbsorption(_PoolTestCase):
     """Boundary absorption is deferred out of the per-step free and paid once
     at a quiescent point. These pin WHERE it is paid, and that skipping it
     stays merely conservative."""
@@ -960,7 +969,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         self.assertEqual(sa._hole_pages(), 0)
 
 
-class TestTriFactorySizing(unittest.TestCase):
+class TestTriFactorySizing(_PoolTestCase):
     """Factory-level contracts: byte-budget sizing, the bs=1 feasibility
     floor, and the boot signature the GPU harness greps for (3 sub-pools,
     swa grow=float)."""
@@ -991,7 +1000,7 @@ class TestTriFactorySizing(unittest.TestCase):
             mamba2_cache_params=cp,
             full_max_total_num_tokens=64,
             swa_max_total_num_tokens=32,
-            max_mamba_cache_size=4,
+            max_mamba_cache_size=20,
             model_context_len=16,
             extra_max_context_len=4,
             max_num_reqs=4,
@@ -1106,7 +1115,8 @@ class TestTriFactorySizing(unittest.TestCase):
                             sliding_window_size=model.sliding_window_size,
                             forward_stream=None,
                             # Spec off: no draft region to fuse.
-                            _fused_draft_for_mamba_factory=lambda: None,
+                            _fused_draft_decision=lambda: None,
+                            _fused_draft_for_pool_factory=lambda decision: None,
                             _unified_request_rows=lambda *, has_state: (
                                 cfg.KVCacheConfigurator._unified_request_rows(
                                     configurator, has_state=has_state
@@ -1149,7 +1159,7 @@ class TestTriFactorySizing(unittest.TestCase):
                                 cfg,
                                 "get_schedule",
                                 return_value=SimpleNamespace(
-                                    max_mamba_cache_size=4,
+                                    max_mamba_cache_size=20,
                                     disable_overlap_schedule=False,
                                     mamba_full_memory_ratio=None,
                                 ),
@@ -1315,7 +1325,8 @@ class TestTriFactorySizing(unittest.TestCase):
         want = (
             64 * plan.sub_pool("full").spec.entry_bytes()
             + 32 * plan.sub_pool("swa").spec.entry_bytes()
-            + 4 * plan.sub_pool("mamba").spec.entry_bytes()
+            + self._factory_kwargs()["max_mamba_cache_size"]
+            * plan.sub_pool("mamba").spec.entry_bytes()
             + plan.sink_bytes()
         )
         self.assertEqual(pool.total_bytes, want)
@@ -1391,7 +1402,7 @@ class TestTriFactorySizing(unittest.TestCase):
             )
 
 
-class TestTriPoolHardening(unittest.TestCase):
+class TestTriPoolHardening(_PoolTestCase):
     """Pressure lanes: the planned-rebalance remedy in the alloc path (a
     mis-positioned float must not fail an alloc that fits in total bytes),
     retract-loop convergence through `check_decode_capacity`, and bounded copy
@@ -1490,7 +1501,7 @@ class TestTriPoolHardening(unittest.TestCase):
         )
 
 
-class TestJointCapacityIsHonoured(unittest.TestCase):
+class TestJointCapacityIsHonoured(_PoolTestCase):
     """`alloc(available_size())` must never fail.
 
     REGRESSION: the joint predicate priced the swa float's extension in RAW
@@ -1615,7 +1626,7 @@ class TestJointCapacityIsHonoured(unittest.TestCase):
                 )
 
 
-class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
+class TestFloatRelocationIsOrderedAgainstTheForward(_PoolTestCase):
     """Float relocation must settle the in-flight forward BEFORE its first copy.
 
     REGRESSION: `make_room` / `compact_holes` issued `move_kv_cache` and
@@ -1712,7 +1723,7 @@ class TestFloatRelocationIsOrderedAgainstTheForward(unittest.TestCase):
         self.assertNotIn("synchronize()", src)
 
 
-class TestFloatHoleCreditIsPerSide(unittest.TestCase):
+class TestFloatHoleCreditIsPerSide(_PoolTestCase):
     """A float's schedulable credit must follow the side the holes are on.
 
     REGRESSION: the base `_peer_drainable_hole_bytes` picks its neighbour from
@@ -1781,7 +1792,7 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
         self.assertEqual(flt._byte_accounting_violations(), [])
 
 
-class TestPreallocIsPricedOnTheSharedGrid(unittest.TestCase):
+class TestPreallocIsPricedOnTheSharedGrid(_PoolTestCase):
     """REGRESSION: PD admission compared FULL and SWA against per-side token
     budgets, but each side's `available_size` credits the peer's drainable
     holes, so a pair that each side can host alone can be jointly infeasible.
