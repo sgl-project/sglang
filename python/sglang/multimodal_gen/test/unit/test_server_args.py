@@ -1243,6 +1243,92 @@ class TestDiffusionModelDetection(unittest.TestCase):
 
 
 class TestMiniMaxH3Routing(unittest.TestCase):
+    def _routing_args(self, kwargs):
+        # These tests cover ServerArgs routing, not device/backend validation.
+        # _from_dict_without_model_resolution mocks CUDA, while EQBSA is NPU-only.
+        with patch.object(
+            MiniMaxH3PipelineConfig, "validate_server_args", return_value=None
+        ):
+            return _from_dict_without_model_resolution(
+                kwargs,
+                pipeline_config=MiniMaxH3PipelineConfig(),
+            )
+
+    def test_transformer_attention_defaults_text_encoder_to_sdpa(self):
+        for backend in ("laser_attn", "eqbsa_attn"):
+            with self.subTest(backend=backend):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": backend,
+                    }
+                )
+
+                self.assertEqual(args.attention_backend, backend)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    {"text_encoder": "torch_sdpa"},
+                )
+                self.assertTrue(
+                    args.is_component_attention_backend_automatic("text_encoder")
+                )
+
+    def test_transformer_attention_preserves_explicit_text_encoder_backend(self):
+        for backend in ("laser_attn", "eqbsa_attn"):
+            with self.subTest(backend=backend):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": backend,
+                        "component_attention_backends": {"text_encoder": "fa"},
+                    }
+                )
+
+                self.assertEqual(args.attention_backend, backend)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    {"text_encoder": "fa"},
+                )
+                self.assertFalse(
+                    args.is_component_attention_backend_automatic("text_encoder")
+                )
+
+    def test_eqbsa_rejects_incompatible_controls_before_loading(self):
+        invalid_configs = (
+            {"precision": "fp8"},
+            {"precision": "bf16"},
+            {"precision": "mxfp4"},
+            {"dense_last_steps": -1},
+            {"dense_last_steps": True},
+            {"skip_first_steps": -1},
+            {"block_size": 64},
+            {"block_size_q": 64},
+            {"block_size_kv": 256},
+        )
+        for config in invalid_configs:
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": "eqbsa_attn",
+                        "attention_backend_config": config,
+                    }
+                )
+
+    def test_eqbsa_dense_tail_config_is_preserved(self):
+        args = self._routing_args(
+            {
+                "model_path": "/models/MiniMax-H3",
+                "performance_mode": "manual",
+                "attention_backend": "eqbsa_attn",
+                "attention_backend_config": {"precision": "mix", "dense_last_steps": 3},
+            }
+        )
+        self.assertEqual(args.attention_backend_config["dense_last_steps"], 3)
+
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
             MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"

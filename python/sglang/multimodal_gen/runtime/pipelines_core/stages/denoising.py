@@ -2444,6 +2444,7 @@ class DenoisingStage(PipelineStage):
         elif self.attn_backend.get_enum() in [
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
+            AttentionBackendEnum.EQBSA_ATTN,
         ]:
             sparse_config = server_args.attention_backend_config
 
@@ -2463,12 +2464,30 @@ class DenoisingStage(PipelineStage):
                 else:
                     patch_size = (patch_size, patch_size, patch_size)
 
+            layout_kwargs = {}
+            if self.attn_backend.get_enum() == AttentionBackendEnum.EQBSA_ATTN:
+                # Pure-video attention uses the patch grid. Joint attention
+                # must supply the actual layout, never infer text from S-T*H*W.
+                video_spans = sparse_config.get("video_spans")
+                layout_kwargs["txt_len"] = sparse_config.get("txt_len", 0)
+                layout_kwargs["precision"] = sparse_config.get("precision", "mix")
+                layout_kwargs["dense_last_steps"] = sparse_config.get(
+                    "dense_last_steps", 0
+                )
+                layout_kwargs["num_steps"] = (
+                    None if timesteps is None else len(timesteps)
+                )
+                if video_spans is not None:
+                    layout_kwargs["video_spans"] = video_spans
+                    raw_latent_shape = None
+
             attn_metadata = self.attn_metadata_builder.build(
                 current_timestep=current_timestep,
                 skip_first_steps=skip_first_steps,
                 sparsity=sparsity,
                 raw_latent_shape=raw_latent_shape,
                 patch_size=patch_size,
+                **layout_kwargs,
             )
         else:
             # attn_metadata can be None for SDPA attention backend
