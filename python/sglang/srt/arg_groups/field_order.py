@@ -426,6 +426,7 @@ POSITIONAL_FIELD_ORDER = (
     "disaggregation_mode",
     "disaggregation_transfer_backend",
     "disaggregation_bootstrap_port",
+    "disaggregation_bootstrap_allowlist",
     "disaggregation_ib_device",
     "disaggregation_decode_enable_radix_cache",
     "disaggregation_decode_enable_offload_kvcache",

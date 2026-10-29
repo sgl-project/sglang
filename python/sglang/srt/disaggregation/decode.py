@@ -162,7 +162,8 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
-    return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+    addr = NetworkAddress(req.bootstrap_host, req.bootstrap_port)
+    return NetworkAddress(addr.host.lower(), addr.port).to_host_port_str()
 
 
 def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
@@ -1218,9 +1219,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Returns (ready_addrs, remaining_reqs)."""
         ready: Dict[str, List[DecodeRequest]] = {}
         remaining: List[DecodeRequest] = []
+        valid_addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
+
+        for bootstrap_addr, reqs in addr_to_reqs.items():
+            normalized_addr = self.kv_manager.get_allowed_prefill_bootstrap_addr(
+                bootstrap_addr
+            )
+            if normalized_addr is None:
+                error_msg = f"Unregistered Prefill bootstrap address: {bootstrap_addr}"
+                logger.error(error_msg)
+                for decode_req in reqs:
+                    prepare_abort(
+                        decode_req.req,
+                        error_msg,
+                        status_code=HTTPStatus.BAD_REQUEST,
+                    )
+                continue
+            valid_addr_to_reqs.setdefault(normalized_addr, []).extend(reqs)
 
         now = time.monotonic()
-        for bootstrap_addr, reqs in addr_to_reqs.items():
+        for bootstrap_addr, reqs in valid_addr_to_reqs.items():
             last_attempt = self._ensure_last_attempt_time.get(bootstrap_addr)
             if last_attempt is not None and (
                 now - last_attempt < self._ensure_retry_interval
