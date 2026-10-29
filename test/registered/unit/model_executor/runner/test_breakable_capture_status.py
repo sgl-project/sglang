@@ -12,9 +12,12 @@
 # limitations under the License.
 # ==============================================================================
 
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     breakable_cuda_graph,
@@ -40,3 +43,7 @@ def test_musa_uses_portable_stream_capture_status() -> None:
         ),
     ):
         assert breakable_cuda_graph._is_stream_capturing(stream)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
