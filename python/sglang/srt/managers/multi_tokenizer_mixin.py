@@ -39,6 +39,7 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.environ import envs
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -132,7 +133,7 @@ def _extract_field_by_index(
     if field is None:
         return None
 
-    should_wrap_result = field_name in ("customized_info", "time_stats")
+    should_wrap_result = field_name == "customized_info"
     if should_wrap_result:
         field = unwrap_from_pickle(field)
         if field is None:
@@ -299,7 +300,6 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
-            time_stats=_extract_field_by_index(output, "time_stats", i),
             pooled_hidden_states=_extract_pooled_hidden_states_by_index(output, i),
         )
     elif isinstance(output, BatchStrOutput):
@@ -426,7 +426,7 @@ def _extract_field_by_indices(
     if field is None:
         return None
 
-    should_wrap_result = field_name in ("customized_info", "time_stats")
+    should_wrap_result = field_name == "customized_info"
     if should_wrap_result:
         field = unwrap_from_pickle(field)
         if field is None:
@@ -542,7 +542,11 @@ def _split_batch_by_key(
 def _send_output_to_tokenizer_workers(
     output: Any, ipcs: List[Optional[str]], socket_mapping: SocketMapping
 ) -> None:
-    grouped = _split_batch_by_key(output, ipcs)
+    grouped = (
+        _split_batch_by_key(output, ipcs)
+        if envs.SGLANG_BATCH_TOKENIZER_OUTPUTS.get()
+        else None
+    )
     if grouped is None:
         for index, ipc_name in enumerate(ipcs):
             single_output = _handle_output_by_index(output, index)
