@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
+from sglang.kernels.ops.speculative.gather_spec_extras import (
+    gather_spec_extras,
+    scatter_spec_extras,
+)
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_exec,
@@ -64,6 +68,8 @@ def decide_needs_confidence_relay() -> bool:
     return read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
 
 
+logger = logging.getLogger(__name__)
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -72,6 +78,14 @@ _is_npu = is_npu()
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
 # via the existing SGLANG_IS_IN_CI; off in production.
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
+
+_fused_relay_logged = set()
+
+
+def _log_fused_relay_once(part: str) -> None:
+    if part not in _fused_relay_logged:
+        _fused_relay_logged.add(part)
+        logger.info("SGLANG_SPEC_FUSED_RELAY on: %s", part)
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
@@ -491,6 +505,10 @@ class FutureMap:
         indices = draft_input.future_indices
         if indices.shape[0] == 0:
             return
+        if envs.SGLANG_SPEC_FUSED_RELAY.get() and self._resolve_single_request_views(
+            batch, indices
+        ):
+            return
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
         if indices.device.type != "cpu":
@@ -532,6 +550,63 @@ class FutureMap:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
+
+    def _resolve_single_request_views(
+        self, batch: ScheduleBatch, indices: torch.Tensor
+    ) -> bool:
+        """SGLANG_SPEC_FUSED_RELAY: a single request whose future indices are
+        the batch's own req_pool_indices resolves its draft inputs as row views
+        of the relay buffers instead of gathering copies. The rows are written
+        back only by this request's next stash, which follows its forward on the
+        same stream. Returns False (nothing changed) when not applicable."""
+        if (
+            not indices.is_cuda
+            or indices.shape[0] != 1
+            or indices is not batch.req_pool_indices
+            or len(batch.reqs) != 1
+            or _DEBUG_ASSERT
+        ):
+            return False
+        draft_input: EagleDraftInput = batch.spec_info
+        row = batch.reqs[0].kv.req_pool_idx
+        draft_input.bonus_tokens = self.output_tokens_buf.narrow(0, row, 1)
+        if self.need_topk:
+            draft_input.topk_p = self.topk_p_buf.narrow(0, row, 1)
+            draft_input.topk_index = self.topk_index_buf.narrow(0, row, 1)
+            if self.need_hidden_states:
+                draft_input.hidden_states = self.hidden_states_buf.narrow(0, row, 1)
+            if self.draft_probs_buf is not None:
+                draft_input.draft_probs = self.draft_probs_buf.narrow(0, row, 1)
+        elif self.need_hidden_states:
+            draft_input.hidden_states = self.hidden_states_buf.narrow(0, row, 1)
+        if draft_input.future_dsa_topk_indices_available:
+            assert self.dsa_topk_indices_buf is not None
+            draft_input.dsa_topk_indices = self.dsa_topk_indices_buf.narrow(0, row, 1)
+        else:
+            draft_input.dsa_topk_indices = None
+        _log_fused_relay_once("views")
+        return True
+
+    def _stash_fused(self, indices: torch.Tensor, payload: RelayPayload) -> None:
+        """SGLANG_SPEC_FUSED_RELAY: every relay row of ``stash`` in one scatter
+        launch (same rows, same values; fields the payload leaves out keep the
+        rows they already hold)."""
+        pairs = [(self.output_tokens_buf, payload.bonus_tokens)]
+        if self.need_topk and payload.topk_p is not None:
+            assert payload.topk_index is not None
+            pairs.append((self.topk_p_buf, payload.topk_p))
+            pairs.append((self.topk_index_buf, payload.topk_index))
+        if self.need_hidden_states and payload.hidden_states is not None:
+            pairs.append((self.hidden_states_buf, payload.hidden_states))
+        if self.draft_probs_buf is not None and payload.draft_probs is not None:
+            pairs.append((self.draft_probs_buf, payload.draft_probs))
+        if (
+            self.dsa_topk_indices_buf is not None
+            and payload.dsa_topk_indices is not None
+        ):
+            pairs.append((self.dsa_topk_indices_buf, payload.dsa_topk_indices))
+        scatter_spec_extras(indices, pairs)
+        _log_fused_relay_once("stash")
 
     def stash_bonus_tokens(
         self, indices: torch.Tensor, bonus_tokens: torch.Tensor
@@ -692,6 +767,9 @@ class FutureMap:
         relay = self._relay
         if relay is not None and payload.bonus_tokens is relay.published_bonus:
             relay.published_bonus = None
+        elif indices.is_cuda and envs.SGLANG_SPEC_FUSED_RELAY.get():
+            self._stash_fused(indices, payload)
+            return
         else:
             self.output_tokens_buf[indices] = payload.bonus_tokens.to(
                 self.output_tokens_buf.dtype

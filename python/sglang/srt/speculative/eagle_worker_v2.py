@@ -1,10 +1,11 @@
 import contextlib
 import logging
 import time
-from typing import Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.row_argmax import draft_extend_tail
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
@@ -143,6 +144,11 @@ from sglang.srt.utils.common import (
     log_info_on_rank0,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.speculative.eagle_step_cuda_graph_runner import (
+        EagleStepCudaGraphRunner,
+    )
+
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
@@ -150,8 +156,15 @@ _is_musa = is_musa()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
-
 logger = logging.getLogger(__name__)
+
+_draft_tail_logged = set()
+
+
+def _log_draft_tail_once(message: str) -> None:
+    if message not in _draft_tail_logged:
+        _draft_tail_logged.add(message)
+        logger.info(message)
 
 
 def _select_spec_graph_runner_cls(
@@ -1122,6 +1135,40 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             cuda_graph_compatible=not (seed_from_extend and prefill_dsa_topk is None),
         )
 
+    def _fused_draft_extend_tail_eligible(
+        self, logits: torch.Tensor, seed_capture: Optional[torch.Tensor]
+    ) -> bool:
+        """SGLANG_SPEC_FUSED_DRAFT_EXTEND_TAIL applies to this draft extend.
+        (Eager draft extends select their rows after this check; the selected
+        copy keeps the dtype and is row-major.)"""
+        if not envs.SGLANG_SPEC_FUSED_DRAFT_EXTEND_TAIL.get():
+            return False
+        reason = None
+        if self.topk != 1 or _is_hip or not logits.is_cuda:
+            reason = "not a CUDA topk-1 draft"
+        elif get_spec().speculative_use_rejection_sampling:
+            reason = "rejection sampling"
+        if reason is None and (
+            logits.ndim != 2
+            or logits.dtype != torch.float32
+            or logits.stride(1) != 1
+            or logits.shape[1] < 131072
+        ):
+            reason = "draft logits are not wide FP32 rows"
+        if (
+            reason is None
+            and seed_capture is not None
+            and (seed_capture.ndim != 2 or seed_capture.stride(1) != 1)
+        ):
+            reason = "seed buffer is not 2-D row-major"
+        if reason is not None:
+            _log_draft_tail_once(
+                f"SGLANG_SPEC_FUSED_DRAFT_EXTEND_TAIL declined: {reason}"
+            )
+            return False
+        _log_draft_tail_once("SGLANG_SPEC_FUSED_DRAFT_EXTEND_TAIL on")
+        return True
+
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
         buf = self.dsa_extend_topk_buf
         if buf is None or buf.shape[0] < num_tokens:
@@ -1253,11 +1300,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Gather the per-request last-position indexer top-k as the next loop's
         # seed (select_index already picks the last accepted position per req).
         dsa_seed_topk_indices = None
+        dsa_extend_topk_capture = None
         if self.seed_dsa_topk_from_draft_extend:
             if can_run_decode_cuda_graph:
                 dsa_extend_topk_capture = self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
             else:
                 dsa_extend_topk_capture = forward_batch.spec_info.dsa_seed_topk_capture
+        fused_tail = self._fused_draft_extend_tail_eligible(
+            draft_logits_output.next_token_logits, dsa_extend_topk_capture
+        )
+        if dsa_extend_topk_capture is not None and not fused_tail:
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
@@ -1295,6 +1347,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         elif self.topk == 1 and _is_hip:
             ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
                 draft_logits_output.next_token_logits
+            )
+            ret_draft_probs = None
+        elif fused_tail:
+            # SGLANG_SPEC_FUSED_DRAFT_EXTEND_TAIL: argmax, unit probs and the
+            # seed-row gather below in two launches, same values.
+            ret_topk_p, ret_topk_index, dsa_seed_topk_indices = draft_extend_tail(
+                draft_logits_output.next_token_logits,
+                dsa_extend_topk_capture,
+                select_index if dsa_extend_topk_capture is not None else None,
             )
             ret_draft_probs = None
         elif self.topk == 1 and not _is_hip:
@@ -1407,6 +1468,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        # Built in init_cuda_graphs, once the per-stage graphs exist.
+        self.step_cuda_graph_runner: Optional[EagleStepCudaGraphRunner] = None
 
     @property
     def last_shared_read_runner(self):
@@ -1460,6 +1523,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
+        if get_spec().enable_speculative_step_cuda_graph and self._hosts_draft:
+            from sglang.srt.speculative.eagle_step_cuda_graph_runner import (
+                EagleStepCudaGraphRunner,
+            )
+
+            self.step_cuda_graph_runner = EagleStepCudaGraphRunner(self)
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
@@ -1517,6 +1586,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+
+            if self.step_cuda_graph_runner is not None:
+                batch_output = self.step_cuda_graph_runner.try_replay(
+                    batch, on_publish, grammar_barrier, pp_proxy_tensors
+                )
+                if batch_output is not None:
+                    return batch_output
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1850,6 +1926,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def activate_step_by_batch(self, batch_size: int) -> None:
         if self.adaptive_controller is not None:
             self.adaptive_controller.activate_step_by_batch(batch_size)
+
+    def step_cuda_graph_stats(self) -> Optional[dict]:
+        if self.step_cuda_graph_runner is None:
+            return None
+        return self.step_cuda_graph_runner.stats()
 
     # -- Adaptive speculative decoding protocol --
 

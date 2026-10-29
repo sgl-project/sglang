@@ -43,6 +43,9 @@ from sglang.srt.mem_cache.allocation import (
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.model_executor.runner_backend_utils.child_graph_capture import (
+    capture_override,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -587,6 +590,7 @@ def sample_simulated_acc_len(
     return int(simulate_acc_len)
 
 
+@capture_override("spec_simulated_accept_index")
 def generate_simulated_accept_index(
     accept_index,
     predict,
@@ -816,6 +820,7 @@ class GrammarTree:
         self._done = done_event
 
     @classmethod
+    @capture_override("spec_grammar_tree_from_device")
     def from_device(
         cls,
         retrieve_next_token: torch.Tensor,
@@ -862,6 +867,7 @@ class GrammarTree:
         return self._host
 
 
+@capture_override("spec_grammar_vocab_mask")
 def build_grammar_vocab_mask(
     *,
     reqs: List[Req],

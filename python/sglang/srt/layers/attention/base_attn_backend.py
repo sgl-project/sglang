@@ -205,6 +205,19 @@ class AttentionBackend(ABC):
 
     supports_draft_extend_metadata_staging: bool = False
 
+    def out_graph_metadata_capturable(self, forward_mode: ForwardMode) -> bool:
+        """True when the replay-time :py:meth:`init_forward_metadata_out_graph`
+        for ``forward_mode`` may itself be recorded into an enclosing CUDA
+        graph: device work on device tensors only (no host reads, no copies of
+        per-step host values, no step-dependent allocation sizes), so that
+        replaying the recording later is equivalent to calling it again.
+
+        The speculative step CUDA graph
+        (``--enable-speculative-step-cuda-graph``) records the draft, target
+        verify and draft extend replay prep only for backends that return True.
+        """
+        return False
+
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds
         this backend's DRAFT_EXTEND_V2 replay metadata inside the captured

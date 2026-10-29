@@ -557,5 +557,6 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_layer_partition",
     "engram_config",
     "moe_ascend_ops_config",
+    "enable_speculative_step_cuda_graph",
 )
 # fmt: on

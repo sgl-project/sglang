@@ -42,6 +42,17 @@ def _default_tree_cache_sanity_check() -> bool:
     return envs.SGLANG_IS_IN_CI.get()
 
 
+def _default_spec_step_cuda_graph() -> bool:
+    """Default of the switches that --enable-speculative-step-cuda-graph turns on:
+    the flag's resolved value, or False where no server config is published
+    (tools, unit tests)."""
+    from sglang.srt.runtime_context import get_context, get_spec
+
+    if not get_context().is_config_namespace_published("spec"):
+        return False
+    return bool(get_spec().enable_speculative_step_cuda_graph)
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -1654,6 +1665,35 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # The next six switches are pieces of --enable-speculative-step-cuda-graph:
+    # unset, each is on with the flag and off without it. Setting one is a test /
+    # bisect override: 0 turns its piece off under the flag, 1 turns it on without
+    # the flag. Outputs are bitwise identical either way.
+    # EAGLE verify bookkeeping: allocate predict / accept_index / num_correct_drafts
+    # as views of one buffer so that the rank-0 TP broadcast of the verify result
+    # is one collective instead of three. Outputs are bitwise identical either way.
+    SGLANG_SPEC_PACKED_VERIFY_BROADCAST = EnvBool(_default_spec_step_cuda_graph)
+    # EAGLE sampled verify on CUDA for chains (topk 1, no rejection sampling):
+    # divide the logits by each request's temperature without expanding it, and
+    # sample without a zero-filled draft_probs. Outputs are bitwise identical.
+    SGLANG_SPEC_LEAN_SAMPLED_VERIFY = EnvBool(_default_spec_step_cuda_graph)
+    # EAGLE topk-1 draft extend on CUDA: the draft argmax, its unit
+    # probabilities and the DSA seed-row gather in two launches (a split-row
+    # argmax whose final step writes all three). Outputs are bitwise identical.
+    SGLANG_SPEC_FUSED_DRAFT_EXTEND_TAIL = EnvBool(_default_spec_step_cuda_graph)
+    # Speculative relay rows (FutureMap): stash every field in one scatter
+    # launch and, for a single request, resolve the draft inputs as row views of
+    # the relay buffers instead of gathered copies. Outputs are bitwise identical.
+    SGLANG_SPEC_FUSED_RELAY = EnvBool(_default_spec_step_cuda_graph)
+    # Speculative step CUDA graph replay: copy the step's live input tensors
+    # into the graph's static input buffers with one fused small-tensor copy
+    # launch instead of one copy per tensor (per-tensor copies whenever a tensor
+    # does not qualify). Outputs are bitwise identical.
+    SGLANG_SPEC_STEP_GRAPH_FUSED_INPUT_COPY = EnvBool(_default_spec_step_cuda_graph)
+    # With SGLANG_SPEC_LEAN_SAMPLED_VERIFY's chain path: run the verify sampling
+    # kernel's two passes over the vocabulary with one CTA per vocabulary chunk
+    # (two launches) instead of one CTA per request. Outputs are bitwise identical.
+    SGLANG_SPEC_CHUNKED_VERIFY_SAMPLING = EnvBool(_default_spec_step_cuda_graph)
     # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
     # it under live traffic isolates where ranks actually diverge. Comma
     # separated presets ("all", "rng", "init", "off"), or SpecTpSyncSite slugs

@@ -222,6 +222,7 @@ class TestServerArgsHook(_RegistryIsolated):
             speculative_draft_window_size=None,
             speculative_draft_sink_size=None,
             speculative_adaptive=False,
+            enable_speculative_step_cuda_graph=False,
         )
 
         handle_speculative_decoding(server_args)

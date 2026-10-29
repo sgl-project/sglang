@@ -812,6 +812,27 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+### One CUDA graph per decode step
+
+At small batch sizes an EAGLE decode step runs three CUDA graphs (draft, target verify, draft extend) with small kernels and host work between them, and the GPU idles between those launches. `--enable-speculative-step-cuda-graph` captures the whole decode step of `EAGLEWorkerV2` as one CUDA graph and reuses the three per-stage graphs inside it as child graphs, so a step is one launch (three launches with constrained decoding, whose grammar bitmask is still built on the host while the target verify runs).
+
+- **When it engages:** CUDA, EAGLE / EAGLE3 / NEXTN with `--speculative-eagle-topk 1`, the full decode CUDA graph backend, decode batch sizes up to 8, and attention backends whose replay metadata preparation can itself be captured (`out_graph_metadata_capturable`; the DSA backend declares it). Greedy and sampled requests, seeded sampling and requests that are all constrained by a grammar are supported.
+- **When it does not:** setups such as pipeline parallelism, attention DP, two-batch overlap, LoRA, PD disaggregation, rejection sampling or adaptive speculation turn the flag off at startup with a warning. Steps it cannot capture (logprobs or hidden states requested, constrained and unconstrained requests in one batch, penalties, logit bias, a batch size above 8, ...) run the regular path. Each reason is logged once and counted. `/update_weights_from_disk` with `recapture_cuda_graph` is refused while the flag is on, before any weight is loaded.
+- **What else it turns on:** six pieces that remove host work and small launches around the per-stage graphs, each with bitwise identical outputs and its own fallback to the existing code: one TP broadcast for the verify result, a lean sampled verify for chains, chain verify sampling in two launches, fused relay stores with single-request relay views, a fused topk-1 draft-extend tail, and one launch for the step graph's input copies. They follow the flag as resolved at startup, so a setup that turns the flag off turns them off too.
+- **Test and bisect overrides:** each piece has an environment variable, `SGLANG_SPEC_PACKED_VERIFY_BROADCAST`, `SGLANG_SPEC_LEAN_SAMPLED_VERIFY`, `SGLANG_SPEC_CHUNKED_VERIFY_SAMPLING`, `SGLANG_SPEC_FUSED_RELAY`, `SGLANG_SPEC_FUSED_DRAFT_EXTEND_TAIL` and `SGLANG_SPEC_STEP_GRAPH_FUSED_INPUT_COPY`. Leave them unset in normal use; `=0` turns that piece off under the flag (and `=1` turns it on without the flag, for tests).
+- **First use:** a step shape (batch size, sampling setup) is captured after two regular steps of that shape, which adds a one-time capture latency to that step, and only while every GPU has enough free memory (the largest captured shape plus 1 GiB). If memory is short but PyTorch caches enough unused memory, that cache is released once for the shape and the check repeats; otherwise the step runs the regular path and the free and needed memory are logged. Each captured shape keeps a small private memory pool. Device memory in use can grow while serving, so the server's startup sends short requests with its default sampling (as the chat API resolves a request that sets no sampling fields) in batches of 1 to N requests, N being the smaller of `--max-running-requests` and the largest batch size the step graph runs (at most 8): the shapes of such requests at those batch sizes are captured before serving starts, and the log lists each one with its memory. SGLang's own warmup request captures the greedy batch-size-1 shape. With `--skip-server-warmup`, the offline engine or `SGLANG_RUST_SERVER=1`, every shape is captured at first use.
+- **Checking it:** `/get_server_info` reports `spec_step_cuda_graph` under `internal_states`: `replays`, `captures`, `capture_failures`, `memory_refusals`, `cache_releases`, `keys`, `captured_keys` (batch size, sampling and MB of each), and `fallbacks` by reason.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model <model> \
+    --speculative-algorithm EAGLE \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --enable-speculative-step-cuda-graph
+```
+
 ---
 
 ## Ngram Speculative Decoding
@@ -1140,6 +1161,10 @@ Below is a comprehensive list of all speculative decoding parameters available i
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--enable-multi-layer-eagle</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable multi-layer EAGLE (auto-enabled for MiMoV2 and Step3p5 models)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--enable-speculative-step-cuda-graph</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Capture each EAGLE decode step as one CUDA graph and turn on its fused verify and relay paths (see <a href="#one-cuda-graph-per-decode-step">One CUDA graph per decode step</a>)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--enable-torch-compile</code></td>

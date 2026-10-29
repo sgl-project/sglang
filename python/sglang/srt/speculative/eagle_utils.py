@@ -554,6 +554,60 @@ def _can_use_sparse_uno_tree_target_sampling(
     )
 
 
+_chunked_verify_sampling_logged = False
+
+
+def _log_chunked_verify_sampling_once() -> None:
+    global _chunked_verify_sampling_logged
+    if not _chunked_verify_sampling_logged:
+        _chunked_verify_sampling_logged = True
+        logger.info(
+            "SGLANG_SPEC_CHUNKED_VERIFY_SAMPLING on: chain verify sampling in two "
+            "launches (one CTA per vocabulary chunk)."
+        )
+
+
+def _alloc_verify_outputs(
+    num_rows: int, bs: int, max_tree_depth: int, device
+) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate verify's ``predict`` (zeros), ``accept_index`` (-1) and
+    ``num_correct_drafts``.
+
+    With ``SGLANG_SPEC_PACKED_VERIFY_BROADCAST`` (or
+    ``SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST``) the three are views of one int32
+    buffer, returned first, so that the TP broadcast of the verify result is one
+    collective (see ``_broadcast_verify_outputs``). Otherwise the first value is
+    None and the tensors are separate, as before.
+    """
+    predict, accept_index, num_correct_drafts, packed = _verify_outputs(
+        rows=num_rows,
+        bs=bs,
+        depth=max_tree_depth,
+        device=device,
+        packed=_PACKED_VERIFY_BCAST or envs.SGLANG_SPEC_PACKED_VERIFY_BROADCAST.get(),
+    )
+    return packed, predict, accept_index, num_correct_drafts
+
+
+def _broadcast_verify_outputs(
+    tp_group,
+    packed: Optional[torch.Tensor],
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+) -> None:
+    """Rank 0's verify result to every rank of ``tp_group``: one collective on
+    the packed buffer when there is one, else one per tensor."""
+    if tp_group.world_size <= 1:
+        return
+    if packed is not None:
+        tp_group.broadcast(packed, src=0)
+        return
+    tp_group.broadcast(predict, src=0)
+    tp_group.broadcast(accept_index, src=0)
+    tp_group.broadcast(num_correct_drafts, src=0)
+
+
 def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
     """The support for eagle_sample's compact top-k branch under
     SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING, or None for the dense branch: every
@@ -687,13 +741,11 @@ def eagle_sample(
             )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    predict_shape = list(next_token_logits.shape)[:-1]
-    predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
-        rows=math.prod(predict_shape),
-        bs=bs,
-        depth=verify_input.max_tree_depth,
-        device=device,
-        packed=_PACKED_VERIFY_BCAST,
+    verify_outputs, predict, accept_index, num_correct_drafts = _alloc_verify_outputs(
+        math.prod(next_token_logits.shape[:-1]),
+        bs,
+        verify_input.max_tree_depth,
+        device,
     )
 
     # Sample tokens
@@ -730,10 +782,9 @@ def eagle_sample(
                 if is_dp_attention_enabled()
                 else get_parallel().tp_group
             )
-            if tp_group.world_size > 1:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
+            _broadcast_verify_outputs(
+                tp_group, verify_outputs, predict, accept_index, num_correct_drafts
+            )
     elif _can_use_sparse_uno_tree_target_sampling(
         uno_target_max_top_k,
         sampling_info,
@@ -766,13 +817,9 @@ def eagle_sample(
             if is_dp_attention_enabled()
             else get_parallel().tp_group
         )
-        if tp_group.world_size > 1:
-            if verify_out is not None:
-                tp_group.broadcast(verify_out, src=0)
-            else:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
+        _broadcast_verify_outputs(
+            tp_group, verify_outputs, predict, accept_index, num_correct_drafts
+        )
     else:
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
@@ -781,13 +828,35 @@ def eagle_sample(
         else:
             sampling_fn = tree_speculative_sampling_target_only
 
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, verify_input.draft_token_num, dim=0
-        )  # (bs * num_draft_tokens, 1)
+        # Lean form (CUDA, chains, no rejection sampling): the same division
+        # broadcast per request instead of expanding the temperatures, and no
+        # zero-filled draft_probs (the sampling kernel's target-only path).
+        lean = (
+            _is_cuda
+            and not use_rejection_sampling
+            and verify_input.tree_topk == 1
+            and next_token_logits.is_contiguous()
+            and envs.SGLANG_SPEC_LEAN_SAMPLED_VERIFY.get()
+        )
+        if lean and envs.SGLANG_SPEC_CHUNKED_VERIFY_SAMPLING.get():
+            _log_chunked_verify_sampling_once()
+            sampling_fn = partial(sampling_fn, chunked=True)
+        if lean:
+            expanded_temperature = None
+            target_probs = sampling_softmax(
+                (
+                    next_token_logits.view(bs, verify_input.draft_token_num, -1)
+                    / sampling_info.temperatures.view(bs, 1, 1)
+                ).view(bs * verify_input.draft_token_num, -1)
+            )  # (bs * num_draft_tokens, vocab_size)
+        else:
+            expanded_temperature = torch.repeat_interleave(
+                sampling_info.temperatures, verify_input.draft_token_num, dim=0
+            )  # (bs * num_draft_tokens, 1)
 
-        target_probs = sampling_softmax(
-            next_token_logits, temperatures=expanded_temperature
-        )  # (bs * num_draft_tokens, vocab_size)
+            target_probs = sampling_softmax(
+                next_token_logits, temperatures=expanded_temperature
+            )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:
             target_probs = top_k_renorm_prob(
@@ -806,11 +875,12 @@ def eagle_sample(
             )
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = (
-            verify_input.draft_probs
-            if use_rejection_sampling
-            else torch.zeros_like(target_probs)
-        )
+        if use_rejection_sampling:
+            draft_probs = verify_input.draft_probs
+        elif lean:
+            draft_probs = None
+        else:
+            draft_probs = torch.zeros_like(target_probs)
         # Defense-in-depth behind the spec_hook startup allowlist: validate
         # the actual kernel inputs before the Triton kernel.
         if use_rejection_sampling and (
@@ -863,13 +933,9 @@ def eagle_sample(
             if is_dp_attention_enabled()
             else get_parallel().tp_group
         )
-        if tp_group.world_size > 1:
-            if verify_out is not None:
-                tp_group.broadcast(verify_out, src=0)
-            else:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
+        _broadcast_verify_outputs(
+            tp_group, verify_outputs, predict, accept_index, num_correct_drafts
+        )
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List
+import time
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
 import numpy as np
 import tqdm
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -36,6 +38,182 @@ async def execute_warmups(
             continue
         logger.info(f"Running warmup {warmup_name}")
         await _warmup_registry[warmup_name](disaggregation_mode, tokenizer_manager)
+
+
+# Long enough for a step graph capture (two regular steps, then the capture) at
+# any accept length.
+_STEP_GRAPH_WARMUP_NEW_TOKENS = 64
+
+
+def default_chat_sampling_params(model_config, max_new_tokens: int) -> Dict[str, Any]:
+    """The sampling params of a chat completion request that sets no sampling
+    field (the model's generation config, then the OpenAI defaults), resolved by
+    the chat API's own code. The tokenizer manager merges
+    ``--preferred-sampling-params`` into them as into any request."""
+    from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": ""}],
+        max_completion_tokens=max_new_tokens,
+        ignore_eos=True,
+    )
+    return request.to_sampling_params(
+        stop=[], model_generation_config=model_config.get_default_sampling_params()
+    )
+
+
+def _active_step_cuda_graph_stats(
+    internal_states: List[Dict[str, Any]],
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    """(scheduler state, runner stats) of every scheduler that built a step CUDA
+    graph runner that did not turn itself off."""
+    active = []
+    for state in internal_states:
+        stats = state.get("spec_step_cuda_graph")
+        if stats is not None and stats["disabled_reason"] is None:
+            active.append((state, stats))
+    return active
+
+
+def _step_graph_warmup_batch_sizes(internal_states: List[Dict[str, Any]]) -> List[int]:
+    """Batch sizes 1 to N: N is the smallest, over the active runners, of the
+    runner's largest batch size and its scheduler's maximum number of running
+    requests. Empty without an active runner."""
+    limits = [
+        min(
+            stats.get("max_batch_size", 1),
+            state.get("effective_max_running_requests_per_dp") or 1,
+        )
+        for state, stats in _active_step_cuda_graph_stats(internal_states)
+    ]
+    return list(range(1, min(limits) + 1)) if limits else []
+
+
+def _missing_batch_sizes(
+    internal_states: List[Dict[str, Any]],
+    batch_sizes: List[int],
+    sampling_flags: Dict[str, bool],
+) -> List[int]:
+    """Sizes missing an unconstrained key for the warmup's sampling mode."""
+    missing = set()
+    for _, stats in _active_step_cuda_graph_stats(internal_states):
+        captured = {
+            key["batch_size"]
+            for key in stats.get("captured_keys", ())
+            if not key["constrained"]
+            and all(key[name] == value for name, value in sampling_flags.items())
+        }
+        missing.update(bs for bs in batch_sizes if bs not in captured)
+    return sorted(missing)
+
+
+async def _run_step_graph_warmup_batch(
+    tokenizer_manager: TokenizerManager,
+    num_requests: int,
+    sampling_params: Dict[str, Any],
+):
+    """Run ``num_requests`` short requests that decode as one batch: the
+    tokenizer manager sends a batch of token ids to the scheduler in one
+    message, so they are prefilled together. Distinct prompts keep the
+    in-batch prefix caching from holding any of them back."""
+    input_ids = [[10 + i, 11, 12] for i in range(num_requests)]
+    req = GenerateReqInput(
+        input_ids=input_ids if num_requests > 1 else input_ids[0],
+        sampling_params=dict(sampling_params),
+    )
+    # Drain the generator so every decode step runs before the next batch.
+    async for _ in tokenizer_manager.generate_request(req, None):
+        pass
+
+
+def _log_step_graph_warmup(
+    internal_states: List[Dict[str, Any]],
+    batch_sizes: List[int],
+    seconds: float,
+    sampling_flags: Dict[str, bool],
+):
+    active = _active_step_cuda_graph_stats(internal_states)
+    for index, (_, stats) in enumerate(active):
+        keys = stats.get("captured_keys", [])
+        logger.info(
+            "Speculative step CUDA graph warm-up done in %.1f s (scheduler %d of "
+            "%d): %d keys, %.1f MB per GPU: %s.",
+            seconds,
+            index + 1,
+            len(active),
+            len(keys),
+            sum(key["memory_mb"] for key in keys),
+            ", ".join(
+                f"batch size {key['batch_size']} "
+                f"{'greedy' if key['greedy'] else 'sampled'} {key['memory_mb']:.1f} MB"
+                for key in keys
+            ),
+        )
+    missing = _missing_batch_sizes(internal_states, batch_sizes, sampling_flags)
+    if missing:
+        logger.warning(
+            "Speculative step CUDA graph warm-up: no key captured for batch "
+            "size(s) %s with the default sampling; they are captured at first use.",
+            missing,
+        )
+
+
+async def speculative_step_cuda_graph_warmup(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Capture the speculative step CUDA graphs of decode steps of batch size 1
+    to N with the server's default sampling, before the server takes requests.
+
+    The step graph captures a key at its third eligible step, and only while
+    enough device memory is free. SGLang's own warm-up request is greedy, so
+    without this the keys of client requests that send no sampling fields are
+    first met while serving, when device memory in use may have grown. Batch
+    size k comes from k requests sent together (k per DP rank), after the
+    smaller sizes; a size still missing afterwards gets one more batch."""
+    from sglang.srt.runtime_context import get_parallel
+
+    if disaggregation_mode != "null":
+        return
+    batch_sizes = _step_graph_warmup_batch_sizes(
+        await tokenizer_manager.get_internal_state()
+    )
+    if not batch_sizes:
+        return
+    sampling_params = default_chat_sampling_params(
+        tokenizer_manager.model_config, _STEP_GRAPH_WARMUP_NEW_TOKENS
+    )
+    effective_params = SamplingParams(
+        **{**(tokenizer_manager.preferred_sampling_params or {}), **sampling_params}
+    )
+    sampling_flags = {
+        "greedy": effective_params.top_k <= 1,
+        "need_top_k_sampling": effective_params.top_k != TOP_K_ALL,
+        "need_top_p_sampling": effective_params.top_p != 1.0,
+        "need_min_p_sampling": effective_params.min_p > 0.0,
+    }
+    logger.info(
+        "Speculative step CUDA graph warm-up with the default sampling: %s; "
+        "batch sizes 1-%d.",
+        {k: sampling_params[k] for k in ("temperature", "top_p", "top_k", "min_p")},
+        batch_sizes[-1],
+    )
+    num_dp_ranks = get_parallel().num_dp_ranks
+    start = time.perf_counter()
+    for bs in batch_sizes:
+        await _run_step_graph_warmup_batch(
+            tokenizer_manager, bs * num_dp_ranks, sampling_params
+        )
+    states = await tokenizer_manager.get_internal_state()
+    missing = _missing_batch_sizes(states, batch_sizes, sampling_flags)
+    for bs in missing:
+        await _run_step_graph_warmup_batch(
+            tokenizer_manager, bs * num_dp_ranks, sampling_params
+        )
+    if missing:
+        states = await tokenizer_manager.get_internal_state()
+    _log_step_graph_warmup(
+        states, batch_sizes, time.perf_counter() - start, sampling_flags
+    )
 
 
 @warmup("whisper_autodetect")

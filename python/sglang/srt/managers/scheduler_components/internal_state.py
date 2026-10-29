@@ -127,6 +127,13 @@ class SchedulerInternalStateController:
             info_record = scheduler.draft_worker.dump_info_records()
             if info_record is not None:
                 state["dspark_info_record"] = info_record
+        step_cuda_graph_stats = getattr(
+            scheduler.draft_worker, "step_cuda_graph_stats", None
+        )
+        if step_cuda_graph_stats is not None:
+            stats = step_cuda_graph_stats()
+            if stats is not None:
+                state["spec_step_cuda_graph"] = stats
 
     def _add_step_times(self, state: Dict[str, Any]) -> None:
         if self.record_step_time:

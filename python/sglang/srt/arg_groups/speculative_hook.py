@@ -266,6 +266,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         if cfg.speculative_adaptive:
             _init_adaptive_speculative_params(server_args)
 
+    if cfg.enable_speculative_step_cuda_graph:
+        _maybe_disable_step_cuda_graph(server_args)
+
     if algo is not None:
         # Imported here and not above: the name is only bound inside the
         # `speculative_algorithm is not None` branch, and this runs either way.
@@ -1427,6 +1430,24 @@ def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
             server_args,
             "_maybe_disable_adaptive",
             speculative_adaptive=False,
+        )
+
+
+def _maybe_disable_step_cuda_graph(server_args: ServerArgs) -> None:
+    from sglang.srt.speculative.eagle_step_cuda_graph_runner import (
+        step_cuda_graph_unsupported_reason,
+    )
+
+    reason = step_cuda_graph_unsupported_reason(server_args)
+    if reason is not None:
+        logger.warning(
+            f"enable_speculative_step_cuda_graph disabled: {reason}. "
+            "Falling back to the per-stage CUDA graphs."
+        )
+        declare_resolution(
+            server_args,
+            "_maybe_disable_step_cuda_graph",
+            enable_speculative_step_cuda_graph=False,
         )
 
 
