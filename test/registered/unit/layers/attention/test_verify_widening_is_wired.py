@@ -34,21 +34,21 @@ from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionBackend,
     FlashAttentionMetadata,
 )
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 _DEV = "cuda"
 _NUM_DRAFT = 4
 _MAX_CTX = 128
 
 
-def _translator(req_to_token, page_size, n_pages):
-    """A translating translator over a fixed, non-identity page map.
+def _runner_ids(req_to_token, page_size, n_pages):
+    """A translating runner_ids over a fixed, non-identity page map.
 
     The allocator wiring is irrelevant here; what matters is that the reads go
     through the real table builder and kernel with a v2p map that a skipped or
@@ -56,7 +56,7 @@ def _translator(req_to_token, page_size, n_pages):
     g = torch.Generator(device="cpu").manual_seed(7 + page_size)
     v2p = torch.randperm(n_pages, generator=g).to(torch.int64)
     v2p[0] = 0  # page 0 is the reserved sink
-    t = KVIndexTranslator.__new__(KVIndexTranslator)
+    t = RunnerIds.__new__(RunnerIds)
     t.req_to_token = req_to_token
     t.page_size = page_size
     t.device = _DEV
@@ -103,15 +103,16 @@ def _expected(req_to_token, live, v2p, page_size):
     return rows
 
 
-def _verify_plan(translator, req_to_token, live, host_lens=None):
+def _verify_plan(runner_ids, req_to_token, live, host_lens=None):
     """The plan a verify forward builds for itself: it writes the draft window
     past `live`, so it reads that far."""
     bs = live.numel()
     rows = torch.arange(bs, device=_DEV)
     cols = live.to(_DEV)[:, None] + torch.arange(_NUM_DRAFT, device=_DEV)[None, :]
-    return translator.own_plan(
+    return runner_ids.own_plan(
         SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            ragged_verify_layout=None,
             spec_info=SimpleNamespace(draft_token_num=_NUM_DRAFT),
             batch_size=bs,
             req_pool_indices=rows,
@@ -122,9 +123,9 @@ def _verify_plan(translator, req_to_token, live, host_lens=None):
     )
 
 
-def _backend(translator, req_to_token, page_size):
+def _backend(runner_ids, req_to_token, page_size):
     b = FlashAttentionBackend.__new__(FlashAttentionBackend)
-    b.kv_index_translator = translator
+    b.runner_ids = runner_ids
     b.req_to_token = req_to_token
     b.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
     b.page_size = page_size
@@ -148,8 +149,8 @@ def _backend(translator, req_to_token, page_size):
 class TestFa3VerifyReadsTheDraftTail(CustomTestCase):
     N_PAGES = 64
 
-    def _check(self, page_table, req_to_token, live, translator, page_size):
-        want = _expected(req_to_token, live, translator._full_v2p_table, page_size)
+    def _check(self, page_table, req_to_token, live, runner_ids, page_size):
+        want = _expected(req_to_token, live, runner_ids._full_v2p_table, page_size)
         got = page_table.cpu()
         for r, row in enumerate(want):
             self.assertTrue(
@@ -162,8 +163,8 @@ class TestFa3VerifyReadsTheDraftTail(CustomTestCase):
         """The captured build a cuda-graph replay runs."""
         for page_size in (1, 4):
             req_to_token, live = _batch(page_size, self.N_PAGES)
-            translator = _translator(req_to_token, page_size, self.N_PAGES)
-            b = _backend(translator, req_to_token, page_size)
+            runner_ids = _runner_ids(req_to_token, page_size, self.N_PAGES)
+            b = _backend(runner_ids, req_to_token, page_size)
             bs = live.numel()
             metadata = FlashAttentionMetadata()
             metadata.cache_seqlens_int32 = torch.zeros(
@@ -176,39 +177,41 @@ class TestFa3VerifyReadsTheDraftTail(CustomTestCase):
             metadata.swa_page_table = None
             b.target_verify_metadata = {bs: metadata}
             b._apply_cuda_graph_metadata(
-                _verify_plan(translator, req_to_token, live),
+                _verify_plan(runner_ids, req_to_token, live),
                 bs,
                 torch.arange(bs, device=_DEV),
                 live.to(_DEV),
                 None,
                 ForwardMode.TARGET_VERIFY,
-                SimpleNamespace(ragged_verify_layout=None),
+                SimpleNamespace(),
                 live,
+                ragged_verify_layout=None,
             )
             self.assertTrue(
                 torch.equal(
                     metadata.cache_seqlens_int32.cpu(), (live + _NUM_DRAFT).int()
                 )
             )
-            self._check(metadata.page_table, req_to_token, live, translator, page_size)
+            self._check(metadata.page_table, req_to_token, live, runner_ids, page_size)
 
     def test_eager_verify_build(self):
         """The eager build, including a DSPARK-style batch whose host lens are
         already expanded by the window."""
         for page_size in (1, 4):
             req_to_token, live = _batch(page_size, self.N_PAGES)
-            translator = _translator(req_to_token, page_size, self.N_PAGES)
-            b = _backend(translator, req_to_token, page_size)
+            runner_ids = _runner_ids(req_to_token, page_size, self.N_PAGES)
+            b = _backend(runner_ids, req_to_token, page_size)
             bs = live.numel()
             for host_lens, spec_info in (
-                (live, SimpleNamespace(ragged_verify_layout=None)),
+                (live, SimpleNamespace()),
                 (
                     live + _NUM_DRAFT,
-                    SimpleNamespace(ragged_verify_layout=None, live_seq_lens_cpu=live),
+                    SimpleNamespace(live_seq_lens_cpu=live),
                 ),
             ):
                 fb = SimpleNamespace(
                     forward_mode=ForwardMode.TARGET_VERIFY,
+                    ragged_verify_layout=None,
                     batch_size=bs,
                     seq_lens=live.to(_DEV),
                     seq_lens_cpu=host_lens,
@@ -217,14 +220,16 @@ class TestFa3VerifyReadsTheDraftTail(CustomTestCase):
                     spec_info=spec_info,
                     encoder_lens=None,
                     out_cache_loc=None,
-                    kv_loc_plan=_verify_plan(translator, req_to_token, live, host_lens),
+                    iteration_ids=_verify_plan(
+                        runner_ids, req_to_token, live, host_lens
+                    ),
                 )
                 b.init_forward_metadata(fb)
                 self._check(
                     b.forward_metadata.page_table,
                     req_to_token,
                     live,
-                    translator,
+                    runner_ids,
                     page_size,
                 )
 

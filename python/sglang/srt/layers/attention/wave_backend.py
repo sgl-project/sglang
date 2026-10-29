@@ -496,7 +496,7 @@ class WaveAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
 
@@ -511,8 +511,8 @@ class WaveAttnBackend(AttentionBackend):
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
             self.forward_metadata.qo_indptr,
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,
@@ -546,14 +546,14 @@ class WaveAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.kv_layers.read(layer.layer_id).key(),
+            self.kv_layers.read(layer.layer_id).value(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,

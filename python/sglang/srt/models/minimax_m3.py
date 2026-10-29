@@ -33,9 +33,11 @@ from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
+    uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -50,6 +52,7 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
     is_dense_ffn_fully_dp,
 )
+from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -66,6 +69,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -93,6 +97,9 @@ from sglang.srt.model_executor.forward_context import (
     has_forward_context,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -100,7 +107,13 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_platform,
+    get_stream,
+)
 from sglang.srt.utils import (
     add_prefix,
     get_device_sm,
@@ -142,6 +155,9 @@ _FP8_KV_DTYPES = (
 # rotary_dim required by the fused qknorm+rope JIT kernel: rotary_dim/2 must
 # equal the CUDA warp size (32) so each warp norms+ropes one head in one pass.
 _M3_FUSED_QKNORM_ROPE_ROTARY_DIM = 64
+# Positions in the group list built by `_qknorm_groups`.
+_QKNORM_GROUP_MAIN_Q = 0
+_QKNORM_GROUP_INDEX_Q = 2
 
 _has_rocm_qk_norm_rope = False
 if _is_hip:
@@ -381,6 +397,7 @@ class MiniMaxM3MoE(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
+        self.config = config
         self.alt_stream = alt_stream
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
         self.num_fused_shared_experts = get_num_fused_shared_experts()
@@ -420,6 +437,9 @@ class MiniMaxM3MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
             gate_up_interleaved=False,
         )
+        self.experts._minimax_activation = (
+            "swigluoai" if config.hidden_act == "swigluoai" else "swiglu"
+        )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=True,
@@ -435,7 +455,9 @@ class MiniMaxM3MoE(nn.Module):
             intermediate_size = config.intermediate_size * self.n_shared_experts
             # DeepEP all-gathers (not all-reduces) the layer output, so a TP-sharded
             # shared MLP would leave an unreduced partial; replicate (tp_size=1), like GLM4 / DSV2.
-            shared_experts_tp1 = get_moe_a2a_backend().is_deepep()
+            shared_experts_tp1 = (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_megamoe()
+            )
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 quant_config=quant_config,
@@ -463,9 +485,29 @@ class MiniMaxM3MoE(nn.Module):
         )
 
         self.layer_id = layer_id
+        self.trtllm_decode_with_mega_moe = (
+            get_moe_a2a_backend().is_megamoe()
+            and get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        )
+        if self.trtllm_decode_with_mega_moe and (
+            get_parallel().attn_tp_group.ranks != get_parallel().moe_ep_group.ranks
+        ):
+            raise ValueError(
+                "M3.1 hybrid MoE requires matching attention TP and MoE EP groups"
+            )
 
         if get_moe_a2a_backend().is_deepep():
             self.top_k = config.num_experts_per_tok
+
+        # The finalize kernels never rescale: the routed scaling factor is already
+        # in the top-k weights (apply_routed_scaling_factor_on_output).
+        self.supports_deferred_finalize = (
+            self.tp_size > 1
+            and self.shared_experts is not None
+            and get_moe_a2a_backend().is_none()
+            and get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            and self.experts.supports_deferred_finalize
+        )
 
     @staticmethod
     def ebias_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -477,39 +519,140 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if get_moe_a2a_backend().is_megamoe():
+            return self.forward_mega_moe(hidden_states, forward_batch)
         if get_moe_a2a_backend().is_deepep():
             return self.forward_deepep(hidden_states, forward_batch)
         else:
             return self.forward_normal(hidden_states)
 
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_mega_moe(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        from sglang.srt.layers.moe.mega_moe import (
+            is_mega_moe_experts_ready,
+            run_mega_routed_experts,
+        )
+
+        if not is_mega_moe_experts_ready(self.experts):
+            raise RuntimeError(
+                "M3.1 NVFP4 MegaMoE weights are not ready on this device"
+            )
+        num_tokens = hidden_states.shape[0]
+        shared = self._forward_shared_experts(hidden_states) if num_tokens else None
+        topk_ids = topk_weights = None
+        if num_tokens:
+            output = self.topk(
+                hidden_states,
+                self._compute_router_logits(hidden_states),
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=(
+                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                    if get_exec().moe.enable_eplb
+                    else None
+                ),
+            )
+            topk_ids, topk_weights = output.topk_ids, output.topk_weights
+        if self.trtllm_decode_with_mega_moe and forward_batch.forward_mode.is_decode():
+            if not num_tokens:
+                return hidden_states
+            output = self._forward_trtllm_decode(hidden_states, topk_ids, topk_weights)
+            return output + shared if shared is not None else output
+        output = run_mega_routed_experts(
+            self.experts,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.intermediate_size,
+            top_k=self.config.num_experts_per_tok,
+            num_tokens=num_tokens,
+            activation=self.experts._minimax_activation,
+            activation_clamp=self.config.swiglu_limit,
+        )
+        return output + shared if shared is not None else output
+
+    def _forward_trtllm_decode(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatchOutput,
+        )
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        group = get_parallel().attn_tp_group
+
+        def gather(t: torch.Tensor) -> torch.Tensor:
+            out = t.new_empty((t.shape[0] * group.world_size, *t.shape[1:]))
+            group.all_gather_into_tensor(out, t)
+            return out
+
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=gather(hidden_states),
+            hidden_states_scale=None,
+            topk_output=StandardTopKOutput(
+                topk_weights=gather(topk_weights),
+                topk_ids=gather(topk_ids),
+                router_logits=None,
+            ),
+        )
+        partial = self.experts.quant_method.apply(self.experts, dispatch_output)
+        output = torch.empty_like(hidden_states)
+        group.reduce_scatter_tensor(output, partial.hidden_states)
+        return output
+
+    def forward_normal(
+        self, hidden_states: torch.Tensor
+    ) -> Union[torch.Tensor, MoeDeferredFinalize]:
+        defer_finalize = get_forward().defer_moe_finalize
         if hidden_states.shape[0] > 0:
             if (
                 self.alt_stream is not None
                 and self.shared_experts is not None
                 and get_is_capture_mode()
+                and not is_in_breakable_cuda_graph()
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 shared_output = self._forward_shared_experts(hidden_states)
                 with torch.cuda.stream(self.alt_stream):
-                    final_hidden_states = self._forward_router_experts(hidden_states)
+                    final_hidden_states = self._forward_router_experts(
+                        hidden_states, defer_finalize=defer_finalize
+                    )
                 current_stream.wait_stream(self.alt_stream)
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
-                final_hidden_states = self._forward_router_experts(hidden_states)
+                final_hidden_states = self._forward_router_experts(
+                    hidden_states, defer_finalize=defer_finalize
+                )
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
+        if defer_finalize:
+            from sglang.srt.layers.moe.utils import sum_post_experts_output
+
+            return MoeDeferredFinalize.from_flashinfer(
+                final_hidden_states,
+                gated_shared_output=shared_output,
+                m=hidden_states.shape[0],
+                reduce=sum_post_experts_output,
+            )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         return final_hidden_states
 
-    def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_router_experts(
+        self, hidden_states: torch.Tensor, *, defer_finalize: bool = False
+    ):
         router_logits = self._compute_router_logits(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        if defer_finalize:
+            return self.experts.forward_deferred_finalize(hidden_states, topk_output)
         return self.experts(hidden_states, topk_output)
 
     def forward_deepep(
@@ -796,6 +939,20 @@ class MiniMaxM3Attention(nn.Module):
             and self.idx_head_dim == 128
             and self.rotary_emb.cos_sin_cache.dtype == torch.float32
         )
+        # Only the NVFP4 backend consumes FP8 Q; gate on the predicate that
+        # selects it and its KV pool, so the three cannot disagree.
+        self._fp8_q_epilogue_ok = (
+            self._combined_qknorm_ok
+            and envs.SGLANG_OPT_USE_MINIMAX_FP8_Q_EPILOGUE.get()
+            and uses_minimax_m3_nvfp4_native_stack(
+                quant_config.get_name() if quant_config is not None else None
+            )
+        )
+        if self.is_sparse_attention_layer and layer_id == 0:
+            logger.info(
+                "MiniMax M3.1 grouped QK norm/RoPE: FP8 Q epilogue %s",
+                "on" if self._fp8_q_epilogue_ok else "off",
+            )
         if self.is_sparse_attention_layer:
             off_iq = self.num_heads + 2 * self.num_kv_heads
             off_ik = off_iq + self.num_idx_heads
@@ -1153,7 +1310,7 @@ class MiniMaxM3Attention(nn.Module):
             return None
 
         layer_id = self.attn.layer_id
-        k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
+        k_cache, v_cache = kv_pool.layer_router.read(layer_id).kv()
         idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
         page_size = int(kv_pool.page_size)
         if (
@@ -1259,7 +1416,7 @@ class MiniMaxM3Attention(nn.Module):
         )
         if can_use_cache_fusion and kv_pool is not None:
             layer_id = self.attn.layer_id
-            k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
+            k_cache, v_cache = kv_pool.layer_router.read(layer_id).kv()
             idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
             q, k, idx_q, idx_k = sparse_qk_index_gemma_rmsnorm_rope_cache(
                 q,
@@ -1344,20 +1501,52 @@ class MiniMaxM3Attention(nn.Module):
                 return None, forward_batch, inner_state
 
             if self._combined_qknorm_ok:
-                from sglang.kernels.ops.attention.minimax_qknorm_rope import (
-                    minimax_qknorm_rope_grouped,
-                )
+                groups = self._qknorm_groups()
+                if self._fp8_q_epilogue_ok:
+                    from sglang.kernels.ops.attention.minimax_qknorm_rope import (
+                        minimax_qknorm_rope_grouped_fp8,
+                    )
 
-                minimax_qknorm_rope_grouped(
-                    fused_out,
-                    self._qknorm_groups(),
-                    self.rotary_emb.cos_sin_cache,
-                    positions,
-                    self.q_norm.variance_epsilon,
-                )
+                    num_tokens = fused_out.shape[0]
+                    fp8_q = fused_out.new_empty(
+                        (num_tokens, self.num_heads, self.head_dim),
+                        dtype=torch.float8_e4m3fn,
+                    )
+                    fp8_idx_q = fused_out.new_empty(
+                        (num_tokens, self.num_idx_heads, self.idx_head_dim),
+                        dtype=torch.float8_e4m3fn,
+                    )
+                    minimax_qknorm_rope_grouped_fp8(
+                        fused_out,
+                        groups,
+                        self.rotary_emb.cos_sin_cache,
+                        positions,
+                        self.q_norm.variance_epsilon,
+                        fp8_a=fp8_q,
+                        group_a=_QKNORM_GROUP_MAIN_Q,
+                        fp8_b=fp8_idx_q,
+                        group_b=_QKNORM_GROUP_INDEX_Q,
+                    )
+                else:
+                    from sglang.kernels.ops.attention.minimax_qknorm_rope import (
+                        minimax_qknorm_rope_grouped,
+                    )
+
+                    minimax_qknorm_rope_grouped(
+                        fused_out,
+                        groups,
+                        self.rotary_emb.cos_sin_cache,
+                        positions,
+                        self.q_norm.variance_epsilon,
+                    )
+                    fp8_q = fp8_idx_q = None
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
                 idx_qkv = fused_out[:, self._fused_main_size :]
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                if fp8_q is not None:
+                    # The backend's `.to(float8_e4m3fn)` is a no-op on these, so
+                    # the two Q cast kernels disappear without a backend change.
+                    q, idx_q = fp8_q, fp8_idx_q
                 inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
                 return None, forward_batch, inner_state
         else:
@@ -1480,7 +1669,24 @@ class MiniMaxM3Attention(nn.Module):
         return self.forward_core(s)
 
 
+def _uses_push_plane_fusion() -> bool:
+    """Fuse each TP boundary into one push-plane kernel (cluster launch: SM90+)."""
+    parallel = get_parallel()
+    return bool(
+        _is_cuda
+        and get_platform().device_sm >= 90
+        and parallel.attn_tp_size == parallel.tp_size
+        and parallel.attn_cp_size == 1
+        and parallel.pp_size == 1
+        and not is_dp_attention_enabled()
+        and not is_dense_ffn_fully_dp()
+        and get_moe_a2a_backend().is_none()
+    )
+
+
 class MiniMaxM3DecoderLayer(nn.Module):
+    attention_cls = MiniMaxM3Attention
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1505,7 +1711,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             is_sparse_attention_layer = False
             disable_index_value = False
 
-        self.self_attn = MiniMaxM3Attention(
+        self.self_attn = self.attention_cls(
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
@@ -1551,10 +1757,21 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
+        options = {}
+        if _uses_push_plane_fusion():
+            from sglang.srt.layers.layer_boundary.fusions.custom_all_reduce_fusion import (
+                CustomAllReduceFusion,
+            )
+
+            options["fusions"] = CustomAllReduceFusion(
+                hidden_size=config.hidden_size,
+                defers_finalize=self.is_layer_sparse
+                and self.mlp.supports_deferred_finalize,
+            )
         attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (attn, self.input_layernorm),
-            (ffn, self.post_attention_layernorm),
+            (attn, self.input_layernorm, options),
+            (ffn, self.post_attention_layernorm, options),
         )
 
     @classmethod
@@ -1610,9 +1827,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        if self.is_layer_sparse or hidden_states.shape[0] != 0:
-            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
-        return self.ffn_boundary.finish(hidden_states, forward_batch)
+        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
+            if self.is_layer_sparse or hidden_states.shape[0] != 0:
+                hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+        return ffn_exit.finish(hidden_states)
 
 
 class MiniMaxM3Model(nn.Module):
@@ -1667,6 +1885,13 @@ class MiniMaxM3Model(nn.Module):
                 self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+        self.finalize_norm = None
+        if _uses_push_plane_fusion():
+            from sglang.srt.layers.layer_boundary.fusions.custom_all_reduce_fusion import (
+                install_terminal_finalize,
+            )
+
+            self.finalize_norm = install_terminal_finalize(self.layers, self.norm)
 
         self.layers_to_capture = []
 
@@ -1708,7 +1933,10 @@ class MiniMaxM3Model(nn.Module):
                 # NOTE: torch dynamo does not support graph break in context manager
                 ctx = (
                     nullcontext()
-                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                    if (
+                        check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                        or is_in_breakable_cuda_graph()
+                    )
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
@@ -1725,7 +1953,15 @@ class MiniMaxM3Model(nn.Module):
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
         hidden_states = residual_batch.final_norm(
-            hidden_states, forward_batch, self.norm, skip_empty=True
+            hidden_states,
+            forward_batch,
+            self.norm,
+            finalize_norm=self.finalize_norm,
+            # The DSpark draft reads the last layer's updated residual.
+            capture=aux_hidden_states.capture
+            if self.end_layer in self.layers_to_capture
+            else None,
+            skip_empty=True,
         )
 
         if len(aux_hidden_states) == 0:
@@ -1789,10 +2025,13 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         the loader before any layer is built."""
         if not getattr(hf_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
-        if quant_config is not None and quant_config.get_name() == "modelopt_mixed":
+        if quant_config is not None and quant_config.get_name() in (
+            "modelopt_mixed",
+            "minimax_m3_nvfp4",
+        ):
             return (
                 "Shared and routed experts may use different quantization formats "
-                "in ModelOpt mixed-precision checkpoints."
+                "in mixed-precision checkpoints."
             )
         if not (_is_cuda or _is_hip):
             return "Shared experts fusion currently requires CUDA or ROCm devices."
@@ -1837,6 +2076,17 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def precompile_kernels_after_loading(self) -> None:
+        if _uses_push_plane_fusion():
+            from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+                register_fused_all_reduce_comm,
+            )
+
+            # Decode and verify batches up to 341 rows at hidden 6144.
+            register_fused_all_reduce_comm(
+                max_push_size=4 * 1024 * 1024, max_push_blocks=512
+            )
 
     @torch.no_grad()
     def forward(
@@ -2010,6 +2260,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 def get_spec_layer_idx_from_weight_name(
     config: PretrainedConfig, weight_name: str
 ) -> Optional[int]:
+    if weight_name.startswith("model.dspark."):
+        return config.num_hidden_layers
     # M3 checkpoints emit MTP weights as model.mtp.layers.{i}.*; skip them here
     # (no NextN module is built for the main model).
     if hasattr(config, "num_mtp_modules") and (config.num_mtp_modules > 0):

@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -7,6 +8,8 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -16,42 +19,80 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+def _leaf(pool):
+    """Route a fake leaf pool as its own one sub-pool."""
+    pool.start_layer, pool.layer_num = 0, 1
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
+
+
+def _windowed(pool):
+    """Route a fake pool over its full and sliding-window sub-pool views."""
+    pool.layer_router = KVLayerRouter.from_layer_maps(
+        pool,
+        [
+            (IdSpaceKind.FULL, pool.full_kv_pool, {}),
+            (IdSpaceKind.SLIDING_WINDOW, pool.swa_kv_pool, {}),
+        ],
+    )
+    return pool
 
 
 class TestHiCacheAutoSize(CustomTestCase):
     def test_hybrid_target_draft_uses_its_sidecar_slot_capacity(self):
         # EAGLE3 can pair a hybrid target with a plain MHA draft. Full drafts
         # follow full target slots; SWA drafts follow the smaller SWA capacity.
-        target = Mock(
-            spec=SWAKVPool,
-            size=128,
-            full_kv_pool=Mock(
+        target = _windowed(
+            Mock(
+                spec=SWAKVPool,
                 size=128,
-                host_capacity_bytes=None,
-                get_kv_size_bytes=Mock(return_value=4096),
-            ),
-            swa_kv_pool=Mock(
-                size=32,
-                host_capacity_bytes=None,
-                get_kv_size_bytes=Mock(return_value=1024),
-            ),
+                full_kv_pool=_leaf(
+                    Mock(
+                        size=128,
+                        host_capacity_bytes=None,
+                        get_kv_size_bytes=Mock(return_value=4096),
+                    )
+                ),
+                swa_kv_pool=_leaf(
+                    Mock(
+                        size=32,
+                        host_capacity_bytes=None,
+                        get_kv_size_bytes=Mock(return_value=1024),
+                    )
+                ),
+            )
         )
-        draft_mha = Mock(
-            spec=MHATokenToKVPool,
-            size=16,
-            host_capacity_bytes=None,
-            get_kv_size_bytes=Mock(return_value=(128, 128)),
+        draft_mha = _leaf(
+            Mock(
+                spec=MHATokenToKVPool,
+                size=16,
+                host_capacity_bytes=None,
+                get_kv_size_bytes=Mock(return_value=(128, 128)),
+            )
         )
         params = CacheInitParams(
             disable=False,
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=target)),
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
+            token_to_kv_pool_allocator=Mock(
+                get_kvcache=Mock(return_value=target), storage=None
+            ),
             page_size=2,
         )
         for draft, expected_sidecar_bytes in (
             (draft_mha, 2048),
-            (Mock(spec=BaseSWAKVPool, swa_kv_pool=draft_mha), 512),
+            (
+                _windowed(
+                    Mock(
+                        spec=BaseSWAKVPool,
+                        full_kv_pool=draft_mha,
+                        swa_kv_pool=draft_mha,
+                    )
+                ),
+                512,
+            ),
         ):
             with self.subTest(
                 draft_type=type(draft).__name__, bytes=expected_sidecar_bytes
@@ -68,24 +109,32 @@ class TestHiCacheAutoSize(CustomTestCase):
         the weight the explicit host-size split already uses. An estimate taken
         from get_kv_size_bytes is zero device bytes, and the default ratio then
         divides by it."""
-        target = Mock(
-            spec=SWAKVPool,
-            size=128,
-            full_kv_pool=Mock(
+        target = _windowed(
+            Mock(
+                spec=SWAKVPool,
                 size=128,
-                host_capacity_bytes=4096,
-                get_kv_size_bytes=Mock(return_value=(0, 0)),
-            ),
-            swa_kv_pool=Mock(
-                size=32,
-                host_capacity_bytes=1024,
-                get_kv_size_bytes=Mock(return_value=(0, 0)),
-            ),
+                full_kv_pool=_leaf(
+                    Mock(
+                        size=128,
+                        host_capacity_bytes=4096,
+                        get_kv_size_bytes=Mock(return_value=(0, 0)),
+                    )
+                ),
+                swa_kv_pool=_leaf(
+                    Mock(
+                        size=32,
+                        host_capacity_bytes=1024,
+                        get_kv_size_bytes=Mock(return_value=(0, 0)),
+                    )
+                ),
+            )
         )
         params = CacheInitParams(
             disable=False,
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=target)),
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
+            token_to_kv_pool_allocator=Mock(
+                get_kvcache=Mock(return_value=target), storage=None
+            ),
             page_size=2,
         )
         self.assertEqual(sizing._estimate_hicache_bytes(params, None), 4096 + 1024)
@@ -105,8 +154,10 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         params = CacheInitParams(
             disable=False,
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=pool)),
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
+            token_to_kv_pool_allocator=Mock(
+                get_kvcache=Mock(return_value=pool), storage=None
+            ),
             page_size=2,
         )
         rank_budget = 10_000

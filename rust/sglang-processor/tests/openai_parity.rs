@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
 use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
 use sglang_processor::openai::{
     ChatModel, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Responder, TokenPieces, lower_chat,
@@ -173,12 +174,12 @@ fn check_case(
         Some(frames) => {
             let mut events = Vec::new();
             let mut reply = None;
-            for frame in stream_frames(frames)
-                .iter()
-                .map(|f| f.to_string())
-                .chain(["[DONE]".into()])
-            {
-                match responder.stream_data(frame.as_bytes()) {
+            for frame in stream_frames(frames).into_iter().map(Some).chain([None]) {
+                let result = match frame {
+                    Some(frame) => responder.stream_data(generate_result(frame)),
+                    None => Ok(responder.stream_end()),
+                };
+                match result {
                     Ok(more) => events.extend(more),
                     Err(error) => {
                         reply = Some(error);
@@ -198,10 +199,17 @@ fn check_case(
             }
         }
         None => {
-            let body = engine["body"].to_string();
             let reply = match case["request"]["stream"] == true || status != 200 {
-                true => Responder::rejected(body.as_bytes()),
-                false => responder.unary(body.as_bytes()),
+                true => generate_result(engine["body"].clone())
+                    .err()
+                    .map(Responder::rejected),
+                false => {
+                    let output = match engine["body"].clone() {
+                        Value::Array(items) => items,
+                        item => vec![item],
+                    };
+                    responder.unary(output.into_iter().map(generate_result).collect())
+                }
             };
             let reply = reply.ok_or("no reply")?;
             (
@@ -227,6 +235,14 @@ const GROWING: [&str; 4] = [
     "output_token_logprobs",
     "output_top_logprobs",
 ];
+
+fn generate_result(value: Value) -> Result<GenerateResponse, GenerateStreamError> {
+    if value.get("error").is_some() {
+        Err(serde_json::from_value(value).unwrap())
+    } else {
+        Ok(serde_json::from_value(value).unwrap())
+    }
+}
 
 /// The frames as the engine sent them, each choice's rebuilt from its stored deltas.
 fn stream_frames(deltas: &[Value]) -> Vec<Value> {

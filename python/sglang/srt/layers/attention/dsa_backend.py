@@ -14,7 +14,11 @@ from typing import (
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    dsa_draft_shards_under_dcp,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
     get_buffer,
@@ -541,7 +545,9 @@ class DeepseekSparseAttnBackend(
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
-        if model_runner.is_draft_worker:
+        if model_runner.is_draft_worker and not dsa_draft_shards_under_dcp(
+            model_runner.model_config.hf_config, get_parallel().attn_dcp_size
+        ):
             self.dcp_size, self.dcp_rank = 1, 0
         else:
             self.dcp_size = get_parallel().attn_dcp_size
@@ -876,6 +882,7 @@ class DeepseekSparseAttnBackend(
         q_dtype: torch.dtype,
         kv_dtype: torch.dtype,
     ) -> dict:
+        kv_indptr = kv_indptr[: bs + 1]
         self._ensure_aiter_dsa_decode_metadata_buffer(
             max_seqlen_q=max_seqlen_q,
             batch_size=bs,
@@ -2233,7 +2240,7 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                self.kv_layers.layer(layer.layer_id).store_mla(
                     layer,
                     cache_loc,
                     k,
@@ -2257,7 +2264,7 @@ class DeepseekSparseAttnBackend(
             )
 
         # Do absorbed multi-latent attention (MLA path)
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = self.kv_layers.read(layer.layer_id).key()
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2272,6 +2279,7 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        shared_topk_indices = topk_indices
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
@@ -2359,6 +2367,18 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
+            if _is_hip and self.dcp_size > 1:
+                assert topk_transform_method == TopkTransformMethod.PAGED
+                return self._forward_triton_dcp(
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    kv_cache=kv_cache,
+                    v_head_dim=layer.v_head_dim,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    layer=layer,
+                    topk_indices=shared_topk_indices,
+                )
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
             )
@@ -2376,7 +2396,7 @@ class DeepseekSparseAttnBackend(
                     if self.dsa_index_kpool <= 1
                     else None
                 ),
-            )
+            ).squeeze(0)
         elif dsa_impl in (
             "flashmla_sparse",
             "flashmla_sparse_q8",
@@ -2589,7 +2609,7 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                self.kv_layers.layer(layer.layer_id).store_mla(
                     layer,
                     cache_loc,
                     k,
@@ -2597,7 +2617,7 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Do absorbed multi-latent attention
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = self.kv_layers.read(layer.layer_id).key()
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -2616,6 +2636,7 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        shared_topk_indices = topk_indices
         # Align topk_indices with q dimensions
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
@@ -2687,6 +2708,19 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
+            # CUDA keeps upstream's dispatch: #43735 wires DCP to the trtllm
+            # backends, and this localized path has only been run on ROCm.
+            if _is_hip and self.dcp_size > 1:
+                return self._forward_triton_dcp(
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    kv_cache=kv_cache,
+                    v_head_dim=layer.v_head_dim,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    layer=layer,
+                    topk_indices=shared_topk_indices,
+                )
             return self._forward_triton_decode(
                 q_nope=q_nope,
                 q_rope=q_rope,
@@ -3460,13 +3494,15 @@ class DeepseekSparseAttnBackend(
                 dim=-1,
             )
 
+        # The kernel adds a singleton batch axis; attention padding expects
+        # the token axis first, as in q_all.
         return tilelang_sparse_fwd(
             q=q_all,
             kv=kv_cache,
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
-        )
+        ).squeeze(0)
 
     def _forward_triton_decode(
         self,
@@ -3491,7 +3527,53 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             d_v=v_head_dim,
             workspace=workspace,
+        ).squeeze(0)
+
+    def _forward_triton_dcp(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        layer: RadixAttention,
+        topk_indices: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend the owned slots of the global top-k; one query row per token."""
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk,
         )
+
+        rows, heads = q_nope.shape[0], q_nope.shape[1]
+        if rows == 0:
+            return (
+                q_nope.new_empty((rows, heads, v_head_dim), dtype=torch.bfloat16),
+                q_nope.new_empty((rows, heads), dtype=torch.float32),
+            )
+        local_page_table, owned_counts = localize_dcp_page_table(
+            self._dcp_page_table_cache,
+            metadata=self.forward_metadata,
+            layer_id=layer.layer_id,
+            topk_indices=topk_indices,
+            page_table=page_table_1[:rows].contiguous(),
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+        )
+        stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
+        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
+        out, lse = triton_sparse_mla_decode_splitk(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv=kv_cache,
+            indices=local_page_table.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=v_head_dim,
+            workspace=workspace,
+            return_lse=True,
+            lengths=owned_counts,
+        )
+        return out.view(rows, heads, v_head_dim), lse
 
     def _forward_intel_xpu_sparse_decode(
         self,
@@ -3874,9 +3956,9 @@ class DeepseekSparseAttnBackend(
                 if not layer.is_cross_attention
                 else forward_batch.encoder_out_cache_loc
             )
-            self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
+            self.kv_layers.layer(layer.layer_id).store_mla(layer, cache_loc, k, k_rope)
 
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.kv_layers.read(layer.layer_id).key()
         kv_cache = k_cache.view(
             -1, self.physical_page_size, self.kv_cache_dim
         ).unsqueeze(1)
@@ -4141,6 +4223,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,
+            dcp_size=self.dcp_size,
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):

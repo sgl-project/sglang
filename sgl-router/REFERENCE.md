@@ -99,9 +99,34 @@ is common with parallel sampling, RL rollouts and agent fan-out.
 `--cache-pending-prefix-ttl-ms` credits a worker with a prompt's prefix for that
 long after routing it there, so the burst stays together. It is off by default
 and needs `--policy cache_aware` with the Router-local radix tree.
+
+By default pending depths merge with the confirmed ones by maximum on every
+request. `--cache-pending-prefix-consult-below <ratio>` switches to
+confirmed-first: a pending stake is consulted only when it is strictly deeper
+than the best confirmed match, so a KV-event match that is at least as good
+always wins, and only while the confirmed match covers less than `ratio` of the
+prompt. A turn whose history the events have confirmed then routes on that
+match and neither walks the pending store nor writes a stake, so a warm request
+pays nothing for the tier; a cold prefix (a first turn, or a turn racing its
+predecessor's events) still consults and stakes. 0.5 is a good starting point;
+1 consults on every request but keeps the strictly-deeper rule.
+
+`--cache-pending-prefix-max-followers` caps how many requests one stake may
+attract within its TTL (default unbounded). The confirmed tree is always
+looked up first; past the cap the stake is simply hidden, so the request is
+routed as if it did not exist, by its confirmed matches or else by the load
+policy, instead of a burst piling onto one worker. The cap is charged on the deepest
+block a request matched, so a shared system prompt is never what reaches it,
+and a conversation keeps following its own stake as each turn stakes a new
+tail. Prefill serves a same-prefix burst from cache once the first member has
+landed, so set the cap only as a safety valve against runaway fan-out.
+
 `sgl_router_cache_pending_prefix_hits_total` counts lookups where a pending
-prefix matched deeper than any confirmed one; the policy's candidate and
-admission filters still decide whether that worker is picked.
+prefix matched deeper than any confirmed one,
+`sgl_router_cache_pending_prefix_followed_total` requests routed to a worker
+because of its stake, and `sgl_router_cache_pending_prefix_capped_total` lookups
+the cap left without a pending candidate; the policy's candidate and admission
+filters still decide whether a worker is picked.
 
 ### Peer bootstrap (Kubernetes)
 
