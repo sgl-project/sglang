@@ -21,7 +21,7 @@ class VPCJPEGDecoder:
         self.device = torch.device(f"npu:{device}")
         torch.npu.set_device(self.device)
         torch.empty(1, device=self.device)  # Initialize the caller's ACL context.
-        self.decoder = JPEGDecoder(device, width_alignment=64)
+        self.decoder = JPEGDecoder(device)
         self.channel, self.channel_created = None, False
         d, a = self.decoder, self.decoder.acl
         try:

@@ -5,9 +5,6 @@ import os
 import threading
 import weakref
 from dataclasses import dataclass
-from io import BytesIO
-
-from PIL import Image
 
 from sglang.srt.hardware_backend.npu.jpeg.dvpp import UnsupportedJPEG, inspect_jpeg
 
@@ -89,20 +86,16 @@ def decode_jpeg(data: bytes):
     """Return uint8 CHW on the current NPU, or None for supported PIL fallback.
 
     No device work is performed for ineligible headers. Runtime failures and
-    malformed/over-budget inputs remain errors rather than hidden CPU success.
+    malformed inputs remain errors rather than hidden CPU success.
     """
     if not isinstance(data, bytes):
         raise TypeError("NPU JPEG input must be bytes")
     if not (data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9")):
         return None
     try:
-        inspect_jpeg(data, width_alignment=64)
+        inspect_jpeg(data)
     except UnsupportedJPEG:
         return None
-    with Image.open(BytesIO(data)) as image:
-        if image.getexif() or image.info.get("icc_profile") or image.info.get("exif"):
-            return None
-
     import torch
     import torch_npu  # noqa: F401 - registers the NPU device backend
 

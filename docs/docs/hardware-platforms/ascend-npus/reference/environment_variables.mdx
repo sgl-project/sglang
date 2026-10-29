@@ -76,7 +76,7 @@ Send requests using the [multimodal chat example](/docs/basic_usage/openai_api_v
 
 ### Supported inputs and quality
 
-- The device path accepts 8-bit baseline SOF0, three-component YCbCr 4:2:0 JPEGs with width and height from 32 through 4096. Complete JPEG candidates exceeding 32 MiB or 16,777,216 pixels raise an error.
+- The device path accepts 8-bit baseline SOF0, three-component YCbCr 4:2:0 JPEGs with width and height from 32 through 4096, and at most 32 MiB of encoded data. Inputs outside these device-path limits retain CPU/PIL decoding.
 - For odd dimensions, an internal JPEGD input copy rounds the SOF0 width or height up by one within the existing MCU grid. Compressed scan data is unchanged, and the RGB output is cropped to the original dimensions.
 - PNG, progressive JPEG, grayscale, CMYK, other chroma sampling, unsupported dimensions, and JPEGs with EXIF or ICC metadata retain the existing PIL path.
 - Processors that disable tensor decoding or request `nvjpeg_fancy` keep their existing loading behavior.

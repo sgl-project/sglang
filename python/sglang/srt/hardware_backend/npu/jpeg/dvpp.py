@@ -58,24 +58,18 @@ class JPEGInfo:
         return self.width_stride * self.height_stride * 3 // 2
 
 
-def inspect_jpeg(data: bytes, *, width_alignment=128, max_pixels=16_777_216):
-    """Read headers only; no CPU pixel decode on the accepted path.
-
-    128 is the original Atlas training alignment. Use 64 for A2/A3 after
-    confirming the product. These are NV12 strides, not RGB strides.
-    """
+def inspect_jpeg(data: bytes):
+    """Read device eligibility and metadata without CPU pixel decoding."""
     if not isinstance(data, bytes):
         raise TypeError("encoded input must be bytes")
-    if width_alignment not in (64, 128):
-        raise ValueError("width_alignment must be 64 (A2/A3) or 128 (original 910)")
-    if not data or len(data) > 32 * 1024 * 1024:
-        raise ValueError("encoded input must contain 1..32 MiB")
+    if not data:
+        raise ValueError("encoded input must not be empty")
+    if len(data) > 32 * 1024 * 1024:
+        raise UnsupportedJPEG("encoded input exceeds the 32 MiB device-path limit")
     with Image.open(BytesIO(data)) as im:
         if im.format != "JPEG":
             raise UnsupportedJPEG("not JPEG")
         w, h = im.size
-        if w * h > max_pixels:
-            raise ValueError("pixel budget exceeded")
         if im.info.get("progressive") or im.info.get("progression"):
             raise UnsupportedJPEG("progressive JPEG uses CPU fallback")
         if im.mode != "RGB" or JpegImagePlugin.get_sampling(im) != 2:
@@ -84,11 +78,13 @@ def inspect_jpeg(data: bytes, *, width_alignment=128, max_pixels=16_777_216):
         # Its even decode extent and the NV12 strides remain within that limit.
         if not (32 <= w <= 4096 and 32 <= h <= 4096):
             raise UnsupportedJPEG("JPEGD/VPC requires dimensions in [32, 4096]")
-    try:
-        inspect_420_sof(data, w, h)
-    except UnsupportedSOF as error:
-        raise UnsupportedJPEG(str(error)) from error
-    return JPEGInfo(w, h, align_up(w, width_alignment), align_up(h, 16))
+        try:
+            inspect_420_sof(data, w, h)
+        except UnsupportedSOF as error:
+            raise UnsupportedJPEG(str(error)) from error
+        if im.getexif() or im.info.get("icc_profile") or im.info.get("exif"):
+            raise UnsupportedJPEG("EXIF/ICC metadata uses CPU fallback")
+    return JPEGInfo(w, h, align_up(w, 64), align_up(h, 16))
 
 
 class DeviceFrame:
@@ -109,21 +105,22 @@ class DeviceFrame:
     def __enter__(self):
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None and self.decoder.poisoned:
+            # Keep potentially active DMA memory and preserve the original error.
+            return
         self.close()
 
 
 class JPEGDecoder:
     """Reuse a JPEGD stream/channel within the caller's initialized context."""
 
-    def __init__(self, device: int, *, width_alignment=128):
+    def __init__(self, device: int):
         if not isinstance(device, int) or isinstance(device, bool) or device < 0:
             raise ValueError("an explicit non-negative device ID is required")
-        if width_alignment not in (64, 128):
-            raise ValueError("width_alignment must be 64 or 128")
         import acl  # provided by the selected CANN environment
 
-        self.acl, self.device, self.width_alignment = acl, device, width_alignment
+        self.acl = acl
         self.pid, self.lock, self.frames = os.getpid(), threading.RLock(), set()
         self.context = self.stream = self.channel = None
         self.channel_created = False
@@ -162,7 +159,7 @@ class JPEGDecoder:
         check(self.acl.rt.set_context(self.context), "acl.rt.set_context")
 
     def decode(self, data: bytes) -> DeviceFrame:
-        info = inspect_jpeg(data, width_alignment=self.width_alignment)
+        info = inspect_jpeg(data)
         data = normalize_420_sof(data, info.width, info.height)
         with self.lock:
             self._activate()
@@ -283,9 +280,3 @@ class JPEGDecoder:
                 self.stream = None
             if self.context is not None:
                 self.context = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.close()

@@ -119,6 +119,8 @@ class TestNpuJpegEligibility(unittest.TestCase):
             image_bytes(mode="L"),
             image_bytes(mode="CMYK"),
             image_bytes(size=(16, 16)),
+            image_bytes(size=(31, 32)),
+            image_bytes(size=(32, 31)),
             image_bytes(size=(4097, 32)),
             image_bytes(size=(32, 4097)),
             image_bytes(exif=exif),
@@ -157,20 +159,56 @@ class TestNpuJpegEligibility(unittest.TestCase):
         with self.assertRaises((OSError, ValueError)):
             jpeg.decode_jpeg(b"\xff\xd8broken\xff\xd9")
 
-    def test_budget_failure_remains_error(self):
-        with patch.object(jpeg, "inspect_jpeg", side_effect=ValueError("pixel budget")):
-            with self.assertRaisesRegex(ValueError, "pixel budget"):
-                jpeg.decode_jpeg(image_bytes())
+    def test_device_limits_keep_real_pil_fallback(self):
+        small = image_bytes()
+        # Valid COM segments increase encoded size without changing the pixels.
+        comment = b"\xff\xfe\xff\xff" + b"x" * 65533
+        large_encoded = small[:2] + comment * 513 + small[2:]
+        self.assertGreater(len(large_encoded), 32 * 1024 * 1024)
+        cases = [
+            image_bytes(size=(4097, 32)),
+            image_bytes(size=(32, 4097)),
+            image_bytes(size=(4097, 4097)),
+            large_encoded,
+        ]
+        with (
+            patch.dict(os.environ, {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "1"}),
+            patch.object(common, "is_npu", return_value=True),
+            patch.object(common, "is_jpeg_with_cuda", return_value=False),
+            patch.object(jpeg, "_decoder", side_effect=AssertionError("device work")),
+        ):
+            for index, data in enumerate(cases):
+                with (
+                    self.subTest(index=index),
+                    Image.open(io.BytesIO(data)) as expected,
+                ):
+                    result = common._load_image(image_bytes=data)
+                    self.assertIsInstance(result, Image.Image)
+                    self.assertEqual(result.size, expected.size)
+                    for pixel in [(0, 0), (expected.width - 1, expected.height - 1)]:
+                        self.assertEqual(
+                            result.getpixel(pixel), expected.getpixel(pixel)
+                        )
 
     def test_odd_and_vpc_boundary_dimensions_are_admitted(self):
-        for w, h in [(65, 32), (64, 33), (65, 33), (4095, 32), (4096, 32)]:
+        for w, h in [
+            (32, 32),
+            (65, 32),
+            (64, 33),
+            (65, 33),
+            (4095, 32),
+            (4096, 32),
+            (32, 4096),
+        ]:
             with self.subTest(size=(w, h)):
-                info = dvpp.inspect_jpeg(image_bytes(size=(w, h)), width_alignment=64)
+                info = dvpp.inspect_jpeg(image_bytes(size=(w, h)))
                 self.assertEqual((info.width, info.height), (w, h))
                 self.assertEqual(
                     (info.decode_width, info.decode_height), (w + w % 2, h + h % 2)
                 )
                 self.assertLessEqual(max(info.width_stride, info.height_stride), 4096)
+                if (w, h) == (32, 32):
+                    self.assertEqual((info.width_stride, info.height_stride), (64, 32))
 
     def test_nonbaseline_frame_falls_back_for_even_and_odd_sizes(self):
         for size in [(64, 32), (65, 33)]:
@@ -262,6 +300,47 @@ class TestVpcCleanup(unittest.TestCase):
             [(102,), (101,)],
         )
         a.media.dvpp_free.assert_called_once_with(17)
+
+
+class TestDeviceFrameOwnership(unittest.TestCase):
+    def setUp(self):
+        self.decoder = dvpp.JPEGDecoder.__new__(dvpp.JPEGDecoder)
+        d = self.decoder
+        d.lock, d.pid, d.context = threading.RLock(), os.getpid(), 1
+        d.poisoned, d.acl = False, Mock()
+        d.acl.rt.set_context.return_value = 0
+        d.acl.media.dvpp_free.return_value = 0
+        self.frame = dvpp.DeviceFrame(d, 17, 3072, dvpp.JPEGInfo(64, 32, 64, 32))
+        d.frames = {self.frame}
+
+    def test_nonpoisoned_unwind_releases_frame_and_keeps_original_error(self):
+        original = RuntimeError("conversion failed")
+        with self.assertRaises(RuntimeError) as caught:
+            with self.frame:
+                raise original
+        self.assertIs(caught.exception, original)
+        self.decoder.acl.media.dvpp_free.assert_called_once_with(17)
+        self.assertEqual(self.frame.ptr, 0)
+        self.assertNotIn(self.frame, self.decoder.frames)
+
+    def test_poisoned_unwind_preserves_sync_error_and_retains_dma_memory(self):
+        original = dvpp.ACLFailure("synchronize_stream VPC: ACL error 9")
+        with self.assertRaises(dvpp.ACLFailure) as caught:
+            with self.frame:
+                self.decoder.poisoned = True
+                raise original
+        self.assertIs(caught.exception, original)
+        self.decoder.acl.media.dvpp_free.assert_not_called()
+        self.assertEqual(self.frame.ptr, 17)
+        self.assertIn(self.frame, self.decoder.frames)
+        with self.assertRaisesRegex(dvpp.ACLFailure, "terminate"):
+            self.frame.close()
+        with self.assertRaisesRegex(dvpp.ACLFailure, "terminate"):
+            self.decoder.close()
+        with self.assertRaisesRegex(dvpp.ACLFailure, "terminate"):
+            with self.frame:
+                pass
+        self.decoder.acl.media.dvpp_free.assert_not_called()
 
 
 class TestNpuJpegOwnership(unittest.TestCase):
