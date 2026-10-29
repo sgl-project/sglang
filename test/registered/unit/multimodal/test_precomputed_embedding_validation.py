@@ -18,6 +18,9 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     BaseMultiModalProcessorOutput,
 )
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
+)
 
 
 class _StubProcessor(BaseMultimodalProcessor):
@@ -54,7 +57,9 @@ class TestPrecomputedEmbeddingValidation(unittest.TestCase):
             "offsets": [(1, 2)],
             "hash": 123,
         }
-        self.processor.use_cuda_ipc = False
+        self.processor._feature_transport = MultimodalFeatureTransport(
+            "cpu", base_gpu_id=0, skip_mm_pool=True
+        )
         self.processor._resolve_processor = Mock(return_value=(None, None))
         items, _, _ = self.processor.process_and_combine_mm_data(
             BaseMultiModalProcessorOutput(
