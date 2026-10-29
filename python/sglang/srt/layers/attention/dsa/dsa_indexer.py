@@ -821,6 +821,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # Draft rows share their request's table; broadcast into the
         # preallocated buffer, since no allocation is legal under capture.
         n_pt, blocks = page_table_64.shape
+        # Consecutive rows that belong to one request (the verify rows of MTP);
+        # the logits kernel shares their K page loads.
+        rows_per_request = 1
+        bs = forward_batch.batch_size
+        if forward_batch.forward_mode.is_target_verify() and bs and rows % bs == 0:
+            rows_per_request = rows // bs
         if n_pt < rows:
             if rows % n_pt or rows * blocks > state.workspace.page_table.numel():
                 return None
@@ -846,6 +852,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             row_ends_int32=seqlens,
             page_table_64=page_table_64,
             rows=rows,
+            rows_per_request=rows_per_request,
         )
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
