@@ -22,6 +22,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
     with_phase,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     parse_connector_type,
 )
@@ -557,7 +558,11 @@ def generate_cpu_graph_batch_sizes(server_args: Any):
 def apply_cuda_graph_disaggregation_roles(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.disaggregation_mode == "prefill":
-        if (Phase.DECODE, "backend") not in server_args._cuda_graph_config_locked:
+        # A platform whose graph runner also serves prefill (it compiles the
+        # prefill shapes) needs that runner built on a PD prefill server too.
+        locked = (Phase.DECODE, "backend") in server_args._cuda_graph_config_locked
+        owns_prefill = current_platform.capabilities.graph_runner_owns_prefill
+        if not locked and not owns_prefill:
             declare_resolution(
                 server_args,
                 "_apply_cuda_graph_disaggregation_roles",
