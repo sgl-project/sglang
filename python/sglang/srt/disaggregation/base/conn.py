@@ -118,6 +118,8 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    # Optional proof of ordinary registerable NHD full/SWA page geometry.
+    kv_pack_layout: Optional[dict] = None
 
 
 class KVPoll:

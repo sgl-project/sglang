@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
@@ -177,9 +178,12 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
+    pack_layout: Optional[dict] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        from sglang.srt.disaggregation.packed_layout import decode_optional_pack_layout
+
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -226,8 +230,10 @@ class KVArgsRegisterInfo:
                 if len(msg) > 19 and msg[19]
                 else []
             ),
-            # Note: always put the staging field at the final
+            # Preserve staging's existing fields 14/15/18; optional extensions
+            # are appended after the KV item lengths at field 19.
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
+            pack_layout=decode_optional_pack_layout(msg[20] if len(msg) > 20 else None),
         )
 
 
@@ -278,6 +284,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self._swa_packing_enabled = envs.SGLANG_MOONCAKE_SWA_PACKING.get()
+        self._swa_packed_local = threading.local()
+        self._swa_packed_senders = []
+        self._swa_packed_senders_lock = threading.Lock()
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
@@ -522,6 +532,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._zmq_ctx.destroy(linger=0)
         except Exception:
             logger.exception("Failed to destroy mooncake zmq context during teardown")
+
+        # A failed sync/active gather retains registration and engine globally.
+        with self._swa_packed_senders_lock:
+            for sender in self._swa_packed_senders:
+                sender.close()
+            self._swa_packed_senders.clear()
 
         # Deregister memory from the transfer engine.
         try:
@@ -2183,6 +2199,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size
                             ),
                             executor=executor,
+                            src_layer_ids=src_state_layer_ids,
+                            dst_layer_ids=dst_state_layer_ids,
                         )
                         or rc
                     )
@@ -2441,6 +2459,91 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
+    def _try_send_swa_packed(
+        self,
+        req,
+        src_pages,
+        src_ptrs,
+        src_item_lens,
+        dst_ptrs,
+        dst_pages,
+        dst_item_lens,
+        executor,
+        src_layer_ids,
+        dst_layer_ids,
+    ):
+        """Optional sender-only SWA path; fallback is legal only before gather."""
+        if not getattr(self, "_swa_packing_enabled", False):
+            return None
+        peer = self.decode_kv_args_table.get(req.mooncake_session_id)
+        if (
+            peer is None
+            or not self.enable_deferred_decode_kv_release
+            or self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or self.pp_size != 1
+            or self.attn_cp_size != 1
+            or self.dcp_size != 1
+            or peer.requires_dcp_relayout
+            or peer.dst_dcp_size != 1
+            or peer.dst_attn_tp_size <= 0
+            or getattr(self.kv_args, "num_draft_entries", 0)
+            or list(self.kv_args.state_types) != [StateType.SWA]
+            or list(src_ptrs) != list(self.kv_args.state_data_ptrs[0])
+            or not peer.dst_state_data_ptrs
+            or list(dst_ptrs) != list(peer.dst_state_data_ptrs[0])
+        ):
+            return None
+        from sglang.srt.disaggregation.packed_layout import prove_packed_transfer
+
+        layout = prove_packed_transfer(
+            getattr(self.kv_args, "kv_pack_layout", None),
+            peer.pack_layout,
+            "swa",
+            src_tp=self.attn_tp_size,
+            dst_tp=peer.dst_attn_tp_size,
+            src_rank=self.attn_tp_rank,
+            dst_rank=peer.dst_tp_rank % peer.dst_attn_tp_size,
+            total_heads=self.kv_args.total_kv_head_num,
+            src_ptrs=src_ptrs,
+            dst_ptrs=dst_ptrs,
+            src_item_lens=src_item_lens,
+            dst_item_lens=dst_item_lens,
+            src_layer_ids=src_layer_ids,
+            dst_layer_ids=dst_layer_ids,
+            src_pages=src_pages,
+            dst_pages=dst_pages,
+        )
+        if layout is None:
+            return None
+        if not len(src_pages):
+            return 0
+        size = envs.SGLANG_MOONCAKE_SWA_PACK_BUFFER_SIZE_MB.get() * 1024 * 1024
+        if size < len(src_ptrs) * layout.dst_page_bytes:
+            return None
+        from sglang.srt.disaggregation.mooncake.packed import MooncakePackedSwaSender
+
+        sender = getattr(self._swa_packed_local, "sender", None)
+        if sender is None:
+            sender = MooncakePackedSwaSender(
+                self.engine, executor, self.kv_args.gpu_id, size
+            )
+            self._swa_packed_local.sender = sender
+            with self._swa_packed_senders_lock:
+                self._swa_packed_senders.append(sender)
+        try:
+            return sender.send(
+                req.mooncake_session_id,
+                src_ptrs,
+                dst_ptrs,
+                src_pages,
+                dst_pages,
+                layout,
+            )
+        except BaseException:
+            self._poison_unsettled_send(req.room)
+            raise
+
     def _send_swa_state_slice(
         self,
         req: TransferInfo,
@@ -2453,7 +2556,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        src_layer_ids=None,
+        dst_layer_ids=None,
     ) -> int:
+        packed = self._try_send_swa_packed(
+            req,
+            prefill_swa_page_indices,
+            src_state_data_ptrs,
+            src_state_item_lens,
+            dst_state_data_ptrs,
+            dst_swa_page_indices,
+            dst_state_item_lens,
+            executor,
+            src_layer_ids or [],
+            dst_layer_ids or [],
+        )
+        if packed is not None:
+            return packed
         blocks = self._get_mha_head_slice_blocks(
             src_ptrs=src_state_data_ptrs,
             src_item_lens=src_state_item_lens,
@@ -3285,6 +3404,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{len(self.kv_args.kv_item_lens)}Q",
                 *self.kv_args.kv_item_lens,
             ),
+            json.dumps(getattr(self.kv_args, "kv_pack_layout", None)).encode("utf-8"),
         ]
 
     def build_receiver_metadata_message(
