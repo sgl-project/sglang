@@ -209,12 +209,14 @@ impl StreamingProcessor {
         let stream_options = &original_request.stream_options;
 
         // Phase 1: Initialize state tracking (per-index for n>1 support)
+        // Token counts are accumulated in u64 (clamped at ingestion) so worker
+        // misreports and multi-choice sums cannot wrap the accounting.
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
         let mut stream_buffers: HashMap<u32, String> = HashMap::new();
         let mut finish_reasons: HashMap<u32, String> = HashMap::new();
         let mut matched_stops: HashMap<u32, Option<Value>> = HashMap::new();
-        let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
-        let mut completion_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut prompt_tokens: HashMap<u32, u64> = HashMap::new();
+        let mut completion_tokens: HashMap<u32, u64> = HashMap::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
 
         // Parser state (lazy initialization per index)
@@ -294,7 +296,7 @@ impl StreamingProcessor {
                     // For SGLang, skip (SGLang sends cumulative values)
                     if chunk.is_vllm() {
                         let tokens_count = completion_tokens.entry(index).or_insert(0);
-                        *tokens_count += chunk.token_ids().len() as u32;
+                        *tokens_count += chunk.token_ids().len() as u64;
                     }
 
                     // Get or create stop decoder for this index
@@ -471,18 +473,25 @@ impl StreamingProcessor {
                         }
                     }
 
-                    // Store metadata
-                    prompt_tokens.insert(index, complete.prompt_tokens() as u32);
+                    // Store metadata (clamp worker-reported counts: negative
+                    // sentinels must not surface as ~4.29e9 after the cast)
+                    prompt_tokens.insert(
+                        index,
+                        utils::clamp_worker_token_count(complete.prompt_tokens()),
+                    );
 
                     // For vLLM, use accumulated count (we tracked deltas)
                     // For SGLang, use complete value (already cumulative)
                     if complete.is_vllm() {
                         completion_tokens.entry(index).or_insert(0);
                     } else {
-                        completion_tokens.insert(index, complete.completion_tokens() as u32);
+                        completion_tokens.insert(
+                            index,
+                            utils::clamp_worker_token_count(complete.completion_tokens()),
+                        );
                     }
 
-                    cached_tokens.insert(index, complete.cached_tokens() as u32);
+                    cached_tokens.insert(index, complete.cached_tokens().max(0) as u32);
                     finish_reasons.insert(index, complete.finish_reason().to_string());
 
                     // Extract matched_stop
@@ -563,15 +572,15 @@ impl StreamingProcessor {
         // Phase 5: Usage chunk
         if let Some(stream_opts) = stream_options {
             if stream_opts.include_usage.unwrap_or(false) {
-                let total_prompt: u32 = prompt_tokens.values().sum();
-                let total_completion: u32 = completion_tokens.values().sum();
+                let total_prompt: u64 = prompt_tokens.values().sum();
+                let total_completion: u64 = completion_tokens.values().sum();
 
                 let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                     .created(created)
                     .usage(Usage {
-                        prompt_tokens: total_prompt,
-                        completion_tokens: total_completion,
-                        total_tokens: total_prompt + total_completion,
+                        prompt_tokens: utils::saturate_to_usage_u32(total_prompt),
+                        completion_tokens: utils::saturate_to_usage_u32(total_completion),
+                        total_tokens: utils::saturate_to_usage_u32(total_prompt + total_completion),
                         completion_tokens_details: None,
                     })
                     .maybe_system_fingerprint(system_fingerprint)
@@ -587,9 +596,9 @@ impl StreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         grpc_stream.mark_completed();
 
-        // Record streaming metrics
-        let total_prompt: u32 = prompt_tokens.values().sum();
-        let total_completion: u32 = completion_tokens.values().sum();
+        // Record streaming metrics (exact u64 totals; no wrap)
+        let total_prompt: u64 = prompt_tokens.values().sum();
+        let total_completion: u64 = completion_tokens.values().sum();
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
@@ -597,8 +606,8 @@ impl StreamingProcessor {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: first_token_time.map(|t| t.duration_since(start_time)),
             generation_duration: start_time.elapsed(),
-            input_tokens: Some(total_prompt as u64),
-            output_tokens: total_completion as u64,
+            input_tokens: Some(total_prompt),
+            output_tokens: total_completion,
         });
 
         Ok(())
@@ -739,9 +748,10 @@ impl StreamingProcessor {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
 
-        // Track state per index for n>1 case
+        // Track state per index for n>1 case (u64 accumulator: streams with
+        // more than 2^32 tokens must not wrap the count mid-stream)
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
-        let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        let mut completion_tokens_map: HashMap<u32, u64> = HashMap::new();
 
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
@@ -757,7 +767,7 @@ impl StreamingProcessor {
 
                     // Both backends send delta token_ids, so accumulate for both
                     let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
-                    *completion_tokens += chunk.token_ids().len() as u32;
+                    *completion_tokens += chunk.token_ids().len() as u64;
                     let current_completion_tokens = *completion_tokens;
 
                     // Decode tokens to text (skip_special_tokens=true to handle newlines correctly)
@@ -837,8 +847,8 @@ impl StreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         stream.mark_completed();
 
-        // Record streaming metrics
-        let total_completion: u32 = completion_tokens_map.values().sum();
+        // Record streaming metrics (exact u64 totals; no wrap)
+        let total_completion: u64 = completion_tokens_map.values().sum();
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
 
         Ok(())
@@ -907,11 +917,12 @@ impl StreamingProcessor {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
 
-        // Track state per index for n>1 case
+        // Track state per index for n>1 case (u64 accumulator: streams with
+        // more than 2^32 tokens must not wrap the count mid-stream)
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
         let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
             HashMap::new();
-        let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        let mut completion_tokens_map: HashMap<u32, u64> = HashMap::new();
 
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e))?;
@@ -927,7 +938,7 @@ impl StreamingProcessor {
 
                     // Both backends send delta token_ids, so accumulate for both
                     let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
-                    *completion_tokens += chunk.token_ids().len() as u32;
+                    *completion_tokens += chunk.token_ids().len() as u64;
                     let current_completion_tokens = *completion_tokens;
 
                     // Decode tokens to text
@@ -1033,8 +1044,8 @@ impl StreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         stream.mark_completed();
 
-        // Record streaming metrics
-        let total_completion: u32 = completion_tokens_map.values().sum();
+        // Record streaming metrics (exact u64 totals; no wrap)
+        let total_completion: u64 = completion_tokens_map.values().sum();
         Self::record_generate_metrics(start_time, first_token_time, total_completion, &ctx);
 
         Ok(())
@@ -1048,7 +1059,7 @@ impl StreamingProcessor {
     fn record_generate_metrics(
         start_time: Instant,
         first_token_time: Option<Instant>,
-        total_completion: u32,
+        total_completion: u64,
         ctx: &GenerateStreamContext,
     ) {
         Metrics::record_streaming_metrics(StreamingMetricsParams {
@@ -1059,7 +1070,7 @@ impl StreamingProcessor {
             ttft: first_token_time.map(|t| t.duration_since(start_time)),
             generation_duration: start_time.elapsed(),
             input_tokens: None, // generate endpoint doesn't expose prompt tokens in streaming
-            output_tokens: total_completion as u64,
+            output_tokens: total_completion,
         });
     }
 
