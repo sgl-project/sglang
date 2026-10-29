@@ -212,6 +212,10 @@ COPY rust/sglang-api-types /tmp/sglang_deps/rust/sglang-api-types
 
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
+# Relax the python-dateutil pin captured by the freeze above: the newly
+# released python-dateutil 3.0.0 gets frozen as the latest (pandas only
+# needs >=2.9.0), but boto3/botocore pulled by runai-model-streamer[s3]
+# require python-dateutil<3.0.0, making the later install unresolvable.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cargo/registry \
     case "$CUDA_VERSION" in \
@@ -228,7 +232,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --index-strategy unsafe-best-match ".[${BUILD_TYPE}]" \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
-    && uv pip freeze | grep -vE "^sglang( |==|@)" > /sgl-workspace/constraints.txt
+    && uv pip freeze | grep -vE "^sglang( |==|@)" > /sgl-workspace/constraints.txt \
+    && sed -i 's/^python-dateutil==.*/python-dateutil<3.0.0/' /sgl-workspace/constraints.txt
 
 # Cosmos3 guardrails default ON: sglang enables them whenever `cosmos_guardrail`
 # is importable (Cosmos3Pipeline.create_pipeline_stages); opt out at runtime with
