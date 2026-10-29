@@ -124,7 +124,7 @@ jobs:
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -139,7 +139,7 @@ jobs:
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -155,7 +155,7 @@ jobs:
   # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
   nightly-4-npu-a3:
     name: nightly-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -171,7 +171,7 @@ jobs:
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -186,7 +186,7 @@ jobs:
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -201,7 +201,7 @@ jobs:
 
   nightly-perf-2-npu-a3:
     name: nightly-perf-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -217,7 +217,7 @@ jobs:
 
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -233,7 +233,7 @@ jobs:
 
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -251,7 +251,7 @@ jobs:
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -268,7 +268,7 @@ jobs:
 
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -308,30 +308,30 @@ jobs:
       max-parallel: 1
       matrix:
         test_config:
-          # glm5_1 performance tests
-          # Disable test case temporarily due to feature refactor in PR #38293.
-          # - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms
-          #   prefill_size: 2
-          #   decode_size: 2
+          # glm5_2 2P2D (2 prefill + 2 decode nodes) accuracy tests
+          - name: glm_5_2_w8a8_2p2d_32p_dcp_gpqa
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_2p2d_32p_dcp_gpqa.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          - name: glm_5_2_w8a8_2p2d_32p_pcp_gpqa
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_2p2d_32p_pcp_gpqa.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          # deepseek_v4_flash performance tests
+          # TEMP: disabled during glm5.2 2P2D validation, restore after.
+          # - name: deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms
+          #   prefill_size: 1
+          #   decode_size: 1
           #   router_size: 1
-          #   test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms.py
+          #   test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py
           #   test_type: 'perf'
           #   prefill_decode_deployment: 'separation'
-          # - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26
-          #   prefill_size: 2
-          #   decode_size: 2
-          #   router_size: 1
-          #   test_case: test/registered/npu/accuracy/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26.py
-          #   test_type: 'accuracy'
-          #   prefill_decode_deployment: 'separation'
-          # deepseek_v4_flash performance tests
-          - name: deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
@@ -349,7 +349,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
