@@ -168,15 +168,23 @@ def handle_attention_backend_compatibility(server_args: Any):
             "Speculative decoding is currently not supported with Flex Attention backend"
         )
 
-    # Whisper's encoder token padding conflicts with prefix caching.
-    # Only disable for Whisper; other encoder-decoder models (e.g., mllama) use radix cache.
+    # Whisper and cohere-transcribe pad the prompt with placeholder encoder
+    # tokens, which are identical across clips and so would match each other as
+    # a cached prefix and reuse the wrong encoder KV. Other encoder-decoder
+    # models (e.g. mllama) do not pad and keep the radix cache.
     if (
         model_config.is_encoder_decoder
         and not cfg.disable_radix_cache
-        and "WhisperForConditionalGeneration"
-        in (model_config.hf_config.architectures or [])
+        and any(
+            arch
+            in (
+                "WhisperForConditionalGeneration",
+                "CohereAsrForConditionalGeneration",
+            )
+            for arch in (model_config.hf_config.architectures or [])
+        )
     ):
-        logger.info("Radix cache is disabled for Whisper")
+        logger.info("Radix cache is disabled for encoder-token-padded ASR models")
         declare_resolution(
             server_args,
             "_handle_attention_backend_compatibility",

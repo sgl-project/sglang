@@ -297,9 +297,11 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
     if current_platform.is_out_of_tree():
         return current_platform.get_default_attention_backend()
 
-    # Whisper requires flashinfer for cross-attention CUDA graph support.
-    if "WhisperForConditionalGeneration" in (
-        model_config.hf_config.architectures or []
+    # Whisper and cohere-transcribe require flashinfer for cross-attention
+    # CUDA graph support.
+    if any(
+        arch in ("WhisperForConditionalGeneration", "CohereAsrForConditionalGeneration")
+        for arch in (model_config.hf_config.architectures or [])
     ):
         return "flashinfer"
 

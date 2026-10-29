@@ -4,6 +4,7 @@ from sglang.srt.configs.bailing_moe_v2 import BailingMM2Config
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
+from sglang.srt.configs.cohere_asr import CohereAsrConfig
 from sglang.srt.configs.cosmos3 import (
     Cosmos3Config,
     Cosmos3EdgeConfig,
@@ -104,6 +105,7 @@ __all__ = [
     "BeamConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
+    "CohereAsrConfig",
     "Cosmos3Config",
     "Cosmos3EdgeConfig",
     "Cosmos3EdgeTextConfig",
