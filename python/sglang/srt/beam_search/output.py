@@ -21,9 +21,10 @@ tokenizer processes can import this without pulling the scheduler graph.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 from sglang.srt.beam_search.types import BeamSearchSequence
+from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
@@ -77,16 +78,18 @@ def is_beam_search_batch(recv_obj: BatchTokenIDOutput) -> bool:
 
 def decode_beam_search_output(
     recv_obj: BatchTokenIDOutput,
+    headers: List[Optional[DetokenizeHeader]],
     *,
     tokenizer,
     disable_batch_decode: bool,
     trim_matched_stop: Callable,
 ) -> None:
-    """Fill each candidate sequence's `text` in place."""
+    """Fill each candidate sequence's `text` in place, decoded with its row's header flags."""
     if disable_batch_decode:
         for i, beam_output in enumerate(recv_obj.beam_search_output):
-            if beam_output is None:
-                # Mixed batch: this item is not a beam request.
+            header = headers[i]
+            if beam_output is None or header is None:
+                # A non-beam item of a mixed batch, or a row with no detokenize state.
                 continue
             for beam in beam_output.sequences:
                 # A group's returned beams mix stop-finished and length-finished
@@ -94,34 +97,33 @@ def decode_beam_search_output(
                 trimmed_tokens = trim_matched_stop(
                     beam.tokens,
                     beam.finish_reason,
-                    recv_obj.no_stop_trim[i],
+                    header.no_stop_trim,
                 )
                 beam.text = tokenizer.decode(
                     trimmed_tokens,
-                    skip_special_tokens=recv_obj.skip_special_tokens[i],
-                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
-                        i
-                    ],
+                    skip_special_tokens=header.skip_special_tokens,
+                    spaces_between_special_tokens=header.spaces_between_special_tokens,
                 )
     else:
         # batch_decode takes scalar skip_special_tokens flags, so decode per
         # request; batching all would apply request 0's flags to everyone.
         for i, beam_output in enumerate(recv_obj.beam_search_output):
-            if beam_output is None:
-                # Mixed batch: this item is not a beam request.
+            header = headers[i]
+            if beam_output is None or header is None:
+                # A non-beam item of a mixed batch, or a row with no detokenize state.
                 continue
             trimmed_tokens = [
                 trim_matched_stop(
                     beam.tokens,
                     beam.finish_reason,
-                    recv_obj.no_stop_trim[i],
+                    header.no_stop_trim,
                 )
                 for beam in beam_output.sequences
             ]
             beam_texts = tokenizer.batch_decode(
                 trimmed_tokens,
-                skip_special_tokens=recv_obj.skip_special_tokens[i],
-                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[i],
+                skip_special_tokens=header.skip_special_tokens,
+                spaces_between_special_tokens=header.spaces_between_special_tokens,
             )
             for beam, text in zip(beam_output.sequences, beam_texts):
                 beam.text = text

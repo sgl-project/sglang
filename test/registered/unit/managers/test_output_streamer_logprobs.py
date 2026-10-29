@@ -1,10 +1,12 @@
 import unittest
+from array import array
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import RequestOutputStats
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_streamer import (
+    OutputSink,
     _GenerationStreamAccumulator,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -43,8 +45,9 @@ class _FakeReq:
         self.output_ids_through_stop = []
         self.send_token_offset = 0
         self.send_output_token_logprobs_offset = 0
-        self.send_decode_id_offset = 0
+        self.detokenize_header_sent = False
         self.origin_input_ids = []
+        self.origin_input_ids_unpadded = array("q")
         self.reasoning_tokens = 0
         self.cached_tokens = 0
         self.retraction_count = 0
@@ -76,16 +79,14 @@ class _FakeReq:
         return False
 
     take_request_stats_due = Req.take_request_stats_due
+    take_detokenize_header_due = Req.take_detokenize_header_due
 
     def get_mm_token_counts(self):
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
 
-    def init_incremental_detokenize(self):
-        return self.output_ids_through_stop, 0
-
 
 def _make_accumulator(
-    *, rust_server_mode: bool = False
+    *, output_sink: OutputSink = OutputSink.DETOKENIZER
 ) -> _GenerationStreamAccumulator:
     return _GenerationStreamAccumulator(
         return_logprob=True,
@@ -97,7 +98,7 @@ def _make_accumulator(
         default_stream_interval=1,
         default_force_stream_interval=1,
         build_request_stats=lambda req: _REQUEST_STATS,
-        rust_server_mode=rust_server_mode,
+        output_sink=output_sink,
         is_request_level_customized_info_key=lambda key: False,
         current_weight_version=None,
     )
@@ -118,7 +119,7 @@ class TestOutputStreamerLogprobs(unittest.TestCase):
         """The Rust frontend rejects a batch whose cached_tokens column is shorter than rids."""
         req = _FakeReq(is_retracted=False, max_new_tokens=16)
         req.cached_tokens = 7
-        accumulator = _make_accumulator(rust_server_mode=True)
+        accumulator = _make_accumulator(output_sink=OutputSink.RUST)
 
         accumulator.accept(req=req)
 
@@ -160,7 +161,11 @@ class TestOutputStreamerReasoningUsage(unittest.TestCase):
                         req.stream = stream
                         # Streaming usage is cumulative, even after a prior emission.
                         req.send_token_offset = 1 if stream else 0
-                        accumulator = _make_accumulator(rust_server_mode=rust)
+                        accumulator = _make_accumulator(
+                            output_sink=(
+                                OutputSink.RUST if rust else OutputSink.DETOKENIZER
+                            )
+                        )
                         accumulator.accept(req=req)
                         self.assertEqual(accumulator.reasoning_tokens, [expected])
                         self.assertEqual(req.reasoning_tokens, original_count)

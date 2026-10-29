@@ -54,6 +54,7 @@ from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -1644,17 +1645,20 @@ def build_flat_top_logprobs_arrays(
 
 
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
+    # http_worker_ipcs is set only with --skip-tokenizer-init, where no
+    # detokenizer keeps it; otherwise the DetokenizeHeader and
+    # finished_http_worker_ipcs carry it.
+
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
-    # For incremental decoding
-    decode_ids: List[array]  # List[array[int]]
-    read_offsets: List[int]
-    # Only used when `--skip-tokenizer-init` is on
+    # Each row's new output ids.
     output_ids: Optional[List[array]]  # Optional[List[array[int]]]
-    # Detokenization configs
-    skip_special_tokens: List[bool]
-    spaces_between_special_tokens: List[bool]
-    no_stop_trim: List[bool]
+    # By row, the request's DetokenizeHeader on its first output, else None;
+    # the whole field is None when no row carries one.
+    detokenize_headers: Optional[List[Optional[DetokenizeHeader]]] = None
+    # By row, a finished row's http_worker_ipc, else None; the whole field is None
+    # when no row finished. A finished row routes by it, even with no stored state.
+    finished_http_worker_ipcs: Optional[List[Optional[str]]] = None
 
     # Token counts
     reasoning_tokens: List[int]
@@ -1737,6 +1741,11 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+
+class DetokenizeReleaseReq(BaseReq, kw_only=True):
+    """Drops the detokenizer's state of a request that ended outside the output
+    stream; sent on the output socket, so it follows the request's last row."""
 
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):

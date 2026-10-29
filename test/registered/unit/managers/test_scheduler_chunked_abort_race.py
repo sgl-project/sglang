@@ -78,6 +78,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         sched._release_aborted_request = Mock()
         sched.tree_cache = None
         sched.ipc_channels = Mock()
+        sched.output_streamer = Mock()
 
         with patch("sglang.srt.managers.scheduler.release_kv_cache"):
             sched.process_pending_chunked_abort()
