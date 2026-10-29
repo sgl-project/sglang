@@ -36,7 +36,7 @@ class _FakeReq:
         self.reasoning_tokens = 0
         self.cached_tokens = 0
         self.retraction_count = 0
-        self.request_header_retraction_count = None
+        self.request_stats_retraction_count = None
         self.time_stats = None
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
@@ -79,7 +79,7 @@ def _make_accumulator(
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
         default_force_stream_interval=1,
-        build_request_header=lambda req: None,
+        build_request_stats=lambda req: None,
         rust_server_mode=rust_server_mode,
         is_request_level_customized_info_key=lambda key: False,
         current_weight_version=None,

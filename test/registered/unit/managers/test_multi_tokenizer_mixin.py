@@ -25,7 +25,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BeamSearchOutput,
     ConfigureLoggingReq,
-    RequestOutputHeader,
+    RequestOutputStats,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
@@ -40,8 +40,8 @@ from sglang.srt.runtime_context import get_context
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _request_header(prompt_tokens, cached_tokens, cached_tokens_details=None):
-    return RequestOutputHeader(
+def _request_stats(prompt_tokens, cached_tokens, cached_tokens_details=None):
+    return RequestOutputStats(
         prompt_tokens=prompt_tokens,
         cached_tokens=cached_tokens,
         cached_tokens_details=cached_tokens_details,
@@ -53,7 +53,7 @@ def _request_header(prompt_tokens, cached_tokens, cached_tokens_details=None):
     )
 
 
-_REQUEST_HEADER_1 = _request_header(20, 4, {"device": 1, "host": 3})
+_REQUEST_STATS_1 = _request_stats(20, 4, {"device": 1, "host": 3})
 
 
 def _make_batch_str_output() -> BatchStrOutput:
@@ -67,8 +67,8 @@ def _make_batch_str_output() -> BatchStrOutput:
         output_ids=[[1], [2]],
         completion_tokens=[1, 2],
         reasoning_tokens=[0, 0],
-        # Only rid-1 has a new header in this step.
-        request_headers=[None, _REQUEST_HEADER_1],
+        # Only rid-1 has new request stats in this step.
+        request_stats=[None, _REQUEST_STATS_1],
         input_token_logprobs_val=[[], []],
         input_token_logprobs_idx=[[], []],
         output_token_logprobs_val=[[], []],
@@ -168,7 +168,7 @@ def _make_batch_embedding_output() -> BatchEmbeddingOutput:
         rids=["embedding-rid-0", "embedding-rid-1"],
         finished_reasons=[None, None],
         embeddings=[[0.1, 0.2], [0.3, 0.4]],
-        request_headers=[_request_header(10, 3), _request_header(20, 4)],
+        request_stats=[_request_stats(10, 3), _request_stats(20, 4)],
         placeholder_tokens_idx=[None, None],
         placeholder_tokens_val=[None, None],
     )
@@ -246,14 +246,14 @@ class TestMultiTokenizerMixin(CustomTestCase):
                     mocks["start_cpu_monitor_thread"].call_count, 1 if enabled else 0
                 )
 
-    def test_batch_str_output_keeps_request_headers_per_request(self):
+    def test_batch_str_output_keeps_request_stats_per_request(self):
         output = _make_batch_str_output()
 
         single_output = _handle_output_by_index(output, 1)
 
         self.assertEqual(single_output.rids, ["rid-1"])
-        self.assertEqual(single_output.request_headers, [_REQUEST_HEADER_1])
-        self.assertEqual(_handle_output_by_index(output, 0).request_headers, [None])
+        self.assertEqual(single_output.request_stats, [_REQUEST_STATS_1])
+        self.assertEqual(_handle_output_by_index(output, 0).request_stats, [None])
 
     def test_batch_str_output_keeps_weight_versions_nested_per_request(self):
         """Per-request segment lists stay one level nested after the split."""
@@ -297,7 +297,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
 
         self.assertEqual(grouped.rids, ["rid-1", "rid-0"])
         self.assertEqual(grouped.output_strs, ["second", "first"])
-        self.assertEqual(grouped.request_headers, [_REQUEST_HEADER_1, None])
+        self.assertEqual(grouped.request_stats, [_REQUEST_STATS_1, None])
         self.assertEqual(
             grouped.weight_versions,
             [
@@ -390,7 +390,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
 
         self.assertEqual(split.rids, ["embedding-rid-1"])
         self.assertEqual(split.embeddings, [[0.3, 0.4]])
-        self.assertEqual(split.request_headers, [_request_header(20, 4)])
+        self.assertEqual(split.request_stats, [_request_stats(20, 4)])
         self.assertEqual(split.pooled_hidden_states, [[2.0]])
 
     def test_embedding_split_takes_a_row_of_stacked_pooled_hidden_states(self):
@@ -516,7 +516,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
         output = _make_batch_embedding_output()
         output.rids.append("embedding-rid-2")
         output.embeddings.append([0.5, 0.6])
-        output.request_headers.append(_request_header(30, 5))
+        output.request_stats.append(_request_stats(30, 5))
         output.finished_reasons.append(None)
         sent = []
         mapping = SimpleNamespace(

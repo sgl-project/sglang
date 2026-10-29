@@ -1394,9 +1394,9 @@ class Req(ReqDllmMixin):
         self.retraction_count = 0
         self.retraction_mb_id = None
 
-        # The retraction_count of the last RequestOutputHeader sent; None before
+        # The retraction_count of the last RequestOutputStats sent; None before
         # the first output.
-        self.request_header_retraction_count: Optional[int] = None
+        self.request_stats_retraction_count: Optional[int] = None
 
         # For observability
         self.metrics_collector = metrics_collector

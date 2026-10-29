@@ -203,7 +203,7 @@ def _handle_output_by_index(output, i):
             no_stop_trim=_extract_field_by_index(output, "no_stop_trim", i),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
-            request_headers=_extract_field_by_index(output, "request_headers", i),
+            request_stats=_extract_field_by_index(output, "request_stats", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -283,7 +283,7 @@ def _handle_output_by_index(output, i):
             rids=[output.rids[i]],
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             embeddings=_extract_field_by_index(output, "embeddings", i),
-            request_headers=_extract_field_by_index(output, "request_headers", i),
+            request_stats=_extract_field_by_index(output, "request_stats", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             pooled_hidden_states=_extract_pooled_hidden_states_by_index(output, i),
@@ -312,7 +312,7 @@ def _handle_output_by_index(output, i):
             output_ids=_extract_field_by_index(output, "output_ids", i),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
-            request_headers=_extract_field_by_index(output, "request_headers", i),
+            request_stats=_extract_field_by_index(output, "request_stats", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),

@@ -98,7 +98,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
-    RequestOutputHeader,
+    RequestOutputStats,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SessionParams,
@@ -282,8 +282,8 @@ class ReqState:
     # For performance metrics
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
-    # The latest header the scheduler sent; it sends only changes.
-    request_header: Optional[RequestOutputHeader] = None
+    # The latest request stats the scheduler sent; it sends only changes.
+    request_stats: Optional[RequestOutputStats] = None
     ttft_observed: bool = False
 
     dispatched: bool = False
@@ -313,7 +313,7 @@ class ReqState:
     @property
     def scheduler_time_stats(self) -> SchedulerOutputTimeStats:
         # Embedding requests, and requests whose own metrics are off, carry none.
-        return self.request_header.time_stats or _NO_SCHEDULER_TIME_STATS
+        return self.request_stats.time_stats or _NO_SCHEDULER_TIME_STATS
 
     def get_crash_dump_output(self) -> Dict[Any, Any]:
         out = {}
@@ -2516,23 +2516,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 continue
 
             if (
-                recv_obj.request_headers is not None
-                and (new_request_header := recv_obj.request_headers[i]) is not None
+                recv_obj.request_stats is not None
+                and (new_request_stats := recv_obj.request_stats[i]) is not None
             ):
-                state.request_header = new_request_header
-            request_header = state.request_header
-            if request_header is None:
+                state.request_stats = new_request_stats
+            request_stats = state.request_stats
+            if request_stats is None:
                 # A late row of an aborted request whose rid was reused.
-                logger.warning(f"Received output for {rid=} before its request header.")
+                logger.warning(f"Received output for {rid=} before its request stats.")
                 continue
 
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
-                "prompt_tokens": request_header.prompt_tokens,
+                "prompt_tokens": request_stats.prompt_tokens,
                 "weight_version": self.config_value("weight_version"),
-                "num_retractions": request_header.retraction_count,
+                "num_retractions": request_stats.retraction_count,
             }
 
             if self.enable_metrics:
@@ -2575,7 +2575,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     {
                         "reasoning_tokens": recv_obj.reasoning_tokens[i],
                         "completion_tokens": recv_obj.completion_tokens[i],
-                        "cached_tokens": request_header.cached_tokens,
+                        "cached_tokens": request_stats.cached_tokens,
                     }
                 )
                 if (
@@ -2587,9 +2587,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         spans,
                         num_output_tokens=recv_obj.completion_tokens[i],
                     )
-                meta_info["cached_tokens_details"] = (
-                    request_header.cached_tokens_details
-                )
+                meta_info["cached_tokens_details"] = request_stats.cached_tokens_details
                 if customized_info is not None:
                     self.update_request_meta_info(
                         meta_info,
@@ -2601,12 +2599,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Add multimodal prompt token counts only for requests that
                 # actually consumed them, so plain-text meta_info stays unchanged.
-                if request_header.image_tokens:
-                    meta_info["image_tokens"] = request_header.image_tokens
-                if request_header.audio_tokens:
-                    meta_info["audio_tokens"] = request_header.audio_tokens
-                if request_header.video_tokens:
-                    meta_info["video_tokens"] = request_header.video_tokens
+                if request_stats.image_tokens:
+                    meta_info["image_tokens"] = request_stats.image_tokens
+                if request_stats.audio_tokens:
+                    meta_info["audio_tokens"] = request_stats.audio_tokens
+                if request_stats.video_tokens:
+                    meta_info["video_tokens"] = request_stats.video_tokens
 
             if getattr(recv_obj, "output_hidden_states", None):
                 hidden_states = recv_obj.output_hidden_states[i]
@@ -3282,15 +3280,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else None
             )
 
-            request_header = state.request_header
+            request_stats = state.request_stats
             self.metrics_collector.observe_one_finished_request(
                 labels,
-                request_header.prompt_tokens,
+                request_stats.prompt_tokens,
                 completion_tokens,
-                request_header.cached_tokens,
+                request_stats.cached_tokens,
                 state.time_stats.get_e2e_latency(),
                 self._request_has_grammar(state.obj),
-                request_header.cached_tokens_details,
+                request_stats.cached_tokens_details,
                 spec_verify_ct=spec_verify_ct,
                 is_streaming=getattr(state.obj, "stream", False),
                 time_per_output_token=time_per_output_token,
@@ -3961,12 +3959,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             span_attrs[SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = (
                 recv_obj.completion_tokens[i]
             )
-        request_header = state.request_header
+        request_stats = state.request_stats
         span_attrs[SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS] = (
-            request_header.prompt_tokens
+            request_stats.prompt_tokens
         )
         span_attrs[SpanAttributes.GEN_AI_USAGE_CACHED_TOKENS] = (
-            request_header.cached_tokens
+            request_stats.cached_tokens
         )
 
         # Request identifiers

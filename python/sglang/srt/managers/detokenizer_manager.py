@@ -473,7 +473,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_ids=recv_obj.output_ids,
             reasoning_tokens=recv_obj.reasoning_tokens,
             completion_tokens=recv_obj.completion_tokens,
-            request_headers=recv_obj.request_headers,
+            request_stats=recv_obj.request_stats,
             spec_verify_ct=recv_obj.spec_verify_ct,
             spec_num_correct_drafts=recv_obj.spec_num_correct_drafts,
             spec_num_block_accept_tokens=recv_obj.spec_num_block_accept_tokens,

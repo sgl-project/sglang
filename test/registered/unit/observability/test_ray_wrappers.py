@@ -338,7 +338,7 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
             ttft_observed=False,
             last_completion_tokens=1,
             finished=False,
-            request_header=SimpleNamespace(
+            request_stats=SimpleNamespace(
                 prompt_tokens=100, cached_tokens=0, cached_tokens_details=None
             ),
             time_stats=SimpleNamespace(
