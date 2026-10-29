@@ -323,7 +323,11 @@ struct SymbolicDType {
   auto m_check_bound() const -> void {
     if (!this->has_value()) return;
     RuntimeCheck(
-        m_check(m_value), "Dtype value [", m_value, "] not in the allowed options: ", details::PrintAbleSpan{m_options});
+        m_check(m_value),
+        "Dtype value [",
+        m_value,
+        "] not in the allowed options: ",
+        details::PrintAbleSpan{m_options});
   }
 
   std::span<const DLDataType> m_options;
