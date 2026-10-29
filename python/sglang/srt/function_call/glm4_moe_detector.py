@@ -1045,13 +1045,6 @@ def _glm_build_tool_call_rules(
     return rules
 
 
-# Longest ordinary-text preamble the grammar allows before a tool call when the
-# call is mandatory (tool_choice "required" or a named function). Bounded so a
-# model cannot run to max_tokens in text while EOS is masked; large enough for
-# the one-sentence lead-in GLM models typically produce before calling.
-GLM_REQUIRED_TEXT_PREAMBLE_MAX_CHARS = 256
-
-
 @dataclass
 class GlmSpecialTokenConfig:
     begin_of_thinking: str = "<think>"
@@ -1153,21 +1146,10 @@ def generate_glm_grammar(
     )
 
     if required and functions:
-        # A mandated tool call (tool_choice "required" or a named function)
-        # must not be reachable only after unbounded ordinary text: EOS stays
-        # masked until a call appears, so a model that keeps talking runs to
-        # max_tokens with zero calls. Keep the short preamble GLM usually
-        # emits before the call, but bound its length so the call is forced
-        # within a fixed budget. `<` is excluded outright, which also keeps
-        # every special token out of the preamble without the Aho-Corasick
-        # exclusion machinery (all GLM special tokens start with `<`).
-        ebnf_lines.append(
-            f"text_block ::= ( {extra_seperator} required_text_preamble )?"
-        )
-        ebnf_lines.append(
-            "required_text_preamble ::= "
-            f"[^<]{{0,{GLM_REQUIRED_TEXT_PREAMBLE_MAX_CHARS}}}"
-        )
+        # A mandatory call must start within a bounded preamble; otherwise the
+        # model can produce text until max_tokens while EOS is masked.
+        # Excluding "<" also keeps every GLM special token out of the preamble.
+        ebnf_lines.append(f"text_block ::= ( {extra_seperator} [^<]{{0,256}} )?")
     else:
         ebnf_lines.append(
             f"text_block ::= ( {extra_seperator} text_without_special_tokens )?"
