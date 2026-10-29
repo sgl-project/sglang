@@ -118,6 +118,28 @@ class TestRequestClassOverridePoints(CustomTestCase):
                 self.assertEqual(req.source_rid, recv.rid)
                 self.assertEqual(req.rid, recv.rid)
 
+    def test_reporting_window_survives_overridden_request_factory(self):
+        """A subclass factory must not drop the server-selected reporting window."""
+        live = Session(capacity_of_str_len=0, session_id="live", streaming=True)
+        for name, session_params, sessions in (
+            ("plain", None, {}),
+            ("session", SessionParams(id="live"), {"live": live}),
+            ("unknown-session", SessionParams(id="gone"), {}),
+        ):
+            with self.subTest(path=name):
+                queued = []
+                scheduler = _scheduler(sessions, queued)
+                recv = _recv(f"rid-window-{name}", session_params)
+                recv.cache_write_reporting_suffix_tokens = 3
+                with get_parallel().override(tp_rank=0):
+                    scheduler.handle_generate_request(recv, mm_input_error="stop")
+                (req,) = queued
+                self.assertIsInstance(req, _TaggedReq)
+                self.assertEqual(
+                    req._cache_write_usage.reported_prompt_tokens,
+                    max(0, len(req.origin_input_ids) - 3),
+                )
+
     def test_tokenizer_manager_emits_the_subclass_wire_types(self):
         """Single and batched dispatch hand the subclass types to the scheduler."""
         manager = TokenizerManager.__new__(_TaggedTokenizerManager)

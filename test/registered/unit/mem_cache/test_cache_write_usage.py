@@ -119,6 +119,16 @@ class TestCacheWriteUsage(CustomTestCase):
                 self.assertIsNone(usage.tokens)
                 self.assertEqual(usage.reported_prompt_tokens, max(0, final - 2))
 
+    def test_late_reporting_window_change_keeps_unknown_sticky(self):
+        usage = CacheWriteUsage(8)
+        usage.mark_supported()
+        usage.set_excluded_suffix_tokens(3)
+        usage.record([(0, 8)], reusable_prefix_len=8)
+        self.assertEqual(usage.tokens, 5)
+        usage.set_excluded_suffix_tokens(2)
+        usage.mark_supported()
+        self.assertIsNone(usage.tokens)
+
     def test_reported_reads_do_not_change_physical_cache_prefix(self):
         from sglang.srt.managers.schedule_batch import Req
 
@@ -213,6 +223,7 @@ class TestUnifiedCacheWriteUsage(CustomTestCase):
             origin_input_ids=array("q", prompt),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=2),
         )
+        req._cache_write_tracking_enabled = True
         pool.alloc([req])
         req.output_ids = array("q", output)
         req.full_untruncated_fill_ids = array("q", (*prompt, *output))
@@ -300,6 +311,38 @@ class TestUnifiedCacheWriteUsage(CustomTestCase):
         with get_disagg().override(disaggregation_decode_enable_offload_kvcache=True):
             cache._prepare_cache_write_usage(req2)
         self.assertIsNone(req2.cache_write_tokens)
+
+    def test_tracking_flag_controls_adoption_without_a_second_match(self):
+        """Accounting must not alter tree matching or run when disabled."""
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                cache, allocator, pool = self._cache()
+                req = self._req(cache, allocator, pool, list(range(8)))
+                req._cache_write_tracking_enabled = enabled
+                with mock.patch.object(
+                    cache.tree_core, "match_prefix", wraps=cache.tree_core.match_prefix
+                ) as match:
+                    with mock.patch.object(
+                        cache, "insert", wraps=cache.insert
+                    ) as insert:
+                        cache.checkpoint(req, up_to=8)
+                self.assertEqual(insert.call_args.args[0].track_adopted_ranges, enabled)
+                match.assert_not_called()
+                self.assertEqual(req.cache_write_tokens, 8 if enabled else None)
+
+    def test_nonbase_token_slot_reports_unknown(self):
+        """TreeCore emits ranges at BASE, so a different token id is unknown."""
+        from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        cache, allocator, pool = self._cache()
+        req = self._req(cache, allocator, pool, list(range(8)))
+        original = cache.slot_id
+        cache.slot_id = lambda family: (
+            ComponentType.SWA if family == TREE_TOKEN else original(family)
+        )
+        cache._prepare_cache_write_usage(req)
+        self.assertIsNone(req.cache_write_tokens)
 
 
 class TestRustUnifiedCacheWriteUsage(TestUnifiedCacheWriteUsage):

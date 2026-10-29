@@ -58,6 +58,19 @@ class CacheWriteUsage:
             self.mark_unknown()
         self.prompt_tokens = prompt_tokens
 
+    def set_excluded_suffix_tokens(self, excluded_suffix_tokens: int) -> None:
+        if (
+            not isinstance(excluded_suffix_tokens, int)
+            or isinstance(excluded_suffix_tokens, bool)
+            or excluded_suffix_tokens < 0
+        ):
+            raise ValueError("excluded_suffix_tokens must be a non-negative integer")
+        if excluded_suffix_tokens == self._excluded_suffix_tokens:
+            return
+        if self._started:
+            self.mark_unknown()
+        self._excluded_suffix_tokens = excluded_suffix_tokens
+
     @property
     def reported_prompt_tokens(self) -> int:
         # Physical KV and checkpoint coordinates retain the complete prompt.

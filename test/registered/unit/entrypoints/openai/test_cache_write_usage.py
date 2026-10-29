@@ -71,6 +71,58 @@ class TestCacheWriteUsage(CustomTestCase):
             )
             self.assertEqual(usage.prompt_tokens_details.cache_write_tokens, value)
 
+    def test_responses_reporting_flag_preserves_default_wire_shape(self):
+        for enabled, value in ((False, 16), (True, None), (True, 0), (True, 16)):
+            with self.subTest(enabled=enabled, value=value):
+                usage = UsageProcessor.calculate_response_usage(
+                    [
+                        {
+                            "meta_info": {
+                                "prompt_tokens": 20,
+                                "cached_tokens": 4,
+                                "cache_write_tokens": value,
+                            }
+                        }
+                    ],
+                    enable_cache_report=enabled,
+                )
+                details = ResponsesResponse.model_construct(usage=usage).model_dump()[
+                    "usage"
+                ]["input_tokens_details"]
+                if not enabled:
+                    self.assertNotIn("cache_write_tokens_reported", details)
+                    self.assertEqual(details["cache_write_tokens"], 0)
+                else:
+                    self.assertEqual(
+                        details["cache_write_tokens_reported"], value is not None
+                    )
+                    self.assertEqual(details["cache_write_tokens"], value or 0)
+
+    def test_messages_stream_emits_only_a_consistent_final_snapshot(self):
+        for value in (None, 0, 8):
+            with self.subTest(value=value):
+                usage = self._usage(value)
+                start = _anthropic_usage_from_openai(
+                    usage,
+                    include_input=True,
+                    include_output=True,
+                    force_zero_output=True,
+                    include_cache_creation=False,
+                ).model_dump(exclude_none=True)
+                self.assertEqual(start["input_tokens"], 16)
+                self.assertNotIn("cache_creation_input_tokens", start)
+                final = _anthropic_usage_from_openai(
+                    usage,
+                    include_input=value is not None,
+                    include_output=True,
+                ).model_dump(exclude_none=True)
+                if value is None:
+                    self.assertNotIn("input_tokens", final)
+                    self.assertNotIn("cache_creation_input_tokens", final)
+                else:
+                    self.assertEqual(final["input_tokens"], 16 - value)
+                    self.assertEqual(final["cache_creation_input_tokens"], value)
+
     def test_invalid_or_per_choice_totals_remain_unknown(self):
         for value in (-1, True, 17):
             self.assertIsNone(

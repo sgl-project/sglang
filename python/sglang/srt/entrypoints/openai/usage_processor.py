@@ -81,7 +81,7 @@ class UsageProcessor:
                 cached_tokens=cached_total, cache_write_tokens=cache_write
             )
 
-        return UsageProcessor.calculate_token_usage(
+        result = UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
             reasoning_tokens=reasoning_tokens,
             completion_tokens=completion_tokens,
@@ -90,6 +90,8 @@ class UsageProcessor:
             audio_tokens=audio_tokens,
             video_tokens=video_tokens,
         )
+        result._cache_write_reporting_enabled = enable_cache_report
+        return result
 
     @staticmethod
     def calculate_streaming_usage(
@@ -136,7 +138,7 @@ class UsageProcessor:
                 ),
             )
 
-        return UsageProcessor.calculate_token_usage(
+        result = UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,
             reasoning_tokens=total_reasoning_tokens,
             completion_tokens=total_completion_tokens,
@@ -145,6 +147,8 @@ class UsageProcessor:
             audio_tokens=audio_tokens,
             video_tokens=video_tokens,
         )
+        result._cache_write_reporting_enabled = enable_cache_report
+        return result
 
     @staticmethod
     def calculate_token_usage(

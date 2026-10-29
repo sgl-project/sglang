@@ -149,8 +149,9 @@ class TestCacheWriteTransport(CustomTestCase):
             init_incremental_detokenize=lambda: ([1], 0),
         )
         snapshots = []
-        for value in (8, 16):
+        for value, reported_cached in ((8, 4), (16, 4), (16, 3)):
             req.cache_write_tokens = value
+            req.reported_cached_tokens = reported_cached
             req.output_ids.append(2)
             req.output_ids_through_stop = req.output_ids
             acc = _GenerationStreamAccumulator(
@@ -158,17 +159,23 @@ class TestCacheWriteTransport(CustomTestCase):
                 return_hidden_states=False,
                 return_routed_experts=False,
                 return_indexer_topk=False,
+                enable_metrics=False,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
                 disaggregation_mode=DisaggregationMode.NULL,
                 default_stream_interval=1,
                 default_force_stream_interval=1,
-                get_cached_tokens_details=lambda req: None,
+                get_cached_tokens_details=lambda req: {"device": 2, "host": 2},
                 is_request_level_customized_info_key=lambda key: False,
                 current_weight_version=None,
             )
             acc.accept(req=req)
             snapshots.append(acc.to_payload(dp_rank=0, is_idle_batch=False))
-        self.assertEqual([x.cache_write_tokens for x in snapshots], [[8], [16]])
+        self.assertEqual([x.cache_write_tokens for x in snapshots], [[8], [16], [16]])
+        self.assertEqual([x.cached_tokens for x in snapshots], [[4], [4], [3]])
+        self.assertEqual(
+            [x.cached_tokens_details for x in snapshots],
+            [[{"device": 2, "host": 2}], [{"device": 2, "host": 2}], [None]],
+        )
 
 
 class TestCacheWriteNativeMetadata(unittest.IsolatedAsyncioTestCase, CustomTestCase):
@@ -281,8 +288,10 @@ class TestCacheWriteReportingWindowTransport(CustomTestCase):
                 tokenizer=SimpleNamespace(decode=lambda *a, **k: "rendered prefix")
             )
             server.enable_response_store = False
+            server._translates_tools = False
             server.use_harmony = False
             server.tool_server = None
+            server.tool_call_parser = None
             server.default_sampling_params = {}
             server._validate_model = lambda model: None
             server.extract_routed_dp_rank_from_header = lambda raw, rank: rank
@@ -297,9 +306,11 @@ class TestCacheWriteReportingWindowTransport(CustomTestCase):
                 modalities=None,
                 require_reasoning=False,
                 uses_response_template=uses_response_template,
+                template_tool_call_grammar=False,
+                message_start_tool_call_constraint=None,
             )
 
-            async def make_request(*args):
+            async def make_request(*args, **kwargs):
                 return [], [list(range(512))], [list(range(512))], processed
 
             captured = []

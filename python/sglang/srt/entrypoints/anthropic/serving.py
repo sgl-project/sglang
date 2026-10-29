@@ -47,6 +47,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionStreamResponse,
+    ResponseFormat,
     StreamOptions,
     Tool,
     ToolChoice,
@@ -99,10 +100,12 @@ def _cache_creation_prompt_tokens(usage) -> Optional[int]:
     )
 
 
-def _anthropic_input_tokens(usage) -> int:
+def _anthropic_input_tokens(usage, *, include_cache_creation: bool = True) -> int:
     prompt = getattr(usage, "prompt_tokens", 0) or 0
     cached = _cached_prompt_tokens(usage)
-    written = _cache_creation_prompt_tokens(usage) or 0
+    written = (
+        (_cache_creation_prompt_tokens(usage) or 0) if include_cache_creation else 0
+    )
     if cached + written > prompt:
         # Upstream telemetry bug: cached cannot exceed the prompt it caches.
         # Clamping silently here would hide the discrepancy from billing
@@ -123,6 +126,7 @@ def _anthropic_usage_from_openai(
     include_input: bool,
     include_output: bool,
     force_zero_output: bool = False,
+    include_cache_creation: bool = True,
 ) -> AnthropicUsage:
     if usage is None:
         return AnthropicUsage(
@@ -133,11 +137,13 @@ def _anthropic_usage_from_openai(
     usage_fields: dict[str, int] = {}
     cached_tokens = _cached_prompt_tokens(usage)
     if include_input:
-        usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
+        usage_fields["input_tokens"] = _anthropic_input_tokens(
+            usage, include_cache_creation=include_cache_creation
+        )
         if cached_tokens:
             usage_fields["cache_read_input_tokens"] = cached_tokens
         written_tokens = _cache_creation_prompt_tokens(usage)
-        if written_tokens is not None:
+        if include_cache_creation and written_tokens is not None:
             usage_fields["cache_creation_input_tokens"] = written_tokens
     if include_output:
         usage_fields["output_tokens"] = (
@@ -631,6 +637,15 @@ class AnthropicServing:
         # is still the hard cap).
         if anthropic_request.output_config is not None:
             oc = anthropic_request.output_config
+            if oc.format is not None:
+                chat_request.response_format = ResponseFormat(
+                    type="json_schema",
+                    json_schema={
+                        "name": "response",
+                        "schema": oc.format.schema_,
+                        "strict": True,
+                    },
+                )
             if oc.effort is not None:
                 chat_request.reasoning_effort = (
                     "max" if oc.effort == "xhigh" else oc.effort
@@ -684,6 +699,7 @@ class AnthropicServing:
                             "name": tool.name,
                             "description": tool.description or "",
                             "parameters": tool.input_schema,
+                            "strict": tool.strict,
                         },
                     )
                 )
@@ -697,6 +713,9 @@ class AnthropicServing:
         # no tool the model could call. Silently downgrading to "no tool"
         # would deceive the caller, so raise an explicit 400.
         if anthropic_request.tool_choice is not None:
+            chat_request.parallel_tool_calls = (
+                not anthropic_request.tool_choice.disable_parallel_tool_use
+            )
             tc_type = anthropic_request.tool_choice.type
             if tc_type == "none":
                 chat_request.tool_choice = "none"
@@ -771,6 +790,12 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except HTTPException as e:
             logger.warning(
                 "Non-streaming request rejected: %s %s", e.status_code, e.detail
@@ -825,6 +850,12 @@ class AnthropicServing:
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
@@ -881,6 +912,9 @@ class AnthropicServing:
                         include_input=True,
                         include_output=True,
                         force_zero_output=True,
+                        # Intermediate write counts can grow or become
+                        # unknown. Publish only a consistent terminal snapshot.
+                        include_cache_creation=False,
                     ),
                 ),
             )
@@ -1129,9 +1163,10 @@ class AnthropicServing:
             if chunk.usage is not None:
                 final_usage = _anthropic_usage_from_openai(
                     chunk.usage,
-                    # Final cumulative usage can update cache creation after
-                    # message_start; billing must use this terminal snapshot.
-                    include_input=True,
+                    # A measured cache write can grow after message_start.
+                    # Update the complete input snapshot only when measured.
+                    include_input=_cache_creation_prompt_tokens(chunk.usage)
+                    is not None,
                     include_output=True,
                 )
 
@@ -1446,6 +1481,7 @@ class AnthropicServing:
                 thinking=request.thinking,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                output_config=request.output_config,
             )
             chat_request = self._convert_to_chat_completion_request(messages_request)
         except asyncio.CancelledError:
@@ -1480,6 +1516,12 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error counting tokens: %s", e)
             return self._error_response(

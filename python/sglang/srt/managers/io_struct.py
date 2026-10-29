@@ -64,6 +64,7 @@ from sglang.srt.managers.schedule_batch import (
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
@@ -1708,9 +1709,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
-    # For observability
-    # Pickled Optional[List[SchedulerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
+    # For observability; None when metrics are off.
+    time_stats: Optional[List[Optional[SchedulerOutputTimeStats]]] = None
 
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
@@ -1805,9 +1805,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
-    # For observability
-    # Pickled Optional[List[SchedulerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
+    # For observability; None when metrics are off.
+    time_stats: Optional[List[Optional[SchedulerOutputTimeStats]]] = None
 
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
@@ -1850,10 +1849,6 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     retraction_counts: Optional[List[int]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
-
-    # For observability
-    # Pickled Optional[List[SchedulerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
 
     # Optional pooled hidden states (pre-head transformer output).
     # Two IPC formats, disambiguated by len vs len(rids):

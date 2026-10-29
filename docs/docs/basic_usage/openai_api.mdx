@@ -10,7 +10,7 @@ For the Anthropic-compatible `/v1/messages` endpoint (including Claude Code inte
 
 ## Cache write usage
 
-With `--enable-cache-report`, supported unified-cache paths report newly adopted,
+With `--enable-cache-report`, supported Python frontend unified-cache paths report newly adopted,
 reusable prompt tokens separately from cache reads:
 
 | API | Field |
@@ -27,7 +27,9 @@ uninstrumented cache paths, sessions and parallel choices can remain unknown.
 Chat and Messages omit unknown write counts. Responses keeps the SDK-required
 numeric field and adds `cache_write_tokens_reported`: a false value means its zero
 is a compatibility placeholder, not a measured amount. Use the final cumulative
-stream usage snapshot rather than summing intermediate snapshots. Messages can
-update input/cache usage in its terminal `message_delta`.
+stream usage snapshot rather than summing intermediate snapshots. Messages
+updates input/cache usage in its terminal `message_delta` only when a cache
+write was measured; its start event leaves cache creation unclassified. The
+separate Rust frontend does not yet report these writes.
 
 Cache write usage does not promise a retention duration or define a billing policy.
