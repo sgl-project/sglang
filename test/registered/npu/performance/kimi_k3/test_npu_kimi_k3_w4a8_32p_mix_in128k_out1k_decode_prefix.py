@@ -68,14 +68,14 @@ KIMI_K3_W4A8_32P_ENVS = {
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
-    # Dev bare-metal values - this is the low-latency decode scenario, and
-    # LONG_SEQ_ROUND 2 is what the dev 25.9 ms C12 TPOT was measured with
-    # (ROUND 64 is a throughput-oriented setting and wrong here). The dev
-    # trio crashed the DeepEP low_latency_combine tiling once in the CI pod
-    # (run 40507429709, EZ1008 on MoeLowLatencyCombineV2, after merging
-    # main); if it crashes again, fall back to HCCL_BUFFSIZE 2000 while
-    # KEEPING ROUND 2.
-    "HCCL_BUFFSIZE": "200",
+    # Low-latency decode tier: LONG_SEQ_ROUND 2 is what the dev 25.9 ms C12
+    # TPOT was measured with (ROUND 64 is a throughput-oriented setting and
+    # wrong here). HCCL_BUFFSIZE 2000 is the CI-proven value (runs 11-15);
+    # the pure dev trio (HCCL 200 + DEEPEP 1800 + ROUND 2) never got judged
+    # in the CI pod - run 40507429709 crashed the DeepEP combine tiling with
+    # it, and run 40832348108 was cancelled before capture. If HCCL 2000 +
+    # DEEPEP 1800 + ROUND 2 still crashes the tiling, drop DEEPEP_HCCL_BUFFSIZE next.
+    "HCCL_BUFFSIZE": "2000",
     "DEEPEP_HCCL_BUFFSIZE": "1800",
     "DEEP_NORMAL_LONG_SEQ_ROUND": "2",
     "DEEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
