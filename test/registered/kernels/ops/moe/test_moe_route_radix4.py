@@ -231,7 +231,8 @@ requires_aiter = pytest.mark.skipif(
 def test_select_experts_preserves_offset_fp32_bias(
     num_experts, topk, num_groups, topk_group, num_tokens, radix4
 ):
-    """Both router dispatches must preserve an fp32 bias that bf16 would collapse."""
+    """aiter must preserve an fp32 bias that bf16 would collapse; radix4 routes
+    against its bf16 copy, exactly as aiter would on bf16 inputs."""
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe import topk as topk_module
     from sglang.srt.layers.moe.topk import TopKConfig, select_experts
@@ -259,6 +260,11 @@ def test_select_experts_preserves_offset_fp32_bias(
         weights, ids, _ = select_experts(
             torch.zeros((num_tokens, 8), device="cuda"), scores, config
         )
+    if radix4 and num_experts == NUM_EXPERTS and num_tokens <= 1024:
+        ref_weights, ref_ids = _aiter_route(scores, bias.to(torch.bfloat16))
+        torch.testing.assert_close(ids, ref_ids.to(ids.dtype), rtol=0, atol=0)
+        torch.testing.assert_close(weights, ref_weights)
+        return
     expected_ids = torch.arange(
         num_experts // 2 - topk, num_experts // 2, device="cuda"
     )
