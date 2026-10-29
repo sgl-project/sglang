@@ -41,6 +41,9 @@ class L2Transfer(NamedTuple):
     device_indices: torch.Tensor
     layer_mapper: Optional[Callable[[int], Optional[int]]] = None
     is_draft: bool = False
+    # Controller ids -> the rows the device pool indexes (a unified sub-pool's
+    # id space); None when they index it as they are.
+    device_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
 
 class TransferCompletion(NamedTuple):
@@ -79,11 +82,10 @@ class L2TransferEngine:
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
         """Resolve controller IDs into this pool's device-buffer indices.
 
-        Call on the index stream after the producer event. The host-transfer
-        move gate prevents relocation until the transfer completes.
+        Call on the index stream after the producer event. The HiCache pin
+        source keeps the rows in place until the transfer is acknowledged.
         """
-        # Mamba state pools do not inherit KVCache's default attributes.
-        translate = getattr(transfer.device_pool, "host_transfer_translate", None)
+        translate = transfer.device_translate
         if translate is None:
             return transfer.device_indices
         original_device = transfer.device_indices.device

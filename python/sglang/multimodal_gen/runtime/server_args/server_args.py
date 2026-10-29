@@ -667,6 +667,13 @@ class ServerArgs(DisaggServerArgsMixin):
         return self.port + 1
 
     @property
+    def cancel_endpoint(self) -> str | None:
+        # the HTTP server publishes cancelled request ids here to every replica driver
+        if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
+            return None
+        return f"ipc://{tempfile.gettempdir()}/sglang-diffusion-cancel-{self.port}"
+
+    @property
     def progress_endpoint(self) -> str | None:
         # replica drivers send video progress here; ipc only reaches this node
         if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
