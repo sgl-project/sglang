@@ -34,6 +34,7 @@ from sglang.srt.arg_groups.arg_utils import (
     record_fields,
 )
 from sglang.srt.arg_groups.argparse_actions import (
+    DeprecatedChoiceToFlagAction,
     DeprecatedStoreTrueAction,
 )
 from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
@@ -422,6 +423,18 @@ class ServerArgs:
             "--dp-size <dp-size> --enable-dp-attention.",
         )
         parser.add_argument(
+            "--monokernel-backend",
+            action=DeprecatedChoiceToFlagAction,
+            dest="monokernel_backend",
+            flags={
+                "amd": ("enable_amd_monokernel", "--enable-amd-monokernel"),
+                "msa": ("enable_nvidia_megakernel", "--enable-nvidia-megakernel"),
+            },
+            help="Deprecated. Use --enable-amd-monokernel instead of "
+            "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
+            "--monokernel-backend msa.",
+        )
+        parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
@@ -583,8 +596,8 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     e4m3 kernel), the trtllm_mha backend (the only dense backend with fp8-q
     GEMMs), and SM100 (MSA fp8 variants and trtllm-gen fp8 dense kernels are
     sm100-only). SGLANG_DISABLE_M3_FP8_ATTN_GEMM=1 is the kill switch:
-    it forces the pre-fp8 numerics (bf16 indexer + widening sparse path,
-    bf16 q) without having to move off trtllm_mha.
+    it forces bf16 q with the widening sparse/indexer path without having to
+    move off trtllm_mha.
     """
     from sglang.srt.environ import envs
 

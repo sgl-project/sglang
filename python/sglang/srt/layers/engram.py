@@ -7,6 +7,7 @@ sglang.kernels.ops.embeddings.engram_hash to produce identical hash ids.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import errno
 import functools
 import glob
@@ -23,7 +24,11 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
-from sglang.kernels.ops.embeddings.engram_gather import engram_gather
+from sglang.kernels.ops.embeddings.engram_gather import (
+    engram_gather,
+    engram_gather_peer,
+    engram_rows_to_token_major,
+)
 from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_DECODE,
     MODE_EXTEND,
@@ -34,6 +39,13 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     engram_hash_ids_and_commit,
 )
 from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
+from sglang.srt.arg_groups.engram_config import (
+    EngramConfig,
+    EngramLookup,
+    EngramPlacement,
+    EngramReplication,
+    cols_per_rank,
+)
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
     find_loaded_library,
@@ -45,8 +57,10 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_dp_global_num_tokens,
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
+    world_dp_gather_enabled,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -61,7 +75,13 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
-from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_model,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -313,6 +333,14 @@ class EngramHasher(nn.Module):
         result.image_token_id = image_token_id
         return result
 
+    def new_hash_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """An uninitialized output for ``input_ids``' hash ids."""
+        return torch.empty(
+            (input_ids.shape[0], self.primes.shape[0], self.offsets.shape[1]),
+            dtype=torch.int64,
+            device=input_ids.device,
+        )
+
     def forward(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
@@ -322,11 +350,7 @@ class EngramHasher(nn.Module):
         mode = forward_batch.forward_mode
         if num_tokens == 0 or mode.is_idle():
             # A DP-attention idle batch carries pad rows; nothing reads its hashes.
-            return torch.zeros(
-                (num_tokens, self.primes.shape[0], self.offsets.shape[1]),
-                dtype=torch.int64,
-                device=input_ids.device,
-            )
+            return self.new_hash_ids(input_ids).zero_()
         if (
             mode.is_extend()
             and not mode.is_target_verify()
@@ -675,23 +699,20 @@ def _registered_device_ptr(host_ptr: int) -> int:
 
 
 class _HostTable:
-    """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
+    """Host-memory backing for one engram table: one shard per rank, or with
+    replication per_node one whole table shared by the TP group.
 
     Lives for the whole process: the mapping, the memfd and the cudaHostRegister
     pin are never released because the table is read by every forward.
     """
 
-    def __init__(self, layout: str, nbytes: int, name: str, group):
-        if layout not in ("shared", "per_rank"):
-            raise ValueError(
-                f"Invalid SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT={layout!r}; expected "
-                "'shared' or 'per_rank'"
-            )
-        self.layout = layout
+    def __init__(self, replication: str, nbytes: int, name: str, group):
+        self.replication = replication
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
-        if layout == "shared":
+        per_node = replication == EngramReplication.PER_NODE
+        if per_node:
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
                 self.fd,
@@ -710,12 +731,12 @@ class _HostTable:
         # Advisory before the first touch: pages are allocated huge at fault time.
         self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
-        if layout == "per_rank":
+        if not per_node:
             # Cached checkpoint pages, left by a previous server or by the loader,
             # make the 512 MiB huge-page faults fall back, so empty them first.
             _drop_page_cache_once("before pre-faulting the per-rank shard")
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
-        if layout == "shared":
+        if per_node:
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
@@ -767,10 +788,11 @@ class _HostTable:
         if not self.dirty:
             return
         self.dirty = False
-        if self.layout == "shared":
+        per_node = self.replication == EngramReplication.PER_NODE
+        if per_node:
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
+        if not per_node and huge_kb < mapped_kb * 0.98:
             # The loader's own reads refilled the page cache; empty it again so the
             # collapse can find contiguous memory.
             drop_checkpoint_page_cache()
@@ -778,12 +800,12 @@ class _HostTable:
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
         msg = (
-            f"engram host table {label}: layout={self.layout}, "
+            f"engram host table {label}: replication={self.replication}, "
             f"{mapped_kb / 2**10:.0f} MiB resident, {huge_kb / 2**10:.0f} MiB in huge pages "
             f"({pct:.0f}%)"
         )
         if huge_kb == 0:
-            knob = "shmem_enabled" if self.layout == "shared" else "enabled"
+            knob = "shmem_enabled" if per_node else "enabled"
             logger.warning(
                 "%s. No huge pages: expect ~10x slower lookups (one TLB miss per row); "
                 "transparent_hugepage/%s is '%s'",
@@ -793,6 +815,200 @@ class _HostTable:
             )
         else:
             logger.info(msg)
+
+
+class _PeerShards:
+    """One rank's engram row shard in exportable device memory (CUDA VMM), with
+    every TP peer's shard mapped into this process after `connect`.
+
+    Inside one NVLink domain (MNNVL included, through FABRIC handles) a kernel
+    reads any peer's rows in place, so a rank looks up only its own tokens: no
+    id gather, no [DP x tokens] buffer, no reduce-scatter. The shard holds the
+    fp8 rows followed by their e8m0 scales. Lives for the whole process.
+    """
+
+    def __init__(self, rows: int, dim: int, group):
+        from sglang.srt.utils.cuda_vmm_utils import (
+            VmmReservation,
+            align_up,
+            get_device_granularity,
+            make_device_allocation_prop,
+        )
+
+        self.rows = rows
+        self.dim = dim
+        self.group = group
+        self.device_id = torch.cuda.current_device()
+        self.w_bytes = rows * dim
+        self.s_bytes = rows * (dim // FP8_BLOCK_SIZE)
+        gran = get_device_granularity(self.device_id)
+        self.size = align_up(max(1, self.w_bytes + self.s_bytes), gran)
+        self.local = VmmReservation(
+            self.size,
+            make_device_allocation_prop(self.device_id),
+            self.device_id,
+            alignment=gran,
+        )
+        self.handle = self.local.map(0, self.size, retain_handle=True)
+        self.base = self.local.base
+        self.w_bias: Optional[torch.Tensor] = None
+        self.s_bias: Optional[torch.Tensor] = None
+        self.starts: Optional[torch.Tensor] = None
+
+    def views(self) -> tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.utils.cuda_vmm_utils import tensor_from_pointer
+
+        raw = tensor_from_pointer(self.base, self.size, device_id=self.device_id)
+        weight = raw[: self.w_bytes].view(torch.float8_e4m3fn).view(self.rows, self.dim)
+        scale = (
+            raw[self.w_bytes : self.w_bytes + self.s_bytes]
+            .view(torch.float8_e8m0fnu)
+            .view(self.rows, self.dim // FP8_BLOCK_SIZE)
+        )
+        return weight, scale
+
+    @property
+    def ready(self) -> bool:
+        return self.starts is not None
+
+    def connect(self, row_start: int, label: str) -> None:
+        """Collective over the TP group: export this shard, map every peer's."""
+        if self.ready:
+            return
+        import torch.distributed as dist
+
+        from sglang.srt.utils.cuda_vmm_utils import (
+            exchange_shareable_handles,
+            import_and_map_alloc,
+        )
+
+        t0 = time.perf_counter()
+        torch.cuda.synchronize()
+        cpu_group = self.group.cpu_group
+        rank, world = self.group.rank_in_group, self.group.world_size
+        use_fabric, peer_handles = exchange_shareable_handles(
+            [self.handle], cpu_group, rank, world
+        )
+        meta = [None] * world
+        dist.all_gather_object(meta, (row_start, self.rows, self.size), group=cpu_group)
+        bases = []
+        try:
+            for r, (_, _, size) in enumerate(meta):
+                if r == rank:
+                    bases.append(self.base)
+                    continue
+                handle = peer_handles[(r, 0)]
+                bases.append(
+                    import_and_map_alloc(
+                        handle if use_fabric else None,
+                        None if use_fabric else handle,
+                        size,
+                        self.device_id,
+                        use_fabric=use_fabric,
+                        peer_rank=r,
+                    )
+                )
+        finally:
+            if not use_fabric:
+                for fd in peer_handles.values():
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        padded = 1 << max(0, (world - 1).bit_length())
+        int64_max = torch.iinfo(torch.int64).max
+        starts, w_bias, s_bias = [], [], []
+        n_scales = self.dim // FP8_BLOCK_SIZE
+        for r in range(padded):
+            if r < world:
+                start, rows = meta[r][0], meta[r][1]
+                starts.append(start)
+                w_bias.append(bases[r] - start * self.dim)
+                s_bias.append(bases[r] + rows * self.dim - start * n_scales)
+            else:
+                starts.append(int64_max)
+                w_bias.append(0)
+                s_bias.append(0)
+        assert starts[0] == 0 and starts[:world] == sorted(starts[:world]), starts
+        device = torch.device("cuda", self.device_id)
+        self.w_bias = torch.tensor(w_bias, dtype=torch.int64, device=device)
+        self.s_bias = torch.tensor(s_bias, dtype=torch.int64, device=device)
+        self.starts = torch.tensor(starts, dtype=torch.int64, device=device)
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        logger.info(
+            "engram peer shards %s: %d ranks over %s, %.2f GiB local, mapped in %.1f s",
+            label,
+            world,
+            "FABRIC" if use_fabric else "POSIX fd",
+            self.size / 2**30,
+            time.perf_counter() - t0,
+        )
+
+    def lookup(self, indices: torch.Tensor) -> torch.Tensor:
+        flat = indices.reshape(-1, indices.shape[-1])
+        if flat.stride(-1) != 1:
+            flat = flat.contiguous()
+        out = torch.empty(
+            *flat.shape, self.dim, dtype=torch.bfloat16, device=indices.device
+        )
+        engram_gather_peer(
+            flat,
+            out,
+            self.w_bias,
+            self.s_bias,
+            self.starts,
+            self.dim,
+            FP8_BLOCK_SIZE,
+        )
+        return out.view(*indices.shape, self.dim)
+
+
+def resolve_engram_config(columns: int) -> EngramConfig:
+    """The engram_config the layers run. The one place `auto` becomes a lookup: once
+    per process, at model construction, when the parallel layout and the GPUs are
+    known; the result is recorded in the config so later layers read it."""
+    config = get_exec().offload.engram_config or EngramConfig()
+    if config.lookup != EngramLookup.AUTO:
+        return config
+    parallel = get_parallel()
+    tp = parallel.tp_size
+    lookup = EngramLookup.ALL_REDUCE
+    # Measured on GB300, B300 and H200 at TP 2-8 and DP 8-32, reading the owner's
+    # shard in place was faster than every collective, for prefill and decode.
+    if (
+        config.placement == EngramPlacement.GPU
+        and is_cuda()
+        and tp > 1
+        and _tp_in_one_nvlink_domain()
+    ):
+        lookup = EngramLookup.PEER_READ
+    # Measured on GB300, B300 and H200 at DP 2-8: fastest for prefill from 8K tokens
+    # per rank and for decode from DP 4; elsewhere within tens of microseconds.
+    elif (
+        is_cuda()
+        and tp > 1
+        and parallel.attn_dp_size == tp
+        and parallel.attn_cp_size == 1
+        and cols_per_rank(columns, tp) is not None
+    ):
+        lookup = EngramLookup.ALL_TO_ALL
+    config = dataclasses.replace(config, lookup=lookup)
+    get_context().override("resolve_engram_config", engram_config=config)
+    logger.info("Engram lookup auto -> %s", lookup)
+    return config
+
+
+def _tp_in_one_nvlink_domain() -> bool:
+    """Collective over the TP group."""
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+        in_one_nvlink_domain,
+    )
+
+    return in_one_nvlink_domain(
+        get_parallel().tp_group.cpu_group,
+        torch.device("cuda", torch.cuda.current_device()),
+    )
 
 
 def shard_range(
@@ -808,12 +1024,9 @@ def shard_range(
     assert column_bounds[-1] == num_embeddings, (
         "the config's table size disagrees with its primes"
     )
-    if (len(column_bounds) - 1) % tp_size == 0:
-        cols_per_rank = (len(column_bounds) - 1) // tp_size
-        return (
-            column_bounds[tp_rank * cols_per_rank],
-            column_bounds[(tp_rank + 1) * cols_per_rank],
-        )
+    k = cols_per_rank(len(column_bounds) - 1, tp_size)
+    if k is not None:
+        return column_bounds[tp_rank * k], column_bounds[(tp_rank + 1) * k]
     return (
         num_embeddings * tp_rank // tp_size,
         num_embeddings * (tp_rank + 1) // tp_size,
@@ -824,9 +1037,9 @@ class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
     Rows are sharded over the TP group in device memory, aligned to the hash
-    columns where they divide evenly (`shard_range`); with
-    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
-    one shared copy or one shard per rank (see _HostTable). Loading is sharded
+    columns where they divide evenly (`shard_range`); --engram-config can read
+    the peers' shards in place or keep the rows in host memory instead, as one
+    shard per rank or one copy per node (see _HostTable). Loading is sharded
     in every layout: a rank writes only its own row range.
     """
 
@@ -848,8 +1061,17 @@ class EngramEmbedding(nn.Module):
         self.host_table: Optional[_HostTable] = None
         self._sort_host_reads = False
         self.staged_by_scheduler = False
-        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
-            self._init_host_table(num_embeddings, dim, layer_id)
+        self.peer: Optional[_PeerShards] = None
+        config = resolve_engram_config(len(column_bounds) - 1)
+        self.lookup = config.lookup
+        self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
+        if config.lookup == EngramLookup.PEER_READ and self.tp_size > 1:
+            self.peer = _PeerShards(self.rows, dim, get_parallel().tp_group)
+            weight, scale = self.peer.views()
+            self.weight = nn.Parameter(weight, requires_grad=False)
+            self.scale = nn.Parameter(scale, requires_grad=False)
+        elif config.placement == EngramPlacement.CPU:
+            self._init_host_table(num_embeddings, dim, layer_id, config.replication)
         else:
             self.weight = nn.Parameter(
                 torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
@@ -864,13 +1086,15 @@ class EngramEmbedding(nn.Module):
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
 
-    def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
-        layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
-        n = num_embeddings if layout == "shared" else self.rows
+    def _init_host_table(
+        self, num_embeddings: int, dim: int, layer_id: int, replication: str
+    ):
+        per_node = replication == EngramReplication.PER_NODE
+        n = num_embeddings if per_node else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
         self.host_table = _HostTable(
-            layout,
+            replication,
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
             f"sglang_engram_{layer_id}",
             get_parallel().tp_group,
@@ -886,7 +1110,10 @@ class EngramEmbedding(nn.Module):
 
     @property
     def _shared(self) -> bool:
-        return self.host_table is not None and self.host_table.layout == "shared"
+        return (
+            self.host_table is not None
+            and self.host_table.replication == EngramReplication.PER_NODE
+        )
 
     @property
     def shared_host_table_without_ats(self) -> bool:
@@ -914,7 +1141,10 @@ class EngramEmbedding(nn.Module):
             self.host_table.dirty = True
 
     def finish_load(self, label: str):
-        """Collective in the shared layout: every rank calls it after loading."""
+        """Collective in the shared layout and with peer shards: every rank calls
+        it after loading."""
+        if self.peer is not None:
+            self.peer.connect(self.row_start, label)
         if self.host_table is not None:
             self.host_table.finish_load(label)
 
@@ -925,10 +1155,15 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
+        if self.peer is not None:
+            assert self.peer.ready, "engram peer shards are mapped in finish_load"
+            # Every shard is mapped here: read this rank's own tokens only, which
+            # also covers the prefill CP and DP paths below without a collective.
+            return self.peer.lookup(indices)
         if self._shared:
             if indices.shape[0] == 0:
-                return self._empty(indices)
-            out = self._empty(indices)
+                return self.new_rows(indices)
+            out = self.new_rows(indices)
             engram_gather(
                 *self._table_ptrs(),
                 indices.reshape(-1),
@@ -986,7 +1221,7 @@ class EngramEmbedding(nn.Module):
         """Lookup when every TP rank holds the same indices: the device and
         per-rank host shards zero unowned rows and the all-reduce reassembles."""
         if indices.shape[0] == 0:
-            return self._empty(indices)
+            return self.new_rows(indices)
         values = self._owned_rows(indices)
         if self.tp_size > 1:
             values = self._reduce_owned_rows(values)
@@ -1001,7 +1236,8 @@ class EngramEmbedding(nn.Module):
             return values
         return tensor_model_parallel_all_reduce(values)
 
-    def _empty(self, indices: torch.Tensor) -> torch.Tensor:
+    def new_rows(self, indices: torch.Tensor) -> torch.Tensor:
+        """An uninitialized output for the rows of ``indices``."""
         return torch.empty(
             *indices.shape, self.dim, dtype=torch.bfloat16, device=indices.device
         )
@@ -1009,7 +1245,7 @@ class EngramEmbedding(nn.Module):
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
-            return self._empty(indices).zero_()
+            return self.new_rows(indices).zero_()
         if self.host_table is None and not _cuda_kernels(indices):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
@@ -1017,7 +1253,7 @@ class EngramEmbedding(nn.Module):
             rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
             values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
-        out = self._empty(indices)
+        out = self.new_rows(indices)
         engram_gather(
             *self._table_ptrs(),
             indices.reshape(-1),
@@ -1035,6 +1271,99 @@ class EngramEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Gather DP ranks' indices before looking up TP-sharded rows."""
         assert forward_batch is not None, "the DP engram lookup needs the batch"
+        exchanges = (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL)
+        sizes = (
+            self._dp_sizes(indices, forward_batch) if self.lookup in exchanges else None
+        )
+        if sizes is None:
+            return self._dp_global_buffer_lookup(indices, forward_batch)
+        if sum(sizes) == 0:
+            return self.new_rows(indices)
+        ids = indices.new_empty((sum(sizes), *indices.shape[1:]))
+        get_parallel().tp_group.all_gatherv(
+            indices.contiguous(), sizes=sizes, output=ids
+        )
+        if self.lookup == EngramLookup.REDUCE_SCATTER:
+            out = self._dp_reduce_scatter_lookup(ids, sizes)
+        else:
+            out = self._dp_all_to_all_lookup(ids, sizes)
+        return out.view(*indices.shape, self.dim)
+
+    def _dp_reduce_scatter_lookup(
+        self, ids: torch.Tensor, sizes: list[int]
+    ) -> torch.Tensor:
+        """Look up the owned rows of every rank's `ids`; a reduce-scatter hands each
+        rank its own tokens' rows."""
+        group = get_parallel().tp_group
+        values = self._owned_rows(ids).view(ids.shape[0], -1)
+        if len(set(sizes)) > 1:
+            return group.reduce_scatterv(values, sizes=sizes)
+        # Equal counts (MAX_LEN batches, CUDA graphs) take the fixed-size collective.
+        local = values.new_empty((sizes[0], values.shape[1]))
+        group.reduce_scatter_tensor(local, values)
+        return local
+
+    def _dp_all_to_all_lookup(
+        self, ids: torch.Tensor, sizes: list[int]
+    ) -> torch.Tensor:
+        """Look up this rank's own hash columns for every token, then send each rank
+        its part, 1/tp of the bytes a reduce-scatter moves. Hash ids are [token,
+        n-gram size, head], so the columns are in that order."""
+        parallel = get_parallel()
+        group = parallel.tp_group
+        k, n = self._cols_per_rank, sizes[parallel.attn_dp_rank]
+        start = parallel.tp_rank * k
+        own = ids.flatten(1)[:, start : start + k].contiguous()
+        values = self._owned_rows(own).view(own.shape[0], -1)
+        recv = values.new_empty((self.tp_size * n, values.shape[1]))
+        if len(set(sizes)) > 1:
+            torch.distributed.all_to_all_single(
+                recv,
+                values,
+                output_split_sizes=[n] * self.tp_size,
+                input_split_sizes=sizes,
+                group=group.device_group,
+            )
+        else:
+            # Equal counts (MAX_LEN batches, CUDA graphs) take the fixed-size collective.
+            group.all_to_all_single(recv.view(-1), values.view(-1))
+        # [source rank, token, its columns] -> [token, columns in rank order]
+        return engram_rows_to_token_major(recv, self.tp_size)
+
+    def _dp_sizes(
+        self, indices: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Optional[list[int]]:
+        """Per-rank row counts for an exchange, or None for the global-buffer path."""
+        parallel = get_parallel()
+        padding = forward_batch.dp_padding_mode
+        if (
+            _is_hip
+            or padding is None
+            or parallel.attn_cp_size > 1
+            or self.tp_size != parallel.attn_dp_size
+            or world_dp_gather_enabled()
+        ):
+            return None
+        n = indices.shape[0]
+        if padding.is_max_len():
+            # Every rank holds n padded rows, so the counts survive a graph capture.
+            full = get_global_dp_buffer_len() == self.tp_size * n
+            return [n] * self.tp_size if full else None
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        sizes = get_dp_global_num_tokens()
+        if (
+            sizes is None
+            or len(sizes) != self.tp_size
+            or sizes[parallel.attn_dp_rank] != n
+        ):
+            return None
+        return list(sizes)
+
+    def _dp_global_buffer_lookup(
+        self, indices: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Look up every DP rank's indices in the global DP buffer and reduce them."""
         rows = get_global_dp_buffer_len()
         ids_global = torch.empty(
             (rows, *indices.shape[1:]), dtype=indices.dtype, device=indices.device
@@ -1042,7 +1371,7 @@ class EngramEmbedding(nn.Module):
         # The MAX_LEN gather may zero its local input in place, hence the clone.
         dp_gather_replicate(ids_global, indices.clone(), forward_batch)
         if rows == 0:
-            return self._empty(indices)
+            return self.new_rows(indices)
         values = self._owned_rows(ids_global).view(rows, -1)
         local = torch.empty(
             (indices.shape[0], values.shape[1]),
@@ -1166,7 +1495,8 @@ class Engram(nn.Module):
             and is_in_breakable_cuda_graph()
         ):
             # Every replay stages new rows, so the lookup runs between segments.
-            emb = _bcg_engram_embed(self, hash_ids, cp_all_tokens)
+            emb = self.embed.new_rows(hash_ids)
+            _bcg_engram_embed(self, hash_ids, cp_all_tokens, emb)
         else:
             emb = self.embed_rows(hash_ids, forward_batch, cp_all_tokens)
         if x.shape[0] == 0:
@@ -1203,8 +1533,8 @@ class Engram(nn.Module):
 
 @eager_on_graph
 def _bcg_engram_embed(
-    engram: Engram, hash_ids: torch.Tensor, cp_all_tokens: bool
-) -> torch.Tensor:
+    engram: Engram, hash_ids: torch.Tensor, cp_all_tokens: bool, out: torch.Tensor
+) -> None:
     # A replay builds a fresh batch; the capture-time one stages no rows.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    return engram.embed_rows(hash_ids, forward_batch, cp_all_tokens)
+    out.copy_(engram.embed_rows(hash_ids, forward_batch, cp_all_tokens))

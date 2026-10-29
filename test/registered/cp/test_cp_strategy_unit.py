@@ -40,9 +40,10 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mem_cache_utils import routed
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ExtendMode:
@@ -183,8 +184,9 @@ class TestPrefillCPBCGReplay(CustomTestCase):
                     512,
                 )
                 self.assertTrue(runner.can_run_graph(batch))
-        batch.extend_prefix_lens_cpu = [0, 1, 0]
-        self.assertFalse(runner.can_run_graph(batch))
+        with get_parallel().override(attn_cp_rank=0, attn_cp_size=4):
+            batch.extend_prefix_lens_cpu = [0, 1, 0]
+            self.assertTrue(runner.can_run_graph(batch))
 
     def test_local_capacity_overflow_uses_next_capture_bucket(self):
         runner = self._make_runner()
@@ -641,6 +643,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             encoder_out_cache_loc=torch.arange(3) + 32,
         )
         layer = SimpleNamespace(
+            layer_id=0,
             is_cross_attention=False,
             k_scale="key-scale",
             v_scale="value-scale",
@@ -652,8 +655,8 @@ class TestCPZigzagStrategy(CustomTestCase):
         with (
             patch.object(strategy, "gather_kv_cache", return_value=local_kv) as gather,
             patch(
-                "sglang.srt.layers.cp.zigzag.get_token_to_kv_pool",
-                return_value=pool,
+                "sglang.srt.layers.cp.zigzag.get_kv_layers",
+                return_value=routed(pool).layer_router,
             ),
         ):
             strategy.materialize_full_kv(forward_batch, layer, key, value, swa_loc)

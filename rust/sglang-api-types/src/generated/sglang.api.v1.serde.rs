@@ -115,25 +115,30 @@ impl<'de> ::serde::Deserialize<'de> for StringListOrList {
                         value: Some(string_list_or_list::Value::One(StringList::default())),
                     });
                 };
-                let is_number = first.is_string();
+                if first.is_string() {
+                    let first =
+                        <::prost::alloc::string::String as ::serde::Deserialize>::deserialize(
+                            first,
+                        )
+                        .map_err(::serde::de::Error::custom)?;
+                    let mut items = vec![first];
+                    while let Some(v) = seq.next_element::<::prost::alloc::string::String>()? {
+                        items.push(v);
+                    }
+                    return Ok(StringListOrList {
+                        value: Some(string_list_or_list::Value::One(StringList { items })),
+                    });
+                }
                 let mut rest = vec![first];
                 while let Some(v) = seq.next_element::<::serde_json::Value>()? {
                     rest.push(v);
                 }
-                let reparse = ::serde_json::Value::Array(rest);
-                if is_number {
-                    let one: StringList =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(StringListOrList {
-                        value: Some(string_list_or_list::Value::One(one)),
-                    })
-                } else {
-                    let many: StringListList =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(StringListOrList {
-                        value: Some(string_list_or_list::Value::Many(many)),
-                    })
-                }
+                let many: StringListList =
+                    ::serde_json::from_value(::serde_json::Value::Array(rest))
+                        .map_err(::serde::de::Error::custom)?;
+                Ok(StringListOrList {
+                    value: Some(string_list_or_list::Value::Many(many)),
+                })
             }
         }
         deserializer.deserialize_any(V)
@@ -311,25 +316,26 @@ impl<'de> ::serde::Deserialize<'de> for TokenIdsOrList {
                         value: Some(token_ids_or_list::Value::One(TokenIds::default())),
                     });
                 };
-                let is_number = first.is_number();
+                if first.is_number() {
+                    let first = <i64 as ::serde::Deserialize>::deserialize(first)
+                        .map_err(::serde::de::Error::custom)?;
+                    let mut ids = vec![first];
+                    while let Some(v) = seq.next_element::<i64>()? {
+                        ids.push(v);
+                    }
+                    return Ok(TokenIdsOrList {
+                        value: Some(token_ids_or_list::Value::One(TokenIds { ids })),
+                    });
+                }
                 let mut rest = vec![first];
                 while let Some(v) = seq.next_element::<::serde_json::Value>()? {
                     rest.push(v);
                 }
-                let reparse = ::serde_json::Value::Array(rest);
-                if is_number {
-                    let one: TokenIds =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(TokenIdsOrList {
-                        value: Some(token_ids_or_list::Value::One(one)),
-                    })
-                } else {
-                    let many: TokenIdsList =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(TokenIdsOrList {
-                        value: Some(token_ids_or_list::Value::Many(many)),
-                    })
-                }
+                let many: TokenIdsList = ::serde_json::from_value(::serde_json::Value::Array(rest))
+                    .map_err(::serde::de::Error::custom)?;
+                Ok(TokenIdsOrList {
+                    value: Some(token_ids_or_list::Value::Many(many)),
+                })
             }
         }
         deserializer.deserialize_any(V)
@@ -2618,6 +2624,15 @@ impl ::serde::Serialize for GenerateMetaInfo {
                 &self.weight_versions,
             )?;
         }
+        if let Some(v) = &self.image_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "image_tokens", v)?;
+        }
+        if let Some(v) = &self.audio_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "audio_tokens", v)?;
+        }
+        if let Some(v) = &self.video_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "video_tokens", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2651,6 +2666,9 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                 let mut f_output_token_logprobs_length = None;
                 let mut f_weight_version = None;
                 let mut f_weight_versions = None;
+                let mut f_image_tokens = None;
+                let mut f_audio_tokens = None;
+                let mut f_video_tokens = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "id" => {
@@ -2794,6 +2812,24 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                                     .unwrap_or_default(),
                             );
                         }
+                        "image_tokens" => {
+                            if f_image_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("image_tokens"));
+                            }
+                            f_image_tokens = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "audio_tokens" => {
+                            if f_audio_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("audio_tokens"));
+                            }
+                            f_audio_tokens = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "video_tokens" => {
+                            if f_video_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("video_tokens"));
+                            }
+                            f_video_tokens = Some(map.next_value::<Option<u32>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2817,6 +2853,9 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                     output_token_logprobs_length: f_output_token_logprobs_length.flatten(),
                     weight_version: f_weight_version.flatten(),
                     weight_versions: f_weight_versions.unwrap_or_default(),
+                    image_tokens: f_image_tokens.flatten(),
+                    audio_tokens: f_audio_tokens.flatten(),
+                    video_tokens: f_video_tokens.flatten(),
                 })
             }
         }

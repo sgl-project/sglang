@@ -66,6 +66,7 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     DEFAULT_PLACEHOLDER_PROMPT,
     SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION,
     _apply_warmup_sampling_overrides,
+    _resolve_default_warmup_resolution,
     _resolve_warmup_num_frames,
     build_warmup_reqs,
     should_include_warmup_image,
@@ -833,6 +834,25 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual((reqs[0].width, reqs[0].height), (832, 480))
         self.assertEqual(reqs[0].num_frames, 17)
         self.assertEqual(reqs[0].num_inference_steps, 2)
+
+    def test_bcg_capture_keeps_the_full_default_video_resolution(self):
+        # graphs replay only the captured shape, so the video area cap must not apply
+        server_args = MagicMock()
+        server_args.pipeline_config.task_type = ModelTaskType.T2V
+        server_args.enable_breakable_cuda_graph = True
+        sampling_defaults = SamplingParams(
+            width=1280,
+            height=720,
+            num_frames=81,
+            supported_resolutions=[(1280, 720), (832, 480)],
+        )
+
+        self.assertEqual(
+            _resolve_default_warmup_resolution(
+                server_args, sampling_defaults, server_based_warmup=True
+            ),
+            (1280, 720),
+        )
 
     def test_ltx2_two_stage_warmup_uses_pipeline_alignment(self):
         server_args = MagicMock()
