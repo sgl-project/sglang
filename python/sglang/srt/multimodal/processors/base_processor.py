@@ -38,6 +38,7 @@ from sglang.srt.multimodal.cache import (
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
+from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -256,10 +257,6 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
-        configure_media_url_security(
-            get_mm().allowed_media_domains,
-            get_mm().media_url_max_file_size_mb,
-        )
         configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
             configured_mm_feature_transport
@@ -270,13 +267,28 @@ class BaseMultimodalProcessor(ABC):
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
-        self.image_processor_backend = get_mm().image_processor_backend
-        if get_mm().disable_fast_image_processor:
+        processor_config = MultimodalProcessorConfig(
+            image_processor_backend=get_mm().image_processor_backend,
+            disable_fast_image_processor=get_mm().disable_fast_image_processor,
+            mm_process_config=get_mm().mm_process_config,
+            mm_processor_worker_num=get_mm().mm_processor_worker_num,
+            mm_io_worker_num=get_mm().mm_io_worker_num,
+            allowed_media_domains=get_mm().allowed_media_domains,
+            media_url_max_file_size_mb=get_mm().media_url_max_file_size_mb,
+        )
+
+        configure_media_url_security(
+            processor_config.allowed_media_domains,
+            processor_config.media_url_max_file_size_mb,
+        )
+
+        self.image_processor_backend = processor_config.image_processor_backend
+        if processor_config.disable_fast_image_processor:
             self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
-        mm_process_config = get_mm().mm_process_config
+        mm_process_config = processor_config.mm_process_config
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
@@ -327,7 +339,7 @@ class BaseMultimodalProcessor(ABC):
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
-        requested_mm_io_worker_num = get_mm().mm_io_worker_num
+        requested_mm_io_worker_num = processor_config.mm_io_worker_num
         env_mm_io_worker_num = os.environ.get("SGLANG_IO_WORKERS")
         if requested_mm_io_worker_num:
             self.mm_io_worker_num = requested_mm_io_worker_num
@@ -350,7 +362,7 @@ class BaseMultimodalProcessor(ABC):
                 io_worker_source,
             )
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
-        requested_mm_processor_worker_num = get_mm().mm_processor_worker_num
+        requested_mm_processor_worker_num = processor_config.mm_processor_worker_num
         self.mm_processor_worker_num = (
             1
             if skip_mm_pool
