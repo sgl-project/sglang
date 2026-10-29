@@ -42,19 +42,25 @@ export const config = {
 
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
-  --backend sglang \\
-  --host {{CURL_HOST}} --port {{CURL_PORT}} \\
-  --model {{MODEL_NAME}} \\
-  --dataset-name {{DATASET}} \\
-  --random-input-len {{ISL}} --random-output-len {{OSL}} \\
-  --random-range-ratio 1.0 \\
-  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
-  --seed 42 --warmup-requests 0 \\
-  --flush-cache`,
+`bench() {
+  python3 -m sglang.bench_serving \\
+    --backend sglang \\
+    --host {{CURL_HOST}} --port {{CURL_PORT}} \\
+    --model {{MODEL_NAME}} \\
+    --dataset-name {{DATASET}} \\
+    --random-input-len {{ISL}} --random-output-len {{OSL}} \\
+    --random-range-ratio 1.0 \\
+    --num-prompts "$1" --max-concurrency {{MAX_CONCURRENCY}} \\
+    --seed 42 --warmup-requests 0 \\
+    --flush-cache
+}
+bench 16                # warm-up: 16 full-length requests, not reported
+bench {{NUM_PROMPTS}}   # measured
+# At concurrency 64 the cards report the median-throughput run of 3 warm-up + measured repeats.`,
     accuracy: {
       gsm8k_pct:
 `pip install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@93bc2d851a59e57d54fe755202756589a04d3d86"
+# Vera Rubin cards: launch with --kv-cache-dtype bfloat16 --context-length 131072 (BF16 in KV Cache Precision).
 # The Vera Rubin cards average seeds 1, 2 and 3; the B300 card reports seed 1.
 for SEED in 1 2 3; do
   sgl-eval run gsm8k \\
@@ -67,6 +73,7 @@ for SEED in 1 2 3; do
 done`,
       gsm8k_100_pct:
 `pip install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@93bc2d851a59e57d54fe755202756589a04d3d86"
+# Vera Rubin cards: launch with --kv-cache-dtype bfloat16 --context-length 131072 (BF16 in KV Cache Precision).
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
@@ -76,6 +83,7 @@ sgl-eval run gsm8k \\
   --out-dir gsm8k-100`,
       mmlu_pct:
 `pip install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@93bc2d851a59e57d54fe755202756589a04d3d86"
+# Vera Rubin cards: launch with --kv-cache-dtype bfloat16 --context-length 131072 (BF16 in KV Cache Precision).
 # The Vera Rubin cards average seeds 1, 2 and 3.
 for SEED in 1 2 3; do
   sgl-eval run mmlu \\
@@ -94,6 +102,7 @@ hf download MMMU/MMMU_Pro --repo-type dataset \\
   --revision 0d7426df4ccb3d8704a992fe6850abee7c262127 \\
   --include "standard (10 options)/*" --include README.md
 python3 -c "from datasets import load_dataset; load_dataset('MMMU/MMMU_Pro', 'standard (10 options)', split='test', revision='0d7426df4ccb3d8704a992fe6850abee7c262127')"
+# Vera Rubin cards: launch with --kv-cache-dtype bfloat16 --context-length 131072 (BF16 in KV Cache Precision).
 # The Vera Rubin cards average seeds 1, 2 and 3; the GB300 card reports seed 1.
 for SEED in 1 2 3; do
   HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 sgl-eval run mmmu_pro \\
@@ -140,8 +149,10 @@ done`,
             { value: 4, disable: { hw: ["h200"], nodes: ["multi-2"] }, disableReason: "SGLang rejects prefill CP with pipeline parallelism, which the two-node H200 recipe uses." }] },
         { id: "dpAttn", label: "DP-Attention",
           values: [null, false, 2, 4,
-            { value: 8, disable: { hw: ["gb300"] },
-              disableReason: "DP-Attention 8 needs 8 ranks; the GB300 recipe runs TP4." }],
+            { value: 8, disable: [
+              { when: { hw: ["gb300"] }, reason: "DP-Attention 8 needs 8 ranks; the GB300 recipe runs TP4." },
+              { when: { hw: ["vera-rubin"], nodes: ["single"] }, reason: "DP-Attention 8 needs 8 ranks; the one-tray Vera Rubin recipe runs TP4." },
+            ] }],
           labels: { "auto": "Auto", "false": "Off" } },
       ],
     },
@@ -155,7 +166,8 @@ done`,
       },
       ep: { label: "EP", values: [null, 1,
         { value: 4, hide: { hw: ["b300", "b200", "h200"] } },
-        { value: 8, hide: { hw: ["gb300"] } }] },
+        { value: 8, hide: { hw: ["gb300"] },
+          disable: [{ when: { hw: ["vera-rubin"], nodes: ["single"] }, reason: "EP 8 needs 8 ranks; the one-tray Vera Rubin recipe runs TP4." }] }] },
     },
 
     speculative: {
