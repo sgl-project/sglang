@@ -22,7 +22,7 @@ import torch
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=600, suite="nightly-amd-1-gpu-mi35x", nightly=True)
+register_amd_ci(est_time=600, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 _skip_reason = "FlyDSL v4 nm decode is gfx950-only"
 if is_hip() and is_gfx95_supported():

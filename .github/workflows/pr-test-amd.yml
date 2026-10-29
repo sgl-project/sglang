@@ -635,7 +635,7 @@ jobs:
         runner: [linux-mi35x-gpu-1]
         part: [0]
     # One job: the MI35x 1-GPU pool is the scarcest AMD runner pool, and
-    # each job sent there waited a median ~8 h. ~26 min of tests.
+    # each job sent there waited a median ~8 h. ~36 min of tests.
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
