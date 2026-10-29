@@ -153,6 +153,32 @@ def test_kernel_masks_padded_rows_and_scales_weights():
     assert torch.equal(weights[real:], torch.zeros_like(weights[real:]))
 
 
+@pytest.mark.parametrize("ep_rank", [0, 5])
+def test_kernel_maps_to_physical_like_mega_gate(ep_rank):
+    tokens, real, dup = 300, 250, 3
+    count = torch.randint(1, dup + 1, (NUM_EXPERTS,), dtype=torch.int32, device="cuda")
+    phys_map = torch.randperm(NUM_EXPERTS * dup, device="cuda").int().view(-1, dup)
+    ids = torch.zeros((tokens, TOPK), dtype=torch.int64, device="cuda")
+    weights = torch.ones((tokens, TOPK), dtype=torch.float32, device="cuda")
+    _simulate_balanced_routing(
+        ids,
+        weights,
+        NUM_EXPERTS,
+        random=False,
+        num_ranks=EP_SIZE,
+        layer_id=3,
+        num_token_non_padded=torch.tensor([real], device="cuda"),
+        to_physical_map=phys_map,
+        logical_count=count,
+        ep_rank=ep_rank,
+    )
+    logical = _route(tokens, layer_id=3)[0].long()
+    rows = torch.arange(tokens, device="cuda").unsqueeze(1)
+    expected = phys_map[logical, (ep_rank + rows * 23333) % count[logical]].long()
+    assert torch.equal(ids[:real], expected[:real])
+    assert torch.equal(ids[real:], torch.full_like(ids[real:], -1))
+
+
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 300])
 @pytest.mark.parametrize("num_ranks", [4, 8, 16])
 def test_single_shard_balances_within_one_slot(num_tokens, num_ranks):
