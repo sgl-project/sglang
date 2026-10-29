@@ -1,13 +1,14 @@
-//! Runtime bootstrap: wires channels, pins CPU-bound pools, starts the tokio
-//! API server, and returns a handle the Python boundary uses for
+//! Runtime bootstrap: wires channels, pins the frontend threads, starts the
+//! tokio API server, and returns a handle the Python boundary uses for
 //! `recv_requests` and `push_decode_result_batch`.
 //!
-//! Thread layout:
-//!   * API transports — one tokio multi-thread runtime (I/O bound), pinned core set A
-//!   * Tokenizer      — N pinned OS threads (CPU bound), core set B
-//!   * Detokenizer    — M pinned OS threads (CPU bound), core set C
-//!   * To_scheduler   — 1 thread driving the FSM
-//!   * From_scheduler — 1 thread draining the scheduler → detok shards
+//! Thread layout (every pinned thread shares one CPU set, see
+//! [`frontend_cpu_set`]):
+//!   * API transports — one tokio multi-thread runtime (I/O bound), pinned
+//!   * Tokenizer      — N pinned OS threads (CPU bound)
+//!   * Detokenizer    — M pinned OS threads (CPU bound)
+//!   * To_scheduler   — 1 pinned thread driving the FSM
+//!   * From_scheduler — 1 pinned thread draining the scheduler → detok shards
 //!   * MM workers     — K unpinned OS threads, spawned late via
 //!     [`Runtime::start_mm_workers`] (multimodal models only)
 //!
@@ -21,7 +22,7 @@ use crate::HttpLayer;
 use crate::message::config::RuntimeConfig;
 use crate::message::detok::DetokMsg;
 
-use super::threads::{join_all_with_timeout, plan_cores, spawn_pool};
+use super::threads::{frontend_cpu_set, join_all_with_timeout, pin_current, spawn_pool};
 use crate::tokenizer_manager::channel::{
     FromSchedulerRx, FromSchedulerTx, ToSchedulerRx, ToSchedulerTx, from_scheduler, to_scheduler,
 };
@@ -134,7 +135,7 @@ impl Drop for Runtime {
 pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtime, String> {
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
-    let plan = plan_cores(&cfg);
+    let cpus = frontend_cpu_set(&cfg);
     // Validated before anything is spawned, so a bad bucket list fails startup
     // cleanly.
     let metrics = match &cfg.server_args.metrics {
@@ -221,12 +222,11 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             Some(t) => detokenizer::DetokenizerBackend::Dynamo(t.clone()),
             None => detokenizer::DetokenizerBackend::Skip,
         };
-        let detok_cores = plan.as_ref().map(|p| p.detok.clone());
         // Each shard owns its receiver outright (one consumer per shard), so the
         // owned `detok_rx` Vec is moved out element-by-element via the iterator.
         let count = detokenizer_rx.len();
         let mut detokenizer_rxs = detokenizer_rx.into_iter();
-        spawn_pool("detokenizer", detok_cores, count, &mut threads, |i| {
+        spawn_pool("detokenizer", cpus, count, &mut threads, |i| {
             detokenizer::DetokenizerWorker::new(
                 i,
                 detokenizer_rxs.next().unwrap(),
@@ -242,12 +242,11 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     if let Some(tokenizer) = &tokenizer {
         // Reuse the single loaded tokenizer (shared with the detok shards).
         let tokenizer = tokenizer.clone();
-        let tok_cores = plan.as_ref().map(|p| p.tok.clone());
         // Workers share the MPMC inbox (`tok_rx`) and the read-only backend, so
         // each gets a cheap clone of both.
         spawn_pool(
             "tokenizer",
-            tok_cores,
+            cpus,
             cfg.server_args.tokenizer_worker_num,
             &mut threads,
             |_i| {
@@ -266,17 +265,13 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
 
     // --- Response dispatcher: drains from_scheduler channel → routes chunks to shards ---
     {
-        // First TM core; from_scheduler is the hotter router (every output token). One
-        // worker today via `spawn_pool`, so sharding by `Rid::shard` later (see
-        // `TM_CORES`) is just a larger count + per-shard receivers.
-        let cores = plan
-            .as_ref()
-            .and_then(|p| p.tm.first().copied())
-            .map(|c| vec![c]);
+        // The hotter router (every output token). One worker today via
+        // `spawn_pool`, so sharding by `Rid::shard` later is just a larger
+        // count + per-shard receivers.
         let mut from_scheduler_rx = Some(from_scheduler_rx); // moved into the single worker
         let activity = response_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
-        spawn_pool("from-scheduler", cores, 1, &mut threads, |_| {
+        spawn_pool("from-scheduler", cpus, 1, &mut threads, |_| {
             tokenizer_manager::from_scheduler::Dispatcher::new(
                 from_scheduler_rx.take().unwrap(),
                 senders.clone(),
@@ -288,12 +283,14 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
 
     // --- TokenizerManager to_scheduler loop ---
     {
-        // Second TM core when present, else share the first (1-core / API-set
-        // fallback) — still off the CPU-bound pool cores either way.
-        let cores = plan
-            .as_ref()
-            .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
-            .map(|c| vec![c]);
+        // TODO(tm-scaling): this thread and `from-scheduler` are single-consumer
+        // serialization points, each with its own ceiling. to-scheduler runs
+        // validate + `normalize_sampling_params` for *every* request before
+        // fanning out to the (pooled) tokenizer workers, so a high
+        // request-arrival / short-request workload is bounded by this one
+        // thread's per-request cost (kept O(fields), see
+        // `sampling::normalize_sampling_params`). Sharding it by rid — like the
+        // tokenizer/detok pools — lifts that ceiling.
         let limits = tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args);
         let mm = tokenizer_manager::to_scheduler::MmDispatch {
             enabled: cfg.server_args.model_is_multimodal(),
@@ -301,7 +298,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         };
         let mut parts = Some((tok_manager_rx, to_scheduler_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
-        spawn_pool("to-scheduler", cores, 1, &mut threads, |_| {
+        spawn_pool("to-scheduler", cpus, 1, &mut threads, |_| {
             let (tok_manager_rx, to_scheduler_tx) = parts.take().unwrap();
             tokenizer_manager::to_scheduler::Intake::new(
                 tok_manager_rx,
@@ -339,7 +336,6 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     // --- HTTP + optional gRPC adapters (one tokio runtime, I/O bound) ---
     {
         let cfg = cfg.clone();
-        let api_cores = plan.as_ref().map(|p| p.api.clone());
         let shutdown_rx = shutdown_rx.clone();
         let core = core.clone();
         let hicache_manager = Arc::new(api_server::handlers::HiCacheManager::new(
@@ -357,19 +353,14 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
+                // This thread runs `block_on` (the listeners' accept loops);
+                // the runtime's worker and blocking threads pin on start.
+                pin_current(cpus.as_ref());
                 let mut builder = tokio::runtime::Builder::new_multi_thread();
                 builder
                     .worker_threads(cfg.rust_server_args.http_api_worker_num)
-                    .enable_all();
-                if let Some(cores) = api_cores {
-                    let next = std::sync::atomic::AtomicUsize::new(0);
-                    builder.on_thread_start(move || {
-                        let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if let Some(c) = cores.get(idx % cores.len()) {
-                            core_affinity::set_for_current(*c);
-                        }
-                    });
-                }
+                    .enable_all()
+                    .on_thread_start(move || pin_current(cpus.as_ref()));
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(async move {
                     let http = api_server::http::app::serve(

@@ -275,11 +275,13 @@ def _partition_cores(
 ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
     """Split this rank's allowed cores into ``(launch_cores, server_cores)``.
 
-    Pure computation — no affinity is changed here. Both sets are a subset
-    of this rank's NUMA-local cores (when affinity/NUMA bind is on), so the
-    partition stays NUMA-local. Returns ``(None, None)`` (server runs
-    unpinned, confined only by the process affinity) when the platform has
-    no affinity API or too few cores to split.
+    ``launch_cores`` are left out of ``server_cores``, so the scheduler thread
+    always finds cores no frontend thread can take; the scheduler thread itself
+    is not pinned to them. Pure computation — no affinity is changed here.
+    Both sets are a subset of this rank's NUMA-local cores (when affinity/NUMA
+    bind is on), so the partition stays NUMA-local. Returns ``(None, None)``
+    (server runs unpinned, confined only by the process affinity) when the
+    platform has no affinity API or too few cores to split.
     """
     if not hasattr(os, "sched_getaffinity"):
         return None, None
@@ -317,7 +319,7 @@ def _partition_cores(
     )
     server_cores = allowed[reserve : reserve + pool_budget]
     logger.info(
-        "rust server cores=%s, scheduler launch cores=%s",
+        "rust server cores=%s, cores kept free for the scheduler=%s",
         server_cores,
         launch_cores,
     )
