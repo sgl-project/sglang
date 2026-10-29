@@ -2081,6 +2081,9 @@ class Envs:
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
+    # Preserve GLM kv_b BF16 on DCP ranks so replicated Q projection can be used.
+    # This trades extra weight memory for avoiding a per-layer Q all-gather.
+    SGLANG_DSA_DCP_KEEP_KV_B_BF16 = EnvBool(False)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)

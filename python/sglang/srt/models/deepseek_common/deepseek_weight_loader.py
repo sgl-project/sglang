@@ -62,12 +62,30 @@ from sglang.srt.models.deepseek_common.utils import (
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import bind_or_assign, log_info_on_rank0
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
 
 logger = logging.getLogger(__name__)
+
+
+def _quantize_glm_kv_b_to_fp8(
+    *, architecture: Optional[str], w_dtype: torch.dtype
+) -> bool:
+    """Whether GLM's bf16 kv_b_proj is converted to per-tensor fp8 on gfx950."""
+    if not (
+        _use_aiter_gfx95
+        and architecture == "GlmMoeDsaForCausalLM"
+        and w_dtype == torch.bfloat16
+    ):
+        return False
+    # q-rep (_prepare_replicated_q_proj) only takes a bf16/fp16 w_kc.
+    return not (
+        envs.SGLANG_DSA_DCP_KEEP_KV_B_BF16.get() and get_parallel().attn_dcp_size > 1
+    )
+
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
@@ -756,11 +774,11 @@ class DeepseekV2WeightLoaderMixin:
 
             # GLM ships kv_b_proj as bf16, which falls back to torch.bmm. Quantize to
             # per-tensor e4m3fn (not fnuz) to match forward_mla_rocm's dtype gate.
-            if (
-                _use_aiter_gfx95
-                and self.config.architectures
-                and self.config.architectures[0] == "GlmMoeDsaForCausalLM"
-                and w.dtype == torch.bfloat16
+            if _quantize_glm_kv_b_to_fp8(
+                architecture=(
+                    self.config.architectures[0] if self.config.architectures else None
+                ),
+                w_dtype=w.dtype,
             ):
                 w, self_attn.w_scale = input_to_float8(w, dtype=torch.float8_e4m3fn)
 
