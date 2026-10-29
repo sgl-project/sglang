@@ -189,7 +189,7 @@ def _handle_output_by_index(output, i):
             spec_cap_lens_histogram=_extract_field_by_index(
                 output, "spec_cap_lens_histogram", i
             ),
-            timing_reports=_extract_field_by_index(output, "timing_reports", i),
+            time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
             decode_ids=_extract_field_by_index(output, "decode_ids", i),
@@ -300,7 +300,6 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
-            timing_reports=_extract_field_by_index(output, "timing_reports", i),
             pooled_hidden_states=_extract_pooled_hidden_states_by_index(output, i),
         )
     elif isinstance(output, BatchStrOutput):
@@ -322,7 +321,7 @@ def _handle_output_by_index(output, i):
             spec_cap_lens_histogram=_extract_field_by_index(
                 output, "spec_cap_lens_histogram", i
             ),
-            timing_reports=_extract_field_by_index(output, "timing_reports", i),
+            time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),
             output_ids=_extract_field_by_index(output, "output_ids", i),

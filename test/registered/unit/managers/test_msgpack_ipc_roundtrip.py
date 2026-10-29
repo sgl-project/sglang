@@ -17,7 +17,6 @@ from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BackupDramReq,
-    BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     ChecksumInfo,
@@ -41,7 +40,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     _merge_checksum_payloads,
 )
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
-from sglang.srt.observability.req_time_stats import SchedulerTimingReport
+from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.weight_checker import ChecksumInfo as PydanticChecksumInfo
 from sglang.srt.utils.weight_checker import ParallelismInfo as PydanticParallelismInfo
@@ -295,25 +294,25 @@ class TestWeightVersionSpansRoundTrip(CustomTestCase):
         self.assertIsNone(_round_trip(AbortReq(rid="r0")).weight_versions)
 
 
-class TestTimingReportsRoundTrip(CustomTestCase):
-    """Per-row scheduler timing decodes back to typed reports, not plain lists."""
+class TestOutputTimeStatsRoundTrip(CustomTestCase):
+    """Per-row scheduler time stats decode back to typed structs, not plain lists."""
 
-    def test_batch_outputs_carry_reports(self):
-        report = SchedulerTimingReport(
+    def test_batch_outputs_carry_time_stats(self):
+        time_stats = SchedulerOutputTimeStats(
             queue_time=0.5, forward_entry_time=1.7e9, storage_staging_wait=0.0
         )
-        for cls in (BatchTokenIDOutput, BatchStrOutput, BatchEmbeddingOutput):
+        for cls in (BatchTokenIDOutput, BatchStrOutput):
             with self.subTest(type=cls.__name__):
                 required = {
                     f.name: [] for f in msgspec.structs.fields(cls) if f.required
                 }
                 obj = cls(**{**required, "rids": ["a", "b"]})
-                obj.timing_reports = [report, None]
+                obj.time_stats = [time_stats, None]
 
                 decoded = _double_hop(obj)
 
-                self.assertEqual(decoded.timing_reports, [report, None])
-                self.assertIsInstance(decoded.timing_reports[0], SchedulerTimingReport)
+                self.assertEqual(decoded.time_stats, [time_stats, None])
+                self.assertIsInstance(decoded.time_stats[0], SchedulerOutputTimeStats)
 
 
 if __name__ == "__main__":

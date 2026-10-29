@@ -141,7 +141,7 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
-    SchedulerTimingReport,
+    SchedulerOutputTimeStats,
     convert_realtime_to_time,
     convert_time_to_realtime,
     real_time,
@@ -449,6 +449,16 @@ class InputFormat(Enum):
     SINGLE_STRING = 1  # Regular single text like "Hello world"
     BATCH_STRINGS = 2  # Regular batch like ["Hello", "World"]
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
+
+
+_NO_SCHEDULER_TIME_STATS = SchedulerOutputTimeStats()
+
+
+def _scheduler_time_stats(recv_obj, i: int) -> SchedulerOutputTimeStats:
+    # Embedding outputs, and requests whose own metrics are off, carry none.
+    if isinstance(recv_obj, BatchEmbeddingOutput) or recv_obj.time_stats is None:
+        return _NO_SCHEDULER_TIME_STATS
+    return recv_obj.time_stats[i] or _NO_SCHEDULER_TIME_STATS
 
 
 _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
@@ -2513,11 +2523,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
-            if self.enable_metrics and recv_obj.timing_reports is not None:
-                # None when the request's own metrics are off (embedding reqs);
-                # reads as an empty report.
-                timing_report = recv_obj.timing_reports[i] or SchedulerTimingReport()
-                meta_info.update(timing_report.to_meta_info())
+            if self.enable_metrics:
+                meta_info.update(_scheduler_time_stats(recv_obj, i).to_meta_info())
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
@@ -2796,12 +2803,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state: ReqState, recv_obj, i: int
     ) -> Optional[float]:
         # Non-streaming outputs are batched; use the scheduler's first-token time.
-        if getattr(state.obj, "stream", False) or recv_obj.timing_reports is None:
+        if getattr(state.obj, "stream", False):
             return None
-        timing_report = recv_obj.timing_reports[i]
-        if timing_report is None or timing_report.prefill_finished_time is None:
+        stamp = _scheduler_time_stats(recv_obj, i).prefill_finished_time
+        if stamp is None:
             return None
-        ts = convert_realtime_to_time(timing_report.prefill_finished_time)
+        ts = convert_realtime_to_time(stamp)
         if state.time_stats.created_time < ts <= time.perf_counter():
             return ts
         return None

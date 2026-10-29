@@ -108,7 +108,7 @@ def _accumulator(
     return_sampling_mask=False,
     request_level_keys=frozenset(),
     rust_server_mode=False,
-    report_timing=False,
+    enable_metrics=False,
 ):
     return _GenerationStreamAccumulator(
         return_logprob=False,
@@ -124,7 +124,7 @@ def _accumulator(
         is_request_level_customized_info_key=request_level_keys.__contains__,
         current_weight_version=current_weight_version,
         rust_server_mode=rust_server_mode,
-        report_timing=report_timing,
+        enable_metrics=enable_metrics,
     )
 
 
@@ -564,11 +564,11 @@ class TestOutputStreamerDecodeLatency(unittest.TestCase):
         self.assertEqual(python_mode.decode_latencies, {})
 
 
-class TestOutputStreamerTimingReports(unittest.TestCase):
-    def test_rows_carry_reports_only_with_metrics_on(self):
-        """With metrics on every emitted row carries its request's report, None
-        for a request whose own metrics are off; with metrics off the payload
-        carries no timing at all."""
+class TestOutputStreamerTimeStats(unittest.TestCase):
+    def test_rows_carry_time_stats_only_with_metrics_on(self):
+        """With metrics on every emitted row carries its request's time stats,
+        None for a request whose own metrics are off; with metrics off the
+        payload carries none at all."""
         timed = SchedulerReqTimeStats(enable_metrics=True)
         timed.queue_duration_s = 0.25
 
@@ -577,16 +577,16 @@ class TestOutputStreamerTimingReports(unittest.TestCase):
             req.time_stats = time_stats
             return req
 
-        for report_timing, expected in (
-            (True, [timed.to_timing_report(), None]),
+        for enable_metrics, expected in (
+            (True, [timed.to_output_time_stats(), None]),
             (False, None),
         ):
-            with self.subTest(report_timing=report_timing):
-                accumulator = _accumulator(report_timing=report_timing)
+            with self.subTest(enable_metrics=enable_metrics):
+                accumulator = _accumulator(enable_metrics=enable_metrics)
                 accumulator.accept(req=req("timed", timed))
                 accumulator.accept(req=req("untimed", SchedulerReqTimeStats()))
                 payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
-                self.assertEqual(payload.timing_reports, expected)
+                self.assertEqual(payload.time_stats, expected)
 
 
 class TestOutputStreamerStreamInterval(unittest.TestCase):

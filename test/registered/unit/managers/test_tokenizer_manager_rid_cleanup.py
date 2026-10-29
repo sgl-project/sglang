@@ -554,7 +554,7 @@ class TestRequestTpotGating(CustomTestCase):
         for completion_tokens, finished_reason in batches:
             batch_output = _make_batch_str_output(rid, finished_reason)
             batch_output.completion_tokens = [completion_tokens]
-            batch_output.timing_reports = [sched_stats.to_timing_report()]
+            batch_output.time_stats = [sched_stats.to_output_time_stats()]
             asyncio.run(tm._handle_batch_output(batch_output))
         (call,) = tm.metrics_collector.observe_one_finished_request.call_args_list
         return call.kwargs["time_per_output_token"]
@@ -605,7 +605,7 @@ class TestNonStreamingFirstTokenTime(CustomTestCase):
             enable_metrics=True, prefill_finished_time=prefill_finished_time
         )
         batch_output = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
-        batch_output.timing_reports = [sched_stats.to_timing_report()]
+        batch_output.time_stats = [sched_stats.to_output_time_stats()]
         arrival = time.perf_counter()
         asyncio.run(tm._handle_batch_output(batch_output))
         return state.time_stats, arrival

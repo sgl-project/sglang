@@ -572,10 +572,10 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
             )
 
 
-class SchedulerTimingReport(
+class SchedulerOutputTimeStats(
     msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
 ):
-    """The scheduler's timing of one request that the tokenizer puts in
+    """The part of a request's scheduler time stats that the tokenizer puts in
     meta_info. Timestamps are wall-clock; None means not stamped.
 
     Fields are the meta_info keys, in meta_info order."""
@@ -669,10 +669,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     _storage_prefetch_wait: Optional[PollTimer] = None
     _storage_staging_wait: Optional[PollTimer] = None
 
-    def to_timing_report(self) -> Optional[SchedulerTimingReport]:
+    def to_output_time_stats(self) -> Optional[SchedulerOutputTimeStats]:
         if not self.enable_metrics:
             return None
-        return SchedulerTimingReport(
+        return SchedulerOutputTimeStats(
             queue_time=self.get_queueing_time(),
             forward_entry_time=_stamped_realtime(self.forward_entry_time),
             prefill_finished_time=_stamped_realtime(self.prefill_finished_time),

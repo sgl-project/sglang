@@ -383,7 +383,6 @@ class TestMultiTokenizerMixin(CustomTestCase):
         output = _make_batch_embedding_output()
         output.retraction_counts = [0, 7]
         output.cached_tokens_details = [{"radix": 0}, {"radix": 2}]
-        output.timing_reports = ["stats-0", "stats-1"]
         output.pooled_hidden_states = [[1.0], [2.0]]
 
         split = _handle_output_by_index(output, 1)
@@ -392,7 +391,6 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(split.embeddings, [[0.3, 0.4]])
         self.assertEqual(split.retraction_counts, [7])
         self.assertEqual(split.cached_tokens_details, [{"radix": 2}])
-        self.assertEqual(split.timing_reports, ["stats-1"])
         self.assertEqual(split.pooled_hidden_states, [[2.0]])
 
     def test_embedding_split_takes_a_row_of_stacked_pooled_hidden_states(self):
@@ -409,7 +407,6 @@ class TestMultiTokenizerMixin(CustomTestCase):
 
         self.assertEqual(split.rids, ["embedding-rid-0"])
         self.assertIsNone(split.retraction_counts)
-        self.assertIsNone(split.timing_reports)
         self.assertIsNone(split.pooled_hidden_states)
 
     def test_router_sends_embedding_output_per_request(self):

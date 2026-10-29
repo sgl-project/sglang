@@ -1,6 +1,6 @@
 """Unit tests for ReqTimeStats.
 
-SchedulerReqTimeStats.to_timing_report converts perf_counter stamps to
+SchedulerReqTimeStats.to_output_time_stats converts perf_counter stamps to
 wall-clock for the tokenizer. A field that was never stamped (0.0) must arrive
 as None, not as a converted value, or "was this stamped?" checks downstream
 fail. Concretely, a PD decode server never stamps prefill_finished_time
@@ -27,35 +27,37 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-def _round_trip(report: rts.SchedulerTimingReport) -> rts.SchedulerTimingReport:
-    """The report as the tokenizer receives it over either IPC codec."""
-    report = pickle.loads(pickle.dumps(report))
+def _round_trip(
+    time_stats: rts.SchedulerOutputTimeStats,
+) -> rts.SchedulerOutputTimeStats:
+    """The time stats as the tokenizer receives them over either IPC codec."""
+    time_stats = pickle.loads(pickle.dumps(time_stats))
     return msgspec.msgpack.decode(
-        msgspec.msgpack.encode(report), type=rts.SchedulerTimingReport
+        msgspec.msgpack.encode(time_stats), type=rts.SchedulerOutputTimeStats
     )
 
 
 def _meta_info(stats: rts.SchedulerReqTimeStats) -> dict:
-    return _round_trip(stats.to_timing_report()).to_meta_info()
+    return _round_trip(stats.to_output_time_stats()).to_meta_info()
 
 
-class TestTimingReportKeepsUnsetStamps(CustomTestCase):
+class TestOutputTimeStatsKeepUnsetStamps(CustomTestCase):
     def test_unset_stamp_stays_unset(self):
         stats = rts.SchedulerReqTimeStats(enable_metrics=True)
         stats.forward_entry_time = 123.456
         stats.prefill_finished_time = 0.0
 
         with mock.patch.object(rts, "global_diff_realtime_monotonic", 1_000_000.0):
-            report = _round_trip(stats.to_timing_report())
+            sent = _round_trip(stats.to_output_time_stats())
 
-        self.assertIsNone(report.prefill_finished_time)
-        self.assertNotIn("prefill_finished_time", report.to_meta_info())
-        self.assertAlmostEqual(report.forward_entry_time, 1_000_123.456)
+        self.assertIsNone(sent.prefill_finished_time)
+        self.assertNotIn("prefill_finished_time", sent.to_meta_info())
+        self.assertAlmostEqual(sent.forward_entry_time, 1_000_123.456)
 
-    def test_metrics_disabled_sends_no_report(self):
+    def test_metrics_disabled_sends_no_time_stats(self):
         stats = rts.SchedulerReqTimeStats()
         stats.forward_entry_time = 123.456
-        self.assertIsNone(stats.to_timing_report())
+        self.assertIsNone(stats.to_output_time_stats())
 
 
 class TestOutputMetaInfo(CustomTestCase):
