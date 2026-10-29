@@ -94,7 +94,7 @@ Performance benchmarks measure **Latency** (Time To First Token - TTFT) and **Th
 This simulates a scenario with low concurrency (e.g., single user) to measure latency.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --host 0.0.0.0 \
   --port 30000 \
@@ -108,7 +108,7 @@ python -m sglang.bench_serving \
 This simulates a high-traffic scenario to measure maximum system throughput.
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --host 0.0.0.0 \
   --port 30000 \
@@ -122,7 +122,7 @@ python -m sglang.bench_serving \
 You can also benchmark the performance of processing a single batch offline.
 
 ```bash Command
-python -m sglang.bench_one_batch_server \
+python -m sglang.benchmark.one_batch_server \
   --model <model-path> \
   --batch-size 8 \
   --input-len 1024 \
