@@ -31,6 +31,7 @@ import sys
 import threading
 import time
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -274,6 +275,9 @@ class TestVmmExportAndImport(CustomTestCase):
     def test_round_trip(self):
         torch.manual_seed(0)
         model = _TinyModel()
+        model_ref = weakref.ref(model)
+        # Model/loader callbacks can create cycles that refcounting cannot free.
+        model.python_cycle = [model]
         names = list(model.state_dict()) + ["cache"]
         tensors = dict(model.named_parameters(remove_duplicate=False))
         tensors.update(model.named_buffers(remove_duplicate=False))
@@ -295,7 +299,10 @@ class TestVmmExportAndImport(CustomTestCase):
                 {name for name, ref in originals.items() if ref.expired()}
             )
             daemon = _make_daemon(model, backend)
+            del model
             daemon._export_state()
+        self.assertIsNone(model_ref())
+        self.assertIsNone(daemon.model)
         entries = daemon.state_entries
         reservation = backend._reservation
 
@@ -315,17 +322,6 @@ class TestVmmExportAndImport(CustomTestCase):
                 if entries[name]["alloc_index"] <= alloc_index
             }
             self.assertEqual(freed, packed_so_far)
-
-        # The daemon's own model now lives in the packed memory, ties intact.
-        self.assertIs(model.head.weight, model.embed.weight)
-        live = dict(model.named_parameters(remove_duplicate=False))
-        live.update(model.named_buffers(remove_duplicate=False))
-        for name in names:
-            tensor = live[name]
-            torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
-            if tensor.numel():
-                self.assertGreaterEqual(tensor.data_ptr(), reservation.base)
-                self.assertLess(tensor.data_ptr(), reservation.base + reservation.size)
 
         # fetch_state: layout first, then one fd per allocation.
         before = _open_fd_count()
@@ -374,7 +370,7 @@ class TestVmmExportAndImport(CustomTestCase):
             tensor = imported[name]
             self.assertEqual(tensor.shape, expected[name].shape, name)
             self.assertEqual(tensor.dtype, expected[name].dtype, name)
-            self.assertEqual(tensor.stride(), live[name].stride(), name)
+            self.assertEqual(tensor.stride(), expected[name].stride(), name)
             torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
         storage_ptr = {
             name: imported[name].untyped_storage().data_ptr()
@@ -389,6 +385,28 @@ class TestVmmExportAndImport(CustomTestCase):
         client.close()
         backend.close()
         self.assertEqual(reservation.close_calls, 1)
+
+    def test_cached_buffer_owner_is_released_before_packing(self):
+        from sglang.srt.layers.rotary_embedding import factory
+
+        model = _TinyModel()
+        cached_layer = torch.nn.Module()
+        cached_layer.register_buffer("view", model.cache[1], persistent=False)
+        owner_ref = weakref.ref(cached_layer)
+        original = StorageWeakRef(model.cache.untyped_storage())
+        cache = {"example": cached_layer}
+        daemon = _make_daemon(
+            model,
+            VmmFdTransportBackend(device=CPU, granularity=GRANULARITY),
+        )
+        del model, cached_layer
+        with mock.patch.object(factory, "_ROPE_DICT", cache), _host_vmm():
+            daemon._export_state()
+        self.assertFalse(cache)
+        self.assertIsNone(owner_ref())
+        self.assertTrue(original.expired())
+        self.assertIsNone(daemon.model)
+        daemon.transport_backend.close()
 
     def test_state_dict_hook_output_is_exported_not_the_live_tensor(self):
         model = torch.nn.Linear(2, 3, bias=False)

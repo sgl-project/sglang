@@ -10,7 +10,7 @@ import socket
 import struct
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, MutableMapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -121,9 +121,9 @@ class WeightCacheTransportBackend(ABC):
 
     @abstractmethod
     def prepare_export(
-        self, state_tensors: Mapping[str, Tuple[torch.Tensor, bool]]
+        self, state_tensors: MutableMapping[str, Tuple[torch.Tensor, bool]]
     ) -> Dict[str, Dict[str, Any]]:
-        """Prepare daemon-side entries for all tensors."""
+        """Prepare daemon-side entries; the backend may consume the mapping."""
 
     @abstractmethod
     def send_fetch_state_response(
@@ -155,7 +155,7 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
     name = TORCH_IPC_BACKEND
 
     def prepare_export(
-        self, state_tensors: Mapping[str, Tuple[torch.Tensor, bool]]
+        self, state_tensors: MutableMapping[str, Tuple[torch.Tensor, bool]]
     ) -> Dict[str, Dict[str, Any]]:
         entries: Dict[str, Dict[str, Any]] = {}
         for name, (tensor, is_param) in state_tensors.items():
@@ -279,14 +279,14 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         )
 
     def prepare_export(
-        self, state_tensors: Mapping[str, Tuple[torch.Tensor, bool]]
+        self, state_tensors: MutableMapping[str, Tuple[torch.Tensor, bool]]
     ) -> Dict[str, Dict[str, Any]]:
         """Pack ``state_tensors`` into exportable allocations.
 
-        The values should be the model's own parameter and buffer objects:
-        each one is repointed at its packed copy as soon as the copy exists,
-        which frees the original before the next allocation is created. If
-        packing fails part-way the daemon is left unusable and exits.
+        Consumes the source mapping; each slot retains its source storages until
+        copied. The caller releases the model and other source owners first so
+        copied originals can be reclaimed before the next allocation. Partial
+        packing failures leave the daemon unusable and it exits.
         """
         from sglang.srt.utils.cuda_vmm_utils import VmmReservation, tensor_from_pointer
 
@@ -299,6 +299,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
             granularity=self._granularity,
             max_alloc_bytes=self._max_alloc_bytes,
         )
+        state_tensors.clear()
         if not plan.alloc_sizes:
             return plan.entries
 
@@ -323,7 +324,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
                     slot.nbytes,
                     device_id=self._device.index,
                 )
-                pack_slot(slot, plan.entries, state_tensors, dst)
+                pack_slot(slot, dst)
             # Wait for the copies, then hand the replaced originals back to
             # the driver so that they can back the next allocation.
             torch.cuda.synchronize(self._device)

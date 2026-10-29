@@ -39,6 +39,7 @@ Usage:
 import argparse
 import dataclasses
 import datetime
+import gc
 import logging
 import multiprocessing
 import os
@@ -485,7 +486,15 @@ class WeightCacheDaemon:
         non_persistent_count = len(state_tensors) - len(state_dict_names)
 
         if self.transport_name == VMM_FD_BACKEND:
-            state_tensors = self._with_live_tensors(state_tensors)
+            # Packing consumes detached storage aliases. The daemon never runs
+            # the model, so release its object graph before moving any bytes.
+            self.model = None
+            from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
+
+            # This process-wide cache also owns model buffers. The standalone
+            # daemon loads one model and does not need to construct another.
+            _ROPE_DICT.clear()
+            gc.collect()
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
 
         # Log approximate serialized metadata size (not payload-backed bytes).
@@ -503,38 +512,6 @@ class WeightCacheDaemon:
             f"transport={self.transport_backend.name}, "
             f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
-
-    def _with_live_tensors(
-        self, state_tensors: Dict[str, Tuple[torch.Tensor, bool]]
-    ) -> Dict[str, Tuple[torch.Tensor, bool]]:
-        """Swap the detached aliases for the model's own parameter and buffer
-        objects. vmm_fd repoints these objects at the packed copy, which is
-        what frees each original while packing; repointing an alias alone
-        would leave the original alive. An entry that does not alias a live
-        object (e.g. one produced by a state_dict hook) is kept as is.
-        """
-        # A buffer that is a view keeps its base, and so the original storage,
-        # alive even after it is repointed. The daemon never runs the model,
-        # so re-register such buffers as plain aliases of the same memory.
-        for module in self.model.modules():
-            for leaf, buf in module._buffers.items():
-                if buf is not None and buf._base is not None:
-                    module._buffers[leaf] = buf.detach()
-        live = dict(self.model.named_buffers(remove_duplicate=False))
-        live.update(self.model.named_parameters(remove_duplicate=False))
-        result = {}
-        for name, (tensor, is_param) in state_tensors.items():
-            obj = live.get(name)
-            if (
-                obj is not None
-                and obj.data_ptr() == tensor.data_ptr()
-                and obj.dtype == tensor.dtype
-                and obj.shape == tensor.shape
-                and obj.stride() == tensor.stride()
-            ):
-                tensor = obj
-            result[name] = (tensor, is_param)
-        return result
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
         """Build the same initial physical expert layout as the engine."""
@@ -685,7 +662,7 @@ class WeightCacheDaemon:
             self.model = None
         self.state_entries.clear()
         if self.transport_backend is not None:
-            # After the model: with vmm_fd its tensors point into these mappings.
+            # Release any model references before closing transport resources.
             self.transport_backend.close()
             self.transport_backend = None
         current_platform.empty_cache()

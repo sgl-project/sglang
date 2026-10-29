@@ -9,8 +9,8 @@ describes it relative to its storage (``storage_offset``, ``shape``,
 ``stride``), so tensors that shared a storage in the daemon (tied weights,
 transposes, slices, dtype views) share one storage again in the engine.
 
-Nothing here calls CUDA: planning, validation and rebuilding tensors only use
-torch metadata, so this module is unit-tested on CPU.
+Planning and validation use torch metadata. Slots retain their source storages
+until packing copies and releases them. These paths are also tested on CPU.
 """
 
 from __future__ import annotations
@@ -33,12 +33,9 @@ class VmmSlot:
     alloc_index: int
     offset: int
     nbytes: int
-    # (name of a tensor on the source storage, byte offset of that storage in
-    # the slot, storage nbytes). More than one source only when distinct
-    # storages overlapped in the daemon.
-    sources: List[Tuple[str, int, int]]
-    # Every tensor that views this slot.
-    names: List[str]
+    # (source storage, byte offset in the slot). Retain each source until this
+    # slot is copied; multiple sources are needed only for overlapping storages.
+    sources: List[Tuple[torch.UntypedStorage, int]]
 
 
 @dataclasses.dataclass
@@ -93,7 +90,8 @@ def plan_vmm_pack(
     Each entry holds ``alloc_index``, ``offset`` (slot start, bytes),
     ``storage_nbytes`` (slot size), ``storage_offset`` (elements, relative to
     the slot), ``shape``, ``stride``, ``dtype`` and ``is_param``. The plan
-    keeps tensor names, not tensors, so it does not keep any original alive.
+    owns the source storages until pack_slot() copies and releases each slot.
+    It does not retain model tensors or need to rebind them.
     """
     if granularity <= 0 or granularity % SLOT_ALIGNMENT:
         raise ValueError(
@@ -138,27 +136,28 @@ def plan_vmm_pack(
     group_starts = [group[0] for group in groups]
 
     group_slots = [
-        VmmSlot(alloc_index=-1, offset=-1, nbytes=end - start, sources=[], names=[])
+        VmmSlot(alloc_index=-1, offset=-1, nbytes=end - start, sources=[])
         for start, end, _ in groups
     ]
     for start in span_starts:
         group = bisect.bisect_right(group_starts, start) - 1
-        nbytes, name = span_source[start]
-        group_slots[group].sources.append((name, start - group_starts[group], nbytes))
+        _, name = span_source[start]
+        group_slots[group].sources.append(
+            (state_tensors[name][0].untyped_storage(), start - group_starts[group])
+        )
 
     tensor_slot: Dict[str, Tuple[VmmSlot, int]] = {}  # name -> (slot, byte offset)
     for name, (start, nbytes) in tensor_spans.items():
         if nbytes == 0:
             continue
         group = bisect.bisect_right(group_starts, start) - 1
-        group_slots[group].names.append(name)
         tensor_slot[name] = (group_slots[group], start - group_starts[group])
 
     ordered: List[Tuple[int, VmmSlot]] = [
         (groups[i][2], slot) for i, slot in enumerate(group_slots)
     ]
     for index, name in empty_names:
-        slot = VmmSlot(alloc_index=-1, offset=-1, nbytes=0, sources=[], names=[name])
+        slot = VmmSlot(alloc_index=-1, offset=-1, nbytes=0, sources=[])
         ordered.append((index, slot))
         tensor_slot[name] = (slot, 0)
     ordered.sort(key=lambda item: item[0])
@@ -287,16 +286,13 @@ def view_from_entry(
 
 def pack_slot(
     slot: VmmSlot,
-    entries: Mapping[str, Mapping[str, Any]],
-    state_tensors: Mapping[str, Tuple[torch.Tensor, bool]],
     dst: torch.Tensor,
 ) -> None:
-    """Copy ``slot``'s source storages into ``dst`` and repoint its tensors.
+    """Copy ``slot``'s retained source storages into ``dst``, then release them.
 
     ``dst`` is a uint8 tensor whose storage is exactly the slot. Once the
-    bytes are copied, every tensor of the slot is repointed in place with
-    ``tensor.data = ...``; when nothing else references the original storage
-    any more, torch frees it.
+    bytes are copied, discard the source storage references for this slot. No
+    daemon model needs rebinding; engines rebuild views from the wire metadata.
     """
     if (
         dst.dtype != torch.uint8
@@ -304,12 +300,7 @@ def pack_slot(
         or dst.untyped_storage().nbytes() != slot.nbytes
     ):
         raise ValueError("dst must be a uint8 tensor covering exactly the slot")
-    for name, rel, nbytes in slot.sources:
-        source = state_tensors[name][0].untyped_storage()
+    for source, rel in slot.sources:
         src = torch.empty(0, dtype=torch.uint8, device=source.device).set_(source)
-        dst[rel : rel + nbytes].copy_(src)
-    storage = dst.untyped_storage()
-    for name in slot.names:
-        state_tensors[name][0].data = view_from_entry(
-            storage, entries[name], dst.device
-        )
+        dst[rel : rel + source.nbytes()].copy_(src)
+    slot.sources.clear()
