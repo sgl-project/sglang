@@ -12,11 +12,7 @@ from sglang.srt.distributed.naive_distributed import (
     set_naive_distributed,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_parallel,
-    get_stream,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import MultiprocessingSerializer, is_pin_memory_available
 from sglang.srt.utils.host_shared_memory import (
     HostSharedMemoryManager,
@@ -185,10 +181,13 @@ class OffloaderV1(BaseOffloader):
 
             def forward(*args, **kwargs):
                 module.forward = original_forward
-                device_state = _get_offloaded_device_state(module, device)
-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
-                module.forward = forward
-                return output
+                try:
+                    device_state = _get_offloaded_device_state(module, device)
+                    return functional_call(
+                        module, device_state, args=args, kwargs=kwargs
+                    )
+                finally:
+                    module.forward = forward
 
             module.forward = forward
 
@@ -306,12 +305,14 @@ def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_di
 
     def forward(*args, **kwargs):
         module.forward = original_forward
-        output = functional_call(
-            module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs
-        )
-        on_forward_end()
-        module.forward = forward
-        return output
+        try:
+            output = functional_call(
+                module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs
+            )
+            on_forward_end()
+            return output
+        finally:
+            module.forward = forward
 
     module.forward = forward
 
