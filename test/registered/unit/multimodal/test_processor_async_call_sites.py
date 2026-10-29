@@ -110,7 +110,14 @@ def test_sglang_entry_forwards_the_request_to_its_core(media_source):
     wrapper._core = SimpleNamespace(process=AsyncMock(return_value=object()))
     wrapper._image_device = "image device"
     wrapper._video_preprocessing_device = None
-    request_obj = SimpleNamespace(video_data=["request video"], audio_data=["audio"])
+    from sglang.srt.managers.io_struct import GenerateReqInput
+
+    request_obj = GenerateReqInput(
+        input_ids=[1, 101, 2],
+        video_data=["request video"],
+        audio_data=["audio"],
+        mm_token_expansion_start_len=1,
+    )
     media = (
         {"video_data": ["video"], "audio_data": ["audio"]}
         if media_source == "arguments"
@@ -132,6 +139,7 @@ def test_sglang_entry_forwards_the_request_to_its_core(media_source):
         media.get("video_data", request_obj.video_data),
         ["audio"],
         input_ids=[1, 101, 2],
+        mm_token_expansion_start_len=1,
         package_output=wrapper._package_output,
         image_device="image device",
         video_device=None,
