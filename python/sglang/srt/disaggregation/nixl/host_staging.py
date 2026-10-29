@@ -34,6 +34,17 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 from sglang.srt.disaggregation.utils import DisaggregationMode, fail_stop
 from sglang.srt.environ import envs
 
+try:
+    from nixl._bindings import nixlNotFoundError, nixlRemoteDisconnectError
+except ImportError:  # NIXL-less CPU environments: no NIXL call raises these.
+
+    class nixlNotFoundError(RuntimeError):
+        pass
+
+    class nixlRemoteDisconnectError(RuntimeError):
+        pass
+
+
 SLOT_COUNT = 2
 VERSION = 4
 MAGIC = 0x33545348  # b"HST3"
@@ -325,7 +336,14 @@ class HostStaging:
     def xfer_state(self, handle):
         if isinstance(handle, HostWrite):
             return handle.state
-        return self.manager.agent.check_xfer_state(handle)
+        try:
+            return self.manager.agent.check_xfer_state(handle)
+        except nixlRemoteDisconnectError:
+            # NIXL raises failed states instead of returning "ERR". A disconnect
+            # means the endpoint failed, which completes every request it carries
+            # (a WRITE split across threads reports only after all of its chunks),
+            # so nothing lands later: settled.
+            return "ERR"
 
     # -- Prefill pipeline -----------------------------------------------------
 
@@ -517,11 +535,36 @@ class HostStaging:
                 peer = manager.decode_kv_args_table[part.peer]
                 # Posted under the lock fail_room() takes: a failure either sees
                 # this part queued (dropped) or posted (fenced by the drain ack).
-                slot.handle = self._post_ring_write(
-                    slot, part, peer.staging_base_ptr + offset
-                )
+                try:
+                    slot.handle = self._post_ring_write(
+                        slot, part, peer.staging_base_ptr + offset
+                    )
+                except Exception as exc:
+                    # Refused for a dropped peer (createXferReq raises), or
+                    # failed posting on a dead endpoint (_post_xfer wraps it).
+                    # A one-row WRITE rides a single endpoint and a failed post
+                    # releases what it began: nothing is running.
+                    cause = exc.__cause__ or exc
+                    if not isinstance(
+                        cause, (nixlNotFoundError, nixlRemoteDisconnectError)
+                    ):
+                        raise
+                    logger.warning(
+                        "Host staging WRITE not posted room=%s seq=%s: %r",
+                        part.room,
+                        part.seq,
+                        exc,
+                    )
+                    self._finish(slot, "ERR")
             return
-        state = manager.agent.check_xfer_state(slot.handle)
+        try:
+            state = self.xfer_state(slot.handle)
+        except nixlNotFoundError:
+            # A disconnect seen on another handle dropped this peer's metadata, so
+            # NIXL cannot read this WRITE until the transfer worker reloads it
+            # (conn.py fails a batch whose WRITE has a failed part, which runs
+            # that reload). It may still be writing: keep it under its deadline.
+            state = "PROC"
         if state == "PROC":
             if time.monotonic() - part.requested >= POST_DEADLINE_S + WRITE_DEADLINE_S:
                 fail_stop(f"Host staging WRITE timeout room={part.room} seq={part.seq}")

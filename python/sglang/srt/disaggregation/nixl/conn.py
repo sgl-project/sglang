@@ -1176,6 +1176,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         while True:
             all_settled = True
             any_failed = failure_seen
+            stranded = False
             states = []
             try:
                 for handle in handles:
@@ -1185,11 +1186,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         any_failed = True
                     elif state != "DONE":
                         all_settled = False
+                        stranded |= self._host_write_failed(handle)
             except Exception as e:
                 logger.warning(f"Failed to read NIXL transfer state: {e}")
                 return False, True
             if all_settled:
                 return True, any_failed
+            if stranded:
+                return False, True
             if started is not None and self._native_write_overdue(
                 handles, states, started
             ):
@@ -1319,6 +1323,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             not isinstance(handle, H.HostWrite) and state not in ("DONE", "ERR")
             for handle, state in zip(handles, states)
         )
+
+    def _host_write_failed(self, handle) -> bool:
+        """HOST: a staged WRITE with a failed part, still waiting on the rest.
+
+        A part the disconnect left unreadable stays so until this room's failure
+        path reloads the peer, and that part's WRITE deadline keeps running: the
+        batch goes to the reaper at once instead of waiting out the settle bound.
+        """
+        if self.host_staging is None:
+            return False
+        from sglang.srt.disaggregation.nixl import host_staging as H
+
+        return isinstance(handle, H.HostWrite) and handle.failed
 
     def _writes_in_flight(self, room: int) -> bool:
         return self._staging_outstanding.get(room, 0) > 0 or (
@@ -2197,6 +2214,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # the timeout.
                     self.poison_deferred_ack_room(room)
                 # Settle first; NIXL 1.3.0 undoes a reload when an old handle fails.
+                # A batch whose staged WRITE already has a failed part reloads
+                # without settling: its unreadable sibling part cannot settle
+                # until the peer is reloaded.
                 # room_transfer_infos survives the sender's clear() of this room.
                 self._reload_invalidated_peers(room_transfer_infos or {})
 

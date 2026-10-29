@@ -1095,6 +1095,144 @@ class HostStagingTest(unittest.TestCase):
         self.assertFalse(rig.receiver.host_allocs)
 
 
+class HostXferStateTest(unittest.TestCase):
+    """NIXL raises a failed transfer's state rather than returning "ERR"."""
+
+    def setUp(self):
+        def fail_stop(reason):
+            raise FailStop(reason)
+
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(H, "fail_stop", side_effect=fail_stop))
+        self.agent = Mock()
+        self.host = h = H.HostStaging.__new__(H.HostStaging)
+        self.manager = m = NixlKVManager.__new__(NixlKVManager)
+        h.manager, h.lock, h.failed_rooms = m, threading.Lock(), set()
+        h.capacity = 1 << 20
+        m.agent, m.host_staging, m._xfer_state = self.agent, h, h.xfer_state
+        m.request_status, m.transfer_infos = {ROOM: KVPoll.Transferring}, {}
+        m.decode_kv_args_table = {"decode": NS(staging_base_ptr=0)}
+        m._is_watermark_ready = lambda peer, rnd, end: True
+        self.write = H.HostWrite(1)
+        self.slot = self.posted(self.write)
+
+    def part(self, write, index=0):
+        rows = np.zeros(1, dtype=np.uint64)
+        args = (ROOM, index, 0, index, write.parts, rows, rows, rows + 1)
+        part = H.HostPart(write, "decode", *args)
+        part.requested = time.monotonic()
+        return part
+
+    def posted(self, write, index=0):
+        return H.HostSlot(None, None, part=self.part(write, index), handle=object())
+
+    def granted(self, write):
+        """An unposted part whose gather finished and whose ring region is granted."""
+        slot = H.HostSlot(NS(get_ptr=lambda: 0), None, part=self.part(write))
+        slot.copy_done = NS(query=lambda: True)
+        size = slot.part.size
+        staging = NS(offsets=[0], rounds=[0], ends=[size])
+        self.manager.transfer_infos = {ROOM: {"decode": NS(staging=staging)}}
+        return slot
+
+    def raise_on_check(self, exc):
+        self.agent.check_xfer_state.side_effect = exc(exc.__name__)
+
+    def test_disconnected_ring_write_fails_the_room_not_the_worker(self):
+        self.raise_on_check(H.nixlRemoteDisconnectError)
+        handle = self.slot.handle
+        self.host._advance(self.slot)
+        self.assertEqual(self.write.state, "ERR")
+        self.assertIsNone(self.slot.part)
+        self.agent.release_xfer_handle.assert_called_once_with(handle)
+
+    def test_unreadable_ring_write_runs_until_its_deadline(self):
+        # A disconnect on another handle drops the peer, and NIXL reports this
+        # WRITE as not found until the peer is reloaded. It may still be writing.
+        self.raise_on_check(H.nixlNotFoundError)
+        self.host._advance(self.slot)
+        self.assertEqual(self.write.state, "PROC")
+        self.assertIsNotNone(self.slot.part)
+        self.agent.release_xfer_handle.assert_not_called()
+        with (
+            patch.object(H, "POST_DEADLINE_S", 0),
+            patch.object(H, "WRITE_DEADLINE_S", 0),
+            self.assertRaisesRegex(FailStop, "WRITE timeout"),
+        ):
+            self.host._advance(self.slot)
+
+    def test_failed_part_fails_the_batch_so_the_peer_is_reloaded(self):
+        # Two parts of one WRITE in flight, no aux: one disconnects, which drops
+        # the peer, so the other reads as not found until the peer is reloaded.
+        write = H.HostWrite(2)
+        first, second = self.posted(write, 0), self.posted(write, 1)
+        lost = first.handle
+
+        def check(handle):
+            if handle is lost:
+                raise H.nixlRemoteDisconnectError("NIXL_ERR_REMOTE_DISCONNECT")
+            raise H.nixlNotFoundError("NIXL_ERR_NOT_FOUND")
+
+        self.agent.check_xfer_state.side_effect = check
+        self.host._advance(first)
+        self.host._advance(second)
+        self.assertEqual((write.state, write.failed), ("PROC", True))
+        # The transfer worker hands the batch to the reaper at once, without
+        # waiting out the settle bound: its failure path is what reloads the
+        # peer, and the unreadable part's WRITE deadline keeps running.
+        result = []
+        waiter = threading.Thread(
+            target=lambda: result.append(
+                self.manager._await_handles(
+                    [write], failure_seen=False, started=time.monotonic()
+                )
+            ),
+            daemon=True,
+        )
+        with patch("sglang.srt.disaggregation.nixl.conn.NIXL_ERR_SETTLE_TIMEOUT_S", 60):
+            waiter.start()
+            waiter.join(5)
+        self.assertEqual(result, [(False, True)])
+        # Reloaded, NIXL reads the second part's own state: it settles the WRITE.
+        self.raise_on_check(H.nixlRemoteDisconnectError)
+        self.host._advance(second)
+        self.assertEqual(write.state, "ERR")
+
+    def test_write_not_posted_to_a_dropped_or_dead_peer_fails_the_part(self):
+        for call, exc in (
+            ("initialize_xfer", H.nixlNotFoundError),  # Peer dropped: refused.
+            ("transfer", H.nixlRemoteDisconnectError),  # Endpoint died at post.
+        ):
+            with self.subTest(call=call):
+                self.agent.reset_mock()
+                getattr(self.agent, call).side_effect = exc(exc.__name__)
+                write = H.HostWrite(1)
+                slot = self.granted(write)
+                self.host._advance(slot)  # No fail-stop.
+                self.assertEqual(write.state, "ERR")
+                self.assertIsNone(slot.part)
+                getattr(self.agent, call).side_effect = None
+
+    def test_native_handles_settle_on_disconnect_only(self):
+        # The native transfer worker and reaper read aux WRITEs through this
+        # seam and keep an unreadable handle running.
+        self.raise_on_check(H.nixlRemoteDisconnectError)
+        self.assertEqual(self.host.xfer_state(object()), "ERR")
+        self.raise_on_check(H.nixlNotFoundError)
+        self.assertRaises(H.nixlNotFoundError, self.host.xfer_state, object())
+
+    def test_other_nixl_errors_still_fail_stop(self):
+        # Anything else is uncertain or local; HostStaging.run() fail-stops on it.
+        self.raise_on_check(RuntimeError)
+        self.assertRaises(RuntimeError, self.host._advance, self.slot)
+        self.assertRaises(RuntimeError, self.host.xfer_state, object())
+        self.agent.check_xfer_state.side_effect = None
+        self.agent.initialize_xfer.side_effect = RuntimeError("NIXL_ERR_BACKEND")
+        slot = self.granted(H.HostWrite(1))
+        self.assertRaises(RuntimeError, self.host._advance, slot)
+
+
 class HostRowValidationTest(unittest.TestCase):
     def setUp(self):
         self.handler = H.HostDecodeStagingHandler.__new__(H.HostDecodeStagingHandler)
