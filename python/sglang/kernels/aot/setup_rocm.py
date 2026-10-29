@@ -74,9 +74,19 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-# gfx942/gfx950 run 64-lane waves; gfx1250 and gfx1201 (RDNA4) run 32-lane waves. Device code sees the
-# target's wave size in WARP_SIZE, host launch code queries it at runtime (see include/utils.h).
-supported_targets = ["gfx942", "gfx950", "gfx1250", "gfx1201"]
+# gfx942/gfx950 run 64-lane waves; gfx1250 and the RDNA3/RDNA4 targets (gfx1100/1101/1102, gfx1200/1201) run
+# 32-lane waves. Device code sees the target's wave size in WARP_SIZE, host launch code queries it at runtime
+# (see include/utils.h).
+supported_targets = [
+    "gfx942",
+    "gfx950",
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1200",
+    "gfx1201",
+    "gfx1250",
+]
 if amdgpu_target not in supported_targets:
     print(
         f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected one of {supported_targets}."
@@ -85,14 +95,14 @@ if amdgpu_target not in supported_targets:
 
 fp8_macro = (
     "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
-)  # gfx950, gfx1250 and gfx1201 use E4M3 (OCP)
+)  # every target except gfx942 uses E4M3 (OCP); gfx11 has no FP8 hardware
 
 # Dynamic shared-memory budget for the TopK kernels.
 # - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
 #   (leaves room for static shared allocations in the kernel).
 # - gfx95x (MI350) and gfx1250: LDS is larger. Large dynamic budget wastes LDS
 #   and pins occupancy to 1 block/CU. Keep it small (40KB) for better occupancy.
-# - gfx1201 (RDNA4): 64KB LDS per workgroup, so the 40KB budget fits as well.
+# - RDNA3/RDNA4 (gfx11xx, gfx12xx): 64KB LDS per workgroup, so the 40KB budget fits as well.
 topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 40 * 1024
 
 hipcc_flags = [

@@ -230,7 +230,9 @@ docker run -it --rm \
 
 ## Radeon RDNA4 / gfx1201 (experimental)
 
-Radeon AI PRO R9700 / R9600D and Radeon RX 9070 / 9070 XT (`gfx1201`) are wave32 RDNA4 discrete GPUs. They are
+Radeon AI PRO R9700 / R9600D and Radeon RX 9070 / 9070 XT (`gfx1201`) are wave32 RDNA4 discrete GPUs. `setup_rocm.py`
+also accepts the other wave32 Radeon targets `gfx1200` (RDNA4) and `gfx1100` / `gfx1101` / `gfx1102` (RDNA3); only
+`gfx1201` and `gfx1100` have been run on hardware. They are
 not covered by the Instinct/CDNA `rocm.Dockerfile` image or by SGLang CI, so support is experimental. It has been
 checked on Radeon AI PRO R9700 (32 GB, PCIe) with PyTorch 2.11.0+rocm10.0.0 (HIP runtime 7.15).
 
