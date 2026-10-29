@@ -60,7 +60,10 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "bfloat16",
     "--tp-size",
     64,
-    "--attn-dp-size",
+    # Temporarily the legacy pair: the B106 snapshot image lacks
+    # "--attn-dp-size". Switch back to "--attn-dp-size", 4, before merge.
+    "--enable-dp-attention",
+    "--dp-size",
     4,
     "--enable-dp-lm-head",
     "--enable-shared-experts-attn-tp",
