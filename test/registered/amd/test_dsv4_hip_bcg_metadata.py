@@ -730,6 +730,7 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
                 seq_lens_cpu = seq_lens_cpu + block
             return SimpleNamespace(
                 forward_mode=ForwardMode.TARGET_VERIFY,
+                ragged_verify_layout=None,
                 batch_size=bs,
                 req_pool_indices=torch.tensor(
                     [4, 1], dtype=torch.int32, device=self.device
@@ -807,6 +808,7 @@ class TestAiterSparseLengthFoldPerStep(CustomTestCase):
             seq_lens_cpu = torch.tensor(prefix_list, dtype=torch.int64)
             return SimpleNamespace(
                 forward_mode=ForwardMode.TARGET_VERIFY,
+                ragged_verify_layout=None,
                 batch_size=bs,
                 req_pool_indices=torch.tensor([4, 1], dtype=torch.int32, device=device),
                 seq_lens=prefix,
