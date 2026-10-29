@@ -4,8 +4,8 @@ import pytest
 import torch
 from torch import nn
 
-from sglang.srt.models.dflash import _radix_topk
-from sglang.srt.models.xpress import XPressRefinerHead
+from sglang.srt.models.dflash import DFlashDraftModel, _radix_topk
+from sglang.srt.models.xpress import Qwen3XPressModel, XPressRefinerHead
 from sglang.srt.speculative.dflash_worker_v2 import _validate_xpress_lm_head
 
 
@@ -67,6 +67,46 @@ def test_xpress_target_head_validation():
     target_head.quant_method = None
     with pytest.raises(ValueError, match="shape"):
         _validate_xpress_lm_head(nn.Linear(31, 64, bias=False), head, config)
+
+
+def test_xpress_checkpoint_load_folds_mixer(monkeypatch):
+    model = Qwen3XPressModel.__new__(Qwen3XPressModel)
+    nn.Module.__init__(model)
+    model.xpress_head = _head("cpu")
+    head = model.xpress_head
+    raw = torch.randn_like(head.mix_L)
+    weights = [
+        ("xpress_head.w1.weight", torch.randn_like(head.w1.weight)),
+        ("xpress_head.down_h.weight", torch.randn_like(head.down_h.weight)),
+        ("xpress_head.down_g.weight", torch.randn_like(head.down_g.weight)),
+        ("xpress_head.in_proj.weight", torch.randn_like(head.in_proj.weight)),
+        ("xpress_head.mlp.gate_proj.weight", torch.randn_like(head.mlp_gate.weight)),
+        ("xpress_head.mlp.up_proj.weight", torch.randn_like(head.mlp_up.weight)),
+        ("xpress_head.mlp.down_proj.weight", torch.randn_like(head.mlp_down.weight)),
+        ("xpress_head.w2.weight", torch.randn_like(head.w2.weight)),
+        ("xpress_head.mix.L", raw),
+    ]
+
+    def load_base_weights(self, mapped):
+        params = dict(self.named_parameters())
+        for name, weight in mapped:
+            params[name].data.copy_(weight)
+
+    monkeypatch.setattr(DFlashDraftModel, "load_weights", load_base_weights)
+    model.load_weights(weights)
+    torch.testing.assert_close(head.mix_L, raw.tril() + torch.eye(head.block_size))
+    torch.testing.assert_close(head._fused_buf["mix_kjc"], head.mix_L.permute(1, 2, 0))
+
+
+def test_xpress_post_load_refreshes_fused_mixer():
+    model = Qwen3XPressModel.__new__(Qwen3XPressModel)
+    nn.Module.__init__(model)
+    model.xpress_head = _head("cpu")
+    model.post_load_weights()
+    old_mixer = model.xpress_head._fused_buf["mix_kjc"].clone()
+    model.xpress_head.fold_from_raw_(torch.randn_like(model.xpress_head.mix_L))
+    model.post_load_weights()
+    assert not torch.equal(model.xpress_head._fused_buf["mix_kjc"], old_mixer)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
