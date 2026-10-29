@@ -1192,12 +1192,16 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         # Expert-major routing for triton_kernels: row i of the grouped GEMM is flat
         # slot combine[i] (= token * top_k + j), sorted by expert id. Everything
         # stays on device (no bincount) so this is CUDA-graph capturable.
+        # -1 ids (experts on other EP ranks) go to an extra bucket that sorts last,
+        # gets no GEMM rows, and is zeroed before the top_k reduction.
         flat_ids = topk_ids.reshape(-1).to(torch.int64)
+        valid = flat_ids >= 0
+        flat_ids = torch.where(valid, flat_ids, self.num_experts)
         combine = torch.argsort(flat_ids, stable=True).to(torch.int32)
         gather = torch.div(combine, top_k, rounding_mode="trunc")
-        counts = torch.zeros(self.num_experts, dtype=torch.int32, device=x.device)
+        counts = torch.zeros(self.num_experts + 1, dtype=torch.int32, device=x.device)
         counts.scatter_add_(0, flat_ids, torch.ones_like(flat_ids, dtype=torch.int32))
-        ragged = make_ragged_tensor_metadata(counts, num_tokens * top_k)
+        ragged = make_ragged_tensor_metadata(counts[:-1], num_tokens * top_k)
         gammas = topk_weights.reshape(-1).to(torch.float32)[combine]
 
         gate_up = matmul(
@@ -1223,5 +1227,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         )
         # The scatter writes row i to flat slot combine[i] (num_tokens * top_k
         # rows) without reducing over top_k, so do the reduction here.
-        out = out.view(num_tokens, top_k, -1).sum(dim=1)
+        out = out.view(num_tokens, top_k, -1)
+        out = out.masked_fill(~valid.view(num_tokens, top_k, 1), 0).sum(dim=1)
         return StandardCombineInput(hidden_states=out.to(x.dtype))
