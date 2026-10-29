@@ -19,6 +19,7 @@ class StateType(str, enum.Enum):
     QSA_PENDING = "qsa_pending"
     QSA_COMPRESSED = "qsa_compressed"
     SWA = "swa"
+    AUXILIARY_SWA = "auxiliary_swa"
     DSA = "dsa"
     # DSA kpool-compress tail: one per-request ring row. The indices encode
     # only the live subrange of that row for the current open pool.

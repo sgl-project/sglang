@@ -56,6 +56,7 @@ class ChainRoles(msgspec.Struct, frozen=True, kw_only=True):
     owner: str
     window: Optional[str] = None
     state: Optional[str] = None
+    windows: Tuple[str, ...] = ()
 
 
 def _chain_order(bands: Sequence[Band]) -> Tuple[Band]:
@@ -81,6 +82,7 @@ def take_new_pages(
     page_tokens: Callable[[torch.Tensor], torch.Tensor],
     *,
     copy_new_pages: bool,
+    physical_pages: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """Fill tail pages before taking new virtual pages for each request.
 
@@ -91,7 +93,7 @@ def take_new_pages(
         return None
     # Physical-capacity pre-check; on shortfall run the relief ladder.
     need_tokens = num_new_pages * owner.page_size
-    if need_tokens > owner.available_size():
+    if physical_pages is None and need_tokens > owner.available_size():
         if not relieve_for_alloc(owner, need_tokens):
             return None
     # The free list is only rebound, not mutated in place, so its consumed
@@ -103,8 +105,12 @@ def take_new_pages(
             new_virtual_pages = new_virtual_pages.clone()
     out_indices = page_tokens(owner.free_virtual_ids)
     if new_virtual_pages is not None:
-        if owner.place_pages(new_virtual_pages, num_new_pages) is None:
-            return None  # defensive; the pre-check should have prevented it
+        if physical_pages is None:
+            if owner.place_pages(new_virtual_pages, num_new_pages) is None:
+                return None
+        else:
+            owner.ids.bind(new_virtual_pages, physical_pages)
+            owner._maybe_zero_pages(physical_pages)
     # A rebind moves the capacity epoch; a step within its pages takes none.
     if num_new_pages > 0:
         owner.free_virtual_ids = owner.free_virtual_ids[num_new_pages:]
@@ -140,11 +146,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         full_max_total_num_tokens: Optional[int] = None,
         swa_max_total_num_tokens: Optional[int] = None,
     ):
-        # Only the owner shards under decode context parallelism, and only in a
-        # chain without a window: window chains reject it at argument
-        # validation and never read the width.
-        shards_under_dcp = roles.window is None
-        dcp_size = get_parallel().attn_dcp_size if shards_under_dcp else 1
+        # Token bands share widened virtual pages. A replicated draft carries
+        # every token inside its entries; target views select the rank's rows.
+        shards_under_dcp = True
+        dcp_size = get_parallel().attn_dcp_size
         super().__init__(
             size=0,
             page_size=page_size * dcp_size,
@@ -173,19 +178,22 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             lazy_compaction=lazy_compaction,
             **band,
         )
-        self.swa_attn_allocator: Optional[Band] = None
-        if roles.window is not None:
-            floats = arena.band(roles.window).grow_direction == "float"
-            # A float never runs the lazy event pipeline: frees mark holes and
-            # allocations reuse them in place.
-            self.swa_attn_allocator = (FloatBand if floats else Band)(
-                sub_pool_name=roles.window,
-                is_id_owner=False,  # binds the virtual pages the owner mints
+        self.window_allocators: Dict[str, Band] = {}
+        window_names = roles.windows or (
+            () if roles.window is None else (roles.window,)
+        )
+        for name in window_names:
+            floats = arena.band(name).grow_direction == "float"
+            self.window_allocators[name] = (FloatBand if floats else Band)(
+                sub_pool_name=name,
+                is_id_owner=False,
                 page_size=page_size,
+                shards_under_dcp=shards_under_dcp,
                 lazy_compaction=lazy_compaction and not floats,
                 virtual_num_pages=self.full_attn_allocator.ids.num_virtual_ids,
                 **band,
             )
+        self.swa_attn_allocator = self.window_allocators.get(roles.window)
         self.mamba_allocator: Optional[Band] = None
         if roles.state is not None:
             self.mamba_allocator = Band(
@@ -200,12 +208,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             b
             for b in (
                 self.full_attn_allocator,
-                self.swa_attn_allocator,
+                *self.window_allocators.values(),
                 self.mamba_allocator,
             )
             if b is not None
         )
-        self.bands = _chain_order(self.members)
+        by_name = {band.sub_pool_name: band for band in self.members}
+        self.bands = tuple(by_name[band.name] for band in arena.bands)
         _wire_chain(self.bands)
         self._band_positions = {b.sub_pool_name: i for i, b in enumerate(self.bands)}
         self._snapshot_key: Optional[int] = None
@@ -242,7 +251,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """A window chain's host pools are sized in tokens."""
         for band, tokens in (
             (self.full_attn_allocator, self.size_full),
-            (self.swa_attn_allocator, self.size_swa),
+            *((window, self.size_swa) for window in self._windows),
         ):
             pool = self.views[band.sub_pool_name]
             pool.host_capacity_tokens = tokens
@@ -254,7 +263,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     @property
     def _windows(self) -> Tuple[Band, ...]:
-        return () if self.swa_attn_allocator is None else (self.swa_attn_allocator,)
+        return tuple(self.window_allocators.values())
 
     # -- capacity views (the interim policy of the chain's shape) --
 
@@ -546,7 +555,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         for window in self._windows:
             spaces[window.sub_pool_name] = window.ids.token_space(
                 (window.sub_pool_name, id(self)),
-                widened_writes=False,
+                widened_writes=True,
                 defer_reads=defer_reads,
             )
         return spaces
@@ -696,7 +705,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         full_tokens: int,
         swa_tokens: int,
         num_owner_pages: int,
-        owner_take: Callable[[], Optional[torch.Tensor]],
+        owner_take: Callable[[Optional[torch.Tensor]], Optional[torch.Tensor]],
         window_pages: Callable[
             [torch.Tensor, torch.Tensor], torch.Tensor
         ] = lambda out, new_pages: new_pages,
@@ -705,13 +714,32 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         owner = self.full_attn_allocator
         if not self._policy.prices_before_take:
             # The owner prices and relieves its own shortfall.
-            return owner_take()
+            return owner_take(None)
         if not self.ensure_capacity(full_tokens, swa_tokens):
             return None
         # free_virtual_ids is rebound (slice/cat), never mutated in place, so
         # this prefix view still names the pages the owner is about to consume.
         new_virtual_pages = owner.free_virtual_ids[:num_owner_pages]
-        out = owner_take()
+        if len(self._windows) > 1:
+            if num_owner_pages > len(owner.free_virtual_ids):
+                return None
+            reserved = self._reserve_token_pages(num_owner_pages, swa_tokens)
+            if reserved is None:
+                return None
+            out = owner_take(reserved[owner.sub_pool_name])
+            assert out is not None
+            for window in self._windows:
+                bind = (
+                    window_pages(out, new_virtual_pages)
+                    if window is self.swa_attn_allocator
+                    else new_virtual_pages
+                )
+                physical = reserved[window.sub_pool_name]
+                assert bind.numel() == physical.numel()
+                window.ids.bind(bind, physical)
+                window._maybe_zero_pages(physical)
+            return out
+        out = owner_take(None)
         assert out is not None, (
             "ChainAllocator: the owner refused after the joint pre-check "
             "passed -- internal-state inconsistency"
@@ -721,13 +749,59 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             window.alloc_with_virtual(bind)
         return out
 
+    def _reserve_token_pages(self, owner_pages, swa_tokens):
+        bands = (self.full_attn_allocator, *self._windows)
+        saved = []
+        reserved = {}
+        for band in bands:
+            fields = [
+                "watermark_physical",
+                "live_page_count",
+                "_free_phys_pages",
+                "_free_phys_sorted",
+            ]
+            if isinstance(band, FloatBand):
+                fields += ["low_wm_page", "high_wm_page", "_next_hole_end"]
+            saved.append((band, {name: getattr(band, name) for name in fields}))
+            pages = (
+                -(-swa_tokens // self.page_size)
+                if band is self.swa_attn_allocator
+                else owner_pages
+            )
+            physical = band.take_physical(pages * band.page_size)
+            if physical is None:
+                # No ids or bytes have been published. Restore the host allocation
+                # state; each assignment advances, never rewinds, its epoch.
+                for allocated, fields in saved:
+                    for name, value in fields.items():
+                        setattr(allocated, name, value)
+                return None
+            reserved[band.sub_pool_name] = physical
+        return reserved
+
+    def _take_owner_tokens(self, need_size, physical):
+        owner = self.full_attn_allocator
+        if physical is None:
+            return owner.alloc(need_size)
+        return take_new_pages(
+            owner,
+            need_size // self.page_size,
+            lambda pages: owner._expand_pages_to_tokens(
+                pages[: need_size // self.page_size]
+            ),
+            copy_new_pages=False,
+            physical_pages=physical,
+        )
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("ChainAllocator.alloc"):
             return self._allocate(
                 full_tokens=need_size,
                 swa_tokens=need_size,
                 num_owner_pages=need_size // self.page_size,
-                owner_take=lambda: self.full_attn_allocator.alloc(need_size),
+                owner_take=lambda physical: self._take_owner_tokens(
+                    need_size, physical
+                ),
             )
 
     def _paged_take(
@@ -739,7 +813,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         num_new_pages: int,
-    ) -> Callable[[], Optional[torch.Tensor]]:
+    ) -> Callable[[Optional[torch.Tensor]], Optional[torch.Tensor]]:
         def extend_tokens(free_pages: torch.Tensor) -> torch.Tensor:
             bs = len(prefix_lens)
             out_indices = torch.empty(
@@ -759,11 +833,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 )
             return out_indices
 
-        return lambda: take_new_pages(
+        return lambda physical=None: take_new_pages(
             self.full_attn_allocator,
             num_new_pages,
             extend_tokens,
             copy_new_pages=False,
+            physical_pages=physical,
         )
 
     def alloc_extend(
@@ -910,11 +985,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 full_tokens=need_tokens,
                 swa_tokens=need_tokens,
                 num_owner_pages=num_new_pages,
-                owner_take=lambda: take_new_pages(
+                owner_take=lambda physical: take_new_pages(
                     self.full_attn_allocator,
                     num_new_pages,
                     decode_tokens,
                     copy_new_pages=True,
+                    physical_pages=physical,
                 ),
             )
 
@@ -956,34 +1032,30 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self._clear_inverse_history()
 
     def free_swa(self, free_index: torch.Tensor) -> None:
-        """Window tombstone path: release window-physical, keep the virtual id
-        and owner-physical live; `v2p_page[v_page] = -1` IS the tombstone."""
+        self.free_window(self.roles.window, free_index)
+
+    def free_window(self, name: str, free_index: torch.Tensor) -> None:
         if free_index is None or free_index.numel() == 0:
             return
+        window = self.window_allocators[name]
         v = free_index.detach().to(torch.int64)
-        ps = self.page_size
-        for window in self._windows:
-            # `> 0` strict: -1 = tombstoned, page 0 = padding sink (never freeable).
-            live = v[window.ids.virtual_to_physical[v // ps] > 0]
-            if live.numel() == 0:
-                continue
-            if ps == 1:
-                # token == page and the live filter just deduped against the v2p
-                # table, so these ARE unique page ids -- same skip as `_free_lazy`.
-                window.free(live, _pages=live)
-            else:
-                window.free(live)
+        live = v[window.ids.virtual_to_physical[v // self.page_size] > 0]
+        if live.numel():
+            window.free(live, _pages=live if self.page_size == 1 else None)
             window.clear_inverse_history()
 
     def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        """free_swa() for a kv-row segment whose window pages are all bound: page
-        reps come from `start_pos`, so it is fixed-shape at every page size."""
+        self.free_window_segment(self.roles.window, free_index, start_pos=start_pos)
+
+    def free_window_segment(
+        self, name: str, free_index: torch.Tensor, *, start_pos: int
+    ) -> None:
         if free_index is None or free_index.numel() == 0:
             return
-        for window in self._windows:
-            reps = window._page_reps(free_index.detach().to(torch.int64), start_pos)
-            self._free_window_page_reps(window, reps)
-            window.clear_inverse_history()
+        window = self.window_allocators[name]
+        reps = window._page_reps(free_index.detach().to(torch.int64), start_pos)
+        self._free_window_page_reps(window, reps)
+        window.clear_inverse_history()
 
     def _free_window_page_reps(self, window: Band, reps: torch.Tensor) -> None:
         v_pages = reps // self.page_size
@@ -1097,7 +1169,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         if both:
             reps = both[0] if len(both) == 1 else torch.cat(tuple(both))
             for window in self._windows:
-                self._free_window_page_reps(window, reps)
+                live = reps
+                if len(self._windows) > 1:
+                    live = reps[
+                        window.ids.virtual_to_physical[reps // self.page_size] > 0
+                    ]
+                if live.numel():
+                    self._free_window_page_reps(window, live)
         pieces = (*both, *full_only)
         reps = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
         self.full_attn_allocator.free(reps, _pages=reps // self.page_size)

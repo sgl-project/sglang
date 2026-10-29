@@ -43,6 +43,9 @@ def _build(n_full: int, n_swa: int, full_layers: int, swa_layers: int):
     """A composite whose sides have different per-page byte costs. `full_layers
     < swa_layers` is the gemma-4 shape: the cheap side is the id owner and ends
     up with far more pages than the side that has to address them."""
+    from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+    setup_allocator_context()
     full_spec = MHASubPoolSpec(
         name="full",
         layer_num=full_layers,

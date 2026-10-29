@@ -302,7 +302,7 @@ class HybridCacheController(BaseHiCacheController):
     @staticmethod
     def supports_page_envelope_host(storage_backend: str | None) -> bool:
         """Only opt in backends whose FULL object is the complete shared page."""
-        return storage_backend is None or storage_backend == "mori"
+        return storage_backend in (None, "mori", "file")
 
     # The per-pool v2 burst runs after super() returns; on_host_pools_registered()
     # fires at its end, so the base class leaves the firing to us.
@@ -316,8 +316,9 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
-        if isinstance(
-            self.storage_host_pool, UnifiedPageEnvelopeHostPool
+        if any(
+            isinstance(entry.host_pool, UnifiedPageEnvelopeHostPool)
+            for entry in self.mem_pool_host.entries
         ) and not self.supports_page_envelope_host(storage_backend):
             # A runtime backend switch cannot replace the existing host arena.
             raise ValueError(
