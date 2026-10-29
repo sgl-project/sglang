@@ -14,8 +14,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.sha }}
   cancel-in-progress: true
 
-  
-
 jobs:
   build:
     name: build ${{ matrix.platform }}-${{ matrix.device_type }}
