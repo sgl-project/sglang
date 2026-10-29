@@ -461,9 +461,13 @@ class GenerateReqInput:
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
             )
-        if self.mm_token_expansion_start_len and not self.input_ids:
+        start_lens = self.mm_token_expansion_start_len
+        if not self.input_ids and any(
+            start_lens if isinstance(start_lens, list) else [start_lens]
+        ):
             raise ValueError(
-                "input_ids must be non-empty when mm_token_expansion_start_len is set."
+                "input_ids must be non-empty when mm_token_expansion_start_len "
+                "is positive."
             )
         if (
             self.return_flat_raw_top_logprobs
