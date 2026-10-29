@@ -1,0 +1,133 @@
+"""Where serving runs media preprocessing, and how many tokens an image takes."""
+
+from typing import List, Optional
+
+import torch
+from transformers import BaseImageProcessor
+
+from sglang.srt import platforms
+from sglang.srt.utils import is_cpu, is_npu, is_xpu
+
+_is_cpu = is_cpu()
+_is_npu = is_npu()
+_is_xpu = is_xpu()
+
+
+def preprocessing_competes_with_the_scheduler(
+    processor,
+    *,
+    disable_fast_image_processor: bool,
+    rl_on_policy_target: Optional[str],
+    true_on_policy_enabled: bool,
+) -> bool:
+    """Whether image preprocessing contends with the serving accelerator.
+
+    The fast image processor runs inside the tokenizer process but may run on
+    the same accelerator as the scheduler. A second preprocessing worker there
+    adds device contention rather than CPU preprocessing parallelism.
+    """
+    if _is_cpu or rl_on_policy_target is not None or true_on_policy_enabled:
+        return False
+    if disable_fast_image_processor:
+        return False
+    image_processor = getattr(processor, "image_processor", None)
+    if not isinstance(image_processor, BaseImageProcessor):
+        return False
+    if _is_xpu or _is_npu:
+        return True
+    platform = platforms.current_platform
+    return platform.is_cuda_alike()
+
+
+def resolve_auto_mm_processor_worker_num(
+    *, competes_with_the_scheduler: bool, declared: Optional[int]
+) -> int:
+    """The worker count to use when the user did not ask for one.
+
+    Two workers overlap preprocessing that runs on the CPU, where the second
+    thread is real parallelism: measured on Qwen2.5-VL with full-page images
+    at 32-way concurrency, 4.46 -> 6.08 req/s on H200 and 7.07 -> 8.76 on
+    GB300.
+
+    The GPU path is capped at one worker even when a model declares more.
+    A declaration records what its author measured on one platform and one
+    image shape; contending for the device the scheduler is serving from is a
+    property of the path itself, and it does not go away because a subclass
+    asked for concurrency. Qwen-VL declares two and is the model that
+    measures 9.30 -> 4.02 req/s on GB300 full-page images, so honouring the
+    declaration here would exempt exactly the case that regresses.
+    `--mm-processor-worker-num` still overrides this.
+    """
+    if competes_with_the_scheduler:
+        return 1
+    return 2 if declared is None else declared
+
+
+def fast_image_processor_device(
+    processor,
+    *,
+    base_gpu_id: int,
+    rl_on_policy_target: Optional[str],
+    true_on_policy_enabled: bool,
+) -> Optional[str]:
+    """The device for the fast image processor, or None to leave it unset."""
+    if _is_cpu or rl_on_policy_target is not None or true_on_policy_enabled:
+        return "cpu"
+    if _is_xpu:
+        return "xpu"
+    if _is_npu:
+        return None if processor.__class__.__name__ == "Glm4vProcessor" else "npu"
+    platform = platforms.current_platform
+    if not platform.is_cuda_alike():
+        return None
+    return f"{platform.device_type}:{base_gpu_id}"
+
+
+def apply_npu_image_preprocess_patches(processor) -> None:
+    """Patch the processor for the Ascend dims limit before it runs on NPU."""
+    if processor.__class__.__name__ == "MiniMaxVLProcessor":
+        # MiniMax's image/video processors create 10-dim tensors during
+        # patch extraction, exceeding the Ascend 8-dim limit; patch them
+        # (same pattern as qwen-vl / GLM-4.6V).
+        from sglang.srt.hardware_backend.npu.modules.minimax_m3_processor import (
+            npu_apply_minimax_m3_image_preprocess_patch,
+            npu_apply_minimax_m3_video_preprocess_patch,
+        )
+
+        npu_apply_minimax_m3_image_preprocess_patch(processor.image_processor)
+        if (
+            hasattr(processor, "video_processor")
+            and processor.video_processor is not None
+        ):
+            npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
+    elif processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
+        # For qwen-vl, the processor hits a reshape issue from the Ascend
+        # dims restriction.
+        from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
+            npu_apply_qwen_image_preprocess_patch,
+        )
+
+        npu_apply_qwen_image_preprocess_patch()
+    elif processor.__class__.__name__ == "Glm46VProcessor":
+        from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
+            npu_apply_glm46v_image_preprocess_patch,
+        )
+
+        npu_apply_glm46v_image_preprocess_patch()
+
+
+def resolve_hf_image_token_counts(processor, images: List) -> List[int]:
+    """Per-image token counts from the HF processor's own helper."""
+    assert images is not None
+    image_sizes = [
+        (
+            tuple(image.shape[-2:])
+            if isinstance(image, torch.Tensor)
+            else (image.height, image.width)
+        )
+        for image in images
+    ]
+    num_image_tokens = processor._get_num_multimodal_tokens(
+        image_sizes=image_sizes
+    ).num_image_tokens
+    return [int(count) for count in num_image_tokens]
