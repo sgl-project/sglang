@@ -199,8 +199,7 @@ def _build_plan(tokenizer):
     intra = _INTRA_CUT if _intra_cut_safe(cfg) else None
     if pattern is None and npattern is None and intra is None:
         return None
-    pp = backend.post_processor
-    specials_added = pp.num_special_tokens_to_add(False) if pp is not None else 0
+    specials_added = backend.num_special_tokens_to_add(False)
     return backend, specials_added, pattern, npattern, intra
 
 
