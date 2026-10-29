@@ -741,7 +741,9 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
             ("get_serving", SimpleNamespace(stream_interval=1, weight_version="v")),
             (
                 "get_observability",
-                SimpleNamespace(enable_request_time_stats_logging=False),
+                SimpleNamespace(
+                    enable_metrics=False, enable_request_time_stats_logging=False
+                ),
             ),
         ):
             patcher = patch(

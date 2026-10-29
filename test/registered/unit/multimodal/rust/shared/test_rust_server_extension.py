@@ -169,19 +169,25 @@ def build_rust_frame_metadata_fixture() -> dict:
         """A frame from a cache with a host tier and, when `storage_attached`,
         a storage tier, whose `rows` map rid -> (cached_tokens, device, host,
         storage)."""
-        streamer = SchedulerOutputStreamer(
-            send_to_detokenizer=None,
-            tree_cache=SimpleNamespace(
-                cache_controller=SimpleNamespace(
-                    storage_backend=HiCacheFile() if storage_attached else None
-                )
+        with patch(
+            "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
+            return_value=SimpleNamespace(
+                enable_metrics=False, enable_request_time_stats_logging=False
             ),
-            server_args=SimpleNamespace(enable_lmcache=False),
-            is_generation=True,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
-            disaggregation_mode=DisaggregationMode.NULL,
-            enable_hicache_storage=lambda: storage_attached,
-        )
+        ):
+            streamer = SchedulerOutputStreamer(
+                send_to_detokenizer=None,
+                tree_cache=SimpleNamespace(
+                    cache_controller=SimpleNamespace(
+                        storage_backend=HiCacheFile() if storage_attached else None
+                    )
+                ),
+                server_args=SimpleNamespace(enable_lmcache=False),
+                is_generation=True,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                disaggregation_mode=DisaggregationMode.NULL,
+                enable_hicache_storage=lambda: storage_attached,
+            )
         reqs = {
             rid: SimpleNamespace(
                 cached_tokens=cached,
