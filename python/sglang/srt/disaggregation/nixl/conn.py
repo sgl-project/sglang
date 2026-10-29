@@ -2737,6 +2737,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_aux_item_lens: list[int],
         dst_aux_index: int,
     ):
+        self.validate_aux_buffers(dst_aux_ptrs, dst_aux_item_lens)
         src_addrs = []
         dst_addrs = []
 

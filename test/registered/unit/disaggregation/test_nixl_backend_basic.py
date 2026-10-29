@@ -971,6 +971,21 @@ class TestNixlStaging(CustomTestCase):
             [([(0x1080, 64, 0)], "DRAM"), ([(0x2080, 64, 0)], "DRAM")],
         )
 
+    def test_send_aux_rejects_metadata_buffer_count_mismatch(self):
+        agent = StagingFakeAgent()
+        mgr = self._make_manager(agent)
+        mgr.kv_args.aux_data_ptrs = [0x1000]
+        mgr.kv_args.aux_item_lens = [64]
+
+        for dst_ptrs, dst_lens in (([0x2000, 0x3000], [64, 64]), ([0x2000], [])):
+            with self.subTest(dst_ptrs=dst_ptrs, dst_lens=dst_lens):
+                with self.assertRaisesRegex(
+                    ValueError, "metadata buffer layout mismatch"
+                ):
+                    mgr.send_aux("peer", 0, dst_ptrs, dst_lens, 0)
+
+        self.assertEqual(agent.get_xfer_descs_calls, [])
+
     def test_do_staging_transfer_requeues_when_allocation_not_ready(self):
         mgr = self._make_manager()
         mgr._staging_ctx = PrefillStagingContext()
