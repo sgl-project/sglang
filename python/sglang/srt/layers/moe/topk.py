@@ -127,6 +127,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
     is_xpu,
 )
 
@@ -146,6 +147,7 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+_is_sail = is_sail()
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -2031,6 +2033,9 @@ def biased_grouped_topk_gpu(
         # flashinfer always renormalizes the selected weights
         and renormalize
         and is_power_of_two(num_experts)
+        # SAIL's torch backend reports as CUDA, but flashinfer topk asserts
+        # sm >= 89, which SAIL Zhenwu 810E devices do not satisfy.
+        and not _is_sail
         # flashinfer constraints (applied to routed experts only)
         and topk_routed <= 8
         and topk_group <= num_expert_group
