@@ -1,4 +1,5 @@
 import concurrent.futures
+import ctypes
 import os
 import threading
 import unittest
@@ -644,6 +645,8 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertNotEqual(src_lens, dst_lens)
         manager.validate_aux_buffers(dst_ptrs, dst_lens)
         for local_lens, peer_ptrs, peer_lens in (
+            (dst_lens, src_ptrs, src_lens),
+            (src_lens, dst_ptrs, dst_lens[:4] + [128] + dst_lens[5:]),
             (src_lens, dst_ptrs, dst_lens[:6] + [2048] + dst_lens[7:]),
             (src_lens, dst_ptrs, dst_lens[:6] + [8192] + dst_lens[7:]),
             (src_lens, dst_ptrs, dst_lens[:7] + [32] + dst_lens[8:]),
@@ -659,6 +662,31 @@ class TestDisaggregationWire(unittest.TestCase):
                     ValueError, "metadata buffer layout mismatch"
                 ):
                     manager.validate_aux_buffers(peer_ptrs, peer_lens)
+
+    def test_mooncake_aux_transfer_uses_destination_row_stride(self):
+        source = np.arange(192, dtype=np.uint8).reshape(3, 64)
+        destination = np.full((3, 128), 255, dtype=np.uint8)
+        manager = object.__new__(MooncakeKVManager)
+        manager.enable_custom_mem_pool = False
+        manager.kv_args = SimpleNamespace(
+            aux_data_ptrs=[source.ctypes.data], aux_item_lens=[64]
+        )
+
+        def copy_aux(_session: str, blocks: list[tuple[int, int, int]]) -> int:
+            for src, dst, length in blocks:
+                ctypes.memmove(dst, src, length)
+            return 0
+
+        manager._transfer_data = copy_aux
+        req = SimpleNamespace(mooncake_session_id="peer", dst_aux_index=1)
+        with patch.object(envs.SGLANG_MOONCAKE_SEND_AUX_TCP, "get", return_value=False):
+            self.assertEqual(
+                manager.send_aux(req, 2, [destination.ctypes.data], [128]), 0
+            )
+
+        expected = np.full_like(destination, 255)
+        expected[1, :64] = source[2]
+        np.testing.assert_array_equal(destination, expected)
 
     def test_mooncake_aux_mismatch_fails_request_and_worker_continues(self):
         manager = object.__new__(MooncakeKVManager)

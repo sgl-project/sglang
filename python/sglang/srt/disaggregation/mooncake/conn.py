@@ -1797,6 +1797,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         req: TransferInfo,
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
+        dst_aux_item_lens: list[int],
     ):
         # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
         if (
@@ -1812,7 +1813,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         for i in range(min(len(prefill_aux_ptrs), len(dst_aux_ptrs))):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
+            dst_addr = dst_aux_ptrs[i] + dst_aux_item_lens[i] * req.dst_aux_index
             transfer_blocks.append((src_addr, dst_addr, length))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
@@ -2819,10 +2820,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     break
 
                             # Only the last chunk we need to send the aux data
+                            assert (
+                                target_rank_registration_info.dst_aux_item_lens
+                                is not None
+                            )
                             ret = self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
+                                target_rank_registration_info.dst_aux_item_lens,
                             )
                             if ret != 0:
                                 # The aux write targets decode's metadata

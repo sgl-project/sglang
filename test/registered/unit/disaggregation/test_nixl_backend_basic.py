@@ -958,6 +958,19 @@ class TestNixlStaging(CustomTestCase):
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
         return mgr
 
+    def test_send_aux_uses_destination_row_stride(self):
+        agent = StagingFakeAgent()
+        mgr = self._make_manager(agent)
+        mgr.kv_args.aux_data_ptrs = [0x1000]
+        mgr.kv_args.aux_item_lens = [64]
+
+        mgr.send_aux("peer", 2, [0x2000], [128], 1)
+
+        self.assertEqual(
+            agent.get_xfer_descs_calls,
+            [([(0x1080, 64, 0)], "DRAM"), ([(0x2080, 64, 0)], "DRAM")],
+        )
+
     def test_do_staging_transfer_requeues_when_allocation_not_ready(self):
         mgr = self._make_manager()
         mgr._staging_ctx = PrefillStagingContext()

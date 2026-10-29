@@ -666,6 +666,7 @@ class CommonKVManager(BaseKVManager):
             == len(dst_aux_ptrs)
             == len(dst_aux_item_lens)
             and src_item_lens[slots] == dst_aux_item_lens[slots]
+            and all(src <= dst for src, dst in zip(src_item_lens, dst_aux_item_lens))
         ):
             raise ValueError(
                 "Disaggregation metadata buffer layout mismatch: "

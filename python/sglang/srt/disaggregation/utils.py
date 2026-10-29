@@ -639,11 +639,6 @@ class MetadataBuffers:
                     ),
                 )
             )
-            if payload:
-                # Reject schema errors before they can abort the decode scheduler.
-                msgspec.msgpack.decode(
-                    payload, type=dict[str, list[object]], ext_hook=ext_hook
-                )
         except (TypeError, ValueError, OverflowError) as exc:
             raise CustomizedInfoError(f"Invalid customized_info: {exc}") from exc
         if len(payload) > self.output_customized_info.shape[1]:
@@ -655,6 +650,13 @@ class MetadataBuffers:
             )
         idx = req.metadata_buffer_index
         if payload:
+            try:
+                # Reject schema errors before they can abort the decode scheduler.
+                msgspec.msgpack.decode(
+                    payload, type=dict[str, list[object]], ext_hook=ext_hook
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise CustomizedInfoError(f"Invalid customized_info: {exc}") from exc
             self.output_customized_info[idx, : len(payload)].copy_(
                 torch.from_numpy(np.frombuffer(payload, dtype=np.uint8).copy())
             )

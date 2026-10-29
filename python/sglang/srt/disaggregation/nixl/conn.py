@@ -1888,10 +1888,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
+                        assert dst_info.dst_aux_item_lens is not None
                         aux_xfer_handle = self.send_aux(
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
                             dst_info.dst_aux_ptrs,
+                            dst_info.dst_aux_item_lens,
                             req.dst_aux_index,
                         )
                         handles.append(aux_xfer_handle)
@@ -2732,6 +2734,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         peer_name: str,
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
+        dst_aux_item_lens: list[int],
         dst_aux_index: int,
     ):
         src_addrs = []
@@ -2744,7 +2747,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         for i in range(min(len(prefill_aux_ptrs), len(dst_aux_ptrs))):
             length = prefill_aux_item_lens[i]
             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
+            dst_addr = dst_aux_ptrs[i] + dst_aux_item_lens[i] * dst_aux_index
             src_addrs.append((src_addr, length, 0))
             dst_addrs.append((dst_addr, length, 0))
 
