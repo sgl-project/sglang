@@ -868,6 +868,9 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # Kill-switch for the gfx11 row-stride pad on unquantized linear and lm_head
+    # weights (see maybe_pad_weight_for_gfx11). Speed only; outputs do not depend on it.
+    SGLANG_DISABLE_GFX11_WEIGHT_PADDING = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
