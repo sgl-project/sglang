@@ -44,6 +44,7 @@ class KernelBackend(str, Enum):
     AOT = "aot"  # sgl_kernel wheel (CUDA / ROCm builds)
     CUTE_DSL = "cute_dsl"
     FLYDSL = "flydsl"  # FlyDSL MLIR compiler (device=HIP, gfx950)
+    TLX = "tlx"  # Triton + TLX: fbtriton, or Triton with the uTLX plugin
     HELION = "helion"
     KDA = "KDA"  # Kernel Design Agents generated implementation
     CAKE = "cake"  # Cake-generated implementation, distributed by FlashInfer
