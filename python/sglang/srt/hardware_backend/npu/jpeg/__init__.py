@@ -1,4 +1,4 @@
-"""Opt-in DVPP/Triton JPEG decoding; unsupported images retain PIL semantics."""
+"""Opt-in DVPP JPEGD/VPC decoding; unsupported images retain PIL semantics."""
 
 import atexit
 import os
@@ -54,9 +54,9 @@ def _decoder(device):
             _live[id(previous[1])].retiring = True
             previous[1].close()
             del _live[id(previous[1])]
-        from sglang.srt.hardware_backend.npu.jpeg.dvpp import TritonJPEGDecoder
+        from sglang.srt.hardware_backend.npu.jpeg.vpc import VPCJPEGDecoder
 
-        decoder = TritonJPEGDecoder(device)
+        decoder = VPCJPEGDecoder(device)
         _live[id(decoder)] = _Entry(weakref.ref(threading.current_thread()), decoder)
         _local.slot = (key, decoder)
         return decoder

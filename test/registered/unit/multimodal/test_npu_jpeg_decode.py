@@ -12,11 +12,17 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
+import numpy as np
 import torch
 from PIL import Image, JpegImagePlugin
 
 from sglang.srt.hardware_backend.npu import jpeg
 from sglang.srt.hardware_backend.npu.jpeg import dvpp
+from sglang.srt.hardware_backend.npu.jpeg.normalize import (
+    inspect_420_sof,
+    normalize_420_sof,
+)
+from sglang.srt.hardware_backend.npu.jpeg.vpc import VPCJPEGDecoder
 from sglang.srt.utils import common
 
 
@@ -112,8 +118,9 @@ class TestNpuJpegEligibility(unittest.TestCase):
             image_bytes(progressive=True),
             image_bytes(mode="L"),
             image_bytes(mode="CMYK"),
-            image_bytes(size=(65, 32)),
             image_bytes(size=(16, 16)),
+            image_bytes(size=(4097, 32)),
+            image_bytes(size=(32, 4097)),
             image_bytes(exif=exif),
             image_bytes(icc_profile=b"profile"),
         ]
@@ -155,6 +162,107 @@ class TestNpuJpegEligibility(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "pixel budget"):
                 jpeg.decode_jpeg(image_bytes())
 
+    def test_odd_and_vpc_boundary_dimensions_are_admitted(self):
+        for w, h in [(65, 32), (64, 33), (65, 33), (4095, 32), (4096, 32)]:
+            with self.subTest(size=(w, h)):
+                info = dvpp.inspect_jpeg(image_bytes(size=(w, h)), width_alignment=64)
+                self.assertEqual((info.width, info.height), (w, h))
+                self.assertEqual(
+                    (info.decode_width, info.decode_height), (w + w % 2, h + h % 2)
+                )
+                self.assertLessEqual(max(info.width_stride, info.height_stride), 4096)
+
+    def test_nonbaseline_frame_falls_back_for_even_and_odd_sizes(self):
+        for size in [(64, 32), (65, 33)]:
+            data = bytearray(image_bytes(size=size))
+            offset = inspect_420_sof(data, *size)
+            data[offset - 4] = 0xC1  # Valid extended sequential SOF1.
+            with (
+                self.subTest(size=size),
+                patch.object(
+                    jpeg, "_decoder", side_effect=AssertionError("device work")
+                ),
+            ):
+                self.assertIsNone(jpeg.decode_jpeg(bytes(data)))
+
+    def test_malformed_sof_segment_is_an_error(self):
+        data = bytearray(image_bytes())
+        offset = inspect_420_sof(data, 64, 32)
+        data[offset - 3 : offset - 1] = b"\x00\x01"
+        with self.assertRaisesRegex(ValueError, "segment length"):
+            inspect_420_sof(bytes(data), 64, 32)
+
+
+class TestOddJpegAdaptation(unittest.TestCase):
+    def test_only_private_sof_dimensions_change_and_valid_pixels_are_preserved(self):
+        for w, h in [(65, 32), (64, 33), (65, 33)]:
+            with self.subTest(size=(w, h)):
+                y, x = np.indices((h, w))
+                pixels = np.stack((x * 7, y * 11, (x + y) * 5), axis=-1).astype(
+                    np.uint8
+                )
+                buffer = io.BytesIO()
+                Image.fromarray(pixels).save(buffer, format="JPEG", subsampling=2)
+                data = buffer.getvalue()
+                offset = inspect_420_sof(data, w, h)
+                normalized = normalize_420_sof(data, w, h)
+                self.assertEqual(data, buffer.getvalue())
+                self.assertEqual(data[:offset], normalized[:offset])
+                self.assertEqual(data[offset + 4 :], normalized[offset + 4 :])
+                with (
+                    Image.open(io.BytesIO(data)) as original,
+                    Image.open(io.BytesIO(normalized)) as adapted,
+                ):
+                    self.assertEqual(original.size, (w, h))
+                    self.assertEqual(adapted.size, (w + w % 2, h + h % 2))
+                    np.testing.assert_array_equal(
+                        np.asarray(original), np.asarray(adapted)[:h, :w]
+                    )
+
+    def test_even_dimensions_keep_the_original_bytes(self):
+        data = image_bytes()
+        self.assertIs(normalize_420_sof(data, 64, 32), data)
+
+
+class TestVpcCleanup(unittest.TestCase):
+    def test_cleanup_error_keeps_original_failure_and_releases_remaining_resources(
+        self,
+    ):
+        decoder = VPCJPEGDecoder.__new__(VPCJPEGDecoder)
+        decoder.torch, decoder.device = Mock(), object()
+        decoder.torch.empty.side_effect = RuntimeError("allocation failure")
+        a = Mock()
+        decoder.decoder = types.SimpleNamespace(acl=a, stream=1, poisoned=False)
+        decoder.channel = 2
+        decoder._description = Mock(side_effect=[101, 102])
+        a.media.dvpp_malloc.return_value = (17, 0)
+        a.media.dvpp_vpc_convert_color_async.return_value = 0
+        a.rt.synchronize_stream.return_value = 0
+        a.media.dvpp_get_pic_desc_ret_code.return_value = 0
+        for name, value in [
+            ("width", 64),
+            ("height", 32),
+            ("width_stride", 192),
+            ("height_stride", 32),
+        ]:
+            getattr(a.media, "dvpp_get_pic_desc_" + name).return_value = value
+        a.media.dvpp_destroy_pic_desc.__name__ = "destroy_pic_desc"
+        a.media.dvpp_destroy_pic_desc.side_effect = [9, 0]
+        a.media.dvpp_free.return_value = 0
+        frame = types.SimpleNamespace(
+            ptr=7, size=3072, info=dvpp.JPEGInfo(64, 32, 64, 32)
+        )
+        with (
+            self.assertWarns(UserWarning),
+            self.assertRaisesRegex(RuntimeError, "allocation failure"),
+        ):
+            decoder._convert_frame(frame)
+        self.assertEqual(
+            [c.args for c in a.media.dvpp_destroy_pic_desc.call_args_list],
+            [(102,), (101,)],
+        )
+        a.media.dvpp_free.assert_called_once_with(17)
+
 
 class TestNpuJpegOwnership(unittest.TestCase):
     def setUp(self):
@@ -163,7 +271,10 @@ class TestNpuJpegOwnership(unittest.TestCase):
             patch.object(jpeg, "_live", {}),
             patch.object(jpeg, "_closed", False),
             patch.object(jpeg, "_pid", os.getpid()),
-            patch.object(dvpp, "TritonJPEGDecoder", side_effect=lambda device: Mock()),
+            patch(
+                "sglang.srt.hardware_backend.npu.jpeg.vpc.VPCJPEGDecoder",
+                side_effect=lambda device: Mock(),
+            ),
         ]
         self.factory = None
         for item in self.patches:

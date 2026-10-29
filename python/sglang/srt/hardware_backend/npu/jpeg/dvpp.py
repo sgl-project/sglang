@@ -14,6 +14,12 @@ from io import BytesIO
 
 from PIL import Image, JpegImagePlugin
 
+from sglang.srt.hardware_backend.npu.jpeg.normalize import (
+    UnsupportedSOF,
+    inspect_420_sof,
+    normalize_420_sof,
+)
+
 
 class UnsupportedJPEG(ValueError):
     """Valid media outside the supported NPU JPEG input contract."""
@@ -38,6 +44,14 @@ class JPEGInfo:
     height: int
     width_stride: int
     height_stride: int
+
+    @property
+    def decode_width(self):
+        return align_up(self.width, 2)
+
+    @property
+    def decode_height(self):
+        return align_up(self.height, 2)
 
     @property
     def nv12_bytes(self):
@@ -66,8 +80,14 @@ def inspect_jpeg(data: bytes, *, width_alignment=128, max_pixels=16_777_216):
             raise UnsupportedJPEG("progressive JPEG uses CPU fallback")
         if im.mode != "RGB" or JpegImagePlugin.get_sampling(im) != 2:
             raise UnsupportedJPEG("v1 accepts only three-component YCbCr 4:2:0 JPEG")
-        if not (32 <= w <= 8192 and 32 <= h <= 8192) or w % 2 or h % 2:
-            raise UnsupportedJPEG("v1 requires even dimensions in [32, 8192]")
+        # VPC color conversion accepts at most 4096 in either dimension.
+        # Its even decode extent and the NV12 strides remain within that limit.
+        if not (32 <= w <= 4096 and 32 <= h <= 4096):
+            raise UnsupportedJPEG("JPEGD/VPC requires dimensions in [32, 4096]")
+    try:
+        inspect_420_sof(data, w, h)
+    except UnsupportedSOF as error:
+        raise UnsupportedJPEG(str(error)) from error
     return JPEGInfo(w, h, align_up(w, width_alignment), align_up(h, 16))
 
 
@@ -143,6 +163,7 @@ class JPEGDecoder:
 
     def decode(self, data: bytes) -> DeviceFrame:
         info = inspect_jpeg(data, width_alignment=self.width_alignment)
+        data = normalize_420_sof(data, info.width, info.height)
         with self.lock:
             self._activate()
             a = self.acl
@@ -151,7 +172,7 @@ class JPEGDecoder:
                 host_ptr, len(data)
             )
             check(ret, "dvpp_jpeg_get_image_info_v2")
-            if (w, h, components) != (info.width, info.height, 3):
+            if (w, h, components) != (info.decode_width, info.decode_height, 3):
                 raise ACLFailure("PIL header and DVPP header disagree")
             size, ret = a.media.dvpp_jpeg_predict_dec_size(
                 host_ptr, len(data), 1
@@ -205,7 +226,12 @@ class JPEGDecoder:
                     getattr(a.media, "dvpp_get_pic_desc_" + n)(desc)
                     for n in ("width", "height", "width_stride", "height_stride")
                 )
-                if actual != (w, h, info.width_stride, info.height_stride):
+                if actual != (
+                    info.decode_width,
+                    info.decode_height,
+                    info.width_stride,
+                    info.height_stride,
+                ):
                     raise ACLFailure(f"unexpected JPEGD layout: {actual}")
                 frame = DeviceFrame(self, out, size, info)
                 self.frames.add(frame)
@@ -263,43 +289,3 @@ class JPEGDecoder:
 
     def __exit__(self, *args):
         self.close()
-
-
-class TritonJPEGDecoder:
-    """Borrow the current NPU context; return uint8 contiguous CHW RGB."""
-
-    def __init__(self, device: int, *, width_alignment=64):
-        import torch
-        import torch_npu  # noqa: F401 - registers NPU support
-
-        self.torch = torch
-        self.device = torch.device(f"npu:{device}")
-        torch.npu.set_device(self.device)
-        # Force runtime initialization before borrowing its context.
-        torch.empty(1, device=self.device)
-        self.decoder = JPEGDecoder(device, width_alignment=width_alignment)
-
-    def decode(self, data: bytes):
-        from sglang.srt.hardware_backend.npu.jpeg.nv12 import nv12_to_rgb_triton
-
-        t, d = self.torch, self.decoder
-        with d.lock:
-            t.npu.set_device(self.device)
-            with d.decode(data) as frame:
-                info = frame.info
-                packed = t.empty(info.nv12_bytes, dtype=t.uint8, device=self.device)
-                t.npu.synchronize(self.device)
-                check(
-                    d.acl.rt.memcpy(
-                        packed.data_ptr(), packed.numel(), frame.ptr, packed.numel(), 3
-                    ),
-                    "memcpy NV12 D2D",
-                )
-            result = nv12_to_rgb_triton(packed, info)
-            # Keep packed alive until the kernel has consumed it. Preserve the
-            # synchronous output contract of the baseline decoder.
-            t.npu.synchronize(self.device)
-            return result
-
-    def close(self):
-        self.decoder.close()

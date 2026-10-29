@@ -19,7 +19,7 @@ This document provides a list of commonly used environment variables and aims to
   <tbody>
     <tr>
       <td><code>SGLANG_ENABLE_NPU_IMAGE_DECODE</code></td>
-      <td>Enable DVPP JPEG decoding and Triton RGB conversion for tensor-capable image processors. See the JPEG decoding section below.</td>
+      <td>Enable DVPP JPEGD decoding and VPC RGB conversion for tensor-capable image processors. See the JPEG decoding section below.</td>
       <td><code>false</code></td>
     </tr>
     <tr>
@@ -52,11 +52,11 @@ This document provides a list of commonly used environment variables and aims to
 
 ## Opt-in NPU JPEG decoding
 
-On Linux Ascend systems, set `SGLANG_ENABLE_NPU_IMAGE_DECODE=1` to decode eligible JPEGs with DVPP JPEGD and convert them to RGB with Triton. The option is off by default.
+On Linux Ascend systems, set `SGLANG_ENABLE_NPU_IMAGE_DECODE=1` to decode eligible JPEGs with DVPP JPEGD and convert them to RGB with DVPP VPC. The option is off by default.
 
 ### Install and enable
 
-Follow the [NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) for a compatible CANN, `torch`, `torch_npu`, and Triton-Ascend environment. CANN must expose the Python `acl.media` JPEGD API. With those runtime and build dependencies installed, install your source checkout from the repository root:
+Follow the [NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) for a compatible CANN, `torch`, and `torch_npu` environment. CANN must expose the Python `acl.media` JPEGD and VPC color-conversion APIs. This path was validated on Ascend910_9362 with CANN 9.1.0. With those runtime and build dependencies installed, install your source checkout from the repository root:
 
 ```bash
 SGLANG_BUILD_RUST_EXTS=none python -m pip install --no-deps --no-build-isolation -e python
@@ -76,13 +76,14 @@ Send requests using the [multimodal chat example](/docs/basic_usage/openai_api_v
 
 ### Supported inputs and quality
 
-- The device path accepts baseline, three-component YCbCr 4:2:0 JPEGs with even width and height from 32 through 8192. Complete JPEG candidates exceeding 32 MiB or 16,777,216 pixels raise an error.
+- The device path accepts 8-bit baseline SOF0, three-component YCbCr 4:2:0 JPEGs with width and height from 32 through 4096. Complete JPEG candidates exceeding 32 MiB or 16,777,216 pixels raise an error.
+- For odd dimensions, an internal JPEGD input copy rounds the SOF0 width or height up by one within the existing MCU grid. Compressed scan data is unchanged, and the RGB output is cropped to the original dimensions.
 - PNG, progressive JPEG, grayscale, CMYK, other chroma sampling, unsupported dimensions, and JPEGs with EXIF or ICC metadata retain the existing PIL path.
 - Processors that disable tensor decoding or request `nvjpeg_fancy` keep their existing loading behavior.
-- Eligible inputs produce contiguous `uint8` CHW RGB tensors on the worker's current NPU. Conversion uses full-range BT.601 with nearest-neighbor chroma upsampling, which can differ from PIL or high-fidelity nvJPEG reconstruction.
+- JPEGD produces NV12; VPC converts it to RGB888 with full-range BT.601. A device copy and Torch layout conversion produce an owned contiguous `uint8` CHW RGB tensor on the worker's current NPU.
 - Device execution failures are surfaced as request errors. The decoder borrows the caller's NPU context and releases its own stream, channel, and buffers.
 
-Historical validation at `5a4cc24` used fixed 100-question derived-JPEG subsets with Qwen2.5-VL-3B-Instruct/BF16. Enabling this path changed MMBench accuracy from 83/100 to 82/100. MMMU stayed at 50/100, with two questions becoming correct and two becoming incorrect. Validate representative images before enabling this path for quality-sensitive use. See the [PR evaluation](https://github.com/sgl-project/sglang/pull/45792) for test conditions and detailed results.
+The matching JPEGD/VPC experiment with Qwen2.5-VL-3B-Instruct/BF16 gave identical answers to CPU/PIL on 1,292 original MMBench DEV EN v1.1 base questions: both scored 1,077/1,292. This fixed-order check is not official CircularEval or a guarantee for every image. The component benchmark favored CPU on the small synthetic image and VPC on the larger two; full-model tests did not establish a stable end-to-end speedup. See the [PR evaluation](https://github.com/sgl-project/sglang/pull/45792) for conditions and results.
 
 ## Used in DeepEP Ascend
 

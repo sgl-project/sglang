@@ -1,4 +1,4 @@
-"""Real DVPP/Triton image contracts; no model loading or CPU device substitute."""
+"""Real JPEGD/VPC contracts through the ordinary image-loading path."""
 
 import importlib.util
 import io
@@ -25,35 +25,59 @@ class TestNpuJpegDecode(unittest.TestCase):
     def setUp(self):
         self.device = torch.device("npu", torch.npu.current_device())
 
-    def test_padded_nv12_matches_independent_cpu_arithmetic(self):
-        from sglang.srt.hardware_backend.npu.jpeg.dvpp import JPEGInfo
-        from sglang.srt.hardware_backend.npu.jpeg.nv12 import nv12_to_rgb_triton
+    def test_patterns_keep_odd_edges_and_owned_rgb_pixels(self):
+        from sglang.srt.utils.common import _load_image
 
-        random = np.random.default_rng(42)
-        for w, h, ws, hs in [(32, 32, 64, 32), (66, 34, 128, 48), (128, 64, 128, 64)]:
-            with self.subTest(width=w, height=h):
-                raw = random.integers(0, 256, ws * hs * 3 // 2, dtype=np.uint8)
-                y = raw[: ws * hs].reshape(hs, ws)[:h, :w].astype(np.float32)
-                uv = raw[ws * hs :].reshape(hs // 2, ws)[: h // 2, :w]
-                uv = uv.reshape(h // 2, w // 2, 2).astype(np.float32)
-                uv = uv.repeat(2, axis=0).repeat(2, axis=1) - np.float32(128)
-                u, v = uv[..., 0], uv[..., 1]
-                expected = np.stack(
-                    [
-                        y + np.float32(1.402) * v,
-                        (y - np.float32(0.344136) * u) - np.float32(0.714136) * v,
-                        y + np.float32(1.772) * u,
-                    ]
+        retained = []
+        with patch.dict("os.environ", {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "1"}):
+            for w, h in [
+                (64, 32),
+                (65, 32),
+                (64, 33),
+                (65, 33),
+                (4095, 32),
+                (32, 4095),
+            ]:
+                with self.subTest(width=w, height=h):
+                    y, x = np.indices((h, w))
+                    pixels = np.stack((x * 7, y * 11, (x + y) * 5), axis=-1).astype(
+                        np.uint8
+                    )
+                    buffer = io.BytesIO()
+                    Image.fromarray(pixels).save(
+                        buffer, format="JPEG", quality=95, subsampling=2
+                    )
+                    data = buffer.getvalue()
+                    with Image.open(io.BytesIO(data)) as image:
+                        expected = (
+                            np.asarray(image.convert("RGB")).transpose(2, 0, 1).copy()
+                        )
+                    result = _load_image(image_bytes=data)
+                    self.assertEqual(result.device, self.device)
+                    self.assertEqual(result.dtype, torch.uint8)
+                    self.assertEqual(tuple(result.shape), (3, h, w))
+                    self.assertTrue(result.is_contiguous())
+                    np.testing.assert_array_equal(result.cpu().numpy(), expected)
+                    retained.append((result, expected))
+        for result, expected in retained:
+            np.testing.assert_array_equal(result.cpu().numpy(), expected)
+
+    def test_close_is_idempotent_and_preserves_the_callers_context(self):
+        from sglang.srt.hardware_backend.npu.jpeg.vpc import VPCJPEGDecoder
+
+        for _ in range(2):
+            decoder = VPCJPEGDecoder(self.device.index)
+            try:
+                buffer = io.BytesIO()
+                Image.new("RGB", (65, 33), (31, 127, 235)).save(
+                    buffer, format="JPEG", subsampling=2
                 )
-                expected = np.rint(expected).clip(0, 255).astype(np.uint8)
-                packed = torch.from_numpy(raw).to(self.device)
-                result = nv12_to_rgb_triton(packed, JPEGInfo(w, h, ws, hs))
-                torch.npu.synchronize(self.device)
-                self.assertEqual(result.dtype, torch.uint8)
-                self.assertEqual(result.device, self.device)
-                self.assertTrue(result.is_contiguous())
-                np.testing.assert_array_equal(result.cpu().numpy(), expected)
-                np.testing.assert_array_equal(packed.cpu().numpy(), raw)
+                result = decoder.decode(buffer.getvalue())
+            finally:
+                decoder.close()
+            decoder.close()
+            self.assertEqual(result.sum().device, self.device)
+            self.assertEqual(torch.ones(4, device=self.device).sum().item(), 4)
 
     def test_real_decode_and_concurrent_worker_reclamation(self):
         from sglang.srt.hardware_backend.npu import jpeg

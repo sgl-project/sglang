@@ -2087,7 +2087,7 @@ def _load_image(
     gpu_image_decode: GPUImageDecodeMode = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
-    Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
+    Try to decode eligible JPEGs with nvJPEG or Ascend DVPP to a device tensor,
     otherwise fallback to decode with PIL on CPU and return a PIL Image.
     Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
     """
