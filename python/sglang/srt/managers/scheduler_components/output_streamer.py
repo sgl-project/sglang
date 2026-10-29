@@ -78,14 +78,18 @@ class SchedulerOutputStreamer:
     # Rust egress ring via `rust_server.push_generation` instead of the zmq
     # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
     rust_server: Optional[RustServer] = None
+    # Set when the scheduler first defers a response; see deferred_output.
+    defer_outputs: bool = False
     _test_stream_output_count: int = 0
+    enable_metrics: bool = field(init=False)
 
     def __post_init__(self) -> None:
         if self.has_additional_customized_info and self.rust_server is not None:
             raise ValueError(
-                "additional customized generation output is not supported by "
-                "Rust egress"
+                "a streamer's additional customized_info needs TokenizerManager "
+                "hooks (update_request_meta_info) the Rust frontend does not run"
             )
+        self.enable_metrics = get_observability().enable_metrics
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -139,6 +143,9 @@ class SchedulerOutputStreamer:
         skip_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
+        if self.defer_outputs:
+            # The scheduler releases held requests after their work completes.
+            reqs = [req for req in reqs if not req.defer_output]
         if self.is_generation:
             self._stream_output_generation(reqs, return_logprob, skip_req)
         else:  # embedding or reward model
@@ -193,6 +200,7 @@ class SchedulerOutputStreamer:
                 self.is_request_level_customized_info_key
             ),
             rust_server_mode=self.rust_server is not None,
+            enable_metrics=self.enable_metrics,
             current_weight_version=get_serving().weight_version,
         )
         for req in reqs:
@@ -270,7 +278,6 @@ class SchedulerOutputStreamer:
         prompt_tokens = []
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
-        time_stats = []
         retraction_counts = []
         phs_list = []
         has_phs = False
@@ -285,7 +292,6 @@ class SchedulerOutputStreamer:
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self.get_cached_tokens_details(req))
-                time_stats.append(req.time_stats)
                 retraction_counts.append(req.retraction_count)
 
                 phs = req.pooled_hidden_state
@@ -320,7 +326,6 @@ class SchedulerOutputStreamer:
             BatchEmbeddingOutput(
                 rids=rids,
                 http_worker_ipcs=http_worker_ipcs,
-                time_stats=wrap_as_pickle(time_stats),
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
@@ -406,6 +411,8 @@ class _GenerationStreamAccumulator:
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
     rust_server_mode: bool = False
+    # Collect each row's SchedulerOutputTimeStats.
+    enable_metrics: bool
     # Rust server mode: by row, the decode latency of a finished non-streaming
     # request, whose first token the Rust frontend does not see.
     decode_latencies: dict = field(default_factory=dict)
@@ -502,9 +509,8 @@ class _GenerationStreamAccumulator:
 
         if not self.rust_server_mode:
             # Everything below feeds the Python DetokenizerManager /
-            # TokenizerManager (incremental detok, meta_info, per-request metrics)
-            # or gets pickled into the payload (time_stats). The Rust server
-            # replaces those stages and builds its own metadata from the
+            # TokenizerManager (incremental detok, meta_info, per-request metrics).
+            # The Rust server replaces those stages and builds its own metadata from the
             # ChunkEvent, so `push_generation` never reads these — skip the whole
             # block. The parallel lists stay empty; the payload goes straight to
             # `push_generation`, which only indexes the fields appended above.
@@ -527,6 +533,8 @@ class _GenerationStreamAccumulator:
 
             # Collect detailed cache breakdown if available
             self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+            if self.enable_metrics:
+                self.time_stats.append(req.time_stats.to_output_time_stats())
 
         # Multimodal prompt token counts. In disagg decode mode the prefill node
         # already computed these and transferred them via the metadata buffer
@@ -552,8 +560,6 @@ class _GenerationStreamAccumulator:
                     self.decode_latencies[len(self.rids) - 1] = latency
         else:
             self.weight_versions.append(None)
-
-        self.time_stats.append(req.time_stats)
 
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
@@ -730,7 +736,7 @@ class _GenerationStreamAccumulator:
             spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
             spec_cap_lens_histogram=self.spec_cap_lens_histogram,
-            time_stats=wrap_as_pickle(self.time_stats),
+            time_stats=self.time_stats or None,
             finished_reasons=self.finished_reasons,
             decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,
@@ -781,8 +787,15 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
+            # The Rust egress encodes the per-token lists itself.
             customized_info=(
-                wrap_as_pickle(self.customized_info) if self.customized_info else None
+                (
+                    self.customized_info
+                    if self.rust_server_mode
+                    else wrap_as_pickle(self.customized_info)
+                )
+                if self.customized_info
+                else None
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
