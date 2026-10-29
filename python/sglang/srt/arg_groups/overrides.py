@@ -578,7 +578,6 @@ def _check_dsa_backend_constraints(
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         # Placed here, not at the top of the function, so a CUDA TileLang +
         # trtllm FP8 mix still reports the mixed-layout error below before any
-        # device probe. trtllm is the auto-selected FP8 default on every
         # device probe. trtllm is the auto-selected FP8 default on every SM >= 10,
         # so this also covers a launch with no DSA flag at all on SM11x/SM12x. The
         # accepted set is the pinned flashinfer's own dispatch condition
