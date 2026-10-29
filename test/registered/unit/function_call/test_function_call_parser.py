@@ -3796,6 +3796,20 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
                             parallel and choice != "none",
                         )
 
+    def test_required_selection_bounds_text_preamble(self):
+        alpha = "<tool_call>alpha</tool_call>"
+        named = ToolChoice(function=ToolChoiceFuncName(name="alpha"))
+        for thinking in (False, True):
+            prefix = "analysis</think>" if thinking else ""
+            for choice in ("auto", "required", named):
+                with self.subTest(thinking=thinking, choice=choice):
+                    grammar = self._compile(choice=choice, thinking=thinking)
+                    self.assertTrue(self._accepts(grammar, prefix + "x" * 256 + alpha))
+                    self.assertEqual(
+                        self._accepts(grammar, prefix + "x" * 257 + alpha),
+                        choice == "auto",
+                    )
+
     def test_enum_json_types_and_boolean_schemas(self):
         cases = [
             ({"enum": [1, 2]}, ["1", "2"], ["3"]),
