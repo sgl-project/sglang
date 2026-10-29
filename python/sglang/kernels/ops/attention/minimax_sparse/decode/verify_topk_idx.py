@@ -4,11 +4,9 @@ A linear draft chain verifies ``num_draft`` consecutive queries per request. The
 share one KV prefix and differ only by causal length, so the score kernel places a
 request's draft rows in the MMA M dimension and reads each index-K tile once
 instead of once per row. Each row keeps its own causal and local-block masks, so
-its scores and top-k match the per-row decode indexer.
-
-On an NVFP4 index-K cache the scorer reads a row as its even and odd columns (see
-`nvfp4_load_even_odd`), so the dots run on ``[tokens, D//2]`` tiles against the
-matching halves of Q and the cache tile needs no interleave or transpose.
+its scores and top-k match the per-row decode indexer. An NVFP4 index-K cache is
+scored as its even and odd columns (see ``nvfp4_load_even_odd``) against the matching
+halves of Q, so the cache tile needs no interleave or transpose.
 """
 
 from typing import Optional, Union
@@ -260,7 +258,7 @@ def _verify_topk_idx_nvfp4(
     k_scale: Optional[float],
     topk_idx_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """`verify_topk_idx` over an NVFP4 index-K cache."""
+    """``verify_topk_idx`` over an NVFP4 index-K cache."""
     rows, num_q_heads, head_dim = q.shape
     page_size = k_cache.page_size
     assert head_dim == 128 and page_size % block_size == 0
@@ -273,14 +271,14 @@ def _verify_topk_idx_nvfp4(
         sm_scale = head_dim**-0.5
     sm_scale = sm_scale * unit_scale(q_scale) * unit_scale(k_scale)
     score_kv_len = min(max_seqlen, req_to_token.shape[1])
-    # no -inf fill: columns past a row's ceil(seq_len/block) are never read
+    # No -inf fill: columns past a row's ceil(seq_len/block) are never read.
     score = torch.empty(
         (num_q_heads, rows, triton.cdiv(score_kv_len, block_size)),
         dtype=torch.float32,
         device=q.device,
     )
     use_jit_topk = decode_topk_uses_jit(score.shape[2], topk)
-    # The fp8 kernel's split-K sizing, but one or two requests fill 1024 programs (MI350X)
+    # The fp8 kernel's split-K sizing, but one or two requests fill 1024 programs (MI350X).
     groups = max(1, num_reqs * num_kv_heads)
     target = max(1, min(256, 2048 // groups), 1024 // groups)
     num_kv_chunks = 1 << (target.bit_length() - 1)
@@ -435,14 +433,14 @@ def verify_topk_idx(
         sm_scale = head_dim**-0.5
     sm_scale = sm_scale * unit_scale(q_scale)
     score_kv_len = min(max_seqlen, req_to_token.shape[1])
-    # no -inf fill: columns past a row's ceil(seq_len/block) are never read
+    # No -inf fill: columns past a row's ceil(seq_len/block) are never read.
     score = torch.empty(
         (num_q_heads, rows, triton.cdiv(score_kv_len, block_size)),
         dtype=torch.float32,
         device=q.device,
     )
     use_jit_topk = decode_topk_uses_jit(score.shape[2], topk)
-    # measured on gfx950 at 1/8/32 requests, 8k context
+    # Measured on gfx950 at 1/8/32 requests, 8k context.
     TARGET_GRID = 2048
     target = max(1, min(256, TARGET_GRID // max(1, num_reqs * num_kv_heads)))
     num_kv_chunks = 1 << (target.bit_length() - 1)

@@ -2,7 +2,7 @@
 
 The payload is read as u16, two bytes holding four e2m1 codes, so one register feeds one
 conversion and the even (low-nibble) and odd elements come out as separate fp16 tiles,
-the split `nvfp4_load_even_odd` makes for the Triton kernels. A dot over the head dim
+the split ``nvfp4_load_even_odd`` makes for the Triton kernels. A dot over the head dim
 is then the even-dim dot accumulated before the odd-dim one, as those kernels chain it.
 """
 
@@ -13,8 +13,10 @@ from .nvfp4 import Nvfp4Cache
 
 
 def fits_buffer_offsets(cache: Nvfp4Cache) -> bool:
-    """Whether 32-bit byte offsets from each buffer's base reach its last element; a
-    pool page-row view spans more bytes than it holds."""
+    """Whether 32-bit byte offsets from each buffer's base reach its last element.
+
+    A pool page-row view spans more bytes than it holds.
+    """
     return all(
         buf.element_size()
         * (1 + sum((n - 1) * s for n, s in zip(buf.shape, buf.stride())))
@@ -36,12 +38,13 @@ def nvfp4_buffer_loadable(cache: Nvfp4Cache) -> bool:
 
 @gluon.jit
 def _fp4x4_to_f16(payload_u16, scale, PURE: gl.constexpr):
-    """Two payload u16 and their fp16 block scale -> fp16 pairs (e0, e1), (e2, e3) of
-    the even and (o0, o1), (o2, o3) of the odd elements of the four bytes.
+    """Two payload u16 and their fp16 block scale -> fp16 even and odd element pairs.
 
-    The conversion's f32 scale only applies an exponent, so it gets 1.0 and the E4M3
-    scale is multiplied after; e2m1 times E4M3 is exact in fp16 (normal range, at most
-    6 significant bits), so these are the values of `nvfp4_kv_dequantize`.
+    The pairs are (e0, e1), (e2, e3) of the even and (o0, o1), (o2, o3) of the odd
+    elements of the four bytes. The conversion's f32 scale only applies an exponent, so
+    it gets 1.0 and the E4M3 scale is multiplied after; e2m1 times E4M3 is exact in fp16
+    (normal range, at most 6 significant bits), so these are the values of
+    ``nvfp4_kv_dequantize``.
     """
     e01, e23, o01, o23, _ = gl.inline_asm_elementwise(
         "v_cvt_scalef32_pk_f16_fp4 $1, $5, 1.0\n\t"
@@ -67,8 +70,10 @@ def _fp4x4_to_f16(payload_u16, scale, PURE: gl.constexpr):
 
 @gluon.jit
 def _interleave_pairs(lo, hi):
-    """[G, 4, N] pairs of a 16-element group -> [8 * G, N]: u16 r of group g gives rows
-    8g + 4 * (r // 2) + r % 2 (``lo``) and those + 2 (``hi``)."""
+    """[G, 4, N] pairs of 16-element groups -> [8 * G, N] rows.
+
+    u16 r of group g gives rows 8g + 4 * (r // 2) + r % 2 (``lo``) and those + 2 (``hi``).
+    """
     G: gl.constexpr = lo.shape[0]
     N: gl.constexpr = lo.shape[2]
     x = gl.join(gl.reshape(lo, [G, 2, 2, N]), gl.reshape(hi, [G, 2, 2, N]))
@@ -77,7 +82,7 @@ def _interleave_pairs(lo, hi):
 
 @gluon.jit
 def _interleave_pairs_w(lo, hi):
-    """`_interleave_pairs` with a leading warp dim: [W, G, 4, N] -> [W, 8 * G, N]."""
+    """``_interleave_pairs`` with a leading warp dim: [W, G, 4, N] -> [W, 8 * G, N]."""
     W: gl.constexpr = lo.shape[0]
     G: gl.constexpr = lo.shape[1]
     N: gl.constexpr = lo.shape[3]
@@ -87,11 +92,11 @@ def _interleave_pairs_w(lo, hi):
 
 @gluon.jit
 def nvfp4_even_odd(payload, scales, GROUP_LAYOUT: gl.constexpr):
-    """Payload [D // 4, N] u16 and E4M3 scales [D // 16, N] (dims x tokens) -> the even
-    and odd dims, fp16 [D // 2, N] each.
+    """u16 payload [D // 4, N] (dims x tokens) -> even and odd dims, fp16 [D // 2, N] each.
 
     ``GROUP_LAYOUT`` is the [D // 16, 4, N] view of the payload's layout, with each
-    thread's u16 of a group contiguous; ``scales`` is in its slice along dim 1.
+    thread's u16 of a group contiguous; the E4M3 ``scales`` [D // 16, N] are in its slice
+    along dim 1.
     """
     U: gl.constexpr = payload.shape[0]
     N: gl.constexpr = payload.shape[1]
@@ -103,9 +108,10 @@ def nvfp4_even_odd(payload, scales, GROUP_LAYOUT: gl.constexpr):
 
 @gluon.jit
 def nvfp4_even_odd_w(payload, scales, GROUP_LAYOUT: gl.constexpr):
-    """`nvfp4_even_odd` per warp: [W, D // 4, N] u16 and [W, D // 16, N] scales ->
-    fp16 [W, D // 2, N] even and odd dims; ``GROUP_LAYOUT`` is the [W, D // 16, 4, N]
-    view."""
+    """``nvfp4_even_odd`` with a leading warp dim W.
+
+    ``GROUP_LAYOUT`` is the [W, D // 16, 4, N] view.
+    """
     W: gl.constexpr = payload.shape[0]
     U: gl.constexpr = payload.shape[1]
     N: gl.constexpr = payload.shape[2]

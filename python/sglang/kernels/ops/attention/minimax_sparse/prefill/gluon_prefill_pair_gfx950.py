@@ -57,8 +57,10 @@ def _pair_union(
     TOPK_P: gl.constexpr,
     pair_layout: gl.constexpr,
 ):
-    """The pair's candidate pages ``key_j`` (query 0's in the first TOPK_P entries), and
-    the union of their distinct pages ascending, ``union_j[:n_blocks]``."""
+    """The pair's candidate pages ``key_j`` and their ascending union ``union_j[:n_blocks]``.
+
+    Query 0's candidates are the first TOPK_P entries of ``key_j``.
+    """
     NC: gl.constexpr = 2 * TOPK_P
     ci = gl.arange(0, NC, layout=gl.SliceLayout(1, pair_layout))
     cj = gl.arange(0, NC, layout=gl.SliceLayout(0, pair_layout))
@@ -112,8 +114,10 @@ def _query_step(
     H: gl.constexpr,
     SUB: gl.constexpr,
 ):
-    """One query's online-softmax update over a SUB-token tile starting at token
-    ``first`` of a block; only the query's own block masks tokens past it."""
+    """One query's online-softmax update over the SUB-token tile at token ``first`` of a block.
+
+    Only the query's own block masks tokens past it.
+    """
     s = mfma(q, k, gl.zeros([H, SUB], gl.float32, mfma_layout))
     if is_self:
         s = gl.where(((first + t_cols) < tail)[None, :], s * qk_scale, float("-inf"))
@@ -146,8 +150,11 @@ def _store_query_out(
     scale_off,
     OUT_QUANT: gl.constexpr,
 ):
-    """One query's O: bf16 [H, D], or with OUT_QUANT the per 1 x 128 FP8 bytes and
-    scales the o_proj's separate quant of that bf16 O writes (see ``store_fp8_out``)."""
+    """Store one query's O as bf16 [H, D], or with OUT_QUANT as per 1 x 128 FP8.
+
+    The FP8 bytes and scales are those the o_proj's separate quant of that bf16 O writes
+    (see ``store_fp8_out``).
+    """
     out = (acc * (v_scale / gl.where(l_i > 0, l_i, 1.0))[:, None]).to(
         o_ptr.dtype.element_ty
     )

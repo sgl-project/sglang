@@ -182,9 +182,9 @@ class TestVerifySharedKV(CustomTestCase):
         prefix lists are pre-windowed by the backend, at most one window long."""
         for prefix_lens, window in (
             ((300, 4095), 4095),
-            # the short window hides 0-6 of 16 keys per query, so an off-by-one shows
+            # The short window hides 0-6 of 16 keys per query, so an off-by-one shows.
             ((16, 13), 16),
-            # past 16 requests the combine merges several draft rows per program
+            # Past 16 requests the combine merges several draft rows per program.
             ((300, 4095) * 9, 4095),
         ):
             with self.subTest(window=window):
