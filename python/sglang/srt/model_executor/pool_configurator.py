@@ -255,9 +255,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc,
             include_mtp=not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle(),
         )
-        if kvc.modelslim_cache_layout is not None:
-            # NPU pools reserve one physical page for the allocator's sink slots.
-            self._fixed_overhead_bytes += self._cell_size * kvc.pool_page_size
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
