@@ -180,6 +180,38 @@ def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
     return False
 
 
+def jinja_template_reads_reasoning_content(chat_template: str) -> bool:
+    if not isinstance(chat_template, str):
+        return False
+
+    jinja_ast = _try_extract_ast(chat_template)
+    if jinja_ast is None:
+        return False
+
+    def is_reasoning_content(node: jinja2.nodes.Node) -> bool:
+        return (
+            isinstance(node, jinja2.nodes.Const) and node.value == "reasoning_content"
+        )
+
+    return (
+        any(
+            node.attr == "reasoning_content"
+            for node in jinja_ast.find_all(jinja2.nodes.Getattr)
+        )
+        or any(
+            is_reasoning_content(node.arg)
+            for node in jinja_ast.find_all(jinja2.nodes.Getitem)
+        )
+        or any(
+            isinstance(call.node, jinja2.nodes.Getattr)
+            and call.node.attr == "get"
+            and call.args
+            and is_reasoning_content(call.args[0])
+            for call in jinja_ast.find_all(jinja2.nodes.Call)
+        )
+    )
+
+
 def process_content_for_template_format(
     msg_dict: dict,
     content_format: str,
@@ -229,6 +261,7 @@ def process_content_for_template_format(
                             detail=image_obj.get("detail") or "auto",
                             max_dynamic_patch=mdp,
                             content_hash=image_obj.get("content_hash"),
+                            max_long_side_pixel=image_obj.get("max_long_side_pixel"),
                         )
                     )
 
@@ -246,7 +279,8 @@ def process_content_for_template_format(
                     }
                     if mdp is not None:
                         preprocess_kwargs["max_dynamic_patch"] = mdp
-                    if not preprocess_kwargs:
+                    max_long_side_pixel = video_obj.get("max_long_side_pixel")
+                    if not preprocess_kwargs and max_long_side_pixel is None:
                         video_data.append(chunk["video_url"]["url"])
                     else:
                         # VideoData survives load_video on every processor; a
@@ -254,7 +288,8 @@ def process_content_for_template_format(
                         video_data.append(
                             VideoData(
                                 url=video_obj["url"],
-                                preprocess_kwargs=preprocess_kwargs,
+                                preprocess_kwargs=preprocess_kwargs or None,
+                                max_long_side_pixel=max_long_side_pixel,
                             )
                         )
                     if chunk.get("modalities"):

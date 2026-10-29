@@ -97,6 +97,7 @@ from sglang.srt.model_loader.utils import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_stream,
 )
@@ -251,6 +252,15 @@ class LongcatFlashMoE(nn.Module):
         self.top_k = config.moe_topk
         self.zero_expert_num = config.zero_expert_num
         self.zero_expert_type = config.zero_expert_type
+        if (
+            self.zero_expert_num > 0
+            and get_exec().moe.ep_dispatch_algorithm is not None
+        ):
+            raise ValueError(
+                "LongCat zero experts do not support expert placement remapping. "
+                "Disable EPLB, redundant experts, custom expert placement, and "
+                "--ep-dispatch-algorithm for this model."
+            )
 
         if config.rounter_params_dtype == "float32":
             self.rounter_params_dtype = torch.float32
@@ -296,6 +306,7 @@ class LongcatFlashMoE(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
