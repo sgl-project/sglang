@@ -767,7 +767,11 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
+      # One at a time serialized image x partition, so the 7.2 schedule ran
+      # its 8 jobs back to back. Four on mi300 matches
+      # stage-b-test-1-gpu-small-amd on the same pool; other runner_arch
+      # dispatches keep one.
+      max-parallel: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 4 || 1 }}
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         part: [0, 1, 2, 3]
@@ -917,7 +921,9 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
+      # Two on mi300, so a run's partitions (or its two 7.2 images) overlap
+      # instead of running back to back; other runner_arch dispatches keep one.
+      max-parallel: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 2 || 1 }}
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         # run_suite.py load-balances the suite's parametrized cases and
