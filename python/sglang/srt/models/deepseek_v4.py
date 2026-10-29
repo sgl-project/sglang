@@ -4440,8 +4440,8 @@ class DeepseekV4Model(nn.Module):
                 )
         finally:
             residual_batch.clear(forward_batch)
-            # Drop this forward's MegaAttention packed-query buffer unless a CUDA
-            # graph captured it; a graph's warmup leaves it for the capture after.
+            # Drop this forward's packed-query buffer unless a CUDA graph captured it;
+            # a graph's warmup leaves it for the capture after.
             if self.use_mega_attention and not get_is_capture_mode():
                 from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
                     DeepseekV4MegaAttnBackend,

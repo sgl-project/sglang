@@ -2123,8 +2123,8 @@ class DeepseekV4AttnBackend(
                 forward_batch.global_num_token_non_padded = bound
                 forward_batch.num_token_non_padded = bound
         if tail_metadata.q_mega_pad_buffer is None:
-            # The late layers run over a subset of this forward's rows, so they
-            # reuse its MegaAttention packed-query buffer.
+            # The late layers run over a subset of this forward's rows,
+            # so they reuse its MegaAttention packed-query buffer.
             tail_metadata.q_mega_pad_buffer = self.forward_metadata.q_mega_pad_buffer
         tail_core = tail_metadata.core_attn_metadata
         self.forward_metadata = tail_metadata

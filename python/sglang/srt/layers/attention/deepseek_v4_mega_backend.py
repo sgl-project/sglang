@@ -20,8 +20,8 @@ def interleave_query_rows(x: torch.Tensor, num_heads: int) -> torch.Tensor:
 def pack_query(
     q: torch.Tensor, padded_heads: int, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    # Writes only the real heads' slots: an ``out`` passed in must already hold
-    # zeros in the padded heads' slots.
+    # Writes only the real heads' slots;
+    # an ``out`` passed in must already hold zeros in the padded heads' slots.
     tokens, heads, _ = q.shape
     if out is None:
         out = q.new_zeros(tokens, padded_heads, HEAD_DIM)
