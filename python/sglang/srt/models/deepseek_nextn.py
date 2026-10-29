@@ -138,6 +138,12 @@ class DeepseekModelNextN(nn.Module):
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    @property
+    def layers(self) -> tuple[nn.Module, ...]:
+        # Prefill CUDA graph setup locates attention layers via `layers`.
+        # A read-only view keeps `decoder` the only registered name.
+        return (self.decoder,)
+
     def embed_input_ids(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
