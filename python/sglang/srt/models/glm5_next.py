@@ -150,20 +150,6 @@ _MHC_POST_MULT_VALUE = 2.0
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 
 
-def _remap_glm5_next_weight_name(name: str) -> str:
-    """Map GLM-Next checkpoint names to this runtime's module layout."""
-    if name.startswith("model.language_model."):
-        name = "model." + name.removeprefix("model.language_model.")
-    elif name.startswith("language_model."):
-        name = name.removeprefix("language_model.")
-
-    return (
-        name.replace(".forget_gate.", ".")
-        .replace(".attn_hc.", ".hc_attn_")
-        .replace(".ffn_hc.", ".hc_ffn_")
-    )
-
-
 @torch.compile(disable=is_npu())
 def swiglu_clamped(y: torch.Tensor, limit: float):
     gate, up = torch.chunk(y, 2, dim=-1)
@@ -1776,7 +1762,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if getattr(self, "language_only", False) and is_visual_weight:
                 continue
 
-            name = _remap_glm5_next_weight_name(name)
+            if "language_model." in name:
+                name = name.replace("language_model.", "")
+            name = (
+                name.replace(".forget_gate.", ".")
+                .replace(".attn_hc.", ".hc_attn_")
+                .replace(".ffn_hc.", ".hc_ffn_")
+            )
             if "model.visual." in name:
                 name = name.replace("model.visual.", "visual.")
 
