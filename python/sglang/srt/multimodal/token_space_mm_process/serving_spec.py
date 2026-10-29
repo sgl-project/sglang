@@ -34,6 +34,7 @@ class TokenSpaceServingSpec:
 
         Runs on processor worker threads, so it must not mutate the spec. The default
         is the legacy processor's split, which finds media boundaries by field name.
+        The wrapper then sets each media item's offsets from its mm_spans row.
         """
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 
