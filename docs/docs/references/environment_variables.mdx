@@ -1938,6 +1938,21 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on ROCm with <code>SGLANG_USE_AITER</code>: run the merged MoE front GEMM through AITER tuned BF16 GEMM for batches between <code>SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS</code> and <code>SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS</code> tokens. Engages only for the TP8 front shape (N = 6016, K = 7168, bf16) on gfx950; other TP sizes and architectures log a warning and keep the default GEMM. Needs an AITER with the tuned rows of <a href="https://github.com/ROCm/aiter/pull/6411">ROCm/aiter#6411</a>; loading fails otherwise.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Smallest batch, in tokens, that takes the tuned MoE front GEMM.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Largest batch, in tokens, that takes the tuned MoE front GEMM.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>192</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx95x with <code>SGLANG_USE_AITER=1</code>, quantize the BF16 GDN <code>in_proj_qkvz</code> and <code>out_proj</code> of Qwen3.5 / Qwen3.8 to MXFP4 after load. Projections with N or K not a multiple of 256 stay BF16. Batches of up to 64 rows run the AITER preshuffled MXFP4 GEMM if AITER has a tuned config for the shape. All other batches run the ASM <code>gemm_a4w4</code>. Set to <code>0</code> to keep the BF16 projections.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
