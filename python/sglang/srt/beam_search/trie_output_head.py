@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -102,11 +103,12 @@ def build_trie_row_levels(
                 level = min(entry.group.num_generated, max_level)
                 row_levels.extend([level] * (entry.end - entry.start))
         assert len(row_levels) == len(batch.seq_lens)
+        # Pinned and non-blocking, so the host never waits on the running forward.
         return torch.tensor(
             row_levels,
             dtype=torch.int64,
-            device=batch.device,
-        )
+            pin_memory=is_pin_memory_available(batch.device),
+        ).to(batch.device, non_blocking=True)
     return None
 
 

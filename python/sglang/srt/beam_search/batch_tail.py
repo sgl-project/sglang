@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Any, List, NamedTuple
 import msgspec
 import torch
 
+from sglang.srt.utils.common import is_pin_memory_available
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
@@ -66,17 +68,22 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
     if not entries:
         return
 
-    leader_idx_cpu = torch.tensor(leader_idx, dtype=torch.int64)
-    widths_cpu = torch.tensor(widths, dtype=torch.int64)
+    pin_memory = is_pin_memory_available(batch.device)
+    leader_idx_cpu = torch.tensor(leader_idx, dtype=torch.int64, pin_memory=pin_memory)
+    widths_cpu = torch.tensor(widths, dtype=torch.int64, pin_memory=pin_memory)
     leader_idx_dev = leader_idx_cpu.to(batch.device, non_blocking=True)
     widths_dev = widths_cpu.to(batch.device, non_blocking=True)
 
     batch.req_pool_indices = torch.cat([batch.req_pool_indices, *tails])
     batch.req_pool_indices_cpu = torch.cat([batch.req_pool_indices_cpu, *tails_cpu])
+    # output_size: without it, device repeats are read back to size the output,
+    # which syncs the host while the overlap scheduler builds the next batch.
     batch.seq_lens = torch.cat(
         [
             batch.seq_lens,
-            torch.repeat_interleave(batch.seq_lens[leader_idx_dev], widths_dev),
+            torch.repeat_interleave(
+                batch.seq_lens[leader_idx_dev], widths_dev, output_size=t
+            ),
         ]
     )
     if batch.seq_lens_cpu is not None:
@@ -89,7 +96,9 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
     batch.orig_seq_lens = torch.cat(
         [
             batch.orig_seq_lens,
-            torch.repeat_interleave(batch.orig_seq_lens[leader_idx_dev], widths_dev),
+            torch.repeat_interleave(
+                batch.orig_seq_lens[leader_idx_dev], widths_dev, output_size=t
+            ),
         ]
     )
     batch.seq_lens_sum = None
