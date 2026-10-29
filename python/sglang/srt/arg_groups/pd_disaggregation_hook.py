@@ -201,8 +201,8 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
     unsupported = []
     if cfg.disaggregation_mode not in ("prefill", "decode"):
         unsupported.append("aggregated serving")
-    if cfg.disaggregation_transfer_backend != "mooncake":
-        unsupported.append("transfer backends other than Mooncake")
+    if cfg.disaggregation_transfer_backend not in ("mooncake", "ascend"):
+        unsupported.append("transfer backends other than Mooncake/Ascend")
     if cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
         unsupported.append("pipeline or attention context parallelism")
     attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
