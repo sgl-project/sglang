@@ -1,9 +1,10 @@
-"""Muse Spark push all-reduce fused with the attention norm-residual boundary, multi-GPU.
+"""Muse Spark push collectives fused with the norm-residual boundary, multi-GPU.
 
-The fused kernel must match the push all-reduce it replaces followed by
-``fused_norm_residual`` bit for bit, on every rank: both sum the same bf16
-partials in fp32 in rank order, round once, and run the same norm. Every test
-runs with unicast and, where supported, multicast pushes.
+Each fused kernel must match the collective it replaces followed by
+``fused_norm_residual`` bit for bit, on every rank. The all-reduce sums the same
+bf16 partials in fp32 in rank order and rounds once; the all-gather moves bf16
+slices unchanged. All-reduce tests run with unicast and, where supported,
+multicast pushes; the all-gather always multicasts.
 
 Usage::
 
@@ -24,6 +25,10 @@ import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication import muse_spark_all_reduce_norm_residual as arn
 from sglang.kernels.ops.communication.all_reduce import AllReduceAlgo
+from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import (
+    all_gather_norm_residual,
+    all_gather_norm_residual_supported,
+)
 from sglang.kernels.ops.layernorm.muse_spark_norm_residual_jit import (
     _cluster_launch_config,
     fused_norm_residual,
@@ -245,6 +250,39 @@ def test_launch_overrides():
         assert arn.all_reduce_norm_residual_supported(comm, 48, HIDDEN)
 
 
+def _gather_inputs(
+    num_tokens: int, seed: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """This rank's bf16 column slice, the gathered branch, and the fp32 residual stream."""
+    world = dist.get_world_size()
+    slices = []
+    for rank in range(world):
+        gen = torch.Generator(device="cuda").manual_seed(seed * 7919 + rank)
+        part = torch.randn(num_tokens, HIDDEN // world, device="cuda", generator=gen)
+        slices.append((0.5 * part).to(torch.bfloat16))
+    # Exact zeros take the producer's +0 -> -0 remap.
+    slices[-1][0, :64] = 0
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    stream = torch.randn(num_tokens, HIDDEN, device="cuda", generator=gen)
+    return slices[dist.get_rank()], torch.cat(slices, dim=1), stream
+
+
+@pytest.mark.parametrize("variant", ["gate", "input_scale", "plain"])
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@torch.inference_mode()
+def test_all_gather_matches_gather_then_norm(num_tokens, variant):
+    comm = _init_communicator()
+    if not comm.has_multicast:
+        pytest.skip("the fused all-gather needs a multicast push workspace")
+    assert all_gather_norm_residual_supported(comm, num_tokens, HIDDEN)
+    kwargs = _boundary_kwargs(variant)
+    for rnd in range(REPEATS):
+        local, branch, stream = _gather_inputs(num_tokens, 100 * num_tokens + rnd)
+        want = fused_norm_residual(branch, stream, POST_EPS, PRE_EPS, **kwargs)
+        got = all_gather_norm_residual(comm, local, stream, POST_EPS, PRE_EPS, **kwargs)
+        _assert_bitwise((*got, None), want, f"M={num_tokens} {variant} round {rnd}")
+
+
 def _standalone_inputs(numel: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
     """This rank's input and the exact all-reduce: small integers sum exactly in bf16."""
     parts = [
@@ -263,8 +301,8 @@ def _standalone_inputs(numel: int, seed: int) -> tuple[torch.Tensor, torch.Tenso
 @pytest.mark.parametrize("use_graph", [False, True])
 @torch.inference_mode()
 def test_interleaves_with_standalone_push(comm, use_graph):
-    """Fused and standalone push all-reduces share the push slots and epoch counters
-    but launch different grids: alternating them at changing sizes must stay exact."""
+    """The fused all-reduce, the standalone push all-reduce, and the fused all-gather share the
+    push slots and epoch counters but launch different grids: alternating them must stay exact."""
     kwargs = _boundary_kwargs("gate")
     algos = [AllReduceAlgo.ONE_SHOT_PUSH, AllReduceAlgo.TWO_SHOT_PUSH]
     steps = [(m, n, algo) for (m, n), algo in itertools.product(INTERLEAVED, algos)]
@@ -274,11 +312,16 @@ def test_interleaves_with_standalone_push(comm, use_graph):
     standalone = [
         _standalone_inputs(n, 6000 + i)[0] for i, (_, n, _) in enumerate(steps)
     ]
+    # The fused all-gather joins the sequence wherever multicast exists.
+    gather = [
+        _gather_inputs(m, 9000 + i) if comm.has_multicast else None
+        for i, (m, *_) in enumerate(steps)
+    ]
 
-    def run_steps() -> tuple[list, list]:
-        got, reduced = [], []
-        for i, ((_, _, algo), (partial, stream), x) in enumerate(
-            zip(steps, fused, standalone)
+    def run_steps() -> tuple[list, list, list]:
+        got, reduced, gathered = [], [], []
+        for i, ((_, _, algo), (partial, stream), x, g) in enumerate(
+            zip(steps, fused, standalone, gather)
         ):
             # Every launch flips the epoch parity: alternate the order so both kinds
             # of launch use both halves of the double buffer.
@@ -293,24 +336,31 @@ def test_interleaves_with_standalone_push(comm, use_graph):
                 reduced.append(comm.custom_all_reduce(x))
             finally:
                 comm.override_algo = None
+            if g is not None:
+                local, _, gather_stream = g
+                gathered.append(
+                    all_gather_norm_residual(
+                        comm, local, gather_stream, POST_EPS, PRE_EPS, **kwargs
+                    )
+                )
             if not i % 2:
                 got.append(
                     arn.all_reduce_norm_residual(
                         comm, partial, stream, POST_EPS, PRE_EPS, **kwargs
                     )
                 )
-        return got, reduced
+        return got, reduced, gathered
 
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        got, reduced = run_steps()
+        got, reduced, gathered = run_steps()
         if use_graph:
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
             with comm.capture():
                 with torch.cuda.graph(graph, stream=side):
-                    got, reduced = run_steps()
+                    got, reduced, gathered = run_steps()
     torch.cuda.synchronize()
     for rnd in range(REPEATS):
         expected = []
@@ -322,10 +372,15 @@ def test_interleaves_with_standalone_push(comm, use_graph):
             x, want = _standalone_inputs(numel, 8000 + 100 * rnd + i)
             standalone[i].copy_(x)
             expected.append(want)
+            if gather[i] is not None:
+                for dst, src in zip(
+                    gather[i], _gather_inputs(num_tokens, 9500 + 100 * rnd + i)
+                ):
+                    dst.copy_(src)
         if use_graph:
             graph.replay()
         else:
-            got, reduced = run_steps()
+            got, reduced, gathered = run_steps()
         torch.cuda.synchronize()
         # Standalone push stores an exact-zero sum as -0.0, which compares equal.
         failures = [
@@ -337,6 +392,13 @@ def test_interleaves_with_standalone_push(comm, use_graph):
         for i, ((partial, stream), out) in enumerate(zip(fused, got)):
             want = _reference(comm, partial, stream, kwargs, False)
             _assert_bitwise(out, want, f"round {rnd} fused all-reduce step {i}")
+        for i, ((_, branch, stream), out) in enumerate(
+            zip(filter(None, gather), gathered)
+        ):
+            want = fused_norm_residual(branch, stream, POST_EPS, PRE_EPS, **kwargs)
+            _assert_bitwise(
+                (*out, None), want, f"round {rnd} fused all-gather step {i}"
+            )
 
 
 if __name__ == "__main__":

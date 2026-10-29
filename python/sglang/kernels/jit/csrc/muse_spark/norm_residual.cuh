@@ -71,8 +71,10 @@ SGL_DEVICE fp32x2_t round_bf16(fp32x2_t v) {
 // `kPrefetchWeights` additionally issues the gate / pre-norm weight loads before
 // the first reduction, so a small-M launch costs one DRAM round trip instead of
 // three; at large M the register cost of that outweighs the latency it hides.
-// `branch_at(pack, index)` returns the row's bf16 branch vector `index`: a load
-// here, the all-reduced row in all_reduce_norm_residual.cuh.
+// `branch_at(pack, index)` returns the row's bf16 branch vector `index`: a load here,
+// the all-reduced row in all_reduce_norm_residual.cuh, a gathered row in
+// all_gather_norm_residual.cuh. It runs after the pack's local loads are issued,
+// so their latency overlaps a branch still arriving from peers.
 template <
     int64_t kHidden,
     int kNumThreads,
@@ -125,7 +127,6 @@ SGL_DEVICE void norm_residual_row(const NormResidualParams& params, int row, Bra
 #pragma unroll
   for (int p = 0; p < kPacks; ++p) {
     const int idx = threadIdx.x + p * kNumThreads;
-    const BF16Vec branch_v = branch_at(p, idx);
 #pragma unroll
     for (int j = 0; j < kFParts; ++j)
       stream_v[p][j].load(stream, idx * kFParts + j);
@@ -148,6 +149,7 @@ SGL_DEVICE void norm_residual_row(const NormResidualParams& params, int row, Bra
       for (int q = 0; q < kPairs; ++q)
         post_w[p][q] = cast<fp32x2_t>(weight_v[q]);
     }
+    const BF16Vec branch_v = branch_at(p, idx);
 #pragma unroll
     for (int q = 0; q < kPairs; ++q) {
       auto v = cast<fp32x2_t>(branch_v[q]);
@@ -501,7 +503,6 @@ SGL_DEVICE void norm_residual_cluster_row(const NormResidualParams& params, int 
 #pragma unroll
   for (int pack = 0; pack < kPacks; ++pack) {
     const int index = cluster_rank * kNumThreads + threadIdx.x + pack * kTotalThreads;
-    const BF16Vec branch_values = branch_at(pack, index);
     BF16Vec post_weights;
     F32Vec stream_values[kFParts];
     F32Vec alpha_values[kFParts];
@@ -521,6 +522,7 @@ SGL_DEVICE void norm_residual_cluster_row(const NormResidualParams& params, int 
         }
       }
     }
+    const BF16Vec branch_values = branch_at(pack, index);
 
 #pragma unroll
     for (int pair = 0; pair < kPairs; ++pair) {
