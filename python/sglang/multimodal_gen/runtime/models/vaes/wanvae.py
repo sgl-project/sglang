@@ -28,6 +28,7 @@ from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
+    is_auto_parallel_decode_mode,
     should_use_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
@@ -59,8 +60,13 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
 from sglang.multimodal_gen.runtime.models.vaes.resample import AvgDown3D
 from sglang.multimodal_gen.runtime.models.vaes.resample import DupUp3D as DupUp3DBase
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.utils import is_gfx1250_supported
 
-if current_platform.is_cuda() or current_platform.is_xpu():
+if (
+    current_platform.is_cuda()
+    or current_platform.is_xpu()
+    or (current_platform.is_rocm() and is_gfx1250_supported())
+):
     try:
         from sglang.kernels.ops.diffusion import (
             can_use_conv_bias_epilogue,
@@ -120,6 +126,9 @@ def _fused_conv_cache_supported(conv: nn.Module, x: torch.Tensor) -> bool:
     return (
         cat_pad_channels_last_3d is not None
         and type(conv) is WanCausalConv3d
+        # ROCm's batched-Conv2D replacement patches ``forward``; the fused
+        # path would call the unpatched conv epilogue instead.
+        and not hasattr(conv, "_weight_2d")
         and x.dim() == 5
         and x.device.type in ("cuda", "xpu")
         and current_platform.is_amp_supported()
@@ -552,7 +561,15 @@ def attention_block_forward(self, x, rows: tuple[int, int] | None = None):
         q = q[:, :, first * width : (first + height) * width]
         identity = identity[..., first : first + height, :]
 
-    x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    if getattr(self, "_sgl_math_sdpa", False) and q.dtype == torch.float32:
+        # The math SDPA backend's ops minus ``_safe_softmax``'s fully-masked-row
+        # fixup (no mask here, so bit-identical), which on gfx1250 is a slow
+        # broadcast ``where`` over the [HW, HW] scores.
+        s = (q.size(-1) ** -0.5) ** 0.5
+        attn = torch.matmul(q * s, k.transpose(-2, -1) * s)
+        x = torch.matmul(torch.softmax(attn, dim=-1), v)
+    else:
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
     x = (
         x.squeeze(1)
@@ -1598,7 +1615,12 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self.latents_std = list(config.latents_std)
         self.shift_factor = config.shift_factor
         self.use_parallel_encode = getattr(config, "use_parallel_encode", False)
-        self.use_parallel_decode = getattr(config, "use_parallel_decode", False)
+        # When auto declines spatial-shard (gfx1250), decode is single-rank and
+        # DecodingStage runs it on the main rank alone under cfg-parallel.
+        self.use_parallel_decode = config.use_parallel_decode and (
+            not is_auto_parallel_decode_mode(config.parallel_decode_mode)
+            or should_use_spatial_shard_parallel_decode(config)
+        )
 
         if config.load_encoder:
             self.encoder = WanEncoder3d(

@@ -302,7 +302,7 @@ mod tests {
             &self,
             _input_ids: crate::message::types::TokenIds,
             _mm: MmData,
-        ) -> Result<crate::multi_modality::worker::MmProcessOutput, String> {
+        ) -> Result<crate::multi_modality::worker::MmProcessOutput, MediaError> {
             unreachable!("prefetch never processes")
         }
 

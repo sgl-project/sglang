@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -48,6 +49,7 @@ from sglang.srt.speculative.base_spec_worker import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
@@ -204,10 +206,13 @@ class TestDecodeRetractionBackup(CustomTestCase):
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             is_eagle=draft_pool is not None,
-            tree_components=(
-                (ComponentType.FULL, ComponentType.SWA)
-                if hybrid_swa
-                else (ComponentType.FULL,)
+            tree_slots=tree_slots_of(
+                (
+                    (ComponentType.FULL, ComponentType.SWA)
+                    if hybrid_swa
+                    else (ComponentType.FULL,)
+                ),
+                window=8 if hybrid_swa else None,
             ),
             sliding_window_size=8 if hybrid_swa else None,
             mtp_draft_device_pools=(
@@ -292,10 +297,15 @@ class TestDecodeRetractionBackup(CustomTestCase):
             torch.arange(self.pool_size, device=self.device),
             shifts=self.pool_size // 2,
         )
-        target_pool.host_transfer_translate = lambda indices: virtual_to_physical[
-            indices
-        ]
-        source_physical_indices = target_pool.host_transfer_translate(source_indices)
+
+        def translate(indices):
+            return virtual_to_physical[indices]
+
+        # The host stack maps the controller's ids to the target pool's rows.
+        anchor = cache.host_pool_group.anchor_entry
+        self.assertIs(anchor.device_pool, target_pool)
+        anchor.device_translate = translate
+        source_physical_indices = translate(source_indices)
         self.assertFalse(torch.equal(source_indices, source_physical_indices))
 
         self._seed_pool(target_pool, source_physical_indices, base=1000)
@@ -325,9 +335,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, self.num_tokens)), destination_indices
         )
-        destination_physical_indices = target_pool.host_transfer_translate(
-            destination_indices
-        )
+        destination_physical_indices = translate(destination_indices)
 
         cache.restore_kv_cache(req, backup)
         self._finish_restores(cache)
@@ -397,16 +405,21 @@ class TestDecodeRetractionBackup(CustomTestCase):
             queue.kv_manager = queue._init_kv_manager()
         queue.scheduler.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=env.cache,
+            storage=kv_storage_of(
+                env.req_to_token_pool,
+                env.allocator,
+                shape=StaticPoolShape(
+                    has_window=hybrid_swa,
+                    has_state=False,
+                    token_capacity=self.pool_size,
+                    full_tokens_per_layer=self.pool_size,
+                    swa_tokens_per_layer=self.pool_size if hybrid_swa else None,
+                ),
+            ),
             token_to_kv_pool_allocator=env.allocator,
-            req_to_token_pool=env.req_to_token_pool,
             session_controller=None,
             hisparse_coordinator=None,
-            is_hybrid_swa=hybrid_swa,
-            is_hybrid_ssm=False,
             enable_hisparse=False,
-            full_tokens_per_layer=self.pool_size,
-            swa_tokens_per_layer=self.pool_size if hybrid_swa else None,
-            max_total_num_tokens=self.pool_size,
         )
         return queue, queue.kv_manager.kv_args
 
