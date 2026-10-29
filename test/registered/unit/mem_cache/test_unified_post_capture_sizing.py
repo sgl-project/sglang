@@ -16,7 +16,7 @@
 With post-capture sizing the shared arena is reserved as CUDA virtual memory
 before graph capture: only the slot-0 sink is physically backed, the graphs
 capture the final tensor address, and ``finalize_backing`` backs the measured
-byte budget in place. ``UnifiedSWATokenToKVPoolAllocator.resize`` then
+byte budget in place. ``ChainAllocator.resize`` then
 re-derives every capacity the sub-allocators and sub-pools expose.
 
 The oracle is the eagerly-allocated pool of the same final size: a resized pool
@@ -65,28 +65,27 @@ def _bundle(*, total_bytes: int, post_capture_active: bool):
 
 def _capacities(bundle) -> dict:
     """Every capacity-derived value a resize must keep consistent."""
-    shared = bundle.unified_memory_pool
+    shared = bundle.arena
     kvcache = bundle.token_to_kv_pool
     allocator = bundle.token_to_kv_pool_allocator
     out = {
         "total_bytes": shared.total_bytes,
-        "active_allocation_bytes": shared.active_allocation_bytes,
+        "active_allocation_bytes": shared.accessible_bytes,
         "buf_lens": kvcache.get_contiguous_buf_infos()[1],
         "kvcache.size": kvcache.size,
-        "kvcache.size_swa": kvcache.size_swa,
         "allocator.size": allocator.size,
         "allocator.available_size": allocator.available_size(),
         "allocator.full_available_size": allocator.full_available_size(),
         "allocator.swa_available_size": allocator.swa_available_size(),
     }
     for name, sub, pool in (
-        ("full", allocator.full_attn_allocator, kvcache.full_kv_pool),
-        ("swa", allocator.swa_attn_allocator, kvcache.swa_kv_pool),
+        ("full", allocator.full_attn_allocator, kvcache.layer_router.view("full")),
+        ("swa", allocator.swa_attn_allocator, kvcache.layer_router.view("swa")),
     ):
-        out[f"{name}.max_slots"] = shared.max_slots(name)
+        out[f"{name}.max_slots"] = shared.num_entries(name)
         out[f"{name}.sub.max_slots"] = sub.max_slots
         out[f"{name}.sub.num_pages"] = sub.num_pages
-        out[f"{name}.sub.num_virtual_ids"] = sub.num_virtual_ids
+        out[f"{name}.sub.ids.num_virtual_ids"] = sub.ids.num_virtual_ids
         out[f"{name}.sub.available_size"] = sub.available_size()
         out[f"{name}.pool.size"] = pool.size
         out[f"{name}.pool.host_capacity_tokens"] = pool.host_capacity_tokens
@@ -103,26 +102,24 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
         """Before sizing, the arena is address space: the sink is resident and
         only it may be handed to transfer engines, not the reserved bound."""
         bundle = self._post_capture_bundle()
-        shared = bundle.unified_memory_pool
+        shared = bundle.arena
         self.assertTrue(bundle.token_to_kv_pool.post_capture_active)
         self.assertEqual(shared.total_bytes, _RESERVED_BYTES)
-        self.assertGreater(shared.active_allocation_bytes, 0)
-        self.assertLessEqual(
-            shared.active_allocation_bytes, shared.post_capture_backed_bytes
-        )
-        self.assertLess(shared.post_capture_backed_bytes, _RESERVED_BYTES)
+        self.assertGreater(shared.accessible_bytes, 0)
+        self.assertLessEqual(shared.accessible_bytes, shared.backed_bytes)
+        self.assertLess(shared.backed_bytes, _RESERVED_BYTES)
         _, buf_lens, _ = bundle.token_to_kv_pool.get_contiguous_buf_infos()
-        self.assertEqual(buf_lens, [shared.active_allocation_bytes])
+        self.assertEqual(buf_lens, [shared.accessible_bytes])
 
     def test_finalize_and_resize_match_the_eager_pool_of_the_final_size(self):
         bundle = self._post_capture_bundle()
-        shared = bundle.unified_memory_pool
+        shared = bundle.arena
         allocator = bundle.token_to_kv_pool_allocator
-        captured_ptr = shared._raw.data_ptr()
+        captured_ptr = shared.raw.data_ptr()
         tables = [
             table
             for sub in (allocator.full_attn_allocator, allocator.swa_attn_allocator)
-            for table in (sub.virtual_to_physical, sub.physical_to_virtual)
+            for table in (sub.ids.virtual_to_physical, sub.ids.physical_to_virtual)
         ]
         table_ptrs = [table.data_ptr() for table in tables]
 
@@ -131,13 +128,11 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
         allocator.resize(config)
 
         # Graphs captured these addresses; sizing may not move them.
-        self.assertEqual(shared._raw.data_ptr(), captured_ptr)
+        self.assertEqual(shared.raw.data_ptr(), captured_ptr)
         self.assertEqual([table.data_ptr() for table in tables], table_ptrs)
-        self.assertGreaterEqual(
-            shared.post_capture_backed_bytes, shared.active_allocation_bytes
-        )
+        self.assertGreaterEqual(shared.backed_bytes, shared.accessible_bytes)
         # The whole advertised span is resident, not just the sink.
-        last = shared._raw[shared.active_allocation_bytes - 1]
+        last = shared.raw[shared.accessible_bytes - 1]
         last.fill_(7)
         torch.cuda.synchronize()
         self.assertEqual(int(last.item()), 7)
@@ -157,7 +152,9 @@ class TestUnifiedPostCaptureSizing(unittest.TestCase):
         kvcache = bundle.token_to_kv_pool
         allocator = bundle.token_to_kv_pool_allocator
         with self.subTest("resize before finalize_backing"):
-            with self.assertRaisesRegex(RuntimeError, "finalize_backing must run"):
+            with self.assertRaisesRegex(
+                RuntimeError, "must be backed before allocator.resize"
+            ):
                 allocator.resize(
                     SimpleNamespace(unified_memory_pool_bytes=_FINAL_BYTES)
                 )

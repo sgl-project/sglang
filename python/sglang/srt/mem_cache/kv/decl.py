@@ -22,8 +22,8 @@ class FullLifetime(msgspec.Struct, frozen=True, tag="full"):
 
 
 class WindowLifetime(msgspec.Struct, frozen=True, tag="window"):
-    """Kept for the last ``window`` tokens of a request; ``None`` when the
-    model does not state its window."""
+    """Kept for the last ``window`` tokens of a request: the window its layers
+    attend over; ``None`` when the model does not state its window."""
 
     window: Optional[int] = None
     rank: ClassVar[int] = 1
@@ -33,8 +33,11 @@ class WindowLifetime(msgspec.Struct, frozen=True, tag="window"):
 
 
 class StateLifetime(msgspec.Struct, frozen=True, tag="state"):
-    """One fixed-size slot per request, overwritten as the request advances."""
+    """One fixed-size slot per request, overwritten as the request advances.
+    A copy of it is valid only after a multiple of ``checkpoint_interval``
+    tokens (the state kernel's chunk); ``None`` when no prefix is cached."""
 
+    checkpoint_interval: Optional[int] = None
     rank: ClassVar[int] = 0
 
     def retention(self) -> Tuple[int, float]:
@@ -42,6 +45,28 @@ class StateLifetime(msgspec.Struct, frozen=True, tag="state"):
 
 
 KVLifetime = Union[FullLifetime, WindowLifetime, StateLifetime]
+
+
+def declares_lifetime_beside_full(model_config) -> bool:
+    """Whether a model's layers declare a sliding window or recurrent state
+    beside full attention. Asks for the window first: argument resolution has
+    not yet published what some state configs read to describe their state."""
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    return model_config.is_hybrid_swa or mambaish_config(model_config) is not None
+
+
+def declared_lifetime_types(model_config) -> frozenset:
+    """The lifetimes a model's layers declare: full attention always, sliding
+    windows and recurrent state when the model has them."""
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    types = {FullLifetime}
+    if model_config.is_hybrid_swa:
+        types.add(WindowLifetime)
+    if mambaish_config(model_config) is not None:
+        types.add(StateLifetime)
+    return frozenset(types)
 
 
 class MHAGeometry(msgspec.Struct, frozen=True, kw_only=True):
@@ -100,6 +125,7 @@ def kv_layer_decls(
     window: Optional[int] = None,
     state_layer_ids: Sequence[int] = (),
     state_geometry: Optional[StateGeometry] = None,
+    checkpoint_interval: Optional[int] = None,
 ) -> Tuple[KVLayerDecl, ...]:
     """One declaration per layer that stores anything, in layer order. A layer
     may hold an attention part and a state part at once."""
@@ -119,7 +145,10 @@ def kv_layer_decls(
             parts.setdefault(layer_id, []).append(part)
     if state_layer_ids:
         assert state_geometry is not None, "state layers need their geometry"
-        part = KVPartDecl(lifetime=StateLifetime(), geometry=state_geometry)
+        part = KVPartDecl(
+            lifetime=StateLifetime(checkpoint_interval=checkpoint_interval),
+            geometry=state_geometry,
+        )
         for layer_id in state_layer_ids:
             parts.setdefault(layer_id, []).append(part)
     return tuple(

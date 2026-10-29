@@ -69,7 +69,7 @@ def test_unified_l2_waits_for_index_producer(direction, backend):
         need_sort=False,
         lazy_compaction=True,
     )
-    device_pool = bundle.token_to_kv_pool.full_kv_pool
+    device_pool = bundle.token_to_kv_pool.layer_router.view("full")
     host_pool = UnifiedPageEnvelopeHostPool(
         device_pool,
         1.0,
@@ -85,7 +85,13 @@ def test_unified_l2_waits_for_index_producer(direction, backend):
     virtual_indices = allocator.alloc(5)
     device_indices = virtual_indices[:1].clone()
     host_indices = host_pool.alloc(1)
-    transfer = L2Transfer(host_pool, device_pool, host_indices, device_indices)
+    transfer = L2Transfer(
+        host_pool,
+        device_pool,
+        host_indices,
+        device_indices,
+        device_translate=allocator.storage.host_ids("full"),
+    )
     device_pages = device_pool.get_page_envelope_buffer()
     try:
         # Warm both copy paths before creating the delayed producer dependency.

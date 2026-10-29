@@ -29,9 +29,11 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.test.tree_slots import tree_slots_of
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_unified_bundle,
+    pin_every_band,
     setup_allocator_context,
 )
 
@@ -105,10 +107,10 @@ class HostModel(msgspec.Struct, kw_only=True):
     cached: int = 0
 
 
-class CompositeAdapter:
-    """The adapter for the composite allocators the unified pool builder builds."""
+class BuilderAdapter:
+    """The adapter for the allocator the unified pool builder builds."""
 
-    name = "composite"
+    name = "builder"
 
     def __init__(self, config: TraceConfig):
         setup_allocator_context()
@@ -118,7 +120,7 @@ class CompositeAdapter:
         self.bundle = build_unified_bundle(trace_geometry(config))
         self.allocator = self.bundle.token_to_kv_pool_allocator
         self.state_allocator = (
-            self.bundle.req_to_token_pool.mamba_allocator
+            self.bundle.token_to_kv_pool_allocator.state_slots
             if config.chain in STATE_CHAINS
             else None
         )
@@ -126,7 +128,7 @@ class CompositeAdapter:
         self.events: List[FakeEvent] = []
         self.tree = self._build_tree() if config.chain == "swa" else None
         if config.lazy:
-            self.allocator.set_disagg_move_gate(lambda: self.gate_open)
+            pin_every_band(self.allocator, lambda: not self.gate_open)
 
     def _build_tree(self) -> UnifiedRadixCache:
         return UnifiedRadixCache(
@@ -141,7 +143,9 @@ class CompositeAdapter:
                 token_to_kv_pool_allocator=self.allocator,
                 page_size=self.page_size,
                 sliding_window_size=32,
-                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                tree_slots=tree_slots_of(
+                    (ComponentType.FULL, ComponentType.SWA), window=32
+                ),
             )
         )
 
@@ -274,8 +278,8 @@ class CompositeAdapter:
         out: Dict[str, object] = {}
         for m in self.members():
             p = m.sub_pool_name
-            out[f"{p}.v2p"] = m.virtual_to_physical.tolist()
-            out[f"{p}.p2v"] = m.physical_to_virtual.tolist()
+            out[f"{p}.v2p"] = m.ids.virtual_to_physical.tolist()
+            out[f"{p}.p2v"] = m.ids.physical_to_virtual.tolist()
             if m.grow_direction == "float":
                 out[f"{p}.edges"] = [m.low_wm_page, m.high_wm_page]
             else:
@@ -300,7 +304,7 @@ class CompositeAdapter:
 
 
 ADAPTERS: Dict[str, Callable[[TraceConfig], object]] = {
-    CompositeAdapter.name: CompositeAdapter
+    BuilderAdapter.name: BuilderAdapter
 }
 
 
@@ -508,7 +512,7 @@ def record_run(
     seed: Optional[int] = None,
     ops: Optional[List[dict]] = None,
     steps: int = 200,
-    adapter_name: str = CompositeAdapter.name,
+    adapter_name: str = BuilderAdapter.name,
     full: bool = False,
     coverage: Optional[collections.Counter] = None,
 ) -> List[dict]:
@@ -561,7 +565,7 @@ def replay_run(
     config: TraceConfig,
     records: List[dict],
     *,
-    adapter_name: str = CompositeAdapter.name,
+    adapter_name: str = BuilderAdapter.name,
     full: bool = False,
 ) -> Optional[Divergence]:
     """Replay recorded operations on an adapter; the first step whose outcome

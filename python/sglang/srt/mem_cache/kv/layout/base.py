@@ -23,6 +23,21 @@ def _check_row_alignment(sub_pool: str, **row_bytes: int) -> None:
             )
 
 
+def check_physical_id_bound(*, sub_pool: str, n_rows: int) -> None:
+    """Physical ids must fit the int32 read-index buffers."""
+    assert n_rows < 2**31, (
+        f"sub-pool {sub_pool!r}: {n_rows} physical ids exceed the int32 "
+        f"bound (2^31) that read-index buffers assume. "
+        "Reduce max_total_num_tokens."
+    )
+
+
+def dense_rows(arena, name: str) -> int:
+    """Token rows a dense view of band ``name`` spans: whole units only."""
+    unit = arena.band(name).unit_entries
+    return arena.extent_entries(name) // unit * unit
+
+
 def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:
     if kv_cache_dtype in (
         torch.float8_e5m2,
@@ -35,7 +50,7 @@ def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:
 
 @dataclass(frozen=True, kw_only=True)
 class SubPoolSpec(ABC):
-    """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`.
+    """Abstract per-slot layout of one sub-pool's band in a `KVArena`.
 
     ``grow_direction`` places the sub-pool in the buffer's chain: the two
     ``"up"``/``"down"`` END pools own the buffer's two ends and grow inward;
@@ -47,6 +62,10 @@ class SubPoolSpec(ABC):
     # Grow directions this subclass accepts. Scratch-class specs (e.g. the
     # spec-decode band) narrow this to ("float",).
     _allowed_grow_directions: ClassVar[Tuple[str, ...]] = ("up", "down", "float")
+    # Whether units of this layout are zeroed when handed out: readers that load
+    # whole pages give rows past the sequence a zero weight, so a NaN left there
+    # by another band's bytes would still reach the output.
+    zero_units_on_handout: ClassVar[bool] = False
 
     name: str
     layer_num: int
