@@ -328,7 +328,31 @@ __all__ = [
     "gelu_tanh_and_mul",
     "relu2",
     "gelu_quick",
+    "bf16_gelu_tanh_mul_lut",
 ]
+
+
+register_kernel(
+    KernelSpec(
+        op="activation.bf16_gelu_tanh_mul_lut",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.xpu_gelu_tanh_mul_lut:bf16_gelu_tanh_mul_lut",
+        capabilities=frozenset({CapabilityRequirement.XPU}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="BF16 gated activation using a caller-owned native GELU table",
+        ),
+    )
+)
+
+
+def bf16_gelu_tanh_mul_lut(input: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    """Exact native BF16 gated activation with a prebuilt caller-owned table."""
+    from sglang.kernels.ops.activation.xpu_gelu_tanh_mul_lut import (
+        bf16_gelu_tanh_mul_lut as implementation,
+    )
+
+    return implementation(input, table)
 
 
 # Triton kernel migrated into this group (from layers/triton_ops/softcap);
