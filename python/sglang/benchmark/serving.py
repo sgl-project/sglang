@@ -1129,6 +1129,27 @@ async def get_request(
             await asyncio.sleep(interval)
 
 
+def _peak_request_concurrency(outputs: List[RequestFuncOutput]) -> int:
+    events: Dict[float, int] = {}
+    for output in outputs:
+        if not output.success:
+            continue
+        start = output.start_time
+        end = start + output.latency
+        # Half-open [start, end) intervals occupy no time when end <= start.
+        if end <= start:
+            continue
+        events[start] = events.get(start, 0) + 1
+        events[end] = events.get(end, 0) - 1
+
+    active = peak = 0
+    # Combine simultaneous departures and arrivals to avoid boundary overlaps.
+    for timestamp in sorted(events):
+        active += events[timestamp]
+        peak = max(peak, active)
+    return peak
+
+
 def calculate_metrics(
     input_requests: Optional[List[DatasetRow]],
     outputs: List[RequestFuncOutput],
@@ -1198,7 +1219,7 @@ def calculate_metrics(
         )
 
     max_output_tokens_per_s = 0.0
-    max_concurrent_requests = 0
+    max_concurrent_requests = _peak_request_concurrency(outputs)
 
     successful_outputs = [output for output in outputs if output.success]
     if successful_outputs:
@@ -1238,7 +1259,6 @@ def calculate_metrics(
 
         if len(tokens_per_second) > 0:
             max_output_tokens_per_s = float(np.max(tokens_per_second))
-            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
 
         if plot_throughput:
             if TERM_PLOTLIB_AVAILABLE:
@@ -1254,7 +1274,7 @@ def calculate_metrics(
                 fig.plot(
                     np.arange(len(concurrent_requests_per_second)),
                     concurrent_requests_per_second,
-                    title="Concurrent requests per second",
+                    title="Requests active during each second",
                     xlabel="Time (s)",
                 )
                 fig.show()
