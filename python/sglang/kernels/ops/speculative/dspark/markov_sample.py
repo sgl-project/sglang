@@ -307,6 +307,7 @@ def _markov_bias_partial_kernel(
         tl.store(out, maximum, has_row)
         tl.store(out + 1, idx.to(tl.float32, bitcast=True), has_row)
 
+
 def _mul32(a: torch.Tensor, b: int) -> tuple[torch.Tensor, torch.Tensor]:
     # (high, low) 32-bit words of a * b; b splits in halves so int64 never overflows.
     product_lo = a * (b & 0xFFFF)

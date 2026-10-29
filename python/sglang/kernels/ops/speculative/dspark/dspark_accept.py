@@ -838,7 +838,9 @@ def _finalize_accept_lens_kernel(
         out_dtype = correct_len_out_ptr.dtype.element_ty
         tl.store(correct_len_out_ptr + offs, correct.to(out_dtype), mask=mask)
         bonus = tl.load(bonus_ptr + offs, mask=mask, other=0)
-        tl.store(bonus_out_ptr + offs, bonus.to(bonus_out_ptr.dtype.element_ty), mask=mask)
+        tl.store(
+            bonus_out_ptr + offs, bonus.to(bonus_out_ptr.dtype.element_ty), mask=mask
+        )
 
 
 def finalize_accept_lens_triton(

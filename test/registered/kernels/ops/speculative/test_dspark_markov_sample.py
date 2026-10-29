@@ -281,7 +281,6 @@ class TestMarkovSampleStep(CustomTestCase):
                 self.assertTrue(torch.equal(tokens, full))
                 self.assertTrue(torch.equal(logits_out, full_logits))
 
-
     def test_bias_gemv_matches_its_materialized_bias(self):
         # Integer weights keep the GEMV exact in any summation order, so the
         # fused bias is bit for bit the one F.linear materializes.
