@@ -101,6 +101,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
+from sglang.srt.utils.common import async_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -1579,6 +1580,26 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
 
+        sender = req.disagg_kv_sender
+        # The schedule stream may wait on the in-flight forward. A sender that takes
+        # host-tensor indices waits on their copy's event itself, so the scheduler
+        # never blocks on these device reads.
+        host_indices = getattr(sender, "supports_host_tensor_indices", False) and not (
+            sender.kv_mgr.enable_all_cp_ranks_for_transfer
+            and not get_parallel().enable_dsa_cache_layer_split
+        )
+
+        def page_indices_of(kv_indices: torch.Tensor):
+            if not host_indices:
+                return kv_to_page_indices(kv_indices, page_size)
+            return async_d2h(kv_indices[::page_size] // page_size)
+
+        def state_page_indices(kv_indices: torch.Tensor) -> np.ndarray:
+            # State rides the last segment's send, whose indices_event is
+            # recorded behind this copy on the same stream.
+            page_indices = page_indices_of(kv_indices)
+            return page_indices.numpy() if host_indices else page_indices
+
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -1633,13 +1654,13 @@ class SchedulerDisaggregationPrefillMixin:
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                return state_page_indices(window_kv_indices_swa)
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, :seq_len
                 ]
-                return kv_to_page_indices(kv_indices_full, page_size)
+                return state_page_indices(kv_indices_full)
 
             def _minimax_payload():
                 return minimax_index_transfer_pages(
@@ -1765,26 +1786,11 @@ class SchedulerDisaggregationPrefillMixin:
                     raw_kv_indices
                 )
             )
-            sender = req.disagg_kv_sender
+            page_indices = page_indices_of(kv_indices)
             indices_event = None
-            if getattr(sender, "supports_host_tensor_indices", False) and not (
-                sender.kv_mgr.enable_all_cp_ranks_for_transfer
-                and not get_parallel().enable_dsa_cache_layer_split
-            ):
-                # The schedule stream may wait on the in-flight forward; move the
-                # D2H wait to the transfer worker so scheduling can continue.
-                page_indices_dev = kv_indices[::page_size] // page_size
-                page_indices = torch.empty(
-                    page_indices_dev.shape,
-                    dtype=page_indices_dev.dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                page_indices.copy_(page_indices_dev, non_blocking=True)
+            if host_indices:
                 indices_event = self.device_module.Event()
                 indices_event.record(self.device_module.current_stream())
-            else:
-                page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
