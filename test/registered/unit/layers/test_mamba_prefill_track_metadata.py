@@ -216,9 +216,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                     lengths, [0, 3][: len(lengths)], [100, 200], mode
                 )
                 if mode == ForwardMode.TARGET_VERIFY:
-                    batch.spec_info = SimpleNamespace(
-                        ragged_verify_layout=None, draft_token_num=3
-                    )
+                    batch.spec_info = SimpleNamespace(draft_token_num=3)
                 with patch.object(
                     torch.Tensor,
                     "__int__",

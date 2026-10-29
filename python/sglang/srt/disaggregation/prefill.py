@@ -25,7 +25,7 @@ import time
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -100,7 +100,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, rank_consensus_checker
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -1154,11 +1154,13 @@ class SchedulerDisaggregationPrefillMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_inflight_queue(
-        self: Scheduler, rids_to_check: Optional[List[str]] = None
+        self: Scheduler, rids_to_check: Optional[Dict[str, bool]] = None
     ) -> List[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
-        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
+        rids_to_check: For PP, the PP consensus of concluded transfers as {rid: failed}.
+        Only these rids are concluded, and a rid failed on any stage is concluded as
+        failed on every stage, whatever this stage's own sender reports.
         """
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
@@ -1193,6 +1195,15 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     undone_reqs.append(req)
                     continue
+                # Conclude with the stage-consensus outcome: another stage may have
+                # failed this transfer (e.g. aborted after this stage finished).
+                if rids_to_check[req.rid]:
+                    poll = KVPoll.Failed
+                rank_consensus_checker.assert_same(
+                    "pp disagg prefill transfer concluded rid=%s failed=%s",
+                    req.rid,
+                    poll == KVPoll.Failed,
+                )
 
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
@@ -1498,7 +1509,7 @@ class SchedulerDisaggregationPrefillMixin:
         # event now so the transfer worker can wait on those writes before the
         # RDMA read, instead of racing them.
         if self.enable_overlap:
-            ev = torch.cuda.Event()
+            ev = self.device_module.Event()
             ev.record(self.forward_stream)
             req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
@@ -1770,8 +1781,8 @@ class SchedulerDisaggregationPrefillMixin:
                     pin_memory=True,
                 )
                 page_indices.copy_(page_indices_dev, non_blocking=True)
-                indices_event = torch.cuda.Event()
-                indices_event.record(torch.cuda.current_stream())
+                indices_event = self.device_module.Event()
+                indices_event.record(self.device_module.current_stream())
             else:
                 page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
