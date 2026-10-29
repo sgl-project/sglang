@@ -563,8 +563,28 @@ def _check_dsa_backend_constraints(
         raise ValueError(
             f"The {'/'.join(sorted(rocm_only))} DSA backend is only supported on "
             "ROCm/HIP. Pick an alternative DSA backend for CUDA "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+            "(flashmla_kv on Hopper, trtllm on SM10.x Blackwell)."
         )
+
+    # trtllm is the auto-selected FP8 default on every SM >= 10, so this also
+    # covers a launch with no DSA flags at all on SM11x/SM12x. The accepted set
+    # is flashinfer's own dispatch condition in
+    # _resolve_dsv4_sparse_mla_backend (flashinfer/mla/_core.py), so anything
+    # flashinfer would refuse is refused here instead of at the first forward;
+    # move it when the flashinfer pin moves.
+    if not hip and "trtllm" in chosen:
+        import torch
+
+        major, minor = torch.cuda.get_device_capability()
+        if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
+            raise ValueError(
+                "The trtllm DSA backend dispatches flashinfer's TRT-LLM-GEN MLA "
+                "kernels, which flashinfer builds for SM100/SM103/SM107 only; "
+                f"this device is SM{major}{minor}, where that dispatch answers "
+                '"requires SM100/SM103/SM107" mid-forward. GlmMoeDsa with FP8 '
+                "KV is resolved to flashinfer_sparse_mla on this device; other "
+                "DSA models have no validated CUDA backend here yet."
+            )
 
     if hip and dcp_size > 1:
         no_dcp_path = chosen - {"triton", None}
