@@ -126,21 +126,9 @@ class AscendKVManager(MooncakeKVManager):
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         # Empty KV views retain layer positions in PD metadata but have no
-        # registered memory. MemFabric rejects their null addresses in a batch.
+        # registered memory to transfer.
         transfer_blocks = [block for block in transfer_blocks if block[2] != 0]
         return super()._transfer_data(mooncake_session_id, transfer_blocks)
-
-    def _registerable_regions(self) -> List[Tuple[int, int]]:
-        # MemFabric aligns registered buffers to 2 MiB. Register everything in
-        # one batch so overlapping aligned ranges from small tensors are merged
-        # before they are published to the peer.
-        regions = super()._registerable_regions()
-        for ptr, length in regions:
-            if ptr <= 0 or length < 0:
-                raise ValueError(
-                    f"Invalid Ascend PD memory region: ptr={ptr}, length={length}"
-                )
-        return regions
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self._is_npu_dsa_layout() and self.dcp_size != dst_dcp_size:
