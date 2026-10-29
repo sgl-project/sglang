@@ -94,7 +94,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             and not envs.SGLANG_ENABLE_CUDA_GRAPH_DEDUP.get()
         ):
             self._hicache_graph_events = HiCacheGraphEvents(
-                self._model_runner.req_to_token_pool
+                self._model_runner.token_to_kv_pool
             )
         self._shared_output_buffer: Optional[Any] = None
         self._precarve = GraphPoolPrecarve()
@@ -299,7 +299,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         if self._enable_hicache_event_capture and self._hicache_graph_events is None:
-            wait_for_layer_loads(self._model_runner.req_to_token_pool)
+            wait_for_layer_loads(self._model_runner.token_to_kv_pool)
         with graph_pool_replay_scope():
             self._graphs[shape_key].replay()
         return self._outputs[shape_key]

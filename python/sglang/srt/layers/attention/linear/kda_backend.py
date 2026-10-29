@@ -492,9 +492,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
         # Mamba2/GDN's [dim, kernel-1] — so expose the transposed shape here.
         self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
-            .transpose(-1, -2)
-            .shape
+            self.state_pool.mamba_cache.conv[0].transpose(-1, -2).shape
         )
         backends = model_runner.linear_attn_backends
         decode_backend = backends.decode
@@ -776,7 +774,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
@@ -1054,7 +1052,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if forward_batch.forward_mode.is_target_verify():
             physical_num_tokens = mixed_qkv.shape[0]
             logical_num_tokens = physical_num_tokens
-            if forward_batch.spec_info.ragged_verify_layout is None:
+            if forward_batch.ragged_verify_layout is None:
                 # MoE may append token padding that is not a complete verify
                 # sequence. Keep it out of convolution and state updates.
                 logical_num_tokens = (
@@ -1082,7 +1080,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
 
             capture_layer_wait(layer.layer_id)
-            layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+            layer_cache = self.state_layer_cache(layer.layer_id)
             return kda_extend_in_graph(
                 layer=layer,
                 meta=self.prefill_graph_metadata,
@@ -1097,7 +1095,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        mamba_cache_params = self.state_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
 
         ssm_states = mamba_cache_params.temporal
@@ -1262,7 +1260,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         retrieve_next_sibling = fm.retrieve_next_sibling
         retrieve_parent_token = fm.retrieve_parent_token
 
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        mamba_cache_params = self.state_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         intermediate_state_cache = getattr(mamba_cache_params, "intermediate_ssm", None)
@@ -1306,7 +1304,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
-        ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        ragged_layout = forward_batch.ragged_verify_layout
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,

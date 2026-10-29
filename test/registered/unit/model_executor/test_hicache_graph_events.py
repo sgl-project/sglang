@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import sglang.srt.model_executor.runner_backend_utils.hicache_graph_events as events
+from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     breakable_cuda_graph as bcg,
 )
@@ -46,8 +47,15 @@ class TestHiCacheGraphEvents(unittest.TestCase):
                 for s in range(3)
             ],
         )
-        self.pool = SimpleNamespace(
-            mamba_map={4: 0, 8: 1}, start_layer=4, layer_transfer_counter=self.counter
+        self.pool = SimpleNamespace(start_layer=4, layer_transfer_counter=self.counter)
+        self.pool.layer_router = KVLayerRouter(
+            self.pool, sub_pools=(), views={}, layers={}
+        )
+        self.pool.layer_router.bind_part(
+            sub_pool="mamba",
+            part=STATE_PART,
+            view=object(),
+            indices={8: 0, 4: 1},
         )
         self.owner = events.HiCacheGraphEvents(self.pool)
         self.graphs = [
@@ -91,6 +99,16 @@ class TestHiCacheGraphEvents(unittest.TestCase):
             self.rt.cudaGraphExecEventWaitNodeSetEvent.call_args_list[-2:],
             [call(20, 30, 100), call(21, 31, 101)],
         )
+
+    def test_graph_wait_uses_the_same_transfer_layer_as_router_reads(self):
+        self.counter.consumer_index = 1
+        self.counter.wait_until = Mock()
+        self.pool.layer_router.load_parts_layer_wise()
+        self.pool.layer_router.read(8, STATE_PART)
+        self.counter.wait_until.assert_called_once_with(4)
+
+        self.owner.bind(self.graphs, self.bindings)
+        self.assertEqual(self.bindings[1][0].event_handle, 1014)
 
     def test_wait_is_scoped_to_capture(self):
         with patch.object(

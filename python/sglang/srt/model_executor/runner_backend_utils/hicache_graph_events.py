@@ -14,13 +14,14 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
     rt,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from sglang.srt.mem_cache.memory_pool import KVCache
 
 _capture: ContextVar[HiCacheGraphEvents | None] = ContextVar(
     "hicache_graph_events", default=None
@@ -42,7 +43,7 @@ def capture_layer_wait(layer: int) -> None:
     owner.ready_events[layer].wait()
 
 
-def wait_for_layer_loads(pool: HybridReqToTokenPool) -> None:
+def wait_for_layer_loads(pool: KVCache) -> None:
     """Conservative fallback when graph nodes cannot use live CUDA events."""
     counter = pool.layer_transfer_counter
     if counter is None or counter.consumer_index < 0:
@@ -53,10 +54,11 @@ def wait_for_layer_loads(pool: HybridReqToTokenPool) -> None:
 
 
 class HiCacheGraphEvents:
-    def __init__(self, pool: HybridReqToTokenPool) -> None:
+    def __init__(self, pool: KVCache) -> None:
         self.pool = pool
         self.ready_events = {
-            layer: torch.cuda.Event(external=True) for layer in sorted(pool.mamba_map)
+            layer: torch.cuda.Event(external=True)
+            for layer in sorted(pool.layer_router.part_indices(STATE_PART))
         }
         for event in self.ready_events.values():
             event.record()
