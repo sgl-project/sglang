@@ -1,7 +1,7 @@
 from sglang.srt.runtime_context import get_context, get_observability, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import math
 import queue
@@ -170,6 +170,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
         for algorithm in (
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DFLASH,
             SpeculativeAlgorithm.DSPARK,
         ):
             with self.subTest(algorithm=algorithm):

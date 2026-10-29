@@ -26,6 +26,7 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_deepep_mode,
     get_moe_a2a_backend,
+    get_moe_ascend_ops_config,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.kt_ep_wrapper import (
@@ -33,9 +34,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
-from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-    AscendTPDispatcher,
-)
+from sglang.srt.layers.moe.token_dispatcher.ascend_ops import AscendOpsDispatcher
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
@@ -172,14 +171,38 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
+def _validate_ascend_no_a2a_layout(moe_runner_config: MoeRunnerConfig) -> None:
+    """Reject the one layout the Ascend no-A2A routing cannot express.
+
+    The routing op indexes the checkpoint's full expert space, and the grouped
+    matmuls consume that same range, so every rank must hold all experts.
+    With ``ep_size > 1`` the community dispatcher rewrites the top-k ids to
+    rank-local ones while the Ascend kernels would still index the global
+    range; route that configuration to a backend that implements EP instead of
+    silently mismatching experts.
+    """
+    if get_parallel().dwdp_size > 1:
+        # DWDP collapses the EP view onto full weights after construction.
+        return
+    if moe_runner_config.num_local_experts == moe_runner_config.num_experts:
+        return
+    raise ValueError(
+        "Expert parallelism (ep_size > 1) is not supported on Ascend NPU with "
+        "--moe-a2a-backend none: that path runs the Ascend routing over the "
+        "full expert range on every rank, but this layer holds "
+        f"{moe_runner_config.num_local_experts} of "
+        f"{moe_runner_config.num_experts} experts. Use "
+        "--moe-a2a-backend deepep (or ascend_fuseep) for EP on NPU, or keep "
+        "ep_size=1."
+    )
+
+
 def create_moe_dispatcher(
     moe_runner_config: MoeRunnerConfig,
     quant_method: FusedMoEMethodBase,
 ) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none() and is_npu():
-        return AscendTPDispatcher(moe_runner_config)
-    elif (
+    if (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
         or a2a_backend.is_flashinfer_megamoe()
@@ -190,6 +213,12 @@ def create_moe_dispatcher(
         # StandardDispatcher is created but never invoked.
         # flashinfer_megamoe does its EP all-to-all inside the kernel, so the
         # dispatcher stays a pure noop passthrough.
+        # On NPU the no-A2A path is this same dispatcher: the Ascend routing
+        # (expert permutation with fused activation quantization, and the
+        # weighted unpermute) runs in the MoE runner's permute hooks, see
+        # moe_runner/ascend.py.
+        if _is_npu and a2a_backend.is_none():
+            _validate_ascend_no_a2a_layout(moe_runner_config)
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()
@@ -229,6 +258,8 @@ def create_moe_dispatcher(
                 else 128
             ),
         )
+    elif a2a_backend.is_ascend_ops():
+        return AscendOpsDispatcher(moe_runner_config, get_moe_ascend_ops_config())
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_parallel().tp_group.device_group,
@@ -349,6 +380,7 @@ class FusedMoE(torch.nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        serves_fused_mxfp4: bool = True,
         prefix: str = "",
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
@@ -374,6 +406,10 @@ class FusedMoE(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
 
         self.params_dtype = params_dtype
+        # False for a model whose loader keeps compressed-tensors' `weight_packed`
+        # expert names; Mxfp4MoEMethod's fused `w13_weight`/`w2_weight` cannot
+        # serve those, so such a model routes to a compressed-tensors MoE scheme.
+        self.serves_fused_mxfp4 = serves_fused_mxfp4
         self.layer_name = prefix
         self.layer_id = layer_id
         self.is_draft = get_flags().moe.in_speculative_scope
@@ -831,11 +867,15 @@ class FusedMoE(torch.nn.Module):
         if self.use_padded_loading:
             if _is_cpu and is_bias:
                 shard_dim = 1
+            weight_start = shard_size * self.moe_tp_rank
+            # Pre-sharded CPU weights are rank-local; do not apply the TP offset again.
+            if _is_cpu and self.use_presharded_weights:
+                weight_start = 0
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
                 start,
-                shard_size * self.moe_tp_rank,
+                weight_start,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -922,11 +962,15 @@ class FusedMoE(torch.nn.Module):
         if self.use_padded_loading:
             if _is_cpu and is_bias:
                 shard_dim = 1
+            weight_start = shard_size * self.moe_tp_rank
+            # Pre-sharded CPU weights are rank-local; do not apply the TP offset again.
+            if _is_cpu and self.use_presharded_weights:
+                weight_start = 0
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
                 0,  # param_data_start
-                shard_size * self.moe_tp_rank,
+                weight_start,
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -1152,6 +1196,11 @@ class FusedMoE(torch.nn.Module):
         else:
             return -1
 
+    def _local_routed_expert_ids(self, physical_expert_ids: List[int]) -> List[int]:
+        start_idx = self._expert_storage_rank * self._num_local_routed
+        end_idx = start_idx + self._num_local_routed
+        return [i for i in physical_expert_ids if start_idx <= i < end_idx]
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -1219,6 +1268,10 @@ class FusedMoE(torch.nn.Module):
                     self.layer_id, expert_id, require_global_experts
                 )
             )
+            if not require_global_experts:
+                # Before the local mapping: after an elastic EP scale-up, another rank's
+                # routed slot can lie past _num_global_routed and map to the shared slot.
+                physical_expert_ids = self._local_routed_expert_ids(physical_expert_ids)
 
         for physical_expert_id in physical_expert_ids:
             self._weight_loader_physical(
