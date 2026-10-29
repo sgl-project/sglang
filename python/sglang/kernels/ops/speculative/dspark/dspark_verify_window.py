@@ -760,9 +760,11 @@ class BuildOutTokens:
         gamma: int,
     ) -> torch.Tensor:
         if _is_npu:
-            from sgl_kernel_npu.operators.sample import build_out_tokens_triton
+            from sgl_kernel_npu.operators.sample import (
+                build_out_tokens_triton as npu_build_out_tokens_triton,
+            )
 
-            return build_out_tokens_triton(
+            return npu_build_out_tokens_triton(
                 draft_tokens=draft_tokens,
                 correct_len=correct_len,
                 bonus=bonus,

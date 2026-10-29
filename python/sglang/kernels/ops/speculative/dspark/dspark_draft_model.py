@@ -72,9 +72,11 @@ class MarkovGreedyStep:
         w2_weight: torch.Tensor,
     ) -> torch.Tensor:
         if _is_npu:
-            from sgl_kernel_npu.operators.sample import markov_greedy_step_triton
+            from sgl_kernel_npu.operators.sample import (
+                markov_greedy_step_triton as npu_markov_greedy_step_triton,
+            )
 
-            return markov_greedy_step_triton(
+            return npu_markov_greedy_step_triton(
                 base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
             )
         return markov_greedy_step_triton(
