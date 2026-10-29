@@ -17,6 +17,7 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
+    RequestOutputHeader,
     msgpack_decode,
     msgpack_encode,
     unwrap_from_pickle,
@@ -591,12 +592,12 @@ def _metered_req():
     return req
 
 
-def _streamer(outputs, enable_hicache_storage=lambda: False):
+def _streamer(outputs, enable_hicache_storage=lambda: False, is_generation=True):
     return SchedulerOutputStreamer(
         send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
         tree_cache=None,
         server_args=SimpleNamespace(enable_lmcache=False),
-        is_generation=True,
+        is_generation=is_generation,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         disaggregation_mode=DisaggregationMode.NULL,
         enable_hicache_storage=enable_hicache_storage,
@@ -669,6 +670,28 @@ class TestOutputStreamerRequestHeader(unittest.TestCase):
         [finished] = output(finished=True)
         self.assertEqual(finished.retraction_count, 1)
         self.assertEqual(finished.time_stats.queue_time, 0.5)
+
+    def test_embedding_rows_carry_their_header(self):
+        """An embedding request is output once, finished, and its row carries
+        its header; embedding outputs carry no time stats even with metrics on."""
+        self._set_metrics(True)
+        outputs = []
+        streamer = _streamer(outputs, is_generation=False)
+        req = _metered_req()
+        req.cached_tokens = 2
+        req.retraction_count = 1
+        req.embedding = [0.5]
+        req.finished_reason = FINISH_LENGTH(length=1)
+
+        streamer.stream_output([req], False)
+
+        [header] = outputs[-1].request_headers
+        self.assertIsInstance(header, RequestOutputHeader)
+        self.assertEqual(
+            (header.prompt_tokens, header.cached_tokens, header.retraction_count),
+            (3, 2, 1),
+        )
+        self.assertIsNone(header.time_stats)
 
     def test_finished_output_carries_current_header(self):
         """A finished output carries the request's current header even when a
