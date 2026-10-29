@@ -1053,19 +1053,20 @@ class ExecOverlap(msgspec.Struct):
     ] = False
     tbo_admission_policy: A[
         Literal["always", "threshold"],
-        "Per-step TBO admission policy. `always` preserves current behavior.",
+        "TBO admission when --enable-two-batch-overlap is set. `always` keeps current "
+        "behavior; `threshold` falls back to a normal forward when the limits below are not met.",
     ] = "always"
     tbo_prefill_token_threshold: A[
         int,
-        "Minimum prefill tokens for threshold-based TBO admission.",
+        "Under `threshold` policy, minimum extend tokens per DP rank to run TBO.",
     ] = 0
     tbo_decode_token_threshold: A[
         int,
-        "Minimum decode or verify tokens for threshold-based TBO admission.",
+        "Under `threshold` policy, minimum decode/verify tokens per DP rank to run TBO.",
     ] = 0
     tbo_min_child_tokens: A[
         int,
-        "Minimum real tokens required in each TBO child.",
+        "Under `threshold` policy, minimum real tokens in each TBO child; empty children are always rejected.",
     ] = 0
     tbo_token_distribution_threshold: A[
         float,
