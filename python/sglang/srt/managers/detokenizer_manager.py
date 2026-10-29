@@ -263,7 +263,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         bs = len(recv_obj.rids)
         vocab_size = self.vocab_size
 
-        # Initialize decode status
+        # Start or extend each row's state and collect its decode ids.
         read_ids, surr_ids = [], []
         for i in range(bs):
             s = self.detokenize_state_table.start_or_extend(
