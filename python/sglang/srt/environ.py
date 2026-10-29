@@ -1770,6 +1770,9 @@ class Envs:
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
+    # Retry a chat turn that finished with no visible text and no tool call
+    # once with thinking disabled. Set to 1 to return the empty answer instead.
+    SGLANG_DISABLE_EMPTY_TURN_REPAIR = EnvBool(False)
 
     # ===================================================================
     # Encoder pipeline and disaggregation
