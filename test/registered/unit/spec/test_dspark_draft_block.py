@@ -2,8 +2,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
 import torch
 
+from sglang.srt.kernel_plugins.nvidia import dspark_binding
 from sglang.srt.models.dspark import (
     GatedMarkovHead,
     Nemotron35VanillaMarkov,
@@ -147,9 +149,9 @@ def _folded_draft_model():
 def _build(model, *, greedy_draft, factory=None, agree=None):
     """maybe_build_draft_sampler, with factory as the megakernel's draft sampler."""
     with (
-        patch.object(ds, "megakernel_draft_sampler", return_value=factory),
-        patch.object(ds, "megakernel_agree", agree or Mock()),
-        patch.object(ds, "get_dp_tp_group", return_value="draft tp group"),
+        patch.object(dspark_binding, "megakernel_draft_sampler", return_value=factory),
+        patch.object(dspark_binding, "megakernel_agree", agree or Mock()),
+        patch.object(dspark_binding, "get_dp_tp_group", return_value="draft tp group"),
     ):
         return ds.maybe_build_draft_sampler(
             draft_model=model,
@@ -164,6 +166,15 @@ def _build(model, *, greedy_draft, factory=None, agree=None):
 
 
 class TestMegakernelDraftSampler(CustomTestCase):
+    def test_bound_strategy_is_a_frozen_struct(self):
+        fields = msgspec.structs.fields(dspark_binding.BoundDsparkDraftStrategy)
+        self.assertEqual(
+            tuple(field.name for field in fields), ("strategy", "step_logits")
+        )
+        self.assertTrue(
+            dspark_binding.BoundDsparkDraftStrategy.__struct_config__.frozen
+        )
+
     def test_the_megakernel_step_runs_only_on_the_batch_sizes_every_rank_serves(self):
         """A served batch size runs the megakernel's step in place of the base
         logits and the Markov block, writing SGLang's buffers; every other size runs
@@ -198,6 +209,17 @@ class TestMegakernelDraftSampler(CustomTestCase):
             sampler(torch.ones(BS * GAMMA, HIDDEN), input_ids)
         stock.assert_called_once()
         self.assertTrue(sampler.out[: BS * GAMMA].eq(7).all())
+
+    def test_absent_provider_uses_the_always_present_stock_strategy(self):
+        tokens = torch.full((BS, GAMMA), 11)
+        input_ids = torch.arange(BS * GAMMA)
+        with patch.object(
+            ds, "draft_markov_block", return_value=(tokens, None)
+        ) as stock:
+            sampler = _build(_folded_draft_model(), greedy_draft=True)
+            sampler(torch.ones(BS * GAMMA, HIDDEN), input_ids)
+        stock.assert_called_once()
+        self.assertTrue(sampler.out[: BS * GAMMA].eq(11).all())
 
 
 class TestDraftParamsRestage(CustomTestCase):
