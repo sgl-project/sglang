@@ -35,6 +35,11 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The token IDs for text; one can specify either text or input_ids.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>mm_token_expansion_start_len</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Union[List[int], int] = 0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Length of the already-expanded prefix of `input_ids`, e.g. earlier turns of a multi-turn RL rollout; only multimodal placeholders after it are expanded, and the request must still carry the prefix's media. Requires `--enable-token-space-processor`. Must be in `[0, len(input_ids)]`.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>input_embeds</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[Union[List[List[List[float]]], List[List[float]]]] = None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The embeddings for input_ids; one can specify either text, input_ids, or input_embeds.</td>
