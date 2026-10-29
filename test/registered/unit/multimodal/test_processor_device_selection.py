@@ -116,6 +116,59 @@ class TestFastImageProcessorDevice(CustomTestCase):
                 )
 
 
+class TestSeveralTokenizerWorkers(CustomTestCase):
+    """Several tokenizer workers preprocess on the CPU: on the GPU each would
+    open its own CUDA context next to the scheduler's memory pool (CUDA out of
+    memory under concurrent image requests)."""
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def _processor(self, tokenizer_worker_num):
+        from transformers import BaseImageProcessor
+
+        processor = _make(base_gpu_id=3, tokenizer_worker_num=tokenizer_worker_num)
+        processor.disable_fast_image_processor = False
+        processor._processor = SimpleNamespace(image_processor=BaseImageProcessor())
+        return processor
+
+    def _cuda(self, nvidia=True):
+        platforms = SimpleNamespace(
+            current_platform=SimpleNamespace(
+                is_cuda_alike=lambda: True, device_type="cuda"
+            )
+        )
+        return patch.multiple(
+            BASE,
+            platforms=platforms,
+            _is_cpu=False,
+            _is_cuda=nvidia,
+            _is_xpu=False,
+            _is_npu=False,
+        )
+
+    def test_device_is_left_unset(self):
+        with self._cuda():
+            one = self._processor(1)._fast_image_processor_device(_Processor())
+            several = self._processor(8)._fast_image_processor_device(_Processor())
+        self.assertEqual(one, "cuda:3")
+        self.assertIsNone(several)
+
+    def test_other_cuda_alike_devices_keep_the_gpu_placement(self):
+        # e.g. ROCm: only validated on NVIDIA GPUs, so unchanged elsewhere.
+        with self._cuda(nvidia=False):
+            several = self._processor(8)._fast_image_processor_device(_Processor())
+        self.assertEqual(several, "cuda:3")
+
+    def test_preprocessing_no_longer_competes_with_the_scheduler(self):
+        with self._cuda():
+            one = self._processor(1)._preprocessing_competes_with_the_scheduler()
+            several = self._processor(8)._preprocessing_competes_with_the_scheduler()
+        self.assertTrue(one)
+        self.assertFalse(several)
+
+
 class TestFastImageProcessorMemoryPool(CustomTestCase):
     def setUp(self):
         reset_context()

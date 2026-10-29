@@ -56,6 +56,7 @@ from sglang.srt.utils import (
     configure_media_url_security,
     envs,
     is_cpu,
+    is_cuda,
     is_npu,
     is_xpu,
     load_audio,
@@ -66,6 +67,7 @@ from sglang.srt.utils import (
 )
 
 _is_cpu = is_cpu()
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
@@ -755,6 +757,18 @@ class BaseMultimodalProcessor(ABC):
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
+    def _many_tokenizer_workers(self) -> bool:
+        """Whether several tokenizer worker processes each run this processor.
+
+        Each worker that ran the fast image processor on the GPU would open its
+        own CUDA context next to the scheduler's static memory pool; with 16
+        workers on a 32 GB GPU image requests then fail with CUDA out-of-memory
+        or "device busy" errors. Those workers preprocess on the CPU instead,
+        where they are also real parallelism. Validated on NVIDIA GPUs only;
+        other devices keep their placement.
+        """
+        return _is_cuda and getattr(self.server_args, "tokenizer_worker_num", 1) > 1
+
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
         """Whether image preprocessing contends with the serving accelerator.
 
@@ -764,7 +778,7 @@ class BaseMultimodalProcessor(ABC):
         """
         if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return False
-        if self.disable_fast_image_processor:
+        if self.disable_fast_image_processor or self._many_tokenizer_workers():
             return False
         image_processor = getattr(self._processor, "image_processor", None)
         if not isinstance(image_processor, BaseImageProcessor):
@@ -809,7 +823,7 @@ class BaseMultimodalProcessor(ABC):
             return "xpu"
         if not _is_npu:
             platform = platforms.current_platform
-            if not platform.is_cuda_alike():
+            if not platform.is_cuda_alike() or self._many_tokenizer_workers():
                 return None
             # Per-worker placement travels as a constructor argument, and
             # this record is that argument.
