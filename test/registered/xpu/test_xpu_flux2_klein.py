@@ -47,11 +47,11 @@ from sglang.test.ci.ci_register import register_xpu_ci
 
 logger = logging.getLogger(__name__)
 
-# Registered like its nightly-xpu-1-gpu siblings so the nightly lists it as
-# skipped; disabled keeps it out of every run.
+# Registered like its nightly-xpu-kernel-main-1-gpu siblings so the nightly
+# lists it as skipped; disabled keeps it out of every run.
 register_xpu_ci(
     est_time=2400,
-    suite="nightly-xpu-1-gpu",
+    suite="nightly-xpu-kernel-main-1-gpu",
     nightly=True,
     disabled="Manual test, not part of the Intel nightly. Run by hand with pytest.",
 )
