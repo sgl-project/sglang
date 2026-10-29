@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     MatchResult,
@@ -47,6 +46,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -54,11 +54,13 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
+device_module = get_device_module()
 
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        ComponentType.MAMBA,
     }
 )
 
@@ -128,10 +130,47 @@ class LayerWiseLoadCounter:
         self.futures.clear()
 
 
+class TransferReady(NamedTuple):
+    events: list[torch.cuda.Event]
+
+    def synchronize(self) -> None:
+        for event in self.events:
+            event.synchronize()
+
+    def wait(self, stream: torch.cuda.Stream) -> None:
+        for event in self.events:
+            stream.wait_event(event)
+
+
 class UnifiedCacheLinker(ABC):
-    """External KV store reached directly from the device pools."""
+    """External KV store reached directly from the device pools.
+
+    Out-of-tree linkers are constructed per worker as
+    ``Linker(server_args, params, components=..., extra_config=..., forward_stream=...)``.
+    Store ``forward_stream`` and use ``record_transfer_ready()`` to gate loads
+    and offloads. ``layer_done_counter`` provides ``set_consumer(index)`` and
+    ``wait_until(layer)``. Report completion only after device copies finish.
+    """
 
     layer_done_counter: object
+    pools: dict[PoolName, object]
+    # None when the current stream is the only one using the pages.
+    forward_stream: Optional[torch.cuda.Stream] = None
+
+    def record_transfer_ready(self) -> TransferReady:
+        """Record what a transfer waits on before it touches device pages.
+
+        The current stream computed the page indices; under read-done the
+        forward in flight may still use those pages, including freed ones.
+        """
+        indices_ready = device_module.Event()
+        indices_ready.record()
+        events = [indices_ready]
+        if self.forward_stream is not None:
+            forward_done = device_module.Event()
+            forward_done.record(self.forward_stream)
+            events.append(forward_done)
+        return TransferReady(events)
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -169,8 +208,14 @@ class UnifiedCacheLinker(ABC):
         """Cancel a load that has not started yet."""
 
     @abstractmethod
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
-        """Queue every transfer for atomic persistence."""
+    def offload(
+        self, transfers: list[PoolTransfer], session_id: Optional[str] = None
+    ) -> bool:
+        """Queue every transfer for atomic persistence.
+
+        ``session_id`` names the session whose insert produced the transfers,
+        when known; backends may attribute the stored objects to it.
+        """
 
     @abstractmethod
     def num_completed_offloads(self) -> int:
@@ -220,16 +265,15 @@ class UnifiedCacheLinkerWrapper:
                 component.name for component in sorted(unsupported, key=int)
             )
             raise ValueError(
-                "External cache linker supports only Full and SWA tree "
+                "External cache linker supports only Full, SWA and Mamba tree "
                 f"components; unsupported: {names}"
             )
 
         self.cache = cache
         self.cache_linker = cache_linker
         swa = cache.components.get(ComponentType.SWA)
-        self._skip_swa = swa is not None and is_swa_req_ring(
-            cache.token_to_kv_pool_allocator
-        )
+        # A store without SWA pages tombstones restored tails instead.
+        self._skip_swa = swa is not None and PoolName.SWA not in cache_linker.pools
         self._components = tuple(
             component
             for component in cache._components_tuple
@@ -479,7 +523,9 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
-            queued = self.cache_linker.offload(transfers)
+            queued = self.cache_linker.offload(
+                transfers, session_id=getattr(cache, "insert_session_id", None)
+            )
         except BaseException:
             cache.dec_lock_ref(node_id, lock_params)
             raise
