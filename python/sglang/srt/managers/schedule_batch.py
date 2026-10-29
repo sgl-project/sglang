@@ -2110,6 +2110,18 @@ class Req(ReqDllmMixin):
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
+            # Generation restarts from scratch here, so every output cursor
+            # must restart with it: the streamer slices new output_ids with
+            # send_token_offset, and the incremental detokenizer rebuilds its
+            # state from surr/read_offset sentinels. Keep these resets after
+            # the truncation above, which must still read the pre-restart
+            # send_token_offset for the already-streamed prefix.
+            self.send_token_offset = 0
+            self.send_decode_id_offset = 0
+            self.send_output_token_logprobs_offset = 0
+            self.send_output_sampling_mask_offset = 0
+            self.surr_offset = None
+            self.read_offset = None
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
         if allocator.cpu_copy_carries_mamba:
@@ -3497,9 +3509,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Aborting, so a host backup to resume from would be wasted.
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
                 continue
-            # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices)):
+            # Restarting after partial output would append generation B to
+            # generation A in the tokenizer's accumulated response.
+            abort_input_embeds_with_output = (
+                req.input_embeds is not None and req.send_token_offset > 0
+            )
+            backup_saved = self.release_req(
+                idx,
+                len(sorted_indices),
+                offload_kv=not abort_input_embeds_with_output,
+            )
+            if backup_saved and not abort_input_embeds_with_output:
                 retracted_reqs.append(req)
+                continue
+
+            if abort_input_embeds_with_output:
+                message = (
+                    "Retracted an input_embeds request after partial output was "
+                    "sent. Retry the request to avoid mixing generations."
+                )
+                status_code = HTTPStatus.SERVICE_UNAVAILABLE
             else:
                 # No backup exists and the device KV is already freed, so the
                 # request cannot resume.
@@ -3512,11 +3541,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         "backup. Retry later."
                     )
                     status_code = HTTPStatus.SERVICE_UNAVAILABLE
-                req.to_finish = FINISH_ABORT(message, status_code=status_code)
-                reqs_to_abort.append(req)
-                logger.warning(
-                    "retract_decode: aborted request %s: %s", req.rid, message
-                )
+            req.to_finish = FINISH_ABORT(message, status_code=status_code)
+            reqs_to_abort.append(req)
+            logger.warning("retract_decode: aborted request %s: %s", req.rid, message)
 
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
