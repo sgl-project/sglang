@@ -82,9 +82,6 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
                 self.llm_config = NemotronHConfig(**llm_config)
             else:
                 self.llm_config = NemotronHPuzzleConfig(**llm_config)
-                # Puzzle requires block_configs; nested diff serialization cannot
-                # construct a default instance of its config.
-                self.has_no_defaults_at_init = True
             assert isinstance(vision_config, dict), "vision_config must be a dictionary"
             self.raw_vision_config = vision_config
         else:

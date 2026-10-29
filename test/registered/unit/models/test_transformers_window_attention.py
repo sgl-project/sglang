@@ -72,6 +72,7 @@ def native_batch(lengths):
             device="cpu",
             req_to_token_pool=SimpleNamespace(req_to_token=request_tokens),
             token_to_kv_pool=TensorKVPool(count),
+            runner_ids=None,
         )
     )
     return batch, backend
