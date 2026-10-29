@@ -734,6 +734,16 @@ class DeepseekMLAForwardMixin:
                     is_neox=self.rotary_emb.is_neox_style,
                     llama_4_scaling=llama_4_scaling,
                 )
+            # SailFlashMLABackend consumes the split q/k and has no
+            # llama_4_scaling argument of its own, so scale both halves before
+            # dispatch. The concat branch below scales the joined q instead.
+            if (
+                llama_4_scaling is not None
+                and self.current_attention_backend == "flashmla"
+            ):
+                q_nope_out *= llama_4_scaling
+                if q_pe is not None:
+                    q_pe *= llama_4_scaling
             if fusion_plan is not None:
                 self._eager_bmm_attention(
                     fusion_plan.q_nope_t,
