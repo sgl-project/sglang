@@ -19,6 +19,7 @@ import uuid
 from contextlib import ExitStack, contextmanager
 from queue import Empty, SimpleQueue
 
+from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorage,
@@ -253,9 +254,8 @@ class KVCRStore(HiCacheStorage):
             raise RuntimeError("KVCR storage backend is closed")
         if self._runner is not None:
             return
-        from kvcr import KVCR, KVCRBindings
+        from kvcr import KVCR, KVCRBindings, ZmqPeerControlChannel
         from kvcr.config import KVCRBackendConfigs, KVCRConfig, LocalDramOptions
-        from kvcr.control_channels import ZmqPeerControlChannel
         from kvcr.types import KVCRStartupError, RegionDescriptor
 
         from sglang.srt.mem_cache.storage.kvcr.diagnostics import DiagnosticStats
@@ -456,7 +456,9 @@ class KVCRStore(HiCacheStorage):
         hint = self._operation_hint(extra_info, keys)
         if hint is not None:
             request_id = uuid.uuid4().hex
-            self._runner.submit_hint(hint, request_id=request_id)
+            self._runner.submit_hint(
+                decode_kv_hints_envelope(hint), request_id=request_id
+            )
         try:
             yield request_id
         finally:
