@@ -41,6 +41,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
 )
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.amd.binding import msa_serves
 from sglang.srt.kernel_plugins.nvidia.eagle_binding import EagleBinding
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
@@ -543,6 +544,9 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_nvidia_megakernel:
         return
+    archs = model_config_of(server_args).hf_config.architectures
+    if msa_serves(archs) and not cfg.enable_amd_monokernel:
+        return  # handle_monokernel checks the MSA plugin's spec
     env_set = []
     reasons = plugin_reasons()
     if not reasons:
@@ -589,7 +593,7 @@ def install_megakernel(
     is_draft: bool,
 ) -> None:
     """Build the model's spec and install its forward; runs before KV cache sizing."""
-    if not megakernel_enabled():
+    if not megakernel_enabled() or msa_serves(hf_config.architectures):
         return
     spec = _find_spec_on_every_rank(hf_config=hf_config, is_draft=is_draft)
     if spec is None:
