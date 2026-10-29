@@ -1,8 +1,8 @@
-"""Verify of the MiniMax-M3.1 DSpark draft's windowed, non-causal draft block.
+"""Split-KV verify of the MiniMax-M3.1 DSpark draft's windowed, non-causal block.
 
-``verify_mla``'s stage 1 masks the prefix by the window, which every draft key sits
-inside; this combine then merges the prefix splits and the draft keys in one pass,
-several draft rows per program.
+``verify_mla``'s stage 1 masks the prefix by the window; every draft key sits inside
+it, so this combine merges the prefix splits and the draft keys in one pass, several
+draft rows per program.
 """
 
 import triton
@@ -20,8 +20,8 @@ _BLOCK_CONFIG = {
 }
 
 
-# Draft rows per program of the combine, measured on gfx950 for the M3.1 draft
-# (16 heads, 7 rows, window 4095) at 1-64 requests.
+# draft rows per program of the combine, measured on gfx950 for the M3.1 draft
+# (16 heads, 7 rows, window 4095) at 1-64 requests
 def _combine_rows(bs: int) -> int:
     return 2 if bs <= 16 else 8
 
@@ -166,9 +166,10 @@ def _verify_window_combine_stage2(
 
 
 class WindowedVerifyMLA(VerifyMLA):
-    """``VerifyMLA`` whose combine is ``_verify_window_combine_stage2``."""
+    """``VerifyMLA`` with the one-pass windowed combine; ``can_handle`` admits only a
+    non-causal block."""
 
-    # Measured on gfx950 for the M3.1 draft window.
+    # measured on gfx950 for the M3.1 draft window
     prefix_num_stages = 2
 
     @staticmethod
