@@ -672,7 +672,7 @@ def handle_model_specific_adjustments(server_args: Any):
     ]:
         if hf_config.sliding_window_pattern is not None:
             # disable_hybrid_swa_memory moved to the override registry
-            # (arg_groups/overrides.py: _exaone_overrides).
+            # (arg_groups/model_overrides/exaone.py).
             # https://docs.sglang.ai/advanced_features/attention_backend.html
             accepted_backends = ["fa3", "triton", "trtllm_mha"]
             attention_backend = resolved_view(server_args).attention_backend
@@ -680,8 +680,8 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
             )
     elif model_arch in ["Olmo2ForCausalLM"]:
-        # disable_hybrid_swa_memory + attention backend selection moved to
-        # the override registry (arg_groups/overrides.py: _olmo2_overrides).
+        # The attention backend selection moved to the override registry
+        # (arg_groups/model_overrides/olmo2.py).
 
         # Flashinfer appears to degrade performance when sliding window attention
         # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
