@@ -33,6 +33,7 @@ from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
 )
 from sglang.srt.multimodal.transport.feature_transport import MultimodalFeatureTransport
 from sglang.srt.runtime_context import get_exec, get_mm
+from sglang.srt.utils import is_cuda_alike
 
 # MultimodalProcessorOutput token-ID field -> mm_token_expansion_params key.
 _OUTPUT_TOKEN_ID_PARAMS = {
@@ -128,6 +129,8 @@ class TokenSpaceSGLangProcessor:
             hf_config,
             _processor,
             processor_config=processor_config,
+            # nvJPEG and GPU video decode use bare "cuda", cuda:0 on a pool thread.
+            worker_thread_device=server_args.base_gpu_id if is_cuda_alike() else None,
         )
         # The tokenizer manager sets pad values through it.
         self.hash_executor = MultimodalHashExecutor()
