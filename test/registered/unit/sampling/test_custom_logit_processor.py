@@ -795,5 +795,77 @@ class TestPageLengthCap(CustomTestCase):
         self.assertEqual(finite, [self.EOS])
 
 
+class TestNGramProcessorBatchEdits(CustomTestCase):
+    """A batch mixing forced, page-banned and n-gram-banned rows.
+
+    Regression: the edits were written row by row through Python indices; on
+    CUDA every write blocked the host on the forward that produced the logits.
+    """
+
+    PAGE, EOS, VOCAB = 7, 1, 64
+
+    def _batch(self):
+        """Two forced rows, two rows with a page and an n-gram ban, one skipped."""
+        P = self.PAGE
+
+        def req(output_ids):
+            r = _make_req(origin_input_ids=[P, 50, P, 50], output_ids=output_ids)
+            r.uocr_doc = UocrReqState(context_pages=0)
+            return r
+
+        common = {
+            "page_token_id": P,
+            "eos_token_id": self.EOS,
+            "ngram_size": 2,
+            "window_size": 100,
+            NGRAM_OUTPUT_ONLY_KEY: True,
+        }
+        return [
+            # Page cap reached on the last page: forced to EOS.
+            {"__req__": req([P, 3, P, 4, 4, 4]), "max_page_tokens": 3, **common},
+            # Repeating tail: forced to EOS.
+            {
+                "__req__": req([P, 2, 5, 2, 5, 2, 5]),
+                "max_page_tokens": 0,
+                "rep_max_pattern_size": 2,
+                "rep_min_count": 3,
+                **common,
+            },
+            # A page short: EOS banned, plus the n-gram ban of 3 after 2.
+            {"__req__": req([P, 2, 3, 2]), "max_page_tokens": 0, **common},
+            None,
+            # Last page: <PAGE> banned, plus the n-gram ban of 9 after 8.
+            {"__req__": req([P, 8, 9, P, 8]), "max_page_tokens": 0, **common},
+        ]
+
+    def _expected(self):
+        """What the per-row edits leave on all-zero logits."""
+        out = torch.zeros(5, self.VOCAB)
+        for row in (0, 1):
+            out[row] = -float("inf")
+            out[row, self.EOS] = 0.0
+        out[2, [self.EOS, 3]] = -float("inf")
+        out[4, [self.PAGE, 9]] = -float("inf")
+        return out
+
+    def test_every_row_gets_its_own_edits(self):
+        result = DeepseekOCRNoRepeatNGramLogitProcessor()(
+            torch.zeros(5, self.VOCAB), self._batch()
+        )
+        self.assertTrue(torch.equal(result, self._expected()))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_cuda_edits_match_and_do_not_sync(self):
+        logits = torch.zeros(5, self.VOCAB, device="cuda")
+        torch.cuda.synchronize()
+        previous = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            result = DeepseekOCRNoRepeatNGramLogitProcessor()(logits, self._batch())
+        finally:
+            torch.cuda.set_sync_debug_mode(previous)
+        self.assertTrue(torch.equal(result.cpu(), self._expected()))
+
+
 if __name__ == "__main__":
     unittest.main()

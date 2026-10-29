@@ -423,6 +423,9 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             return logits
 
         vocab_size = logits.shape[-1]
+        # Collected and applied at once: a CUDA write through Python indices
+        # copies them from pageable memory and blocks the host on the forward.
+        edits = _RowEdits()
         for batch_idx, params in enumerate(custom_param_list):
             if not params:
                 continue
@@ -440,14 +443,55 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
                 if action is not None:
                     forced, banned = action
                     if forced is None and banned is not None:
-                        logits[batch_idx, banned] = -float("inf")
+                        edits.ban(row=batch_idx, cols=[banned])
             if forced is not None:
-                logits[batch_idx, :] = -float("inf")
-                logits[batch_idx, forced] = 0.0
+                edits.force(row=batch_idx, col=forced)
                 continue
 
             indices = _ngram_banned_tokens(req, params, vocab_size=vocab_size)
             if indices:
-                logits[batch_idx, indices] = -float("inf")
+                edits.ban(row=batch_idx, cols=indices)
 
+        edits.apply(logits)
         return logits
+
+
+class _RowEdits:
+    """Per-row logit edits, written with one non-blocking index upload."""
+
+    def __init__(self) -> None:
+        self.forced_rows: List[int] = []
+        self.forced_cols: List[int] = []
+        self.ban_rows: List[int] = []
+        self.ban_cols: List[int] = []
+
+    def force(self, *, row: int, col: int) -> None:
+        self.forced_rows.append(row)
+        self.forced_cols.append(col)
+
+    def ban(self, *, row: int, cols: List[int]) -> None:
+        self.ban_rows.extend([row] * len(cols))
+        self.ban_cols.extend(cols)
+
+    def apply(self, logits: torch.Tensor) -> None:
+        """Force each forced row to its token, then mask the banned cells.
+
+        A forced row has no bans, so the order of the writes does not matter.
+        """
+        n_forced = len(self.forced_rows)
+        if not n_forced and not self.ban_rows:
+            return
+        index = torch.tensor(
+            [self.forced_rows + self.ban_rows, self.forced_cols + self.ban_cols],
+            dtype=torch.int64,
+        )
+        if logits.is_cuda:
+            index = index.pin_memory().to(logits.device, non_blocking=True)
+        rows, cols = index[0], index[1]
+        if n_forced:
+            logits.index_fill_(0, rows[:n_forced], -float("inf"))
+            logits.index_put_((rows[:n_forced], cols[:n_forced]), logits.new_zeros(()))
+        if self.ban_rows:
+            logits.index_put_(
+                (rows[n_forced:], cols[n_forced:]), logits.new_full((), -float("inf"))
+            )
