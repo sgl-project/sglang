@@ -221,6 +221,9 @@ class RustMmProcessor:
         # SGLANG_RUST_SERVER.
         from sglang.srt.managers.multimodal_processor import import_processors
         from sglang.srt.managers.tokenizer_manager import get_processor_wrapper
+        from sglang.srt.multimodal.token_space_mm_process.registry import (
+            register_token_space_models,
+        )
 
         self.server_args = server_args
         self.model_config = model_config
@@ -231,7 +234,7 @@ class RustMmProcessor:
         # init_tokenizer_and_processor. The caller's already-loaded HF
         # AutoProcessor is reused when available (identical construction args).
         import_processors("sglang.srt.multimodal.processors")
-        import_processors("sglang.srt.multimodal.token_space_mm_process.models")
+        register_token_space_models()
         if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
             import_processors(mm_process_pkg, overwrite=True)
         self._processor = processor or get_processor_wrapper()
