@@ -158,7 +158,9 @@ class InternlmDetector(BaseFormatDetector):
         """
         Streaming incremental parsing for InternLM format.
 
-        Supports a single tool call in streaming mode.
+        Supports sequential tool calls. A later ``<|action_start|>`` may
+        arrive without ``<|plugin|>`` in the same chunk; that prefix has to
+        stay buffered or the rest of the call is dropped.
         """
         self._buffer += new_text
         current_text = self._buffer
@@ -167,6 +169,10 @@ class InternlmDetector(BaseFormatDetector):
         start = current_text.find(self.bot_token)
         if start == -1:
             # No tool call marker found
+            # A split ``<|action_start|> <|plugin|>`` marker is not the full
+            # bot token yet. Keep it so the next chunk can finish the call.
+            if self._ends_with_partial_token(current_text, self.bot_token):
+                return StreamingParseResult()
             # If we've already processed tool calls, don't return text again
             if self.current_tool_id > 0:
                 self._buffer = ""
