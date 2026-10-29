@@ -231,6 +231,7 @@ class RustMmProcessor:
         # init_tokenizer_and_processor. The caller's already-loaded HF
         # AutoProcessor is reused when available (identical construction args).
         import_processors("sglang.srt.multimodal.processors")
+        import_processors("sglang.srt.multimodal.token_space_mm_process.models")
         if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
             import_processors(mm_process_pkg, overwrite=True)
         self._processor = processor or get_processor_wrapper()

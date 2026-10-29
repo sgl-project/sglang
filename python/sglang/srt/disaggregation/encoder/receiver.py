@@ -2002,6 +2002,7 @@ class MMReceiverBase(ABC):
         """Load processor and initialize mm_processor, shared by all backends."""
         transport_mode = determine_tensor_transport_mode()
         import_processors("sglang.srt.multimodal.processors")
+        import_processors("sglang.srt.multimodal.token_space_mm_process.models")
 
         extra_kwargs = {}
         if get_serving().tokenizer_backend is not None:
