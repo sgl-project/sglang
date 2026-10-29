@@ -68,11 +68,13 @@ def _fake_store_class(cluster):
             results = []
             for key, ptr, size in zip(keys, ptrs, sizes):
                 data = cluster.objects.get(key)
-                if data is None or len(data) != size:
+                # Like Mooncake: only a buffer smaller than the object fails; a
+                # larger one takes the object and reports the object's size.
+                if data is None or len(data) > size:
                     results.append(-1)
                     continue
-                ctypes.memmove(ptr, data, size)
-                results.append(size)
+                ctypes.memmove(ptr, data, len(data))
+                results.append(len(data))
             return results
 
     return FakeMooncakeDistributedStore
@@ -104,7 +106,9 @@ class _UnifiedHostPool:
         self.kv_buffer = torch.zeros(layout.page_dims(PAGES), dtype=torch.bfloat16)
 
     def get_ksize_per_token(self):
-        return self.page_unified_layout.bytes_per_page // self.page_size
+        # Like the real pools: MHA reports K alone, MLA its whole latent row.
+        layout = self.page_unified_layout
+        return layout.bytes_per_page // layout.components // self.page_size
 
 
 def _chunk_keys(cluster):
@@ -119,14 +123,29 @@ def _page_indices(pages):
 
 
 class _Rank:
-    """One attention-TP rank: its plan, page_unified pool and MooncakeStore."""
+    """One attention-TP rank of a PP stage: plan, page_unified pool and store."""
 
-    def __init__(self, cluster, *, mla, tp_rank, tp_size, head_partition):
+    def __init__(
+        self,
+        cluster,
+        *,
+        mla,
+        tp_rank,
+        tp_size,
+        head_partition,
+        layer_partition=2,
+        start_layer=0,
+        end_layer=LAYERS,
+        pp_rank=0,
+        pp_size=1,
+    ):
         local_heads = 1 if mla else TOTAL_KV_HEADS // tp_size
         groups = 1 if mla else local_heads // head_partition
+        self.start_layer = start_layer
+        self.end_layer = end_layer
         self.layout = PageUnifiedLayout(
             page_size=PAGE_SIZE,
-            layer_num=LAYERS,
+            layer_num=end_layer - start_layer,
             head_num=local_heads,
             head_group_num=groups,
             head_dim=HEAD_DIM,
@@ -142,19 +161,19 @@ class _Rank:
             attn_tp_rank=tp_rank,
             attn_tp_size=tp_size,
             attn_cp_size=1,
-            start_layer=0,
-            end_layer=LAYERS,
-            is_final_stage=True,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            is_final_stage=pp_rank == pp_size - 1,
             head_group=None if mla else head_partition,
-            layer_partition=2,
+            layer_partition=layer_partition,
         )
         self.first_head = tp_rank * local_heads
         self.pool = _UnifiedHostPool(self.layout)
         config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=tp_size,
-            pp_rank=0,
-            pp_size=1,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
             attn_cp_rank=0,
             attn_cp_size=1,
             is_mla_model=mla,
@@ -185,13 +204,14 @@ class _Rank:
     def expected_page(self, page):
         """This rank's slice of one logical page in page_unified byte order."""
         layout = self.layout
+        page = page[self.start_layer : self.end_layer]
         if layout.is_mla:
             return page
         # page: (layer, 2, page_size, total_heads, dim) -> this rank's heads,
         # then (group, layer, 2, page_size, heads_in_group, dim).
         heads = page[:, :, :, self.first_head : self.first_head + layout.head_num]
         return heads.reshape(
-            LAYERS,
+            layout.layer_num,
             2,
             PAGE_SIZE,
             layout.head_group_num,
@@ -254,14 +274,45 @@ class TestMooncakeUnifiedKeys(CustomTestCase):
                 )
             )
 
-    def test_mla_chunks_are_shared_across_tp_sizes(self):
+    def test_mla_chunks_are_shared_across_tp_and_pp_splits(self):
+        """MLA chunks name absolute layer ranges, not a TP size or PP stage.
+
+        A reader with no PP split needs both stages' chunks for a hit, and
+        lands each stage's layers at its own local offsets.
+        """
         cluster = _FakeCluster()
-        writer = _Rank(cluster, mla=True, tp_rank=0, tp_size=2, head_partition=None)
+        stages = [
+            _Rank(
+                cluster,
+                mla=True,
+                tp_rank=0,
+                tp_size=2,
+                head_partition=None,
+                start_layer=start,
+                end_layer=end,
+                pp_rank=pp_rank,
+                pp_size=2,
+            )
+            for pp_rank, (start, end) in enumerate([(0, 2), (2, LAYERS)])
+        ]
         reader = _Rank(cluster, mla=True, tp_rank=1, tp_size=4, head_partition=None)
-        self.assertEqual(writer.plan.suffixes, reader.plan.suffixes)
         logical = _logical_pages(mla=True, count=1)
-        writer.fill_from(logical, host_pages=[1])
-        self.assertEqual(writer.store.batch_set_v1(["p"], _page_indices([1])), [True])
+
+        stages[0].fill_from(logical, host_pages=[1])
+        self.assertEqual(
+            stages[0].store.batch_set_v1(["p"], _page_indices([1])), [True]
+        )
+        self.assertEqual(reader.store.batch_exists(["p"]), 0)
+
+        stages[1].fill_from(logical, host_pages=[2])
+        self.assertEqual(
+            stages[1].store.batch_set_v1(["p"], _page_indices([2])), [True]
+        )
+        self.assertEqual(
+            _chunk_keys(cluster),
+            sorted(f"org-model_p_{suffix}" for suffix in reader.plan.suffixes),
+        )
+        self.assertEqual(reader.store.batch_exists(["p"]), 1)
         self.assertEqual(reader.store.batch_get_v1(["p"], _page_indices([0])), [True])
         self.assertTrue(torch.equal(reader.pool.kv_buffer[0], logical[0]))
 
@@ -288,13 +339,53 @@ class TestMooncakeUnifiedKeys(CustomTestCase):
             [True, False, True],
         )
 
-    def test_backup_metrics_count_pages_not_chunks(self):
+    def test_a_short_chunk_object_fails_its_page(self):
+        """Mooncake fills a larger buffer from a shorter object and reports
+        success; the page must miss, or the rest of the span keeps stale bytes.
+        """
         cluster = _FakeCluster()
         rank = _Rank(cluster, mla=False, tp_rank=0, tp_size=1, head_partition=2)
+        keys = ["p0", "p1"]
+        rank.store.batch_set_v1(keys, _page_indices([0, 1]))
+        short_key = f"org-model_p0_{rank.plan.suffixes[0]}"
+        cluster.objects[short_key] = cluster.objects[short_key][:-16]
+        self.assertEqual(
+            rank.store.batch_get_v1(keys, _page_indices([0, 1])), [False, True]
+        )
+
+    def test_backup_metrics_count_pages_and_bytes(self):
+        """Backups report the pages touched and the bytes put, not chunk counts.
+
+        A ragged final layer range makes chunks unequal, so rewriting only the
+        evicted short chunks moves far less than their share of a page.
+        """
+        cluster = _FakeCluster()
+        rank = _Rank(
+            cluster,
+            mla=False,
+            tp_rank=0,
+            tp_size=1,
+            head_partition=2,
+            layer_partition=3,
+        )
         rank.store.enable_storage_metrics = True
-        rank.store.batch_set_v1(["p0", "p1"], _page_indices([0, 1]))
-        self.assertEqual(rank.store.backup_pgs, [2])
+        # The MHA pool sizes a page by K alone; a unified page holds K and V.
         self.assertEqual(rank.store.gb_per_page * (1 << 30), rank.layout.bytes_per_page)
+        keys = ["p0", "p1"]
+        short_chunks = [suffix for suffix in rank.plan.suffixes if "_L3-4_" in suffix]
+        with patch("time.perf_counter", side_effect=[0.0, 1.0, 1.0, 2.0]):
+            rank.store.batch_set_v1(keys, _page_indices([0, 1]))
+            for suffix in short_chunks:
+                del cluster.objects[f"org-model_p1_{suffix}"]
+            rank.store.batch_set_v1(keys, _page_indices([0, 1]))
+        self.assertEqual(rank.store.backup_pgs, [2, 1])
+        self.assertEqual(
+            rank.store.backup_bandwidth,
+            [
+                2 * rank.layout.bytes_per_page / (1 << 30),
+                len(short_chunks) * rank.layout.layer_bytes / (1 << 30),
+            ],
+        )
 
     def test_spans_must_pair_with_suffixes(self):
         cluster = _FakeCluster()
