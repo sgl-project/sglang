@@ -230,6 +230,7 @@ class TestMooncakeTenantConfig(unittest.TestCase):
             mem_pool_host=SimpleNamespace(layout="page_first"),
             mem_pool_device=SimpleNamespace(dtype=torch.float16),
             get_attn_cp_rank_and_size=lambda: (0, 1),
+            _build_unified_plan=lambda *_: None,
         )
         parallel = SimpleNamespace(
             tp_rank=0, tp_size=1, pp_rank=0, pp_size=1, attn_dcp_size=1, attn_dcp_rank=0
@@ -276,6 +277,7 @@ class TestMooncakeTenantConfig(unittest.TestCase):
             mem_pool_device=SimpleNamespace(dtype=torch.float8_e4m3fn),
             storage_host_pool=LogicalHostPool(size=16, page_size=1),
             get_attn_cp_rank_and_size=lambda: (0, 1),
+            _build_unified_plan=lambda *_: None,
         )
         parallel = SimpleNamespace(
             tp_rank=0, tp_size=1, pp_rank=0, pp_size=1, attn_dcp_size=1, attn_dcp_rank=0
@@ -366,6 +368,7 @@ class TestMooncakeTenantConfig(unittest.TestCase):
             mem_pool_device=MLATokenToKVPool.__new__(MLATokenToKVPool),
             storage_host_pool=host_pool,
             get_attn_cp_rank_and_size=lambda: (0, 1),
+            _build_unified_plan=lambda *_: None,
             page_size=16,
         )
         parallel = SimpleNamespace(
@@ -384,6 +387,75 @@ class TestMooncakeTenantConfig(unittest.TestCase):
         self.assertEqual((config.dcp_size, config.dcp_rank), (2, 1))
         self.assertEqual(config.logical_page_size, 16)
         self.assertFalse(config.is_storage_writer)
+
+    def test_unified_views_preserve_fp8_encoding_in_host_buffers(self):
+        from dataclasses import replace
+
+        from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
+        from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
+        from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+        from sglang.srt.mem_cache.pool_host.common import (
+            ALLOC_MEMORY_FUNCS,
+            alloc_with_pin_memory,
+        )
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+        from sglang.test.unified_allocator_fixtures import arena_of
+
+        for dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz):
+            for is_mla in (False, True):
+                with (
+                    self.subTest(dtype=dtype, is_mla=is_mla),
+                    host_memory_budget_scope(1024 * 1024),
+                    patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc_with_pin_memory}),
+                ):
+                    spec_cls = MLASubPoolSpec if is_mla else MHASubPoolSpec
+                    spec = spec_cls(
+                        name="full",
+                        layer_num=1,
+                        grow_direction="down",
+                        store_dtype=torch.uint8,
+                        **(
+                            dict(kv_lora_rank=32, qk_rope_head_dim=32)
+                            if is_mla
+                            else dict(head_num=1, head_dim=32, kv_cache_dtype=dtype)
+                        ),
+                    )
+                    arena = arena_of(
+                        [spec, replace(spec, name="swa", grow_direction="up")],
+                        total_bytes=spec.entry_bytes() * 10,
+                        device="cpu",
+                        page_size=2,
+                    )
+                    view_cls = MLAView if is_mla else MHAView
+                    view = view_cls(
+                        arena=arena,
+                        spec=spec,
+                        page_size=2,
+                        **(
+                            dict(kv_cache_dtype=dtype)
+                            if is_mla
+                            else dict(model_layer_ids=(0,), enable_alt_stream=False)
+                        ),
+                    )
+                    info = view.get_device_pool_infos()[0].buffer_info
+                    self.assertEqual(info.dtype, torch.uint8)
+                    host_cls = MLATokenToKVPoolHost if is_mla else MHATokenToKVPoolHost
+                    host = host_cls(
+                        info,
+                        host_to_device_ratio=2,
+                        host_size=0,
+                        page_size=2,
+                        layout="page_first",
+                        pin_memory=False,
+                        device_capacity_tokens=view.size,
+                        start_layer=0,
+                        end_layer=1,
+                        host_token_capacity=16,
+                        **(dict(target_layer_num=1) if is_mla else {}),
+                    )
+                    self.addCleanup(host.destroy)
+                    self.assertEqual(host.get_storage_dtype(), dtype)
 
     def test_page_envelope_reports_persisted_value_dtype(self):
         from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool

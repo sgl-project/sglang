@@ -366,6 +366,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._sim_draw_ahead = sim_draw_ahead_enabled(self._simulated_correct_len)
         self.num_sim_draws_ahead = 0
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
+        markov_head = self.draft_model.markov_head
+        self._sharded_accept = (
+            envs.SGLANG_DSPARK_SHARDED_ACCEPT.get()
+            and not self._greedy_draft
+            and markov_head is not None
+            and markov_head.vocab_shard is not None
+        )
+        if self._sharded_accept and self._target_tp_rank == 0:
+            logger.info("DSpark sampling accept runs on the vocab shards.")
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
@@ -375,6 +384,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
             random_seed=target_worker.random_seed,
             greedy_draft=self._greedy_draft,
+            sharded_accept=self._sharded_accept,
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
         self._verify_epilogue = None
@@ -703,6 +713,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             noise=self._proposer.noise,
             greedy_draft=self._greedy_draft,
             tp_sync=self._tp_sync,
+            sharded_accept=self._sharded_accept,
             out=(
                 self._verify_epilogue.draft_tokens_buf
                 if self._verify_epilogue is not None
@@ -1040,21 +1051,25 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._verify_inputs_ready.record()
 
         sampling_info = batch.sampling_info
-        # Simulated acceptance overrides correct_len, so only the bonus token needs the
-        # request's temperature: draft + accept run greedy, the bonus is still sampled.
+        # Simulated acceptance overrides correct_len; the bonus is drawn at that row
+        # with the request's sampling params. SGLANG_SIMULATE_ACC_GREEDY also runs the
+        # draft and accept greedy.
         simulate_bonus_sampling_info = None
         if (
-            self._simulate_acc_greedy
+            self._simulated_correct_len is not None
             and sampling_info is not None
             and not sampling_info.is_all_greedy
-            and not batch.has_grammar
-            and verify_logits_adjustments_are_noop(sampling_info)
-            and not sampling_info.need_top_p_sampling
-            and not sampling_info.need_top_k_sampling
-            and not sampling_info.need_min_p_sampling
         ):
             simulate_bonus_sampling_info = sampling_info
-            sampling_info = None
+            if (
+                self._simulate_acc_greedy
+                and not batch.has_grammar
+                and verify_logits_adjustments_are_noop(sampling_info)
+                and not sampling_info.need_top_p_sampling
+                and not sampling_info.need_top_k_sampling
+                and not sampling_info.need_min_p_sampling
+            ):
+                sampling_info = None
         if self._sim_draw_ahead:
             self._begin_simulated_step_ahead(
                 bs=bs, simulate_bonus_sampling_info=simulate_bonus_sampling_info
@@ -1207,6 +1222,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
         ):
+            if simulate_bonus_sampling_info is not None:
+                epilogue.begin_sim_bonus(
+                    bs, simulate_bonus_sampling_info.temperatures[:bs]
+                )
             region_accept = self._sampling_accept_graph.run(
                 bs=bs, target_logits=logits_output.next_token_logits
             )
@@ -1361,7 +1380,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not sampling_info.need_top_k_sampling
             and not sampling_info.need_top_p_sampling
             and verify_logits_adjustments_are_noop(sampling_info)
-            and simulate_bonus_sampling_info is None
+            # A simulated bonus is drawn in the region from this batch's temperatures.
+            and (
+                simulate_bonus_sampling_info is None
+                or simulate_bonus_sampling_info is sampling_info
+            )
             and not batch.has_grammar
         )
 

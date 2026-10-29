@@ -43,9 +43,16 @@ class HiCacheStorageConfig:
     extra_config: Optional[dict] = None
     # Value dtype persisted by the host pool; raw FP8 buffers may use uint8.
     kv_cache_dtype: Optional[str] = None
+    # Unified key scheme: the topology-free chunk coordinates this rank owns,
+    # layer-major / head-minor. When set, backends MUST key objects by these
+    # instead of by the writer's rank.
+    unified_suffixes: Optional[List[str]] = None
     dcp_size: int = 1
     dcp_rank: int = 0
     logical_page_size: Optional[int] = None
+    # Byte ranges in a local page, paired with unified_suffixes in the same
+    # order. The key grid is layer-major, whereas page bytes are head-major.
+    unified_chunk_spans: Optional[List[tuple[int, int]]] = None
 
     def __post_init__(self):
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
@@ -69,10 +76,15 @@ class HiCacheStorageConfig:
 
     @property
     def is_storage_writer(self) -> bool:
-        """MLA replicas share one writer per DCP shard, in the first DCP group.
+        """Select one writer for each shared storage object.
 
-        With DCP disabled, MLA uses rank 0 and non-MLA uses every TP rank.
+        Unified full-page CP replicas share keys and use CP rank 0. Legacy
+        keys include the CP rank, so every CP copy retains its own writer.
+        MLA uses one writer per DCP shard in the first DCP group; with DCP
+        disabled, MLA uses TP rank 0 and non-MLA uses every TP rank.
         """
+        if self.unified_suffixes is not None and self.attn_cp_rank != 0:
+            return False
         return not self.is_mla_model or self.tp_rank == self.dcp_rank
 
 
@@ -728,6 +740,79 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
 
 
 class HiCacheFile(HiCacheStorage):
+    def _init_config_suffix(self, storage_config: HiCacheStorageConfig) -> None:
+        """Derive the per-deployment key suffix from the storage config."""
+        self._unified_suffixes = None
+        self._unified_chunk_sizes = {}
+        self._unified_chunk_spans = storage_config.unified_chunk_spans
+        if storage_config.unified_suffixes is not None:
+            # The chunk coordinate replaces the whole rank/pp/cp suffix family;
+            # model identity lives inside the namespace digest.
+            suffixes = storage_config.unified_suffixes
+            if not suffixes or len(set(suffixes)) != len(suffixes):
+                raise ValueError(
+                    "Unified storage suffixes must be nonempty and unique."
+                )
+            if storage_config.dcp_size != 1:
+                raise ValueError("Unified storage requires full pages without DCP.")
+            if self._unified_chunk_spans is None:
+                if len(suffixes) != 1:
+                    raise ValueError("Unified multichunk storage requires chunk spans.")
+            else:
+                if len(self._unified_chunk_spans) != len(suffixes):
+                    raise ValueError("Each unified suffix requires one chunk span.")
+                end = 0
+                for offset, length in sorted(self._unified_chunk_spans):
+                    if (
+                        type(offset) is not int
+                        or type(length) is not int
+                        or offset != end
+                        or length <= 0
+                    ):
+                        raise ValueError(
+                            "Unified chunk spans must cover the page without gaps or overlap."
+                        )
+                    end = offset + length
+                self._unified_chunk_spans = tuple(self._unified_chunk_spans)
+            self._unified_suffixes = tuple(f"_{suffix}" for suffix in suffixes)
+            if self._unified_chunk_spans is not None:
+                self._unified_chunk_sizes = dict(
+                    zip(
+                        self._unified_suffixes,
+                        (length for _, length in self._unified_chunk_spans),
+                    )
+                )
+            self.config_suffix = self._unified_suffixes[0]
+            # Unified keys currently support only a single KV pool, without
+            # TP-sharded sidecars. Keep all key lookups in its chunk namespace.
+            self.tp_config_suffix = self.config_suffix
+            return
+        if self._unified_chunk_spans is not None:
+            raise ValueError("Unified chunk spans require unified storage suffixes.")
+        model_name = storage_config.model_name
+        model_name = "-".join(model_name.split("/")) if model_name else ""
+        shard_suffix = ""
+        if storage_config.pp_size > 1:
+            shard_suffix += f"_{storage_config.pp_size}_{storage_config.pp_rank}"
+        # Under NSA context parallel each CP rank holds a disjoint slice of
+        # every page, so give each rank its own file key to avoid a cross-rank
+        # write race.
+        if storage_config.attn_cp_size > 1:
+            shard_suffix += (
+                f"_cp{storage_config.attn_cp_rank}_{storage_config.attn_cp_size}"
+            )
+        # MLA KV is replicated across TP ranks and shares one file per page;
+        # TP-sharded state is keyed by tp_config_suffix instead.
+        self.tp_config_suffix = (
+            f"_{model_name}_{storage_config.tp_rank}_{storage_config.tp_size}"
+            f"{shard_suffix}"
+        )
+        self.config_suffix = (
+            f"_{model_name}{shard_suffix}"
+            if storage_config.is_mla_model
+            else self.tp_config_suffix
+        )
+
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
@@ -737,36 +822,16 @@ class HiCacheFile(HiCacheStorage):
             or file_path
         )
 
-        tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
-            storage_config.tp_rank,
-            storage_config.tp_size,
-            storage_config.pp_rank,
-            storage_config.pp_size,
-            storage_config.model_name,
-            storage_config.is_mla_model,
-        )
+        self._init_config_suffix(storage_config)
+        tp_rank = storage_config.tp_rank
         attn_cp_rank = storage_config.attn_cp_rank
-        attn_cp_size = storage_config.attn_cp_size
-        model_name = "-".join(model_name.split("/")) if model_name else ""
-        enable_pp = pp_size > 1
-        shard_suffix = f"_{pp_size}_{pp_rank}" if enable_pp else ""
-        # Under NSA context parallel each CP rank holds a disjoint slice of every
-        # page, so give each rank its own file key to avoid a cross-rank write race.
-        if attn_cp_size > 1:
-            shard_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
-        # MLA KV is replicated across TP ranks and shares one file per page;
-        # TP-sharded state is keyed by tp_config_suffix instead.
-        self.tp_config_suffix = f"_{model_name}_{tp_rank}_{tp_size}{shard_suffix}"
-        self.config_suffix = (
-            f"_{model_name}{shard_suffix}" if is_mla_model else self.tp_config_suffix
-        )
 
         # TODO: Include KV dtype and stored layout in keys for both DCP and
         # non-DCP caches; raw file payloads do not describe their format.
         if storage_config.dcp_size > 1:
             # Equivalent MLA shards in different DCP groups share a file.
             dcp_suffix = (
-                f"_tp{tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
+                f"_tp{storage_config.tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
                 f"_page{storage_config.logical_page_size}"
             )
             self.config_suffix += dcp_suffix
@@ -806,11 +871,16 @@ class HiCacheFile(HiCacheStorage):
         # module, so a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
-        # Each rank owns its TP-sharded state; selected DCP writers also own
-        # their shared MLA shard files.
-        owned_suffixes = (self.tp_config_suffix,)
-        if is_mla_model and storage_config.is_storage_writer:
-            owned_suffixes += (self.config_suffix,)
+        if storage_config.unified_suffixes is not None:
+            owned_suffixes = (
+                self._unified_suffixes if storage_config.is_storage_writer else ()
+            )
+        else:
+            # Each rank owns its TP-sharded state; selected DCP writers
+            # also own their shared MLA shard files.
+            owned_suffixes = (self.tp_config_suffix,)
+            if storage_config.is_mla_model and storage_config.is_storage_writer:
+                owned_suffixes += (self.config_suffix,)
         self._evictor = LRUFileEvictor(
             self.file_path,
             owned_suffixes=owned_suffixes,
@@ -820,6 +890,42 @@ class HiCacheFile(HiCacheStorage):
                 self.metadata_cache.remove if self.metadata_cache is not None else None
             ),
         )
+
+    def _validate_unified_page_bytes(self, page_bytes: int) -> None:
+        if self._unified_chunk_spans is not None:
+            expected = sum(length for _, length in self._unified_chunk_spans)
+            if page_bytes != expected:
+                raise ValueError(
+                    f"Unified chunk spans cover {expected} bytes, but the page has {page_bytes}."
+                )
+
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        if self._unified_chunk_spans is not None:
+            self._validate_unified_page_bytes(
+                mem_pool_host.page_unified_layout.bytes_per_page
+            )
+        super().register_mem_pool_host(mem_pool_host)
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if self._unified_suffixes is not None:
+            if host_pool_name != PoolName.KV:
+                raise NotImplementedError(
+                    "Unified file storage does not support sidecar pools."
+                )
+            if self._unified_chunk_spans is not None:
+                self._validate_unified_page_bytes(
+                    host_pool.page_unified_layout.bytes_per_page
+                )
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+
+    def _page_chunks(self, key: str, page: torch.Tensor):
+        self._validate_unified_page_bytes(page.numel() * page.element_size())
+        data = page.contiguous().view(torch.uint8).reshape(-1)
+        spans = self._unified_chunk_spans or ((0, data.numel()),)
+        return [
+            (key + suffix, data[offset : offset + length])
+            for suffix, (offset, length) in zip(self._unified_suffixes, spans)
+        ]
 
     def _get_suffixed_key(self, key: str) -> str:
         # Mamba state is TP-sharded even when the model's MLA KV is replicated.
@@ -832,6 +938,15 @@ class HiCacheFile(HiCacheStorage):
             return self._get_suffixed_key(key)
         return self._get_suffixed_key(self._log_key(component_name, key))
 
+    def _get_component_keys(self, key: str, component_name: Optional[str] = None):
+        if self._unified_suffixes is None:
+            return (self._get_component_key(key, component_name),)
+        if component_name not in (None, "__default__", PoolName.KV):
+            raise NotImplementedError(
+                "Unified file storage does not support sidecar pools."
+            )
+        return tuple(key + suffix for suffix in self._unified_suffixes)
+
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
             names = os.listdir(self.file_path)
@@ -842,7 +957,9 @@ class HiCacheFile(HiCacheStorage):
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if stem.endswith((self.config_suffix, self.tp_config_suffix)):
+            if stem.endswith(
+                self._unified_suffixes or (self.config_suffix, self.tp_config_suffix)
+            ):
                 self.metadata_cache.add(stem)
 
     def get(
@@ -851,11 +968,26 @@ class HiCacheFile(HiCacheStorage):
         target_location: torch.Tensor,
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
-        suffixed = self._get_suffixed_key(key)
+        if self._unified_suffixes is None:
+            return self._get_file(self._get_suffixed_key(key), target_location)
+        # Do not expose a partially restored page if any chunk is missing,
+        # truncated, or evicted between the existence check and the read.
+        scratch = torch.empty_like(
+            target_location, memory_format=torch.contiguous_format
+        )
+        for suffixed, chunk in self._page_chunks(key, scratch):
+            if self._get_file(suffixed, chunk) is None:
+                return None
+        target_location.copy_(scratch)
+        return target_location
+
+    def _get_file(self, suffixed: str, target_location: torch.Tensor):
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
+                if os.fstat(f.fileno()).st_size != expected:
+                    raise IOError(f"Incorrect object size for {suffixed}")
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
                 if f.readinto(buf) != expected:
                     raise IOError(f"Short read for {suffixed}")
@@ -863,10 +995,10 @@ class HiCacheFile(HiCacheStorage):
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
             return target_location
-        except FileNotFoundError:
+        except OSError:
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
-            logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+            logger.warning(f"Failed to fetch {suffixed} from HiCacheFile storage.")
             return None
 
     def batch_get(
@@ -889,12 +1021,21 @@ class HiCacheFile(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        suffixed = self._get_suffixed_key(key)
+        if self._unified_suffixes is None:
+            return self._set_file(self._get_suffixed_key(key), value)
+        for suffixed, chunk in self._page_chunks(key, value):
+            if not self._set_file(suffixed, chunk):
+                return False
+        # A small LRU cap may have evicted an earlier chunk while publishing
+        # a later one. Partial pages must not be acknowledged as complete.
+        return self.exists(key)
+
+    def _set_file(self, suffixed: str, value: torch.Tensor) -> bool:
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
-        if self.exists(key):
-            logger.debug(f"Key {key} already exists. Skipped.")
+        if self._file_exists(suffixed):
+            logger.debug(f"Key {suffixed} already exists. Skipped.")
             self._evictor.touch(suffixed, tensor_path)
             return True
 
@@ -903,7 +1044,7 @@ class HiCacheFile(HiCacheStorage):
         try:
             value_bytes = value.numel() * value.element_size()
             # Ask the evictor to admit + reserve disk space (evicting if needed).
-            if not self._evictor.reserve(suffixed, value_bytes, key=key):
+            if not self._evictor.reserve(suffixed, value_bytes, key=suffixed):
                 return False
             reserved = True
 
@@ -915,7 +1056,7 @@ class HiCacheFile(HiCacheStorage):
                 self.metadata_cache.add(suffixed)
             return True
         except Exception as e:
-            logger.error(f"Failed to save tensor {key}: {e}")
+            logger.error(f"Failed to save tensor {suffixed}: {e}")
             # Roll back the reservation and clean up any half-written file.
             if reserved:
                 self._evictor.abort(suffixed)
@@ -941,14 +1082,36 @@ class HiCacheFile(HiCacheStorage):
         return True
 
     def exists(self, key: str) -> bool:
-        key = self._get_suffixed_key(key)
-        if self.metadata_cache is not None and self.metadata_cache.contains(key):
+        return all(self._file_exists(stem) for stem in self._get_component_keys(key))
+
+    def _file_exists(self, key: str) -> bool:
+        # Unified chunks may be shared with a differently sharded deployment,
+        # whose evictor cannot invalidate this instance's metadata cache.
+        if (
+            self._unified_suffixes is None
+            and self.metadata_cache is not None
+            and self.metadata_cache.contains(key)
+        ):
             return True
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
-        if os.path.exists(tensor_path):
+        if self._unified_suffixes is not None:
+            try:
+                size = os.stat(tensor_path).st_size
+                found = all(
+                    size == expected
+                    for suffix, expected in self._unified_chunk_sizes.items()
+                    if key.endswith(suffix)
+                )
+            except OSError:
+                found = False
+        else:
+            found = os.path.exists(tensor_path)
+        if found:
             if self.metadata_cache is not None:
                 self.metadata_cache.add(key)
             return True
+        if self.metadata_cache is not None:
+            self.metadata_cache.remove(key)
         return False
 
     def _collect_existing_component_keys(
@@ -956,10 +1119,22 @@ class HiCacheFile(HiCacheStorage):
         keys: List[str],
         pool_transfers: Optional[List[PoolTransfer]] = None,
     ) -> Set[str]:
-        target_files = {f"{self._get_component_key(key)}.bin" for key in keys}
+        target_files = {
+            f"{stem}.bin" for key in keys for stem in self._get_component_keys(key)
+        }
         for transfer in pool_transfers or []:
             for key in keys:
-                target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
+                target_files.update(
+                    f"{stem}.bin"
+                    for stem in self._get_component_keys(key, transfer.name)
+                )
+
+        if self._unified_suffixes is not None:
+            return {
+                filename
+                for filename in target_files
+                if self._file_exists(filename[:-4])
+            }
 
         if self.metadata_cache is None:
             return {
@@ -989,17 +1164,14 @@ class HiCacheFile(HiCacheStorage):
         existing_files = self._collect_existing_component_keys(keys, pool_transfers)
 
         def has_component(page_idx: int, name: str) -> bool:
-            return (
-                f"{self._get_component_key(keys[page_idx], name)}.bin" in existing_files
+            return all(
+                f"{stem}.bin" in existing_files
+                for stem in self._get_component_keys(keys[page_idx], name)
             )
 
         # Longest contiguous KV prefix present in storage.
         kv_pages = next(
-            (
-                i
-                for i in range(len(keys))
-                if f"{self._get_component_key(keys[i])}.bin" not in existing_files
-            ),
+            (i for i in range(len(keys)) if not has_component(i, PoolName.KV)),
             len(keys),
         )
 
