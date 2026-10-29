@@ -646,11 +646,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
             indices = (h_grid_idx + w_grid).reshape(4, -1)
             weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
-            weights = weights.to(dtype=self.dtype)
-
-            embeds = self.pos_embed(indices)
-            embeds *= weights
-            combined = embeds.sum(dim=0)
+            # Accumulate interpolation in FP32 before rounding the embedding.
+            embeds = self.pos_embed(indices).float() * weights
+            combined = embeds.sum(dim=0).to(self.dtype)
 
             combined = combined.reshape(
                 h // m_size, m_size, w // m_size, m_size, hidden_dim
@@ -758,9 +756,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             ],
             dim=0,
         )
-        weights = torch.stack([w00, w01, w10, w11], dim=0).to(dtype=dtype)
-        embeds = self.pos_embed(indices) * weights[:, :, None]
-        base_embeds = embeds.sum(dim=0)  # [total_hw, C]
+        weights = torch.stack([w00, w01, w10, w11], dim=0)
+        embeds = self.pos_embed(indices).float() * weights[:, :, None]
+        base_embeds = embeds.sum(dim=0).to(dtype)  # [total_hw, C]
 
         # --- 2. temporal repeat (gather) ---
         out_image_id = torch.repeat_interleave(
@@ -860,12 +858,14 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             current_idx = end_idx
 
         idx_tensor = torch.from_numpy(all_indices_np).to(device)
-        weight_tensor = torch.from_numpy(all_weights_np).to(dtype=dtype, device=device)
+        weight_tensor = torch.from_numpy(all_weights_np).to(device=device)
 
         # calculate interpolation
         pos_embeds = self.pos_embed(idx_tensor.view(-1))
         pos_embeds = pos_embeds.view(4, total_patches, -1)
-        patch_pos_embeds = (pos_embeds * weight_tensor.unsqueeze(-1)).sum(dim=0)
+        patch_pos_embeds = (
+            (pos_embeds.float() * weight_tensor.unsqueeze(-1)).sum(dim=0).to(dtype)
+        )
         patch_pos_embeds = patch_pos_embeds.split(patches_size)
         return self._get_position_embedding(
             patch_pos_embeds, temporal_dims, height_dims, width_dims

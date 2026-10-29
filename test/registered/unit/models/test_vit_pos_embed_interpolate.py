@@ -15,7 +15,7 @@ weights / distributed init needed).
 """
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -86,6 +86,55 @@ class TestViTPosEmbedInterpolate(CustomTestCase):
                         grid,
                         f"qwen3_vl/{name}/{dtype}/{device.type}",
                     )
+
+    def test_qwen3_vl_interpolation_accumulates_in_fp32(self):
+        from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel as M
+
+        for device in _devices():
+            for dtype in (torch.bfloat16, torch.float16):
+                with self.subTest(device=device, dtype=dtype):
+                    embedding = nn.Embedding(4, 1, device=device, dtype=dtype)
+                    embedding.weight.data.copy_(
+                        torch.tensor(
+                            [[1.0], [1.5], [2.0], [3.0]], device=device, dtype=dtype
+                        )
+                    )
+                    stub = SimpleNamespace(
+                        num_grid_per_side=2,
+                        spatial_merge_size=2,
+                        pos_embed=embedding,
+                        dtype=dtype,
+                        device=device,
+                    )
+                    expected = (
+                        torch.nn.functional.interpolate(
+                            embedding.weight.float().reshape(1, 1, 2, 2),
+                            size=(4, 4),
+                            mode="bilinear",
+                            align_corners=True,
+                        )
+                        .reshape(2, 2, 2, 2)
+                        .permute(0, 2, 1, 3)
+                        .reshape(-1, 1)
+                        .to(dtype)
+                    )
+                    for method in (
+                        M.fast_pos_embed_interpolate_from_list,
+                        M.fast_pos_embed_interpolate_vectorized,
+                    ):
+                        actual = method(stub, [[1, 4, 4]])
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    stub.align_corners = True
+                    for name in (
+                        "_get_interpolation_indices",
+                        "_calculate_indices_and_weights",
+                        "_get_position_embedding",
+                    ):
+                        setattr(stub, name, MethodType(getattr(M, name), stub))
+                    actual = M.fast_pos_embed_interpolate(
+                        stub, torch.tensor([[1, 4, 4]])
+                    )
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_moss_vl_vectorized_matches_loop(self):
         try:
