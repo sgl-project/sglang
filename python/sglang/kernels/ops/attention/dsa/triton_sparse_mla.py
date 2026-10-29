@@ -97,6 +97,25 @@ def _async_copy_is_harmful() -> bool:
     return _async_copy_is_harmful_on_device(torch.cuda.current_device())
 
 
+def _no_async_copy_scope_is_effective() -> bool:
+    """Whether launches inside :func:`_no_async_copy` lower without async copies.
+
+    False when an explicit TRITON_HIP_USE_ASYNC_COPY=1 overrides the scope, or
+    when this Triton exposes no knob to check (be conservative).
+    """
+    try:
+        from triton import knobs
+    except ImportError:
+        return False
+
+    amd_knobs = getattr(knobs, "amd", None)
+    if not hasattr(amd_knobs, "use_async_copy"):
+        return False
+    if amd_knobs.use_async_copy is not None:
+        return not amd_knobs.use_async_copy
+    return _async_copy_is_harmful()
+
+
 @contextlib.contextmanager
 def _no_async_copy():
     """Compile enclosed DSA launches without direct-to-LDS async copies.
@@ -241,6 +260,75 @@ def _gfx950_sparse_mla_kv_splits(
         return min(kv_splits * 2, max_kv_splits)
 
     return kv_splits
+
+
+def _is_gfx950_decode_fp8_64h(
+    kv_dtype: torch.dtype,
+    H: int,
+    d_v: int,
+    d_tail: int,
+    kv_dim: int,
+) -> bool:
+    """Gate for the gfx950 FP8 decode shapes with a wide head count.
+
+    Distinct from :func:`_is_gfx950_sparse_mla_fp8` (which covers the TP4/TP8
+    prefill shapes with H in (8, 16)); this one guards the residency-aware
+    geometry table used for GLM-5.2 decode, where H is a multiple of 32.
+    """
+    return (
+        kv_dtype != torch.bfloat16
+        and H % 32 == 0
+        and H >= 32
+        and d_v == 512
+        and d_tail == 64
+        and kv_dim == 576
+        and is_gfx95_supported()
+    )
+
+
+def _decode_geometry(
+    seq: int, H: int, base_ctas: int, num_cu: int
+) -> tuple[int, int] | None:
+    """Residency-aware (BLOCK_H, PIPE_STAGES) for gfx950 FP8 decode launches.
+
+    ``base_ctas`` is the BLOCK_H=16 CTA count. Returning ``None`` keeps the
+    caller's existing dispatch. The ladder is explicit on purpose: a cost model
+    that maximizes active CUs picks BLOCK_H=16 at bs12 (measured slower), and a
+    "prefer the larger BLOCK_H" rule regresses bs10 by 7.5 % (also measured).
+    """
+    if base_ctas <= num_cu:
+        return None  # already one round at BLOCK_H=16; keep today's geometry.
+    if base_ctas > 4 * num_cu:
+        return None  # prefill-sized launch: keep today's behaviour.
+    if H % 32 == 0 and seq * (H // 32) <= num_cu:
+        return (32, 2)
+    if base_ctas <= 2 * num_cu:
+        return (16, 2)
+    return None
+
+
+def _decode_splitk_splits(seq: int, topk: int, block_k: int, num_cu: int) -> int | None:
+    """KV splits for the gfx950 FP8 decode plan at BLOCK_H == H.
+
+    At BLOCK_H == H the partial grid is ``(seq, 1, s)``, so a split buys a CTA
+    without duplicating the head-block KV read -- the one geometry where extra
+    parallelism is free. The CTA count is ``seq * s``, and every useful geometry
+    here runs 1 CTA/CU, so wall time is ``ceil(CTAs / num_cu)`` rounds: one split
+    past ``num_cu // seq`` adds a whole round (~35 % measured). That makes this a
+    cliff, not a curve -- compute it, never tabulate it, and never route it
+    through ``_kv_splits_heuristic`` (which rounds down to a power of two and so
+    cannot express s=3 or s=5).
+
+    Returns ``None`` when fewer than two splits are available: at ``kv_splits ==
+    1`` the split-K launcher falls through to the fused kernel, and fused at
+    BLOCK_H == H measured 28 % slower than today's geometry.
+    """
+    splits = min(
+        num_cu // max(seq, 1),
+        (topk + block_k - 1) // block_k,
+        max(1, topk // _PREFERRED_BLOCK_K),
+    )
+    return splits if splits >= 2 else None
 
 
 def _gfx950_sparse_mla_num_warps(
@@ -814,10 +902,74 @@ def _sparse_mla_split_k_kernel(
     KV_SPLITS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    H_PADDED: tl.constexpr = 0,
+    USE_I64_PAGE: tl.constexpr = True,
+    DENSE_TILES: tl.constexpr = False,
+    ROTATE_IDX: tl.constexpr = False,
+    PIPE_STAGES: tl.constexpr = 3,
+    GROUP_W: tl.constexpr = 0,
+    ACC_INPLACE: tl.constexpr = False,
+    KV_CACHE_MOD: tl.constexpr = "",
+    DECOUPLE_DOTS: tl.constexpr = False,
+    PARTIAL_DQ: tl.constexpr = False,
+    LEAN_EPILOGUE: tl.constexpr = False,
+    PARTIAL_STORE_MOD: tl.constexpr = "",
+    FIXED_TRIP: tl.constexpr = False,
     topk_length_ptr=None,
     USE_TOPK_LENGTH: tl.constexpr = False,
 ):
-    """Split-K partial kernel. grid=(seq, head_blocks, kv_splits)."""
+    """Split-K partial kernel. grid=(seq, head_blocks, kv_splits).
+
+    ``GROUP_W`` is the width of one value-dimension group (0 = the legacy 128).
+    The gathered KV row is 576 B of which ``D_V`` is read as ``NUM_GROUPS``
+    tiles; a wider group means fewer, larger loads per gathered row, which is
+    what a latency-bound gather wants.
+
+    ``DECOUPLE_DOTS`` (requires ``ACC_INPLACE``) puts the P@V dots in their own
+    ``scf.if`` region. Triton's AMD AccelerateMatmul treats a dot whose result
+    feeds another dot's A operand *in the same region* as an attention chain
+    and pins it to warpsPerCTA = [num_warps, 1]. At BLOCK_H = 64 with 4 warps
+    and 32x32 MFMAs that layout has only two 32-row tiles for four warps, so
+    every warp computes Q@K^T twice over (18 MFMAs/warp/tile instead of 9) and
+    reads twice the K^T operand from LDS. Outside the chain pattern the
+    generic heuristic picks [2, 2] for Q@K^T and [1, 4] for P@V (no duplicated
+    MFMAs, no duplicated V operand reads); the price is a cross-warp row
+    max/sum, which is far cheaper. Measured on the GLM-5.2 decode shapes
+    (partial + reduce per call, MI355X): 42.4 -> 33.5 us at T=60 and
+    50.2 -> 37.7 us at T=72. Must be compiled without direct-to-LDS async
+    copies -- the launcher enforces that (see ``split_async_scope``).
+
+    ``PARTIAL_DQ`` stores each (row, split) slab of ``acc_partial`` as
+    ``[d // 4][h][d % 4]`` instead of ``[h][d]`` (read back by
+    :func:`_sparse_mla_reduce_dq_kernel`). The P@V result sits in the
+    transposed MFMA C layout -- a lane owns 4 consecutive ``d`` of one head --
+    so in ``[h][d]`` every dword store scatters into 32 separate 8 B pieces,
+    one per head row, and the L1->L2 request count (not the bytes) made the
+    store tail cost ~3.5 us per call. Head-interleaved, lanes 0-31 of a store
+    cover one whole 128 B line. Same values, same bytes; requires
+    ``BLOCK_H == H`` (no head mask). ``LEAN_EPILOGUE`` drops the
+    ``l_i > 0`` select on the accumulators: every CTA that reaches the
+    epilogue ran at least one tile, and a tile always adds ``exp2(0) = 1`` to
+    ``l_i`` (all-masked tiles included), so the select is dead.
+
+    ``PARTIAL_STORE_MOD`` is the cache modifier of the ``lse_partial`` /
+    ``acc_partial`` stores. ``".wt"`` (write-through) leaves no dirty partial
+    lines in L2: the release at the end of the kernel otherwise writes them
+    all back before the reduce can be dispatched, which put ~0.8 us on every
+    call's kernel-to-kernel gap (measured with per-CTA ``s_memrealtime``
+    stamps: 1.9 -> 1.0 us at T=60).
+
+    ``FIXED_TRIP`` runs every CTA's tile loop for the compile-time count
+    ``cdiv(topk, KV_SPLITS * BLOCK_K)``; tiles past ``topk`` (only the last
+    split can have them) are masked by the index load and add exactly
+    nothing (``alpha == 1``, ``p == 0``). With a runtime trip count the
+    software pipeliner must predicate its peeled stages for a possibly empty
+    loop, which costs ~130 ``v_cndmask`` selects on the accumulators plus
+    branches in every CTA's critical path.
+    """
+    # FIXED_TRIP's compile-time trip count covers the whole topk; a per-row
+    # topk_length bound is only honoured by the runtime trip count.
+    tl.static_assert(not (FIXED_TRIP and USE_TOPK_LENGTH))
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
     pid_k = tl.program_id(2)
@@ -825,7 +977,8 @@ def _sparse_mla_split_k_kernel(
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
     dt = tl.arange(0, D_TAIL)
-    g = tl.arange(0, _G)
+    GW: tl.constexpr = _G if GROUP_W == 0 else GROUP_W
+    g = tl.arange(0, GW)
 
     input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
     if USE_FP8_DOT:
@@ -837,19 +990,19 @@ def _sparse_mla_split_k_kernel(
     q0 = tl.load(qn_row + g[None, :], mask=h_mask[:, None], other=0.0).to(input_type)
     if NUM_GROUPS >= 2:
         q1 = tl.load(
-            qn_row + (_G + g)[None, :],
+            qn_row + (GW + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(input_type)
     if NUM_GROUPS >= 3:
         q2 = tl.load(
-            qn_row + (2 * _G + g)[None, :],
+            qn_row + (2 * GW + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(input_type)
     if NUM_GROUPS >= 4:
         q3 = tl.load(
-            qn_row + (3 * _G + g)[None, :],
+            qn_row + (3 * GW + g)[None, :],
             mask=h_mask[:, None],
             other=0.0,
         ).to(input_type)
@@ -878,42 +1031,107 @@ def _sparse_mla_split_k_kernel(
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    acc0 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
+    acc0 = tl.zeros((BLOCK_H, GW), dtype=tl.float32)
     if NUM_GROUPS >= 2:
-        acc1 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
+        acc1 = tl.zeros((BLOCK_H, GW), dtype=tl.float32)
     if NUM_GROUPS >= 3:
-        acc2 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
+        acc2 = tl.zeros((BLOCK_H, GW), dtype=tl.float32)
     if NUM_GROUPS >= 4:
-        acc3 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
+        acc3 = tl.zeros((BLOCK_H, GW), dtype=tl.float32)
 
     k_offs = tl.arange(0, BLOCK_K)
-    for j in tl.range(tile_start, tile_end, num_stages=3):
+    idx_row = idx_ptr + t * topk
+    # Rotated index prefetch: issue tile j+1's slot load before tile j's KV
+    # gather so the two-level dependent chain (idx -> address -> 576 B row)
+    # overlaps instead of serializing.  DENSE_TILES drops the in-range
+    # predicate when the launcher knows topk % BLOCK_K == 0; the slot >= 0
+    # test is kept because it is data-dependent.
+    slot_next = tl.zeros((BLOCK_K,), dtype=tl.int32)
+    if ROTATE_IDX:
+        p0 = tile_start * BLOCK_K + k_offs
+        if DENSE_TILES:
+            slot_next = tl.load(idx_row + p0)
+        else:
+            slot_next = tl.load(idx_row + p0, mask=p0 < topk, other=-1)
+    # FIXED_TRIP (see the docstring): a compile-time trip count, with the
+    # tiles past ``topk`` masked through the index load below.
+    if FIXED_TRIP:
+        loop_lo = 0
+        loop_hi: tl.constexpr = (topk + KV_SPLITS * BLOCK_K - 1) // (
+            KV_SPLITS * BLOCK_K
+        )
+    else:
+        loop_lo = tile_start
+        loop_hi = tile_end
+    for jj in tl.range(loop_lo, loop_hi, num_stages=PIPE_STAGES):
+        if FIXED_TRIP:
+            j = tile_start + jj
+        else:
+            j = jj
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
-        valid = k_pos < topk
 
-        slot = tl.load(idx_ptr + t * topk + k_pos, mask=valid, other=0)
-        valid = valid & (slot >= 0)
-        page = tl.where(valid, slot, 0).to(tl.int64)
+        if ROTATE_IDX:
+            slot = slot_next
+            p_n = k_pos + BLOCK_K
+            if DENSE_TILES:
+                slot_next = tl.load(idx_row + p_n, mask=(j + 1) < tile_end, other=-1)
+            else:
+                slot_next = tl.load(
+                    idx_row + p_n,
+                    mask=((j + 1) < tile_end) & (p_n < topk),
+                    other=-1,
+                )
+        else:
+            if DENSE_TILES and not FIXED_TRIP:
+                slot = tl.load(idx_row + k_pos)
+            else:
+                # Under FIXED_TRIP the last split may run past ``topk``: its
+                # extra tiles read slot -1, i.e. fully masked.
+                slot = tl.load(idx_row + k_pos, mask=k_pos < topk, other=-1)
 
-        kv_base = kv_ptr + page[:, None] * KV_DIM
-        kv0 = tl.load(kv_base + g[None, :], mask=valid[:, None], other=0.0).to(
-            input_type
-        )
+        if DENSE_TILES:
+            valid = slot >= 0
+        else:
+            valid = (k_pos < topk) & (slot >= 0)
+        page = tl.where(valid, slot, 0)
+        if USE_I64_PAGE:
+            kv_base = kv_ptr + page[:, None].to(tl.int64) * KV_DIM
+        else:
+            kv_base = kv_ptr + page[:, None] * KV_DIM
+
+        kv0 = tl.load(
+            kv_base + g[None, :],
+            mask=valid[:, None],
+            other=0.0,
+            cache_modifier=KV_CACHE_MOD,
+        ).to(input_type)
         if NUM_GROUPS >= 2:
             kv1 = tl.load(
-                kv_base + (_G + g)[None, :], mask=valid[:, None], other=0.0
+                kv_base + (GW + g)[None, :],
+                mask=valid[:, None],
+                other=0.0,
+                cache_modifier=KV_CACHE_MOD,
             ).to(input_type)
         if NUM_GROUPS >= 3:
             kv2 = tl.load(
-                kv_base + (2 * _G + g)[None, :], mask=valid[:, None], other=0.0
+                kv_base + (2 * GW + g)[None, :],
+                mask=valid[:, None],
+                other=0.0,
+                cache_modifier=KV_CACHE_MOD,
             ).to(input_type)
         if NUM_GROUPS >= 4:
             kv3 = tl.load(
-                kv_base + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0
+                kv_base + (3 * GW + g)[None, :],
+                mask=valid[:, None],
+                other=0.0,
+                cache_modifier=KV_CACHE_MOD,
             ).to(input_type)
         kv_tail = tl.load(
-            kv_base + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
+            kv_base + (D_V + dt)[None, :],
+            mask=valid[:, None],
+            other=0.0,
+            cache_modifier=KV_CACHE_MOD,
         ).to(input_type)
 
         scores = tl.dot(q0, tl.trans(kv0))
@@ -937,63 +1155,162 @@ def _sparse_mla_split_k_kernel(
             p_dot = (p * fp8_max).to(input_type)
         else:
             p_dot = p.to(input_type)
-        acc0 = acc0 * alpha[:, None] + tl.dot(p_dot, kv0).to(tl.float32) * p_dot_scale
-        if NUM_GROUPS >= 2:
-            acc1 = (
-                acc1 * alpha[:, None] + tl.dot(p_dot, kv1).to(tl.float32) * p_dot_scale
+        if ACC_INPLACE:
+            # D = A*B + C folds the rescaled accumulator straight into the
+            # MFMA's C operand; the uniform 1/fp8_max factor is hoisted into
+            # the epilogue (algebraically exact -- every increment carries it,
+            # and the alpha rescale is linear).
+            if DECOUPLE_DOTS:
+                # Region fence for the P@V dots (see DECOUPLE_DOTS in the
+                # docstring). The condition is always true -- fp8_max is the
+                # launcher's 240/448 -- and both arms are identical, so this
+                # is exactly the plain in-place update.
+                if fp8_max > 0.0:
+                    acc0 = tl.dot(p_dot, kv0, acc0 * alpha[:, None])
+                    if NUM_GROUPS >= 2:
+                        acc1 = tl.dot(p_dot, kv1, acc1 * alpha[:, None])
+                    if NUM_GROUPS >= 3:
+                        acc2 = tl.dot(p_dot, kv2, acc2 * alpha[:, None])
+                    if NUM_GROUPS >= 4:
+                        acc3 = tl.dot(p_dot, kv3, acc3 * alpha[:, None])
+                else:
+                    acc0 = tl.dot(p_dot, kv0, acc0 * alpha[:, None])
+                    if NUM_GROUPS >= 2:
+                        acc1 = tl.dot(p_dot, kv1, acc1 * alpha[:, None])
+                    if NUM_GROUPS >= 3:
+                        acc2 = tl.dot(p_dot, kv2, acc2 * alpha[:, None])
+                    if NUM_GROUPS >= 4:
+                        acc3 = tl.dot(p_dot, kv3, acc3 * alpha[:, None])
+            else:
+                acc0 = tl.dot(p_dot, kv0, acc0 * alpha[:, None])
+                if NUM_GROUPS >= 2:
+                    acc1 = tl.dot(p_dot, kv1, acc1 * alpha[:, None])
+                if NUM_GROUPS >= 3:
+                    acc2 = tl.dot(p_dot, kv2, acc2 * alpha[:, None])
+                if NUM_GROUPS >= 4:
+                    acc3 = tl.dot(p_dot, kv3, acc3 * alpha[:, None])
+        else:
+            acc0 = (
+                acc0 * alpha[:, None] + tl.dot(p_dot, kv0).to(tl.float32) * p_dot_scale
             )
-        if NUM_GROUPS >= 3:
-            acc2 = (
-                acc2 * alpha[:, None] + tl.dot(p_dot, kv2).to(tl.float32) * p_dot_scale
-            )
-        if NUM_GROUPS >= 4:
-            acc3 = (
-                acc3 * alpha[:, None] + tl.dot(p_dot, kv3).to(tl.float32) * p_dot_scale
-            )
+            if NUM_GROUPS >= 2:
+                acc1 = (
+                    acc1 * alpha[:, None]
+                    + tl.dot(p_dot, kv1).to(tl.float32) * p_dot_scale
+                )
+            if NUM_GROUPS >= 3:
+                acc2 = (
+                    acc2 * alpha[:, None]
+                    + tl.dot(p_dot, kv2).to(tl.float32) * p_dot_scale
+                )
+            if NUM_GROUPS >= 4:
+                acc3 = (
+                    acc3 * alpha[:, None]
+                    + tl.dot(p_dot, kv3).to(tl.float32) * p_dot_scale
+                )
         m_i = m_new
         l_i = l_new
 
     neg_large = -3.4028234663852886e38
     denom = tl.maximum(l_i, 1.0e-30)
     inv_denom = 1.0 / denom
+    if ACC_INPLACE:
+        out_scale = inv_denom * p_dot_scale
+    else:
+        out_scale = inv_denom
     has_data = l_i > 0.0
-    acc0 = tl.where(has_data[:, None], acc0 * inv_denom[:, None], 0.0)
-    if NUM_GROUPS >= 2:
-        acc1 = tl.where(has_data[:, None], acc1 * inv_denom[:, None], 0.0)
-    if NUM_GROUPS >= 3:
-        acc2 = tl.where(has_data[:, None], acc2 * inv_denom[:, None], 0.0)
-    if NUM_GROUPS >= 4:
-        acc3 = tl.where(has_data[:, None], acc3 * inv_denom[:, None], 0.0)
+    if LEAN_EPILOGUE:
+        acc0 = acc0 * out_scale[:, None]
+        if NUM_GROUPS >= 2:
+            acc1 = acc1 * out_scale[:, None]
+        if NUM_GROUPS >= 3:
+            acc2 = acc2 * out_scale[:, None]
+        if NUM_GROUPS >= 4:
+            acc3 = acc3 * out_scale[:, None]
+    else:
+        acc0 = tl.where(has_data[:, None], acc0 * out_scale[:, None], 0.0)
+        if NUM_GROUPS >= 2:
+            acc1 = tl.where(has_data[:, None], acc1 * out_scale[:, None], 0.0)
+        if NUM_GROUPS >= 3:
+            acc2 = tl.where(has_data[:, None], acc2 * out_scale[:, None], 0.0)
+        if NUM_GROUPS >= 4:
+            acc3 = tl.where(has_data[:, None], acc3 * out_scale[:, None], 0.0)
 
     lse = tl.where(has_data, tl.log2(l_i) + m_i, neg_large)
 
-    H_padded = tl.cdiv(H, BLOCK_H) * BLOCK_H
+    # H_PADDED is supplied by the launcher so the partial-buffer layout is one
+    # number shared with the reduce kernel instead of two recomputations that
+    # only agree at BLOCK_H == 16.
+    H_padded: tl.constexpr = (
+        tl.cdiv(H, BLOCK_H) * BLOCK_H if H_PADDED == 0 else H_PADDED
+    )
     lse_base = t * KV_SPLITS * H_padded + pid_k * H_padded
-    tl.store(lse_partial_ptr + lse_base + h_offs, lse, mask=h_mask)
+    tl.store(
+        lse_partial_ptr + lse_base + h_offs,
+        lse,
+        mask=h_mask,
+        cache_modifier=PARTIAL_STORE_MOD,
+    )
 
+    partial_ty: tl.constexpr = tl.bfloat16
     ap_base = t * KV_SPLITS * H_padded * D_V + pid_k * H_padded * D_V
+    if PARTIAL_DQ:
+        tl.static_assert(H_padded == H)
+        tl.static_assert(BLOCK_H == H)
+        # [d // 4][h][d % 4]: see PARTIAL_DQ in the docstring.
+        hq = h_offs[:, None] * 4
+        gq = (g // 4)[None, :] * (4 * H_padded) + (g % 4)[None, :]
+        GQ: tl.constexpr = (GW // 4) * (4 * H_padded)
+        tl.store(
+            acc_partial_ptr + ap_base + gq + hq,
+            acc0.to(partial_ty),
+            cache_modifier=PARTIAL_STORE_MOD,
+        )
+        if NUM_GROUPS >= 2:
+            tl.store(
+                acc_partial_ptr + ap_base + GQ + gq + hq,
+                acc1.to(partial_ty),
+                cache_modifier=PARTIAL_STORE_MOD,
+            )
+        if NUM_GROUPS >= 3:
+            tl.store(
+                acc_partial_ptr + ap_base + 2 * GQ + gq + hq,
+                acc2.to(partial_ty),
+                cache_modifier=PARTIAL_STORE_MOD,
+            )
+        if NUM_GROUPS >= 4:
+            tl.store(
+                acc_partial_ptr + ap_base + 3 * GQ + gq + hq,
+                acc3.to(partial_ty),
+                cache_modifier=PARTIAL_STORE_MOD,
+            )
+        return
     tl.store(
         acc_partial_ptr + ap_base + h_offs[:, None] * D_V + g[None, :],
-        acc0.to(tl.bfloat16),
+        acc0.to(partial_ty),
         mask=h_mask[:, None],
+        cache_modifier=PARTIAL_STORE_MOD,
     )
     if NUM_GROUPS >= 2:
         tl.store(
-            acc_partial_ptr + ap_base + h_offs[:, None] * D_V + (_G + g)[None, :],
-            acc1.to(tl.bfloat16),
+            acc_partial_ptr + ap_base + h_offs[:, None] * D_V + (GW + g)[None, :],
+            acc1.to(partial_ty),
             mask=h_mask[:, None],
+            cache_modifier=PARTIAL_STORE_MOD,
         )
     if NUM_GROUPS >= 3:
         tl.store(
-            acc_partial_ptr + ap_base + h_offs[:, None] * D_V + (2 * _G + g)[None, :],
-            acc2.to(tl.bfloat16),
+            acc_partial_ptr + ap_base + h_offs[:, None] * D_V + (2 * GW + g)[None, :],
+            acc2.to(partial_ty),
             mask=h_mask[:, None],
+            cache_modifier=PARTIAL_STORE_MOD,
         )
     if NUM_GROUPS >= 4:
         tl.store(
-            acc_partial_ptr + ap_base + h_offs[:, None] * D_V + (3 * _G + g)[None, :],
-            acc3.to(tl.bfloat16),
+            acc_partial_ptr + ap_base + h_offs[:, None] * D_V + (3 * GW + g)[None, :],
+            acc3.to(partial_ty),
             mask=h_mask[:, None],
+            cache_modifier=PARTIAL_STORE_MOD,
         )
 
 
@@ -1009,12 +1326,20 @@ def _sparse_mla_reduce_kernel(
     ACTIVE_SPLITS_POW2: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    H_PADDED: tl.constexpr = 0,
+    BLOCK_HR: tl.constexpr = 1,
     lse_out_ptr=None,
     STORE_LSE: tl.constexpr = False,
 ):
-    """Reduce split-K partials via log-space combine. grid=(seq, H, d_v_chunks)."""
+    """Reduce split-K partials via log-space combine.
+
+    grid=(seq, cdiv(H, BLOCK_HR), d_v_chunks).  At ``BLOCK_HR > 1`` one CTA owns
+    a run of heads, which are contiguous in ``acc_partial``: the per-split read
+    becomes a single ``BLOCK_HR * D_CHUNK`` burst instead of ``BLOCK_HR``
+    separate 1 KiB strided reads, and the CTA count (and therefore the dispatch
+    cost this kernel is limited by, not bytes) drops by the same factor.
+    """
     t = tl.program_id(0)
-    h = tl.program_id(1)
     dc = tl.program_id(2)
 
     d_offs = dc * D_CHUNK + tl.arange(0, D_CHUNK)
@@ -1025,43 +1350,154 @@ def _sparse_mla_reduce_kernel(
     k_mask = k_offs < ACTIVE_SPLITS
     d_mask = d_offs < D_V
 
-    H_padded = tl.cdiv(H, 16) * 16
+    H_padded: tl.constexpr = tl.cdiv(H, 16) * 16 if H_PADDED == 0 else H_PADDED
 
     lse_base = t * KV_SPLITS * H_padded
+    ap_base = t * KV_SPLITS * H_padded * D_V
+
+    if BLOCK_HR == 1:
+        h = tl.program_id(1)
+        lse_p = tl.load(
+            lse_partial_ptr + lse_base + k_offs * H_padded + h,
+            mask=k_mask,
+            other=-3.4e38,
+        )
+        a_p = tl.load(
+            acc_partial_ptr
+            + ap_base
+            + k_offs[:, None] * H_padded * D_V
+            + h * D_V
+            + d_offs[None, :],
+            mask=k_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        lse_max = tl.max(lse_p, axis=0)
+        weights = tl.exp2(lse_p - lse_max)
+        w_sum = tl.sum(weights, axis=0)
+        scale = tl.exp2(lse_p - lse_max - tl.log2(tl.maximum(w_sum, 1.0e-30)))
+        out = tl.sum(a_p * scale[:, None], axis=0)
+
+        tl.store(
+            out_ptr + t * H * D_V + h * D_V + d_offs,
+            out.to(tl.bfloat16),
+            mask=d_mask,
+        )
+        if STORE_LSE:
+            if dc == 0:
+                tl.store(
+                    lse_out_ptr + t * H + h,
+                    lse_max + tl.log2(tl.maximum(w_sum, 1.0e-30)),
+                )
+    else:
+        h_offs = tl.program_id(1) * BLOCK_HR + tl.arange(0, BLOCK_HR)
+        h_mask = h_offs < H
+        lse_p = tl.load(
+            lse_partial_ptr + lse_base + k_offs[:, None] * H_padded + h_offs[None, :],
+            mask=k_mask[:, None] & h_mask[None, :],
+            other=-3.4e38,
+        )
+        a_p = tl.load(
+            acc_partial_ptr
+            + ap_base
+            + k_offs[:, None, None] * (H_padded * D_V)
+            + h_offs[None, :, None] * D_V
+            + d_offs[None, None, :],
+            mask=k_mask[:, None, None] & h_mask[None, :, None] & d_mask[None, None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        lse_max = tl.max(lse_p, axis=0)
+        weights = tl.exp2(lse_p - lse_max[None, :])
+        w_sum = tl.sum(weights, axis=0)
+        scale = tl.exp2(
+            lse_p - lse_max[None, :] - tl.log2(tl.maximum(w_sum, 1.0e-30))[None, :]
+        )
+        out = tl.sum(a_p * scale[:, :, None], axis=0)
+
+        tl.store(
+            out_ptr + t * H * D_V + h_offs[:, None] * D_V + d_offs[None, :],
+            out.to(tl.bfloat16),
+            mask=h_mask[:, None] & d_mask[None, :],
+        )
+        if STORE_LSE:
+            if dc == 0:
+                tl.store(
+                    lse_out_ptr + t * H + h_offs,
+                    lse_max + tl.log2(tl.maximum(w_sum, 1.0e-30)),
+                    mask=h_mask,
+                )
+
+
+@triton.jit
+def _sparse_mla_reduce_dq_kernel(
+    lse_partial_ptr,
+    acc_partial_ptr,
+    out_ptr,
+    H: tl.constexpr,
+    D_V: tl.constexpr,
+    KV_SPLITS: tl.constexpr,
+    ACTIVE_SPLITS: tl.constexpr,
+    ACTIVE_SPLITS_POW2: tl.constexpr,
+    D_CHUNK: tl.constexpr,
+    H_PADDED: tl.constexpr,
+    OUT_STORE_MOD: tl.constexpr = "",
+):
+    """Reduce split-K partials stored in the ``PARTIAL_DQ`` layout.
+
+    grid=(seq, D_V // D_CHUNK). One CTA owns every head of one ``D_CHUNK``-wide
+    slice of one row; per split it reads one contiguous
+    ``(D_CHUNK // 4) x H_PADDED x 4`` block, indexed in memory order
+    ``[k][d // 4][h][d % 4]`` so a wave's loads walk whole 256 B runs. The
+    log-space combine is the same expression, in the same order, as
+    :func:`_sparse_mla_reduce_kernel`. ``OUT_STORE_MOD`` is the cache modifier
+    of the output store (``".wt"`` on the decode plan: see PARTIAL_STORE_MOD
+    of :func:`_sparse_mla_split_k_kernel`).
+    """
+    t = tl.program_id(0)
+    c = tl.program_id(1)
+    DQ: tl.constexpr = D_CHUNK // 4
+    k_offs = tl.arange(0, ACTIVE_SPLITS_POW2)
+    k_mask = k_offs < ACTIVE_SPLITS
+    h_offs = tl.arange(0, H_PADDED)
+    h_mask = h_offs < H
+    q_offs = tl.arange(0, DQ)
+    e_offs = tl.arange(0, 4)
+
+    lse_base = t * KV_SPLITS * H_PADDED
+    ap_base = t * KV_SPLITS * H_PADDED * D_V
     lse_p = tl.load(
-        lse_partial_ptr + lse_base + k_offs * H_padded + h,
-        mask=k_mask,
+        lse_partial_ptr + lse_base + k_offs[:, None] * H_PADDED + h_offs[None, :],
+        mask=k_mask[:, None] & h_mask[None, :],
         other=-3.4e38,
     )
-
-    ap_base = t * KV_SPLITS * H_padded * D_V
+    a_off = (
+        k_offs[:, None, None, None] * (H_PADDED * D_V)
+        + (c * DQ + q_offs)[None, :, None, None] * (4 * H_PADDED)
+        + h_offs[None, None, :, None] * 4
+        + e_offs[None, None, None, :]
+    )
     a_p = tl.load(
-        acc_partial_ptr
-        + ap_base
-        + k_offs[:, None] * H_padded * D_V
-        + h * D_V
-        + d_offs[None, :],
-        mask=k_mask[:, None] & d_mask[None, :],
+        acc_partial_ptr + ap_base + a_off,
+        mask=k_mask[:, None, None, None],
         other=0.0,
     ).to(tl.float32)
 
     lse_max = tl.max(lse_p, axis=0)
-    weights = tl.exp2(lse_p - lse_max)
+    weights = tl.exp2(lse_p - lse_max[None, :])
     w_sum = tl.sum(weights, axis=0)
-    scale = tl.exp2(lse_p - lse_max - tl.log2(tl.maximum(w_sum, 1.0e-30)))
-    out = tl.sum(a_p * scale[:, None], axis=0)
-
-    tl.store(
-        out_ptr + t * H * D_V + h * D_V + d_offs,
-        out.to(tl.bfloat16),
-        mask=d_mask,
+    scale = tl.exp2(
+        lse_p - lse_max[None, :] - tl.log2(tl.maximum(w_sum, 1.0e-30))[None, :]
     )
-    if STORE_LSE:
-        if dc == 0:
-            tl.store(
-                lse_out_ptr + t * H + h,
-                lse_max + tl.log2(tl.maximum(w_sum, 1.0e-30)),
-            )
+    out = tl.sum(a_p * scale[:, None, :, None], axis=0)
+    out = tl.reshape(tl.permute(out, (1, 0, 2)), (H_PADDED, D_CHUNK))
+    d_offs = c * D_CHUNK + tl.arange(0, D_CHUNK)
+    tl.store(
+        out_ptr + t * H * D_V + h_offs[:, None] * D_V + d_offs[None, :],
+        out.to(tl.bfloat16),
+        mask=h_mask[:, None],
+        cache_modifier=OUT_STORE_MOD,
+    )
 
 
 def _triton_sparse_mla_fwd_splitk(
@@ -1074,6 +1510,12 @@ def _triton_sparse_mla_fwd_splitk(
     kv_splits: int,
     topk_length: torch.Tensor | None = None,
     use_topk_length: bool = False,
+    block_h: int | None = None,
+    pipe_stages: int | None = None,
+    allow_async_copy: bool = False,
+    reduce_d_chunk: int | None = None,
+    reduce_num_warps: int | None = None,
+    decode_tuned: bool = False,
 ) -> torch.Tensor:
     """Split-K path for short sequences."""
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
@@ -1096,7 +1538,11 @@ def _triton_sparse_mla_fwd_splitk(
     q_nope, stride_qn_t, stride_qn_h = _row_strides(q_nope)
     q_rope, stride_qr_t, stride_qr_h = _row_strides(q_rope)
 
-    BLOCK_H = 16
+    BLOCK_H = 16 if block_h is None else block_h
+    # _sparse_mla_reduce_kernel recomputes H_padded as cdiv(H, 16) * 16, which
+    # only matches the h_padded allocated below when BLOCK_H divides H evenly
+    # at 16. Keep the partial-buffer layout provably consistent.
+    assert BLOCK_H == 16 or H % BLOCK_H == 0, f"BLOCK_H={BLOCK_H} must divide H={H}"
     BLOCK_K = _sparse_mla_block_k(kv)
     n_head_blocks = (H + BLOCK_H - 1) // BLOCK_H
     h_padded = n_head_blocks * BLOCK_H
@@ -1128,34 +1574,47 @@ def _triton_sparse_mla_fwd_splitk(
         # gate, since narrowing only paid off in this configuration.
         i32_page_safe = _page_offsets_fit_i32(kv.shape[0], kv_dim)
         i32_page_tuned = optimize_gfx950_fp8 and fused_num_warps == 2 and topk >= 2048
-        _sparse_mla_fused_kernel[(seq, n_head_blocks)](
-            q_nope,
-            q_rope,
-            kv,
-            idx_flat,
-            topk_length_ptr,
-            out,
-            qk_scale,
-            _FP8_MAX,
-            topk=topk,
-            H=H,
-            KV_DIM=kv_dim,
-            D_V=d_v,
-            D_TAIL=d_tail,
-            NUM_GROUPS=num_groups,
-            STRIDE_QN_T=stride_qn_t,
-            STRIDE_QN_H=stride_qn_h,
-            STRIDE_QR_T=stride_qr_t,
-            STRIDE_QR_H=stride_qr_h,
-            USE_FP8_DOT=use_fp8_dot,
-            USE_TOPK_LENGTH=use_topk_length,
-            BLOCK_H=BLOCK_H,
-            BLOCK_K=BLOCK_K,
-            USE_I64_PAGE=not (i32_page_safe and i32_page_tuned),
-            PIPE_STAGES=1 if use_topk_length else 3,
-            num_warps=fused_num_warps,
-            num_stages=2,
+        fused_pipe_stages = (
+            (1 if use_topk_length else 3) if pipe_stages is None else pipe_stages
         )
+        # Direct-to-LDS staging of the gathered KV operand is a loss for the
+        # deep-prologue fused variant on an fp8 cache (measured); the shallower
+        # pipelines are neutral, and a bf16 cache measured 1.7x slower without
+        # it, so those keep their compile-cache keys.
+        fused_async_scope = (
+            _no_async_copy()
+            if fused_pipe_stages >= 3 and is_fp8
+            else contextlib.nullcontext()
+        )
+        with fused_async_scope:
+            _sparse_mla_fused_kernel[(seq, n_head_blocks)](
+                q_nope,
+                q_rope,
+                kv,
+                idx_flat,
+                topk_length_ptr,
+                out,
+                qk_scale,
+                _FP8_MAX,
+                topk=topk,
+                H=H,
+                KV_DIM=kv_dim,
+                D_V=d_v,
+                D_TAIL=d_tail,
+                NUM_GROUPS=num_groups,
+                STRIDE_QN_T=stride_qn_t,
+                STRIDE_QN_H=stride_qn_h,
+                STRIDE_QR_T=stride_qr_t,
+                STRIDE_QR_H=stride_qr_h,
+                USE_FP8_DOT=use_fp8_dot,
+                USE_TOPK_LENGTH=use_topk_length,
+                BLOCK_H=BLOCK_H,
+                BLOCK_K=BLOCK_K,
+                USE_I64_PAGE=not (i32_page_safe and i32_page_tuned),
+                PIPE_STAGES=fused_pipe_stages,
+                num_warps=fused_num_warps,
+                num_stages=2,
+            )
         return out.unsqueeze(0)
 
     tiles_per_split = (topk + kv_splits * BLOCK_K - 1) // (kv_splits * BLOCK_K)
@@ -1167,6 +1626,46 @@ def _triton_sparse_mla_fwd_splitk(
     if optimize_gfx950_fp8:
         split_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, active_splits, num_cu)
 
+    # Partial-loop shape specialisations. Only the measured decode plan opts in,
+    # so every legacy caller keeps its current lowering (and compile-cache key).
+    split_i32_page = decode_tuned and _page_offsets_fit_i32(kv.shape[0], kv_dim)
+    split_dense_tiles = decode_tuned and topk % BLOCK_K == 0
+    # Manual index rotation is dead: the idx address is affine in the tile
+    # counter, so the stream pipeliner already hoists it, and the explicit
+    # rotation only adds a loop-carried vector (measured +11 %).
+    split_rotate_idx = False
+    # The gather is latency-bound, and a 256-wide value group halves the number
+    # of loads per gathered KV row (3 instead of 5) without changing the bytes.
+    # It only pays at a two-deep prologue: three stages of the wider tile costs
+    # the registers back (measured -- GW=256 is a loss at PIPE_STAGES=3).
+    split_group_w = 256 if decode_tuned and d_v % 256 == 0 else 128
+    split_pipe_stages = 2 if decode_tuned else 3
+    split_num_groups = d_v // split_group_w
+    # Fold the accumulator rescale into the MFMA C operand and hoist the
+    # uniform 1/fp8_max to the epilogue: fewer VALU ops and fewer live fp32
+    # dot temporaries on the critical path of a 1-wave/SIMD kernel.
+    split_acc_inplace = bool(decode_tuned)
+    # Streaming (no-allocate) hint on the gathered KV rows. The gather is a
+    # random walk over a 1.28 GB pool, so none of those lines is ever reused:
+    # the 63 % vL1D / 53 % L2 "hit" rates are intra-wavefront coalescing of the
+    # 576 B row, not reuse. Allocating them evicts the only lines that *are*
+    # reused (q, the index row, the partials) and lengthens the fabric read
+    # latency this kernel cannot hide -- it runs 1 wave/SIMD against a measured
+    # 1210-cycle L2-fabric latency, with VALU at 18 %, MFMA at 12 % and VMEM at
+    # 0.7 %, i.e. ~70 % of cycles stalled. Measured 2-3 % across all four cases.
+    split_kv_cache_mod = ".cs" if decode_tuned else ""
+    split_extra: dict = {"matrix_instr_nonkdim": 32} if decode_tuned else {}
+    # Fence the P@V dots out of Triton's attention-chain warp layout (see the
+    # kernel docstring): at BLOCK_H == 64 the chain layout computes Q@K^T twice
+    # per CTA. The per-tile loop is bound by on-CU work (MFMA + LDS + barriers),
+    # not by the gather: an L2-resident index set (rows mod 4096) runs within
+    # 2 % of the 1.28 GB random walk, and hiding the index load moves nothing.
+    # Only when the launch is guaranteed to compile without async copies (see
+    # split_async_scope below).
+    split_decouple_dots = (
+        bool(decode_tuned) and split_acc_inplace and _no_async_copy_scope_is_effective()
+    )
+
     lse_partial = torch.empty(
         seq, kv_splits, h_padded, dtype=torch.float32, device=q_nope.device
     )
@@ -1174,7 +1673,39 @@ def _triton_sparse_mla_fwd_splitk(
         seq, kv_splits, h_padded, d_v, dtype=torch.bfloat16, device=q_nope.device
     )
 
-    with _no_async_copy():
+    # The split-K partial loop stages a gathered KV operand, so direct-to-LDS
+    # async copies help it -- but only the callers that measured it opt in; the
+    # legacy shapes keep their current (staged) lowering.
+    #
+    # DECOUPLE_DOTS is incompatible with them on Triton 3.7 (measured): with
+    # the next tile's rope rows copied direct-to-LDS, heads 48-63 come out
+    # corrupted (~21 dB) and run-to-run nondeterministic; a vmcnt-draining
+    # barrier ahead of the P@V region removes it, so the in-flight copy races
+    # some LDS buffer of the new layout (which one is not established).
+    # Staging that operand through registers instead is exact and costs
+    # nothing (measured within noise on both layouts).
+    split_async_scope = (
+        contextlib.nullcontext()
+        if allow_async_copy and not split_decouple_dots
+        else _no_async_copy()
+    )
+    # Head-interleaved partial slabs (see PARTIAL_DQ in the kernel docstring)
+    # and the matching reduce. Measured on the GLM-5.2 decode shapes (partial
+    # + reduce per call, MI355X): 33.6 -> 30.3 us at T=60, 38.0 -> 35.1 us at
+    # T=72; the reduce itself is unchanged (4.70 vs 4.66 us standalone). Only
+    # the decode plan, where one head block spans every head.
+    split_partial_dq = bool(decode_tuned) and BLOCK_H == H and h_padded == H
+    # LEAN_EPILOGUE is only validated together with PARTIAL_DQ: on the [h][d]
+    # store path it miscompiles heads 48-63 (measured; cause not established).
+    split_lean_epilogue = split_partial_dq
+    # Write-through partial and output stores, and a compile-time tile trip
+    # count (PARTIAL_STORE_MOD / FIXED_TRIP in the kernel docstring). Measured
+    # on the GLM-5.2 decode shapes (partial + reduce per call, CUDA graph,
+    # 8 KV pools, MI355X): 30.5 -> 29.5 us at T=60, 34.8 -> 33.3 us at T=72;
+    # output bit-identical.
+    split_store_mod = ".wt" if decode_tuned else ""
+    split_fixed_trip = bool(decode_tuned)
+    with split_async_scope:
         _sparse_mla_split_k_kernel[(seq, n_head_blocks, kv_splits)](
             q_nope,
             q_rope,
@@ -1189,7 +1720,7 @@ def _triton_sparse_mla_fwd_splitk(
             KV_DIM=kv_dim,
             D_V=d_v,
             D_TAIL=d_tail,
-            NUM_GROUPS=num_groups,
+            NUM_GROUPS=split_num_groups,
             STRIDE_QN_T=stride_qn_t,
             STRIDE_QN_H=stride_qn_h,
             STRIDE_QR_T=stride_qr_t,
@@ -1198,12 +1729,59 @@ def _triton_sparse_mla_fwd_splitk(
             KV_SPLITS=kv_splits,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
+            H_PADDED=h_padded,
+            USE_I64_PAGE=not split_i32_page,
+            DENSE_TILES=split_dense_tiles,
+            ROTATE_IDX=split_rotate_idx,
+            PIPE_STAGES=split_pipe_stages,
+            GROUP_W=split_group_w,
+            ACC_INPLACE=split_acc_inplace,
+            KV_CACHE_MOD=split_kv_cache_mod,
+            DECOUPLE_DOTS=split_decouple_dots,
+            PARTIAL_DQ=split_partial_dq,
+            LEAN_EPILOGUE=split_lean_epilogue,
+            PARTIAL_STORE_MOD=split_store_mod,
+            FIXED_TRIP=split_fixed_trip,
             num_warps=split_num_warps,
             num_stages=2,
+            **split_extra,
         )
 
-        D_CHUNK = _reduce_d_chunk(active_splits, seq * H) if optimize_gfx950_fp8 else 64
-        _sparse_mla_reduce_kernel[(seq, H, (d_v + D_CHUNK - 1) // D_CHUNK)](
+    if split_partial_dq:
+        # 64-wide d slices x every head, 8 warps: the best of a 4x4
+        # (D_CHUNK x num_warps) screen, all within 0.3 us of each other.
+        dq_chunk = 64 if d_v % 64 == 0 else d_v
+        with _no_async_copy():
+            _sparse_mla_reduce_dq_kernel[(seq, d_v // dq_chunk)](
+                lse_partial,
+                acc_partial,
+                out,
+                H=H,
+                D_V=d_v,
+                KV_SPLITS=kv_splits,
+                ACTIVE_SPLITS=active_splits,
+                ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
+                D_CHUNK=dq_chunk,
+                H_PADDED=h_padded,
+                OUT_STORE_MOD=split_store_mod,
+                num_warps=8,
+            )
+        return out.unsqueeze(0)
+
+    if reduce_d_chunk is not None:
+        D_CHUNK = reduce_d_chunk
+    elif optimize_gfx950_fp8:
+        D_CHUNK = _reduce_d_chunk(active_splits, seq * H)
+    else:
+        D_CHUNK = 64
+    # The reduce is dispatch-limited (one single-wave CTA per (row, head)), not
+    # byte-limited; heads are contiguous in acc_partial, so giving a CTA a run
+    # of them turns strided 1 KiB reads into one burst and cuts the CTA count.
+    block_hr = 8 if decode_tuned and H % 8 == 0 else 1
+    with _no_async_copy():
+        _sparse_mla_reduce_kernel[
+            (seq, (H + block_hr - 1) // block_hr, (d_v + D_CHUNK - 1) // D_CHUNK)
+        ](
             lse_partial,
             acc_partial,
             out,
@@ -1214,7 +1792,11 @@ def _triton_sparse_mla_fwd_splitk(
             ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
             D_CHUNK=D_CHUNK,
             BLOCK_K=BLOCK_K,
-            num_warps=4,
+            H_PADDED=h_padded,
+            BLOCK_HR=block_hr,
+            num_warps=(4 if reduce_num_warps is None else reduce_num_warps)
+            if block_hr == 1
+            else 4,
         )
     return out.unsqueeze(0)
 
@@ -1280,7 +1862,49 @@ def triton_sparse_mla_fwd(
                 topk_length=topk_length,
                 use_topk_length=True,
             )
+    decode_fp8_64h = _is_gfx950_decode_fp8_64h(
+        kv.dtype, H, d_v, q_rope.shape[-1], kv.shape[-1]
+    )
+    if decode_fp8_64h and H == 64:
+        # Decode plan: one head block per query row, parallelism bought with KV
+        # splits instead. Shapes only -- cudagraph-safe, no tensor reads.
+        decode_splits = _decode_splitk_splits(seq, topk, BLOCK_K, num_cu)
+        if decode_splits is not None:
+            return _triton_sparse_mla_fwd_splitk(
+                q_nope,
+                q_rope,
+                kv,
+                indices,
+                sm_scale,
+                d_v,
+                kv_splits=decode_splits,
+                block_h=H,
+                allow_async_copy=True,
+                reduce_d_chunk=min(512, _next_pow2(d_v)),
+                reduce_num_warps=1,
+                decode_tuned=True,
+            )
     if base_ctas > num_cu:
+        # Residency-aware geometry: the BLOCK_H=16 launch overshoots the
+        # 1-CTA/CU round, and the fallback below is not a parallelism check
+        # (it merely divides the CTA count by ceil(H/16)). Pick a (BLOCK_H,
+        # PIPE_STAGES) pair that fits one round instead. Shapes only --
+        # cudagraph-safe, no tensor reads.
+        if decode_fp8_64h:
+            geometry = _decode_geometry(seq, H, base_ctas, num_cu)
+            if geometry is not None:
+                new_block_h, new_pipe_stages = geometry
+                return _triton_sparse_mla_fwd_splitk(
+                    q_nope,
+                    q_rope,
+                    kv,
+                    indices,
+                    sm_scale,
+                    d_v,
+                    kv_splits=1,
+                    block_h=new_block_h,
+                    pipe_stages=new_pipe_stages,
+                )
         if optimize_gfx950_fp8:
             with _no_async_copy():
                 return _triton_sparse_mla_fwd_splitk(
