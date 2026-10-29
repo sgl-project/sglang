@@ -528,6 +528,8 @@ class Envs:
     # ===================================================================
     # Runtime simulations
     # ===================================================================
+    # Benchmark mode: changes only the accepted length; verify still runs every op real
+    # serving runs, at real cost (SGLANG_SIMULATE_ACC_GREEDY is the opt-out).
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
@@ -567,6 +569,10 @@ class Envs:
     # the NCCL ring. Only taken when the group's communicator has a multicast
     # plane; off, or no such plane, keeps the NCCL all-gather.
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
+    # With the TP-sharded markov_w2, keep each draft step's logits on the local
+    # vocab shard and run the sampling accept on the shards, instead of
+    # all-gathering the full logits every step. Same accept distribution.
+    SGLANG_DSPARK_SHARDED_ACCEPT = EnvBool(_default_hip)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
@@ -730,6 +736,9 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # PP rank 0 posts its output recv only after its own forward. Enable it if PP
+    # hangs or stalls on kernels that need every SM (e.g. flashinfer MLA).
+    SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
@@ -1147,10 +1156,10 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
-    # time so arch35 (Atlas A5) dense linears run on the native quantized
-    # GEMM instead of the Triton emulation path. Lossy (128x128 fp32 block
-    # scales -> 1x32 UE8M0): off by default; enable explicitly for
-    # performance after validating accuracy for the workload.
+    # time for arch35 (Atlas A5) Linear and MoE MXFP8 GEMMs. Disabled keeps
+    # supported 128x128 FP32-scale checkpoints on native block-FP8 GEMMs.
+    # Requantization is lossy (128x128 FP32 scales -> 1x32 UE8M0): enable
+    # explicitly for performance after validating workload accuracy.
     SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
