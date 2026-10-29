@@ -251,7 +251,8 @@ class ModulateWan(nn.Module):
 
 
 def _joy_image_mlp(mlp: MLP, x: torch.Tensor, fuse_gelu: bool) -> torch.Tensor:
-    linear = mlp.fc_in
+    """Use the SM120 image epilogue when eligible; retain the original MLP otherwise."""
+    fc_in = mlp.fc_in
     # SM120's epilogue wins for the large image projection, but regresses the
     # smaller text projection. It also removes the intermediate BF16 rounding.
     # Native single-reference image buckets have at least 7168 image tokens.
@@ -269,16 +270,17 @@ def _joy_image_mlp(mlp: MLP, x: torch.Tensor, fuse_gelu: bool) -> torch.Tensor:
         or torch.cuda.get_device_capability(x.device) != (12, 0)
         or not isinstance(mlp.act, nn.GELU)
         or mlp.act.approximate != "tanh"
-        or (isinstance(linear, BaseLayerWithLoRA) and linear.lora_active)
-        or not can_use_linear_gelu_static(linear)
-        or linear.weight.shape != (16384, 4096)
-        or linear.weight.dtype != x.dtype
-        or linear.weight.device != x.device
-        or linear.bias.device != x.device
+        or (isinstance(fc_in, BaseLayerWithLoRA) and fc_in.lora_active)
+        or not can_use_linear_gelu_static(fc_in)
+        or fc_in.weight.shape != (16384, 4096)
+        or fc_in.weight.dtype != x.dtype
+        or fc_in.weight.device != x.device
+        or fc_in.bias.device != x.device
     ):
         return mlp(x)
-    x = fused_linear_gelu_tanh(x, linear.weight, linear.bias)
-    return mlp.fc_out(x)[0]
+    hidden = fused_linear_gelu_tanh(x, fc_in.weight, fc_in.bias)
+    # Keep the output projection wrapper, including LoRA and TP reduction.
+    return mlp.fc_out(hidden)[0]
 
 
 class MMDoubleStreamBlock(nn.Module):

@@ -2458,13 +2458,18 @@ def test_joy_image_mlp_quality_restore_and_dynamic_lora():
         joy_image, "fused_linear_gelu_tanh", wraps=joy_image.fused_linear_gelu_tanh
     ) as fused:
         torch.testing.assert_close(
-            joy_image._joy_image_mlp(mlp, x, True), reference, atol=2e-2, rtol=2e-2
+            joy_image._joy_image_mlp(mlp, x, fuse_gelu=True),
+            reference,
+            atol=2e-2,
+            rtol=2e-2,
         )
         assert fused.call_count == 1
-        assert torch.equal(joy_image._joy_image_mlp(mlp, x, False), reference)
+        assert torch.equal(joy_image._joy_image_mlp(mlp, x, fuse_gelu=False), reference)
         # Smaller text/token counts must keep their original, faster projection.
         text = x[:, :1053].contiguous()
-        assert torch.equal(joy_image._joy_image_mlp(mlp, text, True), mlp(text))
+        assert torch.equal(
+            joy_image._joy_image_mlp(mlp, text, fuse_gelu=True), mlp(text)
+        )
         assert fused.call_count == 1
 
         compiled = torch.compile(
@@ -2482,12 +2487,12 @@ def test_joy_image_mlp_quality_restore_and_dynamic_lora():
         mlp.fc_in = wrapper
         adapted = mlp(x)
         assert not torch.equal(adapted, reference)
-        assert torch.equal(joy_image._joy_image_mlp(mlp, x, True), adapted)
+        assert torch.equal(joy_image._joy_image_mlp(mlp, x, fuse_gelu=True), adapted)
         assert fused.call_count == 1
         wrapper.disable_lora = True
-        joy_image._joy_image_mlp(mlp, x, True)
+        joy_image._joy_image_mlp(mlp, x, fuse_gelu=True)
         assert fused.call_count == 2
-        assert torch.equal(joy_image._joy_image_mlp(mlp, x, False), reference)
+        assert torch.equal(joy_image._joy_image_mlp(mlp, x, fuse_gelu=False), reference)
 
 
 # -------------------------------------------------------------------------
