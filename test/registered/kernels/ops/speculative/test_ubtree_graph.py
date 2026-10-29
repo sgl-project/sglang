@@ -56,7 +56,7 @@ def _lookup_config():
     return config
 
 
-def _make_fa3_verify_backend(width, algorithm, enabled):
+def _make_fa3_verify_backend(width, algorithm, enabled, *, max_bs=1):
     from sglang.srt.configs.model_config import AttentionArch
     from sglang.srt.environ import envs
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
@@ -103,8 +103,82 @@ def _make_fa3_verify_backend(width, algorithm, enabled):
         envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.override(enabled),
     ):
         backend = FlashAttentionBackend(runner)
-        backend.init_cuda_graph_state(1, width)
+        backend.init_cuda_graph_state(max_bs, max_bs * width)
     return backend
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FA3 requires CUDA")
+@pytest.mark.parametrize("width", [3, 17])
+@pytest.mark.parametrize(
+    "mode,batch_size,live_bs",
+    [
+        ("eager", 1, 1),
+        ("eager", 2, 2),
+        ("replay", 1, 1),
+        ("replay", 2, 2),
+        ("replay", 2, 1),
+    ],
+)
+def test_eagle_full_mask_metadata_reuses_tree_columns(width, mode, batch_size, live_bs):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.speculative.eagle_utils import TreeMaskMode
+
+    backend = _make_fa3_verify_backend(width, "EAGLE", True, max_bs=batch_size)
+    lengths = [4, 7][:live_bs] + [0] * (batch_size - live_bs)
+    visible = torch.ones(width, width, dtype=torch.bool, device="cuda").tril()
+    masks = [
+        torch.cat(
+            (torch.ones(width, length, dtype=torch.bool, device="cuda"), visible), dim=1
+        )
+        for length in lengths[:live_bs]
+    ]
+    spec = SimpleNamespace(
+        tree_mask_mode=TreeMaskMode.FULL_MASK,
+        custom_mask=torch.cat([mask.flatten() for mask in masks]),
+        positions=torch.arange(live_bs * width, device="cuda"),
+    )
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        batch_size=batch_size,
+        req_pool_indices=torch.arange(batch_size, device="cuda"),
+        seq_lens=torch.tensor(lengths, device="cuda"),
+        seq_lens_cpu=torch.tensor(lengths),
+        encoder_lens=None,
+        spec_info=spec,
+        positions=spec.positions,
+        out_cache_loc=None,
+        kv_loc_plan=None,
+    )
+    if mode == "replay":
+        backend.init_forward_metadata_out_graph(batch, in_capture=True)
+
+    with patch("torch.arange", wraps=torch.arange) as arange:
+        if mode == "eager":
+            backend.init_forward_metadata(batch)
+        else:
+            backend.init_forward_metadata_out_graph(batch)
+    # Prefix cu-seqlens have different arange arguments. The tree-column
+    # range must be constructed once and shared by mask/page-table gathers.
+    tree_ranges = [call for call in arange.call_args_list if call.args == (width,)]
+    assert len(tree_ranges) == 1
+    metadata = backend.forward_metadata_spec_decode_expand
+    torch.testing.assert_close(
+        metadata.cache_seqlens_int32[: live_bs * width],
+        visible.sum(1).int().repeat(live_bs),
+    )
+    columns = torch.arange(width, device="cuda").expand(width, -1)
+    order = torch.where(visible, columns, columns + width).argsort(dim=1)
+    expected = torch.cat(
+        [
+            backend.req_to_token[row, length : length + width]
+            .expand(width, -1)
+            .gather(1, order)
+            for row, length in enumerate(lengths[:live_bs])
+        ]
+    )
+    torch.testing.assert_close(
+        metadata.page_table[: live_bs * width, :width].long(), expected.long()
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FA3 requires CUDA")

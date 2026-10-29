@@ -85,13 +85,14 @@ def _extract_target_verify_tree_mask(
     bs: int,
     verify_width: int,
     seq_lens: torch.Tensor,
-    device: torch.device,
+    cols: torch.Tensor,
     valid_num_tokens: Optional[int] = None,
 ) -> torch.Tensor:
     """Return the [bs * verify_width, verify_width] tree visibility matrix.
 
     FULL_MASK stores prefix columns before each tree suffix and therefore needs
-    a gather. QLEN_ONLY is already the exact suffix matrix and can be viewed
+    a gather, reusing the columns built for the page-table gather. QLEN_ONLY
+    is already the exact suffix matrix and can be viewed
     directly, eliminating the per-step index construction and gather kernel.
     """
     if _is_qlen_only_tree_mask(spec_info):
@@ -102,8 +103,6 @@ def _extract_target_verify_tree_mask(
             )
         return spec_info.custom_mask[:required].view(-1, verify_width)
 
-    offsets = torch.arange(verify_width, device=device).unsqueeze(0)
-    cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
     cum_len = torch.nn.functional.pad(
         torch.cumsum((seq_lens + verify_width).repeat_interleave(verify_width), dim=0),
         (1, 0),
@@ -1263,7 +1262,7 @@ class FlashAttentionBackend(AttentionBackend):
                     bs=batch_size,
                     verify_width=self.speculative_num_draft_tokens,
                     seq_lens=forward_batch.seq_lens,
-                    device=device,
+                    cols=cols,
                 )
 
                 # shift table indices to avoid padding
@@ -3381,7 +3380,7 @@ class FlashAttentionBackend(AttentionBackend):
                     bs=bs,
                     verify_width=verify_width,
                     seq_lens=seq_lens,
-                    device=device,
+                    cols=cols,
                     valid_num_tokens=spec_info.positions.numel(),
                 )
 

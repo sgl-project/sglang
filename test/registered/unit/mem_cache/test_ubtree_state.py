@@ -15,6 +15,12 @@ from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.mem_cache.ubtree_state import ubtree_spec_state_bytes_per_req
+from sglang.srt.mem_cache.unified_memory_pool import (
+    MambaSubPoolSpec,
+    MHASubPoolSpec,
+    UnifiedHybridReqToTokenPool,
+    UnifiedKVPool,
+)
 from sglang.srt.runtime_context import get_context, get_schedule
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -200,6 +206,90 @@ class TestUBTreeState(CustomTestCase):
                         - scratch
                         - (slots + 1) * _params().mamba_cache_per_req,
                     )
+
+
+class TestUnifiedUBTreeIsolation(CustomTestCase):
+    def test_non_ubtree_unified_constructor_keeps_shared_state(self):
+        params = _params()
+        for algorithm, width in ((None, None), ("EAGLE", 4), ("DFLASH", 4)):
+            for extra_buffer in (False, True):
+                with (
+                    self.subTest(algorithm=algorithm, extra_buffer=extra_buffer),
+                    get_context().override_server_args(speculative_algorithm=algorithm),
+                ):
+                    shared = UnifiedKVPool(
+                        total_bytes=1 << 16,
+                        sub_pool_specs=[
+                            MambaSubPoolSpec(
+                                name="mamba",
+                                layer_num=2,
+                                grow_direction="up",
+                                conv_state_shapes=tuple(params.shape.conv),
+                                conv_dtype=params.dtype.conv,
+                                temporal_state_shape=params.shape.temporal,
+                                temporal_dtype=params.dtype.temporal,
+                            ),
+                            MHASubPoolSpec(
+                                name="full",
+                                layer_num=1,
+                                grow_direction="down",
+                                head_num=2,
+                                head_dim=8,
+                                store_dtype=torch.bfloat16,
+                            ),
+                        ],
+                        device="cpu",
+                        enable_memory_saver=False,
+                    )
+                    # Exercise the real subclass -> parent -> virtual-method
+                    # dispatch; mocking _init_mamba_pool hides this regression.
+                    pool = UnifiedHybridReqToTokenPool(
+                        unified_buffer=shared,
+                        mamba_sub_pool_name="mamba",
+                        size=2,
+                        pre_alloc_size=1,
+                        mamba_spec_state_size=2,
+                        max_context_len=16,
+                        device="cpu",
+                        enable_memory_saver=False,
+                        cache_params=params,
+                        mamba_layer_ids=[0, 1],
+                        enable_mamba_extra_buffer=extra_buffer,
+                        enable_mamba_extra_buffer_lazy=False,
+                        speculative_num_draft_tokens=width,
+                    )
+                    self.assertEqual(pool.size, 2)
+                    self.assertEqual(pool.pre_alloc_size, 1)
+                    self.assertEqual(tuple(pool.req_to_token.shape), (4, 16))
+                    state = pool.mamba_pool.mamba_cache
+                    conv, temporal = shared.mamba_views_for("mamba")
+                    self.assertEqual(state.temporal.data_ptr(), temporal.data_ptr())
+                    self.assertEqual(state.conv[0].data_ptr(), conv[0].data_ptr())
+                    self.assertIsNone(getattr(state, "tree_rawv", None))
+                    if width is None:
+                        self.assertIsNone(getattr(state, "intermediate_ssm", None))
+                    else:
+                        self.assertEqual(state.intermediate_ssm.shape[2], width)
+                    state.temporal.fill_(3)
+                    self.assertTrue(torch.all(temporal == 3))
+                    if extra_buffer:
+                        self.assertEqual(
+                            pool.req_index_to_mamba_ping_pong_track_buffer_mapping.dtype,
+                            torch.int64,
+                        )
+
+    def test_unified_pool_rejects_factorized_ubtree_before_allocation(self):
+        pool = UnifiedHybridReqToTokenPool.__new__(UnifiedHybridReqToTokenPool)
+        with self.assertRaisesRegex(ValueError, "UBTREE.*unified"):
+            pool._init_mamba_pool(
+                mamba_size=2,
+                mamba_spec_state_size=1,
+                cache_params=_params(),
+                mamba_layer_ids=[0, 1],
+                device="cpu",
+                enable_mamba_extra_buffer=False,
+                enable_ubtree_factorized_kda=True,
+            )
 
 
 if __name__ == "__main__":
