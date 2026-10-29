@@ -896,14 +896,6 @@ class HiCacheController:
             head_group=memory.hicache_storage_head_partition,
             layer_partition=memory.hicache_storage_layer_partition,
         )
-        # The pool was sized from the same server arg before any backend
-        # attached; if the two disagree the objects would not match their keys.
-        pool_groups = getattr(host_pool, "head_group_num", 1)
-        if plan.head_group_num != pool_groups:
-            raise ValueError(
-                f"the unified plan cuts {plan.head_group_num} head groups but "
-                f"the host pool was allocated with {pool_groups}."
-            )
         logger.info(
             "HiCache unified L3 keys: namespace=%s chunks=%s",
             namespace_digest(plan.namespace),
