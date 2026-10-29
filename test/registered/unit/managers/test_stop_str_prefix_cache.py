@@ -189,6 +189,38 @@ class TestStopStringOptimizationOptIn(unittest.TestCase):
         with envs.SGLANG_ENABLE_STOP_STR_OPTIMIZATION.override(False):
             self.assertFalse(envs.SGLANG_ENABLE_STOP_STR_OPTIMIZATION.get())
 
+    def test_streaming_speculative_finish_after_primed_tail(self):
+        for enabled in (False, True):
+            for old_text, accepted_text, stop, expected_text in [
+                ("abc", "STOPlater.", "STOP", "abcSTOP"),
+                ("abcX", "Ylater.", "XY", "abcXY"),
+            ]:
+                with (
+                    self.subTest(enabled=enabled, stop=stop),
+                    patch.object(
+                        schedule_batch, "_ENABLE_STOP_STR_OPTIMIZATION", enabled
+                    ),
+                ):
+                    req = _make_req(old_text, stops=[stop], stream=True)
+                    req.update_finish_state()
+                    self.assertFalse(req.finished())
+                    req.output_ids.extend(map(ord, accepted_text))
+                    committed_ids = array("q", req.output_ids)
+
+                    # Prime the one-token tail after accepting a chunk. Its stop
+                    # is already outside this window; finishing must widen it.
+                    self.assertNotIn(stop, req.tail_str())
+                    self.assertFalse(req.check_match_stop_str_prefix())
+                    req.update_finish_state(new_accepted_len=len(accepted_text))
+
+                    self.assertTrue(req.finished())
+                    self.assertEqual(req.finished_reason.matched, stop)
+                    self.assertEqual(req.finished_len, len(expected_text))
+                    self.assertEqual(
+                        req.output_ids_through_stop, array("q", map(ord, expected_text))
+                    )
+                    self.assertEqual(req.output_ids, committed_ids)
+
     def test_disabled_path_does_not_cache_or_prune(self):
         class StopWithoutMembershipCheck(str):
             def __contains__(self, value):
