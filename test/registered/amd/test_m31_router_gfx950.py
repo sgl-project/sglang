@@ -116,7 +116,6 @@ class TestM31Router(CustomTestCase):
         self.assertTrue(bool((addend == 3.0).all()))
 
     def _shared_gate_up(self, m, seed):
-        """per-token fp8 activations and a shuffled [1536, 6144] fp8 weight with scales"""
         from aiter.ops.shuffle import shuffle_weight
 
         g = torch.Generator(device="cpu").manual_seed(seed)

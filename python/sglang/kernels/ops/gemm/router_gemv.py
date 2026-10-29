@@ -212,7 +212,7 @@ def _router_gemv_swiglu_kernel(
     pid = tl.program_id(0)
     num_gemv = num_n_blocks * num_m_tiles * SPLIT_K
     if pid < num_gemv:
-        # without the fixup, out_ptr, counter_ptr and stride_om are never read
+        # Without the fixup, out_ptr, counter_ptr and stride_om are never read.
         _router_gemv_tile(
             x_ptr,
             w_ptr,
@@ -278,7 +278,7 @@ _scratch: Dict[
 def _get_scratch(
     device: torch.device, n: int, w_dtype: torch.dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # sized for the weight dtype's own tiles, so the CUDA FP32 path keeps a small buffer
+    # Sized for the weight dtype's own tiles, so the CUDA FP32 path keeps a small buffer.
     key = (device, n, w_dtype)
     if key not in _scratch:
         configs = _configs(w_dtype)
@@ -347,9 +347,11 @@ def router_gemv_partials_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
 
 
 def router_gemv_partials(x: torch.Tensor, w: torch.Tensor) -> Optional[torch.Tensor]:
-    """The [SPLIT_K, M, N] fp32 split-K partials router_gemv sums over dim 0 in order, past
-    _FIXUP_MAX_M rows (None below); valid until the next router_gemv call on the device.
-    Caller guards with router_gemv_supported()."""
+    """The [SPLIT_K, M, N] fp32 split-K partials router_gemv sums over dim 0 in order.
+
+    None up to _FIXUP_MAX_M rows; valid until the next router_gemv call on the device.
+    Caller guards with router_gemv_supported().
+    """
     m = x.shape[0]
     if m <= _FIXUP_MAX_M:
         return None
@@ -369,10 +371,11 @@ def router_gemv_partials_swiglu(
     group_size: Optional[int] = None,
     transpose_scale: bool = False,
 ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """(router_gemv_partials(x, w), swiglu_oai_fp8(gate_up, alpha, limit, group_size,
-    transpose_scale)) in one launch, bitwise equal to the two calls: both are latency-bound
-    and come from the same MoE layer input (router and shared expert). Caller guards with
-    router_gemv_partials_supported()."""
+    """(router_gemv_partials(x, w), swiglu_oai_fp8(gate_up, ...)) from one launch.
+
+    Bitwise equal to the two calls; both are latency-bound and come from the same MoE layer
+    input (router and shared expert). Caller guards with router_gemv_partials_supported().
+    """
     m, k = x.shape
     n = w.shape[0]
     assert _FIXUP_MAX_M < m and gate_up.shape[0] == m
@@ -380,7 +383,7 @@ def router_gemv_partials_swiglu(
     q, scale, sw_block_m, sw_block_n = swiglu_oai_fp8_outputs(
         gate_up, group_size, transpose_scale
     )
-    # both kernels launch with 4 warps on their own; sharing that count keeps their layouts
+    # Both kernels launch with 4 warps on their own; sharing that count keeps their layouts.
     assert num_warps == 4
     partials, _ = _get_scratch(x.device, n, w.dtype)
     m_tiles = triton.cdiv(m, block_m)

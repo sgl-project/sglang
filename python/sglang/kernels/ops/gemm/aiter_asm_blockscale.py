@@ -99,9 +99,11 @@ def gemm_a8w8_blockscale_bpreshuffle_asm_prezeroed(
     split_k: int,
     bias: torch.Tensor,
 ) -> torch.Tensor:
-    """aiter's gemm_a8w8_blockscale_bpreshuffle_asm into ``out`` that holds zeros, without the
-    memset; ``bias`` is the fp32 [1, n] bias (aiter's zero bias buffer for none). The caller
-    checks asm_split_k_supported()."""
+    """aiter's gemm_a8w8_blockscale_bpreshuffle_asm into a pre-zeroed ``out``, without the memset.
+
+    ``bias`` is the fp32 [1, n] bias (aiter's zero bias buffer for none). The caller
+    checks asm_split_k_supported().
+    """
     m, k = xq.shape
     n = wq.shape[0]
     tile_m, tile_n, _ = _kernel_table()[kernel_name]

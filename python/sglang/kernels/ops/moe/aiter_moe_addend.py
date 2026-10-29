@@ -5,7 +5,7 @@ output instead of adding it afterwards, as runtime patches on aiter.
 An accumulating stage2 gets the addend as its output buffer in place of the zeroed
 one the sort would hand it (moe_sorting_small's sort wrapper); a reduce stage2 adds
 it while summing the top-k slots (the ``_run_moe_reduction`` patch below). Any other
-path leaves the addend unconsumed and the caller adds it as before.
+path leaves the addend unconsumed and the caller adds it itself.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class MoeOutputAddend:
-    """`consumed` turns True once an aiter stage folded `tensor` into its output."""
+    """``consumed`` turns True once an aiter stage folded ``tensor`` into its output."""
 
     __slots__ = ("tensor", "consumed")
 
@@ -43,9 +43,9 @@ _pending_addend: ContextVar[Optional[MoeOutputAddend]] = ContextVar(
 
 @contextlib.contextmanager
 def moe_output_addend(tensor: torch.Tensor) -> Iterator[MoeOutputAddend]:
-    """Offer `tensor` to the next aiter routed-MoE call inside the block.
+    """Offer ``tensor`` to the next aiter routed-MoE call inside the block.
 
-    The routed output of a call that consumed it already includes `tensor`, which
+    The routed output of a call that consumed it already includes ``tensor``, which
     may also have been accumulated into in place.
     """
     slot = MoeOutputAddend(tensor)

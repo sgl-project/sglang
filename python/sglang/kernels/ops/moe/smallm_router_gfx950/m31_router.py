@@ -1,5 +1,6 @@
 """gfx950 one-launch MiniMax-M3.1 decode router for 1..16 tokens, bitwise identical to router_gemv ->
 moe_fused_gate (sigmoid, correction bias, top-4, renormalize, routed scaling) -> aiter's MoE sort (block_m 16).
+
 The sorted buffers reach the aiter runner through moe_sorting_small.presorted_moe_sort().
 m31_shared_router() runs it in one launch with the shared expert's gate_up GEMM.
 SGLANG_ROCM_SMALLM_ROUTER=0 disables it; a build/load failure disables it too."""
@@ -31,7 +32,7 @@ _HIPCC_FLAGS = ("--genco", "--offload-arch=gfx950", "-O3")
 MAX_TOK = 16
 NUM_EXPERTS, TOPK, HIDDEN, BLOCK_M = 128, 4, 6144, 16
 # router_gemv tiles (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, warps) the kernels replicate, with the kernel and grid;
-# a different router_gemv tiling would change the logits' rounding, so it disables this path.
+# a different router_gemv tiling would change the logits' rounding, so it disables this path
 _TILES = {
     8: ((16, 32, 256, 12, 8), "m31_router_t8", 48),
     16: ((16, 16, 512, 8, 4), "m31_router_t16", 64),
