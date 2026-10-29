@@ -27,6 +27,44 @@ _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
 
+for _name in ("npu_w8a8_block_fp8_linear", "npu_w8a8_block_fp8_grouped_matmul"):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_name}",
+            backend=KernelBackend.TORCH_NPU,
+            target=f"sglang.kernels.ops.gemm.npu_block_fp8:{_name}",
+            capabilities=frozenset({CapabilityRequirement.NPU}),
+        )
+    )
+del _name
+
+
+def npu_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Ascend arch35 BF16/FP16 Linear with 128x128 FP8 weights and FP32 scales."""
+    return get_kernel("gemm.npu_w8a8_block_fp8_linear", KernelBackend.TORCH_NPU)(
+        input, weight, weight_scale, bias
+    )
+
+
+def npu_w8a8_block_fp8_grouped_matmul(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_list: torch.Tensor,
+    group_list_type: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Ascend arch35 grouped BF16/FP16 input and checkpoint-layout FP8 weights."""
+    return get_kernel(
+        "gemm.npu_w8a8_block_fp8_grouped_matmul", KernelBackend.TORCH_NPU
+    )(input, weight, weight_scale, group_list, group_list_type, output_dtype)
+
+
 def _prefer_torch_rowwise_fp8(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
@@ -166,9 +204,20 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.nvfp4_gemm_swiglu_nvfp4_quant",
+        backend=KernelBackend.CUTE_DSL,
+        target=(
+            "sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant"
+            ":nvfp4_gemm_swiglu_nvfp4_quant"
+        ),
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.bmm_fp8",
         backend=KernelBackend.FLASHINFER,
-        target="sglang.srt.layers.quantization.fp8_utils:bmm_fp8",
+        target="sglang.kernels.ops.gemm.flashinfer_bmm_fp8:bmm_fp8",
         capabilities=CUDA_ONLY,
     )
 )
@@ -334,6 +383,8 @@ __all__ = [
     "dual_gemm_swiglu_fp8",
     "fp8_scaled_mm",
     "kimi_k3_tiny_gemm",
+    "npu_w8a8_block_fp8_grouped_matmul",
+    "npu_w8a8_block_fp8_linear",
     "try_qwen3x_nvfp4_gemm",
     "try_sm120_fp8_linear",
 ]
@@ -376,9 +427,7 @@ register_kernel(
         op="gemm.hopper_bf16_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.hopper_bf16_gemv:hopper_bf16_gemv",
-        capabilities=frozenset(
-            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
-        ),
+        capabilities=_SM90 | _SM12X,
     )
 )
 register_kernel(
@@ -428,6 +477,22 @@ register_kernel(
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
         ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.nvfp4_moe_mtp_mma",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_nvfp4_moe:nvfp4_moe_mtp_mma",
+        capabilities=_SM120,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm120_nvfp4_moe",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_nvfp4_moe:try_nvfp4_moe",
+        capabilities=_SM120,
     )
 )
 register_kernel(
@@ -490,5 +555,37 @@ register_kernel(
         op="gemm.w8a8_block_int8_matmul",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.int8_kernel:w8a8_block_int8_matmul",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.muse_spark_router_gemm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.muse_spark_router_gemm:router_gemm",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.muse_spark_router_gemv",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl:router_gemv_cute",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.router_gemv:router_gemv",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gemm_bf16x3_cublas",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",
+        capabilities=CUDA_ONLY,
     )
 )
