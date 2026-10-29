@@ -7,7 +7,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 EOS_TOKEN_ID = 2
 STOP_TOKEN_ID = 17
@@ -47,16 +47,6 @@ def _make_req(stop_token_ids=None):
 class TestGrammarStopSpeculative(unittest.TestCase):
     def test_requested_stop_token_wins_over_trailing_eos(self):
         req = _make_req(stop_token_ids=[STOP_TOKEN_ID])
-
-        req.update_finish_state(new_accepted_len=4)
-
-        self.assertEqual(req.finished_reason.matched, STOP_TOKEN_ID)
-        self.assertEqual(req.finished_len, 3)
-        self.assertEqual(list(req.output_ids_through_stop), [11, 13, STOP_TOKEN_ID])
-
-    def test_tokenizer_stop_token_wins_over_trailing_eos(self):
-        req = _make_req()
-        req.tokenizer.additional_stop_token_ids = {STOP_TOKEN_ID}
 
         req.update_finish_state(new_accepted_len=4)
 

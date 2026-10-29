@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.observability.forward_pass_metrics import FpmTiming
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -89,6 +90,8 @@ class PPBatchMetadata:
     # composition that actually ran the forward.
     fwd_batch: Optional[ScheduleBatch] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
+    # Rank-local; never sent over the wire.
+    fpm_timing: Optional[FpmTiming] = None
 
 
 class SchedulerPPMixin:
@@ -961,6 +964,7 @@ class SchedulerPPMixin:
                 mb_metadata.can_run_cuda_graph if mb_metadata else False
             ),
             skipped_output_comm=True,
+            fpm_timing=mb_metadata.fpm_timing if mb_metadata else None,
         )
         d2h_event = self.device_module.Event()
         d2h_event.record(self.device_module.current_stream())
@@ -972,8 +976,6 @@ class SchedulerPPMixin:
         mb_metadata: PPBatchMetadata,
         pp_outputs: PPProxyTensors,
     ):
-        from sglang.srt.managers.scheduler import GenerationBatchResult
-
         logits_output = None
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
@@ -1051,6 +1053,7 @@ class SchedulerPPMixin:
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+                fpm_timing=mb_metadata.fpm_timing,
             )
             return output_result
 
@@ -1138,6 +1141,7 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            fpm_timing=mb_metadata.fpm_timing,
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
@@ -1658,6 +1662,7 @@ class SchedulerPPMixin:
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
+                    fpm_timing=result.fpm_timing,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())

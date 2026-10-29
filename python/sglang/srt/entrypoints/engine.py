@@ -62,6 +62,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
@@ -69,6 +70,7 @@ from sglang.srt.managers.data_parallel_controller import (
     run_scheduler_process_with_init_pipe,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
+from sglang.srt.managers.disagg_service import start_disagg_service_for_rust_server
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     CloseSessionReqInput,
@@ -107,6 +109,13 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
+from sglang.srt.observability import metrics_collector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_TOKENIZER,
+    resolve_collector_class,
+    tokenizer_metric_labels,
+)
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
@@ -180,6 +189,8 @@ class SchedulerInitResult:
     wait_for_ready: Callable[[], None] = lambda: None
     block_until_scheduler_exits: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
+    # Rust-server mode only: a KV bootstrap server the Rust server cannot serve.
+    kv_bootstrap_server: Optional[Any] = None
     grpc_server: Optional[Any] = None
 
     def stop_grpc_server(self) -> None:
@@ -999,6 +1010,8 @@ class Engine(EngineScoreMixin, EngineBase):
                     ),
                     key=lambda source: source["dp_rank"],
                 )
+            # Each PP stage reports only its own L3 pools; give every info the merged layout.
+            merge_scheduler_info_layouts(infos)
             scheduler_infos.extend(infos)
             if use_dp_controller and not prelaunch_dp_schedulers:
                 for info in infos:
@@ -1091,7 +1104,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
     @staticmethod
     def _set_startup_time(
-        tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter],
+        set_startup_time: Callable[[Dict[str, Any]], None],
         scheduler_init_result: SchedulerInitResult,
         startup_tic: float,
     ) -> None:
@@ -1102,7 +1115,7 @@ class Engine(EngineScoreMixin, EngineBase):
             ),
             tokenizer_e2e=time.perf_counter() - startup_tic,
         )
-        tokenizer_manager.set_startup_time(startup_time)
+        set_startup_time(startup_time)
         cuda_graph_timings = ", ".join(
             f"{phase}={duration:.2f}"
             for phase, duration in startup_time["cuda_graph"].items()
@@ -1276,7 +1289,8 @@ class Engine(EngineScoreMixin, EngineBase):
                         get_serving().port,
                         get_observability().enable_metrics,
                     )
-                scheduler_init_result.block_until_scheduler_exits()
+                with rust_server_sidecar(rust_server_owns_base_port):
+                    scheduler_init_result.block_until_scheduler_exits()
             finally:
                 scheduler_init_result.stop_grpc_server()
             return (
@@ -1293,7 +1307,15 @@ class Engine(EngineScoreMixin, EngineBase):
         # not start the Python detokenizer subprocess(es) or tokenizer manager.
         # Do not use RayEngine with the Rust server, as it is not supported.
         if envs.SGLANG_RUST_SERVER.get():
+            # In place of the tokenizer manager, which starts the KV bootstrap
+            # server in Python mode.
+            scheduler_init_result.kv_bootstrap_server = (
+                start_disagg_service_for_rust_server()
+            )
             scheduler_init_result.wait_for_ready()
+            cls._set_startup_time(
+                _rust_server_startup_time_sink(), scheduler_init_result, startup_tic
+            )
             # Set up subprocess liveness watchdog to detect crashes
             processes = list(scheduler_procs or [])
             names = [f"scheduler_{i}" for i in range(len(processes))]
@@ -1336,7 +1358,9 @@ class Engine(EngineScoreMixin, EngineBase):
             # Wait for the model to finish loading
             scheduler_init_result.wait_for_ready()
 
-            cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
+            cls._set_startup_time(
+                tokenizer_manager.set_startup_time, scheduler_init_result, startup_tic
+            )
 
             # Get back some info from scheduler to tokenizer_manager
             tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
@@ -1871,8 +1895,27 @@ def _set_envs_and_config(server_args: ServerArgs):
     if cfg.nnodes > 1 and is_mnnvl_fabric_device():
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_MNNVL_ENABLE", "1")
+    # The KV-shard gather registers its scratch as an NCCL symmetric
+    # window, which requires cuMem-backed NCCL memory. The pool keeps torch
+    # memory under the memory saver or a custom mem pool. Multi-node
+    # deployments keep NCCL's setting (MNNVL fabrics default it on above).
+    kv_shard_symmetric_scratch = (
+        cfg.enable_kv_cache_sharding
+        and cfg.nnodes == 1
+        and envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
+        and not cfg.enable_memory_saver
+        and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
+    )
     if "NCCL_CUMEM_ENABLE" not in os.environ or cfg.enable_symm_mem:
-        os.environ["NCCL_CUMEM_ENABLE"] = str(int(cfg.enable_symm_mem))
+        if kv_shard_symmetric_scratch and not cfg.enable_symm_mem:
+            logger.info(
+                "Setting NCCL_CUMEM_ENABLE=1 for every NCCL communicator so the "
+                "KV-shard prefix gather can use a symmetric window. Set "
+                "SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER=0 to keep it off."
+            )
+        os.environ["NCCL_CUMEM_ENABLE"] = str(
+            int(cfg.enable_symm_mem or kv_shard_symmetric_scratch)
+        )
     if (
         "NCCL_NVLS_ENABLE" not in os.environ
         or cfg.enable_nccl_nvls
@@ -2043,6 +2086,20 @@ def _calculate_rank_ranges(node_rank: int) -> Tuple[range, range, int, int]:
     )
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def _rust_server_startup_time_sink() -> Callable[[Dict[str, Any]], None]:
+    """Where the startup phases go when the Rust server replaces the
+    TokenizerManager: this process records the startup-time metrics the
+    TokenizerManager would."""
+    if not get_observability().enable_metrics:
+        return lambda startup_time: None
+    # Read at call time: a plugin or model package may replace the module's
+    # collector class with its own subclass after this module is imported.
+    collector_cls = resolve_collector_class(
+        STAT_LOGGER_ROLE_TOKENIZER, metrics_collector.TokenizerMetricsCollector
+    )
+    return collector_cls(labels=tokenizer_metric_labels()).emit_startup_time
 
 
 def node_hosts_rust_server() -> bool:
