@@ -539,6 +539,8 @@ class Envs:
     # ===================================================================
     # Runtime simulations
     # ===================================================================
+    # Benchmark mode: changes only the accepted length; verify still runs every op real
+    # serving runs, at real cost (SGLANG_SIMULATE_ACC_GREEDY is the opt-out).
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
@@ -578,6 +580,10 @@ class Envs:
     # the NCCL ring. Only taken when the group's communicator has a multicast
     # plane; off, or no such plane, keeps the NCCL all-gather.
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
+    # With the TP-sharded markov_w2, keep each draft step's logits on the local
+    # vocab shard and run the sampling accept on the shards, instead of
+    # all-gathering the full logits every step. Same accept distribution.
+    SGLANG_DSPARK_SHARDED_ACCEPT = EnvBool(_default_hip)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
