@@ -219,8 +219,9 @@ def is_host_cpu_arm64() -> bool:
 
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
+    if os.getenv("SGLANG_USE_CPU_ENGINE", "0") != "1":
+        return False
+    return is_host_cpu_x86() or is_host_cpu_arm64()
 
 
 @lru_cache(maxsize=1)
@@ -2004,6 +2005,7 @@ class ImageData:
     max_dynamic_patch: Optional[int] = None
     preprocess_kwargs: Optional[Dict] = None
     content_hash: Optional[str] = None
+    max_long_side_pixel: Optional[int] = None
 
 
 GLM_MEDIA_CONFIG_KEYS = (
@@ -2018,6 +2020,7 @@ GLM_MEDIA_CONFIG_KEYS = (
 class VideoData:
     url: str
     preprocess_kwargs: Optional[Dict] = None
+    max_long_side_pixel: Optional[int] = None
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
@@ -3345,6 +3348,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("sglang.srt.managers.io_struct", "EmbeddingReqInput"),
         ("sglang.srt.disaggregation.encoder.receiver", "EmbeddingData"),
         ("sglang.srt.managers.schedule_batch", "Modality"),
+        ("sglang.srt.multimodal.modality", "Modality"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorMetadata"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorBucket"),
         (
@@ -4509,6 +4513,7 @@ def get_physical_cpus_by_numa():
 
 
 # Only physical cores are used. Logical cores are excluded.
+@lru_cache(maxsize=1)
 def get_cpu_ids_by_node():
     node_to_cpus = get_physical_cpus_by_numa()
     # Sort by NUMA node index

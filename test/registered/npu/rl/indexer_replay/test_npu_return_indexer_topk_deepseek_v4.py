@@ -22,7 +22,6 @@ from sglang.test.test_utils import (
 from sglang.utils import wait_for_server
 
 register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
-register_npu_ci(est_time=400, suite="base-b-test-2-npu-a3")
 
 
 # Keep the first 6 layers of the BF16 checkpoint. The first 6 V4-Flash

@@ -3,11 +3,12 @@ import json
 import os
 import pickle
 import shutil
+import signal
 import socket
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import msgspec
 import msgspec.structs
@@ -49,11 +50,15 @@ from sglang.srt.arg_groups.kv_shard_hook import (
     validate_kv_shard_attention_backend,
 )
 from sglang.srt.arg_groups.lora_hook import check_lora_server_args
-from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
+from sglang.srt.arg_groups.mamba_hook import (
+    handle_int8_mamba_checkpoint,
+    handle_mamba_backend,
+)
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
+    resolve_ascend_ops_speculative_draft,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
 )
@@ -90,6 +95,7 @@ from sglang.srt.entrypoints.sidecar import (
     Sidecar,
     _run_sidecar,
     build_sidecar_endpoint,
+    rust_server_sidecar,
     start_sidecar,
 )
 from sglang.srt.environ import envs
@@ -119,7 +125,7 @@ from sglang.test.test_utils import (
     enter_scope,
 )
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=11, suite="stage-b-test-cpu-intel")
 
 # Mock get_device() so all tests run on CPU-only CI runners
@@ -398,6 +404,38 @@ class TestPrepareServerArgs(CustomTestCase):
                 16384
             ):
                 validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+
+    def test_megamoe_token_budget_uses_resolved_dp_chunked_prefill(self):
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                tp_size=2,
+                attn_dp_size=2,
+            )
+            per_rank_chunked_prefill_size = 8192
+            declare_resolution(
+                args,
+                "test_data_parallelism",
+                chunked_prefill_size=per_rank_chunked_prefill_size,
+            )
+
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                per_rank_chunked_prefill_size
+            ):
+                validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                per_rank_chunked_prefill_size // 2
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, f"required_per_rank={per_rank_chunked_prefill_size}"
+                ):
+                    validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
 
     def test_megamoe_token_budget_gate_by_arch_and_nvfp4(self):
         from sglang.srt.arg_groups.mega_moe_hook import mega_moe_needs_token_budget
@@ -1075,6 +1113,26 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires SM100"):
             handle_mamba_backend(server_args)
+
+
+class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
+    def test_rejects_unified_memory(self):
+        """The unified pool has no int8 checkpoint pool; the flag used to be
+        accepted and then silently ignored."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_int8_mamba_checkpoint=True,
+            enable_unified_memory=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+            handle_int8_mamba_checkpoint(server_args)
+
+    def test_unified_memory_alone_is_accepted(self):
+        """An inverted condition here would reject every unified launch."""
+        handle_int8_mamba_checkpoint(
+            ServerArgs(model_path="dummy", enable_unified_memory=True)
+        )
 
 
 class TestKV4Compatibility(unittest.TestCase):
@@ -2763,6 +2821,61 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 4)
 
 
+class TestAscendOpsArgs(CustomTestCase):
+    def test_ascend_ops_rejected_by_waterfill_without_config(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="ascend_ops",
+            enable_waterfill=True,
+        )
+        with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
+            handle_a2a_moe(server_args)
+
+    def test_ascend_ops_rejected_by_waterfill_with_config(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="ascend_ops",
+            moe_ascend_ops_config="{}",
+            enable_waterfill=True,
+        )
+        with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
+            handle_a2a_moe(server_args)
+
+    def test_ascend_ops_speculative_draft_requires_npu(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            speculative_moe_a2a_backend="ascend_ops",
+        )
+        with self.assertRaisesRegex(ValueError, "only supported on NPU"):
+            handle_a2a_moe(server_args)
+
+    # Protects the target/draft backend invariant required by the shared
+    # Ascend Ops configuration and communication groups.
+    @override_platform(is_npu=True, is_cuda=False, is_hip=False, is_xpu=False)
+    def test_ascend_ops_requires_matching_target_and_draft_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="ascend_ops",
+            speculative_moe_a2a_backend="deepep",
+        )
+        self.assertEqual(
+            resolve_ascend_ops_speculative_draft(server_args),
+            {"speculative_moe_a2a_backend": "ascend_ops"},
+        )
+
+    # Protects the inverse invariant: a non-Ascend main backend cannot use
+    # Ascend Ops only for the speculative draft model.
+    def test_non_ascend_ops_rejects_ascend_ops_draft_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            speculative_moe_a2a_backend="ascend_ops",
+        )
+        with self.assertRaisesRegex(AssertionError, "cannot be ascend_ops"):
+            resolve_ascend_ops_speculative_draft(server_args)
+
+
 class TestWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
@@ -3856,13 +3969,60 @@ class TestGrpcServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must not be empty"):
             handle_deprecated_args(sa)
 
-    def test_sidecar_rejects_rust_server_lifecycle(self):
-        sa = self._args(sidecar="example.sidecar", grpc_port=50051)
-        with (
-            envs.SGLANG_RUST_SERVER.override(True),
-            self.assertRaisesRegex(ValueError, "does not run the Python sidecar"),
-        ):
+    def test_sidecar_runs_under_rust_server_with_native_grpc(self):
+        with envs.SGLANG_RUST_SERVER.override(True):
+            with self.assertRaisesRegex(ValueError, "requires --grpc-port"):
+                handle_deprecated_args(self._args(sidecar="example.sidecar"))
+            sa = self._args(sidecar="example.sidecar", grpc_port=50051)
             handle_deprecated_args(sa)
+        self.assertEqual(resolution_result(sa, "grpc_port"), 50051)
+
+    def test_sigterm_stops_the_rust_server_sidecar_then_passes_it_on(self):
+        """SIGTERM stops the sidecar once, even when stopping fails, and then
+        still reaches the launcher: its previous handler, or the default action
+        (and an exit when PID 1 drops the re-raise)."""
+        override = get_context().override_server_args(
+            host="127.0.0.1", grpc_port=50051, sidecar="example.sidecar"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        for chained, stop_fails in ((False, False), (True, False), (True, True)):
+            with self.subTest(chained=chained, stop_fails=stop_fails):
+                events = MagicMock()
+                if stop_fails:
+                    events.sidecar.stop.side_effect = RuntimeError("stop failed")
+
+                # signal.signal rejects a MagicMock, so wrap it.
+                def previous_handler(signum, frame):
+                    events.previous(signum)
+
+                previous = previous_handler if chained else signal.SIG_DFL
+                signal.signal(signal.SIGTERM, previous)
+                try:
+                    with (
+                        patch(
+                            "sglang.srt.entrypoints.sidecar.start_sidecar",
+                            return_value=events.sidecar,
+                        ),
+                        # A mocked kill is dropped, as it is for PID 1.
+                        patch("sglang.srt.entrypoints.sidecar.os.kill", events.kill),
+                        rust_server_sidecar(True),
+                    ):
+                        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+                except SystemExit as e:
+                    events.exited(e.code)
+
+                forwarded = (
+                    [call.previous(signal.SIGTERM)]
+                    if chained
+                    else [
+                        call.kill(os.getpid(), signal.SIGTERM),
+                        call.exited(128 + signal.SIGTERM),
+                    ]
+                )
+                self.assertEqual(events.mock_calls, [call.sidecar.stop(), *forwarded])
+                self.assertIs(signal.getsignal(signal.SIGTERM), previous)
 
     def test_sidecar_sets_endpoint_env_before_import_and_calls_main(self):
         main = MagicMock()
@@ -4110,6 +4270,23 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         ]
         return args
 
+    def test_sharding_defaults_to_python_when_backend_is_unset(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        with patch.dict(os.environ), envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+            handle_kv_cache_sharding(args, 80 * 1024)
+            self.assertEqual(
+                envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "python"
+            )
+
+    def test_unsharded_launch_keeps_the_general_backend_default(self):
+        args = self._args(enable_kv_cache_sharding=False)
+        with patch.dict(os.environ):
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+            handle_kv_cache_sharding(args, 80 * 1024)
+            self.assertFalse(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set())
+            self.assertEqual(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "rust")
+
     def test_encoder_decoder_is_rejected_before_backend_setup(self):
         args = self._args(model_config=SimpleNamespace(is_encoder_decoder=True))
 
@@ -4195,6 +4372,18 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         args = self._args(enable_hisparse=True)
 
         with self.assertRaisesRegex(ValueError, "does not support --enable-hisparse"):
+            handle_kv_cache_sharding(args)
+
+    def test_hicache_host_offload_is_accepted_but_not_storage(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.enable_hierarchical_cache = True
+        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+        args = self._args(
+            enable_hierarchical_cache=True, hicache_storage_backend="file"
+        )
+        with self.assertRaisesRegex(ValueError, "not --hicache-storage-backend"):
             handle_kv_cache_sharding(args)
 
     def test_incompatible_cache_tree_modes_are_rejected(self):

@@ -536,7 +536,7 @@ class DraftBlockProposer:
         )
         # Hand-built batch bypasses ForwardBatch.init_new: rebind the write
         # loc to the draft's kernel-facing ids (no-op on plain pools).
-        self.draft_model_runner.kv_index_translator.bind_own_plan(idle_batch)
+        self.draft_model_runner.runner_ids.bind_own_plan(idle_batch)
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)
@@ -587,12 +587,12 @@ class DraftBlockProposer:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-        if batch.seq_lens_cpu is not None:
+        if not self.draft_model_runner.attn_backend.needs_cpu_seq_lens:
+            draft_seq_lens_cpu = None
+            draft_seq_lens_sum = None
+        elif batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
-        elif draft_input.nxt_kv_lens_cpu is not None:
-            draft_seq_lens_cpu = draft_input.nxt_kv_lens_cpu
-            draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
         else:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
@@ -616,9 +616,9 @@ class DraftBlockProposer:
             ),
             global_num_token_non_padded_cpu=draft_num_tokens,
         )
-        verify_window.kv_loc_plan.bind(
+        verify_window.iteration_ids.bind(
             draft_forward_batch,
-            self.draft_model_runner.kv_index_translator,
+            self.draft_model_runner.runner_ids,
             cols=slice(0, query_token_num),
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)

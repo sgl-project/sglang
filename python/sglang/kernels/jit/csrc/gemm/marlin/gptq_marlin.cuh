@@ -264,9 +264,13 @@ bool is_valid_config(
       q_type == W_TYPE && thread_m_blocks == THREAD_M_BLOCKS && thread_n_blocks == THREAD_N_BLOCKS &&                  \
       thread_k_blocks == THREAD_K_BLOCKS && m_block_size_8 == M_BLOCK_SIZE_8 && group_blocks == GROUP_BLOCKS &&        \
       num_threads == NUM_THREADS && is_zp_float == IS_ZP_FLOAT) {                                                      \
+    constexpr auto S_TYPE = W_TYPE == host::kFE2M1f                                                                    \
+                                ? (GROUP_BLOCKS == 1 ? host::kFE4M3fn : host::kFE8M0fnu)                               \
+                                : (std::is_same<scalar_t, half>::value ? host::kFloat16 : host::kBFloat16);            \
     kernel = Marlin<                                                                                                   \
         scalar_t,                                                                                                      \
         W_TYPE.id(),                                                                                                   \
+        S_TYPE.id(),                                                                                                   \
         NUM_THREADS,                                                                                                   \
         THREAD_M_BLOCKS,                                                                                               \
         THREAD_N_BLOCKS,                                                                                               \
@@ -282,7 +286,8 @@ bool is_valid_config(
 // BIGGROUP: cases for big group size (group_blocks in [-1, 8])
 // FZP: cases for float-zero-point (is_zp_float = true)
 // ACT: cases for act order case (group_blocks == 0)
-// FP4: cases for nvfp4(e2m1) (group_blocks == 1)
+// NVFP4: cases for nvfp4(e2m1) (group_blocks == 1)
+// MXFP4: cases for mxfp4(e2m1) (group_blocks == 2)
 #define COMMON_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, -1, NUM_THREADS, false)  \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false)   \
@@ -339,22 +344,39 @@ bool is_valid_config(
   BIGGROUP_GET_IF_M234(W_TYPE, 8, 4, 128)  \
   BIGGROUP_GET_IF_M234(W_TYPE, 4, 8, 128)
 
-#define FP4_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)        \
+#define NVFP4_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)      \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 1, NUM_THREADS, false) \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false)
 
-#define FP4_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
+#define NVFP4_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
   _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false) \
   _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false) \
   _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false)
 
-#define FP4_GET_IF(W_TYPE)            \
-  FP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
-  FP4_GET_IF_M1(W_TYPE, 8, 4, 128)    \
-  FP4_GET_IF_M1(W_TYPE, 4, 8, 128)    \
-  FP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
-  FP4_GET_IF_M234(W_TYPE, 8, 4, 128)  \
-  FP4_GET_IF_M234(W_TYPE, 4, 8, 128)
+#define NVFP4_GET_IF(W_TYPE)            \
+  NVFP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
+  NVFP4_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+  NVFP4_GET_IF_M1(W_TYPE, 4, 8, 128)    \
+  NVFP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
+  NVFP4_GET_IF_M234(W_TYPE, 8, 4, 128)  \
+  NVFP4_GET_IF_M234(W_TYPE, 4, 8, 128)
+
+#define MXFP4_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)      \
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
+
+#define MXFP4_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
+  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
+
+#define MXFP4_GET_IF(W_TYPE)            \
+  MXFP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
+  MXFP4_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+  MXFP4_GET_IF_M1(W_TYPE, 4, 8, 128)    \
+  MXFP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
+  MXFP4_GET_IF_M234(W_TYPE, 8, 4, 128)  \
+  MXFP4_GET_IF_M234(W_TYPE, 4, 8, 128)
 
 // We currently have 4-bit models only with group_blocks == 4
 #define FZP_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
@@ -413,7 +435,7 @@ MarlinFuncPtr get_marlin_kernel(
   COMMON_GET_IF(host::kU4B8)
   COMMON_GET_IF(host::kU8B128)
 
-  FP4_GET_IF(host::kFE2M1f)
+  NVFP4_GET_IF(host::kFE2M1f)
 
   BIGGROUP_GET_IF(host::kFE4M3fn)
 
@@ -424,6 +446,16 @@ MarlinFuncPtr get_marlin_kernel(
     if (false) {
     }
     FZP_GET_IF(host::kU4)
+  }
+
+  // MXFP4's E8M0 scale decoder is only defined for bf16 (see dequant.h), so the
+  // half branch must not even be instantiated -- `if constexpr`, not a runtime
+  // `if`, which would still compile the body and fail to link half2/kFE8M0fnu.
+  if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
+    if (false) {
+      // _GET_IF expands to "else if", so it needs a preceding if to chain onto.
+    }
+    MXFP4_GET_IF(host::kFE2M1f)
   }
 
   return kernel;
@@ -918,14 +950,6 @@ void gptq_marlin_gemm(
     }
   }
 
-  // Verify global_scale
-  int64_t global_scale_size = global_scale.size(0);
-  if (global_scale_size > 0) {
-    RuntimeCheck(b_q_type == kFE2M1f, "global_scale can only be used for float4_e2m1f.");
-  } else {
-    RuntimeCheck(!(b_q_type == kFE2M1f), "the global_scale parameter must be passed for float4_e2m1f.");
-  }
-
   // Derive group_size
   int group_size = -1;
   if (has_act_order) {
@@ -943,6 +967,29 @@ void gptq_marlin_gemm(
     } else {
       group_size = -1;
     }
+  }
+
+  // Verify global_scale (Optional unwrap done in Python).
+  // Only NVFP4 (group_size 16) carries one; MXFP4 folds its scale into the E8M0
+  // group scales.
+  int64_t global_scale_size = global_scale.size(0);
+  if (global_scale_size > 0) {
+    RuntimeCheck(b_q_type == kFE2M1f && group_size == 16, "global_scale can only be used for nvfp4 format.");
+  } else {
+    RuntimeCheck(
+        !(b_q_type == kFE2M1f && group_size == 16), "the global_scale parameter must be passed for nvfp4 format.");
+  }
+
+  if (b_q_type == kFE2M1f) {
+    RuntimeCheck(
+        group_size == 16 || group_size == 32,
+        "float4_e2m1f only supports group_size == 16 (NVFP4) or group_size == 32 (MXFP4). Got group_size = ",
+        group_size);
+    // The E8M0 scale decoder is only instantiated for bf16 (see dequant.h), so a
+    // half call would otherwise dispatch to the no-op MarlinDefault kernel.
+    RuntimeCheck(
+        group_size != 32 || std::is_same<scalar_t, nv_bfloat16>::value,
+        "MXFP4 Marlin with E8M0 scales is only instantiated for bfloat16 activations.");
   }
 
   // Verify workspace and get device info
