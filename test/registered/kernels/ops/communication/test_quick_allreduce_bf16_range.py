@@ -129,7 +129,7 @@ def _run_jit_bitwise_test(rank: int, world_size: int, port: int) -> None:
         aot_comm, jit_comm = _open_comms(rank, world_size)
         generator = torch.Generator(device=device).manual_seed(rank)
         # (requested level, level it runs): asked for INT4, the JIT build runs INT8 below 64 MiB;
-        # at 32 KB a tile, the sizes past the first have more tiles than blocks (grid-stride loop)
+        # at 32 KB a tile, the last three have more tiles than blocks (grid-stride loop)
         for numel, level, runs in (
             (171 * 6144, _INT4, _INT8),  # a partial last tile
             (384 * 6144, _INT4, _INT8),
@@ -243,8 +243,8 @@ class TestQuickAllReduceBf16Range(CustomTestCase):
     )
     def test_jit_matches_sgl_kernel(self):
         """On bf16 cast to fp16 the JIT build must reduce bit-identically to sgl-kernel's at
-        the level it runs (INT8 below 64 MiB when asked for INT4) and refuse any level but
-        INT4 and INT8."""
+        the level it runs (INT8 below 64 MiB when asked for INT4) and refuse float16 input or any
+        level but INT4 and INT8."""
         _spawn(self, _run_jit_bitwise_test, 4, "QuickReduce JIT bitwise test")
 
     @unittest.skipUnless(

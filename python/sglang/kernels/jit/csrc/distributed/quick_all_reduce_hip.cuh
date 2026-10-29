@@ -29,9 +29,8 @@ constexpr int64_t kInt8 = 1;
 constexpr int64_t kInt4 = 3;
 
 struct QuickAllReduce {
-  /// \brief Allocates this rank's communication buffer for a TP group of `world_size`.
-  /// \param max_problem_size Largest all-reduce in bytes; <= 0 keeps sgl-kernel's 2 GiB default.
-  /// \return An opaque DeviceComms handle, released by destroy().
+  /// \brief Allocates this rank's communication buffer and returns its handle, released by destroy().
+  /// max_problem_size is the largest all-reduce in bytes; <= 0 keeps sgl-kernel's 2 GiB default.
   static int64_t init(int64_t world_size, int64_t rank, int64_t max_problem_size) {
     host::RuntimeCheck(world_size == 4, "the JIT quick all-reduce is built for TP4");
     host::RuntimeCheck(0 <= rank && rank < world_size, "invalid rank");
@@ -45,7 +44,7 @@ struct QuickAllReduce {
     return reinterpret_cast<int64_t>(comms);
   }
 
-  /// \brief Writes this rank's IPC handle into `handle`, a CPU uint8 tensor of kHandleBytes.
+  /// \brief Writes this rank's IPC handle into handle, a CPU uint8 tensor of kHandleBytes.
   static void get_handle(int64_t comm, const tvm::ffi::TensorView handle) {
     using namespace host;
     TensorMatcher({kHandleBytes}).with_dtype<uint8_t>().with_device<kDLCPU>().verify(handle);
@@ -53,7 +52,7 @@ struct QuickAllReduce {
     std::memcpy(handle.data_ptr(), &ipc, kHandleBytes);
   }
 
-  /// \brief Opens every rank's buffer from `handles`, CPU uint8 [world_size, kHandleBytes] in rank order.
+  /// \brief Opens every rank's buffer from handles, CPU uint8 [world_size, kHandleBytes] in rank order.
   static void open_handles(int64_t comm, const tvm::ffi::TensorView handles) {
     using namespace host;
     auto* comms = reinterpret_cast<quickreduce::DeviceComms*>(comm);
@@ -64,9 +63,8 @@ struct QuickAllReduce {
     comms->open_ipc_handles(ipc);
   }
 
-  /// \brief out = sum of the bf16 `inp` over the group, out of place, on the current stream.
-  /// \param quant_level 3 (INT4) or 1 (INT8) in sgl-kernel's QuickReduceQuantLevel.
-  /// \param cast_bf2half must be true: the reduction runs in the fp16 kernels, as sgl-kernel's does.
+  /// \brief out = sum of the bf16 inp over the group, out of place, on the current stream.
+  /// quant_level is INT4 or INT8, and cast_bf2half must be true: the reduction runs in the fp16 kernels.
   static void all_reduce(
       int64_t comm,
       const tvm::ffi::TensorView inp,

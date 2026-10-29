@@ -1,7 +1,7 @@
-"""JIT build of sgl-kernel's ROCm quick all-reduce `qr_*` calls, for INT4 and INT8 at TP4.
+"""JIT build of sgl-kernel's ROCm quick all-reduce ``qr_*`` calls, for INT4 and INT8 at TP4.
 
-The two-shot kernel (kernels/jit/csrc/distributed/quick_all_reduce/) is restructured for latency
-but keeps sgl-kernel's buffer sizes, flags and arithmetic, so on bf16 cast to fp16 its outputs
+The two-shot kernel (kernels/jit/csrc/distributed/quick_all_reduce/) is laid out for latency but
+keeps sgl-kernel's buffer sizes, flags and arithmetic, so on bf16 cast to fp16 its outputs
 match bitwise. Asked for INT4, it runs the all-reduces below 64 MiB in INT8. A group it does not
 serve (another world size or level, no bf16 -> fp16 cast) gets sgl-kernel's quick all-reduce.
 """
@@ -32,7 +32,7 @@ _DEFAULT_MAX_SIZE = 1 << 31
 # sgl-kernel's QuickReduceQuantLevel
 _INT8, _INT4 = 1, 3
 # The latency-bound decode and short-extend sizes, where INT8 (about 1/16 of INT4's error) still
-# beats the bf16 custom AR on MI350X TP4 (23.8 vs 31.3 us at 3.1 MB); prefill keeps INT4.
+# beats the bf16 custom AR, measured on MI350X TP4; prefill keeps INT4.
 _INT8_BELOW_BYTES = 64 << 20
 
 
@@ -61,8 +61,7 @@ _SGL_KERNEL_HANDLES: set[int] = set()
 
 
 def jit_serves(world_size: int) -> bool:
-    """Whether the JIT build serves a `world_size` group at the quantization level and
-    bf16 -> fp16 cast that `QuickAllReduce` reads from the environment."""
+    """Whether the JIT build serves the group at the level and cast ``QuickAllReduce`` reads."""
     return (
         world_size == 4
         and os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE") in ("INT4", "INT8")
