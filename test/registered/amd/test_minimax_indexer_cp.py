@@ -102,8 +102,10 @@ def _cp_topk(q, cache, table, slots, lengths, max_len, k_scale, packed_queries=1
 
 
 def _nvfp4_verify_inputs(prefixes, num_draft, seed, tied_pages=False):
-    """DSpark verify rows over the packed NVFP4 index-K pool: whole 128-token pages,
-    shuffled. With ``tied_pages`` most pages copy page 1, so most blocks tie."""
+    """DSpark verify rows over a shuffled NVFP4 index-K pool of whole 128-token pages.
+
+    With ``tied_pages`` most pages copy page 1, so most blocks tie.
+    """
     from sglang.kernels.ops.attention.minimax_sparse.common.nvfp4 import Nvfp4Cache
     from sglang.test.quant_ref_utils import nvfp4_kv_quantize
 

@@ -56,8 +56,7 @@ def _add(a, b):
 
 @gluon.jit
 def _local_range(init_blocks, req_hi, WORLD: gl.constexpr, RANK: gl.constexpr):
-    """Local ids [lo, hi) of this rank's candidate blocks l * WORLD + RANK in
-    [init_blocks, req_hi); with one rank, the blocks themselves."""
+    """Local ids [lo, hi) of blocks l * WORLD + RANK in [init_blocks, req_hi)."""
     if WORLD == 1:
         return init_blocks, req_hi
     lo = (gl.maximum(init_blocks - RANK, 0) + WORLD - 1) // WORLD
@@ -765,8 +764,10 @@ def _cp_local_keys_kernel(
     KP: tl.constexpr,
     NC: tl.constexpr,
 ):
-    """One rank's split lists reduced to its best KP candidates, without the forced
-    blocks: what the native merge would pick from were these all the blocks."""
+    """One rank's split lists reduced to its best KP candidates, forced blocks excluded.
+
+    These are what the native merge would pick from were they all the blocks.
+    """
     r = tl.program_id(0)
     req = (r % rows) // NUM_DRAFT
     c = tl.arange(0, NC)
@@ -798,8 +799,10 @@ def _cp_merge_kernel(
     BLOCK_N: tl.constexpr,
     KT: tl.constexpr,
 ):
-    """_verify_index_topk_merge_kernel over every rank's best KP of head HEAD: rank r
-    scored blocks r, r + WORLD, ..., so together they hold the whole row's best."""
+    """_verify_index_topk_merge_kernel over every rank's best KP of head HEAD.
+
+    Rank r scored blocks r, r + WORLD, ..., so together they hold the whole row's best.
+    """
     r = tl.program_id(0)
     n_blocks = tl.minimum(
         (tl.load(seq_lens_ptr + r).to(tl.int32) + BLOCK_N - 1) // BLOCK_N, max_blocks
@@ -837,9 +840,11 @@ def _cp_merge_kernel(
 
 
 def _cp_split_config(num_reqs: int) -> tuple[int, int, int, bool]:
-    """`_split_config` for a rank's quarter of the blocks with every head's rows in
-    one tile: one wave of short splits up to 96 requests, then two waves of longer
-    splits, which leave fewer CUs idle (measured on MI350X)."""
+    """``_split_config`` for a rank's quarter of the blocks, every head's rows in one tile.
+
+    One wave of short splits up to 96 requests, then two waves of longer splits, which
+    leave fewer CUs idle (measured on MI350X).
+    """
     if num_reqs <= 96:
         return 256, 16, 4, num_reqs <= 64
     return max(512, 2 * num_reqs), 8, 16, False
@@ -860,8 +865,10 @@ def _cp_partial(
     world: int,
     rank: int,
 ):
-    """The fused verify indexer's partial pass over this rank's blocks, every head's
-    rows in one tile: (split lists [heads, rows, nc], splits per request, nc)."""
+    """The fused verify partial pass over this rank's blocks, all heads in one tile.
+
+    The result is (split lists [heads, rows, nc], splits per request, nc).
+    """
     heads, rows, head_dim = q_heads.shape
     num_reqs = rows // num_draft
     max_blocks = triton.cdiv(min(max_seqlen, req_to_token.shape[1]), block_size)
@@ -928,10 +935,12 @@ def cp_verify_local_keys(
     world: int,
     rank: int,
 ) -> torch.Tensor:
-    """Indexer CP on an NVFP4 index-K pool: the best _KP candidate keys per (head, row)
-    among this rank's blocks rank, rank + world, ..., as [heads, rows, _KP] int64.
-    The partial kernel is the fused verify indexer's, every head's rows in one tile, so
-    each K block is read once per request and scores match the unsharded ones."""
+    """Indexer CP on an NVFP4 index-K pool: this rank's best _KP keys per (head, row).
+
+    The int64 keys [heads, rows, _KP] cover blocks rank, rank + world, ...; the partial
+    kernel is the fused verify indexer's, every head's rows in one tile, so each K block
+    is read once per request and scores match the unsharded ones.
+    """
     heads, rows, _ = q_heads.shape
     part_k, part_n, nc = _cp_partial(
         q_heads,
@@ -974,8 +983,10 @@ def cp_verify_merge(
     init_blocks: int,
     local_blocks: int,
 ) -> torch.Tensor:
-    """Head ``head``'s top-k ids [1, rows, topk] from every rank's candidates, in the
-    layout fused_verify_topk_idx writes."""
+    """Head ``head``'s top-k ids [1, rows, topk] from every rank's candidates.
+
+    Laid out as fused_verify_topk_idx writes them.
+    """
     world, heads, rows, kp = gathered_keys.shape
     out = torch.empty((1, rows, topk), dtype=torch.int32, device=gathered_keys.device)
     if rows:
@@ -1015,9 +1026,11 @@ CP_MAX_ROWS = 4096
 
 @triton.jit
 def _wire(key, tag):
-    """A native key (ordered score << 32 | ~block) as an exchange word: ordered
-    score, tag, then 0xFFFFFF - block, so that within one call the words order as
-    the keys do. An empty key becomes the lowest score with block field 0."""
+    """A native key (ordered score << 32 | ~block) as an exchange word.
+
+    The word is ordered score, tag, then 0xFFFFFF - block, so that within one call the
+    words order as the keys do. An empty key becomes the lowest score with block field 0.
+    """
     NO_KEY: tl.constexpr = -9223372036854775808
     blk = (~key).to(tl.int32)
     score = (key >> 32).to(tl.int32)
@@ -1044,8 +1057,10 @@ def _cp_local_keys_ipc_kernel(
     NC: tl.constexpr,
     MAX_ROWS: tl.constexpr,
 ):
-    """_cp_local_keys_kernel, delivering the best KP of (head, row) into the
-    receive buffer of the rank that owns head ``head`` instead of writing them out."""
+    """_cp_local_keys_kernel, delivering the keys over IPC instead of writing them out.
+
+    The best KP of (head, row) go into the receive buffer of the rank that owns ``head``.
+    """
     pid = tl.program_id(0)
     head, r = pid // rows, pid % rows
     req = r // NUM_DRAFT
@@ -1083,8 +1098,11 @@ def _cp_merge_ipc_kernel(
     KT: tl.constexpr,
     MAX_ROWS: tl.constexpr,
 ):
-    """_cp_merge_kernel over the words every rank delivered for this row: waits until
-    all WORLD * KP carry this call's tag, then selects exactly as the native merge."""
+    """_cp_merge_kernel over the words every rank delivered for this row.
+
+    Waits until all WORLD * KP carry this call's tag, then selects exactly as the
+    native merge.
+    """
     r = tl.program_id(0)
     n = tl.load(counters_ptr + r)
     tl.store(counters_ptr + r, n + 1)
@@ -1129,9 +1147,11 @@ def _cp_merge_ipc_kernel(
 
 
 class CpExchange:
-    """One rank's IPC receive buffer, the peers' addresses and the call counters of
-    the indexer-CP candidate exchange. Allocate once, before graph capture, on every
-    rank of ``group`` (a collective); every rank must then make the same calls."""
+    """One rank's receive buffer, peer addresses and call counters of the IPC exchange.
+
+    Allocate once, before graph capture, on every rank of ``group`` (a collective); every
+    rank must then make the same calls.
+    """
 
     def __init__(self, group, device):
         import torch.distributed as dist
@@ -1151,8 +1171,10 @@ class CpExchange:
 
 
 def _hip_runtime():
-    """The HIP runtime this process already loaded (ROCm wheels ship only the
-    versioned soname), through ctypes."""
+    """The HIP runtime this process already loaded, through ctypes.
+
+    Found in /proc/self/maps because ROCm wheels ship only the versioned soname.
+    """
     import ctypes
 
     with open("/proc/self/maps") as maps:
@@ -1163,9 +1185,11 @@ def _hip_runtime():
 
 
 def _uncached_ipc_buffers(nbytes, cpu_group, rank, world):
-    """Every rank's zeroed ``nbytes`` of uncached device memory, as this rank's
-    addresses of them. Uncached, because a peer's writes land in this GPU's memory
-    behind its L2: a cached buffer would keep serving the waiting merge a stale line."""
+    """This rank's addresses of every rank's zeroed ``nbytes`` of uncached device memory.
+
+    Uncached, because a peer's writes land in this GPU's memory behind its L2: a cached
+    buffer would keep serving the waiting merge a stale line.
+    """
     import ctypes
 
     import torch.distributed as dist
@@ -1239,9 +1263,11 @@ def cp_verify_exchange(
     sm_scale,
     exchange: CpExchange,
 ):
-    """Indexer CP with the candidate exchange done in place over IPC: score this
-    rank's blocks, deliver each head's best _KP to its owner, and merge what the
-    peers delivered for this rank's head. [1, rows, topk] int32, as cp_verify_merge."""
+    """Indexer CP with the candidate exchange done in place over IPC.
+
+    Scores this rank's blocks, delivers each head's best _KP to its owner and merges what
+    the peers delivered for this rank's head: [1, rows, topk] int32, as cp_verify_merge.
+    """
     heads, rows, head_dim = q_heads.shape
     assert rows <= CP_MAX_ROWS and heads == exchange.world
     num_reqs = rows // num_draft

@@ -1,9 +1,10 @@
 """Opt-in, decode-only context partitioning of MiniMax's replicated index K.
 
 This first implementation gathers the existing post-RoPE index queries rather
-than changing checkpoint loading or fused projections. Both gathers go through
+than changing checkpoint loading or fused projections. The query gather goes through
 SGLang's communicator so AITER registration and graph capture remain owned by
-the runtime. Communication cost must be included in performance comparisons.
+the runtime; the candidates return through an IPC exchange by default, or a second
+gather. Communication cost must be included in performance comparisons.
 """
 
 import logging
@@ -135,8 +136,10 @@ class MiniMaxIndexerCP:
         self.exchange = None
 
     def warmup(self):
-        """Initialize both runtime and PyNCCL gather paths before graph capture, and
-        the IPC candidate exchange (a collective allocation on every rank)."""
+        """Initialize both runtime and PyNCCL gather paths before graph capture.
+
+        Also allocates the IPC candidate exchange, a collective on every rank.
+        """
         from sglang.srt.environ import envs
 
         if envs.SGLANG_MINIMAX_M3_INDEXER_CP_IPC.get():
