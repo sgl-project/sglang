@@ -327,30 +327,17 @@ class TestDraftBindingDispatch(CustomTestCase):
                 token_to_kv_pool_allocator=alloc,
             )
 
-    def test_non_eagle_draft_takes_the_private_arm_sized_by_the_id_space(self):
-        alloc = self._swa_allocator(with_draft_region=False)
-        id_space = alloc.full_attn_allocator.max_slots - 1
-        # The distinction under test only exists while budget < id space.
-        self.assertLess(alloc.size_full, id_space)
-        with self.assertRaises(_CapturedSizes) as caught:
-            self._run(
-                algorithm=SpeculativeAlgorithm.DSPARK,
-                alloc=alloc,
-                max_total_num_tokens=alloc.size_full,
-            )
-        sized = caught.exception.sizes.max_total_num_tokens
-        self.assertEqual(sized, (id_space + _PS - 1) // _PS * _PS)
-
-    def test_a_declined_fusion_takes_the_private_arm_over_a_stateless_table(self):
-        """A target without recurrent state shares its stateless request table
-        with a draft whose fusion was declined (DFLASH without a draft window
-        under file-backed HiCache, which keeps drafts unfused; DSPARK under
-        HiCache): the draft binds no state and builds its private pool."""
-        for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
+    def test_supported_drafts_require_a_declared_placement(self):
+        for algorithm in (
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DSPARK,
+        ):
             with self.subTest(algorithm=algorithm.name):
                 alloc = self._swa_allocator(with_draft_region=False)
-                self.assertIsNone(alloc.state)
-                with self.assertRaises(_CapturedSizes):
+                with self.assertRaisesRegex(
+                    ValueError, "must declare the draft payload"
+                ):
                     self._run(
                         algorithm=algorithm,
                         alloc=alloc,
@@ -358,9 +345,7 @@ class TestDraftBindingDispatch(CustomTestCase):
                     )
 
     def test_a_draft_with_a_region_binds_the_fused_pool(self):
-        """An EAGLE or DSPARK draft binds the fused pool over the target's
-        allocator when the target resolved a region; the region-less private
-        arm above is the fallback."""
+        """Supported draft algorithms bind the placement priced by the target."""
         alloc = self._swa_allocator(with_draft_region=True)
         for algorithm in (SpeculativeAlgorithm.EAGLE3, SpeculativeAlgorithm.DSPARK):
             pools = self._run(

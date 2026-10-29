@@ -161,7 +161,10 @@ def _float_open_short_side(flt, demand) -> None:
             continue
         holes = len(band_alloc._free_phys_pages) if band_alloc.lazy_compaction else 0
         ext = max(0, pages - holes)
-        side = "high" if band_alloc.grow_direction == "down" else "low"
+        above = flt.high_peer
+        while above is not None and above is not band_alloc:
+            above = above.high_peer
+        side = "high" if above is band_alloc else "low"
         sides[side] += ext * band_alloc.entry_bytes_per_page
     band = {
         "low": max(

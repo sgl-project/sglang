@@ -18,9 +18,12 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
 )
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_unified_pools
 from sglang.srt.mem_cache.kv.decl import (
+    FullLifetime,
     MHAGeometry,
     MLAGeometry,
     StateGeometry,
+    StateLifetime,
+    WindowLifetime,
     kv_layer_decls,
 )
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
@@ -254,7 +257,14 @@ def plan_stand_in(arena: SpecArena, fused_draft=None) -> SimpleNamespace:
     """What draft binding reads of a plan, over a test arena's specs."""
     return SimpleNamespace(
         fused_draft=fused_draft,
-        sub_pool=lambda name: SimpleNamespace(spec=arena.spec(name)),
+        sub_pool=lambda name: SimpleNamespace(
+            spec=arena.spec(name),
+            lifetime=FullLifetime()
+            if name == "full"
+            else StateLifetime()
+            if name == "mamba"
+            else WindowLifetime(window=64),
+        ),
     )
 
 

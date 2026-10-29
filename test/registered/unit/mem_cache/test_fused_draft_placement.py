@@ -14,25 +14,10 @@
 """`place_fused_draft` and the target's fused-draft decision: which drafts
 fuse into the host's entries, and where each runner's layers land.
 
-A decline keeps a draft on a private pool (or refuses it at boot); admitting
-one that cannot read the fused rows correctly gives silently wrong drafts.
-Pinned:
-  - a replicated head under multi-layer EAGLE gets one lane RANGE per runner
-    (one shared region would let the runners clobber each other's KV);
-  - a per-depth head serves one depth per runner and needs one runner per
-    depth;
-  - a draft with a layer kind no registered host kind serves declines, and
-    so does a draft under --dcp-size > 1 (each rank's rows hold only its
-    share of the tokens), an explicit draft KV dtype unlike the host's, and
-    a draft under HiCache or host-pool decode retraction (they build the
-    draft's host pool off a device pool of its own);
-  - no attention backend takes part: a fused draft reads its rows through
-    the same views and id spaces as the target, whatever backend it runs;
-  - the profile divides the draft's heads by attn_tp, as the target does,
-    and owns recurrent state only for a per-depth conv-chain head;
-  - the registry refuses a duplicate host or a second primary host for one
-    layer kind and reports hosts in registration order, every placed host
-    reports itself in the boot log, and runner ranges must tile a region.
+Lifetimes determine shared or independent bands. Each runner owns disjoint
+lanes; row geometry and dtype belong to its parts. DCP replicas and complete
+host envelopes are priced in the same plan. Invalid layer declarations fail
+before allocation.
 
     python -m pytest test/registered/unit/mem_cache/test_fused_draft_placement.py -v
 """
@@ -43,6 +28,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
 from sglang.srt.mem_cache.layout.fused_draft import (
     FULL_HOST,
@@ -178,42 +164,42 @@ class TestPlaceFusedDraft(CustomTestCase):
         placement = decision.placement
         self.assertIsNotNone(placement, decision.declined)
         self.assertEqual(placement.region("full").lane_num, 2)
-        self.assertEqual(placement.region("swa").lane_num, 1)
+        self.assertEqual(placement.region("draft_swa").lane_num, 1)
         self.assertEqual(placement.lanes_for(0, "full"), range(0, 1))
-        self.assertEqual(placement.lanes_for(1, "swa"), range(0, 1))
+        self.assertEqual(placement.lanes_for(1, "draft_swa"), range(0, 1))
         self.assertEqual(placement.lanes_for(1, "full"), range(0))
         self.assertEqual(placement.lanes_for(2, "full"), range(1, 2))
 
-    def test_window_layers_fall_back_to_the_full_sub_pool(self):
-        """A window wider than the target's, an undeclared window, or a host
-        without an swa sub-pool sends the window layers to the full sub-pool
-        with their own row geometry; the decision says why."""
-        for kwargs in (
-            dict(window=256, target_window=128),
-            dict(window=None, target_window=128),
-            dict(window=64, target_window=None),
-            dict(window=64, target_window=128, host_names=("full", "mamba")),
+    def test_unmatched_windows_get_independent_bands(self):
+        for window, hosts, name in (
+            (256, _HOSTS, "draft_swa"),
+            (64, _HOSTS, "draft_swa"),
+            (64, ("full", "mamba"), "swa"),
         ):
-            profile = _profile(window_layer_ids=(0,), window=kwargs.pop("window"))
-            decision = _place(profile, num_runners=2, **kwargs)
+            decision = _place(
+                _profile(window_layer_ids=(0,), window=window),
+                num_runners=2,
+                target_window=128,
+                host_names=hosts,
+            )
             placement = decision.placement
             self.assertIsNotNone(placement, decision.declined)
-            self.assertIn("ride in the 'full' sub-pool", decision.note)
-            self.assertIsNone(placement.region("swa"))
-            self.assertEqual(placement.region("full").lane_num, 2)
-            self.assertEqual(placement.region("full").head_num, _WINDOW.head_num)
-            self.assertEqual(placement.lanes_for(1, "full"), range(1, 2))
+            self.assertIsNone(placement.region("full"))
+            self.assertEqual(placement.new_bands[name].window, window)
+            self.assertEqual(placement.region(name).lane_num, 2)
+            self.assertEqual(placement.lanes_for(1, name), range(1, 2))
 
-    def test_a_fold_cannot_mix_two_row_geometries(self):
-        """One region holds one row geometry: window layers the swa sub-pool
-        turns away fold into the full sub-pool only when their rows match the
-        full layers', else the whole draft declines."""
+    def test_distinct_lifetimes_keep_different_geometries(self):
         decision = _place(
             _profile(num_layers=2, window_layer_ids=(1,), window=256),
             target_window=128,
         )
-        self.assertIsNone(decision.placement)
-        self.assertIn("cannot share", decision.declined)
+        self.assertIsNotNone(decision.placement, decision.declined)
+        self.assertEqual(decision.placement.hosts(), ("full", "draft_swa"))
+        self.assertNotEqual(
+            decision.placement.region("full").head_num,
+            decision.placement.region("draft_swa").head_num,
+        )
 
     def test_per_depth_head_needs_one_runner_per_depth(self):
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 1).placement)
@@ -245,10 +231,10 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertEqual(placement.region("mamba").lane_num, 4)
         self.assertEqual(placement.lanes_for(1, "mamba"), range(2, 4))
 
-    def test_state_layers_decline_without_a_state_host(self):
+    def test_state_layers_get_a_planned_band_without_a_state_host(self):
         decision = _place(_profile(state_layer_ids=(0,)), host_names=_HOSTS)
-        self.assertIsNone(decision.placement)
-        self.assertIn("'mamba'", decision.declined)
+        self.assertIsNotNone(decision.placement, decision.declined)
+        self.assertEqual(decision.placement.new_bands["mamba"].kind, LAYER_STATE)
 
     def test_a_layer_kind_with_no_host_kind_declines(self):
         with _dense_only_registry():
@@ -289,6 +275,7 @@ class TestPlaceFusedDraft(CustomTestCase):
 
 def _config(**overrides):
     fields = dict(
+        attention_arch=AttentionArch.MHA,
         is_hybrid_swa=True,
         is_deepseek_v4_arch=False,
         swa_attention_layer_ids=[0],
@@ -316,6 +303,14 @@ _TRUNK_STATE = SimpleNamespace(
 
 
 class TestDraftKVProfile(CustomTestCase):
+    def test_window_layers_require_a_retention_length(self):
+        for window in (None, 0, -1):
+            with (
+                self.subTest(window=window),
+                self.assertRaisesRegex(ValueError, "positive window"),
+            ):
+                _place(_profile(window_layer_ids=(0,), window=window))
+
     def test_heads_are_divided_by_attn_tp(self):
         with patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None):
             profile = draft_kv_profile(_config(), num_layers=2, attn_tp_size=2)
@@ -380,10 +375,6 @@ class TestHostKindRegistry(CustomTestCase):
     def test_one_primary_host_per_layer_kind(self):
         with _dense_only_registry(), self.assertRaises(AssertionError):
             register_host_kind(self._dense(serves=LAYER_FULL))
-
-    def test_a_fallback_host_must_be_registered_first(self):
-        with _dense_only_registry(), self.assertRaises(AssertionError):
-            register_host_kind(self._dense(fallback_host="ghost"))
 
     def test_hosts_follow_registration_order(self):
         """Binders and the boot log walk `hosts()`; dict order of a placement's
@@ -701,6 +692,8 @@ class TestFusedDraftDecision(CustomTestCase):
             draft_kv_num_layers=1,
             dflash_draft_num_layers=1,
             draft_model_config=SimpleNamespace(
+                model_path="draft-model",
+                revision="test-revision",
                 is_hybrid_swa=False,
                 is_deepseek_v4_arch=False,
                 num_nextn_predict_layers=None,
@@ -907,31 +900,17 @@ class TestFusedDraftDecision(CustomTestCase):
         decision = self._decide(target_backends=("trtllm_mha", "trtllm_mha"))
         self.assertIsNotNone(decision.placement)
 
-    def test_dcp_keeps_the_private_pool(self):
-        """Under --dcp-size > 1 each rank's host rows hold only its share of
-        the widened id space, while the draft, outside the DCP group, reads
-        every token."""
+    def test_dcp_prices_a_replicated_draft_region(self):
         for algorithm in ("DSPARK", "EAGLE"):
-            declined = self._decide(algorithm=algorithm, dcp_size=2)
-            self.assertIsNone(declined.placement, algorithm)
-            self.assertIn("--dcp-size 2", declined.declined)
+            decision = self._decide(algorithm=algorithm, dcp_size=2)
+            self.assertIsNotNone(decision.placement, decision.declined)
+            self.assertEqual(decision.placement.region("full").token_replicas, 2)
 
-    def test_hierarchical_cache_keeps_the_private_pool(self):
-        """HiCache builds the draft's host pool off its own device pool, which
-        a fused draft does not have; DSPARK + HiCache keeps working on the
-        private pool."""
-        declined = self._decide(algorithm="DSPARK", hicache=True)
-        self.assertIsNone(declined.placement)
-        self.assertIn("--enable-hierarchical-cache", declined.declined)
-
-    def test_host_pool_retraction_keeps_the_private_pool(self):
-        """Host-pool decode retraction builds the draft's host pool off its
-        own device pool too; DSPARK with it keeps the private pool."""
-        declined = self._decide(algorithm="DSPARK", retraction_backup="host_pool")
-        self.assertIsNone(declined.placement)
-        self.assertIn(
-            "--disaggregation-decode-retraction-backup=host_pool", declined.declined
-        )
+    def test_host_transfers_keep_the_declared_placement(self):
+        for flags in (dict(hicache=True), dict(retraction_backup="host_pool")):
+            decision = self._decide(algorithm="DSPARK", **flags)
+            self.assertIsNotNone(decision.placement, decision.declined)
+            self.assertEqual(decision.placement.hosts(), ("full",))
 
 
 if __name__ == "__main__":

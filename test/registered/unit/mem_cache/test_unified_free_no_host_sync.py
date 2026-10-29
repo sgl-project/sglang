@@ -421,6 +421,9 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
     PS = 4
 
     def _swa_composite(self, lazy=True, ps=None):
+        from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+        setup_allocator_context()
         from test_multi_ended_allocator import _FakeKVCache, _make_mha_spec
 
         full = _make_mha_spec("full", "up", layer_num=4)

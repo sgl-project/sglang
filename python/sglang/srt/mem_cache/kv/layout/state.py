@@ -78,7 +78,7 @@ class MambaSubPoolSpec(SubPoolSpec):
                 *(
                     TensorPartDecl(
                         name=f"conv.{i}",
-                        shape=shape,
+                        shape=shape if self.layer_num else (0, *shape),
                         dtype=self.conv_dtype,
                         layer_ids=layers,
                         slice_axis=self.conv_slice_axis,
@@ -87,7 +87,9 @@ class MambaSubPoolSpec(SubPoolSpec):
                 ),
                 TensorPartDecl(
                     name="temporal",
-                    shape=self.temporal_state_shape,
+                    shape=self.temporal_state_shape
+                    if self.layer_num
+                    else (0, *self.temporal_state_shape),
                     dtype=self.temporal_dtype,
                     layer_ids=layers,
                     slice_axis=0,
@@ -115,9 +117,16 @@ class MambaSubPoolSpec(SubPoolSpec):
         return self.conv_dtype  # representative state dtype; matches MambaPool.dtype
 
     def part_views(self, arena):
-        return self.entry_layout().views(
+        views = self.entry_layout().views(
             arena.raw, arena.extent_entries(self.name), entry_bytes=self.entry_bytes()
         )
+        if not self.layer_num:
+            for name in (
+                "temporal",
+                *(f"conv.{i}" for i in range(len(self.conv_state_shapes))),
+            ):
+                views[name] = views[name].movedim(1, 0)
+        return views
 
     def views(self, arena) -> Tuple[List[torch.Tensor], torch.Tensor]:
         views = self.part_views(arena)
@@ -191,6 +200,7 @@ class StateView:
         intermediate_conv_window: Optional[List[torch.Tensor]] = None,
     ):
         assert spec.layer_num == len(mamba_layer_ids)
+        self._has_draft_parts = spec.draft_region is not None
         self._arena = arena
         self._sub_pool_name = spec.name
         self._entry_bytes = spec.entry_bytes()
@@ -348,6 +358,17 @@ class StateView:
     # -- host transfer and PD --
 
     def host_layout(self):
+        from sglang.srt.mem_cache.kv.layout.page import page_envelope_host_layout
+
+        if self._has_draft_parts:
+            return page_envelope_host_layout(
+                self._arena,
+                self._sub_pool_name,
+                self.size
+                if self.host_capacity_tokens is None
+                else self.host_capacity_tokens,
+                1,
+            )
         (info,) = self.get_device_pool_infos()
         return StateHostLayout(
             buffer_info=info.buffer_info,

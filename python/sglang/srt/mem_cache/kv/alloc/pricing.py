@@ -631,3 +631,77 @@ def float_byte_shortfall(
     sink_bytes = min(band.min_page * band.page_bytes for band in (fa, sa, ma))
     required = num_tokens // snap.page_size * (fa.page_bytes + sa.page_bytes)
     return max(0, required + live_bytes + sink_bytes - snap.total_bytes)
+
+
+def sequential_fit(
+    snapshot: ChainSnapshot, demands: Tuple[Tuple[str, int], ...]
+) -> bool:
+    """Price physical takes in their actual order, without relocation credit.
+
+    Empty floats choose the midpoint of their current neighbours, so changing
+    an earlier demand can change a later float's placement. This predicate is
+    exact for the no-relief takes, but is not assumed monotone in total demand.
+    """
+    bands = snapshot.bands
+    lows = [b.low_byte for b in bands]
+    highs = [b.high_byte for b in bands]
+    live = [b.live for b in bands]
+    for name, pages in demands:
+        if pages < 0:
+            return False
+        if not pages:
+            continue
+        i = snapshot.index(name)
+        b = bands[i]
+        holes = b.holes if b.lazy or b.grow == "float" else 0
+        extension = max(0, pages - holes)
+        if b.live + pages > b.num_pages - b.min_page:
+            return False
+        low = next(
+            (
+                highs[j]
+                for j in range(i - 1, -1, -1)
+                if live[j] or bands[j].grow != "float"
+            ),
+            0,
+        )
+        high = next(
+            (
+                lows[j]
+                for j in range(i + 1, len(bands))
+                if live[j] or bands[j].grow != "float"
+            ),
+            snapshot.total_bytes,
+        )
+        lo = max(b.min_page, -(-low // b.page_bytes))
+        hi = min(b.num_pages, high // b.page_bytes)
+        if extension:
+            if b.grow == "up":
+                end = highs[i] // b.page_bytes + extension
+                if end > hi:
+                    return False
+                highs[i] = end * b.page_bytes
+            elif b.grow == "down":
+                start = lows[i] // b.page_bytes - extension
+                if start < lo:
+                    return False
+                lows[i] = start * b.page_bytes
+            elif not live[i]:
+                if extension > hi - lo:
+                    return False
+                start = lo + (hi - lo - extension) // 2
+                lows[i], highs[i] = (
+                    start * b.page_bytes,
+                    (start + extension) * b.page_bytes,
+                )
+            else:
+                start, end = lows[i] // b.page_bytes, highs[i] // b.page_bytes
+                below, above = start - lo, hi - end
+                if extension > max(below, above):
+                    return False
+                if above >= below:
+                    highs[i] += extension * b.page_bytes
+                else:
+                    lows[i] -= extension * b.page_bytes
+        live[i] += pages
+    return True
