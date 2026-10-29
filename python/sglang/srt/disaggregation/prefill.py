@@ -727,22 +727,43 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
-    def _is_continuous_input_polling_enabled(self: Scheduler) -> bool:
-        """Check support once on entry to the prefill overlap loop."""
-        if not envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.get():
-            return False
+    def _supports_result_wait_polling(self: Scheduler) -> bool:
+        """Whether the overlap loop can wait for a result without blocking.
+
+        Attention DP and CP shards keep different queues, so one shard could
+        leave the wait while another enters the TP-wide readiness all-reduce.
+        """
         parallel = get_parallel()
-        enabled = (
+        return (
             parallel.attn_dp_size == 1
             and parallel.attn_cp_size == 1
             and self.spec_algorithm.is_none()
             and self.is_generation
             and self.dllm_config is None
         )
+
+    def _is_continuous_input_polling_enabled(self: Scheduler) -> bool:
+        """Check support once on entry to the prefill overlap loop."""
+        if not envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.get():
+            return False
+        enabled = self._supports_result_wait_polling()
         if not enabled:
             logger.warning(
                 "Continuous prefill input polling requires attention DP=CP=1 and "
                 "non-speculative autoregressive generation; using the regular overlap loop."
+            )
+        return enabled
+
+    def _is_transfer_wait_polling_enabled(self: Scheduler) -> bool:
+        """Check support once on entry to the prefill overlap loop."""
+        if not envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.get():
+            return False
+        enabled = self._supports_result_wait_polling()
+        if not enabled:
+            logger.warning(
+                "Polling KV transfers while a forward result is pending requires "
+                "attention DP=CP=1 and non-speculative autoregressive generation; "
+                "finished transfers retire between forwards."
             )
         return enabled
 
@@ -771,6 +792,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.enable_continuous_input_polling = (
             self._is_continuous_input_polling_enabled()
         )
+        poll_transfers_while_waiting = self._is_transfer_wait_polling_enabled()
         self.result_queue = deque()
         batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
         # True when intake repeats while the oldest batch result is unfinished.
@@ -786,15 +808,23 @@ class SchedulerDisaggregationPrefillMixin:
             if self.gracefully_exit:
                 break
 
+            # A result wait takes new work only with continuous input polling.
+            should_ingest_requests = (
+                not waiting_for_batch_result or self.enable_continuous_input_polling
+            )
             # Stop dispatching at pause requests while waiting for a batch result.
-            received_inputs = self.ingest_requests(
+            received_inputs = should_ingest_requests and self.ingest_requests(
                 stop_at_pause=waiting_for_batch_result
             )
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 self._yield_gil_if_needed()
                 continue
-            bootstrapped_reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            bootstrapped_reqs = (
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                if should_ingest_requests
+                else []
+            )
             self.waiting_queue.extend(bootstrapped_reqs)
             # Resume batch creation on completion, new/ready requests, or an idle step.
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
@@ -802,7 +832,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Keep at most two batches in flight.
             if (
-                len(self.result_queue) < 2
+                should_ingest_requests
+                and len(self.result_queue) < 2
                 and not self.gracefully_exit
                 and not self._deferred_input_requests
                 and not skip_batch_creation
@@ -840,8 +871,11 @@ class SchedulerDisaggregationPrefillMixin:
                     batch_result = None
 
             if self.last_batch:
-                if self.enable_continuous_input_polling:
-                    # Resume intake until the oldest result is ready on all TP ranks.
+                # Poll until the oldest result is ready on all TP ranks while there
+                # is input to take or a transfer to retire; otherwise block.
+                if self.enable_continuous_input_polling or (
+                    poll_transfers_while_waiting and self.disagg_prefill_inflight_queue
+                ):
                     oldest_batch_result = self.result_queue[0][1]
                     if (
                         not self.gracefully_exit
@@ -850,6 +884,8 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     ):
                         waiting_for_batch_result = True
+                        if poll_transfers_while_waiting:
+                            self.process_disagg_prefill_inflight_queue()
                         if war_barrier_pending:
                             self._apply_war_barrier()
                             war_barrier_pending = False
