@@ -84,13 +84,8 @@ SUPPORTED_CUDA_ARCHS = ((9, 0), (10, 0), (10, 3))
 # ceil(rows / (SMs * occupancy)) rounds; raising occupancy to 3 moves that grid and can remove a
 # whole round. Paying for it means fitting the plan under (opt-in smem)/3, which caps
 # reconstruct_threshold at 2048 and so costs per-CTA throughput -- `TopkNormal` therefore takes
-# this tier only when it saves a round.
-#
-# `incoming_topk_pairs` doubles as the window-delta table, so the threshold also sets the ceiling
-# on MAX_VOCAB_SIZE: at 2048 the kernel reaches 6291456 rows, which the vendored 8 M default
-# overshoots. 4 M is between the two bounds rather than at either -- shared memory is what caps the
-# threshold, and the longest row a paged indexer presents is one position per context token.
-_DENSE_MAX_VOCAB_SIZE = 1 << 22
+# this tier only when it saves a round. A threshold that small leaves NUM_EXTRA_SLOTS too small for
+# the index-sort window delta table, so the tier is only offered when nothing sorts by index.
 _DENSE_CONFIGS: Dict[Tuple[torch.dtype, int], _Config] = {
     (torch.bfloat16, 512): _Config(512, 256, 3, 4096, 2048, 2),
 }
@@ -145,7 +140,8 @@ def _jit_deep_select_module(
     if cluster_size == 1:
         configs = _NORMAL_CONFIGS[(value_dtype, max_topk)]
         host_dispatch = "TopkNormal"
-        dense = _DENSE_CONFIGS.get((value_dtype, max_topk)) if page_transform else None
+        offer_dense = page_transform and not sorted_index
+        dense = _DENSE_CONFIGS.get((value_dtype, max_topk)) if offer_dense else None
         if dense is not None and len(configs) == 2:
             configs = (*configs, dense)
     else:
@@ -196,11 +192,6 @@ def _jit_deep_select_module(
             "--use_fast_math",
             "--ftz=false",
             "-Xptxas=--register-usage-level=10",
-            *(
-                [f"-DTOPK_SELECT_MAX_VOCAB_SIZE={_DENSE_MAX_VOCAB_SIZE}u"]
-                if len(configs) == 3
-                else []
-            ),
         ],
     )
 

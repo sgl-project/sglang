@@ -7,12 +7,7 @@ static constexpr uint32_t INPUT_STRIDE_ALIGNMENT_REQUIREMENT = 1024; // In numbe
 static constexpr uint32_t OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT = 32; // In number of bytes
 
 static constexpr uint32_t MAX_INT_ADDITION_RANGE_BY_FP32_SIMULATION = 1u << 23;
-// [SGLang] Overridable so a module that only ever sees short rows can shrink the window-delta
-// table in `incoming_topk_pairs`, which is what pins NUM_EXTRA_SLOTS and so the plan size.
-#ifndef TOPK_SELECT_MAX_VOCAB_SIZE
-#define TOPK_SELECT_MAX_VOCAB_SIZE (1u << 23)
-#endif
-static constexpr uint32_t MAX_VOCAB_SIZE = TOPK_SELECT_MAX_VOCAB_SIZE;
+static constexpr uint32_t MAX_VOCAB_SIZE = 1u << 23;
 static_assert(MAX_VOCAB_SIZE <= MAX_INT_ADDITION_RANGE_BY_FP32_SIMULATION);
 
 struct TopkSelectArgs {
