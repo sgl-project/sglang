@@ -1,5 +1,6 @@
 """Unit tests for backend-specific JSON Schema prevalidation."""
 
+import copy
 import unittest
 from unittest.mock import MagicMock
 
@@ -12,8 +13,79 @@ from sglang.srt.constrained.json_schema_validation import (
 from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
+
+
+class TestUniqueItemsJSONSchemaValidation(CustomTestCase):
+    @staticmethod
+    def schemas_with_array(array_schema):
+        return {
+            "#": array_schema,
+            "#/properties/values": {"properties": {"values": array_schema}},
+            "#/items": {"type": "array", "items": array_schema},
+            "#/$defs/values": {"$defs": {"values": array_schema}},
+        }
+
+    def test_accepts_false_and_absent_unique_items_without_mutating_schema(self):
+        for options in ({}, {"uniqueItems": False}):
+            array_schema = {"type": "array", "items": {"type": "integer"}, **options}
+            for pointer, schema in self.schemas_with_array(array_schema).items():
+                for validate in (
+                    validate_xgrammar_json_schema,
+                    validate_outlines_json_schema,
+                ):
+                    with self.subTest(
+                        backend=validate.__name__, pointer=pointer, **options
+                    ):
+                        original = copy.deepcopy(schema)
+                        validate(schema)
+                        self.assertEqual(schema, original)
+
+    def test_rejects_true_unique_items_in_nested_schemas(self):
+        array_schema = {"type": "array", "uniqueItems": True}
+        for pointer, schema in self.schemas_with_array(array_schema).items():
+            for validate in (
+                validate_xgrammar_json_schema,
+                validate_outlines_json_schema,
+            ):
+                with self.subTest(backend=validate.__name__, pointer=pointer):
+                    with self.assertRaises(UnsupportedJSONSchemaFeature) as raised:
+                        validate(schema)
+                    self.assertIn(f"at {pointer} ", str(raised.exception))
+                    self.assertIn("uniqueItems", str(raised.exception))
+
+    def test_does_not_treat_false_like_values_as_boolean_false(self):
+        for value in (0, None, "", "false", [], {}):
+            for validate in (
+                validate_xgrammar_json_schema,
+                validate_outlines_json_schema,
+            ):
+                with self.subTest(backend=validate.__name__, value=value):
+                    with self.assertRaisesRegex(
+                        UnsupportedJSONSchemaFeature, "uniqueItems"
+                    ):
+                        validate({"type": "array", "uniqueItems": value})
+
+    def test_false_unique_items_does_not_hide_other_unsupported_constraints(self):
+        for schema in (
+            {"type": "array", "uniqueItems": False, "contains": {"type": "integer"}},
+            {
+                "type": "array",
+                "uniqueItems": False,
+                "items": {"type": "integer", "multipleOf": 2},
+            },
+        ):
+            for validate in (
+                validate_xgrammar_json_schema,
+                validate_outlines_json_schema,
+            ):
+                with self.subTest(backend=validate.__name__, schema=schema):
+                    with self.assertRaisesRegex(
+                        UnsupportedJSONSchemaFeature, "contains|multipleOf"
+                    ):
+                        validate(schema)
 
 
 class TestXGrammarJSONSchemaValidation(unittest.TestCase):
