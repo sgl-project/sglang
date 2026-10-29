@@ -11,6 +11,7 @@ class LinearAttnKernelBase(ABC):
     """
 
     uses_state_checkpoints: bool = False
+    uses_int64_query_start_loc: bool = False
     supports_fused_chain_verify: bool = False
     # Opt in only when target-verify kernels honor non-unit token strides.
     supports_strided_target_verify_qkv: bool = False
