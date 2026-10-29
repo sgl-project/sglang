@@ -113,7 +113,7 @@ class TestBudgetSizing(unittest.TestCase):
             ),
             page_size=4,
         )
-        for cap, dcp in ((None, 1), (4096, 1)):
+        for cap, dcp in ((None, 1), (4096, 1), (4096, 2)):
             with (
                 self.subTest(cap=cap, dcp=dcp),
                 get_parallel().override(attn_dcp_size=dcp),

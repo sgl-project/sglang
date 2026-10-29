@@ -10,6 +10,7 @@ from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
 )
+from sglang.srt.configs.attention_execution import attention_dcp_size
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -251,19 +252,15 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        # TODO: this logic should be fixed in non-hip platform
-        self.is_hip_dspark_draft = (
-            _is_hip
-            and model_runner.is_draft_worker
-            and model_runner.spec_algorithm.is_dspark()
+        self.dcp_size = attention_dcp_size(
+            backend="triton",
+            model_config=model_runner.model_config,
+            dcp_size=get_parallel().attn_dcp_size,
+            is_draft_worker=model_runner.is_draft_worker,
+            is_dspark=model_runner.spec_algorithm.is_dspark(),
+            is_hip=_is_hip,
         )
-        if self.is_hip_dspark_draft:
-            # Drafts never join the dcp group so we ignore it
-            self.dcp_size = 1
-            self.dcp_rank = 0
-        else:
-            self.dcp_size = get_parallel().attn_dcp_size
-            self.dcp_rank = get_parallel().attn_dcp_rank
+        self.dcp_rank = get_parallel().attn_dcp_rank if self.dcp_size > 1 else 0
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size

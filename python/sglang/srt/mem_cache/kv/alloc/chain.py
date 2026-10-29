@@ -303,14 +303,15 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def _size_window_host_pools(self) -> None:
-        """A window chain's host pools are sized in tokens."""
+        """Host views advertise physical rows, before the host layout widens IDs."""
         for band, tokens in (
             (self.full_attn_allocator, self.size_full),
             *((window, self.size_swa) for window in self._windows),
         ):
             pool = self.views[band.sub_pool_name]
-            pool.host_capacity_tokens = tokens
-            pool.host_capacity_bytes = tokens * band.entry_bytes
+            rows = tokens * band.pool_page_size // band.page_size
+            pool.host_capacity_tokens = rows
+            pool.host_capacity_bytes = rows * band.entry_bytes
 
     @property
     def has_window_pool(self) -> bool:
