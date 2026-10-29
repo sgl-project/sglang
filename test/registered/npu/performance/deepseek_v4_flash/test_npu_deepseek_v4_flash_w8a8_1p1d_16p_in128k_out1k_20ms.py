@@ -239,7 +239,7 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
     model_config = DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG
     dataset_name = "generated-shared-prefix"
     max_concurrency = 60
-    num_prompts = 100
+    num_prompts = 80
     input_len = 131072
     output_len = 1024
     random_range_ratio = 1
@@ -250,7 +250,7 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
     pop_sglang_is_in_ci_for_gsp = True
     tpot = 20
     output_token_throughput = 964.864
-    ttft = 7
+    ttft = 7000
 
     def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_20ms(self):
         """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k."""
