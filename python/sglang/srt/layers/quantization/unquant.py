@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -269,25 +269,72 @@ _BF16_WARP_SPLITK_TUNED_TACTICS = {
     (32, 1024, 4096): (16, 16, 256, 10, 2),
 }
 
+# GLM-5 TP4 decode on SM107 (VR200), merged into the table above on SM107 only;
+# FlashInfer's default tactics, each faster than TGV/cuBLAS/fused_a per call with PDL.
+_BF16_SM107_WARP_SPLITK_TUNED_TACTICS = {
+    # o_proj.
+    (1, 6144, 4096): (32, 8, 256, 11, 2),
+    (4, 6144, 4096): (32, 8, 256, 11, 2),
+    (5, 6144, 4096): (32, 8, 256, 11, 2),
+    (20, 6144, 4096): (32, 32, 256, 6, 2),
+    # fused_qkv_a.
+    (1, 2624, 6144): (16, 8, 256, 16, 2),
+    (4, 2624, 6144): (16, 8, 256, 16, 2),
+    (5, 2624, 6144): (16, 8, 256, 16, 2),
+    (20, 2624, 6144): (16, 32, 256, 9, 2),
+    # Indexer wk and weights_proj.
+    (5, 160, 6144): (16, 8, 256, 16, 2),
+    # Shared expert gate_up and down.
+    (1, 1024, 6144): (16, 8, 256, 16, 2),
+    (4, 1024, 6144): (16, 8, 256, 16, 2),
+    (5, 1024, 6144): (16, 8, 256, 16, 2),
+    (20, 1024, 6144): (16, 16, 256, 13, 2),
+    (1, 6144, 512): (32, 8, 128, 4, 1),
+    (4, 6144, 512): (32, 8, 128, 4, 1),
+    (5, 6144, 512): (32, 8, 128, 4, 1),
+}
+# fused_qkv_a keys that leave the fused_a JIT (M <= 16) for warp split-K on SM107.
+_BF16_SM107_FUSED_A_SPLITK_KEYS = frozenset(
+    {(1, 2624, 6144), (4, 2624, 6144), (5, 2624, 6144)}
+)
+_use_sm107_splitk_tactics = False
+
 
 def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
     key = (m, n, k)
     return key in _BF16_SPLITK_TUNED_TACTICS or key in _BF16_WARP_SPLITK_TUNED_TACTICS
 
 
-def precompile_splitk_tactics() -> bool:
-    """JIT-compile every tuned tactic through the real dispatch,
+def prefer_bf16_splitk_over_fused_a(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (
+        _use_sm107_splitk_tactics
+        and (x.shape[0], *weight.shape) in _BF16_SM107_FUSED_A_SPLITK_KEYS
+    )
+
+
+def precompile_splitk_tactics(
+    keys: Optional[Iterable[tuple[int, int, int]]] = None,
+) -> bool:
+    """JIT-compile every tuned tactic (or only ``keys``) through the real dispatch,
     so CUDA graph capture never hits a cold kernel."""
     if not _enable_bf16_splitk_gemm:
         return False
+    if keys is None:
+        keys = {**_BF16_SPLITK_TUNED_TACTICS, **_BF16_WARP_SPLITK_TUNED_TACTICS}
     device = torch.cuda.current_device()
-    for m, n, k in {**_BF16_SPLITK_TUNED_TACTICS, **_BF16_WARP_SPLITK_TUNED_TACTICS}:
+    for m, n, k in keys:
         x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
         weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
         out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
         _bf16_splitk_gemm_out(x, weight, None, out)
     torch.cuda.synchronize()
     return True
+
+
+def precompile_sm107_splitk_tactics() -> bool:
+    return _use_sm107_splitk_tactics and precompile_splitk_tactics(
+        keys=_BF16_SM107_WARP_SPLITK_TUNED_TACTICS
+    )
 
 
 def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
@@ -304,7 +351,7 @@ def initialize_bf16_gemm_config() -> None:
     global _prefer_direct
     global _run_direct_dense
     global _warp_splitk_tactic, _run_warp_splitk_dense
-    global _enable_bf16_splitk_gemm
+    global _enable_bf16_splitk_gemm, _use_sm107_splitk_tactics
 
     backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
@@ -348,6 +395,7 @@ def initialize_bf16_gemm_config() -> None:
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
 
     _enable_bf16_splitk_gemm = False
+    _use_sm107_splitk_tactics = False
     if should_enable_bf16_splitk_gemm(backend):
         from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
             default_tactic,
@@ -371,6 +419,11 @@ def initialize_bf16_gemm_config() -> None:
         _warp_splitk_tactic = WarpSplitKTactic
         _run_warp_splitk_dense = run_warp_splitk_dense
         _enable_bf16_splitk_gemm = True
+        if get_platform().device_sm == 107:
+            _BF16_WARP_SPLITK_TUNED_TACTICS.update(
+                _BF16_SM107_WARP_SPLITK_TUNED_TACTICS
+            )
+            _use_sm107_splitk_tactics = True
 
     _BF16_GEMM_BACKEND = backend
 
