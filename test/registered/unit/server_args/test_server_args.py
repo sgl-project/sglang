@@ -1766,6 +1766,54 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         self.assertEqual(resolved_view(args).page_size, 128)
 
 
+class TestFlashInferFp32DtypeGuard(CustomTestCase):
+    """FlashInfer has no FP32 attention kernels, so dtype=float32 with the
+    flashinfer backend crashed mid-startup during CUDA-graph capture with a
+    bare `KeyError: torch.float32` that killed the engine process group
+    (sgl-project/sglang#43162). Resolution must fail fast with an actionable
+    error instead."""
+
+    def _make_args(self, dtype, attention_backend=None, prefill=None, decode=None):
+        args = ServerArgs(model_path="dummy", dtype=dtype)
+        args.attention_backend = attention_backend
+        args.prefill_attention_backend = prefill
+        args.decode_attention_backend = decode
+        # Short-circuit model_config_of(): the guard only needs the resolved
+        # dtype/backend fields, not a real ModelConfig.
+        args._model_config = MagicMock()
+        return args
+
+    def test_flashinfer_with_float32_raises(self):
+        args = self._make_args(dtype="float32", attention_backend="flashinfer")
+        with self.assertRaisesRegex(ValueError, "float32"):
+            handle_attention_backend_compatibility(args)
+
+    def test_flashinfer_with_float_alias_raises(self):
+        # "float" is the documented FP32 alias; it must be guarded too.
+        args = self._make_args(dtype="float", attention_backend="flashinfer")
+        with self.assertRaisesRegex(ValueError, "float32"):
+            handle_attention_backend_compatibility(args)
+
+    def test_flashinfer_split_decode_backend_raises(self):
+        # The crash in #43162 happened in the decode path (FlashInfer decode
+        # wrapper JIT), so a split backend with flashinfer decode must raise.
+        args = self._make_args(dtype="float32", prefill="triton", decode="flashinfer")
+        with self.assertRaisesRegex(ValueError, "flashinfer"):
+            handle_attention_backend_compatibility(args)
+
+    def test_flashinfer_with_bfloat16_is_allowed(self):
+        args = self._make_args(dtype="bfloat16", attention_backend="flashinfer")
+        handle_attention_backend_compatibility(args)  # must not raise
+
+    def test_fp32_with_triton_is_allowed(self):
+        args = self._make_args(dtype="float32", attention_backend="triton")
+        handle_attention_backend_compatibility(args)  # must not raise
+
+    def test_fp32_with_torch_native_is_allowed(self):
+        args = self._make_args(dtype="float32", attention_backend="torch_native")
+        handle_attention_backend_compatibility(args)  # must not raise
+
+
 class TestContextParallelServerArgs(CustomTestCase):
     def setUp(self):
         self.parser = server_args_module.argparse.ArgumentParser()
