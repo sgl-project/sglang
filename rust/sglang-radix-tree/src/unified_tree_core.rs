@@ -2946,7 +2946,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         cache_actions: &mut CacheActions,
     ) {
-        self.record_remove_event_(node_id, medium);
+        self.record_remove_event_(node_id, medium, RemovalReason::Evicted);
         for i in 0..self.components.len() {
             let component_type = self.components[i].component_type();
             self.evict_component_and_detach_lru_(
@@ -3067,7 +3067,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         if component_type == BASE_COMPONENT_TYPE {
             // BlockRemoved tracks Full host residency, not auxiliary slices.
-            self.record_remove_event_(node_id, StorageMedium::Cpu);
+            self.record_remove_event_(
+                node_id,
+                StorageMedium::Cpu,
+                RemovalReason::DuplicateReclaimed,
+            );
         }
         self.evict_component_and_detach_lru_(
             node_id,
@@ -3101,7 +3105,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.is_evictable_host_leaf_(self.arena.node(node_id)),
             "node {node_id} is not an H-leaf"
         );
-        self.record_remove_event_(node_id, StorageMedium::Cpu);
+        self.record_remove_event_(node_id, StorageMedium::Cpu, RemovalReason::Evicted);
         for i in 0..self.components.len() {
             let component_type = self.components[i].component_type();
             let (_, host_freed) = self.evict_component_and_detach_lru_(
@@ -3187,7 +3191,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             cache_actions,
             EvictLayer::Device,
         );
-        self.record_remove_event_(node_id, StorageMedium::Gpu);
+        self.record_remove_event_(node_id, StorageMedium::Gpu, RemovalReason::Demoted);
 
         // after device eviction, insert aux components into host LRU.
         self.for_each_component_lru_(
@@ -3581,14 +3585,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 Some(KvCacheEvent::BlockRemoved {
                     block_hashes: tail_hashes,
                     medium: tail_medium,
+                    reason: tail_reason,
                     extra_key: tail_extra_key,
                 }),
                 KvCacheEvent::BlockRemoved {
                     mut block_hashes,
                     medium,
+                    reason,
                     extra_key,
                 },
-            ) if *tail_medium == medium && *tail_extra_key == extra_key => {
+            ) if *tail_medium == medium
+                && *tail_reason == reason
+                && *tail_extra_key == extra_key =>
+            {
                 tail_hashes.append(&mut block_hashes)
             }
             (
@@ -3767,7 +3776,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Queue one BlockRemoved carrying all the node's page hashes; hashes lazily if needed.
-    fn record_remove_event_(&mut self, node_id: NodeIdx_, medium: StorageMedium) {
+    fn record_remove_event_(
+        &mut self,
+        node_id: NodeIdx_,
+        medium: StorageMedium,
+        reason: RemovalReason,
+    ) {
         if !self.enable_kv_cache_events {
             return;
         }
@@ -3802,6 +3816,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
                 block_hashes,
                 medium,
+                reason,
                 extra_key,
             });
         }
@@ -6208,6 +6223,28 @@ impl StorageMedium {
     }
 }
 
+/// Why blocks left a storage tier in a BlockRemoved event; mirrors the python RemovalReason.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RemovalReason {
+    /// Capacity pressure; no copy was kept anywhere else.
+    Evicted,
+    /// Freed here because a copy exists in a lower tier.
+    Demoted,
+    /// A duplicate host copy freed while the device copy stays resident.
+    DuplicateReclaimed,
+}
+
+impl RemovalReason {
+    /// The python RemovalReason enum value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemovalReason::Evicted => "evicted",
+            RemovalReason::Demoted => "demoted",
+            RemovalReason::DuplicateReclaimed => "duplicate_reclaimed",
+        }
+    }
+}
+
 // The dynamo format publishes namespaced hashes as block hashes. If you change
 // this tag, all of these hashes change. disaggregation/kv_events.py has a Python copy.
 const KV_EVENT_NAMESPACE_SEED_TAG: &[u8] = b"sglang-kv-event-namespace-v1";
@@ -6263,6 +6300,7 @@ pub enum KvCacheEvent<A> {
     BlockRemoved {
         block_hashes: Vec<i64>,
         medium: StorageMedium,
+        reason: RemovalReason,
         extra_key: Option<Arc<str>>,
     },
     AllBlocksCleared,

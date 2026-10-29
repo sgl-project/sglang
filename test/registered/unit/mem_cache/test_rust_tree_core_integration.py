@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    RemovalReason,
     StorageMedium,
     kv_event_namespace_seed,
     namespaced_block_hash,
@@ -2036,7 +2037,11 @@ def test_salted_events_match_python_hash_and_metadata_contract():
     evicted.host_frees.clear()
     core.evict_device_end(ComponentType.FULL)
     assert core.take_events() == [
-        BlockRemoved(block_hashes=hashes, medium=StorageMedium.GPU)
+        BlockRemoved(
+            block_hashes=hashes,
+            medium=StorageMedium.GPU,
+            reason=RemovalReason.EVICTED,
+        )
     ]
 
 
@@ -2085,7 +2090,11 @@ def test_dynamo_format_events_match_python_hashes_and_name_the_adapter():
     evicted.host_frees.clear()
     core.evict_device_end(ComponentType.FULL)
     assert core.take_events() == [
-        BlockRemoved(block_hashes=namespaced, medium=StorageMedium.GPU)
+        BlockRemoved(
+            block_hashes=namespaced,
+            medium=StorageMedium.GPU,
+            reason=RemovalReason.EVICTED,
+        )
     ]
 
 
@@ -2131,7 +2140,11 @@ def test_demote_emits_block_removed():
         for h in mem_cache.get_hash_str(array("q", [1, 2]), None, 1)
     ]
     assert core.take_events() == [
-        BlockRemoved(block_hashes=hashes, medium=StorageMedium.GPU)
+        BlockRemoved(
+            block_hashes=hashes,
+            medium=StorageMedium.GPU,
+            reason=RemovalReason.DEMOTED,
+        )
     ]
 
 

@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    RemovalReason,
     StorageMedium,
     kv_event_namespace_seed,
     namespaced_block_hash,
@@ -152,6 +153,7 @@ def _kv_event_from_tagged(
                 namespaced_block_hash(h, namespace_seed=seed) for h in event[1]
             ],
             medium=StorageMedium(event[2]),
+            reason=RemovalReason(event[4]),
         )
     if tag == "all_blocks_cleared":
         return AllBlocksCleared()

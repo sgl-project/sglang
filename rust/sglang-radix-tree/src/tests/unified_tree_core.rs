@@ -3577,12 +3577,14 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![1],
         medium: StorageMedium::Gpu,
+        reason: RemovalReason::Evicted,
         extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 5);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![2, 3],
         medium: StorageMedium::Gpu,
+        reason: RemovalReason::Evicted,
         extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 5);
@@ -3594,6 +3596,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![4],
         medium: StorageMedium::Cpu,
+        reason: RemovalReason::Evicted,
         extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 6);
@@ -3602,6 +3605,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![5],
         medium: StorageMedium::Cpu,
+        reason: RemovalReason::Evicted,
         extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 8);
@@ -3659,11 +3663,13 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![1],
         medium: StorageMedium::Gpu,
+        reason: RemovalReason::Evicted,
         extra_key: None,
     });
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![2],
         medium: StorageMedium::Gpu,
+        reason: RemovalReason::Evicted,
         extra_key: Some(Arc::from("lora-a")),
     });
     assert_eq!(tc.kv_event_queue.len(), 4);
@@ -3696,6 +3702,7 @@ fn eviction_emits_block_removed_with_all_page_hashes() {
                 .map(|h| crate::node::hash_str_to_int64(h))
                 .collect(),
             medium: StorageMedium::Gpu,
+            reason: RemovalReason::Evicted,
             extra_key: None,
         }]
     );
@@ -3897,6 +3904,97 @@ fn demoted_events_leaf(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
 }
 
 #[test]
+fn demotion_emits_a_demoted_gpu_block_removed() {
+    let mut tc = events_core(1);
+    tc.set_hicache_enabled();
+    tc.insert(&insert_params(&vec![1], &[10]));
+    let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64]), HashMap::new())
+        .expect("live test node");
+    let _ = tc.take_events();
+    tc.demote(leaf).expect("valid demote");
+    let hashes = crate::node::get_hash_str::<Vec<i64>>(&[1], None, 1);
+    assert_eq!(
+        tc.take_events(),
+        vec![KvCacheEvent::BlockRemoved {
+            block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
+            medium: StorageMedium::Gpu,
+            reason: RemovalReason::Demoted,
+            extra_key: None,
+        }]
+    );
+}
+
+#[test]
+fn reclaiming_a_host_duplicate_emits_a_duplicate_reclaimed_cpu_block_removed() {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            enable_kv_cache_events: true,
+            is_write_back: true,
+            ..CacheInitParams::default()
+        },
+        vec![FULL],
+    );
+    tc.set_hicache_enabled();
+    tc.insert(&insert_params(&vec![1], &[10]));
+    let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64]), HashMap::new())
+        .expect("live test node");
+    // The write-through acknowledgment registers the host copy as a duplicate.
+    tc.mark_write_through_pending(vec![leaf], /* ack_id = */ leaf)
+        .expect("live test node");
+    tc.finish_write_through(vec![leaf], /* ack_id = */ leaf)
+        .expect("live test node");
+    let _ = tc.take_events();
+    tc.drive_host_eviction(FULL, 1);
+    let hashes = crate::node::get_hash_str::<Vec<i64>>(&[1], None, 1);
+    assert_eq!(
+        tc.take_events(),
+        vec![KvCacheEvent::BlockRemoved {
+            block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
+            medium: StorageMedium::Cpu,
+            reason: RemovalReason::DuplicateReclaimed,
+            extra_key: None,
+        }]
+    );
+}
+
+#[test]
+fn block_removed_events_with_different_reasons_stay_separate() {
+    let mut tc = events_core(1);
+    for reason in [
+        RemovalReason::Evicted,
+        RemovalReason::Demoted,
+        RemovalReason::Demoted,
+    ] {
+        tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+            block_hashes: vec![1],
+            medium: StorageMedium::Gpu,
+            reason,
+            extra_key: None,
+        });
+    }
+    assert_eq!(
+        tc.take_events(),
+        vec![
+            KvCacheEvent::BlockRemoved {
+                block_hashes: vec![1],
+                medium: StorageMedium::Gpu,
+                reason: RemovalReason::Evicted,
+                extra_key: None,
+            },
+            KvCacheEvent::BlockRemoved {
+                block_hashes: vec![1, 1],
+                medium: StorageMedium::Gpu,
+                reason: RemovalReason::Demoted,
+                extra_key: None,
+            },
+        ]
+    );
+}
+
+#[test]
 fn host_eviction_emits_a_cpu_block_removed() {
     let mut tc = events_core(1);
     demoted_events_leaf(&mut tc);
@@ -3907,6 +4005,7 @@ fn host_eviction_emits_a_cpu_block_removed() {
         vec![KvCacheEvent::BlockRemoved {
             block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
             medium: StorageMedium::Cpu,
+            reason: RemovalReason::Evicted,
             extra_key: None,
         }]
     );
@@ -4008,6 +4107,7 @@ fn drop_subtree_emits_removals_for_host_descendants_then_the_leaf() {
                     .map(|h| crate::node::hash_str_to_int64(h))
                     .collect(),
                 medium: StorageMedium::Cpu,
+                reason: RemovalReason::Evicted,
                 extra_key: None,
             },
             KvCacheEvent::BlockRemoved {
@@ -4016,6 +4116,7 @@ fn drop_subtree_emits_removals_for_host_descendants_then_the_leaf() {
                     .map(|h| crate::node::hash_str_to_int64(h))
                     .collect(),
                 medium: StorageMedium::Gpu,
+                reason: RemovalReason::Evicted,
                 extra_key: None,
             },
         ]

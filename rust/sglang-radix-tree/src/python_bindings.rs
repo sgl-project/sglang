@@ -2163,6 +2163,7 @@ macro_rules! tree_core_methods {
                         KvCacheEvent::BlockRemoved {
                             block_hashes,
                             medium,
+                            reason,
                             extra_key,
                         } => {
                             let item: Py<PyAny> = (
@@ -2170,6 +2171,7 @@ macro_rules! tree_core_methods {
                                 block_hashes,
                                 medium.as_str(),
                                 extra_key.map(|extra_key| extra_key.to_string()),
+                                reason.as_str(),
                             )
                                 .into_py_any(py)?;
                             list.append(item)?;
