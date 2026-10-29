@@ -1271,11 +1271,7 @@ sgl-eval run aime25 \\
     // and --kv-cache-dtype fp8_e4m3 both come from that precedent. Pinned to a
     // newer image (v0.5.22, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
     // mi355x cells. Low-Latency uses validated TP8/EP1; High-Throughput uses
-    // TP4/EP4 with DCP4 (--dcp-size 4, InferenceX PR #4064), which stripes the
-    // latent KV across the four ranks. DSA DCP does not combine HiCache with
-    // MTP, so that cell runs without HiCache; its admission and decode-graph
-    // limits follow the c48 point (2x concurrency, graph batch capped at 64).
-    // Both use five-step MTP from InferenceX PR #2900.
+    // TP4/EP4 with DCP4. Both use five-step MTP from InferenceX PR #2900.
     // DSA backend: triton (SGLang's ROCm default). Five-step MTP cells select
     // the top-k v2 indexer kernel, matching InferenceX PR #3724.
     // ====================================================================
@@ -1339,10 +1335,9 @@ sgl-eval run aime25 \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
-        "--chunked-prefill-size 32768",
         "--mem-fraction-static 0.85",
-        "--cuda-graph-max-bs-decode 64",
-        "--max-running-requests 96",
+        "--cuda-graph-max-bs-decode 256",
+        "--max-running-requests 256",
         "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
