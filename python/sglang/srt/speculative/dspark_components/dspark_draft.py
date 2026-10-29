@@ -214,8 +214,15 @@ def _draft_step(
     step: int,
     logits_out: Optional[torch.Tensor],
     sharded_accept: bool,
+    prev_candidates: Optional[torch.Tensor] = None,
+    defer: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if logits_out is None and len(prev_tokens) == 1:
+    """``prev_candidates``: the previous step's gathered candidates, whose tokens this
+    step's launch picks into ``prev_tokens``; ``defer``: return this step's candidates
+    instead of its tokens (``_markov_folds``); ``out``: where the tokens go."""
+    folded = prev_candidates is not None or defer
+    if not folded and logits_out is None and len(prev_tokens) == 1:
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
         w2_weight = markov_head.greedy_w2_weight()
         # The kernel reads one w2 row per base-logit column.
@@ -227,6 +234,8 @@ def _draft_step(
             )
             return tokens, state
     bias = markov_head.bias_gemv(prev_tokens)
+    if prev_candidates is not None:
+        bias = bias._replace(prev_candidates=prev_candidates)
     if bias is None:
         bias, state = markov_head.step_bias(
             prev_tokens, hidden_states=hidden_states, state=state
@@ -252,9 +261,26 @@ def _draft_step(
         logits_out=logits_out,
         # Rows sample at their temperatures only when the step logits are kept.
         has_sampled_rows=None if logits_out is not None else False,
+        defer=defer,
+        out=out,
         **sharded,
     )
     return tokens, state
+
+
+def _markov_folds(
+    markov_head: BaseDSparkMarkovHead, prev_tokens: torch.Tensor, whole_logits: bool
+) -> bool:
+    """Whether a step's token pick folds into the next step's launch: a fused bias GEMV
+    over a sharded vocab (otherwise the pick is cheap or local) whose kept step logits,
+    if any, stay on the shard."""
+    return (
+        envs.SGLANG_OPT_DSV41_DSPARK_MARKOV_FOLD.get()
+        and markov_head.vocab_shard is not None
+        and prev_tokens.is_cuda
+        and not whole_logits
+        and markov_head.bias_gemv(prev_tokens) is not None
+    )
 
 
 def draft_markov_block(
@@ -283,26 +309,56 @@ def draft_markov_block(
         )
     state = markov_head.init_state(draft_hidden)
     prev_tokens = anchor_tokens.long()
-    draft_tokens = []
-    for step in range(gamma):
-        prev_tokens, state = _draft_step(
-            markov_head,
-            prev_tokens,
-            base_logits[:, step],
-            hidden_states=None if draft_hidden is None else draft_hidden[:, step],
-            state=state,
-            temperatures=step_temperatures,
-            noise=noise,
-            step=step,
-            logits_out=None if greedy_draft else logits_out[:, step],
-            sharded_accept=sharded_accept,
+    if _markov_folds(
+        markov_head, prev_tokens, whole_logits=not (greedy_draft or sharded_accept)
+    ):
+        # each step's launch picks the previous step's tokens into their column
+        tokens = torch.empty(
+            prev_tokens.shape[0], gamma, dtype=torch.int64, device=prev_tokens.device
         )
-        prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
-        draft_tokens.append(prev_tokens)
+        pending = None
+        for step in range(gamma):
+            got, state = _draft_step(
+                markov_head,
+                prev_tokens if step == 0 else tokens[:, step - 1],
+                base_logits[:, step],
+                hidden_states=None if draft_hidden is None else draft_hidden[:, step],
+                state=state,
+                temperatures=step_temperatures,
+                noise=noise,
+                step=step,
+                logits_out=None if greedy_draft else logits_out[:, step],
+                sharded_accept=sharded_accept,
+                prev_candidates=pending,
+                defer=step + 1 < gamma,
+                out=tokens[:, step],
+            )
+            pending = got
+        # every rank picked from the same gathered candidates; one sync a block
+        # where the unfolded loop syncs each step
+        tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, tokens)
+    else:
+        draft_tokens = []
+        for step in range(gamma):
+            prev_tokens, state = _draft_step(
+                markov_head,
+                prev_tokens,
+                base_logits[:, step],
+                hidden_states=None if draft_hidden is None else draft_hidden[:, step],
+                state=state,
+                temperatures=step_temperatures,
+                noise=noise,
+                step=step,
+                logits_out=None if greedy_draft else logits_out[:, step],
+                sharded_accept=sharded_accept,
+            )
+            prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
+            draft_tokens.append(prev_tokens)
+        tokens = torch.stack(draft_tokens, dim=1)
     if greedy_draft:
-        return torch.stack(draft_tokens, dim=1), None
+        return tokens, None
     noise.offset.add_(1)
-    return torch.stack(draft_tokens, dim=1), logits_out
+    return tokens, logits_out
 
 
 def sample_draft_block(

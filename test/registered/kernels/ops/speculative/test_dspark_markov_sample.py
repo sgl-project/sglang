@@ -343,6 +343,79 @@ class TestMarkovSampleStep(CustomTestCase):
                 kept[1][1], kept[0][1], rtol=0, atol=0, equal_nan=True
             )
 
+    def test_folded_pick_matches_the_finish_launch(self):
+        # A step whose launch picks the previous step's tokens from its gathered
+        # candidates draws what separate finish launches draw, over sharded ranks,
+        # and writes the picks into the token buffer's strided columns.
+        g = torch.Generator(device=DEVICE).manual_seed(6)
+        rows, shard, rank, steps, world = 20, 3000, 256, 3, 3
+        vocab = world * shard - 40
+        w1 = torch.randint(-2, 3, (vocab, rank), generator=g, device=DEVICE)
+        w2 = torch.randint(-2, 3, (vocab, rank), generator=g, device=DEVICE)
+        w1, w2 = w1.to(torch.bfloat16), w2.to(torch.bfloat16)
+        base = torch.randn(rows, steps, world * shard, generator=g, device=DEVICE) * 16
+        temps = torch.rand(rows, generator=g, device=DEVICE) + 0.2
+        temps[::3] = 0.0
+        anchor = torch.randint(0, vocab, (rows,), generator=g, device=DEVICE)
+
+        def launch(r, step, prev, gather, prev_candidates=None, **kwargs):
+            start = r * shard
+            return _call(
+                MarkovSampleStep.triton,
+                base=base[:, step, start : start + shard].contiguous(),
+                bias=MarkovBiasGemv(
+                    prev_tokens=prev,
+                    w1=w1,
+                    w2=w2[start : start + shard],
+                    prev_candidates=prev_candidates,
+                ),
+                temps=temps,
+                step_dtype=torch.float32,
+                step=step,
+                vocab_start=start,
+                gather=gather,
+                logits_out=torch.empty(rows, shard, device=DEVICE),
+                **kwargs,
+            )
+
+        def stacked(run):
+            parts = [None] * world
+            for r in range(world):
+                run(r, lambda part, r=r: parts.__setitem__(r, part) or part)
+            return torch.cat(parts)
+
+        # separate finish launches, a step at a time
+        prev, want = anchor, []
+        for step in range(steps):
+            cands = stacked(lambda r, gather: launch(r, step, prev, gather))
+            prev = launch(0, step, prev, lambda _: cands)
+            want.append(prev)
+        # folded: each launch picks the previous step's tokens into their column
+        tokens = [
+            torch.full((rows, steps), -1, dtype=torch.int64, device=DEVICE)
+            for _ in range(world)
+        ]
+        cands = None
+        for step in range(steps):
+
+            def folded(r, gather, step=step, cands=cands):
+                return launch(
+                    r,
+                    step,
+                    anchor if step == 0 else tokens[r][:, step - 1],
+                    gather,
+                    prev_candidates=cands,
+                    defer=step + 1 < steps,
+                    out=tokens[r][:, step],
+                )
+
+            cands_now = stacked(folded)
+            for r in range(world):
+                folded(r, lambda _: cands_now)
+            cands = cands_now
+        for r in range(world):
+            self.assertTrue(torch.equal(tokens[r], torch.stack(want, dim=1)))
+
 
 if __name__ == "__main__":
     unittest.main()

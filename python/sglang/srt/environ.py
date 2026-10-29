@@ -598,6 +598,12 @@ class Envs:
     SGLANG_OPT_DSV41_DSPARK_MARKOV_FUSED_BIAS = EnvBool(
         SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
     )
+    # With the fused bias over a sharded vocab: each draft step's launch picks the
+    # previous step's tokens from its gathered candidates, and the block syncs its
+    # tokens once instead of every step.
+    SGLANG_OPT_DSV41_DSPARK_MARKOV_FOLD = EnvBool(
+        SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
+    )
     # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
     # greedy accept and its bookkeeping as one kernel.
     SGLANG_DSPARK_FUSED_ACCEPT_TAIL = EnvBool(

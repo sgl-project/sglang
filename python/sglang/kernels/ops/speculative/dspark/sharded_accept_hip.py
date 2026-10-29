@@ -278,6 +278,7 @@ def accept_sampling_sharded(
         gathered,
         drawn,
         bs,
+        drawn.stride(0),
         parts,
         world,
         triton.next_power_of_2(parts * world),

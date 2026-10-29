@@ -34,11 +34,16 @@ _GEMV_BLOCK_R = 64
 class MarkovBiasGemv(NamedTuple):
     """The step bias ``w2 @ w1[prev_tokens]``, rounded to BF16, left for the step
     to compute where it adds it: ``w1`` is ``[vocab, rank]``, ``w2`` the
-    ``[width, rank]`` rows of the shard, both BF16."""
+    ``[width, rank]`` rows of the shard, both BF16.
+
+    With ``prev_candidates`` (the previous step's gathered candidates, its tokens not
+    yet picked) the launch picks ``prev_tokens`` itself and writes them there, so the
+    previous step needs no finish launch."""
 
     prev_tokens: torch.Tensor
     w1: torch.Tensor
     w2: torch.Tensor
+    prev_candidates: Optional[torch.Tensor] = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -163,15 +168,8 @@ def _select_block(
 
 
 @triton.jit
-def _markov_sample_finish_kernel(
-    P,
-    OUT,
-    BS,
-    PARTS: tl.constexpr,
-    WORLD: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
+def _pick_candidate(P, row, BS, PARTS, WORLD: tl.constexpr, BLOCK: tl.constexpr):
+    # Row ``row``'s token from every rank's per-block (value, index bits) candidates.
     i = tl.arange(0, BLOCK)
     valid = i < PARTS * WORLD
     rank, part = i // PARTS, i % PARTS
@@ -186,13 +184,29 @@ def _markov_sample_finish_kernel(
     has_nan = tl.sum(nan.to(tl.int32), 0) > 0
     maximum = tl.max(tl.where(valid & ~nan, value, -float("inf")), 0)
     wins = tl.where(has_nan, nan, valid & (value == maximum))
-    result = tl.min(tl.where(wins, idx, _NO_INDEX), 0)
-    tl.store(OUT + row, result.to(tl.int64))
+    return tl.min(tl.where(wins, idx, _NO_INDEX), 0)
+
+
+@triton.jit
+def _markov_sample_finish_kernel(
+    P,
+    OUT,
+    BS,
+    OUT_STRIDE,
+    PARTS: tl.constexpr,
+    WORLD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    result = _pick_candidate(P, row, BS, PARTS, WORLD, BLOCK)
+    tl.store(OUT + row * OUT_STRIDE, result.to(tl.int64))
 
 
 @triton.jit
 def _markov_bias_partial_kernel(
     PREV,
+    G,
+    PREV_STRIDE,
     W1,
     W2,
     X,
@@ -220,6 +234,9 @@ def _markov_bias_partial_kernel(
     SELECT: tl.constexpr,
     SAMPLE: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
+    FOLD: tl.constexpr,
+    WORLD: tl.constexpr,
+    G_BLOCK: tl.constexpr,
 ):
     # _markov_sample_partial_kernel over a block of rows, its bias the GEMV of
     # W1[PREV] with this block's W2 rows, which each row block reads once.
@@ -229,7 +246,19 @@ def _markov_bias_partial_kernel(
     has_row = row < ROWS
     valid = i < WIDTH
     in_shard = i < PADDED
-    prev = tl.load(PREV + row, has_row, 0)
+    if FOLD:
+        # the previous step's tokens from its gathered candidates, picked as its
+        # finish launch would; block 0 writes them to PREV
+        prev = tl.zeros([BLOCK_M], tl.int64)
+        for m in tl.static_range(BLOCK_M):
+            r = tl.program_id(1) * BLOCK_M + m
+            if r < ROWS:
+                tok = _pick_candidate(G, r, ROWS, PARTS, WORLD, G_BLOCK).to(tl.int64)
+                prev = tl.where(tl.arange(0, BLOCK_M) == m, tok, prev)
+                if part == 0:
+                    tl.store(PREV + r * PREV_STRIDE, tok)
+    else:
+        prev = tl.load(PREV + row * PREV_STRIDE, has_row, 0)
     acc = tl.zeros([BLOCK_M, BLOCK_V], tl.float32)
     for r0 in tl.static_range(0, RANK, BLOCK_R):
         r = r0 + tl.arange(0, BLOCK_R)
@@ -390,8 +419,15 @@ def _launch_bias_partial(
     partial = torch.empty(
         (rows, parts, 2), device=base_logits.device, dtype=torch.float32
     )
+    fold = bias.prev_candidates is not None
+    world = bias.prev_candidates.shape[0] // rows if fold else 1
+    if fold:
+        # the previous step's launch: the same shard, so the same blocks
+        assert bias.prev_candidates.shape[1] == parts * 2
     _markov_bias_partial_kernel[(parts, triton.cdiv(rows, _GEMV_BLOCK_M))](
         bias.prev_tokens,
+        bias.prev_candidates if fold else partial,
+        bias.prev_tokens.stride(0),
         w1,
         w2,
         base_logits,
@@ -419,9 +455,30 @@ def _launch_bias_partial(
         select,
         has_sampled_rows is not False,
         _PHILOX_ROUNDS,
+        fold,
+        world,
+        triton.next_power_of_2(parts * world),
         num_warps=4,
     )
     return partial.view(rows, parts * 2)
+
+
+def pick_candidates(gathered: torch.Tensor, rows: int, out: torch.Tensor) -> None:
+    """Write each row's token from the ranks' gathered candidates (``[world * rows,
+    parts * 2]``) into ``out`` (int64, one a row, any stride)."""
+    parts = gathered.shape[1] // 2
+    world = gathered.shape[0] // rows
+    _markov_sample_finish_kernel[(rows,)](
+        gathered,
+        out,
+        rows,
+        out.stride(0),
+        parts,
+        world,
+        triton.next_power_of_2(parts * world),
+        num_warps=4,
+    )
+
 
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
@@ -486,7 +543,11 @@ class MarkovSampleStep:
         gather_logits: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
+        defer: bool = False,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``defer``: return the gathered candidates, for the next step's
+        ``MarkovBiasGemv.prev_candidates``; ``out``: where the tokens go."""
         cls._check(
             base_logits,
             bias,
@@ -509,6 +570,8 @@ class MarkovSampleStep:
             has_sampled_rows=has_sampled_rows,
         )
         if gather_logits is not None and logits_out is not None:
+            # a folded step keeps its logits on the shard (``_markov_folds``)
+            assert not defer and out is None
             local = torch.empty(
                 base_logits.shape, device=base_logits.device, dtype=step_dtype
             )
@@ -524,18 +587,14 @@ class MarkovSampleStep:
                 vocab_start=vocab_start,
             )
             gathered = partial if gather is None else gather(partial)
-        parts = gathered.shape[1] // 2
-        world = gathered.shape[0] // rows
-        result = torch.empty(rows, device=base_logits.device, dtype=torch.int64)
-        _markov_sample_finish_kernel[(rows,)](
-            gathered,
-            result,
-            rows,
-            parts,
-            world,
-            triton.next_power_of_2(parts * world),
-            num_warps=4,
+        if defer:
+            return gathered
+        result = (
+            torch.empty(rows, device=base_logits.device, dtype=torch.int64)
+            if out is None
+            else out
         )
+        pick_candidates(gathered, rows, result)
         return result
 
     @classmethod
@@ -554,6 +613,8 @@ class MarkovSampleStep:
         gather_logits: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
+        defer: bool = False,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # None draws the noise for every row: reading the temperatures on the
         # host would break a graph capture.
@@ -569,6 +630,9 @@ class MarkovSampleStep:
             logits_out,
         )
         if isinstance(bias, MarkovBiasGemv):
+            if bias.prev_candidates is not None:
+                rows = bias.prev_tokens.shape[0]
+                bias.prev_tokens.copy_(_pick_torch(bias.prev_candidates, rows))
             bias = bias.materialize()
         rows, width = bias.shape
         value = base_logits.to(torch.float32, copy=True)
@@ -628,15 +692,27 @@ class MarkovSampleStep:
             [local_values.float(), local_indices.view(torch.float32)], dim=1
         )
         gathered = partial if gather is None else gather(partial)
-        gathered = gathered.view(-1, rows, 2)
-        values = gathered[..., 0].transpose(0, 1)
-        indices = gathered[..., 1].contiguous().view(torch.int32) & _NO_INDEX.value
-        indices = indices.transpose(0, 1).long()
-        # Lowest index among the NaNs if any, else among the maxima.
-        valid = indices != _NO_INDEX.value
-        nan = valid & values.isnan()
-        has_nan = nan.any(dim=-1, keepdim=True)
-        finite = torch.where(valid & ~nan, values, -torch.inf)
-        maximum = finite.amax(dim=-1, keepdim=True)
-        wins = torch.where(has_nan, nan, valid & (finite == maximum))
-        return torch.where(wins, indices, _NO_INDEX.value).amin(dim=-1)
+        if defer:
+            return gathered
+        result = _pick_torch(gathered, rows)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
+
+def _pick_torch(gathered: torch.Tensor, rows: int) -> torch.Tensor:
+    """``pick_candidates`` in torch: each row's token from the gathered candidates."""
+    gathered = gathered.reshape(-1, rows, gathered.shape[1] // 2, 2)
+    gathered = gathered.transpose(0, 1).reshape(rows, -1, 2)
+    values = gathered[..., 0]
+    indices = gathered[..., 1].contiguous().view(torch.int32) & _NO_INDEX.value
+    indices = indices.long()
+    # Lowest index among the NaNs if any, else among the maxima.
+    valid = indices != _NO_INDEX.value
+    nan = valid & values.isnan()
+    has_nan = nan.any(dim=-1, keepdim=True)
+    finite = torch.where(valid & ~nan, values, -torch.inf)
+    maximum = finite.amax(dim=-1, keepdim=True)
+    wins = torch.where(has_nan, nan, valid & (finite == maximum))
+    return torch.where(wins, indices, _NO_INDEX.value).amin(dim=-1)
