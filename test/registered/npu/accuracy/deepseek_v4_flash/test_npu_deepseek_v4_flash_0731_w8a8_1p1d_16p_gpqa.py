@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
@@ -237,6 +238,8 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     #     self.run_accuracy()
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_l2_host_hit_rate(self):
         """run_bench_serving in 128k out 1k asserts the host hit rate"""
+        bench_env = os.environ.copy()
+        bench_env.pop("SGLANG_IS_IN_CI", None)
         run_bench_serving(
             host=self.host,
             port=self.port,
@@ -252,7 +255,8 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
             warmup_requests=16,
             repeat_rate=0.9,
             cache_report=True,
-            min_host_hit_rate_pct=0
+            min_host_hit_rate_pct=0,
+            env=bench_env,
         )
 
 
