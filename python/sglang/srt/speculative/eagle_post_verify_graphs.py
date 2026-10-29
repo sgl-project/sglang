@@ -109,6 +109,11 @@ class EaglePostVerifyGraphs:
             or info.sampling_seed is not None
             or info.need_min_p_sampling
             or (watermark is not None and info.has_watermark_candidates)
+            # compute_spec_logprobs reads the gathered logits off logits_output
+            or (
+                batch.return_logprob
+                and logits_output.next_token_logits_vocab_shard is not None
+            )
         ):
             return None
         return (
@@ -145,6 +150,7 @@ class EaglePostVerifyGraphs:
             need_top_p=bool(info.need_top_p_sampling),
             max_top_k=max_top_k,
             logits=logits_output.next_token_logits,
+            vocab_shard=logits_output.next_token_logits_vocab_shard,
             staged=staged,
             device=batch.device,
             forward_mode=batch.forward_mode,
@@ -244,7 +250,10 @@ def _sample(slot: SimpleNamespace) -> tuple:
     return eagle_sample(
         verify_view,
         batch_view,
-        SimpleNamespace(next_token_logits=slot.logits),
+        SimpleNamespace(
+            next_token_logits=slot.logits,
+            next_token_logits_vocab_shard=slot.vocab_shard,
+        ),
         uno_target_max_top_k=slot.max_top_k,
         simulated_acc_len=staged.get("sim_accept_len"),
         sparse_bonus_argmax=slot.max_top_k is not None,
