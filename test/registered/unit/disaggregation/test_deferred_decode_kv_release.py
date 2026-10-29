@@ -337,6 +337,56 @@ class TestCommonAbortAckDispatch(CustomTestCase):
 
 
 class TestDeferredAckTargets(CustomTestCase):
+    def test_failed_ack_is_retained_while_other_destinations_complete(self):
+        mgr = _make_prefill_manager()
+        # Exercise the real ACK encoder and sender; only the transport fails.
+        del mgr._send_abort_ack
+        mgr._prefill_unique_rank = lambda: 0
+        failed = AckTarget("localhost", 5000, 3)
+        ready = AckTarget("localhost", 5001, 8)
+        sent = []
+
+        def send(endpoint, frames, **kwargs):
+            if endpoint.endswith(":5000"):
+                raise RuntimeError("injected socket failure")
+            sent.append(frames)
+
+        mgr._send_multipart_locked = send
+        mgr.register_deferred_ack_target(7, failed)
+        mgr.register_deferred_ack_target(7, ready)
+        mgr._maybe_ack_drained_abort(7)
+        self.assertEqual(
+            mgr._deferred_ack_targets[7], {(failed.ip, failed.port): failed}
+        )
+        self.assertEqual(sent, [AbortAck(7, 0, ready.generation).to_zmq()])
+
+        mgr._send_multipart_locked = lambda endpoint, frames, **kw: sent.append(frames)
+        mgr._maybe_ack_drained_abort(7)
+        self.assertNotIn(7, mgr._deferred_ack_targets)
+        self.assertEqual(sent[-1], AbortAck(7, 0, failed.generation).to_zmq())
+
+    def test_failed_ack_does_not_restore_stale_or_poisoned_target(self):
+        old = AckTarget("localhost", 5000, 3)
+        newer = AckTarget("localhost", 5000, 4)
+        for poisoned in (False, True):
+            with self.subTest(poisoned=poisoned):
+                mgr = _make_prefill_manager()
+                del mgr._send_abort_ack
+                mgr._prefill_unique_rank = lambda: 0
+
+                def send(*args, **kwargs):
+                    if poisoned:
+                        mgr.poison_deferred_ack_room(7)
+                    else:
+                        mgr.register_deferred_ack_target(7, newer)
+                    raise RuntimeError("injected socket failure")
+
+                mgr._send_multipart_locked = send
+                mgr.register_deferred_ack_target(7, old)
+                mgr._maybe_ack_drained_abort(7)
+                expected = {} if poisoned else {(newer.ip, newer.port): newer}
+                self.assertEqual(mgr._deferred_ack_targets.get(7, {}), expected)
+
     def test_target_registered_during_poison_never_acks(self):
         """A target that races past the poisoned check must not ack later."""
         mgr = _make_prefill_manager()
