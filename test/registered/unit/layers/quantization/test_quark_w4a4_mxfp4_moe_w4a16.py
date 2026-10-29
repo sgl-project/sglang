@@ -1,14 +1,18 @@
-"""Quark MXFP4 MoE W4A16 (triton_kernels) path under expert parallelism.
+"""Quark MXFP4 MoE W4A16 (triton_kernels) path on gfx1151.
 
+The path must only replace the AITER path on gfx1151; other AMD GPUs keep AITER.
 With EP > 1 the dispatcher maps experts owned by other ranks to -1; the W4A16
 path must drop those slots instead of indexing with -1 (a GPU memory fault).
 """
 
+import importlib
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -80,6 +84,29 @@ def _to_rank_local(topk_ids: torch.Tensor, rank: int) -> torch.Tensor:
     local = topk_ids - rank * LOCAL_EXPERTS
     owned = (local >= 0) & (local < LOCAL_EXPERTS)
     return torch.where(owned, local, -1).to(torch.int32)
+
+
+def _w4a16_enabled_on(arch: str) -> bool:
+    props = SimpleNamespace(gcnArchName=arch)
+    with mock.patch("torch.cuda.get_device_properties", return_value=props):
+        return importlib.reload(quark_w4a4_mxfp4_moe)._use_triton_w4a16
+
+
+@unittest.skipUnless(is_hip(), "needs a ROCm build")
+class TestQuarkMxfp4MoeW4A16Gate(unittest.TestCase):
+    def setUp(self):
+        # Re-import with the real device so later tests see the real gate.
+        self.addCleanup(importlib.reload, quark_w4a4_mxfp4_moe)
+
+    def test_gfx942_keeps_the_aiter_path(self):
+        self.assertFalse(_w4a16_enabled_on("gfx942:sramecc+:xnack-"))
+
+    def test_gfx1151_uses_the_w4a16_path(self):
+        self.assertTrue(_w4a16_enabled_on("gfx1151"))
+
+    def test_env_switch_disables_the_w4a16_path_on_gfx1151(self):
+        with envs.SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16.override(False):
+            self.assertFalse(_w4a16_enabled_on("gfx1151"))
 
 
 @unittest.skipUnless(
