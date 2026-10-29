@@ -1348,6 +1348,92 @@ fn host_eviction_takes_a_host_leaf_atomically() {
     assert!(!tc.host_lru_list(MAMBA).in_list(Some(leaf_idx)));
 }
 
+// Give `nodes` host Mamba slots 10, 11, ... in LRU order (first is least recent).
+fn seed_host_mamba_lru(tc: &mut UnifiedTreeCore<Vec<i64>>, nodes: &[NodeIdx_]) {
+    for (i, &node) in nodes.iter().enumerate() {
+        set_mamba_host(tc, node, 10 + i as i64);
+        tc.host_lru_list_mut(MAMBA).insert_mru(node);
+    }
+}
+
+// Run one Mamba host eviction and return the freed host slots in order.
+fn drive_mamba_host_eviction(tc: &mut UnifiedTreeCore<Vec<i64>>, num_tokens: usize) -> Vec<i64> {
+    let mut tracker = HashMap::from([(MAMBA, 0)]);
+    let mut host_frees = HashMap::new();
+    mamba_component().drive_host_eviction(
+        tc,
+        num_tokens,
+        &mut tracker,
+        &mut HashMap::new(),
+        &mut host_frees,
+        &mut Vec::new(),
+    );
+    let freed: Vec<i64> = host_frees
+        .remove(&MAMBA)
+        .unwrap_or_default()
+        .iter()
+        .map(|t| t.int64_value(&[0]))
+        .collect();
+    assert_eq!(tracker[&MAMBA], freed.len());
+    freed
+}
+
+#[test]
+fn host_eviction_takes_a_pass_through_checkpoint_before_an_older_tail() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let [a, tail] = chain::<2>(&mut tc);
+    // The tail is the LRU host state; plain LRU order would evict it first.
+    seed_host_mamba_lru(&mut tc, &[tail, a]);
+    assert_eq!(drive_mamba_host_eviction(&mut tc, 1), vec![11]);
+    assert!(!tc.arena.node(a).has_host_value(MAMBA));
+    assert!(!tc.host_lru_list(MAMBA).in_list(Some(a)));
+    assert!(tc.arena.node(tail).has_host_value(MAMBA));
+    assert!(tc.host_lru_list(MAMBA).in_list(Some(tail)));
+}
+
+#[test]
+fn host_eviction_keeps_a_fork_until_the_fallback_pass() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let [fork, left, pass, right] = {
+        let [fork, left] = chain::<2>(&mut tc);
+        let pass = tc.arena.alloc_child(fork, vec![7], 0, None).unwrap();
+        let right = tc.arena.alloc_child(pass, vec![8], 0, None).unwrap();
+        [fork, left, pass, right]
+    };
+    // The fork is least recent but shared by both branches.
+    seed_host_mamba_lru(&mut tc, &[fork, left, right, pass]);
+    assert_eq!(drive_mamba_host_eviction(&mut tc, 1), vec![13]);
+    assert!(!tc.arena.node(pass).has_host_value(MAMBA));
+    assert!(tc.arena.node(fork).has_host_value(MAMBA));
+    assert!(tc.arena.node(left).has_host_value(MAMBA));
+    assert!(tc.arena.node(right).has_host_value(MAMBA));
+}
+
+#[test]
+fn host_eviction_keeps_a_state_whose_child_has_none() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let [p, a, _stateless, tail] = chain::<4>(&mut tc);
+    // `a` is the deepest state of every hit that ends inside `_stateless`, so
+    // the newer pass-through `p` goes first although `a` is least recent.
+    seed_host_mamba_lru(&mut tc, &[a, tail, p]);
+    assert_eq!(drive_mamba_host_eviction(&mut tc, 1), vec![12]);
+    assert!(tc.arena.node(a).has_host_value(MAMBA));
+    assert!(tc.arena.node(tail).has_host_value(MAMBA));
+}
+
+#[test]
+fn host_eviction_falls_back_to_lru_order_once_no_pass_through_is_left() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let [a, b, tail] = chain::<3>(&mut tc);
+    seed_host_mamba_lru(&mut tc, &[tail, a, b]);
+    // a and b are pass-through checkpoints; the tail goes in the fallback pass.
+    assert_eq!(drive_mamba_host_eviction(&mut tc, 3), vec![11, 12, 10]);
+    for node in [a, b, tail] {
+        assert!(!tc.arena.node(node).has_host_value(MAMBA));
+        assert!(!tc.host_lru_list(MAMBA).in_list(Some(node)));
+    }
+}
+
 #[test]
 #[should_panic(expected = "has no host value")]
 fn host_drive_panics_on_an_lru_member_without_a_mamba_host_value() {

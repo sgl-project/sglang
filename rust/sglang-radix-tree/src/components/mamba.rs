@@ -731,6 +731,13 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
 
     /// Evict mamba host resources: internal nodes tombstone privately, host
     /// leaves evict atomically.
+    ///
+    /// Pass-through checkpoints go first. A host prefix hit ends at the deepest
+    /// Mamba state on the matched path, so evicting a path's last state drops
+    /// the hit for all of its host KV. A pass-through checkpoint has one child
+    /// that holds its own state, so evicting it only loses hits that end
+    /// exactly there. Leaves, forks and states with no stateful child are
+    /// kept until no pass-through checkpoint is left.
     fn drive_host_eviction(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
@@ -739,6 +746,51 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         cache_actions: &mut CacheActions,
+    ) {
+        for pass_through_only in [true, false] {
+            if tracker[&MAMBA] >= num_tokens {
+                return;
+            }
+            self.drive_host_eviction_pass_(
+                tree_core,
+                num_tokens,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions,
+                pass_through_only,
+            );
+        }
+    }
+}
+
+impl MambaComponent {
+    /// One child, and that child holds its own Mamba state (device or host).
+    fn is_pass_through_checkpoint_<K: ChildKeyType>(
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> bool {
+        let node = tree_core.arena.node(node_id);
+        if node.children.len() != 1 {
+            return false;
+        }
+        let child = *node.children.values().next().expect("one child");
+        tree_core.arena.has_device_value(child, MAMBA)
+            || tree_core.arena.has_host_value(child, MAMBA)
+    }
+
+    /// One LRU sweep of `drive_host_eviction`; `pass_through_only` skips every
+    /// state that is not a pass-through checkpoint.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_host_eviction_pass_<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        num_tokens: usize,
+        tracker: &mut HashMap<ComponentType, usize>,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
+        pass_through_only: bool,
     ) {
         let ct = MAMBA;
         let mut x = tree_core
@@ -759,7 +811,9 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 .get_prev_no_lock(cur, &tree_core.arena);
             // The host LRU filters Mamba's own locks. A Full load-back pin may
             // cover an ancestor whose Mamba state is not being transferred.
-            if tree_core.evictable_host_leaves.contains(cur) {
+            if pass_through_only && !Self::is_pass_through_checkpoint_(tree_core, cur) {
+                // Kept for the fallback pass.
+            } else if tree_core.evictable_host_leaves.contains(cur) {
                 // Host leaf: atomic eviction (all components host + delete)
                 tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees, cache_actions);
             } else {
