@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 # The TP case spawns two gloo workers that each re-import torch and sglang.
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -135,7 +136,7 @@ class TestDecodeHiCacheL2(CustomTestCase):
                 req_to_token_pool=self.pool,
                 token_to_kv_pool_allocator=self.allocator,
                 page_size=128,
-                tree_components=(ComponentType.FULL,),
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
             )
         )
         self.controller = _CPUController(self.allocator)

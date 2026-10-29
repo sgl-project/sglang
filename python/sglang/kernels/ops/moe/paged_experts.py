@@ -34,6 +34,7 @@ def _jit_module() -> Module:
 
 def paged_experts_decide(
     topk: torch.Tensor,
+    topk_weights: torch.Tensor,
     step: torch.Tensor,
     slot_expert: torch.Tensor,
     expert_slot: torch.Tensor,
@@ -41,16 +42,31 @@ def paged_experts_decide(
     src: torch.Tensor,
     dst: torch.Tensor,
     count: torch.Tensor,
+    run_ids: torch.Tensor,
+    run_w: torch.Tensor,
 ) -> None:
     """Make every expert in ``topk`` (``[T]`` routed ids, negative = padding, ``T <= K``) resident.
 
     Keeps the resident ones, gives each missing one the least recently used slot the step does
     not need, and updates the residency state in place: ``step`` ``[1]``, ``slot_expert`` and
     ``slot_lastuse`` ``[K]``, ``expert_slot`` ``[E]``. Writes the page-in plan to ``src``/``dst``
-    ``[K]`` (expert -> slot) and its length to ``count`` ``[1]``.
+    ``[K]`` (expert -> slot) and its length to ``count`` ``[1]``, and the runner's inputs:
+    ``run_ids`` ``[T]`` int32, the slot holding each entry's expert, and ``run_w`` ``[T]``
+    float32, its weight from ``topk_weights`` ``[T]`` float32; padding entries (id outside
+    ``[0, E)``) get slot 0 and weight 0.
     """
     _jit_module().paged_experts_decide(
-        topk, step, slot_expert, expert_slot, slot_lastuse, src, dst, count
+        topk,
+        topk_weights,
+        step,
+        slot_expert,
+        expert_slot,
+        slot_lastuse,
+        src,
+        dst,
+        count,
+        run_ids,
+        run_w,
     )
 
 

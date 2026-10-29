@@ -235,3 +235,51 @@ def make_nvfp4_weight_and_ref(
     )
 
     return fp4_weight, scales, global_scale, weight_ref
+
+
+def make_mxfp4_weight_and_ref(
+    size_n: int,
+    size_k: int,
+    dtype: torch.dtype = torch.bfloat16,
+    group_size: int = 32,
+    device: str = "cuda",
+):
+    """Build a random MXFP4-quantized weight and its FP dequantized reference.
+
+    MXFP4 differs from NVFP4 in three ways: group_size 32 rather than 16, E8M0
+    power-of-two scales stored as raw uint8 exponent bytes rather than E4M3, and
+    no outer global scale.
+
+    Returns:
+        fp4_weight: (size_n, size_k // 2) uint8, two packed FP4 (E2M1) values per byte
+        scales: (size_n, size_k // group_size) uint8 E8M0 biased exponents
+        weight_ref: (size_n, size_k) tensor in `dtype` = dequantized weight
+    """
+    if dtype != torch.bfloat16:
+        raise ValueError("MXFP4 Marlin is only instantiated for bfloat16.")
+
+    fp4_weight = torch.randint(
+        0, 256, (size_n, size_k // 2), dtype=torch.uint8, device=device
+    )
+    scale_source = torch.randn((size_n, size_k), dtype=dtype, device=device)
+    # /6 = FP4 (E2M1) max, so each group's largest value maps to the FP4 ceiling.
+    amax = scale_source.view(size_n, -1, group_size).abs().max(-1)[0] / 6
+    # E8M0 holds a power of two only: round the exponent, then bias by 127.
+    exponent = torch.floor(torch.log2(amax.float().clamp(min=2**-127))).clamp(-127, 127)
+    scales = (exponent + 127).to(torch.uint8)
+
+    def _unpack(byte_view: torch.Tensor) -> torch.Tensor:
+        # Convert 4-bit E2M1 nibble (in upper bits of a uint8) to FP8 E4M3 bit pattern.
+        unpacked = (byte_view & 0b10000000) | ((byte_view & 0b01110000) >> 2)
+        return unpacked.view(torch.float8_e4m3fn).to(dtype) * (2**6)
+
+    part_low = _unpack(fp4_weight)
+    part_high = _unpack(fp4_weight << 4)
+
+    weight_ref = torch.cat([part_high.unsqueeze(2), part_low.unsqueeze(2)], 2).view(
+        size_n, size_k
+    )
+    scale_fp = torch.exp2(exponent).to(dtype)
+    weight_ref = weight_ref * scale_fp.repeat_interleave(group_size, 1)
+
+    return fp4_weight, scales, weight_ref
