@@ -9,6 +9,9 @@ from triton.experimental.gluon import language as gl
 
 from .decode_attention_sm100 import swapab_attention as _swapab_attention
 
+# router row cap
+MAX_BATCH = 16
+
 
 @gluon.jit
 def _load_v4_hip(

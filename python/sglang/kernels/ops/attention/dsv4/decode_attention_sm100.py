@@ -10,8 +10,6 @@ import triton.language as tl
 from .kv_layout import KVLayout
 
 LAYOUT = KVLayout.V4
-# gfx950 router row cap
-MAX_BATCH = 16
 # SM100 row cap, below the ~48-row break-even against FlashMLA.
 MAX_ROWS = 40
 NUM_HEADS = 16

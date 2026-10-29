@@ -4,7 +4,6 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import MAX_BATCH
 from sglang.kernels.ops.attention.dsv4.norm_rope import fused_rope_inplace
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -15,7 +14,10 @@ register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-
 register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 if is_hip():
-    from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
+    from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import (
+        MAX_BATCH,
+        swapab_attention,
+    )
 else:
     from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
         swapab_attention,
