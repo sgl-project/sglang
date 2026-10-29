@@ -123,6 +123,22 @@ fn token_ids_or_list_shape_dispatch() {
         empty.value,
         Some(token_ids_or_list::Value::One(ref t)) if t.ids.is_empty()
     ));
+    // `/generate` decodes its body through a `Value`, where a flat list
+    // streams the same way; a list whose later elements break the first
+    // element's shape is refused on either path.
+    let via_value =
+        |json: &str| serde_json::from_value::<TokenIdsOrList>(serde_json::from_str(json).unwrap());
+    assert!(matches!(
+        via_value("[1, 2]").unwrap().value,
+        Some(token_ids_or_list::Value::One(ref t)) if t.ids == vec![1, 2]
+    ));
+    for mixed in ["[1, [2]]", r#"[1, "2"]"#, "[1, 2.5]", "[[1], 2]"] {
+        assert!(
+            serde_json::from_str::<TokenIdsOrList>(mixed).is_err(),
+            "{mixed}"
+        );
+        assert!(via_value(mixed).is_err(), "{mixed}");
+    }
 }
 
 /// Nullable list elements (PD bootstrap columns): [null, "h"] keeps per-item
