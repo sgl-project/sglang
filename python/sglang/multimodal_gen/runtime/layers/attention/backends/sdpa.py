@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -349,9 +352,12 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len).
             # FA4's faster sub-tile kernel pays off in captured segments, but
             # its host dispatch loses to cuDNN in eager (including BCG breaks).
-            # The BCG scope includes warmup, so FA4 is primed before capture.
+            # Keep exact requests on the reference route: cuDNN and FA4 differ
+            # in rounding. The BCG scope includes warmup, priming FA4 for capture.
             if not is_in_breakable_cuda_graph():
-                return True
+                context = get_forward_context_or_none()
+                if context is not None and context.quality in ("lossless", "high"):
+                    return True
             short_side, long_side = sorted((query.shape[1], key.shape[1]))
             return short_side >= 128 or long_side < 128
         if query.shape[1] != key.shape[1]:

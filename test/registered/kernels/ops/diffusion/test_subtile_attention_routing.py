@@ -35,7 +35,9 @@ class TestSubtileAttentionRouting(unittest.TestCase):
         v = torch.randn_like(k)
         with (
             torch.inference_mode(),
-            set_forward_context(current_timestep=0, attn_metadata=None),
+            set_forward_context(
+                current_timestep=0, attn_metadata=None, quality="lossless"
+            ),
         ):
             reference = impl.forward(q, k, v, None)
             stream = torch.cuda.Stream()
@@ -49,6 +51,13 @@ class TestSubtileAttentionRouting(unittest.TestCase):
                 captured = impl.forward(q, k, v, None)
             graph.replay()
             torch.testing.assert_close(captured, reference, rtol=1e-2, atol=1e-2)
+            with (
+                set_forward_context(0, None, quality="exact"),
+                patch.object(impl.fa_impl, "forward", wraps=impl.fa_impl.forward) as fa,
+            ):
+                exact = impl.forward(q, k, v, None)
+                fa.assert_called_once()
+            torch.testing.assert_close(captured, exact, rtol=0, atol=0)
             q.copy_(torch.randn_like(q))
             k.copy_(torch.randn_like(k))
             v.copy_(torch.randn_like(v))

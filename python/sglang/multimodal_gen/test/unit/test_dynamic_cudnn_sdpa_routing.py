@@ -7,6 +7,10 @@ import torch
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     DynamicCudnnSDPAImpl,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+    set_forward_context,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     enable_breakable_cuda_graph,
 )
@@ -24,11 +28,16 @@ def _qkv(q_len: int, kv_len: int, heads: int = 32, head_dim: int = 64):
 
 
 class TestDynamicCudnnSDPARouting(unittest.TestCase):
-    def _uses_cudnn(self, q_len: int, kv_len: int, *, graph: bool = False) -> bool:
+    def _uses_cudnn(
+        self, q_len: int, kv_len: int, *, graph: bool = False, quality: str = "lossless"
+    ) -> bool:
         impl = SimpleNamespace(
             causal=False, _cudnn_failed=False, _is_sm100=True, _is_sm103=False
         )
-        with enable_breakable_cuda_graph() if graph else nullcontext():
+        with (
+            set_forward_context(0, None, quality=quality),
+            enable_breakable_cuda_graph() if graph else nullcontext(),
+        ):
             return DynamicCudnnSDPAImpl._use_cudnn_sdpa(impl, *_qkv(q_len, kv_len))
 
     def test_blackwell_keeps_cudnn_when_both_sides_fill_a_tile(self):
@@ -46,6 +55,30 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
 
     def test_blackwell_keeps_cudnn_when_both_sides_are_short(self):
         self.assertTrue(self._uses_cudnn(126, 126))
+
+    def test_exact_keeps_reference_subtile_route_in_both_modes(self):
+        for graph in (False, True):
+            for q_len, kv_len in ((26, 1536), (1536, 26), (126, 1536)):
+                self.assertFalse(
+                    self._uses_cudnn(q_len, kv_len, graph=graph, quality="exact")
+                )
+
+    def test_missing_context_keeps_reference_route(self):
+        impl = SimpleNamespace(
+            causal=False, _cudnn_failed=False, _is_sm100=True, _is_sm103=False
+        )
+        self.assertFalse(DynamicCudnnSDPAImpl._use_cudnn_sdpa(impl, *_qkv(126, 1536)))
+        self.assertTrue(self._uses_cudnn(126, 1536, quality="high"))
+
+    def test_quality_context_is_explicit_and_restores(self):
+        batch = SimpleNamespace(extra={})
+        with set_forward_context(0, None, forward_batch=batch, quality="lossless"):
+            self.assertEqual(get_forward_context().quality, "lossless")
+            with set_forward_context(0, None, quality="exact"):
+                self.assertEqual(get_forward_context().quality, "exact")
+            self.assertEqual(get_forward_context().quality, "lossless")
+        with set_forward_context(0, None):
+            self.assertEqual(get_forward_context().quality, "exact")
 
 
 if __name__ == "__main__":
