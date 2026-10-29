@@ -90,13 +90,16 @@ async fn await_server_info(state: &AppState) -> Result<ServerInfo, Response> {
 }
 
 /// `GET /get_model_info` (+ `/model_info` alias) — serialize the shared static
-/// model metadata (no scheduler round-trip).
+/// model metadata, Python's launch-time model fields last (no scheduler
+/// round-trip).
 async fn model_info(State(state): State<Arc<AppState>>) -> Response {
     let info = state.core.model_info();
     (
         StatusCode::OK,
         [("content-type", "application/json")],
-        serde_json::to_vec(&info).unwrap_or_default(),
+        info.to_json()
+            .and_then(|body| serde_json::to_vec(&body))
+            .unwrap_or_default(),
     )
         .into_response()
 }
@@ -407,6 +410,15 @@ mod tests {
             reasoning_parser: Some("reasoner".into()),
             tool_call_parser: Some("tools".into()),
             disaggregation_mode: DisaggregationMode::Prefill,
+            launch_model_info: crate::message::config::JsonObject(Arc::new(
+                serde_json::json!({
+                    "has_image_understanding": true,
+                    "architectures": ["Arch"],
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            )),
             ..Default::default()
         });
         let app = routes().with_state(state);
@@ -433,6 +445,13 @@ mod tests {
             assert_eq!(body["tool_call_parser"], "tools");
             assert_eq!(body["disaggregation_mode"], "prefill");
             assert!(body["preferred_sampling_params"].is_null());
+            // Python's launch-time model fields follow the typed ones.
+            let keys: Vec<_> = body.as_object().unwrap().keys().collect();
+            assert_eq!(
+                keys[keys.len() - 2..],
+                ["has_image_understanding", "architectures"]
+            );
+            assert_eq!(body["architectures"], serde_json::json!(["Arch"]));
         }
     }
 
@@ -465,7 +484,7 @@ mod tests {
             },
             max_total_num_tokens: 8192,
             version: "1.2.3".into(),
-            launch_server_info: crate::message::config::LaunchServerInfo(Arc::new(
+            launch_server_info: crate::message::config::JsonObject(Arc::new(
                 launch_fields.as_object().unwrap().clone(),
             )),
             ..Default::default()

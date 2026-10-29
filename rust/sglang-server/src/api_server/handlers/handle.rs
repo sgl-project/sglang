@@ -60,6 +60,7 @@ pub(crate) struct CoreMetadata {
     pub(super) incremental_streaming_output: bool,
     pub(super) deployment_info: crate::message::config::DeploymentInfo,
     pub(super) launch_server_info: Arc<serde_json::Map<String, serde_json::Value>>,
+    pub(super) launch_model_info: Arc<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl From<&ServerArgs> for CoreMetadata {
@@ -82,6 +83,7 @@ impl From<&ServerArgs> for CoreMetadata {
             incremental_streaming_output: args.incremental_streaming_output,
             deployment_info: args.deployment_info.clone(),
             launch_server_info: args.launch_server_info.0.clone(),
+            launch_model_info: args.launch_model_info.0.clone(),
         }
     }
 }
