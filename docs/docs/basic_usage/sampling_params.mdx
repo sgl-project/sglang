@@ -162,7 +162,7 @@ python -m sglang.launch_server --model-path <MODEL> --sampling-defaults openai
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>stop_token_ids</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[List[int]] = None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Provide stop words in the form of token IDs. Generation will stop if one of these token IDs is sampled. Each ID must be in `[0, vocab_size)`, otherwise the request fails with HTTP 400.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Provide stop words in the form of token IDs. Generation will stop if one of these token IDs is sampled. IDs outside `[0, vocab_size)` are ignored because they can never be sampled.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>stop_regex</td>

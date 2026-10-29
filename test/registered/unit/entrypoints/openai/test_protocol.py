@@ -560,19 +560,6 @@ class TestChatCompletionRequest(CustomTestCase):
                 sampling_params.verify(vocab_size=32)
                 self.assertEqual(sampling_params.max_new_tokens, expected)
 
-    def test_chat_stop_token_id_bounds_are_validated(self):
-        """Chat stop_token_ids must reach SamplingParams validation."""
-        for token_id in (-1, 32, 33):
-            with self.subTest(token_id=token_id):
-                request = ChatCompletionRequest(
-                    messages=[{"role": "user", "content": "Hello"}],
-                    stop_token_ids=[token_id],
-                    min_tokens=1,
-                )
-                sampling_params = SamplingParams(**request.to_sampling_params([], {}))
-                with self.assertRaisesRegex(ValueError, "stop_token_ids"):
-                    sampling_params.verify(vocab_size=32)
-
     def test_out_of_range_sampling_params_are_rejected(self):
         """Out-of-range sampling values previously passed validation."""
         for field, value in (

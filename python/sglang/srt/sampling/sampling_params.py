@@ -306,13 +306,6 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     f"min_new_tokens must be in [0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
-        if self.stop_token_ids is not None:
-            for token_id in self.stop_token_ids:
-                if not 0 <= token_id < vocab_size:
-                    raise ValueError(
-                        f"stop_token_ids must be in [0, {vocab_size - 1}], got "
-                        f"{token_id}."
-                    )
         if self.logit_bias is not None:
             for token_id, bias in self.logit_bias.items():
                 if not 0 <= int(token_id) < vocab_size:

@@ -378,19 +378,13 @@ class TestSamplingParamsVerify(CustomTestCase):
             logit_bias={"0": LOGIT_BIAS_ABS_MAX, "1": -LOGIT_BIAS_ABS_MAX}
         ).verify(self.VOCAB_SIZE)
 
-    def test_stop_token_id_bounds(self):
-        """Invalid native stop IDs must fail before minimum-token penalization."""
-        for min_new_tokens in (0, 1):
-            for token_id in (-1, self.VOCAB_SIZE, self.VOCAB_SIZE + 1):
-                with self.subTest(min_new_tokens=min_new_tokens, token_id=token_id):
-                    with self.assertRaisesRegex(ValueError, "stop_token_ids"):
-                        self._make(
-                            stop_token_ids=[token_id], min_new_tokens=min_new_tokens
-                        ).verify(self.VOCAB_SIZE)
-
-        self._make(stop_token_ids=[0, self.VOCAB_SIZE - 1], min_new_tokens=1).verify(
-            self.VOCAB_SIZE
-        )
+    def test_stop_token_ids_outside_vocab_are_accepted(self):
+        """Stop IDs outside the vocab are accepted (they never match), not rejected."""
+        for token_id in (-1, self.VOCAB_SIZE, self.VOCAB_SIZE + 1):
+            with self.subTest(token_id=token_id):
+                self._make(stop_token_ids=[token_id], min_new_tokens=1).verify(
+                    self.VOCAB_SIZE
+                )
 
     # --- sampling_seed ---
     def test_sampling_seed_valid(self):

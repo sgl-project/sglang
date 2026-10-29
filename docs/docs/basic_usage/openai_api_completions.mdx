@@ -359,7 +359,6 @@ Requests with invalid sampling parameters are rejected with HTTP 400 before gene
 | `temperature` | Finite number greater than or equal to 0 (negative, `inf` and `nan` are rejected) | Chat completions |
 | `top_logprobs` | Integer greater than or equal to 0; with `logprobs=true` it must also not exceed the vocabulary size | Chat completions |
 | `logit_bias` values | Finite numbers with a magnitude of at most `1e30` | Chat completions and completions |
-| `stop_token_ids` (SGLang extension) | Token IDs in the range `[0, vocab_size)` | Chat completions and completions |
 
 For chat completions, `max_completion_tokens` takes precedence over `max_tokens` when both are set, including an explicit `max_completion_tokens=0`, which generates no tokens and returns `finish_reason="length"`. The completions API still requires `max_tokens` to be greater than 0.
 
