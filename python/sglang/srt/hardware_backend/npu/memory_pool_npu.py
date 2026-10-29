@@ -810,6 +810,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self._finalize_allocation_log(size)
 
     def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
+        # Skip tail allocation for local layers that do not run indexer top-k.
         return not self.skip_topk_layers[local_layer_idx]
 
     def _init_kpool_compress_tail_buffers(
@@ -854,13 +855,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ]
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        # Return the index-key cache, which stores compressed keys in KPool mode.
         return self.get_index_k_buffer(layer_id)
 
     def get_compress_tail_buffers(
         self, layer_id: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Return references to the per-request tail key and score buffers.
         assert self._kpool_use_compress, (
             "get_compress_tail_buffers called when kpool compress is disabled"
         )
