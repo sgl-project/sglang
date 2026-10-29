@@ -84,6 +84,8 @@ class ForwardBatchDeepSeekMHAMixin:
         self.prefix_chunk_kv_indices = []
         req_to_token = get_req_to_token_pool().req_to_token
         translator = get_attn_backend().kv_index_translator
+        # The chunks may describe only the batch's leading requests.
+        num_reqs = self.prefix_chunk_seq_lens.shape[1]
         for idx in range(self.num_prefix_chunks):
             chunk_starts = self.prefix_chunk_starts[idx]
             chunk_seq_lens = self.prefix_chunk_seq_lens[idx]
@@ -106,9 +108,9 @@ class ForwardBatchDeepSeekMHAMixin:
                 )
                 self.prefix_chunk_kv_indices.append(chunk_kv_indices)
                 continue
-            create_chunked_prefix_cache_kv_indices[(self.batch_size,)](
+            create_chunked_prefix_cache_kv_indices[(num_reqs,)](
                 req_to_token,
-                self.req_pool_indices,
+                self.req_pool_indices[:num_reqs],
                 chunk_starts,
                 chunk_seq_lens,
                 chunk_cu_seq_lens,
@@ -138,7 +140,7 @@ class ForwardBatchDeepSeekMHAMixin:
             max_dense_chunk_tokens, dtype=torch.int32, device=device
         )
         self.mha_empty_kv_indptr = torch.zeros(
-            self.batch_size + 1, dtype=torch.int32, device=device
+            num_reqs + 1, dtype=torch.int32, device=device
         )
 
     # Here we suppose the length of each chunk is equal
@@ -155,7 +157,7 @@ class ForwardBatchDeepSeekMHAMixin:
         prefix_chunk_starts = (
             torch.arange(num_prefix_chunks, device=device, dtype=torch.int32)
             .unsqueeze(1)
-            .expand(-1, self.batch_size)
+            .expand(-1, prefix_lens.shape[0])
             * prefix_chunk_len
         )
         prefix_chunk_ends = torch.min(
@@ -177,7 +179,10 @@ class ForwardBatchDeepSeekMHAMixin:
         pack_all_prefix_chunks: bool = False,
         single_chunk: bool = False,
         dense_metadata: bool = False,
+        num_reqs: Optional[int] = None,
     ):
+        """num_reqs limits the prefix chunks to the batch's leading requests
+        (default: every request)."""
 
         from sglang.srt.mem_cache.memory_pool import (
             HybridLinearKVPool,
@@ -190,7 +195,9 @@ class ForwardBatchDeepSeekMHAMixin:
             and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
-        if not any(self.extend_prefix_lens_cpu):
+        num_reqs = self.batch_size if num_reqs is None else num_reqs
+        prefix_lens_cpu = self.extend_prefix_lens_cpu[:num_reqs]
+        if not any(prefix_lens_cpu):
             self.num_prefix_chunks = 0
             return
 
@@ -206,25 +213,27 @@ class ForwardBatchDeepSeekMHAMixin:
             # The caller has already checked that the full packed prefix fits
             # chunk_capacity. One request-major chunk gives the fused kernel the
             # same per-request layout described by prefix_chunk_cu_seq_lens[0].
-            self.prefix_chunk_len = max(self.extend_prefix_lens_cpu)
+            self.prefix_chunk_len = max(prefix_lens_cpu)
         else:
+            # Sized by the whole batch even when num_reqs < batch_size, so the
+            # leading requests see the same chunk boundaries either way.
             self.prefix_chunk_len = chunk_capacity // self.batch_size
 
         self.num_prefix_chunks = (
-            max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
+            max(prefix_lens_cpu) + self.prefix_chunk_len - 1
         ) // self.prefix_chunk_len
 
         # Here we compute chunk lens twice to avoid stream sync, once on gpu and once on cpu.
         prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cuda = (
             self.get_prefix_chunk_seq_lens(
-                self.extend_prefix_lens,
+                self.extend_prefix_lens[:num_reqs],
                 self.num_prefix_chunks,
                 self.prefix_chunk_len,
             )
         )
         prefix_chunk_starts_cpu, prefix_chunk_seq_lens_cpu = (
             self.get_prefix_chunk_seq_lens(
-                torch.tensor(self.extend_prefix_lens_cpu),
+                torch.tensor(prefix_lens_cpu),
                 self.num_prefix_chunks,
                 self.prefix_chunk_len,
             )
@@ -238,7 +247,7 @@ class ForwardBatchDeepSeekMHAMixin:
         # Metadata for attention backend
         self.prefix_chunk_cu_seq_lens = torch.zeros(
             self.num_prefix_chunks,
-            self.batch_size + 1,
+            num_reqs + 1,
             device=device,
             dtype=torch.int32,
         )

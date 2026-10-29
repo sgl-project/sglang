@@ -9,6 +9,7 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
+import msgspec
 import torch
 import triton
 
@@ -165,6 +166,21 @@ def _quantize_fp8_qkv(q, k, v, layer):
 global_cute_dsl_workspace_buffer = None
 
 
+class TRTLLMMLAMixedDecodeTail(msgspec.Struct, frozen=True):
+    """The trailing one-token requests of a mixed (prefill + decode) extend
+    batch, served by the MLA decode kernel instead of the prefill passes.
+
+    Requests ``[num_prefill_reqs:]`` each extend by one token on top of a
+    cached prefix; their rows start at ``num_prefill_tokens``.
+    """
+
+    num_prefill_reqs: int
+    num_prefill_tokens: int
+    block_kv_indices: torch.Tensor
+    seq_lens_k: torch.Tensor
+    max_seq_len_k: int
+
+
 @dataclass
 class TRTLLMMLAPrefillMetadata:
     """Metadata for TRTLLM MLA prefill operations."""
@@ -173,6 +189,7 @@ class TRTLLMMLAPrefillMetadata:
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
     fallback_to_flashinfer_impl: bool = False
+    decode_tail: Optional[TRTLLMMLAMixedDecodeTail] = None
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -294,6 +311,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
         self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
+        # Serve the decode tail of a mixed extend batch with the decode kernel
+        # (see TRTLLMMLAMixedDecodeTail). Subclasses that swap the kernel or
+        # own the prefill Q/K/V preparation keep the stock extend path.
+        self.serve_mixed_decode_tail = (
+            self.backend == "trtllm-gen"
+            and not hasattr(self, "prepare_prefill_qkv")
+            and not get_parallel().dcp_enabled
+        )
 
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.dense_q_indptr_verify = (
@@ -807,11 +832,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             ).int()
             max_seq_len = max(forward_batch.extend_seq_lens_cpu)
+            decode_tail = None
+            if self.serve_mixed_decode_tail and not fallback_to_flashinfer_impl:
+                decode_tail = self._plan_mixed_decode_tail(forward_batch)
             self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
                 max_seq_len,
                 cum_seq_lens_q,
                 seq_lens,
                 fallback_to_flashinfer_impl,
+                decode_tail=decode_tail,
             )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -902,6 +931,89 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:
             return super().init_forward_metadata(forward_batch)
+
+    def _plan_mixed_decode_tail(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[TRTLLMMLAMixedDecodeTail]:
+        """Find the decode tail from host-side lengths (no device sync) and
+        build its page table once per forward for every MLA layer."""
+        if forward_batch.spec_info is not None:
+            return None
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        num_prefill_reqs = find_mixed_decode_tail_start(
+            extend_seq_lens=extend_lens, extend_prefix_lens=prefix_lens
+        )
+        if num_prefill_reqs is None:
+            return None
+
+        # Build the page table over the whole batch and keep the tail rows: a
+        # translated plan's table is laid out from the batch's first request.
+        max_seq_len = max(p + e for p, e in zip(prefix_lens, extend_lens))
+        block_kv_indices = self._create_block_kv_indices(
+            plan=forward_batch.kv_loc_plan,
+            batch_size=forward_batch.batch_size,
+            max_blocks=self._calc_padded_blocks(max_seq_len),
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            device=forward_batch.seq_lens.device,
+        )
+        return TRTLLMMLAMixedDecodeTail(
+            num_prefill_reqs=num_prefill_reqs,
+            num_prefill_tokens=sum(extend_lens[:num_prefill_reqs]),
+            block_kv_indices=block_kv_indices[num_prefill_reqs:],
+            seq_lens_k=forward_batch.seq_lens[num_prefill_reqs:].to(torch.int32),
+            max_seq_len_k=max(prefix_lens[num_prefill_reqs:]) + 1,
+        )
+
+    def get_mixed_decode_tail(self) -> Optional[TRTLLMMLAMixedDecodeTail]:
+        """The current extend batch's decode tail, or None if it has none."""
+        metadata = self.forward_prefill_metadata
+        return None if metadata is None else metadata.decode_tail
+
+    def forward_mixed_decode_tail(
+        self,
+        *,
+        q_nope_out: torch.Tensor,
+        q_rope: torch.Tensor,
+        layer: RadixAttention,
+        decode_tail: TRTLLMMLAMixedDecodeTail,
+    ) -> torch.Tensor:
+        """Absorbed MLA decode for the decode tail of a mixed extend batch.
+
+        q_nope_out [n, H, kv_lora_rank] is the query already multiplied by
+        W_UK and q_rope [n, H, qk_rope_head_dim] is post-RoPE; their KV is
+        already in the cache. Returns the latent output [n, H, kv_lora_rank].
+        """
+        # Same query layout and cast as forward_decode.
+        query = concat_mla_absorb_q_general(q_nope_out, q_rope).to(self.data_type)
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        raw_out = self._run_decode_kernel(
+            query=query.unsqueeze(1),
+            kv_cache=paged_row_view(k_cache, self.page_size).unsqueeze(1),
+            block_tables=decode_tail.block_kv_indices,
+            seq_lens=decode_tail.seq_lens_k,
+            max_seq_len=decode_tail.max_seq_len_k,
+            layer=layer,
+        )
+        return raw_out.view(-1, layer.tp_q_head_num, self.kv_lora_rank)
+
+    def _extend_query_reqs(
+        self, num_q_tokens: int, forward_batch: ForwardBatch
+    ) -> tuple[int, torch.Tensor, torch.Tensor]:
+        """(batch size, cum_seq_lens, seq_lens) of the requests the extend
+        query covers: only the prefill requests when the caller passed just
+        their rows and serves the decode tail with forward_mixed_decode_tail."""
+        metadata = self.forward_prefill_metadata
+        decode_tail = metadata.decode_tail
+        if decode_tail is None or num_q_tokens != decode_tail.num_prefill_tokens:
+            return forward_batch.batch_size, metadata.cum_seq_lens, metadata.seq_lens
+        num_reqs = decode_tail.num_prefill_reqs
+        return (
+            num_reqs,
+            metadata.cum_seq_lens[: num_reqs + 1],
+            metadata.seq_lens[:num_reqs],
+        )
 
     def pad_draft_extend_query(
         self,
@@ -1695,6 +1807,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert q_rope is None
             assert k_rope is None
             chunk_idx = forward_batch.prefix_chunk_idx
+            batch_size, cum_seq_lens_q, _ = self._extend_query_reqs(
+                q.shape[0], forward_batch
+            )
 
             out = torch.empty(
                 q.shape[0],
@@ -1708,8 +1823,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 k=k,
                 v=v,
                 layer=layer,
-                batch_size=forward_batch.batch_size,
-                cum_seq_lens_q=self.forward_prefill_metadata.cum_seq_lens,
+                batch_size=batch_size,
+                cum_seq_lens_q=cum_seq_lens_q,
                 max_q_len=self.forward_prefill_metadata.max_seq_len,
                 seq_lens_kv=forward_batch.prefix_chunk_seq_lens[chunk_idx],
                 cum_seq_lens_kv=forward_batch.prefix_chunk_cu_seq_lens[chunk_idx],
@@ -1733,12 +1848,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     out_tensor,
                     lse_tensor,
                     forward_batch.prefix_chunk_seq_lens[chunk_idx],
-                    self.forward_prefill_metadata.cum_seq_lens,
+                    cum_seq_lens_q,
                     self.forward_prefill_metadata.max_seq_len,
                 )
 
             return result
         else:
+            batch_size, cum_seq_lens, seq_lens = self._extend_query_reqs(
+                q.shape[0], forward_batch
+            )
             out = torch.empty(
                 q.shape[0],
                 q.shape[1],
@@ -1746,16 +1864,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=q.device,
                 dtype=self.q_data_type,
             )
+            # A decode tail only shortens the batch: max_seq_len still bounds
+            # the remaining requests' query and key lengths.
             return self._run_prefill_kernel(
                 q=q,
                 k=k,
                 v=v,
                 layer=layer,
-                batch_size=forward_batch.batch_size,
-                cum_seq_lens_q=self.forward_prefill_metadata.cum_seq_lens,
+                batch_size=batch_size,
+                cum_seq_lens_q=cum_seq_lens,
                 max_q_len=self.forward_prefill_metadata.max_seq_len,
-                seq_lens_kv=self.forward_prefill_metadata.seq_lens,
-                cum_seq_lens_kv=self.forward_prefill_metadata.cum_seq_lens,
+                seq_lens_kv=seq_lens,
+                cum_seq_lens_kv=cum_seq_lens,
                 max_kv_len=self.forward_prefill_metadata.max_seq_len,
                 is_causal=True,
                 return_lse=forward_batch.mha_return_lse,
@@ -1811,3 +1931,22 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
         )
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_out_graph(inner_fb)
+
+
+def find_mixed_decode_tail_start(
+    *, extend_seq_lens: list[int], extend_prefix_lens: list[int]
+) -> Optional[int]:
+    """Index of the first request in the decode tail of a mixed extend batch.
+
+    A mixed batch appends the running decode requests after the prefill
+    requests, each extending a cached prefix by one token. Returns None unless
+    the batch has both a prefill part and such a tail.
+    """
+    start = len(extend_seq_lens)
+    while (
+        start > 0
+        and extend_seq_lens[start - 1] == 1
+        and extend_prefix_lens[start - 1] > 0
+    ):
+        start -= 1
+    return start if 0 < start < len(extend_seq_lens) else None

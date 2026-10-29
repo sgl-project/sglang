@@ -14,6 +14,7 @@ from sglang.srt.layers.dcp import (
     filter_dcp_local_kv_indices,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.lora.deepseek_mla_correction import is_kv_b_lora_active
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -171,6 +172,12 @@ def forward_dsa_indexer_for_mha(
 class DeepseekMHAForwardMixin:
     def init_mha_forward(self: DeepseekV2AttentionMLA):
         self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
+        # Whether the decode tail of a mixed extend batch may take the absorbed
+        # MLA decode path (_mixed_decode_tail_attn_mha). The weight dtypes are
+        # only known after loading and are checked per call.
+        self.can_absorb_mixed_decode_tail = (
+            not self.use_dsa and not envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+        )
 
         # TODO: Design a finer way to determine the threshold
         self.chunked_prefix_cache_threshold = (
@@ -348,10 +355,46 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
         gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
-            forward_batch.extend_prefix_lens_cpu
-        )
         backend = resolve_attn_backend(forward_batch)
+        decode_tail = self._get_mixed_decode_tail(
+            backend=backend, num_tokens=q.shape[0]
+        )
+        if decode_tail is None:
+            attn_output = self._chunked_kv_attn_mha(
+                q=q, k=k, v=v, forward_batch=forward_batch, backend=backend
+            )
+        else:
+            attn_output = self._mixed_decode_tail_attn_mha(
+                q=q,
+                k=k,
+                v=v,
+                forward_batch=forward_batch,
+                backend=backend,
+                decode_tail=decode_tail,
+            )
+
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _chunked_kv_attn_mha(
+        self: DeepseekV2AttentionMLA,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+        backend,
+        num_reqs: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Attention of the first num_reqs requests (default: all) over their
+        current chunk and cached prefix; q/k/v hold just their rows."""
+        prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        if num_reqs is not None:
+            prefix_lens_cpu = prefix_lens_cpu[:num_reqs]
+        has_extend_prefix = prefix_lens_cpu is not None and any(prefix_lens_cpu)
         prepare_qkv_fn = getattr(backend, "prepare_chunked_prefill_qkv", None)
         if has_extend_prefix and prepare_qkv_fn is not None:
             q, k, v = prepare_qkv_fn(q, k, v, forward_batch)
@@ -367,17 +410,13 @@ class DeepseekMHAForwardMixin:
                 pack_all_prefix_chunks=use_packed_prefix_chunks(backend, forward_batch),
                 single_chunk=fused_prefix,
                 dense_metadata=use_dense_prefix_kv(backend),
+                num_reqs=num_reqs,
             )
             if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
                 get_attn_backend().init_mha_chunk_metadata(forward_batch)
 
         if fused_prefix:
-            attn_output = self._fused_prefix_extend_attn_mha(q, k, v, forward_batch)
-            attn_output = attn_output.reshape(
-                -1, self.num_local_heads * self.v_head_dim
-            )
-            output, _ = self.o_proj(attn_output)
-            return output
+            return self._fused_prefix_extend_attn_mha(q, k, v, forward_batch)
 
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
@@ -394,11 +433,72 @@ class DeepseekMHAForwardMixin:
                 accum_lse=lse,
                 forward_batch=forward_batch,
             )
+        return attn_output
 
-        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        if gate is not None:
-            attn_output = self._apply_gated(attn_output, gate)
-        output, _ = self.o_proj(attn_output)
+    def _get_mixed_decode_tail(
+        self: DeepseekV2AttentionMLA, *, backend, num_tokens: int
+    ):
+        """The backend's decode tail of a mixed extend batch when this layer
+        can serve it with absorbed MLA decode (bf16 W_UK / W_UV); else None."""
+        get_decode_tail = getattr(backend, "get_mixed_decode_tail", None)
+        if get_decode_tail is None or not self.can_absorb_mixed_decode_tail:
+            return None
+        decode_tail = get_decode_tail()
+        if decode_tail is None:
+            return None
+        # DP attention may pad the query past the batch's real tokens.
+        num_decode_reqs = decode_tail.seq_lens_k.shape[0]
+        if num_tokens != decode_tail.num_prefill_tokens + num_decode_reqs:
+            return None
+        if (
+            self.use_deep_gemm_bmm
+            or self.w_kc is None
+            or self.w_kc.dtype != torch.bfloat16
+            or self.w_vc.dtype != torch.bfloat16
+            or is_kv_b_lora_active(self)
+        ):
+            return None
+        return decode_tail
+
+    def _mixed_decode_tail_attn_mha(
+        self: DeepseekV2AttentionMLA,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+        backend,
+        decode_tail,
+    ) -> torch.Tensor:
+        """Attention of a mixed extend batch: chunked MHA for the prefill
+        requests, absorbed MLA decode over the latent cache for the decode
+        tail (one query token each), as a decode batch would run them."""
+        num_prefill_tokens = decode_tail.num_prefill_tokens
+        output = q.new_empty((q.shape[0], self.num_local_heads, self.v_head_dim))
+        output[:num_prefill_tokens] = self._chunked_kv_attn_mha(
+            q=q[:num_prefill_tokens],
+            k=k[:num_prefill_tokens],
+            v=v[:num_prefill_tokens],
+            forward_batch=forward_batch,
+            backend=backend,
+            num_reqs=decode_tail.num_prefill_reqs,
+        ).view(num_prefill_tokens, self.num_local_heads, self.v_head_dim)
+
+        q_nope, q_pe = q[num_prefill_tokens:].split(
+            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc).transpose(0, 1)
+        latent_output = backend.forward_mixed_decode_tail(
+            q_nope_out=q_nope_out,
+            q_rope=q_pe,
+            layer=self.attn_mqa,
+            decode_tail=decode_tail,
+        )
+        torch.bmm(
+            latent_output.transpose(0, 1),
+            self.w_vc,
+            out=output[num_prefill_tokens:].transpose(0, 1),
+        )
         return output
 
     def forward_normal_one_shot_prepare(
