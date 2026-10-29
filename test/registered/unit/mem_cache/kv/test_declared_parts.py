@@ -780,6 +780,56 @@ class TestDeclaredParts(CustomTestCase):
             state.get_device_pool_infos()[0].buffer_info.extra_checkpoint_buffers, ()
         )
 
+    def test_owner_only_plan_allocates_reuses_and_checkpoints_pages(self):
+        setup_allocator_context()
+        plan = plan_kv_storage(
+            kv_layer_decls(
+                full_layer_ids=(0, 1),
+                full_geometry=MHAGeometry(
+                    head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16
+                ),
+            ),
+            page_size=4,
+        )
+        sized = size_plan(
+            plan,
+            KVSizingInputs(
+                budget_bytes=8192, max_running_requests=2, context_len=32, alignment=1
+            ),
+        )
+        storage = build_kv_storage(
+            plan,
+            sized,
+            UnifiedBuildContext(
+                device="cpu",
+                start_layer=0,
+                end_layer=2,
+                enable_memory_saver=False,
+                need_sort=False,
+                max_num_reqs=2,
+                model_context_len=32,
+            ),
+        )
+        allocator = storage.allocator
+        available = allocator.available_size()
+        ids = allocator.alloc(available)
+        self.assertIsNotNone(ids)
+        self.assertIsNone(allocator.alloc(4))
+        physical = allocator.full_attn_allocator.ids.translate(ids)
+        view = storage.view("full")
+        view.k_buffer[0][physical] = 7
+        saved = allocator.get_cpu_copy(ids)
+        view.k_buffer[0][physical] = 0
+        allocator.load_cpu_copy(saved, ids)
+        self.assertTrue(torch.all(view.k_buffer[0][physical] == 7))
+        allocator.free(ids)
+        self.assertEqual(allocator.available_size(), available)
+        self.assertEqual(allocator.verify_byte_accounting(), [])
+        self.assertEqual(
+            storage.plan.tree_slots()[0].component,
+            storage.plan.owner().external.tree_component,
+        )
+
     def test_full_cap_uses_widened_dcp_units(self):
         _, plan, _ = _build(state=True)
         sized = size_plan(
@@ -861,6 +911,95 @@ class TestDeclaredParts(CustomTestCase):
             self.assertEqual(
                 tensor.stride(0) * tensor.itemsize,
                 plan.sub_pool("mamba").spec.entry_bytes(),
+            )
+
+    def test_sparse_page_regions_and_request_ring_reuse(self):
+        # Packed DSA pages put all 128-byte keys before the 4-byte scales;
+        # QSA pages contain two compressed K rows. Neither is token-interleaved.
+        dsa = TensorPartDecl(
+            name="index", shape=(4 * (128 + 4),), dtype=torch.uint8, layer_ids=(0, 4)
+        )
+        qsa = TensorPartDecl(
+            name="compressed",
+            shape=(2, 2, 8),
+            dtype=torch.bfloat16,
+            layer_ids=(0, 4),
+            slice_axis=1,
+        )
+        tails = tuple(
+            RequestPartDecl(
+                part=TensorPartDecl(
+                    name=name, shape=(7, 128), dtype=torch.bfloat16, layer_ids=(0, 4)
+                ),
+                wire="dsa_tail",
+            )
+            for name in ("tail_k", "tail_score")
+        )
+        pending = RequestPartDecl(
+            part=TensorPartDecl(
+                name="pending", shape=(2, 2, 8), dtype=torch.bfloat16, layer_ids=(0, 4)
+            ),
+            wire="qsa_pending",
+        )
+        rope = RequestPartDecl(
+            part=TensorPartDecl(name="rope", shape=(2, 3), dtype=torch.int64),
+            wire="qsa_pending",
+        )
+        storage, plan, sized = _build(
+            derived=(
+                DerivedPartDecl(sub_pool="full", part=dsa, wire="dsa"),
+                DerivedPartDecl(sub_pool="full", part=qsa, wire="qsa_compressed"),
+            ),
+            requests=(*tails, pending, rope),
+        )
+        wires = plan.wire_entries()
+        self.assertEqual(
+            [e.state_type for e in wires],
+            ["swa", "dsa", "dsa_tail", "qsa_pending", "qsa_compressed"],
+        )
+        self.assertEqual(storage.regions("full", part="dsa").item_lens, (528, 528))
+        region = storage.regions("full", part="qsa_compressed")
+        self.assertEqual(region.item_lens, (64, 64))
+        self.assertEqual(region.layer_ids, (0, 4))
+        self.assertEqual(region.dim_per_tensor, (2, 2))
+        self.assertEqual(region.slice_outer_counts, (2, 2))
+        self.assertEqual(
+            storage.regions("full", part="dsa_tail").item_lens, (1792,) * 4
+        )
+        self.assertEqual(
+            storage.regions("full", part="qsa_pending").item_lens, (64, 64, 48)
+        )
+        arena = storage.allocator.arena
+        for tensor in arena.page_parts["full"].tensors.values():
+            tensor[:, 3].fill_(7)
+        arena.move_units("full", torch.tensor([9]), torch.tensor([3]))
+        for tensor in arena.page_parts["full"].tensors.values():
+            self.assertTrue(torch.all(tensor[:, 9] == 7))
+        for declared in plan.request_parts:
+            storage._request_memory.tensors[declared.part.name].fill_(9)
+        row = storage.take_rows(1)[0]
+        for declared in plan.request_parts:
+            part = declared.part
+            tensor = storage._request_memory.tensors[part.name]
+            self.assertTrue(
+                torch.all(tensor.select(part.row_axis, row) == part.reset_value)
+            )
+        storage.release_rows([row])
+        for declared in plan.request_parts:
+            part = declared.part
+            storage._request_memory.tensors[part.name].select(part.row_axis, row).fill_(
+                11
+            )
+        self.assertEqual(storage.take_rows(1), [row])
+        for declared in plan.request_parts:
+            part = declared.part
+            self.assertTrue(
+                torch.all(
+                    storage._request_memory.tensors[part.name].select(
+                        part.row_axis, row
+                    )
+                    == part.reset_value
+                )
             )
 
     def test_derived_page_blobs_move_with_physical_pages(self):
