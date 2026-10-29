@@ -822,6 +822,7 @@ def load_model_from_full_model_state_dict(
                             f"param_cls={type(actual_param).__name__}"
                         ) from exc
                     sharded_tensor = temp_param.data
+                    del temp_param
                     if host_spill is not None and spilled is not None:
                         host_spill.seal(
                             target_param_name, meta_sharded_param.shape, target_dtype
@@ -894,6 +895,25 @@ def load_model_from_full_model_state_dict(
             sharded_sd[target_param_name] = nn.Parameter(
                 sharded_tensor, requires_grad=False
             )
+
+        module_name, _, param_name = target_param_name.rpartition(".")
+        if not is_fsdp_model and param_name == "weight":
+            module = model.get_submodule(module_name)
+            process_weight_on_load = getattr(
+                getattr(module, "quant_method", None), "_process_weight_on_load", None
+            )
+            if process_weight_on_load is not None:
+                module.weight = sharded_sd[target_param_name]
+                process_weight_on_load(module)
+                prefix = f"{module_name}." if module_name else ""
+                for name in ("weight", "weight_scale"):
+                    param = getattr(module, name)
+                    if cpu_offload:
+                        param.data = param.data.cpu()
+                    sharded_sd[f"{prefix}{name}"] = param
+                # The pending state must retain only converted device storage.
+                custom_param_sd.pop(target_param_name)
+        del loaded_tensor, full_tensor, sharded_tensor
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
 

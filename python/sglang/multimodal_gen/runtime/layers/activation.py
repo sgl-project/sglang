@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _is_cuda = current_platform.is_cuda()
@@ -26,8 +27,6 @@ elif _is_hip or _is_xpu:
 
 if _is_npu:
     import torch_npu
-# TODO (will): remove this dependency
-from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
 
 @CustomOp.register("silu_and_mul")
@@ -41,7 +40,52 @@ class SiluAndMul(CustomOp):
         return: (num_tokens, d) or (batch_size, seq_len, d)
     """
 
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+    _quant_linear: nn.Module | None = None
+
+    def __init__(
+        self,
+        *,
+        preserve_activation_rounding: bool = False,
+        reuse_input: bool = False,
+    ) -> None:
+        super().__init__()
+        self.preserve_activation_rounding = preserve_activation_rounding
+        self.reuse_input = reuse_input
+
+    def fuse_input_quant(self, linear: nn.Module) -> None:
+        # Keep the consuming projection out of this module's children.
+        self.__dict__["_quant_linear"] = linear
+
+    def forward_cuda(self, x: torch.Tensor) -> Any:
+        linear = self._quant_linear
+        accepts_mxfp8 = getattr(
+            getattr(linear, "quant_method", None), "accepts_mxfp8_input", None
+        )
+        if accepts_mxfp8 is not None and accepts_mxfp8(linear):
+            from sglang.kernels.ops.diffusion import (
+                can_use_silu_mul_mxfp8,
+                silu_mul_mxfp8,
+            )
+
+            if can_use_silu_mul_mxfp8(x):
+                return silu_mul_mxfp8(x)
+        if self.preserve_activation_rounding:
+            if (
+                x.is_cuda
+                and x.dtype == torch.bfloat16
+                and x.is_contiguous()
+                and x.shape[-1] % 16 == 0
+            ):
+                from sglang.kernels.ops.activation.activation import (
+                    silu_and_mul_with_activation_rounding,
+                    silu_and_mul_with_activation_rounding_,
+                )
+
+                if self.reuse_input:
+                    return silu_and_mul_with_activation_rounding_(x)
+                # Quantized consumers require contiguous rows outside the packed input.
+                return silu_and_mul_with_activation_rounding(x)
+            return self.forward_native(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -53,14 +97,27 @@ class SiluAndMul(CustomOp):
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
-    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_npu(self, x: torch.Tensor) -> Any:
+        quantize_swiglu = getattr(
+            getattr(self._quant_linear, "quant_method", None), "quantize_swiglu", None
+        )
+        if quantize_swiglu is not None:
+            quantized = quantize_swiglu(x)
+            if quantized is not None:
+                return quantized
+        if self.preserve_activation_rounding:
+            return self.forward_native(x)
         out = torch_npu.npu_swiglu(x)
         return out
 
     def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        if self.preserve_activation_rounding:
+            return self.forward_native(x)
         return nn.SwishGLU()(x)
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        if self.preserve_activation_rounding:
+            return self.forward_native(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)

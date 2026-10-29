@@ -3020,7 +3020,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 "auto-detected from the checkpoint config or safetensors metadata when "
                 "possible. Use this flag to override auto-detection. "
                 "Online (post-load) quantization from a BF16/FP16 checkpoint "
-                "is supported for 'fp8', 'mxfp4' and 'convrot_int8' (ConvRot INT8 "
+                "is supported for 'fp8', 'mxfp4', Ascend 'w8a8_int', and "
+                "'convrot_int8' (ConvRot INT8 "
                 "W8A8; runs on SGLang's JIT-compiled fused ops on CC 9.0, 10.0, "
                 "12.0 and 12.1, else on comfy_kitchen; see "
                 "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND). Other methods "
@@ -3037,7 +3038,7 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.quantization_ignored_layers,
             help=(
                 "Layer name patterns to keep unquantized during online quantization "
-                "(fp8/mxfp4/convrot_int8). Each pattern is matched against the "
+                "(fp8/mxfp4/convrot_int8/w8a8_int). Each pattern is matched against the "
                 "layer prefix. "
                 "Example: --quantization-ignored-layers img_mod txt_mod to_out"
             ),
