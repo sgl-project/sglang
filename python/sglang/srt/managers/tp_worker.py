@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -634,6 +634,7 @@ class TpModelWorker(BaseTpWorker):
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         pp_loras: Optional[set[Optional[str]]] = None,
         return_iteration_ids: bool = False,
+        before_sample: Optional[Callable[[], None]] = None,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         folded = None
@@ -756,6 +757,10 @@ class TpModelWorker(BaseTpWorker):
                 return batch_result
 
             if not forward_batch.is_prefill_only:
+                if before_sample is not None:
+                    # Host work that must precede sampling (e.g. the grammar
+                    # barrier); it overlaps the forward launched above.
+                    before_sample()
                 # For normal requests, sample the next token ids.
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch

@@ -782,6 +782,45 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
     )
 
 
+def top_k_top_p_filter_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    max_top_k: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Unnormalized descending ``(probs_sort, probs_idx)`` after top-k/top-p.
+
+    max_top_k, when given, must be >= every value in top_ks.
+    """
+    # The top-k mask below zeroes every column at rank >= top_k, so the max_top_k
+    # leading columns carry all the mass that survives and sorting only those is
+    # exact. Callers that need a batch-independent tie order pass None.
+    if max_top_k is not None and max_top_k < probs.shape[-1]:
+        probs_sort, probs_idx = torch.topk(probs, k=max_top_k, dim=-1, sorted=True)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[
+        torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
+        >= top_ks.view(-1, 1)
+    ] = 0.0
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    return probs_sort, probs_idx
+
+
+def top_k_top_p_normalize_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    max_top_k: Optional[int] = None,
+) -> torch.Tensor:
+    probs_sort, probs_idx = top_k_top_p_filter_probs_torch(
+        probs, top_ks, top_ps, max_top_k
+    )
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    return torch.zeros_like(probs).scatter_(-1, probs_idx, probs_sort)
+
+
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -805,26 +844,17 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 
     max_top_k, when given, must be >= every value in top_ks.
     """
-    # The top-k mask below zeroes every column at rank >= top_k, so the max_top_k
-    # leading columns carry all the mass that survives and sorting only those is
-    # exact. The seeded path keeps the full sort because the order of tied
+    # The seeded path keeps the full sort because the order of tied
     # probabilities may depend on k, which is a batch-wide value, and
     # deterministic inference must not depend on the batch composition.
-    if (
-        max_top_k is not None
-        and max_top_k < probs.shape[-1]
-        and sampling_seed is None
-        and not return_filtered_probs
-    ):
-        probs_sort, probs_idx = torch.topk(probs, k=max_top_k, dim=-1, sorted=True)
-    else:
-        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    probs_sort, probs_idx = top_k_top_p_filter_probs_torch(
+        probs,
+        top_ks,
+        top_ps,
+        max_top_k=(
+            max_top_k if sampling_seed is None and not return_filtered_probs else None
+        ),
+    )
 
     if need_min_p_sampling:
         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed

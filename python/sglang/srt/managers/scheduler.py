@@ -2175,15 +2175,23 @@ class Scheduler(
         need_grammar_sync = (
             batch
             and not batch.spec_algorithm.is_none()
-            and batch.grammar_needs_sync()
-            and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
+            and (
+                (batch.grammar_needs_sync() and batch.forward_mode.is_decode())
+                or (
+                    batch.mixed_decode_rows_have_grammar()
+                    and not batch.spec_algorithm.supports_mixed_grammar_barrier()
+                )
+            )
         )
 
         # Algorithms that support grammar overlap advance the FSM inside verify()
         # via the grammar barrier (overlapping the target forward), which resolves
-        # whatever result is still pending in the queue — including the
-        # extend->decode boundary — so no grammar-specific overlap disable is needed.
+        # whatever result is still pending in the queue, including the
+        # extend->decode boundary. A mixed batch has no verify: its decode rows are
+        # sampled in the target extend, so the worker must run the barrier before
+        # that sampling (supports_mixed_grammar_barrier) or the batch takes the
+        # sync path.
         return disable_overlap_for_batch or need_grammar_sync
 
     def _advance_pending_grammar(self):
