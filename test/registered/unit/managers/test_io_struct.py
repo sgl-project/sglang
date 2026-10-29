@@ -460,6 +460,42 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             rid=["id1", "id2"],
         )
 
+    def test_parallel_sampling_null_n_uses_default(self):
+        for text, params in (
+            ("Hello", {"n": None}),
+            (["Hello", "World"], {"n": None}),
+            (["Hello", "World"], [{"n": None}, {}]),
+            (["Hello", "World"], [{}, {"n": None}]),
+        ):
+            with self.subTest(text=text, params=params):
+                req = GenerateReqInput(text=text, sampling_params=params)
+                req.normalize_batch_and_arguments()
+                self.assertEqual(req.parallel_sample_num, 1)
+                self.assertEqual(req.text, text)
+
+    def test_beam_sample_count_does_not_expand_requests(self):
+        req = GenerateReqInput(text="Hello", sampling_params={"n": 2, "beam_width": 4})
+        req.normalize_batch_and_arguments()
+        self.assertTrue(req.is_single)
+        self.assertEqual(req.parallel_sample_num, 1)
+        self.assertEqual(req.sampling_params["n"], 2)
+
+    def test_parallel_sampling_rejects_invalid_n_before_expansion(self):
+        for value in (0, -1, 1.5, "2", True, False):
+            for text, params in (
+                ("Hello", {"n": value}),
+                (["Hello", "World"], {"n": value}),
+                (["Hello", "World"], [{"n": value}, {"n": value}]),
+                ("Hello", {"n": value, "beam_width": 4}),
+            ):
+                with self.subTest(value=value, text=text, params=params):
+                    req = GenerateReqInput(text=text, sampling_params=params)
+                    with self.assertRaisesRegex(
+                        ValueError, "n must be a positive integer"
+                    ):
+                        req.normalize_batch_and_arguments()
+                    self.assertEqual(req.text, text)
+
     def test_sampling_logprobs_mode_normalization(self):
         default_req = copy.deepcopy(self.base_req)
         default_req.normalize_batch_and_arguments()
