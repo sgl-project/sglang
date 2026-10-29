@@ -14,6 +14,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    Union,
     overload,
 )
 
@@ -910,7 +911,7 @@ def compute_mamba_state_slice_blocks(
     dst_attn_tp_size: int,
     dst_tp_rank_in_group: int,
     local_tp_rank_in_group: int,
-    conv_shard_groups: Optional[List[int]] = None,
+    conv_shard_groups: Optional[List[Union[int, Tuple[int, int]]]] = None,
 ) -> List[Tuple[int, int, int]]:
     """Blocks to copy one mamba state item across differing attn-TP sizes.
 
@@ -928,10 +929,22 @@ def compute_mamba_state_slice_blocks(
     contiguous write interleaves the sub-blocks by writer. Both directions emit one
     block per sub-block for conv_state; temporal_state and non-GDN states (when
     ``conv_shard_groups`` is None) keep the single contiguous slice.
+
+    Each ``conv_shard_groups`` entry is either the sub-block's full dim (its
+    heads are assumed to divide every TP size) or a ``(full_dim, num_heads)``
+    pair. With the head count, TP sizes larger than the head count are handled
+    the way GDN key heads are sharded (``Mamba2StateShape.create`` extends the
+    groups): rank ``r`` holds the single head ``r // (tp // num_heads)``, so
+    consecutive ranks replicate one head and the local sub-block is one head
+    wide rather than ``full_dim // tp``.
     """
-    use_subdims = (
-        conv_shard_groups is not None
-        and sum(conv_shard_groups) == src_dim * src_attn_tp_size
+    groups = (
+        [_conv_shard_group(g) for g in conv_shard_groups]
+        if conv_shard_groups is not None
+        else None
+    )
+    use_subdims = groups is not None and src_dim == _local_conv_dim(
+        groups, src_attn_tp_size
     )
 
     if src_attn_tp_size > dst_attn_tp_size:
@@ -944,35 +957,78 @@ def compute_mamba_state_slice_blocks(
         # writer ([q0,k0,v0,q1,k1,v1,...]); place this writer's shard of each
         # independently head-sharded sub-block at its grouped offset so the decode
         # buffer is [q0,q1,...,k0,k1,...,v0,v1,...].
-        blocks: List[Tuple[int, int, int]] = []
-        src_off = 0
-        dst_off = 0
-        for full_sd in conv_shard_groups:
-            src_sub = full_sd // src_attn_tp_size
-            dst_sub = full_sd // dst_attn_tp_size
-            blocks.append((src_off, dst_off + local_writer_idx * src_sub, src_sub))
-            src_off += src_sub
-            dst_off += dst_sub
-        return blocks
+        src_rank = local_tp_rank_in_group
+        dst_rank = local_tp_rank_in_group // writers_per_decode
+        writers = range(dst_rank * writers_per_decode, src_rank)
+    else:
+        # Scatter: 1 prefill rank feeds several decode ranks.
+        if not use_subdims:
+            src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
+            return [(src_dim_start, 0, dst_dim)]
+        # conv_state: gather the decode rank's [q | k | v] shard from the three
+        # independently head-sharded sub-blocks of the src tensor.
+        dst_rank = dst_tp_rank_in_group
+        src_rank = dst_tp_rank_in_group // (dst_attn_tp_size // src_attn_tp_size)
+        writers = range(0)
 
-    # Scatter: 1 prefill rank feeds several decode ranks.
-    if not use_subdims:
-        src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
-        return [(src_dim_start, 0, dst_dim)]
-
-    # conv_state: gather the decode rank's [q | k | v] shard from the three
-    # independently head-sharded sub-blocks of the src tensor. dst is contiguous.
     blocks: List[Tuple[int, int, int]] = []
     src_off = 0
     dst_off = 0
-    for full_sd in conv_shard_groups:
-        src_sub = full_sd // src_attn_tp_size  # this prefill rank's shard of sub-block
-        dst_sub = full_sd // dst_attn_tp_size  # this decode rank's shard of sub-block
-        src_start = src_off + (dst_tp_rank_in_group * dst_sub) % src_sub
-        blocks.append((src_start, dst_off, dst_sub))
-        src_off += src_sub
-        dst_off += dst_sub
+    for full_dim, num_heads in groups:
+        head_dim = full_dim // num_heads
+        s0, sn = _sub_heads_on_rank(src_attn_tp_size, src_rank, num_heads)
+        d0, dn = _sub_heads_on_rank(dst_attn_tp_size, dst_rank, num_heads)
+        lo, hi = max(s0, d0), min(s0 + sn, d0 + dn)
+        # A replicated head is written once: skip it when an earlier writer of
+        # this decode rank holds the same heads.
+        duplicate = any(
+            _sub_heads_on_rank(src_attn_tp_size, q, num_heads) == (s0, sn)
+            for q in writers
+        )
+        if lo < hi and not duplicate:
+            blocks.append(
+                (
+                    src_off + (lo - s0) * head_dim,
+                    dst_off + (lo - d0) * head_dim,
+                    (hi - lo) * head_dim,
+                )
+            )
+        src_off += sn * head_dim
+        dst_off += dn * head_dim
     return blocks
+
+
+def _conv_shard_group(group) -> Tuple[int, int]:
+    """``(full_dim, num_heads)``; a bare full dim counts every channel as a head."""
+    if isinstance(group, int):
+        return group, group
+    full_dim, num_heads = group
+    if num_heads <= 0 or full_dim % num_heads:
+        raise ValueError(f"conv shard group {group}: dim not divisible by heads")
+    return int(full_dim), int(num_heads)
+
+
+def _local_conv_dim(groups: List[Tuple[int, int]], tp_size: int) -> Optional[int]:
+    """Per-rank conv dim the groups imply at ``tp_size``; None if unshardable."""
+    try:
+        return sum(
+            _sub_heads_on_rank(tp_size, 0, heads)[1] * (full // heads)
+            for full, heads in groups
+        )
+    except ValueError:
+        return None
+
+
+def _sub_heads_on_rank(tp_size: int, tp_rank: int, num_heads: int) -> Tuple[int, int]:
+    """``(first_head, num_heads)`` of a sub-block held by ``tp_rank``."""
+    if num_heads % tp_size == 0:
+        per_rank = num_heads // tp_size
+        return tp_rank * per_rank, per_rank
+    if tp_size % num_heads == 0:
+        return tp_rank // (tp_size // num_heads), 1
+    raise ValueError(
+        f"{num_heads} conv heads cannot be sharded over attention TP {tp_size}"
+    )
 
 
 def compute_mamba_state_slice_byte_blocks(
@@ -986,7 +1042,7 @@ def compute_mamba_state_slice_byte_blocks(
     dst_attn_tp_size: int,
     dst_tp_rank_in_group: int,
     local_tp_rank_in_group: int,
-    conv_shard_groups: Optional[List[int]] = None,
+    conv_shard_groups: Optional[List[Union[int, Tuple[int, int]]]] = None,
 ) -> List[Tuple[int, int, int]]:
     """Convert logical TP slices into physical byte blocks for one state slot.
 
