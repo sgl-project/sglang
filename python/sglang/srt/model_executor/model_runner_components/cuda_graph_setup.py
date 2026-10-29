@@ -501,7 +501,10 @@ def capture_prefill_graph(
             return result(None)
         if model_runner.is_draft_worker and not force_for_draft_worker:
             return result(None)
-        if not model_runner._uses_cpu_graph_attention_backend():
+        if (
+            not hasattr(model_runner, "_uses_cpu_graph_attention_backend")
+            or not model_runner._uses_cpu_graph_attention_backend()
+        ):
             return result(None)
         if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
             return result(None)
@@ -761,8 +764,8 @@ def capture_decode_graph(
         pass
     if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
         return no_capture
-    if model_runner.device == "cpu":
-        if not get_flags().capture.enable_torch_compile:
+    if getattr(model_runner, "device", None) == "cpu":
+        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return no_capture
         try:
             decode_backend = get_exec().graph.cuda_graph_config.decode.backend
@@ -775,8 +778,6 @@ def capture_decode_graph(
                 f"Unsupported CPU decode graph backend: {decode_backend!r}; "
                 "only 'full' is supported on CPU."
             )
-        if prefill_runner is None:
-            prefill_runner = getattr(model_runner, "prefill_cuda_graph_runner", None)
         if isinstance(prefill_runner, CPUGraphRunner):
             return GraphCapture(
                 runner=prefill_runner,
@@ -784,6 +785,8 @@ def capture_decode_graph(
                 memory_usage_gb=0,
                 capture_time=0,
             )
+        if not get_flags().capture.enable_torch_compile:
+            return no_capture
         if (
             not hasattr(model_runner, "_uses_cpu_graph_attention_backend")
             or not model_runner._uses_cpu_graph_attention_backend()
