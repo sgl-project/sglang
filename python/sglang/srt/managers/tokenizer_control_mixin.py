@@ -56,6 +56,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
+    ModelExpressWeightUpdateReqOutput,
     OpenSessionReqInput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
@@ -84,6 +85,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
+    UpdateWeightsFromModelExpressReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
     UpdateWeightVersionReqInput,
@@ -129,6 +131,7 @@ _COMMUNICATOR_SPECS = [
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
+    ("modelexpress", ModelExpressWeightUpdateReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
@@ -914,6 +917,18 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def update_weights_from_modelexpress(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromModelExpressReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> ModelExpressWeightUpdateReqOutput:
+        success, message = await self._weight_update_session_call(
+            self.modelexpress_communicator, obj
+        )
+        if success:
+            self._update_weight_version_if_provided(obj.weight_version)
+        return ModelExpressWeightUpdateReqOutput(success=success, message=message)
 
     async def check_weights(
         self: TokenizerManager,
