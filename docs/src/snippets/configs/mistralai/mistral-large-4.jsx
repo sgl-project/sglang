@@ -60,7 +60,6 @@ bench {{NUM_PROMPTS}}   # measured
     accuracy: {
       gsm8k_pct:
 `pip install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@93bc2d851a59e57d54fe755202756589a04d3d86"
-# Vera Rubin cards: launch with --kv-cache-dtype bfloat16 --context-length 131072 (BF16 in KV Cache Precision).
 # The Vera Rubin cards average seeds 1, 2 and 3; the B300 card reports seed 1.
 for SEED in 1 2 3; do
   sgl-eval run gsm8k \\
@@ -73,7 +72,6 @@ for SEED in 1 2 3; do
 done`,
       gsm8k_100_pct:
 `pip install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@93bc2d851a59e57d54fe755202756589a04d3d86"
-# Vera Rubin cards: launch with --kv-cache-dtype bfloat16 --context-length 131072 (BF16 in KV Cache Precision).
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\
@@ -83,7 +81,6 @@ sgl-eval run gsm8k \\
   --out-dir gsm8k-100`,
       mmlu_pct:
 `pip install "sgl-eval @ git+https://github.com/sgl-project/sgl-eval.git@93bc2d851a59e57d54fe755202756589a04d3d86"
-# Vera Rubin cards: launch with --kv-cache-dtype bfloat16 --context-length 131072 (BF16 in KV Cache Precision).
 # The Vera Rubin cards average seeds 1, 2 and 3.
 for SEED in 1 2 3; do
   sgl-eval run mmlu \\
@@ -102,7 +99,6 @@ hf download MMMU/MMMU_Pro --repo-type dataset \\
   --revision 0d7426df4ccb3d8704a992fe6850abee7c262127 \\
   --include "standard (10 options)/*" --include README.md
 python3 -c "from datasets import load_dataset; load_dataset('MMMU/MMMU_Pro', 'standard (10 options)', split='test', revision='0d7426df4ccb3d8704a992fe6850abee7c262127')"
-# Vera Rubin cards: launch with --kv-cache-dtype bfloat16 --context-length 131072 (BF16 in KV Cache Precision).
 # The Vera Rubin cards average seeds 1, 2 and 3; the GB300 card reports seed 1.
 for SEED in 1 2 3; do
   HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 sgl-eval run mmmu_pro \\

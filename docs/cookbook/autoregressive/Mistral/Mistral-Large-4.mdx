@@ -71,7 +71,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Benchmarks
 
-Accuracy uses `sgl-eval` at temperature 1.0, top-p 0.95, at most 8,192 output tokens and `reasoning_effort` `low`, unless noted. Speed uses `bench_serving` with 1,024-token random prompts and 512 output tokens, 64 requests per concurrency point after a 16-request warm-up and a flushed cache; at concurrency 64 the cards keep the median-throughput run of three. Total tok/s/GPU counts input and output tokens. The Vera Rubin rows were measured with BF16 KV and a 131,072-token context: reproduce them with BF16 in the Playground's **KV Cache Precision** card (`--kv-cache-dtype bfloat16 --context-length 131072`); with the default FP8 KV they score GSM8K 96.71% / 96.79% (3 seeds) and MMLU 91.53% / 91.81% (1 seed) for FP8 / NVFP4. The benchmark card of each recipe carries the full protocol and a ⚡ Reproduce button.
+Accuracy uses `sgl-eval` at temperature 1.0, top-p 0.95, at most 8,192 output tokens and `reasoning_effort` `low`, unless noted. Speed uses `bench_serving` with 1,024-token random prompts and 512 output tokens, 64 requests per concurrency point after a 16-request warm-up and a flushed cache; at concurrency 64 the cards keep the median-throughput run of three. Total tok/s/GPU counts input and output tokens. The benchmark card of each recipe carries the full protocol and a ⚡ Reproduce button.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
