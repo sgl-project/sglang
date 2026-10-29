@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.kv.layout.mha import MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLAView
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -168,6 +169,9 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                         controller.page_size = PHYSICAL_PAGE * dcp_size
                         controller.get_attn_cp_rank_and_size = lambda: (0, 1)
                         with (
+                            get_context().override_server_args(
+                                hicache_storage_key_scheme="rank-suffix"
+                            ),
                             mock.patch(
                                 "sglang.srt.managers.cache_controller.get_parallel",
                                 return_value=SimpleNamespace(
