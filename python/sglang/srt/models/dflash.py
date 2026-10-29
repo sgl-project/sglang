@@ -67,10 +67,11 @@ logger = logging.getLogger(__name__)
 # matches the target's (e.g. partial/M-RoPE fields copied from the target
 # config) would share the target's module. The draft forward may then replace
 # cos_sin_cache with a dtype-cast tensor, freeing the buffer that the target's
-# already-captured CUDA graphs read on replay (illegal memory access). Give
-# the draft its own copy, shared by its layers. The copy is only weakly
-# referenced here so it is released with the draft, and a copy killed by a
-# teardown is rebuilt, mirroring get_rope()'s own cache.
+# already-captured CUDA graphs read on replay (illegal memory access). Drafts
+# get a copy instead, cached per shared module in this process-wide weak cache:
+# drafts alive at the same time share one copy (isolated from the target, not
+# from each other), the copy is freed once its last holder is gone, and a copy
+# killed by a teardown is rebuilt, mirroring get_rope()'s own cache.
 _DRAFT_PRIVATE_ROPES: weakref.WeakKeyDictionary[nn.Module, weakref.ref] = (
     weakref.WeakKeyDictionary()
 )
