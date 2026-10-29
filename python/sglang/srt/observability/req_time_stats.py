@@ -504,9 +504,7 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def get_response_sent_to_client_realtime(self):
         return convert_time_to_realtime(self.response_sent_to_client_time)
 
-    def convert_to_output_meta_info(
-        self, scheduler_time_stats=None, completion_tokens=0
-    ):
+    def convert_to_output_meta_info(self, completion_tokens=0):
         meta_info = {}
         if self.created_time > 0.0:
             meta_info["request_received_ts"] = convert_time_to_realtime(
