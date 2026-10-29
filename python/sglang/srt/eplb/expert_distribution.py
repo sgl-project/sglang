@@ -53,7 +53,9 @@ from sglang.srt.runtime_context import (
     logs_expert_balancedness_to_server_log,
     reports_expert_balancedness,
 )
-from sglang.srt.utils import Withable, get_device, get_int_env_var
+from sglang.srt.utils import Withable, get_device, get_int_env_var, is_npu
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -146,6 +148,12 @@ class ExpertDistributionRecorder(ABC):
             )
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.eplb_statistics import (
+                    NpuExpertDistributionRecorder,
+                )
+
+                return NpuExpertDistributionRecorder(expert_location_metadata, rank)
             return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
@@ -223,9 +231,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
-        self._accumulator = _Accumulator.init_new(expert_location_metadata, rank)
+        self._accumulator = self._create_accumulator(expert_location_metadata, rank)
         self._single_pass_gatherers = {
-            k: _SinglePassGatherer.init_new(expert_location_metadata, rank)
+            k: self._create_gatherer(expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
@@ -235,6 +243,12 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
             )
             self.start_record()
+
+    def _create_accumulator(self, expert_location_metadata, rank):
+        return _Accumulator.init_new(expert_location_metadata, rank)
+
+    def _create_gatherer(self, expert_location_metadata, rank):
+        return _SinglePassGatherer.init_new(expert_location_metadata, rank)
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
@@ -727,6 +741,9 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 
 
 class _Accumulator(ABC):
+    # Backends may override this to use a dedicated statistics communicator.
+    _communication_group: Optional[torch.distributed.ProcessGroup] = None
+
     @staticmethod
     def init_new(
         expert_location_metadata: ExpertLocationMetadata,
@@ -824,7 +841,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            gpu_physical_count,
+            dst=0,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._communication_group,
         )
 
         if self._rank == 0:
@@ -981,7 +1001,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
     def dump(self, output_mode: _OutputMode):
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
-            self._global_physical_count_of_buffered_step.get_all(),
+            self._get_physical_count_for_dump(output_mode),
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
@@ -992,7 +1012,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            logical_count_of_buffered_step,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._communication_group,
         )
 
         output = dict(
@@ -1008,6 +1030,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             return output
         else:
             raise NotImplementedError
+
+    def _get_physical_count_for_dump(self, output_mode: _OutputMode):
+        return self._global_physical_count_of_buffered_step.get_all()
 
     def _get_global_average_utilization_rate(self):
         if not self._enable or math.isclose(
@@ -1027,11 +1052,17 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device="cuda",
+                device=get_device_namespace().device,
             )
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
+            avg_rate_tensor = torch.empty(
+                1,
+                dtype=torch.float32,
+                device=get_device_namespace().device,
+            )
+        torch.distributed.broadcast(
+            avg_rate_tensor, src=0, group=self._communication_group
+        )
         return avg_rate_tensor.item()
 
 

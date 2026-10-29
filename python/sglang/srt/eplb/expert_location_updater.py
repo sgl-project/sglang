@@ -27,7 +27,12 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.runtime_context import get_device
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_npu
+
+_is_npu = is_npu()
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.eplb import prepare_expert_weight_update
+
 
 logger = logging.getLogger(__name__)
 
@@ -145,9 +150,18 @@ def _update_expert_weights_raw(
 ):
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
-    temp_buffers = create_temp_buffers(
-        routed_experts_weights_of_layer[update_layer_ids[0]]
-    )
+    if _is_npu:
+        update_layer_ids, temp_buffers, update_layer = prepare_expert_weight_update(
+            weights_by_layer=routed_experts_weights_of_layer,
+            layer_ids=update_layer_ids,
+            old_map=old_expert_location_metadata.physical_to_logical_map_cpu,
+            new_map=new_expert_location_metadata.physical_to_logical_map_cpu,
+        )
+    else:
+        temp_buffers = create_temp_buffers(
+            routed_experts_weights_of_layer[update_layer_ids[0]]
+        )
+        update_layer = update_expert_weights_single_layer
 
     world_size = torch.distributed.get_world_size()
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
@@ -157,7 +171,7 @@ def _update_expert_weights_raw(
 
     for layer_id in update_layer_ids:
         missing_logical_experts_info: List[int] = []
-        update_expert_weights_single_layer(
+        update_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
             temp_buffers=temp_buffers,
             old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map_cpu[
@@ -194,6 +208,7 @@ def update_expert_weights_single_layer(
     missing_logical_experts_info: Optional[List[int]] = None,
     debug: bool = False,
     log_metrics: bool = False,
+    group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     assert all(
         tensor.shape[0] == num_local_physical_experts
@@ -356,6 +371,7 @@ def update_expert_weights_single_layer(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
                         peer=src_rank,
+                        group=group,
                     )
                     for i in range(num_tensors)
                 ],
@@ -406,6 +422,7 @@ def update_expert_weights_single_layer(
                             routed_experts_weights, i, src_expert_location
                         ),
                         peer=dst_rank,
+                        group=group,
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)
