@@ -366,6 +366,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._sim_draw_ahead = sim_draw_ahead_enabled(self._simulated_correct_len)
         self.num_sim_draws_ahead = 0
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
+        markov_head = self.draft_model.markov_head
+        self._sharded_accept = (
+            envs.SGLANG_DSPARK_SHARDED_ACCEPT.get()
+            and not self._greedy_draft
+            and markov_head is not None
+            and markov_head.vocab_shard is not None
+        )
+        if self._sharded_accept and self._target_tp_rank == 0:
+            logger.info("DSpark sampling accept runs on the vocab shards.")
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
@@ -375,6 +384,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
             random_seed=target_worker.random_seed,
             greedy_draft=self._greedy_draft,
+            sharded_accept=self._sharded_accept,
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
         self._verify_epilogue = None
@@ -703,6 +713,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             noise=self._proposer.noise,
             greedy_draft=self._greedy_draft,
             tp_sync=self._tp_sync,
+            sharded_accept=self._sharded_accept,
             out=(
                 self._verify_epilogue.draft_tokens_buf
                 if self._verify_epilogue is not None
