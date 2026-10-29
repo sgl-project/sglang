@@ -77,17 +77,14 @@ DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 <
 class DecodeStatus:
     """Store the status of incremental decoding."""
 
-    decoded_text: str
     decode_ids: List[int]
     surr_offset: int
     read_offset: int
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
-    decoded_text_len: int = dataclasses.field(init=False)
+    decoded_text: str = ""
+    decoded_text_len: int = dataclasses.field(default=0, init=False)
     decoded_text_chunks: List[str] = dataclasses.field(default_factory=list)
-
-    def __post_init__(self):
-        self.decoded_text_len = len(self.decoded_text)
 
     def append_decoded_text(self, text: str):
         if text:
@@ -317,7 +314,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             rid = recv_obj.rids[i]
             if rid not in self.decode_status:
                 s = DecodeStatus(
-                    decoded_text=recv_obj.decoded_texts[i],
                     decode_ids=self._clamp_decode_ids(
                         recv_obj.decode_ids[i], vocab_size
                     ),

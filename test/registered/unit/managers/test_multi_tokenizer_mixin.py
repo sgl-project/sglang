@@ -132,7 +132,6 @@ def _make_batch_token_id_output() -> BatchTokenIDOutput:
         spec_num_cap_tokens=[],
         spec_cap_lens_histogram=[],
         finished_reasons=[None, None],
-        decoded_texts=["first", "second"],
         decode_ids=[[1], [2]],
         read_offsets=[0, 1],
         output_ids=[[1], [2]],
@@ -379,7 +378,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], "detok-a")
         self.assertEqual(sent[0][1].rids, ["token-rid-0", "token-rid-1"])
-        self.assertEqual(sent[0][1].decoded_texts, ["first", "second"])
+        self.assertEqual(sent[0][1].prompt_tokens, [10, 20])
         self.assertIsNone(sent[0][1].spec_verify_ct)
 
     def test_embedding_split_preserves_per_request_fields(self):
