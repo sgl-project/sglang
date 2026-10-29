@@ -743,11 +743,20 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+    mrope_position_delta_device_cache: Optional[torch.Tensor] = None
 
     # Moss-VL related
     vision_position_ids: Optional[torch.Tensor] = None
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
+
+    def get_mrope_position_delta_on_device(self, device) -> torch.Tensor:
+        # Rebuilding this from Python ints every decode step costs a blocking H2D copy.
+        if self.mrope_position_delta_device_cache is None:
+            self.mrope_position_delta_device_cache = self.mrope_position_delta.reshape(
+                1
+            ).to(device=device, dtype=torch.int64)
+        return self.mrope_position_delta_device_cache
 
     def release_features(self):
         """Release feature tensors to free GPU memory."""
@@ -1648,6 +1657,7 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs.merge(image_inputs)
 
         self.multimodal_inputs.mrope_position_delta_repeated_cache = None
+        self.multimodal_inputs.mrope_position_delta_device_cache = None
         if positions is not None:
             self.multimodal_inputs.mrope_positions = positions
             self.multimodal_inputs.mrope_position_delta = (
