@@ -14,26 +14,21 @@ Usage:
 import json
 import os
 import random
-import signal
-import socket
-import subprocess
 import time
 import unittest
+import uuid
 from contextlib import contextmanager
 
 import requests
-from test_hicache_storage_mooncake_backend import (
-    HiCacheStorageMooncakeBackendBaseMixin,
-)
-from test_hicache_storage_mooncake_unified import run_gsm8k, storage_hit_tokens
+from test_hicache_storage_mooncake_unified import l3_loaded_tokens, run_gsm8k
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.mooncake_utils import MooncakeTestServices
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    find_available_port,
     get_gpu_count,
     popen_launch_server,
     terminate_and_kill_process_tree,
@@ -62,96 +57,20 @@ def _prompts(seed):
 
 
 @unittest.skipUnless(get_gpu_count() >= 2, "Requires 2 GPUs for the TP2 servers")
-class TestMooncakeUnifiedCrossTopology(
-    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
-):
+class TestMooncakeUnifiedCrossTopology(CustomTestCase):
     model = DEFAULT_MODEL_NAME_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
-    mooncake_store_port_base = 50052
-    store_service_process = None
-
-    # The mixin's single-server test needs a server from setUpClass; this class
-    # starts its own servers per phase, so drop it from collection.
-    test_basic_backup_and_prefetch = None
 
     @classmethod
     def setUpClass(cls):
-        # Reuse only the master and metadata-server lifecycle; servers start
-        # and stop inside the test.
-        cls.mooncake_master_port = find_available_port(cls.mooncake_master_port_base)
-        cls.mooncake_metadata_port = find_available_port(
-            cls.mooncake_metadata_port_base
-        )
-        cls.mooncake_store_port = find_available_port(cls.mooncake_store_port_base)
-        cls._start_mooncake_services()
-        try:
-            cls._start_mooncake_store_service()
-        except Exception:
-            cls._stop_mooncake_store_service()
-            cls._stop_mooncake_services()
-            raise
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._stop_mooncake_store_service()
-        cls._stop_mooncake_services()
-
-    @classmethod
-    def _start_mooncake_store_service(cls):
-        # Store capacity lives here, so cached pages survive server restarts.
-        cls.store_service_process = subprocess.Popen(
-            [
-                "mooncake_client",
-                "--host=127.0.0.1",
-                f"--port={cls.mooncake_store_port}",
-                f"--master_server_address=127.0.0.1:{cls.mooncake_master_port}",
-                f"--metadata_server=http://127.0.0.1:{cls.mooncake_metadata_port}/metadata",
-                "--protocol=tcp",
-                "--device_names=",
-                "--global_segment_size=17179869184",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid,
-        )
-        deadline = time.monotonic() + 90
-        while time.monotonic() < deadline:
-            if cls.store_service_process.poll() is not None:
-                raise RuntimeError("Mooncake store service exited during startup.")
-            try:
-                with socket.create_connection(
-                    ("127.0.0.1", cls.mooncake_store_port), timeout=2
-                ):
-                    return
-            except OSError:
-                time.sleep(1)
-        raise TimeoutError("Timed out waiting for the Mooncake store service.")
-
-    @classmethod
-    def _stop_mooncake_store_service(cls):
-        process = cls.store_service_process
-        if process is None:
-            return
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            process.wait(timeout=10)
-        except (ProcessLookupError, subprocess.TimeoutExpired, OSError) as e:
-            print(f"Warning: could not stop the Mooncake store service: {e}")
-        cls.store_service_process = None
+        # Store capacity lives in the external mooncake_client, so cached pages
+        # survive server restarts; servers start and stop inside the test.
+        cls.mooncake = MooncakeTestServices(protocol="tcp", store_segment_size=16 << 30)
+        cls.addClassCleanup(cls.mooncake.stop)
+        cls.mooncake.start()
 
     @contextmanager
     def _server(self, tp_size):
-        env = {
-            **os.environ,
-            "MOONCAKE_MASTER": f"127.0.0.1:{self.mooncake_master_port}",
-            "MOONCAKE_PROTOCOL": "tcp",
-            "MC_MS_AUTO_DISC": "0",
-            "MOONCAKE_DEVICE": "",
-            "MOONCAKE_TE_META_DATA_SERVER": (
-                f"http://127.0.0.1:{self.mooncake_metadata_port}/metadata"
-            ),
-            "MOONCAKE_GLOBAL_SEGMENT_SIZE": "0",
-        }
         process = popen_launch_server(
             self.model,
             self.base_url,
@@ -189,7 +108,7 @@ class TestMooncakeUnifiedCrossTopology(
                 "--hicache-storage-layer-partition",
                 str(LAYER_PARTITION),
             ],
-            env=env,
+            env={**os.environ, **self.mooncake.server_env()},
         )
         try:
             yield
@@ -207,6 +126,7 @@ class TestMooncakeUnifiedCrossTopology(
                     "ignore_eos": True,
                 },
                 "return_logprob": True,
+                "cache_salt": self.cache_salt,
             },
             timeout=120,
         )
@@ -217,8 +137,12 @@ class TestMooncakeUnifiedCrossTopology(
         """Greedy outputs whose prefix KV this server computed and still holds."""
         hits = []
         for input_ids in prompts:
-            self._generate(input_ids)
-            hits.append(self._generate(input_ids))
+            computed = self._generate(input_ids)
+            self.assertEqual(computed["meta_info"]["cached_tokens"], 0)
+            hit = self._generate(input_ids)
+            details = hit["meta_info"]["cached_tokens_details"]
+            self.assertEqual(details["device"], PROMPT_PAGES * PAGE_SIZE, details)
+            hits.append(hit)
         return hits
 
     def _flush_to_storage(self):
@@ -253,6 +177,9 @@ class TestMooncakeUnifiedCrossTopology(
 
     def test_cache_moves_between_tp2_and_tp1(self):
         prompts_a, prompts_b = _prompts(seed=1), _prompts(seed=2)
+        # One salt for every phase of this attempt: a CI retry of the method
+        # recomputes its references instead of reading the failed attempt's.
+        self.cache_salt = uuid.uuid4().hex
 
         with self._server(tp_size=2):
             tp2_a = self._device_hits(prompts_a)
@@ -266,9 +193,9 @@ class TestMooncakeUnifiedCrossTopology(
                 self._assert_close(self._storage_hit(input_ids), reference)
             # Ahead of the GSM8K backlog: a flush drops backups still queued.
             tp1_b = self._device_hits(prompts_b)
-            hits_before = storage_hit_tokens(self.base_url)
+            loaded_before = l3_loaded_tokens(self.base_url)
             tp1_score = self._gsm8k()
-            gsm8k_hit_tokens = storage_hit_tokens(self.base_url) - hits_before
+            gsm8k_loaded_tokens = l3_loaded_tokens(self.base_url) - loaded_before
             self._flush_to_storage()
             for input_ids in prompts_b:
                 self._storage_hit(input_ids)
@@ -285,9 +212,9 @@ class TestMooncakeUnifiedCrossTopology(
             for input_ids, reference in zip(prompts_b, tp1_b):
                 self._assert_close(self._storage_hit(input_ids), reference)
 
-        print(f"{tp2_score=:.3f} {tp1_score=:.3f} {gsm8k_hit_tokens=:.0f}")
+        print(f"{tp2_score=:.3f} {tp1_score=:.3f} {gsm8k_loaded_tokens=:.0f}")
         # TP1 answered GSM8K from question pages TP2 stored.
-        self.assertGreaterEqual(gsm8k_hit_tokens, 50 * PAGE_SIZE)
+        self.assertGreaterEqual(gsm8k_loaded_tokens, 50 * PAGE_SIZE)
         self.assertGreater(tp2_score, 0.6)
         self.assertGreater(tp1_score, 0.6)
 
