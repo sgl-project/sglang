@@ -17,6 +17,9 @@ from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BackupDramReq,
+    BatchEmbeddingOutput,
+    BatchStrOutput,
+    BatchTokenIDOutput,
     ChecksumInfo,
     CheckWeightsReqOutput,
     DumperControlReqInput,
@@ -38,6 +41,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     _merge_checksum_payloads,
 )
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+from sglang.srt.observability.req_time_stats import SchedulerTimingReport
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.weight_checker import ChecksumInfo as PydanticChecksumInfo
 from sglang.srt.utils.weight_checker import ParallelismInfo as PydanticParallelismInfo
@@ -289,6 +293,27 @@ class TestWeightVersionSpansRoundTrip(CustomTestCase):
     def test_abort_req_defaults_to_no_spans(self):
         """The field is optional on the wire, so an abort without spans decodes to None."""
         self.assertIsNone(_round_trip(AbortReq(rid="r0")).weight_versions)
+
+
+class TestTimingReportsRoundTrip(CustomTestCase):
+    """Per-row scheduler timing decodes back to typed reports, not plain lists."""
+
+    def test_batch_outputs_carry_reports(self):
+        report = SchedulerTimingReport(
+            queue_time=0.5, forward_entry_time=1.7e9, storage_staging_wait=0.0
+        )
+        for cls in (BatchTokenIDOutput, BatchStrOutput, BatchEmbeddingOutput):
+            with self.subTest(type=cls.__name__):
+                required = {
+                    f.name: [] for f in msgspec.structs.fields(cls) if f.required
+                }
+                obj = cls(**{**required, "rids": ["a", "b"]})
+                obj.timing_reports = [report, None]
+
+                decoded = _double_hop(obj)
+
+                self.assertEqual(decoded.timing_reports, [report, None])
+                self.assertIsInstance(decoded.timing_reports[0], SchedulerTimingReport)
 
 
 if __name__ == "__main__":

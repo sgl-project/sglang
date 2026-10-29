@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import msgspec
 from typing_extensions import Self
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -76,6 +77,10 @@ def convert_time_to_realtime(time_value: float) -> float:
 
 def convert_time_to_realtime_ns(time_value: float) -> int:
     return int((time_value + global_diff_realtime_monotonic) * 1e9)
+
+
+def convert_realtime_to_time(realtime_value: float) -> float:
+    return realtime_value - global_diff_realtime_monotonic
 
 
 def convert_time_cross_thread(
@@ -606,6 +611,43 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
             )
 
 
+class SchedulerTimingReport(
+    msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
+):
+    """The scheduler's timing of one request that the tokenizer puts in
+    meta_info. Timestamps are wall-clock; None means not stamped."""
+
+    queue_time: float = 0.0
+    forward_entry_time: Optional[float] = None
+    prefill_finished_time: Optional[float] = None
+    # None while unmeasured or still waiting.
+    storage_prefetch_wait: Optional[float] = None
+    storage_staging_wait: Optional[float] = None
+
+    def to_meta_info(self) -> Dict[str, float]:
+        meta_info = {}
+        if self.storage_prefetch_wait is not None:
+            meta_info["storage_prefetch_wait"] = self.storage_prefetch_wait
+        if self.storage_staging_wait is not None:
+            meta_info["storage_staging_wait"] = self.storage_staging_wait
+        if self.forward_entry_time is not None:
+            meta_info["forward_entry_time"] = self.forward_entry_time
+        if self.prefill_finished_time is not None:
+            meta_info["prefill_finished_time"] = self.prefill_finished_time
+        meta_info["queue_time"] = self.queue_time
+        return meta_info
+
+
+def _stamped_realtime(time_value: float) -> Optional[float]:
+    return convert_time_to_realtime(time_value) if time_value > 0.0 else None
+
+
+def _finished_wait(
+    wait_s: Optional[float], timer: Optional[PollTimer]
+) -> Optional[float]:
+    return None if timer is not None and timer.running else wait_s
+
+
 @dataclass
 class SchedulerReqTimeStats(ReqTimeStatsBase):
     """
@@ -660,47 +702,30 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     transfer_total_mb: float = 0.0
 
     # Seconds spent in the waiting queue over every entry (a retracted request
-    # re-enters it). Must not end in "time": __setstate__ clock-rebases those.
+    # re-enters it).
     queue_duration_s: float = 0.0
 
     # Poll-observed waits; staging can include a re-prefetch and overlap prefetch.
-    # None means unmeasured (including stats received from an older scheduler).
+    # None means unmeasured.
     storage_prefetch_wait_s: Optional[float] = None
     storage_staging_wait_s: Optional[float] = None
     _storage_prefetch_wait: Optional[PollTimer] = None
     _storage_staging_wait: Optional[PollTimer] = None
 
-    has_timing_data: bool = False
-
-    def __getstate__(self) -> object:
-        # send to detokenizer/tokenizer
-        if not (self.enable_metrics or self.has_timing_data):
-            return {}
-
-        state = {
-            "has_timing_data": True,
-            "wait_queue_entry_time": self.wait_queue_entry_time,
-            "forward_entry_time": self.forward_entry_time,
-            "prefill_finished_time": self.prefill_finished_time,
-            # Read by meta_info["queue_time"] on the tokenizer; timestamps cannot rebuild it.
-            "queue_duration_s": self.queue_duration_s,
-            "storage_prefetch_wait_s": (
-                self.storage_prefetch_wait_s
-                if not (
-                    self._storage_prefetch_wait and self._storage_prefetch_wait.running
-                )
-                else None
+    def to_timing_report(self) -> Optional[SchedulerTimingReport]:
+        if not self.enable_metrics:
+            return None
+        return SchedulerTimingReport(
+            queue_time=self.get_queueing_time(),
+            forward_entry_time=_stamped_realtime(self.forward_entry_time),
+            prefill_finished_time=_stamped_realtime(self.prefill_finished_time),
+            storage_prefetch_wait=_finished_wait(
+                self.storage_prefetch_wait_s, self._storage_prefetch_wait
             ),
-            "storage_staging_wait_s": (
-                self.storage_staging_wait_s
-                if not (
-                    self._storage_staging_wait and self._storage_staging_wait.running
-                )
-                else None
+            storage_staging_wait=_finished_wait(
+                self.storage_staging_wait_s, self._storage_staging_wait
             ),
-            "diff_realtime_monotonic": global_diff_realtime_monotonic,
-        }
-        return state
+        )
 
     def set_scheduler_recv_time(self, ts=None):
         calibrate_time_diff()
@@ -1207,31 +1232,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             )
         else:
             return "Unknown Time Stats"
-
-    def convert_to_output_meta_info(self):
-        meta_data = {}
-        if self.storage_prefetch_wait_s is not None and not (
-            self._storage_prefetch_wait and self._storage_prefetch_wait.running
-        ):
-            meta_data["storage_prefetch_wait"] = self.storage_prefetch_wait_s
-        if self.storage_staging_wait_s is not None and not (
-            self._storage_staging_wait and self._storage_staging_wait.running
-        ):
-            meta_data["storage_staging_wait"] = self.storage_staging_wait_s
-        if self.forward_entry_time > 0.0:
-            meta_data["forward_entry_time"] = convert_time_to_realtime(
-                self.forward_entry_time
-            )
-        if self.prefill_finished_time > 0.0:
-            meta_data["prefill_finished_time"] = convert_time_to_realtime(
-                self.prefill_finished_time
-            )
-        meta_data.update(
-            {
-                "queue_time": self.get_queueing_time(),
-            }
-        )
-        return meta_data
 
     def format_duration(self, duration: float) -> str:
         return f"{duration * 1e3:.2f}ms"

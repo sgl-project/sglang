@@ -198,6 +198,7 @@ class SchedulerOutputStreamer:
                 self.is_request_level_customized_info_key
             ),
             rust_server_mode=self.rust_server is not None,
+            report_timing=get_observability().enable_metrics,
             current_weight_version=get_serving().weight_version,
         )
         for req in reqs:
@@ -275,7 +276,8 @@ class SchedulerOutputStreamer:
         prompt_tokens = []
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
-        time_stats = []
+        report_timing = get_observability().enable_metrics
+        timing_reports = []
         retraction_counts = []
         phs_list = []
         has_phs = False
@@ -290,7 +292,8 @@ class SchedulerOutputStreamer:
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self.get_cached_tokens_details(req))
-                time_stats.append(req.time_stats)
+                if report_timing:
+                    timing_reports.append(req.time_stats.to_timing_report())
                 retraction_counts.append(req.retraction_count)
 
                 phs = req.pooled_hidden_state
@@ -325,7 +328,7 @@ class SchedulerOutputStreamer:
             BatchEmbeddingOutput(
                 rids=rids,
                 http_worker_ipcs=http_worker_ipcs,
-                time_stats=wrap_as_pickle(time_stats),
+                timing_reports=timing_reports or None,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
@@ -387,7 +390,7 @@ class _GenerationStreamAccumulator:
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
     beam_search_output: list = field(default_factory=list)
-    time_stats: list = field(default_factory=list)
+    timing_reports: list = field(default_factory=list)
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
     output_token_logprobs_val: Optional[list] = None
@@ -411,6 +414,8 @@ class _GenerationStreamAccumulator:
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
     rust_server_mode: bool = False
+    # Collect each row's SchedulerTimingReport; set when metrics are on.
+    report_timing: bool
     # Rust server mode: by row, the decode latency of a finished non-streaming
     # request, whose first token the Rust frontend does not see.
     decode_latencies: dict = field(default_factory=dict)
@@ -507,9 +512,8 @@ class _GenerationStreamAccumulator:
 
         if not self.rust_server_mode:
             # Everything below feeds the Python DetokenizerManager /
-            # TokenizerManager (incremental detok, meta_info, per-request metrics)
-            # or gets pickled into the payload (time_stats). The Rust server
-            # replaces those stages and builds its own metadata from the
+            # TokenizerManager (incremental detok, meta_info, per-request metrics).
+            # The Rust server replaces those stages and builds its own metadata from the
             # ChunkEvent, so `push_generation` never reads these — skip the whole
             # block. The parallel lists stay empty; the payload goes straight to
             # `push_generation`, which only indexes the fields appended above.
@@ -532,6 +536,8 @@ class _GenerationStreamAccumulator:
 
             # Collect detailed cache breakdown if available
             self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+            if self.report_timing:
+                self.timing_reports.append(req.time_stats.to_timing_report())
 
         # Multimodal prompt token counts. In disagg decode mode the prefill node
         # already computed these and transferred them via the metadata buffer
@@ -557,8 +563,6 @@ class _GenerationStreamAccumulator:
                     self.decode_latencies[len(self.rids) - 1] = latency
         else:
             self.weight_versions.append(None)
-
-        self.time_stats.append(req.time_stats)
 
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
@@ -735,7 +739,7 @@ class _GenerationStreamAccumulator:
             spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
             spec_cap_lens_histogram=self.spec_cap_lens_histogram,
-            time_stats=wrap_as_pickle(self.time_stats),
+            timing_reports=self.timing_reports or None,
             finished_reasons=self.finished_reasons,
             decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,

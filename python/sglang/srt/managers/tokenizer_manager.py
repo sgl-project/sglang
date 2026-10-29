@@ -141,6 +141,8 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
+    SchedulerTimingReport,
+    convert_realtime_to_time,
     convert_time_to_realtime,
     real_time,
     set_time_batch,
@@ -2485,7 +2487,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchTokenIDOutput,
         ],
     ):
-        recv_obj.time_stats = unwrap_from_pickle(recv_obj.time_stats)
         if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
             customized_info = unwrap_from_pickle(recv_obj.customized_info)
         else:
@@ -2512,10 +2513,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
-            if self.enable_metrics:
-                if recv_obj.time_stats is not None:
-                    scheduler_time_stats = recv_obj.time_stats[i]
-                    meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
+            if self.enable_metrics and recv_obj.timing_reports is not None:
+                # None when the request's own metrics are off (embedding reqs);
+                # reads as an empty report.
+                timing_report = recv_obj.timing_reports[i] or SchedulerTimingReport()
+                meta_info.update(timing_report.to_meta_info())
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
@@ -2794,9 +2796,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state: ReqState, recv_obj, i: int
     ) -> Optional[float]:
         # Non-streaming outputs are batched; use the scheduler's first-token time.
-        if getattr(state.obj, "stream", False) or recv_obj.time_stats is None:
+        if getattr(state.obj, "stream", False) or recv_obj.timing_reports is None:
             return None
-        ts = recv_obj.time_stats[i].prefill_finished_time
+        timing_report = recv_obj.timing_reports[i]
+        if timing_report is None or timing_report.prefill_finished_time is None:
+            return None
+        ts = convert_realtime_to_time(timing_report.prefill_finished_time)
         if state.time_stats.created_time < ts <= time.perf_counter():
             return ts
         return None
