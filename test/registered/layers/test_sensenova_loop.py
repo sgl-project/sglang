@@ -141,6 +141,83 @@ class TestSenseNovaMHCRouter(CustomTestCase):
         self.assertEqual(router.merge(branch, x, mix, post).shape, x.shape)
 
 
+class TestSenseNovaVisionIsolation(CustomTestCase):
+    def test_precision_selection_does_not_change_regular_vision(self):
+        from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
+        from sglang.srt.layers.rotary_embedding import get_rope
+        from sglang.srt.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+        from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
+        from sglang.srt.runtime_context import get_parallel, publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", mm_attention_backend="sdpa"), role="test"
+        )
+        get_parallel().override_permanently(
+            tp_group=None,
+            pp_group=SimpleNamespace(
+                is_first_rank=True, is_last_rank=True, world_size=1
+            ),
+        )
+        self.assertFalse(Qwen3_5ForConditionalGeneration.preserve_hf_vision_numerics)
+        self.assertTrue(
+            SenseNovaLoopForConditionalGeneration.preserve_hf_vision_numerics
+        )
+        config = Qwen3VLVisionConfig(
+            hidden_size=144,
+            num_heads=2,
+            intermediate_size=144,
+            depth=1,
+            patch_size=2,
+            temporal_patch_size=2,
+            num_position_embeddings=4,
+            spatial_merge_size=2,
+            out_hidden_size=32,
+            deepstack_visual_indexes=[],
+        )
+        previous_dtype = torch.get_default_dtype()
+        self.addCleanup(torch.set_default_dtype, previous_dtype)
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device("cuda"):
+            regular = Qwen3VLMoeVisionModel(config, use_data_parallel=True).eval()
+        with torch.no_grad():
+            for parameter in regular.parameters():
+                parameter.uniform_(-0.1, 0.1)
+        pixels = torch.randn(4, 24, device="cuda", dtype=torch.bfloat16)
+        grid = [[1, 2, 2]]
+        cache = regular.rotary_pos_emb
+        original_cache = cache.cos_sin_cache.clone()
+        with torch.inference_mode():
+            before = regular(pixels, grid_thw=grid).clone()
+        with torch.device("cuda"):
+            precise = Qwen3VLMoeVisionModel(
+                config, use_data_parallel=True, preserve_hf_numerics=True
+            ).eval()
+        self.assertTrue(regular.patch_embed.proj.enable_linear)
+        self.assertFalse(precise.patch_embed.proj.enable_linear)
+        self.assertFalse(regular.blocks[0].attn.use_eager_rope)
+        self.assertTrue(precise.blocks[0].attn.use_eager_rope)
+        self.assertFalse(cache.init_inv_freq_on_cpu)
+        self.assertTrue(precise.rotary_pos_emb.init_inv_freq_on_cpu)
+        self.assertIsNot(cache, precise.rotary_pos_emb)
+        self.assertIs(
+            cache,
+            get_rope(
+                head_size=72,
+                rotary_dim=36,
+                max_position=8192,
+                base=10000.0,
+                is_neox_style=True,
+            ),
+        )
+        torch.testing.assert_close(cache.cos_sin_cache, original_cache, rtol=0, atol=0)
+        with torch.inference_mode():
+            after = regular(pixels, grid_thw=grid)
+        torch.testing.assert_close(after, before, rtol=0, atol=0)
+
+
 class TestSenseNovaLoopWeights(CustomTestCase):
     def test_canonical_weights_load_vision_and_late_shared_layers(self):
         # Exercise the real multimodal loader with tiny parameters, without a

@@ -227,6 +227,7 @@ class Qwen3_VisionBlock(nn.Module):
         prefix: str = "",
         use_data_parallel: bool = False,
         workspace_buffer: torch.Tensor | None = None,
+        use_eager_rope: bool = False,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -247,6 +248,7 @@ class Qwen3_VisionBlock(nn.Module):
             use_data_parallel=use_data_parallel,
             use_dp_attention_reduce=is_dp_attention_enabled(),
             workspace_buffer=workspace_buffer,
+            use_eager_rope=use_eager_rope,
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -372,6 +374,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        preserve_hf_numerics: bool = False,
     ) -> None:
         super().__init__()
         self.pp_group = get_parallel().pp_group
@@ -386,6 +389,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.spatial_merge_unit = self.spatial_merge_size**2
         self.temporal_patch_size = vision_config.temporal_patch_size
         self.use_data_parallel = use_data_parallel
+        self.preserve_hf_numerics = preserve_hf_numerics
         # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
         self.disable_merger_proj = getattr(vision_config, "disable_merger_proj", False)
@@ -398,7 +402,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         # The GEMM replacement can round differently from cuDNN convolution.
         self.patch_embed = Qwen3VLVisionPatchEmbed(
             config=vision_config,
-            disable_linear=get_exec().deterministic.rl_on_policy_target is not None,
+            disable_linear=preserve_hf_numerics,
         )
         if self.pp_group.is_first_rank:
             self.pos_embed = VocabParallelEmbedding(
@@ -428,6 +432,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             max_position=8192,
             base=10000.0,
             is_neox_style=True,
+            init_inv_freq_on_cpu=preserve_hf_numerics,
         )
 
         workspace_buffer = None
@@ -455,6 +460,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     use_data_parallel=use_data_parallel,
                     workspace_buffer=workspace_buffer,
+                    use_eager_rope=preserve_hf_numerics,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -650,8 +656,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
             indices = (h_grid_idx + w_grid).reshape(4, -1)
             weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
-            # Accumulate interpolation in FP32 before rounding the embedding.
-            embeds = self.pos_embed(indices).float() * weights
+            interpolation_dtype = (
+                torch.float32 if self.preserve_hf_numerics else self.dtype
+            )
+            weights = weights.to(dtype=interpolation_dtype)
+            embeds = self.pos_embed(indices).to(interpolation_dtype)
+            embeds *= weights
             combined = embeds.sum(dim=0).to(self.dtype)
 
             combined = combined.reshape(
@@ -760,8 +770,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             ],
             dim=0,
         )
-        weights = torch.stack([w00, w01, w10, w11], dim=0)
-        embeds = self.pos_embed(indices).float() * weights[:, :, None]
+        interpolation_dtype = torch.float32 if self.preserve_hf_numerics else dtype
+        weights = torch.stack([w00, w01, w10, w11], dim=0).to(interpolation_dtype)
+        embeds = self.pos_embed(indices).to(interpolation_dtype) * weights[:, :, None]
         base_embeds = embeds.sum(dim=0).to(dtype)  # [total_hw, C]
 
         # --- 2. temporal repeat (gather) ---
@@ -862,13 +873,16 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             current_idx = end_idx
 
         idx_tensor = torch.from_numpy(all_indices_np).to(device)
-        weight_tensor = torch.from_numpy(all_weights_np).to(device=device)
+        interpolation_dtype = torch.float32 if self.preserve_hf_numerics else dtype
+        weight_tensor = torch.from_numpy(all_weights_np).to(
+            dtype=interpolation_dtype, device=device
+        )
 
         # calculate interpolation
-        pos_embeds = self.pos_embed(idx_tensor.view(-1))
+        pos_embeds = self.pos_embed(idx_tensor.view(-1)).to(interpolation_dtype)
         pos_embeds = pos_embeds.view(4, total_patches, -1)
         patch_pos_embeds = (
-            (pos_embeds.float() * weight_tensor.unsqueeze(-1)).sum(dim=0).to(dtype)
+            (pos_embeds * weight_tensor.unsqueeze(-1)).sum(dim=0).to(dtype)
         )
         patch_pos_embeds = patch_pos_embeds.split(patches_size)
         return self._get_position_embedding(
@@ -1299,6 +1313,8 @@ class Qwen3LLMModel(Qwen3Model):
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):
+    preserve_hf_vision_numerics = False
+
     supports_cuda_vmm_feature_transport = True
 
     # To ensure correct weight loading and mapping.
@@ -1341,6 +1357,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 prefix=add_prefix("model.visual", prefix),
                 use_data_parallel=self.use_data_parallel,
+                preserve_hf_numerics=self.preserve_hf_vision_numerics,
             )
 
         # TODO: make it more elegant

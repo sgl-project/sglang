@@ -98,6 +98,7 @@ class RotaryEmbedding(BaseFusedOp):
         is_neox_style: bool,
         dtype: torch.dtype,
         position_start: int = 0,
+        init_inv_freq_on_cpu: bool = False,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -107,6 +108,7 @@ class RotaryEmbedding(BaseFusedOp):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
         self.position_start = position_start
+        self.init_inv_freq_on_cpu = init_inv_freq_on_cpu
         self._force_native = (
             publish_role() is not None
             and get_exec().deterministic.rl_on_policy_target is not None
@@ -236,7 +238,7 @@ class RotaryEmbedding(BaseFusedOp):
         # use CPU to compute the cache and then move it to GPU. However, we
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
-        init_device = "cpu" if self._force_native else None
+        init_device = "cpu" if self._force_native or self.init_inv_freq_on_cpu else None
         inv_freq = 1.0 / (
             base
             ** (
@@ -258,6 +260,9 @@ class RotaryEmbedding(BaseFusedOp):
             self.position_start + self.max_position_embeddings,
             dtype=torch.float,
         )
+
+        if self.init_inv_freq_on_cpu:
+            inv_freq = inv_freq.to(t.device)
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()

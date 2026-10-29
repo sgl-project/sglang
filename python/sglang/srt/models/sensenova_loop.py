@@ -209,6 +209,8 @@ class SenseNovaLoopModel(qwen3_5.Qwen3_5ForCausalLM):
 
 
 class SenseNovaLoopForConditionalGeneration(qwen3_5.Qwen3_5ForConditionalGeneration):
+    preserve_hf_vision_numerics = True
+
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__(
             config=config,
