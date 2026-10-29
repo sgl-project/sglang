@@ -3959,6 +3959,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def swa_evictable_size(self) -> int:
         return self.tree_core.swa_evictable_size()
 
+    def auxiliary_swa_evictable_size(self) -> int:
+        if ComponentType.AUXILIARY_SWA not in self.components:
+            return 0
+        return self.tree_core.component_evictable_size(ComponentType.AUXILIARY_SWA)
+
     def mamba_evictable_size(self) -> int:
         return self.tree_core.mamba_evictable_size()
 

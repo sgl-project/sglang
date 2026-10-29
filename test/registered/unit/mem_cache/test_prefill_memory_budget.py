@@ -27,12 +27,16 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
-from sglang.test.unified_allocator_fixtures import build_test_unified_pools
+from sglang.test.unified_allocator_fixtures import (
+    build_test_unified_pools,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
+    setup_allocator_context()
     # `pool_tokens` sizes both sub-pools directly, for a test whose arithmetic
     # needs an exact token count rather than whatever a byte budget buys.
     sized = (
@@ -68,6 +72,7 @@ def _cache():
         sliding_window_size=8,
         full_evictable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
+        auxiliary_swa_evictable_size=lambda: 0,
         supports_prefix_sharing=lambda: True,
     )
 
@@ -90,8 +95,15 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
         self.assertEqual(self.budget.check_prefill(**self.request), (True, 16))
         self.budget.reserve(12, 4, chunk_limit=16)
         # Each side separately has room, but their combined reservation does not.
-        self.assertGreater(self.budget.remaining_total, 20)
-        self.assertGreater(self.budget.remaining_swa, 16)
+        self.assertGreater(
+            self.allocator.full_attn_allocator.available_size()
+            - self.budget.total_offset,
+            20,
+        )
+        self.assertGreater(
+            self.allocator.swa_attn_allocator.available_size() - self.budget.swa_offset,
+            16,
+        )
         self.assertEqual(self.budget.check_prefill(**self.request), (False, None))
         self.assertEqual(self.allocator.full_attn_allocator.allocated_count(), 0)
         self.assertEqual(self.allocator.swa_attn_allocator.allocated_count(), 0)
@@ -188,6 +200,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             disable=True,
             full_evictable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
+            auxiliary_swa_evictable_size=lambda: 0,
             supports_prefix_sharing=lambda: False,
             supports_mamba=lambda: False,
         )
@@ -371,10 +384,10 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         self.addCleanup(reset_context)
         bundle, allocator, cache = build_tri_cache(state_cache=False)
         states = allocator.state_slots.alloc(8)
-        slots = allocator.alloc(96)
+        slots = allocator.alloc(allocator.available_size())
         self.assertIsNotNone(states)
         self.assertIsNotNone(slots)
-        for i in range(96):
+        for i in range(slots.numel()):
             cache.insert(
                 InsertParams(key=RadixKey(array("q", [i])), value=slots[i : i + 1])
             )

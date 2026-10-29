@@ -633,6 +633,52 @@ def float_byte_shortfall(
     return max(0, required + live_bytes + sink_bytes - snap.total_bytes)
 
 
+def reclaimed_snapshot(
+    snapshot: ChainSnapshot, reclaim_pages: Dict[str, int], *, empty_pool: bool = False
+) -> ChainSnapshot:
+    """Conservative geometry after reclaim, without guessing where holes lie.
+
+    Partial float and lazy-end frees remain holes in their original spans. Empty
+    floats become transparent; unblocked empty ends can flush to their sink.
+    Eager ends compact on release. No live float relocation is credited.
+    """
+    bands = []
+    for b in snapshot.bands:
+        reclaimed = (
+            b.live if empty_pool else min(b.live, max(0, reclaim_pages.get(b.name, 0)))
+        )
+        live = b.live - reclaimed
+        low, high, span = b.low_byte, b.high_byte, b.span
+        holes = b.holes + reclaimed
+        if empty_pool or (not live and (b.grow == "float" or not b.blocked)):
+            span = holes = 0
+            low = high = (
+                b.num_pages if b.grow == "down" else b.min_page
+            ) * b.page_bytes
+        elif b.grow != "float" and not b.lazy and not b.blocked:
+            span, holes = live, 0
+            if b.grow == "up":
+                high = (b.min_page + live) * b.page_bytes
+            else:
+                low = (b.num_pages - live) * b.page_bytes
+        bands.append(
+            msgspec.structs.replace(
+                b,
+                live=live,
+                span=span,
+                holes=holes,
+                low_byte=low,
+                high_byte=high,
+                free_virtual_pages=(
+                    b.num_virtual_pages - b.min_page
+                    if empty_pool
+                    else b.free_virtual_pages + reclaimed
+                ),
+            )
+        )
+    return msgspec.structs.replace(snapshot, bands=tuple(bands))
+
+
 def sequential_fit(
     snapshot: ChainSnapshot, demands: Tuple[Tuple[str, int], ...]
 ) -> bool:

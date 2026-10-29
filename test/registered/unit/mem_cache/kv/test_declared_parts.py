@@ -685,6 +685,140 @@ class TestDeclaredParts(CustomTestCase):
                         all(b.allocated_count() == 0 for b in allocator.bands)
                     )
 
+    def test_request_cleanup_releases_independently_retained_windows(self):
+        """Returning owner ids must not strand a longer window's physical pages."""
+        from sglang.srt.mem_cache.common import free_kv_row_segments
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+
+        for window in (8, 32):
+            placement = FusedDraftPlacement.from_counts(
+                counts={"draft_swa": [1]},
+                regions={
+                    "draft_swa": DenseDraftRegion(
+                        lane_num=1,
+                        head_num=1,
+                        head_dim=8,
+                        store_dtype=torch.bfloat16,
+                    )
+                },
+                new_bands={"draft_swa": DraftBand(kind="window", window=window)},
+            )
+            for grouped in (False, True):
+                for direct in (False, True):
+                    with self.subTest(window=window, grouped=grouped, direct=direct):
+                        storage, _, _ = _build(fused_draft=placement)
+                        a = storage.allocator
+                        ids = a.alloc(32)
+                        self.assertIsNotNone(ids)
+                        a.free_swa_segment(ids[:16], start_pos=0)
+                        if window < 16:
+                            a.free_window_segment("draft_swa", ids[:24], start_pos=0)
+                        if grouped:
+                            a.free_group_begin()
+                        if direct:
+                            a.free_full(ids[:16])
+                            a.free(ids[16:])
+                        else:
+                            free_kv_row_segments(a, [(ids, 0)], swa_evicted_seqlen=16)
+                        if grouped:
+                            a.free_group_end()
+                        self.assertEqual(
+                            {b.sub_pool_name: b.allocated_count() for b in a.bands},
+                            {b.sub_pool_name: 0 for b in a.bands},
+                        )
+                        self.assertEqual(storage.accounting_violations(), [])
+                        reused = a.alloc(32)
+                        self.assertIsNotNone(reused)
+                        for band in a._windows:
+                            self.assertTrue(torch.all(band.ids.translate(reused) > 0))
+                        a.free(reused)
+                        self.assertEqual(storage.accounting_violations(), [])
+
+    def test_multiwindow_admission_reclaims_cached_prefixes(self):
+        """Evictable prefixes must not leave an idle allocator refusing new work."""
+        from array import array
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={
+                "draft_swa": DenseDraftRegion(
+                    lane_num=1,
+                    head_num=1,
+                    head_dim=8,
+                    store_dtype=torch.bfloat16,
+                )
+            },
+            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+        )
+        storage, _, _ = _build(fused_draft=placement)
+        a = storage.allocator
+        empty_demands = [n for n in range(8, 128, 4) if a.can_reserve(n, n)]
+        ids = []
+        while a.can_reserve(4, 4):
+            allocation = a.alloc(4)
+            self.assertIsNotNone(allocation)
+            ids.append(allocation)
+        ids = torch.cat(ids)
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=storage.requests,
+                token_to_kv_pool_allocator=a,
+                page_size=4,
+                sliding_window_size=16,
+                tree_slots=storage.tree_slots(),
+                tree_core_backend="python",
+            )
+        )
+        key = RadixKey(array("q", range(ids.numel())))
+        cache.insert(InsertParams(key=key, value=ids.clone()))
+        need = next(n for n in empty_demands if not a.can_reserve(n, n))
+        budget = a.create_prefill_budget(cache)
+        before = a.pricing_snapshot()
+        self.assertTrue(budget._fits(need, need, empty_pool=True))
+        self.assertTrue(budget._fits(need, need))
+        self.assertEqual(a.pricing_snapshot(), before)
+        node = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+        receipt = cache.inc_lock_ref(node)
+        try:
+            self.assertFalse(budget._fits(need, need))
+            self.assertTrue(budget._fits(need, need, empty_pool=True))
+        finally:
+            cache.dec_lock_ref(node, receipt.to_dec_params())
+        self.assertEqual(
+            budget.check_prefill(
+                extend_input_len=need - 4,
+                total_tokens=need,
+                max_new_tokens=0,
+                input_tokens=need - 4,
+                swa_host_hit_length=0,
+                chunk_limit=None,
+            ),
+            (True, None),
+        )
+        self.assertIsNone(a.reclaim_for_prealloc(cache, need, need))
+        fresh = a.alloc(need)
+        self.assertIsNotNone(fresh)
+        a.free(fresh)
+        self.assertEqual(storage.accounting_violations(), [])
+
     def test_state_only_draft_owns_a_planned_band(self):
         from sglang.srt.mem_cache.layout.fused_draft import (
             DraftKVProfile,

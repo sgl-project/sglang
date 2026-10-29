@@ -1070,8 +1070,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         window.free(reps, _pages=v_pages)
 
     def free_full(self, free_index: torch.Tensor) -> None:
-        """Release the owner-physical page and the virtual id, leaving the window
-        alone -- the caller already tombstoned it. Without a window this is free()."""
+        """Release owner ids after primary-window retirement.
+
+        Independently retained windows may still own those ids and are released too.
+        """
         if not self._windows:
             self.free(free_index)
             return
@@ -1080,12 +1082,15 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         if self.free_group is not None:
             self.full_free_group.append(self._copy_for_free_group(free_index))
             return
-        self.full_attn_allocator.free(free_index.detach().to(torch.int64))
-        self.full_attn_allocator.clear_inverse_history()
+        if len(self._windows) > 1:
+            pages = torch.unique(free_index.detach().to(torch.int64) // self.page_size)
+            self._release_page_reps((), (pages * self.page_size,))
+        else:
+            self.full_attn_allocator.free(free_index.detach().to(torch.int64))
+            self.full_attn_allocator.clear_inverse_history()
 
     def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        """Release a kv-row segment's owner side; its window side is already
-        tombstoned."""
+        """Release a kv-row segment after its primary window was tombstoned."""
         if not self._windows:
             BaseTokenToKVPoolAllocator.free_full_segment(
                 self, free_index, start_pos=start_pos
@@ -1099,12 +1104,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         # Signal-only invariant: avoid launching its lookup and comparison
         # when detection is disabled. This invariant has no recovery action.
         if resolve_level() >= InvariantCheckLevel.WARN:
-            for window in self._windows:
-                expect(
-                    UNIFIED_SWA_SEGMENT_RELEASED,
-                    window.ids.virtual_to_physical[reps // self.page_size] <= 0,
-                    msg="caller wants free_segment",
-                )
+            expect(
+                UNIFIED_SWA_SEGMENT_RELEASED,
+                self.swa_attn_allocator.ids.virtual_to_physical[reps // self.page_size]
+                <= 0,
+                msg="caller wants free_segment",
+            )
         if self.free_page_reps_group is None:
             self._release_page_reps((), (reps,))
         else:
@@ -1138,8 +1143,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         full_free_group, self.full_free_group = self.full_free_group, []
         super().free_group_end()
         if full_free_group:
-            self.full_attn_allocator.free(torch.cat(full_free_group))
-            self.full_attn_allocator.clear_inverse_history()
+            self.free_full(torch.cat(full_free_group))
         if pending or full_pending:
             self._release_page_reps(pending, full_pending)
 
@@ -1164,20 +1168,28 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def _release_page_reps(
         self, both: Sequence[torch.Tensor], full_only: Sequence[torch.Tensor]
     ) -> None:
-        """Free page reps: `both` on every window and the owner, `full_only` on
-        the owner."""
-        if both:
-            reps = both[0] if len(both) == 1 else torch.cat(tuple(both))
+        """Return owner ids only after releasing every independently retained window.
+
+        `full_only` means the primary window has retired, not that all windows have.
+        """
+        pieces = (*both, *full_only)
+        reps = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+        window_pieces = pieces if len(self._windows) > 1 else both
+        if window_pieces:
+            window_reps = (
+                window_pieces[0]
+                if len(window_pieces) == 1
+                else torch.cat(tuple(window_pieces))
+            )
             for window in self._windows:
-                live = reps
+                live = window_reps
                 if len(self._windows) > 1:
-                    live = reps[
-                        window.ids.virtual_to_physical[reps // self.page_size] > 0
+                    live = window_reps[
+                        window.ids.virtual_to_physical[window_reps // self.page_size]
+                        > 0
                     ]
                 if live.numel():
                     self._free_window_page_reps(window, live)
-        pieces = (*both, *full_only)
-        reps = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
         self.full_attn_allocator.free(reps, _pages=reps // self.page_size)
         self._clear_inverse_history()
 
