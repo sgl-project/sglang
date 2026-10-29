@@ -103,7 +103,11 @@ from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.mem_cache.allocation import alloc_for_decode, alloc_for_extend
+from sglang.srt.mem_cache.allocation import (
+    alloc_for_decode,
+    alloc_for_extend,
+    retire_window,
+)
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -118,7 +122,8 @@ from sglang.srt.mem_cache.common import (
     match_kv_cache,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
 from sglang.srt.model_executor.forward_batch_info import (
@@ -2109,11 +2114,11 @@ class Req(ReqDllmMixin):
             )
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
-        if allocator.get_kvcache().cpu_copy_carries_mamba:
+        if allocator.cpu_copy_carries_mamba:
             return None
-        if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+        if not req_to_token_pool.holds_state_slots:
             return None
-        return req_to_token_pool.mamba_pool
+        return allocator.state.pool
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -2144,7 +2149,7 @@ class Req(ReqDllmMixin):
         # Loads both the kv cache and mamba state if exists
         mamba_cpu = self.kv.retraction_backup.mamba_cpu
         if mamba_cpu is not None and self.kv.holds_mamba:
-            req_to_token_pool.mamba_pool.load_cpu_copy(
+            token_to_kv_pool_allocator.state.pool.load_cpu_copy(
                 mamba_cpu, self.kv.mamba_pool_idx.unsqueeze(0)
             )
         token_to_kv_pool_allocator.load_cpu_copy(
@@ -2339,7 +2344,7 @@ def set_mamba_track_indices_from_reqs(
     mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
     if track_positions is None:
         # Guard: mamba_next_track_idx may be None for requests that haven't
-        # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
+        # been given a ping-pong buffer yet (e.g., spec v2 verify path).
         # Keep the gather in bounds for those requests. Freed rows are
         # invalidated below so they cannot scatter into a recycled slot.
         track_positions = [
@@ -3487,8 +3492,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 reqs_to_abort.append(req)
                 free_member_rows(
                     req.beam_group,
-                    self.req_to_token_pool,
-                    self.token_to_kv_pool_allocator,
+                    kv_storage_of(
+                        self.req_to_token_pool, self.token_to_kv_pool_allocator
+                    ),
                 )
                 # Aborting, so a host backup to resume from would be wasted.
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
@@ -3530,8 +3536,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if last_req.beam_group is not None:
                 free_member_rows(
                     last_req.beam_group,
-                    self.req_to_token_pool,
-                    self.token_to_kv_pool_allocator,
+                    kv_storage_of(
+                        self.req_to_token_pool, self.token_to_kv_pool_allocator
+                    ),
                 )
             self.release_req(last_idx, 0, offload_kv=False)
             logger.warning(
@@ -3633,7 +3640,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         there. The old slot is freed after the forward in
         mamba_lazy_post_decode_at_boundary.
         """
-        pool = self.req_to_token_pool
+        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
         for i, req in enumerate(self.reqs):
             buf = req.kv.mamba_ping_pong_track_buffer
             assert buf is not None
@@ -3645,14 +3652,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
                 continue
-            if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
-                new_slot = None
-            else:
-                # No evict-retry: a transient slot is not worth evicting a
-                # cached checkpoint for; on failure tracking degrades in place.
-                new_slot = pool.mamba_allocator.alloc(1)
-            if new_slot is not None:
-                pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
+            # No evict-retry: a transient slot is not worth evicting a cached
+            # checkpoint for; on failure tracking degrades in place.
+            took = not envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get() and (
+                storage.take_tracking_slot(req, other_idx)
+            )
+            if took:
                 req.kv.mamba_next_track_idx = other_idx
             else:
                 # The in-flight write invalidates the keep slot's old checkpoint.
@@ -3664,7 +3669,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         and whose result path never frees them."""
         if self.mamba_track_mask_cpu is None:
             return
-        pool = self.req_to_token_pool
+        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
         for req, at_boundary in zip(self.reqs, self.mamba_track_mask_cpu):
             if not at_boundary:
                 continue
@@ -3674,8 +3679,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if buf[1 - next_idx].item() == -1:
                 # The prealloc failed, so tracking would have been in place.
                 continue
-            pool.mamba_allocator.free(buf[next_idx].unsqueeze(0))
-            pool.set_mamba_ping_pong_slot(req, next_idx, -1)
+            storage.release_tracking_slot(req, next_idx)
             req.kv.mamba_next_track_idx = 1 - next_idx
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
@@ -3689,7 +3693,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         scatter position is recorded on the batch and rides the result-queue
         copy (forward isolation restores batch fields).
         """
-        pool = self.req_to_token_pool
+        storage = kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
         track_positions: List[int] = []
         for req in self.reqs:
             buf = req.kv.mamba_ping_pong_track_buffer
@@ -3704,16 +3708,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             other_idx = 1 - req.kv.mamba_next_track_idx
             has_pending = not req.kv.mamba_ping_pong_empty[other_idx]
             if not has_pending:
-                if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
-                    new_slot = None
-                else:
-                    # No evict-retry: a transient slot is not worth
-                    # evicting a cached checkpoint for.
-                    new_slot = pool.mamba_allocator.alloc(1)
-                if new_slot is not None:
-                    pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
-                    has_pending = True
-                else:
+                # No evict-retry: a transient slot is not worth evicting a
+                # cached checkpoint for.
+                has_pending = not envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get() and (
+                    storage.take_tracking_slot(req, other_idx)
+                )
+                if not has_pending:
                     req.kv.mamba_last_track_seqlen = None
             # On failure the verify scatters in place into the keep slot.
             track_positions.append(
@@ -4009,6 +4009,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_pool_indices=self.req_pool_indices,
             req_pool_indices_cpu=self.req_pool_indices_cpu,
             model_config=self.model_config,
@@ -4133,8 +4134,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _evict_swa(self, req: Req, pre_len: int, *, eviction_interval: int = 1):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
-        self.tree_cache.evict_sliding_windows(
-            req, pre_len, eviction_interval=eviction_interval
+        retire_window(
+            req, pre_len, self.tree_cache, eviction_interval=eviction_interval
         )
 
     def __str__(self):
