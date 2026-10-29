@@ -18,6 +18,7 @@ import numpy as np
 import soundfile as sf
 
 from sglang.srt.entrypoints.openai.audio_chunking import (
+    SPLIT_SEARCH_WINDOW_S,
     find_split_point,
     split_audio_energy_aware,
 )
@@ -67,6 +68,18 @@ class TestFindSplitPoint(CustomTestCase):
 
 
 class TestSplitAudioEnergyAware(CustomTestCase):
+    def test_rejects_non_positive_sample_rate(self):
+        with self.assertRaisesRegex(ValueError, "sample_rate must be positive"):
+            split_audio_energy_aware(b"invalid", max_clip_s=30.0, sample_rate=0)
+
+    def test_rejects_clip_window_that_cannot_advance(self):
+        for max_clip_s in (0.0, 0.5, SPLIT_SEARCH_WINDOW_S):
+            with self.subTest(max_clip_s=max_clip_s):
+                with self.assertRaisesRegex(
+                    ValueError, "max_clip_s must be greater than"
+                ):
+                    split_audio_energy_aware(b"invalid", max_clip_s=max_clip_s)
+
     def test_short_audio_single_chunk(self):
         wav = _tone_with_silences(10.0, [])
         chunks, offsets = split_audio_energy_aware(_wav_bytes(wav), max_clip_s=30.0)
