@@ -15,6 +15,7 @@
 
 import logging
 import math
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -33,7 +34,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, publish_role
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_lora,
+    get_parallel,
+    publish_role,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -127,7 +134,52 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
+def _accepts_nvfp4_input(linear: nn.Module) -> bool:
+    """Whether ``linear`` is a W4A4 NVFP4 linear that takes a pre-quantized input
+    and FlashInfer's fused SiLU-and-mul + NVFP4 quant kernel (CuTe-DSL, SM100+)
+    is available."""
+    scheme = getattr(linear, "scheme", None)
+    return (
+        _is_cuda
+        and getattr(scheme, "accepts_prequantized_input", False)
+        and _flashinfer_silu_and_mul_nvfp4_available()
+    )
+
+
+@lru_cache(maxsize=1)
+def _flashinfer_silu_and_mul_nvfp4_available() -> bool:
+    try:
+        from flashinfer.cute_dsl import is_cute_dsl_available
+        from flashinfer.quantization import silu_and_mul_nvfp4_quantize  # noqa: F401
+    except ImportError:
+        return False
+    return is_cute_dsl_available()
+
+
+# Below this many tokens the fused kernel is no faster than silu_and_mul +
+# fp4_quantize (0.8-1.0x up to 64 tokens, 1.1x from 256 on an RTX 5090).
+_NVFP4_FUSION_MIN_TOKENS = 256
+
+
+def _can_fuse_nvfp4_act_quant(x: torch.Tensor) -> bool:
+    """Whether the fused SiLU-and-mul + NVFP4 quant kernel can produce the input
+    of the projection for ``x``, and pays off. LoRA adds to the projection's
+    input, and sequence parallelism splits it; both need the unquantized
+    activation."""
+    return (
+        x.numel() >= _NVFP4_FUSION_MIN_TOKENS * x.shape[-1]
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.shape[-1] % 32 == 0
+        and x.is_contiguous()
+        and not get_lora().enable_lora
+        and not get_forward().sp_active
+    )
+
+
 class SiluAndMul(BaseFusedOp):
+    # The projection that consumes this op's output; see fuse_output_quant().
+    _quant_linear: Optional[nn.Module] = None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if (
@@ -142,12 +194,35 @@ class SiluAndMul(BaseFusedOp):
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
+    def fuse_output_quant(self, linear: nn.Module) -> None:
+        """Fuse the NVFP4 activation quantization of ``linear``, the projection
+        that consumes this op's output, whenever forward_cuda can. Only W4A4
+        NVFP4 linears that take a pre-quantized input are kept; the projection
+        stays out of this module's children."""
+        if _accepts_nvfp4_input(linear):
+            self.__dict__["_quant_linear"] = linear
+
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
-        return out
+        if self._quant_linear is None or not _can_fuse_nvfp4_act_quant(x):
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            silu_and_mul(x, out)
+            return out
+        return self._forward_nvfp4_quant(x)
+
+    def _forward_nvfp4_quant(self, x: torch.Tensor) -> tuple:
+        """(fp4, block scale, dtype, output leading dims) for the W4A4 NVFP4
+        linear, which then skips its own quantization. FlashInfer's kernel gives
+        the same FP4 codes and swizzled block scales as silu_and_mul followed by
+        fp4_quantize."""
+        from flashinfer.quantization import silu_and_mul_nvfp4_quantize
+
+        # nvfp4_4over6=None: plain NVFP4 rounding, whatever the environment says.
+        x_fp4, block_scale = silu_and_mul_nvfp4_quantize(
+            x, self._quant_linear.input_global_scale, nvfp4_4over6=None
+        )
+        return x_fp4, block_scale, x.dtype, tuple(x.shape[:-1])
 
     def forward_aiter(self, x: torch.Tensor, limit: float = 0.0) -> torch.Tensor:
         d = x.shape[-1] // 2

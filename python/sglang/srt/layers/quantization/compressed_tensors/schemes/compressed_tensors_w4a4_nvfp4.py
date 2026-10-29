@@ -30,6 +30,10 @@ __all__ = ["CompressedTensorsW4A4Fp4"]
 
 
 class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
+    # apply_weights also takes an input already quantized by a fused
+    # SiLU-and-mul + NVFP4 quant (SiluAndMul.fuse_output_quant).
+    accepts_prequantized_input = True
+
     def __init__(self):
         self.group_size = 16
 
@@ -137,12 +141,20 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        output_dtype = x.dtype
         w_n, _ = layer.weight_packed.shape
-        output_shape = [x.shape[0], w_n]
-
-        # quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
+        if isinstance(x, tuple):
+            # Already quantized by the fused SiLU-and-mul + NVFP4 quant kernel:
+            # (fp4, block scale, output dtype, leading dims of its input).
+            x_fp4, x_blockscale, output_dtype, leading_dims = x
+            output_shape = [*leading_dims, w_n]
+        else:
+            output_dtype = x.dtype
+            # Keep the leading dims (e.g. [batch, seq] from vision towers): the
+            # FP4 quant and GEMM take 2D [tokens, hidden] only.
+            output_shape = [*x.shape[:-1], w_n]
+            x = x.reshape(-1, x.shape[-1])
+            # quantize BF16 or FP16 to (FP4 and interleaved block scale)
+            x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight_packed.dtype == torch.uint8

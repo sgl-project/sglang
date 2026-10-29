@@ -118,6 +118,7 @@ class LlamaMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.act_fn.fuse_output_quant(self.down_proj)
         self.dual_gemm = DualGemm(self.gate_up_proj, self.down_proj, hidden_size)
         self.activation_quant = DenseSiluAndMulQuant(self.down_proj)
 
