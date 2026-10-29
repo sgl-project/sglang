@@ -72,6 +72,7 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    Sequence,
     Set,
     Tuple,
     TypeAlias,
@@ -2434,7 +2435,12 @@ def compute_extend_logprob_start_len(
     prefix_len: int,
     extend_len: int,
     full_untruncated_fill_len: int,
+    input_logprobs_finalized: bool,
 ) -> int:
+    # A retracted request re-prefills prompt + output; its input logprobs were
+    # finalized on the first prefill and its output logprobs stay on the req.
+    if input_logprobs_finalized:
+        return extend_len
     # Key variables:
     # - logprob_start_len: Absolute position in full sequence where logprob computation begins
     # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
@@ -2445,6 +2451,26 @@ def compute_extend_logprob_start_len(
         # logprob_start_len should be at least the length of the prefix indices
         resolved_start = max(logprob_start_len, prefix_len)
     return min(resolved_start - prefix_len, extend_len)
+
+
+def compute_extend_input_logprob_token_ids(
+    *,
+    origin_input_ids: Sequence[int],
+    logprob_start_len: int,
+    prefix_len: int,
+    extend_end: int,
+    num_input_logprobs: int,
+) -> List[int]:
+    # One target id per input-logprob row: the prompt token after the scored
+    # position. Rows past the prompt have none and are padded with 0, e.g.
+    # origin [1, 2, 3, 4] with fill [3, 4] -> [4, 0].
+    if num_input_logprobs <= 0:
+        return []
+    if logprob_start_len == -1:
+        logprob_start_len = len(origin_input_ids)
+    start = max(prefix_len, logprob_start_len)
+    token_ids = list(origin_input_ids[start + 1 : extend_end + 1])
+    return token_ids + [0] * (num_input_logprobs - len(token_ids))
 
 
 def _compute_chunked_req_next_prompt_token(
@@ -2877,6 +2903,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 prefix_len=prefix_lens[i],
                 extend_len=extend_lens[i],
                 full_untruncated_fill_len=len(r.full_untruncated_fill_ids),
+                input_logprobs_finalized=r.logprob.input_token_logprobs_val is not None,
             )
             for i, r in enumerate(reqs)
         ]
@@ -3014,44 +3041,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
 
             if self.return_logprob:
-                # Find input logprob token ids.
-                # First, find a global index within origin_input_ids and slide it by 1
-                # to compute input logprobs. It is because you need the next token
-                # to compute input logprobs. E.g., (chunk size 2)
-                #
-                # input_logprobs = [1, 2, 3, 4]
-                # get_fill_ids() = [1, 2]
-                # extend_input_logprob_token_id = [2, 3]
-                #
-                # Note that it can also overflow. In this case, we pad it with 0.
-                # input_logprobs = [1, 2, 3, 4]
-                # get_fill_ids() = [3, 4]
-                # extend_input_logprob_token_id = [4, 0]
-                global_start_idx, global_end_idx = (
-                    req.prefix_len,
-                    req.extend_end,
-                )
-                if req.logprob_start_len == -1:
-                    logprob_start_len = len(req.origin_input_ids)
-                else:
-                    logprob_start_len = req.logprob_start_len
-                # Apply logprob_start_len
-                if global_start_idx < logprob_start_len:
-                    global_start_idx = logprob_start_len
-
-                logprob_token_ids = req.origin_input_ids[
-                    global_start_idx + 1 : global_end_idx + 1
-                ]
-                extend_input_logprob_token_ids.extend(logprob_token_ids)
-
-                # We will need req.extend_len - extend_logprob_start_lens[i] number of
-                # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
                 extend_input_logprob_token_ids.extend(
-                    [0]
-                    * (
-                        req.extend_len
-                        - extend_logprob_start_lens[i]
-                        - len(logprob_token_ids)
+                    compute_extend_input_logprob_token_ids(
+                        origin_input_ids=req.origin_input_ids,
+                        logprob_start_len=req.logprob_start_len,
+                        prefix_len=req.prefix_len,
+                        extend_end=req.extend_end,
+                        num_input_logprobs=req.extend_len
+                        - extend_logprob_start_lens[i],
                     )
                 )
 
