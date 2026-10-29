@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
 from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
     commit_gdn_replayssm_fold_all_layers,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -276,6 +277,123 @@ class TestGdnReplayssmSpecFold(CustomTestCase):
                     atol=FP32_ATOL,
                     msg=f"{dtype=} {it=}",
                 )
+
+
+def _cuda_commit_available() -> bool:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0):
+        return False
+    try:
+        import cuda.bindings.nvrtc  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@unittest.skipUnless(_cuda_commit_available(), "needs SM90+ and cuda.bindings")
+class TestGdnReplayssmCommitCuda(CustomTestCase):
+    """Compare the tolerance-equivalent CUDA commit with stock Triton."""
+
+    def test_cuda_commit_is_tolerance_equivalent_to_triton(self):
+        from sglang.kernels.ops.attention.linear import gdn_replayssm_commit_cuda
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+            commit_gdn_replayssm_circular,
+        )
+
+        layers, slots, h, hv, d, ring = 2, 12, 2, 8, 128, 16
+        gen = torch.Generator(device=DEVICE).manual_seed(3)
+
+        def rand(*shape, scale):
+            x = torch.randn(*shape, device=DEVICE, generator=gen) * scale
+            return x.to(torch.bfloat16)
+
+        state = rand(layers, slots, hv, d, d, scale=0.05)
+        caches = dict(
+            d_cache=rand(layers, slots, hv, ring, d, scale=0.05),
+            k_cache=rand(layers, slots, h, ring, d, scale=0.09),
+            g_cache=-torch.rand(layers, slots, hv, ring, device=DEVICE, generator=gen)
+            * 0.5,
+            d_residual_cache=rand(layers, slots, hv, ring, d, scale=1e-4),
+            k_residual_cache=rand(layers, slots, h, ring, d, scale=1e-4),
+        )
+        state_rows = torch.tensor([3, 7, -1, 1], dtype=torch.int32, device=DEVICE)
+        replay_rows = torch.tensor([0, 5, 9, 2], dtype=torch.int64, device=DEVICE)
+        accept_lens = torch.tensor([3, 7, 2, 1], dtype=torch.int32, device=DEVICE)
+        write_pos = torch.zeros(slots, dtype=torch.int32, device=DEVICE)
+        write_pos[replay_rows] = torch.tensor([3, 12, 2, 1], device=DEVICE).int()
+        cache_base = torch.randint(
+            0, ring, (slots,), device=DEVICE, generator=gen
+        ).int()
+        is_flush = torch.ones(slots, dtype=torch.int8, device=DEVICE)
+        track_rows = torch.tensor([10, 11, -1, 4], dtype=torch.int64, device=DEVICE)
+        track_steps = torch.tensor([1, 6, -1, 0], dtype=torch.int32, device=DEVICE)
+
+        capability_inputs = dict(
+            d_cache=caches["d_cache"],
+            k_cache=caches["k_cache"],
+            g_cache=caches["g_cache"],
+            d_residual_cache=caches["d_residual_cache"],
+            k_residual_cache=caches["k_residual_cache"],
+            state_batch_indices=state_rows,
+            replay_indices=replay_rows,
+            write_pos=write_pos,
+            cache_base=cache_base,
+            is_flush=is_flush,
+            accept_lens=accept_lens,
+            mamba_track_indices=track_rows,
+            mamba_steps_to_track=track_steps,
+        )
+        self.assertTrue(
+            gdn_replayssm_commit_cuda._supported(
+                checkpoint_state=state, **capability_inputs
+            )
+        )
+        # Precision gate: FP32 checkpoints retain the stock, bitwise path.
+        self.assertFalse(
+            gdn_replayssm_commit_cuda._supported(
+                checkpoint_state=state.float(), **capability_inputs
+            )
+        )
+
+        outs = []
+        for runtime_optimization in (False, True):
+            cursors = [t.clone() for t in (write_pos, cache_base, is_flush)]
+            out = state.clone()
+            with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(
+                runtime_optimization
+            ):
+                commit_gdn_replayssm_circular(
+                    checkpoint_state=out,
+                    **caches,
+                    state_batch_indices=state_rows,
+                    replay_indices=replay_rows,
+                    write_pos=cursors[0],
+                    cache_base=cursors[1],
+                    is_flush=cursors[2],
+                    accept_lens=accept_lens,
+                    mamba_track_indices=track_rows,
+                    mamba_steps_to_track=track_steps,
+                    null_block_id=-1,
+                )
+            outs.append((out, cursors))
+        self.assertTrue(gdn_replayssm_commit_cuda._KERNELS)
+
+        (want, want_cursors), (got, got_cursors) = outs
+        for a, b in zip(want_cursors, got_cursors):
+            self.assertTrue(torch.equal(a, b))
+        written = [3, 7, 1, 10, 11, 4]
+        self.assertEqual(gdn_replayssm_commit_cuda.CUDA_COMMIT_RTOL, 2**-7)
+        self.assertEqual(gdn_replayssm_commit_cuda.CUDA_COMMIT_ATOL, 1e-6)
+        torch.testing.assert_close(
+            got[:, written].float(),
+            want[:, written].float(),
+            rtol=gdn_replayssm_commit_cuda.CUDA_COMMIT_RTOL,
+            atol=gdn_replayssm_commit_cuda.CUDA_COMMIT_ATOL,
+        )
+        # This deliberately does not assert equality: CUDA and Triton accumulate
+        # FP32 terms in different orders, so bitwise parity is not the contract.
+        self.assertFalse(torch.equal(want[:, written], state[:, written]))
+        untouched = [s for s in range(slots) if s not in written]
+        self.assertTrue(torch.equal(got[:, untouched], state[:, untouched]))
 
 
 if __name__ == "__main__":

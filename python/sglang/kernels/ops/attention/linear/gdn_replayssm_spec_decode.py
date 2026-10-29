@@ -44,6 +44,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported
 
 _IS_GFX95 = is_gfx95_supported()
@@ -1300,6 +1301,33 @@ def commit_gdn_replayssm_circular(
     k_residual_buf = k_residual_cache if has_residual else k_cache
     BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    if _try_runtime_cuda_commit(
+        checkpoint_state=checkpoint_state,
+        d_cache=d_cache,
+        k_cache=k_cache,
+        g_cache=g_cache,
+        d_residual_cache=d_residual_cache if has_residual else None,
+        k_residual_cache=k_residual_cache if has_residual else None,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        accept_lens=accept_lens,
+        mamba_track_indices=mamba_track_indices if has_track else None,
+        mamba_steps_to_track=mamba_steps_to_track if has_track else None,
+        null_block_id=null_block_id,
+    ):
+        _finish_circular_fold(
+            write_pos=write_pos,
+            cache_base=cache_base,
+            is_flush=is_flush,
+            state_batch_indices=state_batch_indices,
+            replay_indices=replay_indices,
+            max_cache_len=max_cache_len,
+            null_block_id=null_block_id,
+        )
+        return
     if has_track:
         track_indices = mamba_track_indices
         track_steps = mamba_steps_to_track
@@ -1355,7 +1383,28 @@ def commit_gdn_replayssm_circular(
         num_warps=4,
         num_stages=2,
     )
-    block = triton.next_power_of_2(max(1, B))
+    _finish_circular_fold(
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        max_cache_len=max_cache_len,
+        null_block_id=null_block_id,
+    )
+
+
+def _finish_circular_fold(
+    *,
+    write_pos: torch.Tensor,
+    cache_base: torch.Tensor,
+    is_flush: torch.Tensor,
+    state_batch_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    max_cache_len: int,
+    null_block_id: int,
+) -> None:
+    B = state_batch_indices.shape[0]
     _finish_gdn_replayssm_circular_fold_kernel[(1,)](
         write_pos,
         cache_base,
@@ -1366,6 +1415,23 @@ def commit_gdn_replayssm_circular(
         stride_indices=state_batch_indices.stride(0),
         stride_replay_indices=replay_indices.stride(0),
         MAX_CACHE_LEN=max_cache_len,
-        BLOCK=block,
+        BLOCK=triton.next_power_of_2(max(1, B)),
         NULL_BLOCK_ID=null_block_id,
     )
+
+
+def _try_runtime_cuda_commit(**kw) -> bool:
+    """Try the generic one-launch commit behind the runtime optimization switch.
+
+    The master switch is the only policy gate. ``try_commit`` owns the BF16,
+    shape, layout and CUDA-ISA capability checks; returning ``False`` preserves
+    the stock Triton commit below. The CUDA kernel changes FP32 accumulation
+    order, so its contract is tolerance-equivalent rather than bitwise.
+    """
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return False
+    from sglang.kernels.ops.attention.linear import (
+        gdn_replayssm_commit_cuda as cuda_commit,
+    )
+
+    return cuda_commit.try_commit(**kw)
