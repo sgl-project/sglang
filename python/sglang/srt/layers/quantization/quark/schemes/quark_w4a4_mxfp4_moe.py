@@ -1149,6 +1149,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         assert self.moe_runner_config.activation == "silu", (
             f"The W4A16 triton path only supports silu, got {self.moe_runner_config.activation}"
         )
+        logger.info_once(
+            "Quark MXFP4 MoE on gfx1151: no FP4 hardware, running the W4A4 MXFP4 "
+            "checkpoint as W4A16 (bf16 activations, MXFP4 weights upcast in "
+            "triton_kernels). Set SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16=0 to disable."
+        )
         self.num_experts = layer.w13_weight.shape[0]
         self.intermediate_size = layer.w13_weight.shape[1] // 2
         precision_configs = []
