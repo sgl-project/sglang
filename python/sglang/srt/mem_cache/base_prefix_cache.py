@@ -594,6 +594,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_evictable_size(self):
         return 0
 
+    def auxiliary_swa_evictable_size(self):
+        return 0
+
     def protected_size(self):
         return 0
 
@@ -700,6 +703,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # the last checkpoint. Those caches override this. Everyone else has
         # nothing deeper than the tail to protect.
         return None
+
+    def window_retention(self, req):
+        """Running-request window components, retention lengths and prefix floors."""
+        return (
+            (ComponentType.SWA, self.swa_retain_window, self.swa_retain_floor(req)),
+        )
 
     def swa_reprefill_tail_tokens(self, req=None) -> int:
         # Caches whose matched SWA is not reusable as is override this.

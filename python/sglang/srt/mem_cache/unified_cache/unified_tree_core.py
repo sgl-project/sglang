@@ -437,9 +437,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self._family_slot_ids.setdefault(slot.family, ComponentType[slot.component])
             if slot.component == "SWA":
                 self._family_slot_ids[slot.family] = ComponentType.SWA
-        self._independent_windows = sum(
-            slot.family == TREE_WINDOW for slot in params.tree_slots
-        ) > 1
+        self._independent_windows = (
+            sum(slot.family == TREE_WINDOW for slot in params.tree_slots) > 1
+        )
         self.is_eagle = params.is_eagle and TREE_STATE not in self._family_slot_ids
         self.enable_hicache = False
         self.is_host_memory_buffer_only = False

@@ -73,6 +73,7 @@ def _cache():
         window_retain_size=lambda component: 32,
         full_evictable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
+        auxiliary_swa_evictable_size=lambda: 0,
         supports_prefix_sharing=lambda: True,
     )
 
@@ -354,8 +355,15 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
         self.assertEqual(self.budget.check_prefill(**self.request), (True, 16))
         self.budget.reserve(12, 4, chunk_limit=16)
         # Each side separately has room, but their combined reservation does not.
-        self.assertGreater(self.budget.remaining_total, 20)
-        self.assertGreater(self.budget.remaining_swa, 16)
+        self.assertGreater(
+            self.allocator.full_attn_allocator.available_size()
+            - self.budget.total_offset,
+            20,
+        )
+        self.assertGreater(
+            self.allocator.swa_attn_allocator.available_size() - self.budget.swa_offset,
+            16,
+        )
         self.assertEqual(self.budget.check_prefill(**self.request), (False, None))
         self.assertEqual(self.allocator.full_attn_allocator.allocated_count(), 0)
         self.assertEqual(self.allocator.swa_attn_allocator.allocated_count(), 0)
@@ -451,6 +459,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             disable=True,
             full_evictable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
+            auxiliary_swa_evictable_size=lambda: 0,
             supports_prefix_sharing=lambda: False,
             supports_mamba=lambda: False,
         )
@@ -640,10 +649,10 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         self.addCleanup(reset_context)
         bundle, allocator, cache = build_tri_cache(state_cache=False)
         states = allocator.state_slots.alloc(8)
-        slots = allocator.alloc(96)
+        slots = allocator.alloc(allocator.available_size())
         self.assertIsNotNone(states)
         self.assertIsNotNone(slots)
-        for i in range(96):
+        for i in range(slots.numel()):
             cache.insert(
                 InsertParams(key=RadixKey(array("q", [i])), value=slots[i : i + 1])
             )

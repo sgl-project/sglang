@@ -3956,6 +3956,20 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_swa(self) -> bool:
         return self.is_swa_enabled
 
+    def supports_auxiliary_swa(self) -> bool:
+        return ComponentType.AUXILIARY_SWA in self.components
+
+    def window_retention(self, req):
+        return tuple(
+            (
+                slot,
+                component.sliding_window_size,
+                self.swa_retain_floor(req, window=component.sliding_window_size),
+            )
+            for slot, component in self.components.items()
+            if isinstance(component, SWAComponent)
+        )
+
     def supports_mamba(self) -> bool:
         return self.is_mamba_enabled
 
@@ -3992,6 +4006,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def swa_evictable_size(self) -> int:
         return self.tree_core.swa_evictable_size()
+
+    def auxiliary_swa_evictable_size(self) -> int:
+        if ComponentType.AUXILIARY_SWA not in self.components:
+            return 0
+        return self.tree_core.component_evictable_size(ComponentType.AUXILIARY_SWA)
 
     def mamba_evictable_size(self) -> int:
         return self.tree_core.mamba_evictable_size()
@@ -4150,13 +4169,3 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def dfs_weight_order(self, node_handles: Sequence[NodeId]) -> list[int]:
         return self.tree_core.dfs_weight_order(node_handles)
-
-
-    def supports_auxiliary_swa(self) -> bool:
-        return ComponentType.AUXILIARY_SWA in self.components
-
-
-    def auxiliary_swa_evictable_size(self) -> int:
-        if ComponentType.AUXILIARY_SWA not in self.components:
-            return 0
-        return self.tree_core.component_evictable_size(ComponentType.AUXILIARY_SWA)

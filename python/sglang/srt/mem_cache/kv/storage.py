@@ -391,6 +391,34 @@ class KVStorage:
         before."""
         self._allocator.free_full_segment(ids, start_pos=0)
 
+    def free_row(self, kv: ReqKvInfo, ranges: list[tuple[int, int]]) -> None:
+        from sglang.srt.mem_cache.common import coalesce_ranges
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        row = self.requests.req_to_token[kv.req_pool_idx]
+        ranges = coalesce_ranges(ranges)
+        for sub_pool in self._sub_pools:
+            if sub_pool.name not in self._allocator.window_allocators:
+                continue
+            component = ComponentType[sub_pool.external.tree_component]
+            dead_lo = (
+                kv.swa_dead_lo(self._allocator.page_size)
+                if component == ComponentType.SWA
+                else kv.cache_protected_len
+            )
+            dead_hi = max(dead_lo, kv.get_evicted_seqlen(component))
+            for start, end in ranges:
+                lo = min(max(dead_lo, start), end)
+                hi = min(max(dead_hi, start), end)
+                for left, right in ((start, lo), (hi, end)):
+                    if left < right:
+                        self._allocator.free_window_segment(
+                            sub_pool.name, row[left:right], start_pos=left
+                        )
+        self._allocator.free_full_segments(
+            [(row[start:end], start) for start, end in ranges]
+        )
+
     def window_ids(self, sub_pool: str, owner_ids: torch.Tensor) -> torch.Tensor:
         """The window's row ids of these owner token ids, as transfers and the
         tree's window values name them."""
@@ -736,35 +764,6 @@ class KVStorage:
             slots = self._allocator.state_slots
             return slots.alloc, slots.free
         return None
-
-
-    def free_row(self, kv: ReqKvInfo, ranges: list[tuple[int, int]]) -> None:
-        from sglang.srt.mem_cache.common import coalesce_ranges
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-
-        row = self.requests.req_to_token[kv.req_pool_idx]
-        ranges = coalesce_ranges(ranges)
-        for sub_pool in self._sub_pools:
-            if sub_pool.name not in self._allocator.window_allocators:
-                continue
-            component = ComponentType[sub_pool.external.tree_component]
-            dead_lo = (
-                kv.swa_dead_lo(self._allocator.page_size)
-                if component == ComponentType.SWA
-                else kv.cache_protected_len
-            )
-            dead_hi = max(dead_lo, kv.get_evicted_seqlen(component))
-            for start, end in ranges:
-                lo = min(max(dead_lo, start), end)
-                hi = min(max(dead_hi, start), end)
-                for left, right in ((start, lo), (hi, end)):
-                    if left < right:
-                        self._allocator.free_window_segment(
-                            sub_pool.name, row[left:right], start_pos=left
-                        )
-        self._allocator.free_full_segments(
-            [(row[start:end], start) for start, end in ranges]
-        )
 
 
 def _page_pairs(
