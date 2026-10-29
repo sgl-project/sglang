@@ -1,3 +1,4 @@
+import contextlib
 import functools
 import hashlib
 import os
@@ -243,12 +244,20 @@ class TokenSpaceSGLangProcessor:
             set(strategy.mm_item_fields) - strategy.mm_feature_fields
         )
         for item in mm_items:
-            item.set_hash(
-                resolve_multimodal_item_hash(
-                    feature=item.feature,
-                    namespace=_layout_digest(item, layout_fields),
-                )
+            feature = item.feature
+            # tensor_hash copies a CUDA feature to the current device, cuda:0 on this thread.
+            on_feature_device = (
+                torch.cuda.device(feature.device)
+                if isinstance(feature, torch.Tensor) and feature.is_cuda
+                else contextlib.nullcontext()
             )
+            with on_feature_device:
+                item.set_hash(
+                    resolve_multimodal_item_hash(
+                        feature=feature,
+                        namespace=_layout_digest(item, layout_fields),
+                    )
+                )
 
     # Adapted from sglang.srt.multimodal.processors.base_processor.BaseMultimodalProcessor.collect_mm_items_from_processor_output.
     def _collect_mm_items(self, output: BatchFeature) -> list[MultimodalDataItem]:
