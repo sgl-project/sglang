@@ -321,7 +321,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
-        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
+        self.model_runner.runner_ids.bind_runner_slots(forward_batch)
 
         def run_once():
             # Record the metadata rebuild against the committed target-prefix
@@ -357,7 +357,10 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         saved_backend_pool = self.draft_attn_backend.token_to_kv_pool
         self.draft_attn_backend.token_to_kv_pool = target_pool
         try:
-            with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
+            with forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend),
+                forward_batch=forward_batch,
+            ):
                 self.frozen_kv_mtp_worker._init_frozen_kv_metadata_capture_cuda_graph(
                     forward_batch
                 )

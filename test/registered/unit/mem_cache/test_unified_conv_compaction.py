@@ -5,12 +5,13 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_mamba_swa_pools
+from sglang.srt.mem_cache.kv.layout.state import StateView
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-register_cuda_ci(est_time=20, stage="extra-a", runner_config="1-gpu-small")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
 
 
 def make_conv_bundle(device, page_size=1, lazy=True, state_slots=40):
@@ -23,7 +24,7 @@ def make_conv_bundle(device, page_size=1, lazy=True, state_slots=40):
         dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.bfloat16),
         layers=[1, 3],
     )
-    return init_unified_mamba_swa_pools(
+    return build_test_unified_pools(
         device=device,
         kv_cache_dtype=torch.bfloat16,
         head_num=1,
@@ -58,12 +59,13 @@ def make_conv_bundle(device, page_size=1, lazy=True, state_slots=40):
 class TestConvCompaction(CustomTestCase):
     def _exercise(self, device, page_size, mode):
         bundle = make_conv_bundle(device, page_size, lazy=mode != "eager")
-        pool = bundle.unified_memory_pool
+        pool = bundle.arena
         composite = bundle.token_to_kv_pool_allocator
-        state = bundle.req_to_token_pool.mamba_pool
+        state = composite.state.pool
         alloc = composite.mamba_allocator
         self.assertEqual(state.mamba_cache.temporal.numel(), 0)
-        self.assertFalse(state._should_fuse_slot_ops())
+        # Clears and copies act on whole entries; no fused slot kernel.
+        self.assertIsInstance(state, StateView)
         self.assertIs(alloc.high_peer, composite.swa_attn_allocator)
         self.assertIs(
             composite.swa_attn_allocator.high_peer, composite.full_attn_allocator
@@ -77,16 +79,16 @@ class TestConvCompaction(CustomTestCase):
         ]
         live_ids = [ids, tokens, tokens]
         before_maps = [
-            a.translate_kv_loc(v).cpu().clone() for a, v in zip(allocators, live_ids)
+            a.ids.translate(v).cpu().clone() for a, v in zip(allocators, live_ids)
         ]
         reference = torch.randint(
             0,
             64,
-            pool._raw.shape,
+            pool.raw.shape,
             dtype=torch.uint8,
             generator=torch.Generator().manual_seed(781),
         )
-        pool._raw.copy_(reference)
+        pool.raw.copy_(reference)
         if device == "cuda":
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
@@ -107,29 +109,29 @@ class TestConvCompaction(CustomTestCase):
         self.assertIsNotNone(full.alloc(need))
         self.assertFalse(
             torch.equal(
-                composite.swa_attn_allocator.translate_kv_loc(tokens).cpu(),
+                composite.swa_attn_allocator.ids.translate(tokens).cpu(),
                 before_maps[1],
             )
         )
         self.assertEqual(composite.verify_byte_accounting(), [])
-        actual = pool._raw.cpu()
+        actual = pool.raw.cpu()
         moved = 0
         for group, (a, virtual, old) in enumerate(
             zip(allocators, live_ids, before_maps)
         ):
-            current = a.translate_kv_loc(virtual).cpu()
+            current = a.ids.translate(virtual).cpu()
             for i, (v, src, dst) in enumerate(
                 zip(virtual.cpu().tolist(), old.tolist(), current.tolist())
             ):
                 if group == 0 and 8 <= i < 16:
-                    self.assertEqual(int(a.virtual_to_physical[v]), -1)
+                    self.assertEqual(int(a.ids.virtual_to_physical[v]), -1)
                     continue
                 if group == 0:
                     moved += src != dst
                 elif group == 2:
                     self.assertEqual(src, dst)
                 self.assertEqual(
-                    int(a.physical_to_virtual[dst // a.page_size]), v // a.page_size
+                    int(a.ids.physical_to_virtual[dst // a.page_size]), v // a.page_size
                 )
                 n = a.entry_bytes
                 self.assertTrue(
@@ -144,8 +146,8 @@ class TestConvCompaction(CustomTestCase):
         )
         # Ordinary COW remains available for Conv-only states after compaction.
         new = alloc.alloc(1).clone()
-        src = alloc.virtual_to_physical[ids[-1:]]
-        dst = alloc.virtual_to_physical[new]
+        src = alloc.ids.virtual_to_physical[ids[-1:]]
+        dst = alloc.ids.virtual_to_physical[new]
         state.copy_from(src, dst)
         for tensor in state.mamba_cache.conv:
             self.assertTrue(torch.equal(tensor[:, src], tensor[:, dst]))
