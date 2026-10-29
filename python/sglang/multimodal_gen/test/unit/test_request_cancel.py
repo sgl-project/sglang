@@ -497,11 +497,13 @@ def test_sequential_worker_does_not_skip_a_request(monkeypatch):
     """A skipped request would leave its output to the next request of the group."""
     worker = _bare_worker(monkeypatch)
     monkeypatch.setattr(gpu_worker_module, "raise_if_cancelled", _cancelled)
-    output = OutputBatch()
+    first, second = OutputBatch(), OutputBatch()
+    outputs = iter((first, second))
+    forward = Mock(side_effect=lambda: next(outputs))
 
     result = worker._execute_forward_common(
         SimpleNamespace(is_warmup=False, extra={}),
-        forward_fn=lambda: output,
+        forward_fn=forward,
         log_reqs=[],
         return_req=False,
         save_output_paths=Mock(),
@@ -510,7 +512,9 @@ def test_sequential_worker_does_not_skip_a_request(monkeypatch):
         check_cancelled=False,
     )
 
-    assert result is output
+    forward.assert_called_once_with()
+    assert result.cancelled
+    assert next(outputs) is second
 
 
 @pytest.mark.parametrize("propagate", [False, True])
