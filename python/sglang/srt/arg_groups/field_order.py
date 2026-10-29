@@ -524,5 +524,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_response_store",
     "disaggregation_decode_host_receive_threshold",
     "enable_prefill_weight_versions",
+    "enable_token_space_processor",
 )
 # fmt: on
