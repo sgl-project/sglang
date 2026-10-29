@@ -126,7 +126,7 @@ class TestResolveHybridSWALayerIds(CustomTestCase):
                     is_draft_worker=True,
                     draft_model_idx=depth,
                 )
-                self.assertTrue(layer_info.is_hybrid_swa_mtp_draft)
+                self.assertTrue(layer_info.draft_owns_its_depth)
                 self.assertEqual(layer_info.swa_attention_layer_ids, swa)
                 self.assertEqual(layer_info.full_attention_layer_ids, full)
 
@@ -143,7 +143,7 @@ class TestResolveHybridSWALayerIds(CustomTestCase):
             draft_model_idx=1,
         )
 
-        self.assertFalse(layer_info.is_hybrid_swa_mtp_draft)
+        self.assertFalse(layer_info.draft_owns_its_depth)
         self.assertEqual(layer_info.swa_attention_layer_ids, [0])
         self.assertEqual(layer_info.full_attention_layer_ids, [])
 

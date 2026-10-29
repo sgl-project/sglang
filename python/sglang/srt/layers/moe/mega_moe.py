@@ -484,9 +484,11 @@ def run_mega_routed_experts(
             routed_scaling_factor=routed_scaling_factor,
         )
 
+    jit_pre_dispatch = mma_type == "fp8xfp4"
     if routed_scaling_factor != 1.0:
         assert not routing_in_buffer
-        topk_weights_in = topk_weights_in * routed_scaling_factor
+        if not jit_pre_dispatch:
+            topk_weights_in = topk_weights_in * routed_scaling_factor
 
     global_num_tokens = _mega_moe_global_tokens_hint(buf)
     mega_kwargs = {"recipe": (1, 1, 32)}
@@ -563,6 +565,7 @@ def run_mega_routed_experts(
                 ),
                 shared_block_m=shared_block_m,
                 copy_topk=not routing_in_buffer,
+                topk_weight_scale=routed_scaling_factor,
             )
 
     if global_num_tokens is not None:

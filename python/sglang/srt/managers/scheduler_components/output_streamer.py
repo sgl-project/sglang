@@ -85,8 +85,8 @@ class SchedulerOutputStreamer:
     def __post_init__(self) -> None:
         if self.has_additional_customized_info and self.rust_server is not None:
             raise ValueError(
-                "additional customized generation output is not supported by "
-                "Rust egress"
+                "a streamer's additional customized_info needs TokenizerManager "
+                "hooks (update_request_meta_info) the Rust frontend does not run"
             )
 
     def _get_storage_backend_type(self) -> str:
@@ -786,8 +786,15 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
+            # The Rust egress encodes the per-token lists itself.
             customized_info=(
-                wrap_as_pickle(self.customized_info) if self.customized_info else None
+                (
+                    self.customized_info
+                    if self.rust_server_mode
+                    else wrap_as_pickle(self.customized_info)
+                )
+                if self.customized_info
+                else None
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
