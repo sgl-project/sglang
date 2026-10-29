@@ -329,6 +329,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
+    "Vinsmoke86": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 30,
+        "reason": "PPU PoC"
+    },
     "Xia-Weiwen": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
