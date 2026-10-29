@@ -265,7 +265,11 @@ def compute_env_stamp() -> Dict[str, str]:
             device_capability = f"{cap.major}.{cap.minor}"
     except Exception:
         pass
-    return {"device_capability": device_capability, "torch_version": torch_version}
+
+    return {
+        "device_capability": device_capability,
+        "torch_version": torch_version,
+    }
 
 
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:
