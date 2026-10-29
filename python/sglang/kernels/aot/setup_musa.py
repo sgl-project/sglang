@@ -70,6 +70,9 @@ include_dirs = [
     root / "include",
     root / "include" / "impl",
     root / "csrc",
+    # Speculative device kernels are shared with the JIT launchers, which own
+    # the header tree they live in.
+    root.parent / "jit" / "include",
     root / _FLASHINFER_REPO.source_dir / "include",
     root / _FLASHINFER_REPO.source_dir / "csrc",
     root / _MUTLASS_REPO.source_dir / "include",
@@ -94,7 +97,6 @@ sources = [
     "csrc/speculative/packbit.cu",
     "csrc/speculative/speculative_sampling.cu",
     "csrc/kvcacheio/transfer.cu",
-    "csrc/gemm/awq_kernel.cu",
     "csrc/gemm/per_token_quant_fp8.cu",
     "csrc/gemm/per_token_group_quant_8bit.cu",
     "csrc/gemm/per_token_group_quant_8bit_v2.cu",

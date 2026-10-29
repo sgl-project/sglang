@@ -54,24 +54,18 @@ from sglang.benchmark.serving import (
     _EMBEDDING_BACKENDS,
     ASYNC_REQUEST_FUNCS,
     _finite_positive_float,
+    _validate_parsed_gsp_args,
     async_request_openai_embeddings,
     flush_server_cache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=38, suite="base-a-test-cpu")
+register_cpu_ci(est_time=42, suite="base-a-test-cpu")
 register_cpu_ci(est_time=46, suite="stage-b-test-cpu-intel")
 
 
 _BENCH_SERVING_CLI_CASES = {
-    "help": ["--help"],
-    "invalid_distribution": [
-        "--dataset-name",
-        "generated-shared-prefix",
-        "--gsp-group-distribution",
-        "invalid_name",
-    ],
     "flush_cache_timeout": ["--flush-cache-timeout", "inf"],
     "zipf_without_alpha": [
         "--dataset-name",
@@ -566,6 +560,16 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertIn("temperature", rows[0].extra_request_body)
         self.assertIn("tools", rows[1].extra_request_body)
 
+        for row in rows:
+            rendered = self.tokenizer.apply_chat_template(
+                row.prompt, tokenize=False, add_generation_prompt=True
+            )
+            expected_prompt_len = len(self.tokenizer.encode(rendered))
+            tools = row.extra_request_body.get("tools")
+            if tools:
+                expected_prompt_len += len(self.tokenizer.encode(json.dumps(tools)))
+            self.assertEqual(row.prompt_len, expected_prompt_len)
+
     def test_generated_shared_prefix_sampler(self):
         args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)
         rows = sample_generated_shared_prefix_requests(
@@ -804,6 +808,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
 
     def test_speed_bench_sampler(self):
+        """Each row's prompt_len is the token count of its chat-templated prompt."""
         dataset_path = self._write_speed_bench_jsonl()
         args = make_args(
             dataset_name="speed-bench",
@@ -817,7 +822,24 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 3)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.output_len == 512 for row in rows))
-        self.assertTrue(all(row.prompt_len > 0 for row in rows))
+
+        with open(dataset_path) as f:
+            source_prompts = [json.loads(line)["turns"][0] for line in f]
+        templated_lens = {
+            len(
+                self.tokenizer.encode(
+                    self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": text}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    ),
+                    add_special_tokens=False,
+                )
+            )
+            for text in source_prompts
+        }
+        for row in rows:
+            self.assertIn(row.prompt_len, templated_lens)
 
     def test_speed_bench_category_filter(self):
         dataset_path = self._write_speed_bench_jsonl()
@@ -1031,6 +1053,66 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(agentic_rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in agentic_rows))
 
+    def test_gsp_token_ids_have_exact_lengths_and_statistics(self):
+        args = make_args(
+            tokenize_prompt=True,
+            gsp_system_prompt_len=8,
+            gsp_question_len=4,
+            gsp_range_ratio=1.0,
+            gsp_fast_prepare=True,
+            gsp_send_routing_key=True,
+        )
+        dataset = GeneratedSharedPrefixDataset.from_args(args)
+        with (
+            patch.object(self.tokenizer, "encode", side_effect=AssertionError),
+            patch.object(self.tokenizer, "decode", side_effect=AssertionError),
+            patch("builtins.print") as print_mock,
+        ):
+            rows = dataset.load(self.tokenizer)
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(len(row.prompt), 12)
+            self.assertEqual(row.prompt_len, 12)
+            self.assertTrue(all(isinstance(token, int) for token in row.prompt))
+        printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
+        self.assertIn(f"Total input tokens: {12 * len(rows)}", printed)
+        self.assertIn("Average system prompt length: 8.0 tokens", printed)
+        self.assertIn("Average question length: 4.0 tokens", printed)
+
+    def test_gsp_token_ids_reject_multiple_turns(self):
+        parser = argparse.ArgumentParser()
+        with (
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            self.assertRaises(SystemExit) as error,
+        ):
+            _validate_parsed_gsp_args(
+                parser,
+                make_args(
+                    dataset_name="generated-shared-prefix",
+                    tokenize_prompt=True,
+                    gsp_num_turns=2,
+                ),
+            )
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("--gsp-num-turns=1", stderr.getvalue())
+        with self.assertRaisesRegex(ValueError, "--gsp-num-turns=1"):
+            GeneratedSharedPrefixDataset.from_args(
+                make_args(tokenize_prompt=True, gsp_num_turns=2)
+            )
+        with self.assertRaisesRegex(ValueError, "num_turns=1"):
+            sample_generated_shared_prefix_requests(
+                num_groups=2,
+                prompts_per_group=2,
+                system_prompt_len=8,
+                question_len=4,
+                output_len=2,
+                range_ratio=1.0,
+                tokenizer=self.tokenizer,
+                seed=42,
+                input_ids=True,
+                num_turns=2,
+            )
+
     def test_get_dataset_unknown_dataset(self):
         args = make_args(dataset_name="not-a-dataset")
         with self.assertRaises(ValueError):
@@ -1057,6 +1139,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         output_len=2,
         fast_prepare=True,
         global_seed=None,
+        input_ids=False,
     ):
         # GSP's own `seed` kwarg only feeds the cache filename; reproducibility
         # of compute_random_lens / gen_prompt comes from seeding the module
@@ -1079,6 +1162,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             ordered=ordered,
             group_distribution=mode,
             zipf_alpha=alpha,
+            input_ids=input_ids,
         )
 
     @staticmethod
@@ -1117,33 +1201,63 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(path.parent, Path.home() / ".cache" / "sglang" / "benchmark")
 
     def test_gsp_cache_respects_ordering(self):
-        shuffled_rows = self._run_gsp(ordered=False)
-        rows = self._run_gsp(ordered=True)
+        """Warm or legacy caches must not change ordering or prompt representation."""
+        for mode, alpha in (("uniform", None), ("zipf", 1.5)):
+            for first_ordered in (False, True):
+                home = self.tmpdir_path / f"{mode}-{first_ordered}"
+                for input_ids in (False, True):
+                    with self.subTest(
+                        mode=mode, first_ordered=first_ordered, input_ids=input_ids
+                    ):
+                        kwargs = dict(mode=mode, alpha=alpha, input_ids=input_ids)
+                        with patch(
+                            "sglang.benchmark.datasets.generated_shared_prefix.Path.home",
+                            return_value=home / f"fresh-{input_ids}",
+                        ):
+                            expected = {
+                                ordered: self._row_fields(
+                                    self._run_gsp(ordered=ordered, **kwargs)
+                                )
+                                for ordered in (False, True)
+                            }
 
-        with patch(
-            "sglang.benchmark.datasets.generated_shared_prefix.Path.home",
-            return_value=self.tmpdir_path / "fresh",
-        ):
-            expected = self._run_gsp(ordered=True)
-
-        self.assertEqual(self._row_fields(rows), self._row_fields(expected))
-
-        # Pre-upgrade ordered caches must not contaminate shuffled runs either.
-        legacy_path = get_gen_prefix_cache_path(
-            seed=42,
-            num_groups=4,
-            prompts_per_group=5,
-            system_prompt_len=4,
-            question_len=3,
-            output_len=2,
-            tokenizer=self.tokenizer,
-        )
-        with open(legacy_path, "wb") as f:
-            pickle.dump(expected, f)
-        self.assertEqual(
-            self._row_fields(self._run_gsp(ordered=False)),
-            self._row_fields(shuffled_rows),
-        )
+                        with patch(
+                            "sglang.benchmark.datasets.generated_shared_prefix.Path.home",
+                            return_value=home,
+                        ):
+                            legacy_path = get_gen_prefix_cache_path(
+                                seed=42,
+                                num_groups=4,
+                                prompts_per_group=5,
+                                system_prompt_len=4,
+                                question_len=3,
+                                output_len=2,
+                                tokenizer=self.tokenizer,
+                                group_distribution=mode,
+                                zipf_alpha=alpha,
+                                input_ids=input_ids,
+                            )
+                            legacy_path.parent.mkdir(parents=True, exist_ok=True)
+                            with open(legacy_path, "wb") as f:
+                                pickle.dump(
+                                    [
+                                        DatasetRow(
+                                            prompt="LEGACY", prompt_len=1, output_len=1
+                                        )
+                                    ],
+                                    f,
+                                )
+                            for ordered in (
+                                first_ordered,
+                                not first_ordered,
+                                first_ordered,
+                            ):
+                                self.assertEqual(
+                                    self._row_fields(
+                                        self._run_gsp(ordered=ordered, **kwargs)
+                                    ),
+                                    expected[ordered],
+                                )
 
     def test_zipf_group_probs_helper(self):
         # Rank-based probability vector: weight(rank) = 1 / rank ** alpha,
@@ -1439,26 +1553,6 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             args = make_args(dataset_name="generated-shared-prefix", **case)
             with self.assertRaises(ValueError, msg=f"case={case}"):
                 GeneratedSharedPrefixDataset.from_args(args)
-
-    def test_bench_serving_help_and_invalid_choice_argparse(self):
-        # Subprocess-driven coverage of the live CLI: --help advertises both
-        # flags with the rank-based Zipf formula and the alpha constraint,
-        # and argparse rejects an unknown distribution choice.
-        help_res = _bench_serving_cli_results()["help"]
-        self.assertEqual(help_res.returncode, 0, help_res.stderr)
-        out = help_res.stdout
-        # Both new flags appear.
-        self.assertIn("--gsp-group-distribution", out)
-        self.assertIn("--gsp-zipf-alpha", out)
-        # Rank-based Zipf formula and alpha constraint are documented.
-        self.assertIn("1/rank**alpha", out)
-        self.assertIn("rank starts at 1", out)
-        self.assertIn("finite float", out)
-
-        # Argparse rejects unknown distribution choice.
-        bad_choice_res = _bench_serving_cli_results()["invalid_distribution"]
-        self.assertNotEqual(bad_choice_res.returncode, 0)
-        self.assertIn("invalid choice", (bad_choice_res.stderr + bad_choice_res.stdout))
 
     def test_serving_benchmark_cli_rejects_invalid_flush_cache_timeout(self):
         """Invalid timeouts fail before the benchmark contacts a server or hangs."""

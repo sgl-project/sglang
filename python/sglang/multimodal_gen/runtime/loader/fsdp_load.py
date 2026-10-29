@@ -28,6 +28,9 @@ from torch.nn.modules.module import _IncompatibleKeys
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    MergedReplicatedLinear,
+    QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
@@ -54,10 +57,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import set_mixed_precision_policy
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     process_model_weights_after_loading,
 )
-from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
 
@@ -110,6 +113,16 @@ def _can_assign_tensor_without_copy(
     """Return whether a TP=1 linear loader would only copy this tensor."""
     weight_loader = actual_param.__dict__.get("weight_loader")
     if not isinstance(weight_loader, MethodType):
+        return False
+    # subclasses may transform weights even when shapes and dtypes match
+    if weight_loader.__func__ not in (
+        ReplicatedLinear.weight_loader,
+        MergedReplicatedLinear.weight_loader,
+        ColumnParallelLinear.weight_loader,
+        MergedColumnParallelLinear.weight_loader,
+        QKVParallelLinear.weight_loader,
+        RowParallelLinear.weight_loader,
+    ):
         return False
 
     owner = weight_loader.__self__
@@ -201,7 +214,20 @@ def _maybe_dequantize_fp8(
     scale_key = target_param_name.rsplit(".", 1)[0] + ".weight_scale"
     scale_tensor = param_sd.get(scale_key)
     if scale_tensor is not None:
-        full_tensor = full_tensor.to(torch.float32) * scale_tensor.float()
+        if (
+            scale_tensor.dtype == torch.uint8
+            and full_tensor.ndim == scale_tensor.ndim
+            and full_tensor.shape[:1] == scale_tensor.shape[:1]
+            and full_tensor.shape[-1] == scale_tensor.shape[-1] * 32
+        ):
+            scale = torch.exp2(scale_tensor.float() - 127.0)
+            blocked_shape = (*full_tensor.shape[:-1], scale_tensor.shape[-1], 32)
+            full_tensor = (
+                full_tensor.float().reshape(blocked_shape) * scale.unsqueeze(-1)
+            ).reshape(full_tensor.shape)
+        else:
+            full_tensor = full_tensor.to(torch.float32) * scale_tensor.float()
+
         logger.debug(
             "Auto-dequantized FP8 weight %s using %s",
             target_param_name,
@@ -370,7 +396,9 @@ def maybe_load_fsdp_model(
         )
         register_fsdp_entrypoints(model)
 
-    param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+    param_names_mapping_fn = get_param_names_mapping(
+        model.param_names_mapping, valid_target_names=set(model.state_dict())
+    )
 
     # 2. load model from disk
     preprocess_loaded_state_dict = getattr(model, "preprocess_loaded_state_dict", None)

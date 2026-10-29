@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import copy
 import dataclasses
 import gc
 import logging
@@ -31,6 +32,7 @@ import signal
 import tempfile
 import threading
 import time
+import types
 from typing import (
     Any,
     AsyncIterator,
@@ -44,6 +46,7 @@ from typing import (
     cast,
 )
 
+import msgspec
 import torch
 import uvloop
 import zmq
@@ -59,16 +62,21 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
+    run_scheduler_process_with_init_pipe,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
+from sglang.srt.managers.disagg_service import start_disagg_service_for_rust_server
 from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -93,10 +101,21 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
+    get_main_process_id,
+    get_tokenizer_worker_class,
+    read_from_shared_memory,
     run_multi_detokenizer_router_process,
+    write_data_for_multi_tokenizer,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
+from sglang.srt.observability import metrics_collector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_TOKENIZER,
+    resolve_collector_class,
+    tokenizer_metric_labels,
+)
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
@@ -115,6 +134,7 @@ from sglang.srt.runtime_context import (
     restore_context,
     snapshot_context,
 )
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -131,6 +151,7 @@ from sglang.srt.utils import (
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
+    start_follower_grpc_server,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
@@ -155,6 +176,10 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _is_cuda = is_cuda()
 
 
+def _server_args_for_logging(server_args: ServerArgs) -> Dict[str, Any]:
+    return redact_watermark_secrets(server_args.resolved_dict())
+
+
 @dataclasses.dataclass
 class SchedulerInitResult:
     """Result from launching schedulers."""
@@ -164,6 +189,14 @@ class SchedulerInitResult:
     wait_for_ready: Callable[[], None] = lambda: None
     block_until_scheduler_exits: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
+    # Rust-server mode only: a KV bootstrap server the Rust server cannot serve.
+    kv_bootstrap_server: Optional[Any] = None
+    grpc_server: Optional[Any] = None
+
+    def stop_grpc_server(self) -> None:
+        if self.grpc_server is not None:
+            self.grpc_server.shutdown()
+            self.grpc_server = None
 
 
 def init_tokenizer_manager(
@@ -242,6 +275,11 @@ class Engine(EngineScoreMixin, EngineBase):
     # Backend-specific launch handle: the Ray engine schedules its actors onto a
     # placement group. Not config — a live cluster object.
     _placement_group = None
+    # Set by attach_tokenizer_worker(): this instance only owns a TokenizerWorker,
+    # the engine subprocesses belong to the parent Engine.
+    _attached = False
+    tokenizer_router: Optional[MultiTokenizerRouter] = None
+    _multi_tokenizer_shm = None
 
     def __init__(self, **kwargs):
         """
@@ -266,13 +304,17 @@ class Engine(EngineScoreMixin, EngineBase):
             # There was no command line, so the call is what the operator
             # asked for. `log_level` is filled in above when absent, so it
             # shows here even when the caller did not pass it.
-            object.__setattr__(
+            msgspec.Struct.__setattr__(
                 server_args,
                 "_launch_command",
-                "Engine(" + ", ".join(f"{k}={v!r}" for k, v in kwargs.items()) + ")",
+                "Engine("
+                + ", ".join(
+                    f"{k}={v!r}" for k, v in redact_watermark_secrets(kwargs).items()
+                )
+                + ")",
             )
         self.server_args = server_args
-        logger.info(f"server_args={server_args.resolved_dict()}")
+        logger.info(f"server_args={_server_args_for_logging(server_args)}")
 
         # Rust Server is not supported with the offline Engine API
         if envs.SGLANG_RUST_SERVER.get():
@@ -315,6 +357,25 @@ class Engine(EngineScoreMixin, EngineBase):
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
 
+        if isinstance(tokenizer_manager, MultiTokenizerRouter):
+            # --tokenizer-worker-num > 1: the router only bridges TokenizerWorkers to
+            # the scheduler and has no generate_request. Publish the launch data the
+            # workers need (same shared-memory contract as `sglang serve`) and give
+            # this process its own worker so Engine.generate() keeps working here;
+            # more processes join with Engine.attach_tokenizer_worker().
+            self.tokenizer_router = tokenizer_manager
+            scheduler_info = {
+                **scheduler_init_result.scheduler_infos[0],
+                "startup_time": tokenizer_manager.startup_time,
+            }
+            self._multi_tokenizer_shm = write_data_for_multi_tokenizer(
+                port_args, server_args, scheduler_info
+            )
+            self.tokenizer_manager, self.template_manager = self._init_tokenizer_worker(
+                server_args, port_args, scheduler_info
+            )
+            self.tokenizer_manager._subprocess_watchdog = subprocess_watchdog
+
         # Initialize ZMQ sockets
         context = zmq.Context(2)
         if get_parallel().node_rank == 0:
@@ -328,7 +389,7 @@ class Engine(EngineScoreMixin, EngineBase):
         if get_observability().enable_trace:
             process_tracing_init(
                 get_observability().otlp_traces_endpoint,
-                "sglang",
+                get_observability().otlp_service_name,
                 trace_modules=get_observability().trace_modules,
             )
             thread_label = "Tokenizer"
@@ -338,11 +399,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 thread_label = "Decode Tokenizer"
             trace_set_thread_info(thread_label)
 
-        try:
-            self.loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
+        self.loop = self._ensure_event_loop()
 
     def get_all_child_pids(self) -> List[int]:
         """Returns a list of all child process PIDs."""
@@ -365,15 +422,15 @@ class Engine(EngineScoreMixin, EngineBase):
                 routed_dp_rank = data_parallel_rank
 
         if routed_dp_rank is not None:
-            dp_size = get_parallel().dp_size
-            if dp_size <= 1 and routed_dp_rank == 0:
+            num_dp_ranks = get_parallel().num_dp_ranks
+            if num_dp_ranks <= 1 and routed_dp_rank == 0:
                 logger.debug(
-                    f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
+                    f"routed_dp_rank={routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
                 )
                 return None
-            if routed_dp_rank < 0 or routed_dp_rank >= dp_size:
+            if routed_dp_rank < 0 or routed_dp_rank >= num_dp_ranks:
                 raise ValueError(
-                    f"routed_dp_rank={routed_dp_rank} out of range [0, {dp_size})"
+                    f"routed_dp_rank={routed_dp_rank} out of range [0, {num_dp_ranks})"
                 )
 
         logger.debug(f"routed_dp_rank: {routed_dp_rank}")
@@ -422,6 +479,7 @@ class Engine(EngineScoreMixin, EngineBase):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        kv_hints: Optional[Dict] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
@@ -466,6 +524,7 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_room=bootstrap_room,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            kv_hints=kv_hints,
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
@@ -535,6 +594,7 @@ class Engine(EngineScoreMixin, EngineBase):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        kv_hints: Optional[Dict] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
@@ -579,6 +639,7 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_room=bootstrap_room,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            kv_hints=kv_hints,
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
@@ -699,15 +760,8 @@ class Engine(EngineScoreMixin, EngineBase):
                 "--dist-init-addr so all nodes rendezvous at the same endpoint."
             )
 
-        tp_size = get_parallel().tp_size
-
         pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
-            _calculate_rank_ranges(
-                get_parallel().nnodes,
-                get_parallel().pp_size,
-                tp_size,
-                get_parallel().node_rank,
-            )
+            _calculate_rank_ranges(get_parallel().node_rank)
         )
 
         # Build the distributed init method (multi-node uses the user-provided
@@ -860,10 +914,17 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         scheduler_procs = []
         use_dp_controller = (
-            get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
+            get_parallel().num_dp_ranks > 1 or get_exec().moe.ep_join_mode == "scale"
         )
+        prelaunch_dp_schedulers = (
+            use_dp_controller
+            and get_parallel().attn_dp_enabled
+            and get_exec().moe.elastic_ep_backend is None
+            and not get_exec().moe.is_ep_joiner
+        )
+        prelaunched_schedulers = {}
 
-        if not use_dp_controller:
+        if not use_dp_controller or prelaunch_dp_schedulers:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
                 enable=get_exec().features.enable_memory_saver
@@ -871,42 +932,34 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_pipe_readers = []
 
             pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
-                _calculate_rank_ranges(
-                    get_parallel().nnodes,
-                    get_parallel().pp_size,
-                    get_parallel().tp_size,
-                    get_parallel().node_rank,
-                )
+                _calculate_rank_ranges(get_parallel().node_rank)
             )
 
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
-                    reader, writer = mp.Pipe(duplex=False)
+                    reader, writer = mp.Pipe(duplex=prelaunch_dp_schedulers)
                     gpu_id = (
                         get_device().base_gpu_id
                         + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                         + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
                     )
-                    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-                        tp_rank
-                    )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
-                        proc = mp.Process(
-                            target=run_scheduler_process_func,
-                            args=(
+                        if prelaunch_dp_schedulers:
+                            target = run_scheduler_process_with_init_pipe
+                            args = (run_scheduler_process_func, writer)
+                        else:
+                            target = run_scheduler_process_func
+                            args = (
                                 server_args,
                                 port_args,
                                 gpu_id,
                                 tp_rank,
-                                attn_cp_rank,
-                                moe_dp_rank,
-                                moe_ep_rank,
                                 pp_rank,
                                 None,
                                 writer,
-                            ),
-                        )
+                            )
+                        proc = mp.Process(target=target, args=args)
                         with (
                             memory_saver_adapter.configure_subprocess(),
                             numa_utils.configure_subprocess(server_args, gpu_id),
@@ -914,8 +967,13 @@ class Engine(EngineScoreMixin, EngineBase):
                             proc.start()
 
                     scheduler_procs.append(proc)
-                    scheduler_pipe_readers.append(reader)
-        else:
+                    if prelaunch_dp_schedulers:
+                        prelaunched_schedulers[pp_rank, tp_rank] = (proc.pid, reader)
+                        writer.close()
+                    else:
+                        scheduler_pipe_readers.append(reader)
+
+        if use_dp_controller:
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_readers = [reader]
@@ -926,29 +984,55 @@ class Engine(EngineScoreMixin, EngineBase):
                     port_args=port_args,
                     pipe_writer=writer,
                     run_scheduler_process_func=run_scheduler_process_func,
+                    prelaunched_schedulers=prelaunched_schedulers or None,
                 ),
             )
-            proc.start()
-            scheduler_procs.append(proc)
+            try:
+                proc.start()
+            finally:
+                for _, init_pipe in prelaunched_schedulers.values():
+                    init_pipe.close()
+            scheduler_procs.insert(0, proc)
 
         all_child_pids = [proc.pid for proc in scheduler_procs]
         scheduler_infos = []
 
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+            if any("kv_event_sources" in info for info in infos):
+                # Both gRPC entrypoints consume the first scheduler info. Keep
+                # the sources from every local scheduler, not just the first.
+                infos[0]["kv_event_sources"] = sorted(
+                    (
+                        source
+                        for info in infos
+                        for source in info.get("kv_event_sources", [])
+                    ),
+                    key=lambda source: source["dp_rank"],
+                )
+            # Each PP stage reports only its own L3 pools; give every info the merged layout.
+            merge_scheduler_info_layouts(infos)
             scheduler_infos.extend(infos)
-            if use_dp_controller:
+            if use_dp_controller and not prelaunch_dp_schedulers:
                 for info in infos:
                     if SCHEDULER_PIDS_ARG in info:
                         all_child_pids.extend(info[SCHEDULER_PIDS_ARG])
 
         def block_until_scheduler_exits():
-            for proc in scheduler_procs:
-                proc.join()
-                logger.error(
-                    f"Scheduler or DataParallelController {proc.pid} "
-                    f"terminated with {proc.exitcode}"
-                )
+            watchdog = None
+            if prelaunch_dp_schedulers and get_parallel().node_rank > 0:
+                watchdog = SubprocessWatchdog(scheduler_procs)
+                watchdog.start()
+            try:
+                for proc in scheduler_procs:
+                    proc.join()
+                    logger.error(
+                        f"Scheduler or DataParallelController {proc.pid} "
+                        f"terminated with {proc.exitcode}"
+                    )
+            finally:
+                if watchdog is not None:
+                    watchdog.stop()
 
         return (
             SchedulerInitResult(
@@ -1010,6 +1094,7 @@ class Engine(EngineScoreMixin, EngineBase):
         router_proc = mp.Process(
             target=run_multi_detokenizer_router_process,
             args=(worker_ipc_names, server_args, port_args),
+            kwargs={"enable_metrics": get_observability().enable_metrics},
         )
         router_proc.start()
         processes.append(router_proc)
@@ -1019,7 +1104,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
     @staticmethod
     def _set_startup_time(
-        tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter],
+        set_startup_time: Callable[[Dict[str, Any]], None],
         scheduler_init_result: SchedulerInitResult,
         startup_tic: float,
     ) -> None:
@@ -1030,7 +1115,7 @@ class Engine(EngineScoreMixin, EngineBase):
             ),
             tokenizer_e2e=time.perf_counter() - startup_tic,
         )
-        tokenizer_manager.set_startup_time(startup_time)
+        set_startup_time(startup_time)
         cuda_graph_timings = ", ".join(
             f"{phase}={duration:.2f}"
             for phase, duration in startup_time["cuda_graph"].items()
@@ -1085,11 +1170,9 @@ class Engine(EngineScoreMixin, EngineBase):
         # sentinel: a record rejected here has to stay retryable.
         server_args.check_server_args()
 
-        # Needs a tokenizer and a chat template, so it cannot live in the
-        # pipeline; after the plugins, which may register the parser detected.
-        parsers = resolving_view(server_args)
-        if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
-            resolve_auto_parsers(server_args)
+        # Architecture defaults and template auto-detection must run before
+        # publication; plugins may register parsers used by either path.
+        resolve_auto_parsers(server_args)
 
         # This publish replaces whatever was published before it, so the
         # rollback below restores that rather than clearing the process: a
@@ -1105,7 +1188,7 @@ class Engine(EngineScoreMixin, EngineBase):
             # Allocate ports for inter-process communications
             if port_args is None:
                 port_args = PortArgs.init_new(server_args)
-            logger.info(f"server_args={server_args.resolved_dict()}")
+            logger.info(f"server_args={_server_args_for_logging(server_args)}")
 
             # Start the engine info bootstrap server if per-rank info is needed.
             engine_info_bootstrap_server = None
@@ -1158,6 +1241,18 @@ class Engine(EngineScoreMixin, EngineBase):
             # Non-zero-rank nodes do not run tokenizer processes.
             scheduler_init_result.wait_for_ready()
 
+            try:
+                scheduler_init_result.grpc_server = start_follower_grpc_server(
+                    server_args, scheduler_init_result.scheduler_infos[0]
+                )
+            except BaseException:
+                # Engine.__init__ has not received these handles yet. Do not
+                # leave GPU workers behind if binding the metadata port fails.
+                for proc in scheduler_procs or []:
+                    kill_process_tree(proc.pid, wait_timeout=60)
+                cls._terminate_weight_cache_daemons(weight_cache_daemon_procs)
+                raise
+
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
                 # When using `Engine` as a Python API, we don't want to block here.
                 return (
@@ -1169,13 +1264,35 @@ class Engine(EngineScoreMixin, EngineBase):
                     weight_cache_daemon_procs,
                 )
 
-            launch_dummy_health_check_server(
-                get_serving().host,
-                get_serving().port,
-                get_observability().enable_metrics,
-            )
+            # Non-zero ranks cannot drain on their own: rank 0 stops every TP rank
+            # via the ShutdownReq broadcast, and the orchestrator's kill timeout is
+            # the backstop.
+            if threading.current_thread() is threading.main_thread():
 
-            scheduler_init_result.block_until_scheduler_exits()
+                def sigterm_handler(signum, frame):
+                    logger.warning(
+                        f"SIGTERM received on node_rank {get_parallel().node_rank}; "
+                        "waiting for the rank-0 ShutdownReq broadcast to stop "
+                        "the schedulers."
+                    )
+
+                signal.signal(signal.SIGTERM, sigterm_handler)
+
+            # A node-local Rust listener owns the health endpoints when present.
+            rust_server_owns_base_port = (
+                envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
+            )
+            try:
+                if not rust_server_owns_base_port:
+                    launch_dummy_health_check_server(
+                        get_serving().host,
+                        get_serving().port,
+                        get_observability().enable_metrics,
+                    )
+                with rust_server_sidecar(rust_server_owns_base_port):
+                    scheduler_init_result.block_until_scheduler_exits()
+            finally:
+                scheduler_init_result.stop_grpc_server()
             return (
                 None,
                 None,
@@ -1190,7 +1307,15 @@ class Engine(EngineScoreMixin, EngineBase):
         # not start the Python detokenizer subprocess(es) or tokenizer manager.
         # Do not use RayEngine with the Rust server, as it is not supported.
         if envs.SGLANG_RUST_SERVER.get():
+            # In place of the tokenizer manager, which starts the KV bootstrap
+            # server in Python mode.
+            scheduler_init_result.kv_bootstrap_server = (
+                start_disagg_service_for_rust_server()
+            )
             scheduler_init_result.wait_for_ready()
+            cls._set_startup_time(
+                _rust_server_startup_time_sink(), scheduler_init_result, startup_tic
+            )
             # Set up subprocess liveness watchdog to detect crashes
             processes = list(scheduler_procs or [])
             names = [f"scheduler_{i}" for i in range(len(processes))]
@@ -1233,7 +1358,9 @@ class Engine(EngineScoreMixin, EngineBase):
             # Wait for the model to finish loading
             scheduler_init_result.wait_for_ready()
 
-            cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
+            cls._set_startup_time(
+                tokenizer_manager.set_startup_time, scheduler_init_result, startup_tic
+            )
 
             # Get back some info from scheduler to tokenizer_manager
             tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
@@ -1264,11 +1391,95 @@ class Engine(EngineScoreMixin, EngineBase):
             weight_cache_daemon_procs,
         )
 
+    @staticmethod
+    def _init_tokenizer_worker(
+        server_args: ServerArgs, port_args: PortArgs, scheduler_info: Dict[str, Any]
+    ) -> Tuple[TokenizerManager, TemplateManager]:
+        # TokenizerWorker.__init__ registers with the router over a zmq.asyncio
+        # socket, which needs the loop the Engine will later run to be current.
+        Engine._ensure_event_loop()
+        port_args = copy.copy(port_args)
+        port_args.tokenizer_ipc_name = (
+            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        )
+        tokenizer_manager, template_manager = init_tokenizer_manager(
+            server_args,
+            port_args,
+            TokenizerManagerClass=get_tokenizer_worker_class(server_args),
+        )
+        tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+        tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
+        return tokenizer_manager, template_manager
+
+    @staticmethod
+    def _ensure_event_loop() -> asyncio.AbstractEventLoop:
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        try:
+            return asyncio.get_event_loop_policy().get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
+
+    @classmethod
+    def attach_tokenizer_worker(cls, parent_pid: Optional[int] = None) -> Engine:
+        """Join an Engine launched with ``tokenizer_worker_num > 1`` from another
+        process on the same host.
+
+        The returned Engine has no subprocesses of its own: it holds a
+        ``TokenizerWorker`` registered with the parent's ``MultiTokenizerRouter``, so
+        ``generate``/``async_generate`` run on this process while prefill and decode
+        stay on the parent's schedulers. Use it to spread the per-request Python
+        work of one engine over several processes (what ``sglang serve`` does with
+        uvicorn workers). ``parent_pid`` defaults to the multiprocessing parent, so
+        children spawned by the parent can omit it. Weight updates and other RPCs
+        must go through the parent Engine.
+        """
+        parent_pid = get_main_process_id() if parent_pid is None else parent_pid
+        port_args, server_args, scheduler_info = read_from_shared_memory(
+            f"multi_tokenizer_args_{parent_pid}"
+        )
+        publish(server_args, role="tokenizer")
+        self = cls.__new__(cls)
+        self._attached = True
+        self.server_args = server_args
+        self.port_args = port_args
+        self._scheduler_init_result = types.SimpleNamespace(
+            scheduler_infos=[scheduler_info], all_child_pids=[]
+        )
+        self._weight_cache_daemon_procs = []
+        self.send_to_rpc = None
+        self.tokenizer_manager, self.template_manager = self._init_tokenizer_worker(
+            server_args, port_args, scheduler_info
+        )
+        self.loop = self._ensure_event_loop()
+        return self
+
     def shutdown(self):
         """Shutdown the engine; block until the scheduler subprocess releases
         its GPU context so the caller can immediately reallocate on the same
         device."""
+        if self._attached:
+            if isinstance(self.tokenizer_manager, TokenizerManager):
+                mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
+                if mm_processor is not None:
+                    mm_processor.shutdown()
+                self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+            return
+        shm = getattr(self, "_multi_tokenizer_shm", None)
+        if shm is not None:
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            self._multi_tokenizer_shm = None
         try:
+            scheduler_init_result = getattr(self, "_scheduler_init_result", None)
+            if scheduler_init_result is not None:
+                scheduler_init_result.stop_grpc_server()
             if (
                 self.tokenizer_manager is not None
                 and self.tokenizer_manager._subprocess_watchdog is not None
@@ -1372,14 +1583,16 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.get_internal_state()
         )
         return msgspec_to_builtins(
-            {
-                **self.tokenizer_manager.server_args.resolved_dict(),
-                "launch_command": self.tokenizer_manager.server_args.launch_command,
-                **self._scheduler_init_result.scheduler_infos[0],
-                "startup_time": self.tokenizer_manager.startup_time,
-                "internal_states": internal_states,
-                "version": __version__,
-            }
+            redact_watermark_secrets(
+                {
+                    **self.tokenizer_manager.server_args.resolved_dict(),
+                    "launch_command": self.tokenizer_manager.server_args.launch_command,
+                    **self._scheduler_init_result.scheduler_infos[0],
+                    "startup_time": self.tokenizer_manager.startup_time,
+                    "internal_states": internal_states,
+                    "version": __version__,
+                }
+            )
         )
 
     def get_model_info(self):
@@ -1401,6 +1614,7 @@ class Engine(EngineScoreMixin, EngineBase):
             "load_format": tm.config_value("load_format"),
             "reasoning_parser": tm.config_value("reasoning_parser"),
             "tool_call_parser": tm.config_value("tool_call_parser"),
+            "disaggregation_mode": tm.config_value("disaggregation_mode"),
         }
 
     def init_weights_update_group(
@@ -1435,6 +1649,20 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.destroy_weights_update_group(obj, None)
+        )
+
+    def begin_weight_update(self, selector: str = "all"):
+        """Open a weight-update session; close it with end_weight_update()."""
+        obj = BeginWeightUpdateReqInput(selector=selector)
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.begin_weight_update(obj, None)
+        )
+
+    def end_weight_update(self):
+        """Close the session and finalize quantized weights into kernel layout."""
+        obj = EndWeightUpdateReqInput()
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.end_weight_update(obj, None)
         )
 
     def update_weights_from_distributed(
@@ -1659,7 +1887,6 @@ class Engine(EngineScoreMixin, EngineBase):
 
 
 def _set_envs_and_config(server_args: ServerArgs):
-
     cfg = resolving_view(server_args)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
@@ -1668,8 +1895,27 @@ def _set_envs_and_config(server_args: ServerArgs):
     if cfg.nnodes > 1 and is_mnnvl_fabric_device():
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_MNNVL_ENABLE", "1")
+    # The KV-shard gather registers its scratch as an NCCL symmetric
+    # window, which requires cuMem-backed NCCL memory. The pool keeps torch
+    # memory under the memory saver or a custom mem pool. Multi-node
+    # deployments keep NCCL's setting (MNNVL fabrics default it on above).
+    kv_shard_symmetric_scratch = (
+        cfg.enable_kv_cache_sharding
+        and cfg.nnodes == 1
+        and envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
+        and not cfg.enable_memory_saver
+        and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
+    )
     if "NCCL_CUMEM_ENABLE" not in os.environ or cfg.enable_symm_mem:
-        os.environ["NCCL_CUMEM_ENABLE"] = str(int(cfg.enable_symm_mem))
+        if kv_shard_symmetric_scratch and not cfg.enable_symm_mem:
+            logger.info(
+                "Setting NCCL_CUMEM_ENABLE=1 for every NCCL communicator so the "
+                "KV-shard prefix gather can use a symmetric window. Set "
+                "SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER=0 to keep it off."
+            )
+        os.environ["NCCL_CUMEM_ENABLE"] = str(
+            int(cfg.enable_symm_mem or kv_shard_symmetric_scratch)
+        )
     if (
         "NCCL_NVLS_ENABLE" not in os.environ
         or cfg.enable_nccl_nvls
@@ -1718,7 +1964,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.18",
+                "0.7.2",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -1726,7 +1972,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.6.post1",
+                "0.4.9",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
@@ -1762,34 +2008,6 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set gc threshold
     if gc_threshold := cfg.gc_threshold:
         gc.set_threshold(*gc_threshold)
-
-    _log_legacy_kernel_cache_dirs()
-
-
-def _log_legacy_kernel_cache_dirs():
-    """Note the pre-SGLANG_CACHE_DIR cache dirs without touching them: other
-    frameworks on the box may still be using them."""
-    # TODO(shuwang21): drop once SGLANG_CACHE_DIR has been the default for a
-    # few releases.
-    legacy_dirs = [
-        d
-        for d in (
-            os.path.expanduser("~/.triton"),
-            os.path.expanduser("~/.cache/flashinfer"),
-            os.path.expanduser("~/.cache/deep_gemm"),
-        )
-        if os.path.isdir(d)
-    ]
-    if not legacy_dirs:
-        return
-    logger.info(
-        "Compiled-kernel caches now live under SGLANG_CACHE_DIR (%s). These "
-        "older directories are no longer used by sglang, but may still be "
-        "used by other frameworks on this machine, so they were left alone: "
-        "%s. Remove them yourself if nothing else needs them.",
-        envs.SGLANG_CACHE_DIR.get(),
-        ", ".join(legacy_dirs),
-    )
 
 
 def _scheduler_died_error(rank: int, proc) -> RuntimeError:
@@ -1835,15 +2053,13 @@ def _wait_for_scheduler_ready(
     return scheduler_infos
 
 
-def _calculate_rank_ranges(
-    nnodes: int, pp_size: int, tp_size: int, node_rank: int
-) -> Tuple[range, range, int, int]:
+def _calculate_rank_ranges(node_rank: int) -> Tuple[range, range, int, int]:
     """Calculate pp_rank_range and tp_rank_range for a given node.
 
+    `node_rank` stays an argument because the Ray launchers size every node
+    from the driver, not just their own.
+
     Args:
-        nnodes: Total number of nodes.
-        pp_size: Pipeline parallel size.
-        tp_size: Tensor parallel size.
         node_rank: The rank of the node to compute ranges for.
 
     Returns:
@@ -1853,15 +2069,17 @@ def _calculate_rank_ranges(
         - pp_size_per_node: number of PP ranks per node.
         - tp_size_per_node: number of TP ranks per node.
     """
-    pp_size_per_node = max(pp_size // nnodes, 1)
-    nnodes_per_pp_rank = max(nnodes // pp_size, 1)
+    parallel = get_parallel()
+    nnodes = parallel.nnodes
+    pp_size_per_node = max(parallel.pp_size // nnodes, 1)
+    nnodes_per_pp_rank = max(nnodes // parallel.pp_size, 1)
     pp_rank_range = range(
         pp_size_per_node * (node_rank // nnodes_per_pp_rank),
         pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),
     )
 
     nnodes_per_tp_group = nnodes_per_pp_rank
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
     tp_rank_range = range(
         tp_size_per_node * (node_rank % nnodes_per_tp_group),
         tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
@@ -1870,26 +2088,35 @@ def _calculate_rank_ranges(
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
 
 
-def _compute_parallelism_ranks(tp_rank: int) -> Tuple[int, int, int]:
-    """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank.
-
-    Called while the launcher is deciding what to spawn, so the sizes are the
-    configured ones -- the groups this is laying out do not exist yet.
-    """
-    attn_dp_size = get_parallel().dp_size if get_parallel().enable_dp_attention else 1
-    tp_size = get_parallel().tp_size
-    attn_cp_size = get_parallel().attn_cp_size
-    moe_dp_size = get_parallel().moe_dp_size
-
-    # Parallelism hierarchy (outermost to innermost):
-    # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
-    # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
-    attn_tp_size = tp_size // attn_dp_size // attn_cp_size
-    attn_cp_rank = (tp_rank // attn_tp_size) % attn_cp_size
-    moe_dp_rank = tp_rank // (tp_size // moe_dp_size)
-    moe_ep_rank = (
-        tp_rank
-        % (tp_size // moe_dp_size)
-        // (tp_size // moe_dp_size // get_parallel().ep_size)
+def _rust_server_startup_time_sink() -> Callable[[Dict[str, Any]], None]:
+    """Where the startup phases go when the Rust server replaces the
+    TokenizerManager: this process records the startup-time metrics the
+    TokenizerManager would."""
+    if not get_observability().enable_metrics:
+        return lambda startup_time: None
+    # Read at call time: a plugin or model package may replace the module's
+    # collector class with its own subclass after this module is imported.
+    collector_cls = resolve_collector_class(
+        STAT_LOGGER_ROLE_TOKENIZER, metrics_collector.TokenizerMetricsCollector
     )
-    return attn_cp_rank, moe_dp_rank, moe_ep_rank
+    return collector_cls(labels=tokenizer_metric_labels()).emit_startup_time
+
+
+def node_hosts_rust_server() -> bool:
+    """Whether this node contains a Rust listener rank, assuming Rust mode."""
+    parallel = get_parallel()
+    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(parallel.node_rank)
+    if 0 not in pp_rank_range:
+        return False
+
+    if get_exec().moe.is_ep_scale_joiner:
+        # Scale joiners launch the full local TP group, including its first rank.
+        return True
+
+    # Each attention DP group hosts a listener on its first rank (CP=TP=0).
+    ranks_per_dp_group = parallel.attn_tp_size * parallel.attn_cp_size
+    for tp_rank in tp_rank_range:
+        rank_within_dp_group = tp_rank % ranks_per_dp_group
+        if rank_within_dp_group == 0:
+            return True
+    return False

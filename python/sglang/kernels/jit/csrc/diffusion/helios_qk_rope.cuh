@@ -19,7 +19,7 @@ namespace sglang {
  * multiply and add/subtract operations preserve the separate eager FP32
  * intermediates before the result is rounded back to fp16/bf16.
  *
- * \tparam T Activation type: fp16_t or bf16_t
+ * \tparam T Activation type: fp16_t, bf16_t or fp32_t
  * \param q Normalized query tensor, contiguous [tokens, heads, head_dim]
  * \param k Normalized key tensor, contiguous [tokens, heads, head_dim]
  * \param freqs Transposed Helios frequency tensor, contiguous
@@ -38,7 +38,7 @@ __global__ void helios_qk_rope_kernel(
     uint32_t pairs_per_head,
     uint32_t num_heads,
     uint32_t freq_stride) {
-  static_assert(std::is_same_v<T, fp16_t> || std::is_same_v<T, bf16_t>);
+  static_assert(std::is_same_v<T, fp16_t> || std::is_same_v<T, bf16_t> || std::is_same_v<T, fp32_t>);
   using Packed = packed_t<T>;
 
   auto* q_pairs = reinterpret_cast<Packed*>(q);
@@ -79,10 +79,18 @@ struct HeliosQKRoPEKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({N, H, D}).with_dtype<DType>().with_device(device).verify(q).verify(k);
-    TensorMatcher({N, F}).with_dtype<fp32_t>().with_device(device).verify(freqs);
+    int64_t batch = 1;
+    if (q.ndim() == 4) {
+      auto B = SymbolicSize{"batch"};
+      TensorMatcher({B, N, H, D}).with_dtype<DType>().with_device(device).verify(q).verify(k);
+      TensorMatcher({B, N, F}).with_dtype<fp32_t>().with_device(device).verify(freqs);
+      batch = B.unwrap();
+    } else {
+      TensorMatcher({N, H, D}).with_dtype<DType>().with_device(device).verify(q).verify(k);
+      TensorMatcher({N, F}).with_dtype<fp32_t>().with_device(device).verify(freqs);
+    }
 
-    const int64_t tokens = N.unwrap();
+    const int64_t tokens = batch * N.unwrap();
     const int64_t heads = H.unwrap();
     const int64_t head_dim = D.unwrap();
     const int64_t freq_dim = F.unwrap();

@@ -49,17 +49,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def(
       "deepseek_v4_topk_transform_512(Tensor scores, Tensor seq_lens, Tensor page_table, Tensor! "
-      "page_indices, int page_size, Tensor!? raw_indices) -> ()");
+      "page_indices, int page_size, Tensor!? raw_indices, bool sort_output=False) -> ()");
   m.impl("deepseek_v4_topk_transform_512", torch::kCUDA, &deepseek_v4_topk_transform_512);
-
-  m.def(
-      "dsv4_fused_q_norm_rope(Tensor q_input, Tensor! q_output, Tensor freqs_cis, Tensor positions, float eps) -> ()");
-  m.impl("dsv4_fused_q_norm_rope", torch::kCUDA, &dsv4_fused_q_norm_rope);
-
-  m.def(
-      "dsv4_fused_k_norm_rope_flashmla(Tensor kv, Tensor kv_weight, Tensor freqs_cis, Tensor positions, "
-      "Tensor out_loc, Tensor! kvcache, float eps, int page_size) -> ()");
-  m.impl("dsv4_fused_k_norm_rope_flashmla", torch::kCUDA, &dsv4_fused_k_norm_rope_flashmla);
 
   m.def(
       "dsv4_fused_q_indexer_rope_hadamard_quant(Tensor q_input, Tensor! q_fp8, Tensor weight, "
@@ -149,22 +140,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
 
   /*
-   * From csrc/speculative
-   */
-  m.def(
-      "verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
-      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
-      "Tensor target_predict) -> ()");
-  m.impl("verify_tree_greedy", torch::kCUDA, &verify_tree_greedy);
-
-  m.def(
-      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
-      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
-      "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> "
-      "()");
-  m.impl("build_tree_kernel_efficient", torch::kCUDA, &build_tree_kernel_efficient);
-
-  /*
    * From csrc/kvcacheio
    */
   m.def(
@@ -201,6 +176,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "transfer_kv_all_layer_mla_lf_pf(Tensor src_layers, Tensor dst, Tensor src_indices, Tensor dst_indices, "
       "int item_size, int dst_layout_dim, int num_layers, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kCUDA, &transfer_kv_all_layer_mla_lf_pf);
+  m.def("get_device_accessible_ptr(Tensor tensor, int device_index) -> int", &get_device_accessible_ptr);
   m.def(
       "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
       "page_size) -> ()");

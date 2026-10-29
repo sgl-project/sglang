@@ -9,6 +9,7 @@ pynvml. However, it should not initialize cuda context.
 import os
 from collections.abc import Callable
 from functools import lru_cache, wraps
+from pkgutil import resolve_name
 from typing import Any, TypeVar
 
 import psutil
@@ -23,7 +24,8 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import import_pynvml
+from sglang.multimodal_gen.third_party import pynvml
+from sglang.srt.environ import envs as srt_envs
 
 logger = init_logger(__name__)
 
@@ -37,8 +39,6 @@ _DYNAMIC_CUDNN_SDPA_BACKEND_CLS_STR = "sglang.multimodal_gen.runtime.layers.atte
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
-
-pynvml = import_pynvml()  # type: ignore[no-untyped-call]
 
 # pytorch 2.5 uses cudnn sdpa by default, which will cause crash on some models
 # see https://github.com/huggingface/diffusers/issues/9704 for details
@@ -155,15 +155,21 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
 
     @classmethod
     def resolve(cls, platform) -> str | AttentionBackendEnum:
-        try:
-            from sageattention import sageattn  # noqa: F401
-        except ImportError:
-            logger.info(
-                "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
-            )
-            return AttentionBackendEnum.FA
+        trtllm_gen = srt_envs.SGLANG_USE_SAGE_ATTENTION_IMPL.get().lower() in {
+            "trtllm_gen",
+            "trtllm-gen",
+        }
 
-        if platform.is_hopper():
+        if not trtllm_gen:
+            try:
+                from sageattention import sageattn  # noqa: F401
+            except ImportError:
+                logger.info(
+                    "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
+                )
+                return AttentionBackendEnum.FA
+
+        if not trtllm_gen and platform.is_hopper():
             try:
                 # fixed SM90 bindings retain the fake implementation under its own name
                 from sageattention.sm90_compile import (  # noqa: F401
@@ -258,12 +264,17 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError("Video Sparse Attention backend is not installed.") from e
 
 
+# The vendored Triton tile-64 kernel is written against Hopper and Blackwell
+# block-sparse geometry. sm80 (A100) is supported too: there the kernel selects
+# a raw-pointer load path, because Triton does not lower TMA descriptor loads
+# natively before Hopper (see vsa_h3_kernels.py). Older architectures still
+# fail closed.
+VSA_H3_CAPABILITIES = frozenset({(8, 0), (9, 0), (10, 0), (10, 3)})
+
+
 class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
-
-    # The vendored Triton tile-64 kernel is written against Hopper and
-    # Blackwell block-sparse geometry; older architectures fail closed.
-    supported_capabilities = {(9, 0), (10, 0), (10, 3)}
+    supported_capabilities = VSA_H3_CAPABILITIES
 
     @classmethod
     def resolve(cls, platform) -> str:
@@ -274,9 +285,9 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
         if capability_tuple not in cls.supported_capabilities:
             found = capability.as_version_str() if capability else "unknown"
             raise ValueError(
-                "VSA-H3 (video_sparse_attn_h3) needs compute capability 9.0 "
-                "(Hopper), 10.0 (B200 / GB200) or 10.3 (B300 / GB300); "
-                f"this device reports {found}."
+                "VSA-H3 (video_sparse_attn_h3) needs compute capability 8.0 "
+                "(A100), 9.0 (Hopper), 10.0 (B200 / GB200) or 10.3 "
+                f"(B300 / GB300); this device reports {found}."
             )
         try:
             from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (  # noqa: F401
@@ -289,6 +300,52 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
             raise ImportError(
                 "VSA-H3 attention needs Triton and the in-tree tile-64 "
                 "block-sparse kernel."
+            ) from e
+
+
+class _HybridWindowAttentionH3BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
+
+    # the window rides FlashAttention varlen: FA4 on SM100 / SM103 / SM120, FA3 on
+    # SM90; SM80 / SM86 / SM89 run FA3's Sm80 mainloop (FA2-class throughput)
+    supported_capabilities = {
+        (8, 0),
+        (8, 6),
+        (8, 9),
+        (9, 0),
+        (10, 0),
+        (10, 3),
+        (12, 0),
+    }
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        capability_tuple = (
+            (capability.major, capability.minor) if capability is not None else None
+        )
+        if capability_tuple not in cls.supported_capabilities:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "hybrid_window_attn_h3 (VDN-H3) needs compute capability 8.0 / "
+                "8.6 / 8.9 (Ampere, Ada), 9.0 (Hopper), 10.0 (B200 / GB200), "
+                "10.3 (B300 / GB300) or 12.0 (RTX PRO 6000 Blackwell); this "
+                f"device reports {found}."
+            )
+        if not platform._prepare_flash_attention_for_blackwell():
+            raise RuntimeError(
+                "hybrid_window_attn_h3 requires FlashAttention for its dense legs"
+            )
+        try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3 import (  # noqa: F401
+                HybridWindowAttentionH3Backend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3.HybridWindowAttentionH3Backend"
+        except Exception as e:
+            logger.error("Failed to import hybrid_window_attn_h3 backend: %s", str(e))
+            raise ImportError(
+                "hybrid_window_attn_h3 needs FlashAttention and Triton."
             ) from e
 
 
@@ -472,6 +529,36 @@ class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
         return AttentionBackendEnum.FA
 
 
+class _FP8FlashAttentionSM120BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.FP8_FA_SM120
+
+    # CuTe-DSL mma.sync FP8 kernel written for SM120 (GeForce RTX 50 / RTX PRO
+    # Blackwell). Dense non-causal head_dim 128 only; the backend itself falls
+    # back to cuDNN SDPA for other calls.
+    @classmethod
+    def resolve(cls, platform) -> str | AttentionBackendEnum:
+        if platform.get_device_capability() != (12, 0):
+            logger.warning(
+                "fp8_fa_sm120 attention needs an SM120 device; falling back to cuDNN SDPA."
+            )
+            return AttentionBackendEnum.TORCH_CUDNN_SDPA
+        try:
+            import cutlass.cute  # noqa: F401
+            import triton  # noqa: F401
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.fp8_fa_sm120_attn import (  # noqa: F401
+                FP8FlashAttentionSM120Backend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.fp8_fa_sm120_attn.FP8FlashAttentionSM120Backend"
+        except ImportError as error:
+            logger.warning(
+                "fp8_fa_sm120 attention backend failed to import (%s); falling back to cuDNN SDPA.",
+                error,
+            )
+            return AttentionBackendEnum.TORCH_CUDNN_SDPA
+
+
 _CUDA_ATTENTION_BACKEND_RESOLVERS = {
     resolver.backend: resolver
     for resolver in (
@@ -487,6 +574,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SpargeAttentionBackendResolver,
         _VideoSparseAttentionBackendResolver,
         _VideoSparseAttentionH3BackendResolver,
+        _HybridWindowAttentionH3BackendResolver,
         _CubeSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
         _SolAttnBackendResolver,
@@ -494,6 +582,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SubBlockSparseAttentionBackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
+        _FP8FlashAttentionSM120BackendResolver,
     )
 }
 
@@ -510,28 +599,16 @@ class CudaPlatformBase(Platform):
         return torch.device(f"cuda:{envs.LOCAL_RANK}")
 
     @classmethod
+    def synchronize(cls) -> None:
+        torch.cuda.synchronize()
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        torch.cuda.empty_cache()
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
-
-    @classmethod
-    def get_device_name(cls, device_id: int = 0) -> str:
-        raise NotImplementedError
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def get_device_total_memory(cls, device_id: int = 0) -> int:
-        raise NotImplementedError
-
-    @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable CUDA "
-                "graph. Since, enforce-eager is enabled, async output "
-                "processor cannot be used"
-            )
-            return False
-        return True
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -654,7 +731,9 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def _prepare_flash_attention_for_blackwell(cls) -> bool:
-        if not cls.is_blackwell():
+        # the FA4 CuTe package ships an sm120 forward kernel; the default FA backend
+        # still resolves to SDPA on SM120 before reaching this
+        if not (cls.is_blackwell() or cls.is_sm120()):
             return True
 
         try:
@@ -700,7 +779,11 @@ class CudaPlatformBase(Platform):
                 )
 
                 supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
-                if head_size not in supported_sizes:
+                # FA4 on sm100 serves every multiple of 8 up to 128, e.g. Qwen-VL vision heads (72, 80)
+                fa4_head_size = (
+                    cls.is_blackwell() and head_size <= 128 and head_size % 8 == 0
+                )
+                if head_size not in supported_sizes and not fa4_head_size:
                     logger.info(
                         "Cannot use FlashAttention backend for head size %d.",
                         head_size,
@@ -747,6 +830,14 @@ class CudaPlatformBase(Platform):
 
             resolved_backend = resolver.resolve(cls)
             if isinstance(resolved_backend, str):
+                if selected_backend == AttentionBackendEnum.SAGE_ATTN:
+                    backend_cls = resolve_name(resolved_backend)
+                    if head_size not in backend_cls.get_supported_head_sizes():
+                        # leave fallback policy to the component-aware selector
+                        raise ValueError(
+                            f"SageAttention 2 does not support head size {head_size}; "
+                            "supported head sizes are 1 through 128"
+                        )
                 return resolved_backend
             target_backend = resolved_backend
 
@@ -760,17 +851,24 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
-        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image
-        VAE decoder fast paths.
+        """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image /
+        MiniMax-H3 VAE fast paths.
 
-        Requests with quality="extra-high" or "high" run the fast paths; the
-        "lossless" default runs the original module path bit-for-bit. See
-        flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
+        Requests with quality="lossless" or "high" run the fast paths; the
+        "exact" default runs the original module path bit-for-bit. See
+        flux2_vae_cuda_opt, wan_vae_cuda_opt and minimax_h3_vae_cuda_opt for
+        details.
         """
         try:
             from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (
                 maybe_optimize_autoencoder_kl,
                 maybe_optimize_flux2_vae,
+            )
+            from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
+                maybe_optimize_minimax_h3_vae,
+            )
+            from sglang.multimodal_gen.runtime.models.vaes.qwen_image21_vae_cuda_opt import (
+                maybe_optimize_qwen_image21_vae,
             )
             from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
                 maybe_optimize_qwen_image_vae,
@@ -781,6 +879,8 @@ class CudaPlatformBase(Platform):
             vae = maybe_optimize_autoencoder_kl(vae)
             vae = maybe_optimize_wan_vae(vae)
             vae = maybe_optimize_qwen_image_vae(vae)
+            vae = maybe_optimize_qwen_image21_vae(vae)
+            vae = maybe_optimize_minimax_h3_vae(vae)
         except Exception:
             logger.warning(
                 "Failed to apply CUDA VAE optimizations; using the unmodified VAE.",

@@ -37,7 +37,8 @@ struct Params {
   const void* txt_k_weight;
   const void* img_cache;
   const void* txt_cache;
-  int64_t input_token_stride_bytes;
+  int64_t img_token_stride_bytes;
+  int64_t txt_token_stride_bytes;
   int64_t output_token_stride_bytes;
   int64_t head_stride_bytes;
   uint32_t img_tokens;
@@ -57,14 +58,15 @@ __global__ void qwen_qkv_epilogue_kernel(const Params __grid_constant__ params) 
   const uint32_t start = blockIdx.x * kWarps + warp;
   const uint32_t workers = gridDim.x * kWarps;
   const uint32_t total_tokens = params.txt_tokens + params.img_tokens;
-  const uint32_t token_head_works = total_tokens * params.num_heads;
-  const uint32_t total_works = 3 * token_head_works;
+  const uint32_t kind = blockIdx.y;  // Q, K, and V have independent grids.
+  const bool is_value = kind == 2;
+  const uint32_t v_heads = div_ceil(params.num_heads, uint32_t(2));
+  const uint32_t heads_per_token = is_value ? v_heads : params.num_heads;
+  const uint32_t total_works = total_tokens * heads_per_token;
 
   for (uint32_t work = start; work < total_works; work += workers) {
-    const uint32_t kind = work / token_head_works;  // 0: Q, 1: K, 2: V.
-    const uint32_t token_head = work % token_head_works;
-    const uint32_t joint_token = token_head / params.num_heads;
-    const uint32_t head = token_head % params.num_heads;
+    const uint32_t joint_token = work / heads_per_token;
+    const uint32_t head = (work % heads_per_token) * (is_value ? 2 : 1);
     const bool is_text = joint_token < params.txt_tokens;
     const uint32_t source_token = is_text ? joint_token : joint_token - params.txt_tokens;
 
@@ -81,16 +83,26 @@ __global__ void qwen_qkv_epilogue_kernel(const Params __grid_constant__ params) 
       output_base = params.joint_v;
     }
 
+    const auto input_token_stride_bytes = is_text ? params.txt_token_stride_bytes : params.img_token_stride_bytes;
     const void* input =
-        pointer::offset(input_base, source_token * params.input_token_stride_bytes, head * params.head_stride_bytes);
+        pointer::offset(input_base, source_token * input_token_stride_bytes, head * params.head_stride_bytes);
     void* output =
         pointer::offset(output_base, joint_token * params.output_token_stride_bytes, head * params.head_stride_bytes);
 
-    auto input_vec = load_as<Storage>(input, lane);
     if (kind == 2) {
-      store_as<Storage>(output, input_vec, lane);
+      // One warp copies two adjacent heads, keeping all V workers active while
+      // issuing twice as many bytes per memory instruction.
+      if (head + 1 < params.num_heads) {
+        using CopyStorage = AlignedVector<Packed, 2 * kVecSize>;
+        const auto input_vec = load_as<CopyStorage>(input, lane);
+        store_as<CopyStorage>(output, input_vec, lane);
+      } else {
+        const auto input_vec = load_as<Storage>(input, lane);
+        store_as<Storage>(output, input_vec, lane);
+      }
       continue;
     }
+    auto input_vec = load_as<Storage>(input, lane);
 
     const void* weight_base;
     if (kind == 0) {
@@ -123,15 +135,20 @@ __global__ void qwen_qkv_epilogue_kernel(const Params __grid_constant__ params) 
     const auto* cache = static_cast<const float*>(is_text ? params.txt_cache : params.img_cache);
     const auto* cos_ptr = cache + source_token * kHeadDim;
     const auto* sin_ptr = cos_ptr + kHeadDim / 2;
+    // Each lane consumes two adjacent cache entries. Loading them together
+    // avoids the half-used sectors from two stride-2 scalar loads.
+    const auto cos_pair = __ldg(reinterpret_cast<const float2*>(cos_ptr) + lane);
+    const auto sin_pair = __ldg(reinterpret_cast<const float2*>(sin_ptr) + lane);
 #pragma unroll
     for (uint32_t i = 0; i < kElemsPerThread; i += 2) {
       const float x = elems[i];
       const float y = elems[i + 1];
-      const uint32_t cache_idx = (lane * kElemsPerThread + i) / 2;
-      const float cos = __ldg(cos_ptr + cache_idx);
-      const float sin = __ldg(sin_ptr + cache_idx);
-      elems[i] = x * cos - y * sin;
-      elems[i + 1] = y * cos + x * sin;
+      const float cos = i == 0 ? cos_pair.x : cos_pair.y;
+      const float sin = i == 0 ? sin_pair.x : sin_pair.y;
+      // Preserve the original QKNorm/RoPE contraction: round the sin product
+      // before adding it to the fused cos product, including for vector loads.
+      elems[i] = __fmaf_rn(x, cos, -__fmul_rn(y, sin));
+      elems[i + 1] = __fmaf_rn(y, cos, __fmul_rn(x, sin));
     }
 
 #pragma unroll
@@ -204,7 +221,6 @@ struct QwenQKVEpilogueKernel {
     RuntimeCheck(
         txt_q.stride(0) == txt_k.stride(0) && txt_q.stride(0) == txt_v.stride(0),
         "text QKV inputs must use the same token stride");
-    RuntimeCheck(img_q.stride(0) == txt_q.stride(0), "image/text QKV token strides must match");
     RuntimeCheck(
         img_q.stride(1) == kHeadDim && img_k.stride(1) == kHeadDim && img_v.stride(1) == kHeadDim,
         "image QKV heads must be contiguous");
@@ -220,11 +236,10 @@ struct QwenQKVEpilogueKernel {
     const uint32_t img_tokens = static_cast<uint32_t>(NI.unwrap());
     const uint32_t txt_tokens = static_cast<uint32_t>(NT.unwrap());
     const uint32_t num_heads = static_cast<uint32_t>(H.unwrap());
-    const uint32_t total_works = 3 * (img_tokens + txt_tokens) * num_heads;
+    const uint32_t total_works = (img_tokens + txt_tokens) * num_heads;
     if (total_works == 0) return;
 
     const int64_t head_stride_bytes = kHeadDim * sizeof(bf16_t);
-    const int64_t input_token_stride_bytes = img_q.stride(0) * sizeof(bf16_t);
     const int64_t output_token_stride_bytes = num_heads * head_stride_bytes;
     const auto params = Params{
         .joint_q = joint_q.data_ptr(),
@@ -242,7 +257,8 @@ struct QwenQKVEpilogueKernel {
         .txt_k_weight = txt_k_weight.data_ptr(),
         .img_cache = img_cache.data_ptr(),
         .txt_cache = txt_cache.data_ptr(),
-        .input_token_stride_bytes = input_token_stride_bytes,
+        .img_token_stride_bytes = img_q.stride(0) * sizeof(bf16_t),
+        .txt_token_stride_bytes = txt_q.stride(0) * sizeof(bf16_t),
         .output_token_stride_bytes = output_token_stride_bytes,
         .head_stride_bytes = head_stride_bytes,
         .img_tokens = img_tokens,
@@ -256,7 +272,7 @@ struct QwenQKVEpilogueKernel {
     static const uint32_t blocks_per_sm = runtime::get_blocks_per_sm(qwen_qkv_epilogue_kernel, kThreads);
     const uint32_t needed_blocks = div_ceil(total_works, uint32_t(kWarps));
     const uint32_t blocks = std::min(blocks_per_sm * sm_count, needed_blocks);
-    LaunchKernel(blocks, kThreads, device.unwrap())(qwen_qkv_epilogue_kernel, params);
+    LaunchKernel(dim3(blocks, 3), kThreads, device.unwrap())(qwen_qkv_epilogue_kernel, params);
   }
 };
 

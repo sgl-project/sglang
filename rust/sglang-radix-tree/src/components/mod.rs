@@ -5,9 +5,9 @@ use std::collections::HashMap;
 
 use tch::Tensor;
 
-use crate::node::{ChildKeyType, NodeArena, NodeIdx_, TreeCoreRuntimeError};
+use crate::node::{ChildKeyType, Node, NodeArena, NodeId, NodeIdx_, TreeCoreRuntimeError};
 use crate::unified_tree_core::{
-    CacheAction, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertParams,
+    CacheActions, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertParams,
     InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult, PoolTransfer,
     PoolTransferResult, UnifiedTreeCore,
 };
@@ -60,6 +60,53 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// The component this driver serves.
     fn component_type(&self) -> ComponentType;
 
+    /// What the driver keeps of a cached prefix; the core finds the window
+    /// or state slot by its family, never by its id.
+    fn family(&self) -> Family;
+
+    /// Allocator slots reclaimed from this component's device value.
+    /// Roots and absent device values contribute zero; splits preserve the total.
+    fn reclaimable_value_len(&self, node: &Node<K>) -> usize {
+        node.device_reclaimable_value_len(self.component_type())
+    }
+
+    /// Drop component-owned metadata after the node is removed.
+    fn on_node_removed(&self, _node_id: NodeId) {}
+
+    /// Return the node's lock-segment UUID, minting and storing one when absent.
+    fn get_or_fill_uuid(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+        host: bool,
+    ) -> i64 {
+        let component_type = self.component_type();
+        let existing = match (self.family(), host) {
+            (Family::Token, true) => tree_core.arena.node(node_id).full_host_uuid,
+            (Family::Window, true) => tree_core.arena.node(node_id).swa_host_uuid,
+            (Family::Window, false) => tree_core.arena.node(node_id).swa_uuid,
+            (Family::Token, false) => {
+                panic!("get_or_fill_uuid is unsupported for token device locks")
+            }
+            (Family::State, _) => {
+                panic!("get_or_fill_uuid is unsupported for state slots")
+            }
+        };
+        if let Some(uuid) = existing {
+            return uuid;
+        }
+
+        let uuid = tree_core.next_component_uuid_(component_type);
+        let node = tree_core.arena.node_mut(node_id);
+        match (self.family(), host) {
+            (Family::Token, true) => node.full_host_uuid = Some(uuid),
+            (Family::Window, true) => node.swa_host_uuid = Some(uuid),
+            (Family::Window, false) => node.swa_uuid = Some(uuid),
+            (Family::Token, false) | (Family::State, _) => unreachable!(),
+        }
+        uuid
+    }
+
     /// Whether this component has device data that still needs a host backup.
     fn needs_incremental_backup(
         &self,
@@ -76,7 +123,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         phase: LRURefreshPhase,
         node_id: NodeIdx_,
     ) {
-        // Python reference — tree_component.py::TreeComponent.refresh_lru:
+        // Python reference — base.py::TreeComponent.refresh_lru:
         //     def refresh_lru(
         //         self,
         //         phase: LRURefreshPhase,
@@ -104,7 +151,7 @@ pub trait TreeComponent<K: ChildKeyType> {
 
     /// Return a per-match stateful predicate deciding whether a node is a valid
     /// match boundary for this component.
-    // Python reference — tree_component.py::TreeComponent.create_match_validator:
+    // Python reference — base.py::TreeComponent.create_match_validator:
     //     @abstractmethod
     //     def create_match_validator(
     //         self, match_device_only: bool = False
@@ -130,6 +177,8 @@ pub trait TreeComponent<K: ChildKeyType> {
         &self,
         tree_core: &UnifiedTreeCore<K>,
         result: MatchResult,
+        _last_device_node_idx: NodeIdx_,
+        _best_match_node_idx: NodeIdx_,
         params: &MatchPrefixParams<'_, K>,
         value_chunks: &[Tensor],
         best_value_len: usize,
@@ -138,6 +187,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     }
 
     /// Called per-node when an insert's key overlaps an existing node.
+    /// `preserve_full_ids` keeps canonical FULL IDs during auxiliary recovery.
     /// Returns the index within `value_slice` from which this component
     /// consumed (took ownership of) the underlying KV pool slots.
     /// Returns `prefix_len` if nothing was consumed (default).
@@ -151,8 +201,9 @@ pub trait TreeComponent<K: ChildKeyType> {
         total_prefix_len: usize,
         value_slice: Tensor,
         params: &InsertParams<'_, K>,
+        preserve_full_ids: bool,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) -> usize {
         prefix_len
     }
@@ -169,7 +220,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         total_prefix_len: usize,
         params: &InsertParams<'_, K>,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
     }
 
@@ -192,7 +243,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         is_new_leaf: bool,
         params: &InsertParams<'_, K>,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
     }
 
@@ -204,12 +255,13 @@ pub trait TreeComponent<K: ChildKeyType> {
         tail_node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
     ) {
     }
 
     /// Redistribute component data between `new_parent` and `child` when a node is
     /// split; `new_parent` is the newly created prefix node.
-    // Python reference — tree_component.py::TreeComponent.redistribute_on_node_split:
+    // Python reference — base.py::TreeComponent.redistribute_on_node_split:
     //     @abstractmethod
     //     def redistribute_on_node_split(
     //         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -232,7 +284,7 @@ pub trait TreeComponent<K: ChildKeyType> {
 
     /// Free this component's KV resources on a node being evicted; returns
     /// (device_freed, host_freed) token counts.
-    // Python reference — tree_component.py::TreeComponent.evict_component:
+    // Python reference — base.py::TreeComponent.evict_component:
     //     @abstractmethod
     //     def evict_component(
     //         self,
@@ -259,6 +311,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) -> (usize, usize);
 
@@ -281,13 +334,14 @@ pub trait TreeComponent<K: ChildKeyType> {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_>;
 
     /// Clear this component's device-eviction walk state.
     fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K>);
 
     /// Increment component lock refs, protecting nodes from eviction.
-    // Python reference — tree_component.py::TreeComponent.acquire_component_lock:
+    // Python reference — base.py::TreeComponent.acquire_component_lock:
     //     @abstractmethod
     //     def acquire_component_lock(
     //         self,
@@ -306,7 +360,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     //           node itself (mamba state is per-leaf, not per-path).
     //
     //         When ``lock_host`` is True, the lock applies to host-side state:
-    //         - Full: single-node host lock.
+    //         - Full: a one-node UUID-bounded segment that expands across splits.
     //         - SWA: host window-lock with a dedicated host UUID boundary.
     //         - Mamba: single-node host lock with host LRU detach."""
     //         ...
@@ -319,7 +373,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     ) -> IncLockRefResult;
 
     /// Decrement component lock refs, un-protecting nodes.
-    // Python reference — tree_component.py::TreeComponent.release_component_lock:
+    // Python reference — base.py::TreeComponent.release_component_lock:
     //     @abstractmethod
     //     def release_component_lock(
     //         self,
@@ -336,13 +390,14 @@ pub trait TreeComponent<K: ChildKeyType> {
     //         - Mamba: single-node unlock — only decrements lock_ref on the
     //           node itself.
     //
-    //         When ``lock_host`` is True, the inverse host-side semantics apply."""
+    //         When ``lock_host`` is True, Full and SWA replay their host boundary
+    //         UUIDs while Mamba retains its single-node semantics."""
     //         ...
     fn release_component_lock(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
         lock_host: bool,
     );
 
@@ -352,9 +407,10 @@ pub trait TreeComponent<K: ChildKeyType> {
         &self,
         _tree_core: &mut UnifiedTreeCore<K>,
         _node_id: NodeIdx_,
-        _swa_uuid_for_lock: Option<i64>,
+        _params: &DecLockRefParams,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) {
         unimplemented!("release_window_lock is SWA-only")
     }
@@ -370,9 +426,10 @@ pub trait TreeComponent<K: ChildKeyType> {
         host_indices: Option<Tensor>,
         token_ids: Option<&[i64]>,
         prefetch_tokens: usize,
+        staging_tokens: usize,
         last_hash: Option<&str>,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
-        // Python reference — tree_component.py::TreeComponent.build_hicache_transfers:
+        // Python reference — base.py::TreeComponent.build_hicache_transfers:
         //     def build_hicache_transfers(
         //         self,
         //         node: UnifiedTreeNode,
@@ -382,12 +439,22 @@ pub trait TreeComponent<K: ChildKeyType> {
         //         host_indices: Optional[torch.Tensor] = None,
         //         token_ids: Optional[Sequence[int]] = None,
         //         prefetch_tokens: int = 0,
+        //         staging_tokens: int = 0,
         //         last_hash: Optional[str] = None,
         //     ) -> Optional[list[PoolTransfer]]:
         //         """Build transfer descriptors for this component in the given phase.
         //         Returns None if the component has nothing to transfer."""
         //         return None
         unimplemented!("TreeComponent.build_hicache_transfers")
+    }
+
+    /// Build this component's direct device-to-external-store transfer for a node.
+    fn build_external_linker_offload_transfer(
+        &self,
+        _tree_core: &UnifiedTreeCore<K>,
+        _node_id: NodeIdx_,
+    ) -> Option<PoolTransfer> {
+        None
     }
 
     /// Post-transfer bookkeeping: store host indices, update LRU, etc.
@@ -397,11 +464,11 @@ pub trait TreeComponent<K: ChildKeyType> {
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
         transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         insert_result: Option<&mut InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
-        // Python reference — tree_component.py::TreeComponent.commit_hicache_transfer:
+        // Python reference — base.py::TreeComponent.commit_hicache_transfer:
         //     def commit_hicache_transfer(
         //         self,
         //         node: UnifiedTreeNode,
@@ -426,6 +493,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) {
     }
 
@@ -439,11 +507,62 @@ pub trait TreeComponent<K: ChildKeyType> {
         _tracker: &mut HashMap<ComponentType, usize>,
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
     ) {
     }
 }
 
 // Tree component types.
+
+/// What a tree slot keeps of a cached prefix: every token (`Token`), the
+/// trailing window (`Window`) or recurrent state checkpoints (`State`). The
+/// plan gives each slot its family; behavior follows the family, the slot id
+/// only names the slot.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub enum Family {
+    Token = 0,
+    Window = 1,
+    State = 2,
+}
+
+/// The slot id the native driver of `family` serves. Each native driver
+/// serves one fixed slot today; several window slots need per-instance ids.
+pub const fn native_slot(family: Family) -> ComponentType {
+    match family {
+        Family::Token => FULL,
+        Family::Window => SWA,
+        Family::State => MAMBA,
+    }
+}
+
+/// The family whose native driver serves `slot`, for callers that name slots
+/// by id (tests).
+pub fn native_family(slot: ComponentType) -> Family {
+    [Family::Token, Family::Window, Family::State]
+        .into_iter()
+        .find(|&family| native_slot(family) == slot)
+        .unwrap_or_else(|| panic!("no native driver serves slot {slot:?}"))
+}
+
+impl Family {
+    /// Families per tree; arrays indexed by `Family::idx` are sized to this.
+    pub const COUNT: usize = Family::State as usize + 1;
+
+    /// Index into a per-family array.
+    pub const fn idx(self) -> usize {
+        self as usize
+    }
+
+    /// The family a tree slot names (`TreeSlot.family` on the Python side).
+    pub fn parse(name: &str) -> Option<Family> {
+        match name {
+            "token" => Some(Family::Token),
+            "window" => Some(Family::Window),
+            "state" => Some(Family::State),
+            _ => None,
+        }
+    }
+}
 
 /// The tree components; discriminants define the per-component array indexes.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
@@ -463,6 +582,49 @@ pub const BASE_COMPONENT_TYPE: ComponentType = ComponentType::Full;
 
 /// Slots per tier — the arrays are sized to this, not the enabled subset.
 pub const NUM_COMPONENT_TYPES: usize = ComponentType::Mamba as usize + 1;
+
+/// A set of component types (bitmask over `ComponentType::idx`), e.g. the
+/// components an `inc_lock_ref` left untaken.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub struct ComponentSet(u8);
+
+impl ComponentSet {
+    pub const EMPTY: ComponentSet = ComponentSet(0);
+
+    /// The set holding exactly one component.
+    pub const fn of(component_type: ComponentType) -> ComponentSet {
+        ComponentSet(1 << component_type.idx())
+    }
+
+    pub fn insert(&mut self, component_type: ComponentType) {
+        self.0 |= 1 << component_type.idx();
+    }
+
+    pub const fn contains(self, component_type: ComponentType) -> bool {
+        self.0 & (1 << component_type.idx()) != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The members, in component-index order.
+    pub fn iter(self) -> impl Iterator<Item = ComponentType> {
+        (0..NUM_COMPONENT_TYPES)
+            .filter(move |idx| self.0 & (1 << idx) != 0)
+            .map(ComponentType::from_idx)
+    }
+}
+
+impl FromIterator<ComponentType> for ComponentSet {
+    fn from_iter<I: IntoIterator<Item = ComponentType>>(iter: I) -> Self {
+        let mut set = ComponentSet::EMPTY;
+        for component_type in iter {
+            set.insert(component_type);
+        }
+        set
+    }
+}
 
 impl ComponentType {
     /// Index into a per-component array.

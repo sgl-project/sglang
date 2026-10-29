@@ -17,7 +17,8 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.utils.common import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +37,14 @@ def handle_offload_compatibility(server_args: Any) -> None:
             "would stage the pinned PLE embedding back to the device."
         )
 
+    if cfg.ple_offload_backend == "file" and cfg.ple_offload_embedding is False:
+        raise ValueError(
+            "--ple-offload-backend file requires --ple-offload-embedding: "
+            "the file-backed table is the offloaded table."
+        )
 
-def handle_gpu_memory_settings(server_args: Any, gpu_mem):
+
+def handle_gpu_memory_settings(server_args: Any):
     """
     Configure GPU memory-dependent settings including
     chunked_prefill_size, cuda_graph_config[decode].max_bs, and mem_fraction_static.
@@ -68,10 +75,12 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
     )
 
     cfg = resolving_view(server_args)
+    gpu_mem = get_device_memory_capacity(cfg.device)
     # A copy, so an earlier declaration keeps the value it recorded.
     cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
     decode_cuda_graph_config = cuda_graph_config.decode
     prefill_cuda_graph_config = cuda_graph_config.prefill
+    decode_max_bs_is_default = decode_cuda_graph_config.max_bs is None
 
     # ------------------------------------------------------------------
     # GPU-dependent capacity defaults
@@ -170,10 +179,25 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         if decode_cuda_graph_config.max_bs is None:
             decode_cuda_graph_config.max_bs = 160
 
+    if (
+        decode_max_bs_is_default
+        and cfg.max_running_requests is not None
+        and decode_cuda_graph_config.max_bs is not None
+        and decode_cuda_graph_config.max_bs > cfg.max_running_requests
+    ):
+        decode_cuda_graph_config.max_bs = cfg.max_running_requests
+
+    from sglang.srt.arg_groups.model_overrides.qwen3_vl import (
+        expand_multimodal_decode_graph_to_running_limit,
+    )
+
+    expand_multimodal_decode_graph_to_running_limit(
+        server_args, decode_cuda_graph_config, gpu_mem
+    )
+
     # ------------------------------------------------------------------
     # CUDA graph batch-size materialization
     # ------------------------------------------------------------------
-
     if cfg.device != "cpu":
         if decode_cuda_graph_config.bs is None:
             decode_cuda_graph_config.bs = generate_decode_cuda_graph_batch_sizes(
@@ -207,13 +231,11 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         decode_cuda_graph_config.max_bs = cfg.torch_compile_max_bs
 
     if prefill_cuda_graph_config.max_bs is None:
-        # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
-        # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
-        # To avoid the performance regression, we set max_bs to 2048 by default.
+        # Default to the chunked prefill size; cap MLA capture at 8192 tokens.
         if not use_mla_backend(server_args):
             prefill_cuda_graph_config.max_bs = cfg.chunked_prefill_size
         else:
-            prefill_cuda_graph_config.max_bs = 2048
+            prefill_cuda_graph_config.max_bs = min(8192, cfg.chunked_prefill_size)
 
         # For opt-in PP breakable graphs, capture small aggregate-token
         # buckets by default and leave larger forwards on the eager path.
@@ -346,14 +368,14 @@ def reserve_for_graph_mb(server_args: Any) -> float:
         reserved_mem += decode_cuda_graph_config.max_bs * 2
 
     if (
-        resolved_view(server_args).enable_dp_attention
+        attn_dp_enabled_of(resolved_view(server_args))
         and cfg.disaggregation_mode != "prefill"
     ):
         # DP attention needs more padding for some operations, and much more for large
         # cuda graph max bs (torch allocator / implementation inefficiencies).
-        reserved_mem += decode_cuda_graph_config.max_bs * cfg.dp_size * 3
+        reserved_mem += decode_cuda_graph_config.max_bs * cfg.attn_dp_size * 3
         if decode_cuda_graph_config.max_bs > 300:
-            reserved_mem += decode_cuda_graph_config.max_bs * cfg.dp_size * 1.5
+            reserved_mem += decode_cuda_graph_config.max_bs * cfg.attn_dp_size * 1.5
 
     if (
         cfg.disaggregation_mode != "decode"

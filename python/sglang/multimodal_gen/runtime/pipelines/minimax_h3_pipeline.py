@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 import shutil
+from dataclasses import replace
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
@@ -26,6 +29,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+    MINIMAX_H3_TASK_PARTITIONS,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -45,7 +51,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         # scheduler intentionally absent: model_index carries scheduler=null;
         # per-modality sigma schedules are generated in TimestepPreparation
         # from the task profile, and the loop scheduler math lives in
-        # scheduling_minimax_h3_euler_ancestral (stages accept scheduler=None).
+        # minimax_h3/denoise_loop.py (stages accept scheduler=None).
         "transformer",
     ]
 
@@ -75,6 +81,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         subfolders = {
             "fl2va": "FL2VA",
             "ref2va": "Ref2VA",
+            "hybrid": "Ref2VA",
         }
         try:
             return subfolders[normalized]
@@ -88,6 +95,14 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         model_variant = self.server_args.model_variant
         if model_variant is not None:
             semantic_subfolder = self.model_subfolder_for_variant(model_variant)
+            if model_variant.strip().lower() == "hybrid" and not (
+                self.server_args.component_weights_paths.get("transformer")
+                or self.server_args.transformer_weights_path
+            ):
+                raise ValueError(
+                    "MiniMax H3 --model-variant hybrid requires explicit merged "
+                    "weights via --component-weights-paths.transformer"
+                )
             explicit_subfolder = self.server_args.model_subfolder
             if (
                 explicit_subfolder is not None
@@ -104,11 +119,19 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.release_metadata = MiniMaxH3ReleaseMetadata.from_model_index(model_index)
         if (
             model_variant is not None
-            and self.release_metadata.partition != model_variant.strip().lower()
+            and self.release_metadata.partition != semantic_subfolder.lower()
         ):
             raise ValueError(
                 "MiniMax H3 loaded checkpoint partition does not match "
                 f"--model-variant {model_variant!r}"
+            )
+        if model_variant is not None and model_variant.strip().lower() == "hybrid":
+            # merged checkpoints share the native graph across all three tasks
+            # keep the base partition contract strict unless explicitly selected
+            self.release_metadata = replace(
+                self.release_metadata,
+                partition="hybrid",
+                tasks=tuple(MINIMAX_H3_TASK_PARTITIONS),
             )
         return model_index
 
@@ -118,6 +141,25 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 "MiniMaxH3Pipeline only supports monolithic deployment; "
                 f"disaggregation role {role.value!r} is not supported"
             )
+
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        self.pdd_heads = self._resolve_pdd_heads()
+        transformer = self.get_module("transformer")
+        if (
+            self.pdd_heads
+            and transformer is not None
+            and transformer.final_layer._pdd_heads is None
+        ):
+            transformer.final_layer.load_pdd_fused_heads(self.pdd_heads)
+
+    def _resolve_pdd_heads(self) -> str | None:
+        """The env override, else a PDD release's own fused heads."""
+        if envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS:
+            return envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
+        release_metadata = getattr(self, "release_metadata", None)
+        if release_metadata is None or release_metadata.pdd_fused_heads is None:
+            return None
+        return os.path.join(self.model_path, release_metadata.pdd_fused_heads)
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         # Per-model sigma override from model_index.json; contract tests
@@ -154,6 +196,12 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             MiniMaxH3TimestepPreparationStage(
                 sigma_shift_scales=sigma_shift_scales,
+                dmd_denoising_steps=(
+                    release_metadata.dmd_denoising_steps
+                    if release_metadata is not None
+                    else None
+                ),
+                pdd_heads=getattr(self, "pdd_heads", None),
             )
         )
         self.add_stage(
@@ -169,12 +217,22 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             )
         )
 
+    def create_comfyui_stages(self, server_args: ServerArgs) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
+            MiniMaxH3ComfyUIStepStage,
+        )
+
+        self.add_stage(
+            MiniMaxH3ComfyUIStepStage(transformer=self.get_module("transformer"))
+        )
+
 
 class FastH3Pipeline(MiniMaxH3Pipeline):
-    """FastH3: 4-step DMD2-distilled MiniMax-H3 (t2va only).
+    """FastH3: 8-step DMD2-distilled MiniMax-H3 (V2, t2va only), and the
+    FastH3 Omni Ref2VA PDD student.
 
     The flat single-partition repo is materialized into the base-H3 layout by
-    the bundled model overlay (see model_overlays/), so every stage, loader,
+    its registered model overlay (see runtime/utils/model_overlay.py), so every stage, loader,
     and admission path below is exactly the MiniMax-H3 one. There is no
     FL2VA/Ref2VA partition layout to default into.
     """

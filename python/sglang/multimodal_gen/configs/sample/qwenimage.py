@@ -40,3 +40,7 @@ class QwenImageLayeredSamplingParams(QwenImageSamplingParams):
     num_inference_steps: int = 50
     cfg_normalize: bool = True
     use_en_prompt: bool = True
+
+    @property
+    def num_samples_per_request(self) -> int:
+        return self.num_frames

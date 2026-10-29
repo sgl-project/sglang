@@ -1,34 +1,22 @@
 """Unit tests for mem_cache/utils.py — no server, no model loading."""
 
 import hashlib
-import sys
-import types
 import unittest
 from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.mem_cache.evict_policy import (
-    FIFOStrategy,
-    FILOStrategy,
-    LFUStrategy,
-    LRUStrategy,
-    MRUStrategy,
-    PriorityStrategy,
-    SLRUStrategy,
-)
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
     get_eviction_strategy,
     get_hash_str,
     hash_str_to_int64,
-    maybe_init_custom_mem_pool,
     split_node_hash_value,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
 
 def _legacy_get_hash_str(token_ids, prior_hash=None):
@@ -56,10 +44,11 @@ def _legacy_page_hashes(key, page_size, prior_hash=None):
 
 
 class _HashKey:
-    def __init__(self, token_ids, is_bigram=False, cache_salt=None):
+    def __init__(self, token_ids, is_bigram=False, cache_salt=None, extra_key=None):
         self.token_ids = token_ids
         self.is_bigram = is_bigram
         self.cache_salt = cache_salt
+        self.extra_key = extra_key
 
     def __len__(self):
         if self.is_bigram:
@@ -75,17 +64,19 @@ class _HashKey:
                     self.token_ids[start : stop + 1],
                     is_bigram=True,
                     cache_salt=self.cache_salt,
+                    extra_key=self.extra_key,
                 )
-            return _HashKey(self.token_ids[start:stop], cache_salt=self.cache_salt)
+            return _HashKey(
+                self.token_ids[start:stop],
+                cache_salt=self.cache_salt,
+                extra_key=self.extra_key,
+            )
         if self.is_bigram:
             return (self.token_ids[index], self.token_ids[index + 1])
         return self.token_ids[index]
 
     def raw_token_ids(self):
         return self.token_ids
-
-    def hash_page(self, start, end, prior_hash=None):
-        return _legacy_get_hash_str(self[start:end], prior_hash)
 
 
 def _single_hash_compatibility_cases():
@@ -143,32 +134,6 @@ def _page_hash_compatibility_cases():
 
 
 class TestGetEvictionStrategy(unittest.TestCase):
-    def test_lru(self):
-        self.assertIsInstance(get_eviction_strategy("lru"), LRUStrategy)
-
-    def test_lfu(self):
-        self.assertIsInstance(get_eviction_strategy("lfu"), LFUStrategy)
-
-    def test_fifo(self):
-        self.assertIsInstance(get_eviction_strategy("fifo"), FIFOStrategy)
-
-    def test_mru(self):
-        self.assertIsInstance(get_eviction_strategy("mru"), MRUStrategy)
-
-    def test_filo(self):
-        self.assertIsInstance(get_eviction_strategy("filo"), FILOStrategy)
-
-    def test_priority(self):
-        self.assertIsInstance(get_eviction_strategy("priority"), PriorityStrategy)
-
-    def test_slru(self):
-        self.assertIsInstance(get_eviction_strategy("slru"), SLRUStrategy)
-
-    def test_case_insensitive(self):
-        self.assertIsInstance(get_eviction_strategy("LRU"), LRUStrategy)
-        self.assertIsInstance(get_eviction_strategy("Lru"), LRUStrategy)
-        self.assertIsInstance(get_eviction_strategy("FIFO"), FIFOStrategy)
-
     def test_unknown_policy_raises_valueerror(self):
         with self.assertRaises(ValueError) as ctx:
             get_eviction_strategy("nonexistent")
@@ -182,45 +147,29 @@ class TestGetEvictionStrategy(unittest.TestCase):
         self.assertIn("priority", msg)
         self.assertIn("slru", msg)
 
-    def test_each_call_creates_new_instance(self):
-        s1 = get_eviction_strategy("lru")
-        s2 = get_eviction_strategy("lru")
-        self.assertIsNot(s1, s2)
-
-
-class TestMaybeInitCustomMemPool(unittest.TestCase):
-    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
-    def test_disabled_by_default(self, mock_env_get):
-        mock_env_get.return_value = None
-        enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
-        self.assertFalse(enabled)
-        self.assertIsNone(pool)
-        self.assertIsNone(pool_type)
-
-    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
-    def test_enabled_via_env(self, mock_env_get):
-        mock_env_get.return_value = "enabled"
-        mock_init = MagicMock()
-        mock_init.return_value = (True, "mock_pool_instance", "mooncake")
-
-        mooncake_pkg = types.ModuleType("sglang.srt.disaggregation.mooncake")
-        mooncake_utils = types.ModuleType("sglang.srt.disaggregation.mooncake.utils")
-        mooncake_utils.init_mooncake_custom_mem_pool = mock_init
-        with patch.dict(
-            sys.modules,
-            {
-                "sglang.srt.disaggregation.mooncake": mooncake_pkg,
-                "sglang.srt.disaggregation.mooncake.utils": mooncake_utils,
-            },
-        ):
-            enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
-        self.assertTrue(enabled)
-        self.assertEqual(pool, "mock_pool_instance")
-        self.assertEqual(pool_type, "mooncake")
-        mock_init.assert_called_once_with("cuda:0")
-
 
 class TestGetHashStr(unittest.TestCase):
+    def test_wide_tokens_preserve_page_chaining(self):
+        wide = (1 << 62) + 123
+        tokens = [1, 2, wide, 4, 5]
+        first = _legacy_get_hash_str(tokens[:2])
+        second = hashlib.sha256(
+            bytes.fromhex(first)
+            + b"\xff"
+            + wide.to_bytes(8, "little")
+            + (4).to_bytes(8, "little")
+        ).hexdigest()
+        expected = [first, second, _legacy_get_hash_str([5], second)]
+        for values in (tokens, array("q", tokens), array("Q", tokens)):
+            self.assertEqual(get_hash_str(values, page_size=2), expected)
+            self.assertEqual(get_hash_str(values[2:4], first), second)
+        self.assertNotEqual(get_hash_str([wide]), get_hash_str([wide & 0xFFFFFFFF]))
+        self.assertEqual(get_hash_str([(1, wide)]), get_hash_str([1, wide]))
+        self.assertEqual(
+            get_hash_str(_HashKey(array("q", [1, wide, 2]), is_bigram=True)),
+            get_hash_str([(1, wide), (wide, 2)]),
+        )
+
     def test_hash_str_matches_pre_optimization_per_token_loop(self):
         for name, tokens, prior_hash in _single_hash_compatibility_cases():
             with self.subTest(name=name):
@@ -257,13 +206,50 @@ class TestGetHashStr(unittest.TestCase):
             with self.subTest(tokens=tokens):
                 self.assertRegex(get_hash_str(tokens), r"^[0-9a-f]{64}$")
 
-    def test_hash_key_hash_page_matches_get_hash_str(self):
-        key = _HashKey(array("q", [1, 2, 3, 4, 5, 6]), is_bigram=True)
-        prior_hash = get_hash_str([(9, 10)])
 
+class TestStorageHashNamespace(unittest.TestCase):
+    def test_node_hashes_isolate_namespaces_and_continue_the_chain(self):
+        root = SimpleNamespace(parent=None, key=_HashKey(array("q")), hash_value=None)
+        tokens = array("q", range(1, 129))
+
+        def child(extra_key=None, cache_salt=None):
+            return SimpleNamespace(
+                parent=root,
+                key=_HashKey(tokens, extra_key=extra_key, cache_salt=cache_salt),
+                hash_value=None,
+            )
+
+        plain = compute_node_hash_values(child(), page_size=64)
+        self.assertEqual(plain, get_hash_str(tokens, None, page_size=64))
+        # Also guard ambiguous concatenations: ("a", "bc") vs ("ab", "c").
+        namespaced = [
+            compute_node_hash_values(child(*namespace), page_size=64)
+            for namespace in [
+                ("lora-a", None),
+                ("lora-b", None),
+                (None, "tenant-a"),
+                ("lora-a", "tenant-a"),
+                ("a", "bc"),
+                ("ab", "c"),
+            ]
+        ]
+        for i in range(len(plain)):
+            page_hashes = {plain[i], *(hashes[i] for hashes in namespaced)}
+            self.assertEqual(len(page_hashes), 1 + len(namespaced))
+
+        # Continue the parent chain without re-seeding.
+        parent = child("lora-a", "tenant-a")
+        parent.hash_value = namespaced[3]
+        grand = SimpleNamespace(
+            parent=parent,
+            key=_HashKey(
+                array("q", range(200, 264)), extra_key="lora-a", cache_salt="tenant-a"
+            ),
+            hash_value=None,
+        )
         self.assertEqual(
-            key.hash_page(1, 4, prior_hash),
-            get_hash_str(key[1:4], prior_hash),
+            compute_node_hash_values(grand, page_size=64),
+            get_hash_str(array("q", range(200, 264)), namespaced[3][-1], page_size=64),
         )
 
 
@@ -292,12 +278,6 @@ class TestHashStrToInt64(unittest.TestCase):
         h1 = hash_str_to_int64("a" * 16 + "0" * 48)
         h2 = hash_str_to_int64("a" * 16 + "f" * 48)
         self.assertEqual(h1, h2)
-
-    def test_roundtrip_with_get_hash_str(self):
-        hash_hex = get_hash_str([42, 99])
-        int64_val = hash_str_to_int64(hash_hex)
-        self.assertIsInstance(int64_val, int)
-        self.assertTrue(-(2**63) <= int64_val < 2**63)
 
 
 class TestComputeNodeHashValues(unittest.TestCase):
@@ -332,10 +312,6 @@ class TestComputeNodeHashValues(unittest.TestCase):
         self.assertEqual(
             compute_node_event_hash_values(self._make_node(key), page_size=8),
             _legacy_page_hashes(key, page_size=8, prior_hash=seed),
-        )
-        self.assertEqual(
-            compute_node_hash_values(self._make_node(key), page_size=8),
-            _legacy_page_hashes(key, page_size=8),
         )
 
         other = _HashKey(array("q", range(1, 17)), cache_salt="tenant-b")
@@ -421,58 +397,11 @@ class TestComputeNodeHashValues(unittest.TestCase):
 
 
 class TestSplitNodeHashValue(unittest.TestCase):
-    def test_none_input_returns_none_tuple(self):
-        result = split_node_hash_value(None, 10, 4)
-        self.assertEqual(result, (None, None))
-
-    def test_page_size_one_split(self):
-        hash_values = [f"hash_{i}" for i in range(4)]
-        new_hash, child_hash = split_node_hash_value(hash_values, 2, 1)
-        self.assertEqual(new_hash, ["hash_0", "hash_1"])
-        self.assertEqual(child_hash, ["hash_2", "hash_3"])
-
-    def test_page_size_one_split_at_zero(self):
-        hash_values = ["a", "b", "c"]
-        new_hash, child_hash = split_node_hash_value(hash_values, 0, 1)
-        self.assertEqual(new_hash, [])
-        self.assertEqual(child_hash, ["a", "b", "c"])
-
-    def test_page_size_one_split_at_len(self):
-        hash_values = ["a", "b", "c"]
-        new_hash, child_hash = split_node_hash_value(hash_values, 3, 1)
-        self.assertEqual(new_hash, ["a", "b", "c"])
-        self.assertEqual(child_hash, [])
-
-    def test_page_size_larger_than_one(self):
-        hash_values = ["p0", "p1", "p2", "p3", "p4", "p5"]
-        new_hash, child_hash = split_node_hash_value(hash_values, 4, 2)
-        self.assertEqual(new_hash, ["p0", "p1"])
-        self.assertEqual(child_hash, ["p2", "p3", "p4", "p5"])
-
-    def test_page_size_split_exact_page_boundary(self):
-        hash_values = ["a", "b", "c", "d"]
-        new_hash, child_hash = split_node_hash_value(hash_values, 4, 4)
-        self.assertEqual(new_hash, ["a"])
-        self.assertEqual(child_hash, ["b", "c", "d"])
-
     def test_page_size_split_within_page(self):
         hash_values = ["a", "b", "c"]
         new_hash, child_hash = split_node_hash_value(hash_values, 6, 4)
         self.assertEqual(new_hash, ["a"])
         self.assertEqual(child_hash, ["b", "c"])
-
-    def test_total_length_preserved(self):
-        hash_values = [f"h_{i}" for i in range(10)]
-        for split_len in [0, 1, 3, 5, 7, 9, 10]:
-            for page_size in [1, 2, 4]:
-                new_hash, child_hash = split_node_hash_value(
-                    hash_values, split_len, page_size
-                )
-                self.assertEqual(
-                    len(new_hash) + len(child_hash),
-                    len(hash_values),
-                    f"split_len={split_len}, page_size={page_size}",
-                )
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
@@ -105,7 +106,11 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
             )
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in Attention TP>1 case)
-        if isinstance(layer, RowParallelLinear) and layer.tp_rank > 0:
+        if (
+            isinstance(layer, RowParallelLinear)
+            and layer.tp_group is not None
+            and layer.tp_group.rank_in_group > 0
+        ):
             quant_bias = None
         else:
             quant_bias = layer.quant_bias
@@ -200,10 +205,15 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         weight = layer.weight.data
         if weight.dtype == torch.float8_e4m3fn:
             # Offline (ModelSlim) path: weight is already MXFP8-quantised and
-            # layer.weight_scale holds the uint8 block scales [out, in/32]. Only
-            # re-layout to [in, out] / [in//64, out, 2] strided views below.
+            # layer.weight_scale holds one uint8 scale per 32 input elements.
+            # Pair the scales for the NPU kernel, padding an odd final count
+            # (e.g. K=4304 -> 135 scales -> 136 -> 68 pairs).
             n_dim, k_dim = layer.weight_scale.data.shape
-            scale = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
+            scale_data = layer.weight_scale.data
+            if k_dim % 2 != 0:
+                scale_data = F.pad(scale_data, (0, 1), mode="constant", value=0)
+                k_dim += 1
+            scale = scale_data.reshape(n_dim, k_dim // 2, 2)
             layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
             layer.weight_scale_inv = Parameter(
                 scale.transpose(0, 1), requires_grad=False
@@ -256,22 +266,33 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | Tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        original_dtype = x.dtype
-        if original_dtype not in (torch.float16, torch.bfloat16):
-            x = x.to(torch.bfloat16)
+        if isinstance(x, tuple):
+            # MLAProlog supplies a [tokens, hidden] quantized query norm.
+            qx, input_scale = x
+            input_shape = qx.shape
+            if input_scale.dtype == torch.uint8:
+                input_scale = input_scale.view(_get_float8_e8m0fnu_dtype())
+            input_scale = input_scale.reshape(
+                qx.shape[0], qx.shape[1] // (2 * MXFP8_BLOCK_SIZE), 2
+            ).contiguous()
             original_dtype = torch.bfloat16
+        else:
+            original_dtype = x.dtype
+            if original_dtype not in (torch.float16, torch.bfloat16):
+                x = x.to(torch.bfloat16)
+                original_dtype = torch.bfloat16
 
-        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant
-        input_shape = x.shape
-        x_2d = x.reshape(-1, x.shape[-1])
+            # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant
+            input_shape = x.shape
+            x_2d = x.reshape(-1, x.shape[-1])
 
-        # Dynamic MXFP8 activation quantisation
-        qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=torch.float8_e4m3fn
-        )
+            # Dynamic MXFP8 activation quantisation
+            qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                x_2d, dst_type=torch.float8_e4m3fn
+            )
 
         # MXFP8 matmul (weight & scale already transposed at load time)
         # Use the cached FP32 bias from process_weights_after_loading; fall back

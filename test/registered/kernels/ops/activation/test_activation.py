@@ -9,7 +9,9 @@ from sglang.kernels.ops.activation.activation import (
     SUPPORTED_ACTIVATIONS,
     relu2,
     run_activation,
+    silu_and_mul_with_activation_rounding,
 )
+from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -166,6 +168,43 @@ def test_activation_filter_expert_none_skipped(op_name: str) -> None:
     torch.testing.assert_close(out_filtered, out_unfiltered, atol=0.0, rtol=0.0)
 
 
+@pytest.mark.parametrize("op_name", OPS)
+@pytest.mark.parametrize("block_m", [16, 64])
+def test_activation_sorted_rows(op_name: str, block_m: int) -> None:
+    """Sorted MoE layout: rows past num_tokens_post_padded, padding sentinels and
+    -1 expert blocks are left untouched; every other row is bit-identical."""
+    num_valid, num_blocks = 300, 40
+    rows = num_blocks * block_m + 7  # buffer tail past the last full block
+    num_post = (num_blocks - 3) * block_m
+    sorted_ids = torch.randint(0, num_valid, (rows,), dtype=torch.int32, device="cuda")
+    sorted_ids[torch.rand(rows, device="cuda") < 0.3] = num_valid
+    expert_ids = torch.randint(
+        0, 8, (num_blocks + 1,), dtype=torch.int32, device="cuda"
+    )
+    expert_ids[::5] = -1
+    x = torch.randn(rows, 1024, dtype=torch.bfloat16, device="cuda")
+    out = torch.full((rows, 512), float("nan"), dtype=x.dtype, device="cuda")
+
+    run_activation(
+        op_name,
+        x,
+        out,
+        expert_ids,
+        block_m,
+        sorted_token_ids=sorted_ids,
+        num_tokens_post_padded=torch.tensor(
+            [num_post], dtype=torch.int32, device="cuda"
+        ),
+        num_valid_tokens=num_valid,
+    )
+
+    row = torch.arange(rows, device="cuda")
+    kept = (row < num_post) & (sorted_ids < num_valid)
+    kept &= expert_ids[row // block_m] != -1
+    assert torch.equal(out[kept], run_activation(op_name, x, None)[kept])
+    assert torch.isnan(out[~kept]).all()
+
+
 def test_activation_filter_expert_int64_under_torch_compile() -> None:
     """torch.topk routing ids remain usable after AOTAutograd realizes int64."""
     shape = (32, 512)
@@ -237,6 +276,65 @@ def test_relu2_negative_inputs_zeroed() -> None:
     x = -torch.rand((64, 512), dtype=torch.bfloat16, device="cuda") - 1e-3
     out = relu2(x)
     assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("limit", [0.0, 6.3, 10.0])
+@pytest.mark.skipif(not is_sm90_supported(), reason="Hopper rounding contract")
+def test_rounded_silu_clamp_graph(dtype, limit):
+    # Include all input bit patterns, especially eager rounding boundaries,
+    # infinities and NaNs; the activation must round before multiplying up.
+    values = (
+        torch.arange(65536, device="cuda", dtype=torch.int32)
+        .to(torch.int16)
+        .view(dtype)
+    )
+    x = torch.cat((values.view(-1, 32), values.roll(17953).view(-1, 32)), dim=1)
+
+    def reference():
+        gate, up = x.chunk(2, dim=-1)
+        if limit > 0:
+            gate = gate.clamp(max=limit)
+            up = up.clamp(-limit, limit)
+        return F.silu(gate) * up
+
+    actual = silu_and_mul_with_activation_rounding(x, clamp_limit=limit)
+    torch.testing.assert_close(actual, reference(), rtol=0, atol=0, equal_nan=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        silu_and_mul_with_activation_rounding(x, actual, clamp_limit=limit)
+    x.neg_()
+    graph.replay()
+    torch.testing.assert_close(actual, reference(), rtol=0, atol=0, equal_nan=True)
+
+
+def test_swiglu_oai_split_is_the_marlin_gpt_oss_activation() -> None:
+    """Marlin's GPT-OSS-style activation, gate * sigmoid(alpha * gate) * (up + 1)
+    with gate clamped above and up clamped both ways, runs through
+    swiglu_oai_split(beta=1). It must match that formula, be no less accurate than
+    the bf16 elementwise version it replaced, and write into the given buffer."""
+    from sglang.kernels.ops.activation.minimax_m3_swiglu import swiglu_oai_split
+
+    alpha, limit, inter = 1.702, 7.0, 2880
+    g = torch.Generator(device="cuda").manual_seed(0)
+    x = (torch.randn((257, 2 * inter), device="cuda", generator=g) * 4).to(
+        torch.bfloat16
+    )
+
+    def gpt_oss(t: torch.Tensor) -> torch.Tensor:
+        gate = t[:, :inter].clamp(max=limit)
+        up = t[:, inter:].clamp(min=-limit, max=limit)
+        return gate * torch.sigmoid(gate * alpha) * (up + 1)
+
+    reference = gpt_oss(x.float())
+    out = torch.empty((x.shape[0], inter), device="cuda", dtype=torch.bfloat16)
+    result = swiglu_oai_split(x, alpha, 1.0, limit, out=out)
+
+    assert result.data_ptr() == out.data_ptr()
+    fused_err = (out.float() - reference).abs().max()
+    bf16_err = (gpt_oss(x).float() - reference).abs().max()
+    assert fused_err <= bf16_err, (fused_err, bf16_err)
+    torch.testing.assert_close(out.float(), reference, rtol=1.6e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

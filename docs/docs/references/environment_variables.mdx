@@ -83,6 +83,31 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cache directory for model weights and other data. Also the default root for compiled-kernel caches: Triton, Inductor, FlashInfer, the CUDA driver and DeepGEMM are pointed under it unless their own env vars (`TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`, `FLASHINFER_WORKSPACE_BASE`, `CUDA_CACHE_PATH`, `SGLANG_DG_CACHE_DIR`) are set explicitly</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>~/.cache/sglang</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_DIR</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default directory for the file-backed Qwen4-Exp PLE table (`--ple-offload-backend file`); one subdirectory per model path is created under it</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{SGLANG_CACHE_DIR}/ple</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_PREFETCH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hint the page cache (`posix_fadvise(WILLNEED)`) with the rows a prefill-sized PLE gather is about to read from the file-backed table. Set to `0` to disable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip the load-time check that the device reads pageable host memory through the host page tables (`cudaDevAttrPageableMemoryAccessUsesHostPageTables`) before using the file-backed PLE table; only for devices that cannot be queried</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cap (GiB) on the resident set of the file-backed PLE mapping. A row fault maps a whole page-cache folio, so the mapping otherwise creeps towards the full table and consumes the free memory that sizes the KV pool; over the cap the pages are dropped with `MADV_DONTNEED` and stay in the page cache. Set to `0` to disable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>8.0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How often the file-backed PLE mapping's resident set is compared against `SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>30.0</code></td>
+    </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CUTE_AOT_CACHE_DIR</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Trusted directory for persistent CuTe DSL AOT objects shared across process restarts. Artifacts are namespaced by source, runtime ABI, host platform, and target GPU architecture. Set to an empty string to keep compilation process-local. Only use a directory writable by trusted users because SGLang loads cached object files into the process.</td>
@@ -113,6 +138,11 @@ SGLang supports various environment variables that can be used to configure its 
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the DSv4.1 DSpark and Qwen3.5 MTP runtime optimization groups accompanying NVIDIA megakernels, including EAGLE post-verify graphs and GDN prefill graphs. Unset child switches follow this value; explicitly set child values take precedence, including `0`. Existing backend and capability checks still apply. Simulation, fake/forced acceptance and skip-computation controls remain independent. This does not enable the megakernel backend itself.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_TORCH_INFERENCE_MODE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control whether to use torch.inference_mode</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
@@ -139,7 +169,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FLASHINFER_AUTOTUNE_CACHE`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reuse persisted FlashInfer autotune results from `SGLANG_CACHE_DIR` across runs. Set to `0` to force re-autotuning on every startup; the fresh result is written to a `runs/<rank>.<timestamp>.json` sibling file (the canonical cache is left untouched).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reuse persisted FlashInfer autotune results from `SGLANG_CACHE_DIR` across runs, including MegaMoE capacity profiles. Set to `0` to disable disk-cache reuse; the fresh result is written to a `runs/<rank>.<timestamp>.<uuid>.json` sibling file (the canonical cache is left untouched). Target MegaMoE rank files include the physical GPU UUID. Use separate `SGLANG_CACHE_DIR` roots for engines sharing physical GPUs; a running process retains tactics for already-pooled workspaces.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`true`</td>
     </tr>
     <tr>
@@ -268,11 +298,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"true"`</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of workers for parallel DeepGEMM kernel compilation</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`4`</td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Indicator flag used during the DeepGEMM precompile script</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"false"`</td>
@@ -284,7 +309,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DG_USE_NVRTC</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use NVRTC (instead of Triton) for JIT compilation (Experimental)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use NVRTC instead of NVCC for DeepGEMM JIT compilation (Experimental)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
     </tr>
     <tr>
@@ -325,6 +350,21 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of dispatched tokens on each GPU for --moe-a2a-backend=flashinfer</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"1024"`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FlashInfer NVFP4 MegaMOE cross-rank combine wire format. Supported values are <code>bf16</code>, <code>mxfp8</code>, and <code>nvfp4</code>. Quantized formats are incompatible with <code>SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=1</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"bf16"</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Per-rank FlashInfer MegaMOE symmetric-workspace token capacity. A value of <code>0</code> derives the capacity from the runtime token limits.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Permit CuTe DSL MegaMOE in-kernel FC2 reduction for NVFP4 W4A4, NVFP4 W4A16, and MXFP8. FlashInfer's tuning profile may still select external reduction. BF16 atomic accumulation is nondeterministic; leave disabled for reproducibility. Requires BF16 combine.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS`</td>
@@ -372,12 +412,12 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_LOGPROB_CHUNK</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Process logits in chunks to reduce peak memory.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_LOGITS_PROCESSER_CHUNK_SIZE</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_LOGPROB_CHUNK_SIZE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Chunk size (in tokens) used when logits-processor chunking is enabled.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>2048</code></td>
     </tr>
@@ -451,9 +491,9 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"auto"</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_FP8_COMB</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FP8 for combine</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_COMBINE_DTYPE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Combine dtype: <code>auto</code>, <code>bf16</code>, <code>fp8</code>, <code>fp4</code>, or <code>fp8_direct_cast</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"auto"</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>MORI_DISABLE_AUTO_XGMI</code></td>
@@ -477,8 +517,18 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_MOE_MAX_INPUT_TOKENS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Truncate the dispatch buffer to this many rows before MoE computation, reducing kernel overhead on padding tokens. The value must be &gt;= the actual number of received tokens (<code>totalRecvTokenNum</code>); setting it too small causes incorrect results. <code>0</code> disables truncation (use full buffer).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Manual MoE input row limit for MORI EPv1 and EPv2. A positive value overrides <code>SGLANG_MORI_RECV_BOUND</code> and is used unrounded, capped at the receive capacity; it only narrows the MoE input view, not the communication buffer. It must be &gt;= the actual received tokens, or results are incorrect. <code>0</code> leaves it to <code>SGLANG_MORI_RECV_BOUND</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_EP_V2</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select MORI EPv2 for <code>--moe-a2a-backend mori</code>. When unset, EPv2 is used only for DeepSeek-V4 models on AITER with <code>ep_size</code> &lt;= 8 (on gfx1250, any <code>ep_size</code> that fits one UALink vPOD), a bfloat16 model dtype and <code>MORI_ENABLE_SDMA</code> off, and MORI EPv1 otherwise. Set to <code>true</code> to use EPv2 even when these checks fail (a warning names the failed check), or <code>false</code> to always use EPv1.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_RECV_BOUND</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hand the MoE only the receive rows the per-rank DP token counts can fill (rounded up) instead of the full MORI receive buffer. Unverified layouts, missing metadata and two-batch overlap keep the full view.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code></td>
@@ -523,7 +573,7 @@ SGLang supports various environment variables that can be used to configure its 
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_FUSE_TOPK</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the operation of picking topk logits and picking topk indices from page table. <code>SGLANG_NSA_FUSE_TOPK</code> is a deprecated alias.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the operation of picking topk logits and picking topk indices from page table.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
@@ -538,7 +588,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When the maximum kv len in current prefill batch exceeds this value, the sparse mla kernel will be applied, else it falls back to dense MHA implementation. Default to the index topk of model (2048 for DeepSeek V3.2). <code>SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD</code> is a deprecated alias.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When the maximum kv len in current prefill batch exceeds this value, the sparse mla kernel will be applied, else it falls back to dense MHA implementation. Default to the index topk of model (2048 for DeepSeek V3.2).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>2048</code></td>
     </tr>
     <tr>
@@ -568,7 +618,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_HIP_DISABLE_PRESHUFFLE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Disable weight pre-shuffle on the HIP DSA path. <code>SGLANG_NSA_HIP_DISABLE_PRESHUFFLE</code> is a deprecated alias.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Disable weight pre-shuffle on the HIP DSA path.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
@@ -712,12 +762,22 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV4_REASONING_EFFORT</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default <code>reasoning_effort</code> for the DeepSeek V4 chat encoder when a request does not set it. The preview profile accepts <code>high</code> and <code>max</code>; the official profile accepts <code>low</code>, <code>high</code>, and <code>max</code>. The profile is detected from the bundled encoder. Override it with <code>--json-model-override-args '&#123;"dsv4_reasoning_effort_profile":"official"&#125;'</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default <code>reasoning_effort</code> for DeepSeek-V4 when a request does not set it: a deepseek-recipe tier name. Unset means deepseek-recipe's default.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_REASONING_EFFORT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default <code>reasoning_effort</code> for DeepSeek-V4.1 when a request does not set it: a deepseek-recipe tier name or an integer budget in [1, 100]. Unset means deepseek-recipe's default.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>For DeepSeek V4, quantize the SWA FP8 KV cache from BF16-rounded values instead of FP32 registers. This matches trainer-side QAT and the DSA prefill-CP path, at the cost of an extra BF16 KV materialization and separate cache-store kernels.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_BEAM_DECODE_GEMV</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run single-token Beam MoE decode through a fused GEMV on SM103 (GB300) for BF16 experts with MoE TP4 and EP1, where Beam fuses the expert sum into its all-reduce (Triton MoE runner). Requires <code>SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED=1</code>. Unsupported setups and forwards keep their normal MoE path. Only a failed static check (device, BF16 experts, MoE TP/EP or expert shape) logs that the switch is unused.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
   </tbody>
@@ -766,13 +826,13 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use BF16 activations and outputs with FlashInfer CuTe DSL NVFP4 weights on NVIDIA SM100-family GPUs (SM100/SM103). Serialized dense linear layers use this mode with <code>--fp4-gemm-backend flashinfer_cutedsl</code>. MoE layers use it with <code>--moe-runner-backend flashinfer_cutedsl</code>; the MoE path supports online weight quantization and serialized ModelOpt NVFP4 weights with either no A2A or FlashInfer A2A, and honors <code>SGLANG_FLASHINFER_MOE_FUSED_FINALIZE</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use BF16 activations and outputs with FlashInfer CuTe DSL NVFP4 weights on NVIDIA SM100-family GPUs (SM100/SM103). Serialized dense linear layers use this mode with <code>--fp4-gemm-backend flashinfer_cutedsl</code>. With <code>--moe-runner-backend flashinfer_cutedsl</code>, MoE layers support online weight quantization and serialized ModelOpt NVFP4 weights with either no A2A or FlashInfer A2A, and honor <code>SGLANG_FLASHINFER_MOE_FUSED_FINALIZE</code>. With <code>--moe-runner-backend flashinfer_megamoe --moe-a2a-backend flashinfer_megamoe</code>, MoE layers support serialized ModelOpt NVFP4 weights and <code>--quantization nvfp4_online</code> for gated SiLU/SwiGLU or SiTU. MegaMOE uses BF16 activations and combine, with equal TP, attention-DP, and EP sizes. For more on the W4A16 MoE design and performance, see <a href="https://humansand.ai/blog/faster-than-light-nvfp4-decode">Faster-than-light NVFP4 decode—with precision</a> by Ziang Li at humans& ai.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MOE_FUSED_FINALIZE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FlashInfer's fused atomic CUTLASS and CuTe DSL MoE finalize for best performance. Deterministic inference overrides this to <code>false</code>.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FlashInfer's fused atomic CUTLASS and CuTe DSL MoE finalize. Disabled by default for better numerical accuracy. Set to <code>1</code> to opt in for more aggressive performance. Deterministic inference overrides this to <code>false</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>FLASHINFER_NVFP4_4OVER6</code></td>
@@ -875,11 +935,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_DYNAMIC_MXFP4_LINEAR</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use dynamic MXFP4 quantization for linear layers.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>USE_TRITON_W8A8_FP8_KERNEL</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the Triton W8A8 FP8 kernel.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
@@ -903,6 +958,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_SYNC_TOKEN_IDS_ACROSS_TP</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Synchronize sampled token ids across tensor-parallel ranks.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-kv-cache-sharding</code>, register the prefix gather scratch of single-node shard groups as an NCCL symmetric window so NCCL 2.31.2+ runs the all-gather on copy engines (zero SMs). Older NCCL versions keep the SM-kernel all-gather. On single-node deployments this also makes the server set <code>NCCL_CUMEM_ENABLE=1</code> for every NCCL communicator unless it is already set, except under <code>--enable-memory-saver</code> or <code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code>; see <code>--enable-kv-cache-sharding</code> for the full conditions. Set to <code>false</code> to keep the SM-kernel all-gather and the default <code>NCCL_CUMEM_ENABLE=0</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
   </tbody>
 </table>
@@ -1017,6 +1077,16 @@ SGLang supports various environment variables that can be used to configure its 
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KERNEL_API_DUMP_EXCLUDE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated wildcard patterns for kernel API names to exclude from level-10 dumps.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When set, each hierarchical cache storage backend call is delayed by a random duration drawn uniformly from <code>[0, N)</code> seconds, where <code>N</code> is the variable value. Each rank uses an independent random sequence, skewing storage IO timing across TP/PP ranks to expose race conditions and rank divergence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When set to a probability <code>p</code> in <code>[0, 1]</code>, each hierarchical cache storage backend call randomly fails with probability <code>p</code> (a failed call degrades to a cache miss or an unsuccessful write). Each rank uses an independent random sequence. Can be combined with <code>SGLANG_ENABLE_RANK_CONSENSUS_CHECKER=1</code> to detect rank divergence under storage failures.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
 </tbody>
@@ -1166,6 +1236,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUGEPAGE_SIZE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use huge pages for host KV cache allocations (HiCache / disaggregation offload). Valid values: <code>2MB</code> (2 MiB pages via <code>MAP_HUGE_2MB</code>) or <code>1GB</code> (1 GiB pages via <code>MAP_HUGE_1GB</code>). Requires huge pages to be pre-allocated on the host OS (<code>/proc/sys/vm/nr_hugepages</code> or <code>/sys/kernel/mm/hugepages</code>). If the allocation fails, the allocator logs a warning and falls back to regular page-size mmap automatically.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (uses OS default page size)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When positive, host KV cache pools on the plain mmap path (<code>SGLANG_HUGEPAGE_SIZE</code> unset or failed) are mapped <code>MAP_PRIVATE | MAP_ANONYMOUS</code> with <code>MADV_HUGEPAGE</code> and <code>MADV_DONTFORK</code>, and prefaulted by this many threads before pinning. A <code>fork()</code>ed child cannot access the buffer. Any failure falls back to the default shared mapping. <code>0</code> disables.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_HF3FS_CONFIG_PATH</code></td>
@@ -1370,16 +1445,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1.0</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_UNIFIED_RADIX_TREE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the unified radix-tree cache implementation.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EXPERIMENTAL_CPP_RADIX_TREE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the experimental C++ radix-tree implementation.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_RADIX_FORCE_MISS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force radix-cache misses (debugging/benchmarking).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
@@ -1529,13 +1594,23 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_FAILED_SESSION_PROBE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Probe failed Mooncake sessions for recovery.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Periodically probe blacklisted Mooncake sessions and un-blacklist the ones that answer. Probes run on their own thread, off the KV transfer path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FAILED_SESSION_PROBE_INTERVAL_S</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Interval (seconds) between failed-session probes.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How often (seconds) the probe loop runs, and the first retry interval of a failing session.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>30.0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cap (seconds) on a session's probe interval, which doubles after each failed probe.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>300.0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Drop a blacklisted Mooncake session that no request has targeted for this many seconds, e.g. the old session id of a restarted decode.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>600.0</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>MOONCAKE_MASTER</code></td>
@@ -1671,6 +1746,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_PCIE_IPC_ALLREDUCE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FlashInfer's PCIe-IPC all-reduce on switch-free intra-node hosts (no NVLink, no multicast), where the other custom all-reduce backends do not apply. Serves bf16 decode reductions that fit the workspace bound; everything else stays on NCCL. Left off under deterministic inference.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PCIE_IPC_MAX_NUMEL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Elements the PCIe-IPC workspace is sized for; it cannot grow after construction. <code>0</code> derives it from the widest decode batch the runner captures for. Raising it hands larger reductions to the kernels, at roughly <code>2 * world_size * max_numel * itemsize</code> bytes per rank.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FlashInfer prefill split-tile size for deterministic attention.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>4096</code></td>
@@ -1679,11 +1764,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FlashInfer decode split-tile size for deterministic attention.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>2048</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Triton prefill truncation alignment size for deterministic attention.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>4096</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE</code></td>
@@ -1754,11 +1834,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>/tmp</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Removed. Use <code>--expert-balancedness-report-mode=prometheus</code> to emit the EPLB balancedness metric.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_LOG_EXPERT_LOCATION_METADATA</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Log expert-location metadata.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
@@ -1813,6 +1888,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx942, run dense block-FP8 linears with the AITER CK blockscale GEMM instead of the AITER Triton one for faster decode. Accuracy differences depend on the evaluation setting: Qwen3-32B-FP8 is 1 point lower on 8-shot GSM8K with 512 output tokens, but only 0.26 points lower with 5 shots and 2048 output tokens, with MMLU unchanged (see <a href="https://github.com/sgl-project/sglang/issues/43526">#43526</a>). Set to <code>false</code> to use Triton.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_AITER_MOE_GU_ITLV</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the AITER MoE gate/up tile layout: <code>true</code> interleaves, <code>false</code> uses the separated layout.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
@@ -1828,6 +1908,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>nhd</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_PAGED_PREFILL_ASM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Let gfx950 fp8 hd256 chunked prefill read the KV pool in place through AITER's paged-varlen ASM kernel, instead of gathering the prefix into a contiguous buffer first. The ASM kernel is compiled for a 4D LINEAR <code>[N, 64, H, D]</code> KV cache, so it serves <code>--page-size 64</code> on the NHD pool and nothing else; at any other page size this variable has no effect whichever way it is set. Where it does apply, the gain grows with context and is flat to marginally negative at moderate ISL, so set it to <code>false</code> for workloads that are not long-context.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_FUSED_DECODE_MLA</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the fused decode MLA kernel on ROCm.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
@@ -1838,6 +1923,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HACK_FLASHMLA_BACKEND</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V4 HIP decode attention kernel: <code>auto</code> takes aiter's gluon sparse kernel on gfx950 and the tilelang partial + combine elsewhere; <code>aiter_sparse</code>, <code>tilelang</code>, <code>triton</code>, <code>torch</code>, <code>comparison</code> or <code>unified_kv_triton</code> force one.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on ROCm: fold the KDA <code>[f_a|b]</code> tail into the wide <code>[q,k,v,g]</code> projection so the whole input projection is one GEMM. Applies to unquantized weights only; falls back to the split projection otherwise.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
@@ -1846,6 +1936,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token count above which <code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code> stops applying and the split projection runs instead. The merged shape is only faster while the projection is bandwidth bound.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx95x with <code>SGLANG_USE_AITER=1</code>, quantize the BF16 GDN <code>in_proj_qkvz</code> and <code>out_proj</code> of Qwen3.5 / Qwen3.8 to MXFP4 after load. Projections with N or K not a multiple of 256 stay BF16. Batches of up to 64 rows run the AITER preshuffled MXFP4 GEMM if AITER has a tuned config for the shape. All other batches run the ASM <code>gemm_a4w4</code>. Set to <code>0</code> to keep the BF16 projections.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
   </tbody>
 </table>
@@ -2146,6 +2241,11 @@ MPS and does not read them.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>10</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HTTP_SERVER_APP_PATH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>ASGI import string (<code>module:attr</code>) that Uvicorn and Granian worker processes load when <code>--tokenizer-worker-num</code> is greater than 1. Point it at an app that extends the SGLang app with extra routes.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>sglang.srt.entrypoints.http_server:app</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Have the <code>/health</code> endpoint run a generation as part of the check.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
@@ -2191,7 +2291,7 @@ MPS and does not read them.
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AUTO_NUMA_BIND</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Automatically detect each NVIDIA GPU's local NUMA node and bind its worker when <code>--numa-node</code> is not specified. Set to <code>false</code> to leave workers unbound; an explicit <code>--numa-node</code> takes precedence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Automatically detect each NVIDIA GPU's local NUMA node and bind its worker when <code>--numa-node</code> is not specified. Without <code>CAP_SYS_NICE</code>, only CPU affinity is set. Set to <code>false</code> to leave workers unbound; an explicit <code>--numa-node</code> takes precedence.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>

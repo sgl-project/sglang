@@ -369,9 +369,9 @@ HIS_PREFIX = 1  # extend_prefix_lens > 0
 HIS_SEQ_MINUS_EXT = 2  # (seq_lens[:B] - extend_seq_lens) > 0 (draft_extend_v2 capture)
 HIS_ONES = 3  # target_verify: always has initial state
 
-# The single-tile local cumsum bounds the fused path; larger batches fall back
-# to the unfused op sequence.
-_FUSED_EXTEND_MAX_B = 1023
+# The single-tile local cumsum bounds variable-length extend; larger batches
+# fall back to the unfused op sequence. Uniform-length verify needs no cumsum.
+_FUSED_EXTEND_MAX_B = 2047
 
 
 @triton.jit
@@ -475,7 +475,8 @@ def fused_extend_sconv_metadata(
     owning layer).
     Returns ``(query_start_loc, has_initial_state, SconvExtendMetadata)`` with
     tensors bit-identical to the unfused path, or None when the shape falls
-    outside the fused kernel's single-tile bound (caller runs unfused).
+    outside the variable-length kernel's single-tile bound (caller runs unfused).
+    Uniform-length target verification does not have that batch-size bound.
 
     ``his_mode`` selects the has_initial_state source: HIS_ZEROS (boundary-KV
     draft extend), HIS_PREFIX (``his_src`` = extend_prefix_lens), HIS_SEQ_MINUS_EXT
@@ -483,10 +484,10 @@ def fused_extend_sconv_metadata(
     ``extend_seq_lens`` unused). Pass ``out`` to write into preallocated (e.g.
     cuda-graph-static) destinations instead of fresh allocations.
     """
-    if B > _FUSED_EXTEND_MAX_B or not cache_indices.is_cuda:
+    is_verify = his_mode == HIS_ONES
+    if (not is_verify and B > _FUSED_EXTEND_MAX_B) or not cache_indices.is_cuda:
         return None
     assert cache_indices.shape[0] >= B and cache_indices.stride(0) == 1
-    is_verify = his_mode == HIS_ONES
     if is_verify:
         assert draft_token_num is not None
     else:
@@ -499,7 +500,9 @@ def fused_extend_sconv_metadata(
     safe_idx = dst["safe_idx"]
     cu = dst["cu"]
     si = dst["si"]
-    BLOCK_T = 256
+    # Keep the variable-length si comparison tile at most 256 * 1024 elements
+    # when the cumsum tile grows to 2048 requests (e.g. MTP batches of 1264).
+    BLOCK_T = 128 if not is_verify and B > 1023 else 256
     dummy = cache_indices  # never dereferenced thanks to masks/constexpr
     _fused_extend_metadata_kernel[(1 + triton.cdiv(T, BLOCK_T),)](
         cache_indices,
