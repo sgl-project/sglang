@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.layers.attention import flashinfer_mla_backend as mla
+from sglang.srt.layers.attention import trtllm_mla_backend as trtllm_mla
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -139,6 +140,69 @@ class TestFlashInferCudaGraphMetadataReuse(unittest.TestCase):
                         wrapper_cls.call_args.kwargs["kv_indices"],
                         backend.cuda_graph_kv_indices,
                     )
+
+
+class TestTRTLLMMLAGraphMetadata(unittest.TestCase):
+    @patch.object(
+        trtllm_mla, "get_parallel", return_value=SimpleNamespace(dcp_enabled=False)
+    )
+    def test_replay_updates_captured_storage_and_isolates_keys(self, _parallel):
+        backend = trtllm_mla.TRTLLMMLABackend.__new__(trtllm_mla.TRTLLMMLABackend)
+        backend.decode_cuda_graph_metadata = {}
+        backend.decode_cuda_graph_kv_indices = torch.zeros((4, 4), dtype=torch.int32)
+        backend.max_context_len = 32
+        backend.num_draft_tokens = 3
+        backend._calc_padded_blocks = lambda _: 4
+        backend.runner_ids = SimpleNamespace(
+            is_translating=True,
+            copy_page_table=lambda plan, out: out.copy_(plan[: out.shape[0]]),
+        )
+        captured = []
+        for index, mode in enumerate(
+            (
+                ForwardMode.DECODE,
+                ForwardMode.TARGET_VERIFY,
+                ForwardMode.DRAFT_EXTEND_V2,
+            )
+        ):
+            with self.subTest(mode=mode):
+                lengths = torch.ones(2, dtype=torch.int64)
+                num_tokens = 2 if mode.is_decode_or_idle() else 6
+                backend._init_cuda_graph_metadata(
+                    2, num_tokens, mode, lengths, lengths.device
+                )
+                first = backend.forward_decode_metadata
+                captured.append(first.seq_lens_k)
+                backend._init_cuda_graph_metadata(
+                    2, num_tokens, mode, lengths, lengths.device
+                )
+                page_table = (
+                    torch.arange(8, dtype=torch.int32).reshape(2, 4) + 8 * index
+                )
+                lengths.copy_(torch.tensor([7 + index, 11 + index]))
+                backend._apply_cuda_graph_metadata(
+                    page_table, 2, torch.tensor([0, 1]), lengths, mode
+                )
+
+                expected = lengths.to(torch.int32)
+                if mode.is_target_verify():
+                    expected += backend.num_draft_tokens
+                torch.testing.assert_close(first.seq_lens_k, expected)
+                torch.testing.assert_close(first.block_kv_indices, page_table)
+
+        lengths = torch.ones(4, dtype=torch.int64)
+        backend._init_cuda_graph_metadata(
+            4, 4, ForwardMode.DECODE, lengths, lengths.device
+        )
+        captured.append(backend.forward_decode_metadata.seq_lens_k)
+        self.assertEqual(len({buffer.data_ptr() for buffer in captured}), 4)
+        backend._init_cuda_graph_metadata(
+            2, 2, ForwardMode.IDLE, lengths[:2], lengths.device
+        )
+        self.assertEqual(
+            backend.forward_decode_metadata.seq_lens_k.data_ptr(),
+            captured[0].data_ptr(),
+        )
 
 
 if __name__ == "__main__":
