@@ -72,6 +72,7 @@ class SystemOneServing(OpenAIServingDecisions):
     /v1/decisions, or, for a Clef or Kev checkpoint, with its own head."""
 
     route = "/v1/systemone"
+    supports_mis = False
 
     def _request_id_prefix(self) -> str:
         return "systemone-"

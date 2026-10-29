@@ -3,7 +3,9 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.linear.gdn_backend import build_gdn_mis_metadata
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -93,6 +95,41 @@ class TestGDNMISMetadata(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "final delimiter"):
             build_gdn_mis_metadata(forward_batch)
+
+
+class TestFlashInferMISPositions(CustomTestCase):
+    def test_mrope_axes_take_the_item_positions(self):
+        """Every mRoPE axis places each item right after its request's query,
+        so a Qwen3.5 item does not rotate by the items packed before it, and
+        an empty query leaves no position at -1, which RoPE kernels index."""
+        positions = torch.cat([torch.arange(11), torch.arange(7), torch.arange(7)])
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=torch.empty(25, dtype=torch.int64),
+            extend_seq_lens_cpu=[11, 7, 7],
+            extend_prefix_lens_cpu=[0, 0, 0],
+            multi_item_delimiter_indices=[
+                torch.tensor([3, 6, 10], dtype=torch.int64),
+                torch.tensor([2, 4, 6], dtype=torch.int64),
+                torch.tensor([0, 3, 6], dtype=torch.int64),
+            ],
+            positions=positions,
+            mrope_positions=positions.repeat(3, 1),
+        )
+
+        FlashInferAttnBackend._process_multi_item_scoring(
+            SimpleNamespace(enable_mis=True), forward_batch
+        )
+
+        # Query, then each delimiter at the last query position and its item after.
+        # Without a query, items start at 0 and their delimiters take 0 too.
+        expected = torch.tensor(
+            [0, 1, 2, 2, 3, 4, 2, 3, 4, 5, 2]
+            + [0, 1, 1, 2, 1, 2, 1]
+            + [0, 0, 1, 0, 0, 1, 0]
+        )
+        torch.testing.assert_close(forward_batch.positions, expected)
+        torch.testing.assert_close(forward_batch.mrope_positions, expected.repeat(3, 1))
 
 
 if __name__ == "__main__":
