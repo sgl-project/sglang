@@ -394,6 +394,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 ctx = self.grammar_compiler.compile_json_schema(
                     schema=key_string,
                     any_whitespace=self.any_whitespace,
+                    separators=None if self.any_whitespace else (",", ":"),
                     max_whitespace_cnt=self.max_whitespace_cnt,
                 )
 
