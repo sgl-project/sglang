@@ -370,7 +370,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             device="cuda",
         )
 
-        cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
+        cache = fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0)
         initial_conv = cache.conv[0].clone()
         initial_ssm = cache.temporal.clone()
         flashinfer_output = run_gdn_fixture_eager(fixture)

@@ -145,7 +145,7 @@ find_latest_image() {
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
 
-  # First, check local cache on the runner.
+  # Prefer the newest date, checking both local and remote before falling back.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
@@ -154,17 +154,13 @@ find_latest_image() {
       echo "rocm/sgl-dev:${image_tag}"
       return 0
     fi
-  done
-
-  # If not found locally, resolve the latest tag from the public registry.
-  for days_back in {0..6}; do
-    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
     if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
       echo "Found available image: rocm/sgl-dev:${image_tag}" >&2
       echo "rocm/sgl-dev:${image_tag}"
       return 0
     fi
+    echo "Image unavailable: rocm/sgl-dev:${image_tag}; checking older dates" >&2
   done
 
   # Docker Hub's `name=` filter is fuzzy; only accept official version tags.
