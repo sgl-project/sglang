@@ -1,8 +1,11 @@
-"""Gemma-3 bidirectional image attention on XPU (sgl-kernel-xpu bidirectional_block_ids).
+"""Gemma 3 / Gemma 4 bidirectional image attention on XPU (sgl-kernel-xpu
+bidirectional_block_ids).
 
 Guards the cases the kernel mask cannot express directly: a sliding-window layer
 whose prompt exceeds the window must keep local attention, and image tokens in an
-extend after a cached prefix must still attend bidirectionally.
+extend after a cached prefix must still attend bidirectionally. Gemma 4 must hand
+the backend the same ids, on sliding layers only, and only for checkpoints with
+use_bidirectional_attention == "vision".
 """
 
 import unittest
