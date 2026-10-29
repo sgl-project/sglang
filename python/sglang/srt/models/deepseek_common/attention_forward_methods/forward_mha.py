@@ -31,6 +31,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _use_aiter_gfx95,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.utils import BumpAllocator, next_power_of_2
 
@@ -601,7 +602,10 @@ class DeepseekMHAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if _is_cuda:
+        if _is_cuda or (
+            current_platform.is_out_of_tree()
+            and current_platform.capabilities.supports_triton
+        ):
             # Save latent cache
             get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
                 self.attn_mha,
