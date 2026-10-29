@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 # rows: ~51 GB/s H2D and ~52 GB/s D2H, vs 46 / 35 GB/s with 8 / 32 per lane.
 _VECS_PER_LANE = 16
 _BLOCK_SIZE = 512
-# Two CTAs saturate B300 PCIe; MI350X needs 16+ (32: 55 / 52 GB/s D2H / H2D vs 26 / 18).
+# Two CTAs saturate B300 PCIe; MI350X needs 16 or more (measured on gfx950).
 _BLOCK_QUOTA = 32 if is_hip_runtime() else 2
 
 

@@ -2,7 +2,7 @@
 
 A row is one head of one token: ``D // 2`` payload bytes (two e2m1 codes per
 byte, the even element in the low nibble) and ``D // 16`` E4M3 block scales,
-with a unit outer scale -- the layout `MiniMaxM3Nvfp4KVPool` stores.
+with a unit outer scale -- the layout ``MiniMaxM3Nvfp4KVPool`` stores.
 """
 
 import msgspec
@@ -12,7 +12,7 @@ import triton.language as tl
 
 
 class Nvfp4Cache(msgspec.Struct, frozen=True):
-    """One layer of a packed NVFP4 cache, as `MiniMaxM3Nvfp4KVPool` stores it.
+    """One layer of a packed NVFP4 cache, as ``MiniMaxM3Nvfp4KVPool`` stores it.
 
     ``payload`` is uint8 ``[pages, (heads,) page_size, D // 2]`` and ``scales``
     uint8 ``[pages, (heads,) page_size, D // 16]`` (E4M3 bits); the index-K
@@ -140,8 +140,10 @@ def nvfp4_load_rows(
     row_mask,
     D: tl.constexpr,
 ):
-    """Load rows as one fp16 ``[N, D]`` tile in element order, with the values of
-    `nvfp4_load_even_odd` and each block scale read once. gfx950 only."""
+    """Load rows as one fp16 ``[N, D]`` tile in element order. gfx950 only.
+
+    The values are those of ``nvfp4_load_even_odd``, with each block scale read once.
+    """
     N: tl.constexpr = payload_row_off.shape[0]
     HALF: tl.constexpr = D // 2
     NBLK: tl.constexpr = D // 16

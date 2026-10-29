@@ -70,8 +70,8 @@ def quantize_nvfp4_shard(w: torch.Tensor, gs=None):
     return w_q, sf_linear, gs, w_dequant
 
 
-# e2m1 magnitude code = how many of these a value passes: round half to even, saturating
-# at FLOAT4_E2M1_MAX
+# An e2m1 magnitude code counts the thresholds a value passes: round half to even,
+# saturating at FLOAT4_E2M1_MAX.
 _E2M1_ABOVE = (0.25, 1.25, 2.5, 5.0)
 _E2M1_AT_OR_ABOVE = (0.75, 1.75, 3.5)
 
@@ -79,15 +79,17 @@ _E2M1_AT_OR_ABOVE = (0.75, 1.75, 3.5)
 def nvfp4_kv_quantize(
     x: torch.Tensor, global_scale: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """NVFP4 KV quantize in `NVFP4KVQuantizeUtil`'s layout without FlashInfer: ``[R, D]``
-    bf16/fp16 -> (``[R, D//2]`` uint8 payload, even element in the low nibble,
-    ``[R, D//16]`` uint8 E4M3 scales)."""
+    """NVFP4 KV quantize in ``NVFP4KVQuantizeUtil``'s layout without FlashInfer.
+
+    ``[R, D]`` bf16/fp16 -> (``[R, D//2]`` uint8 payload, even element in the low
+    nibble, ``[R, D//16]`` uint8 E4M3 scales).
+    """
     rows, dim = x.shape
     assert dim % 16 == 0
     gs = global_scale.float().reshape(())
     blocks = x.float().view(rows, dim // 16, 16)
     amax = blocks.abs().amax(-1)
-    # saturate at E4M3's max like the hardware conversion; torch's cast overflows to NaN
+    # Saturate at E4M3's max like the hardware conversion; torch's cast overflows to NaN.
     scale = (
         (amax / (FLOAT4_E2M1_MAX * gs))
         .clamp(max=FLOAT8_E4M3_MAX)

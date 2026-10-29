@@ -133,7 +133,7 @@ def test_rows_straddling_block_boundaries(num_draft, radix_topk):
 
 @NUM_DRAFTS
 def test_score_chunks_spanning_several_blocks(num_draft):
-    """At long context each score program walks several blocks of its chunk; 24
+    """Score programs that walk several blocks of their chunk keep the per-row top-k; 24
     requests get 64 chunks, so 150-block prefixes put 3 blocks in each."""
     prefixes = [BLOCK_SIZE * (150 - r % 3) - r for r in range(24)]
     inputs = _build(prefixes, req_slots=list(range(24)), num_draft=num_draft)
@@ -203,6 +203,7 @@ def test_no_local_blocks_keeps_rows_causal(num_draft):
 
 def _build_paged(prefixes, *, num_draft, k_dtype, seed, tied_pages=False):
     """Like _build, but slots are whole 128-token pages, as the paged KV pool hands out.
+
     With ``tied_pages``, every page copies page 1 except every 13th, which copies page 2:
     most blocks tie on score and the few others rank above or below them."""
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
@@ -231,7 +232,7 @@ def _build_paged(prefixes, *, num_draft, k_dtype, seed, tied_pages=False):
         k_cache=k_cache.to(k_dtype),
         req_to_token=req_to_token,
         seq_lens=torch.tensor(seq_lens, dtype=torch.int64, device=DEVICE),
-        # graph capture sizes the score columns past the real lengths
+        # Graph capture sizes the score columns past the real lengths.
         max_seqlen=max_len + 4 * BLOCK_SIZE,
         slot_ids=torch.arange(len(prefixes), device=DEVICE).repeat_interleave(
             num_draft

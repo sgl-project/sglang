@@ -129,7 +129,7 @@ def _token_rows(layout: gl.constexpr, R: gl.constexpr, ROW: gl.constexpr):
 
 @gluon.jit
 def _token_rows_w(layout: gl.constexpr, R: gl.constexpr, ROW: gl.constexpr):
-    """`_token_rows` as 4 warps x 32 tokens, [4, R, 32]."""
+    """``_token_rows`` as 4 warps x 32 tokens, [4, R, 32]."""
     w = gl.arange(0, 4, layout=gl.SliceLayout(1, gl.SliceLayout(2, layout)))
     r = gl.arange(0, R, layout=gl.SliceLayout(0, gl.SliceLayout(2, layout)))
     t = gl.arange(0, 32, layout=gl.SliceLayout(0, gl.SliceLayout(1, layout)))
@@ -140,8 +140,11 @@ def _token_rows_w(layout: gl.constexpr, R: gl.constexpr, ROW: gl.constexpr):
 def _nvfp4_tiles_kernel(
     payload_ptr, scale_ptr, even_ptr, odd_ptr, PER_WARP: gl.constexpr
 ):
-    """Dequantize 128 tokens into token-major even and odd dims, [128, 64] each, with
-    the prefill tile helper or, as 4 warps x 32 tokens, the per-warp one."""
+    """Dequantize 128 tokens into token-major even and odd dims, [128, 64] each.
+
+    ``PER_WARP`` runs the per-warp helper on 4 warps x 32 tokens instead of the prefill
+    tile helper.
+    """
     if PER_WARP:
         lay: gl.constexpr = gl.BlockedLayout(
             [1, 4, 1], [1, 4, 16], [4, 1, 1], [2, 1, 0]
@@ -495,7 +498,7 @@ def test_gluon_prefill_meta_does_not_wait_for_queued_work():
     prefix = torch.tensor([5, 300], device=DEVICE, dtype=torch.int32)
     seq_lens = prefix + torch.tensor([3, 5], device=DEVICE, dtype=torch.int32)
     seq_lens_cpu = seq_lens.cpu()
-    # Same shapes once, so first-use kernel loading is not inside the timed call.
+    # same shapes once, so first-use kernel loading is not inside the timed call
     gluon_prefill._build_gluon_prefill_meta(
         cu.clone(), prefix.clone(), seq_lens.clone(), seq_lens_cpu, 8
     )

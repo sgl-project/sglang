@@ -29,7 +29,7 @@ _WARPS = 4
 # the NVFP4 score kernel is slower, so fusing it pays off at fewer requests).
 VERIFY_FUSED_MIN_REQS = 16
 VERIFY_FUSED_MIN_REQS_NVFP4 = 3
-# splits per request; doubled below 8 requests, which leave CUs idle with 32
+# Splits per request; doubled below 8 requests, which leave CUs idle with 32.
 _MAX_SPLITS = 32
 
 
@@ -71,12 +71,14 @@ def _split_plan(
     MIN_SPLIT: gl.constexpr,
     W: gl.constexpr,
 ):
-    """(request, split, splits of the request, end of its candidates, its
-    req_to_token row) of this program; request >= num_reqs when idle. Every request's
-    candidate blocks are cut into splits of at most S blocks (at least one split, at
-    most MAX_SPLITS), S = cdiv(total, PROGRAMS) when those splits fit in PROGRAMS, else
-    cdiv(total, PROGRAMS - num_reqs), which always fits; the programs take the splits
-    in request order, so a long request gets more programs than a short one."""
+    """This program's (request, split, request's splits, candidate end, req_to_token row).
+
+    The request is >= num_reqs when idle. Every request's candidate blocks are cut into
+    splits of at most S blocks (at least one split, at most MAX_SPLITS), with
+    S = max(cdiv(total, PROGRAMS), MIN_SPLIT) when those splits fit in PROGRAMS, else
+    the same over PROGRAMS - num_reqs, which always fits; the programs take the splits
+    in request order, so a long request gets more programs than a short one.
+    """
     plan_l: gl.constexpr = gl.BlockedLayout([1, ND_P2], [64, 1], [W, 1], [1, 0])
     r = gl.arange(0, R_P2, layout=gl.SliceLayout(1, plan_l))
     d = gl.arange(0, ND_P2, layout=gl.SliceLayout(0, plan_l))
@@ -129,9 +131,11 @@ def _load_k_tile(
     PAGE_SIZE: gl.constexpr,
     K_FP4: gl.constexpr,
 ):
-    """One index-K block per warp from its first slot ``base`` [W], dims x tokens, as
-    stored: [W, HEAD_DIM, BLOCK_N], or NVFP4 u16 payload [W, HEAD_DIM // 4, BLOCK_N] and
-    each token's 8-byte E4M3 scale row as u32 [W, 2, BLOCK_N]."""
+    """One index-K block per warp from its first slot ``base`` [W], dims x tokens, as stored.
+
+    That is [W, HEAD_DIM, BLOCK_N], or the NVFP4 u16 payload [W, HEAD_DIM // 4, BLOCK_N]
+    and each token's 8-byte E4M3 scale row as u32 [W, 2, BLOCK_N].
+    """
     stride_k_page, stride_k_s, stride_sc_page = strides
     if K_FP4:
         # 32-bit offsets keep the buffer base uniform across the warps' blocks.
@@ -152,8 +156,10 @@ def _load_k_tile(
 
 @gluon.jit
 def _scale_bytes(srow, grp, scale_layout: gl.constexpr):
-    """u32 scale rows [W, 2, N] -> E4M3 byte of group ``grp`` [G] of each token, u8
-    [W, G, N] in ``scale_layout``."""
+    """u32 scale rows [W, 2, N] -> each token's E4M3 byte of groups ``grp`` [G].
+
+    The bytes are u8 [W, G, N] in ``scale_layout``.
+    """
     lo, hi = gl.split(gl.permute(srow, [0, 2, 1]))
     zero = gl.zeros(
         [srow.shape[0], grp.shape[0], srow.shape[2]], gl.int32, scale_layout
@@ -196,7 +202,9 @@ def _score_round(
     K_FP4: gl.constexpr,
 ):
     """Score round ``it`` (block b0 + it * W + w for warp w) into each row's list.
-    Without ``K_FP4``, ``q_even`` is the whole Q operand and ``q_odd`` is unused."""
+
+    Without ``K_FP4``, ``q_even`` is the whole Q operand and ``q_odd`` is unused.
+    """
     W: gl.constexpr = warp.shape[0]
     s = gl.zeros([W, M, BLOCK_N], gl.float32, mfma_layout)
     if K_FP4:
@@ -585,8 +593,7 @@ def can_fuse_verify_topk(
 def _split_config(
     num_reqs: int, num_kv_heads: int, k_fp4: bool
 ) -> tuple[int, int, int, bool]:
-    """(programs, max splits per request, min candidate blocks per warp, paired
-    rounds)."""
+    """(programs, max splits per request, min candidate blocks per warp, paired rounds)."""
     groups = num_reqs * num_kv_heads
     # Programs per KV head: one full wave of two per CU (a partial wave doubles some CUs'
     # work), measured on MI350X at 8-128 requests; the plan needs more than one per request.
@@ -595,7 +602,7 @@ def _split_config(
     cap = 2 * _MAX_SPLITS if num_reqs < 8 else _MAX_SPLITS
     max_splits = max(1, min(cap, 2 * programs // num_reqs))
     min_blocks = 4 if num_reqs < 64 else 8
-    # paired rounds pay off on NVFP4 only (measured on MI350X at 8-64 requests)
+    # Paired rounds pay off on NVFP4 only (measured on MI350X at 8-64 requests).
     paired = k_fp4
     return programs, max_splits, min_blocks, paired
 
@@ -624,7 +631,7 @@ def fused_verify_topk_idx(
             k_cache.scales.view(torch.int32),
         )
         k_strides = tuple(s // 2 for s in k_cache.payload_strides())
-        # the scale row pitch is the kernel's constexpr 2 u32 (see _scale_rows_loadable)
+        # The scale row pitch is the kernel's constexpr 2 u32 (see _scale_rows_loadable).
         sc_strides = tuple(s // 4 for s in k_cache.scale_strides()[:2])
         page_size, num_kv_heads = k_cache.page_size, k_cache.num_heads
     else:
@@ -682,7 +689,7 @@ def fused_verify_topk_idx(
     if out is None:
         out = torch.empty((num_heads, rows, topk), dtype=torch.int32, device=q.device)
     else:
-        # the merge writes num_heads * rows flat rows through stride(1)
+        # The merge writes num_heads * rows flat rows through stride(1).
         assert out.shape == (num_heads, rows, topk) and out.dtype == torch.int32
         assert out.stride(2) == 1
         assert num_heads == 1 or out.stride(0) == rows * out.stride(1)

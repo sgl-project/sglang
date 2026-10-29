@@ -1,5 +1,7 @@
-"""Gluon epilogue of the gfx950 sparse attention kernels: O written as the fp8 input of the
-o_proj GEMM, with the bytes and scales of aiter's separate quant."""
+"""Gluon epilogue of the gfx950 sparse attention kernels: O as the fp8 o_proj GEMM input.
+
+The bytes and scales are those of aiter's separate quant.
+"""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -17,9 +19,11 @@ def _rcp_f32(x):
 
 @gluon.jit
 def store_fp8_out(x, q8_ptrs, scale_ptr, scale_offs, OUT_QUANT: gl.constexpr):
-    """Quantize the bf16-rounded O [H, D] (fp32 ``x``) as the separate aiter quant of
-    the o_proj input would: per token over the row (1) or per 1 x 128 head (2), the
-    arithmetic of ``fp8_per_token_quant`` / ``fp8_group_quant``."""
+    """Quantize the bf16-rounded O [H, D] (fp32 ``x``) like aiter's separate o_proj quant.
+
+    ``OUT_QUANT`` 1 is per token over the row and 2 per 1 x 128 head, the arithmetic of
+    ``fp8_per_token_quant`` / ``fp8_group_quant``.
+    """
     if OUT_QUANT == 1:
         scale = gl.max(gl.max(gl.abs(x), axis=1), axis=0) * (1.0 / _FP8_E4M3_MAX)
         q = gl.clamp(x * _rcp_f32(scale), -_FP8_E4M3_MAX, _FP8_E4M3_MAX)

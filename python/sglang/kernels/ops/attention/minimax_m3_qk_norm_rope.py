@@ -413,7 +413,7 @@ def _load_quarter(row_ptr, stride_d, mask, g: tl.constexpr):
     cols = _quarter_cols(g)
     h = tl.arange(0, 2)[None, None, None, :, None]
     x = tl.load(row_ptr + cols * stride_d, mask=mask, other=0.0)
-    # the other 8-column half of each chunk, for the sum of squares
+    # The other 8-column half of each chunk, for the sum of squares.
     x_other_half = tl.load(
         row_ptr + (cols + 8 - 16 * h) * stride_d, mask=mask, other=0.0
     )
@@ -488,7 +488,7 @@ def _norm_rope_heads(
     b = _gemma_norm(b, rstd, w_b, norm_dtype)
     c = _gemma_norm(c, rstd, w_c, norm_dtype)
     d = _gemma_norm(d, rstd, w_d, norm_dtype)
-    # fp32 normed and neox-rotated quarters of [BLOCK_T, HEADS_P2] heads
+    # Returns fp32 normed and neox-rotated quarters of [BLOCK_T, HEADS_P2] heads.
     a, b = a * cos - b * sin, b * cos + a * sin
     return a, b, c, d, mask
 
@@ -503,9 +503,11 @@ def _store_quarters(row_ptr, stride_d, mask, a, b, c, d):
 
 @triton.jit
 def _nvfp4_quarter(x, BLOCK_T: tl.constexpr, HEADS: tl.constexpr):
-    """One 32-column quarter [BLOCK_T, HEADS, 2, 2, 8] to NVFP4: payload
-    [BLOCK_T, HEADS, 2, 2, 4] and E4M3 scales [BLOCK_T, HEADS, 2] (axis 2 is the
-    16-column scale group, as `_quarter_cols` lays the columns out)."""
+    """Quantize one 32-column quarter [BLOCK_T, HEADS, 2, 2, 8] to NVFP4.
+
+    Returns the payload [BLOCK_T, HEADS, 2, 2, 4] and E4M3 scales [BLOCK_T, HEADS, 2];
+    axis 2 is the 16-column scale group, as ``_quarter_cols`` lays the columns out.
+    """
     amax = tl.max(tl.max(tl.abs(x), axis=4), axis=3)
     scale_e4m3 = (amax / 6.0).to(tl.float8e4nv)
     inv = tl.where(amax != 0.0, 1.0 / scale_e4m3.to(tl.float32), 0.0)
@@ -528,7 +530,7 @@ def _store_nvfp4_quarter(
     j = tl.arange(0, 2)[None, None, :, None, None]
     h = tl.arange(0, 2)[None, None, None, :, None]
     pair = tl.arange(0, 4)[None, None, None, None, :]
-    # a byte holds columns 2i (low nibble) and 2i+1 of the row
+    # A byte holds columns 2i (low nibble) and 2i+1 of the row.
     tl.store(payload_row_ptr + 16 * g + 8 * j + 4 * h + pair, payload, mask=mask)
     tl.store(scale_row_ptr + 2 * g + j, scales[:, :, :, None, None], mask=mask)
 
@@ -554,8 +556,7 @@ def _store_nvfp4_quarters(
     HEADS: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
 ):
-    """Quantize a [BLOCK_T, HEADS] tile of 128-column rows to NVFP4 and scatter it
-    into the MSA-v1 paged payload/scale buffers at ``loc``."""
+    """Quantize [BLOCK_T, HEADS] 128-column rows to NVFP4 and scatter them to MSA-v1 pages."""
     page = loc // PAGE_SIZE
     row = loc % PAGE_SIZE
     payload_row = payload_ptr + page * pay_page + heads * pay_head + row * pay_row
@@ -701,7 +702,7 @@ def _kv_block(
     # (padding rows may hold NaN); the K-only index scatter writes it.
     kv_mask = mask & (loc != 0)
     if NVFP4:
-        # quantize the rounded K the attention reads, as the pool's own store does
+        # Quantize the rounded K the attention reads, as the pool's own store does.
         _store_nvfp4_quarters(
             k_cache_ptr,
             k_scale_cache_ptr,
@@ -818,7 +819,7 @@ def _idx_k_block(
         d.to(norm_dtype),
     )
     if NVFP4:
-        # quantize the rounded index K, as the pool's own store does
+        # Quantize the rounded index K, as the pool's own store does.
         _store_nvfp4_quarters(
             cache_ptr,
             scale_cache_ptr,
@@ -840,7 +841,7 @@ def _idx_k_block(
             NV_PAGE,
         )
     else:
-        # cast fp32 straight to the cache dtype (fp8 on gfx95) to avoid rounding twice
+        # Cast fp32 straight to the cache dtype (fp8 on gfx95) to avoid rounding twice.
         cache_dtype: tl.constexpr = cache_ptr.dtype.element_ty
         _store_quarters(
             cache_ptr + loc * cache_stride_s,
@@ -1105,7 +1106,7 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_tiled_kernel(
     v_cache_stride_d,
     idx_k_cache_stride_s,
     idx_k_cache_stride_d,
-    # NVFP4 caches only: E4M3 scale buffers and the MSA-v1 (page, head, row) strides
+    # NVFP4 caches only: E4M3 scale buffers and the MSA-v1 (page, head, row) strides.
     k_scale_cache_ptr,
     v_scale_cache_ptr,
     idx_k_scale_cache_ptr,
@@ -1270,7 +1271,7 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
 
     The caches may be fp8; K/V are then divided by their per-tensor scales
     (``None`` is unit) before the cast, as the unfused pool store does. They may
-    also be `Nvfp4Cache` (all three), quantized from the rounded K/V/index K.
+    also be ``Nvfp4Cache`` (all three), quantized from the rounded K/V/index K.
     """
     nvfp4 = isinstance(k_cache, Nvfp4Cache)
     if nvfp4:

@@ -10,7 +10,7 @@ straight into MFMA operands, which fixes how the MFMA indices map to head dims:
     the conversion pairs two tokens per register (cvt + pack + scale mul).
   * P: S column 16n + 4b + i is PV K-index 8b + 4n + i, so the S result registers are
     the PV A operand as is.
-The values are those of `nvfp4_kv_dequantize` (e2m1 times E4M3 is exact in fp16), so
+The values are those of ``nvfp4_kv_dequantize`` (e2m1 times E4M3 is exact in fp16), so
 outputs agree with the bf16 Triton decode kernel on the dequantized cache up to fp32
 rounding.
 """
@@ -32,7 +32,7 @@ from .topk_sparse import _merge_topk_attn_out_kernel
 _LOG2E = 1.4426950408889634
 _LN2 = gl.constexpr(0.6931471805599453)
 _WARPS = 4
-# measured on MI350X (M3.1 verify, 1-128 requests x 32k-150k); re-tune with the kernel
+# Measured on MI350X for M3.1 verify at 1-128 requests x 32k-150k; re-tune with the kernel.
 _TARGET_GRID = 256
 
 
@@ -144,8 +144,11 @@ def _block_table(
     SC_ROW: gl.constexpr,
     W: gl.constexpr,
 ):
-    """LDS table of the row's top-k blocks, [TOPK_P] x (payload offset in 64-byte units,
-    scale offset in 8-byte units, rows before seq_len), and the chunk's end entry."""
+    """LDS table of the row's top-k blocks, and the chunk's end entry.
+
+    Each of the [TOPK_P] entries holds the payload offset in 64-byte units, the scale
+    offset in 8-byte units and the rows before seq_len.
+    """
     t_l: gl.constexpr = gl.BlockedLayout([1], [64], [W], [0])
     seq_len = gl.minimum(gl.load(seq_lens + pid_b), max_kv_len).to(gl.int32)
     sid = (gl.load(slot_ids + pid_b).to(gl.int64) + max_slots) % max_slots
@@ -191,9 +194,12 @@ def _load_tiles(
     PAY_ROW: gl.constexpr,
     SC_ROW: gl.constexpr,
 ):
-    """Raw K/V tiles of table entry i; entries from c_end on reload the chunk's last
-    block with no valid rows. The per-register offset parts (k_s, ks_s, v_row) are added
-    last, so the loads take them as instruction offsets."""
+    """Raw K/V tiles of table entry i.
+
+    Entries from c_end on reload the chunk's last block with no valid rows. The
+    per-register offset parts (k_s, ks_s, v_row) are added last, so the loads take them
+    as instruction offsets.
+    """
     k_pay_ptr, k_sc_ptr, v_pay_ptr, v_sc_ptr = ptrs
     k_lane, k_s, ks_lane, ks_s, v_lane, vs_lane, v_tok_lane, v_row = offsets
     rec_l: gl.constexpr = gl.BlockedLayout([4], [64], [W], [0])
@@ -237,8 +243,10 @@ def _k_operand(ky, ks, k5_l: gl.constexpr, k6_l: gl.constexpr, dot_b: gl.constex
 
 @gluon.jit
 def _v_operand(vz, vs, dot_b: gl.constexpr):
-    """vz [W, k // 8, k % 8, g] u32 (dword g of the row PV K-index k reads) and its
-    scales -> V [W, k, 16e + g] fp16."""
+    """vz [W, k // 8, k % 8, g] u32 and its scales -> V [W, k, 16e + g] fp16.
+
+    Dword g of ``vz`` is from the row PV K-index k reads.
+    """
     W: gl.constexpr = vz.shape[0]
     TW: gl.constexpr = vz.shape[1] * vz.shape[2]
     vz = gl.convert_layout(gl.reshape(vz, [W, TW, 16]), dot_b, assert_trivial=True)
@@ -307,8 +315,11 @@ def _store_merged(
     stride_s_h,
     OUT_QUANT: gl.constexpr,
 ):
-    """Merge the warps' softmax states and store O [H, D] (dims in order) and its lse,
-    or, with ``OUT_QUANT``, O quantized to FP8 for the o_proj (see ``store_fp8_out``)."""
+    """Merge the warps' softmax states and store O [H, D] (dims in order) and its lse.
+
+    With ``OUT_QUANT`` it stores O quantized to FP8 for the o_proj instead (see
+    ``store_fp8_out``).
+    """
     m_i, l_i, acc = state
     W: gl.constexpr = acc.shape[0]
     H: gl.constexpr = acc.shape[1]
@@ -503,8 +514,10 @@ def _nvfp4_sparse_decode_kernel(
 
 @gluon.constexpr_function
 def _merge_o_layout(C, H, W):
-    """Triton's layout for `_merge_topk_attn_out_kernel`'s [C, 128] bf16 tile at four
-    warps, with H heads as a leading dim over registers and groups of four warps."""
+    """Triton's layout for ``_merge_topk_attn_out_kernel``'s [C, 128] bf16 tile at four warps.
+
+    H heads are a leading dim over registers and groups of four warps.
+    """
     if C == 2:
         spt, tpw, wpc = [1, 1], [1, 64], [2, 2]
     else:
@@ -539,9 +552,11 @@ def _merge_quant_kernel(
     OUT_QUANT: gl.constexpr,  # see store_fp8_out
     num_warps: gl.constexpr,
 ):
-    """One row's chunks merged as `_merge_topk_attn_out_kernel` merges them, bitwise:
-    each head's reduction over the chunks keeps that kernel's lane and warp structure.
-    O is then quantized for the o_proj like the single-chunk epilogue does."""
+    """Merge a row's chunks bitwise like ``_merge_topk_attn_out_kernel``, then quantize O.
+
+    Each head's reduction over the chunks keeps that kernel's lane and warp structure; O
+    is quantized for the o_proj as the single-chunk epilogue does.
+    """
     C: gl.constexpr = NUM_TOPK_CHUNKS
     o_l: gl.constexpr = _merge_o_layout(C, H, num_warps)
     lse_l: gl.constexpr = _merge_lse_layout(H, num_warps)
@@ -642,13 +657,13 @@ def flash_decode_nvfp4_gfx950(
     v_scale: float,
     out_quant: str = "",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """`flash_decode_with_gqa_share_sparse` on an NVFP4 cache, where
-    `can_use_nvfp4_decode_gfx950`.
+    """``flash_decode_with_gqa_share_sparse`` on an NVFP4 cache.
 
-    ``out_quant`` is the o_proj's ``fp8_input_quant_format``; when this kernel (one
-    top-k chunk) or the chunk merge (2-8 chunks, one KV head) leaves O final, O comes
-    back already quantized for the o_proj as ``(fp8 [batch_size, num_q_heads * 128],
-    scale)``, the bytes of the separate quant.
+    Requires ``can_use_nvfp4_decode_gfx950``. ``out_quant`` is the o_proj's
+    ``fp8_input_quant_format``; when this kernel (one top-k chunk) or the chunk merge
+    (2-8 chunks, one KV head) leaves O final, O comes back already quantized for the
+    o_proj as ``(fp8 [batch_size, num_q_heads * 128], scale)``, the bytes of the
+    separate quant.
     """
     triton.set_allocator(robust_allocator)
     batch_size, num_q_heads, head_dim = q.shape
