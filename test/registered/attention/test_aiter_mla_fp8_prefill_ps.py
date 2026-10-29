@@ -18,6 +18,7 @@ if _RUNNABLE:
         AiterAttnBackend,
         ForwardMetadata,
     )
+    from sglang.srt.layers.attention.merge_state import merge_state
     from sglang.srt.utils import is_gfx95_supported
 
     _RUNNABLE = is_gfx95_supported()
@@ -123,6 +124,50 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
                 self.assertTrue(lse.is_contiguous())
                 ref_out, ref_lse = _reference(q, k, v, q_lens, kv_lens)
                 self._assert_matches(out, lse, ref_out, ref_lse, slice(None))
+
+    def test_prefix_chunk_with_keyless_requests(self):
+        """Prefix chunk where some requests have no keys: their rows leave with LSE -inf,
+        so merge_state keeps the other state; the rest must match the reference."""
+        q_lens = [130, 40, 260]
+        num_heads = KIMI_K3_TP8_HEADS
+        # Middle request keyless (gathered rows) and leading one keyless (slice).
+        for chunk_lens in ([700, 0, 333], [0, 515, 260]):
+            with self.subTest(chunk_lens=chunk_lens):
+                backend = _backend(num_heads, q_lens)
+                chunk_lens_t = torch.tensor([chunk_lens], dtype=torch.int32)
+                cu = torch.zeros(1, len(chunk_lens) + 1, dtype=torch.int32)
+                cu[:, 1:] = chunk_lens_t.cumsum(1)
+                batch = SimpleNamespace(
+                    extend_seq_lens_cpu=q_lens,
+                    num_prefix_chunks=1,
+                    prefix_chunk_idx=0,
+                    prefix_chunk_seq_lens_cpu=chunk_lens_t,
+                    prefix_chunk_has_zero_kv=[True],
+                    prefix_chunk_cu_seq_lens=cu.cuda(),
+                    prefix_chunk_num_tokens=[sum(chunk_lens)],
+                )
+                backend.init_mha_chunk_metadata(batch, disable_flashinfer_ragged=True)
+                q, k_nope, k_pe, v = _qkv(num_heads, q_lens, chunk_lens)
+                layer = _layer(num_heads)
+
+                out, lse = backend._forward_extend_prefix_chunk(
+                    q, _cat_k(k_nope, k_pe), v, layer, batch
+                )
+
+                ref_out, ref_lse = _reference(
+                    q, _cat_k(k_nope, k_pe), v, q_lens, chunk_lens
+                )
+                keyless = torch.repeat_interleave(
+                    torch.tensor([n == 0 for n in chunk_lens]), torch.tensor(q_lens)
+                ).cuda()
+                self._assert_matches(out, lse, ref_out, ref_lse, ~keyless)
+                self.assertTrue(torch.isneginf(lse[keyless]).all())
+
+                other_out = torch.randn_like(out)
+                other_lse = torch.randn_like(lse)
+                merged, _ = merge_state(out, lse, other_out, other_lse)
+                self.assertFalse(merged.isnan().any())
+                torch.testing.assert_close(merged[keyless], other_out[keyless])
 
 
 if __name__ == "__main__":
