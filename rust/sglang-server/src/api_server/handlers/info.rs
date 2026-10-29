@@ -25,6 +25,7 @@ impl CoreHandle {
             reasoning_parser: metadata.reasoning_parser.clone(),
             tool_call_parser: metadata.tool_call_parser.clone(),
             disaggregation_mode: metadata.disaggregation_mode,
+            launch_fields: metadata.launch_model_info.clone(),
         }
     }
 
