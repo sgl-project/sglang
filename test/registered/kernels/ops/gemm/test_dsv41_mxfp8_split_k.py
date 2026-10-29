@@ -1,4 +1,4 @@
-"""Opt-in B300 dense split-K: numerical accuracy, fallbacks and graph replay."""
+"""B300 dense split-K: numerical accuracy, fallbacks and graph replay."""
 
 import unittest
 from functools import partial
@@ -86,7 +86,7 @@ class TestDsv41Mxfp8SplitK(CustomTestCase):
 
     @torch.inference_mode()
     def test_default_and_unsupported_cases_preserve_output(self):
-        """The opt-in cannot change other M/N/K shapes, dtypes or hardware."""
+        """The policy cannot change other M/N/K shapes, dtypes or hardware."""
         for m, n, k, dtype in (
             (9, 1792, 5120, torch.bfloat16),
             (1, 128, 5120, torch.bfloat16),
@@ -161,8 +161,8 @@ class TestDsv41Mxfp8SplitK(CustomTestCase):
                             use_small_batch_split_k=enabled,
                         )
 
-    def test_model_optin_only_marks_target_projections(self):
-        """Model wiring must not opt other projections into the new policy."""
+    def test_model_default_and_optout(self):
+        """The unset default enables only target projections; zero opts out."""
         from sglang.srt.environ import envs
         from sglang.srt.layers.quantization.fp8 import Fp8Config
         from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
@@ -206,7 +206,9 @@ class TestDsv41Mxfp8SplitK(CustomTestCase):
             DeepseekV4ForCausalLM._configure_small_batch_split_k(target)
         for projection, original in zip(projections, before):
             self.assertIs(projection.quant_method.w8a8_mxfp8_linear, original)
-        with envs.SGLANG_OPT_DSV41_SMALL_BATCH_SPLIT_K.override(True):
+        with envs.SGLANG_OPT_DSV41_SMALL_BATCH_SPLIT_K.override(False):
+            # Exercise the unset default while restoring the caller's env on exit.
+            envs.SGLANG_OPT_DSV41_SMALL_BATCH_SPLIT_K.clear()
             DeepseekV4ForCausalLM._configure_small_batch_split_k(target)
         for projection in (projections[0], projections[2]):
             self.assertTrue(
