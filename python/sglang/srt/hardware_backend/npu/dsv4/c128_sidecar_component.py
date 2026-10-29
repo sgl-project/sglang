@@ -149,15 +149,6 @@ class C128SidecarComponent(TreeComponent):
         ]
         return endpoints[-blocks:] if blocks else []
 
-    def _block_transfer(self, blocks: int) -> PoolTransfer:
-        return PoolTransfer(
-            name=self.pool_name,
-            keys=["__placeholder__"] * blocks,
-            hit_policy=PoolHitPolicy.BLOCK_GROUPS,
-            block_pages=self.block_pages(),
-            group_pages=1,
-        )
-
     def prepare_prefetch(
         self,
         node_id: NodeId,
@@ -605,8 +596,17 @@ class C128SidecarComponent(TreeComponent):
             if blocks == 0:
                 return None
             # Placeholder keys: the controller rewrites them to the span's block
-            # boundary hashes once the KV hit length is known.
-            return [self._block_transfer(blocks)]
+            # boundary hashes once the KV hit length is known. The staging slots
+            # are the controller's to allocate (indices_from_pool is unset).
+            return [
+                PoolTransfer(
+                    name=self.pool_name,
+                    keys=["__placeholder__"] * blocks,
+                    hit_policy=PoolHitPolicy.BLOCK_GROUPS,
+                    block_pages=self.block_pages(),
+                    group_pages=1,
+                )
+            ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
             # Collect host values from complete-group endpoints on the evicted path.
