@@ -33,6 +33,8 @@ PATCH_SIZE = 32
 T_EPS = 0.001
 CONDITION_IMAGE_SIZE = 384
 NOISE_SCALE = 8.0
+REROLL_OUT_OF_RANGE_THRESHOLD = 0.001
+REROLL_MAX_ATTEMPTS = 3
 
 PREDEFINED_RESOLUTIONS = [
     (2048, 2048),
@@ -176,12 +178,15 @@ class FlashFlowMatchScheduler:
             sigma_next = self.sigmas[self._step_index + 1]
             if generator is not None and generator.device.type == "cpu":
                 noise = torch.randn(
-                    model_output.shape, generator=generator,
-                    dtype=denoised.dtype).to(model_output.device)
+                    model_output.shape, generator=generator, dtype=denoised.dtype
+                ).to(model_output.device)
             else:
-                noise = torch.randn(model_output.shape,
-                                    device=model_output.device,
-                                    dtype=denoised.dtype, generator=generator)
+                noise = torch.randn(
+                    model_output.shape,
+                    device=model_output.device,
+                    dtype=denoised.dtype,
+                    generator=generator,
+                )
             if noise_clip_std > 0:
                 clip_val = noise_clip_std * noise.std().item()
                 noise = noise.clamp(min=-clip_val, max=clip_val)
@@ -698,6 +703,29 @@ def decode_patches_to_image(
     return img
 
 
+def draw_initial_noise(
+    noise_scale: float,
+    height: int,
+    width: int,
+    h_patches: int,
+    w_patches: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """(1, 3, H, W) scaled noise -> patch layout (1, h*w, 3*patch_size^2)."""
+    noise = noise_scale * torch.randn(
+        (1, 3, height, width),
+        generator=generator,
+        device=generator.device,
+        dtype=torch.float32,
+    ).to(device, dtype)
+    z = noise.reshape(1, 3, h_patches, PATCH_SIZE, w_patches, PATCH_SIZE)
+    return (
+        z.permute(0, 2, 4, 1, 3, 5).contiguous().reshape(1, h_patches * w_patches, -1)
+    )
+
+
 def resize_pilimage(pil_image, image_size, patch_size=16, resampler=None):
     """Aspect-preserving resize + center crop (official utils.py)."""
     from PIL import Image as _Image
@@ -1006,10 +1034,9 @@ class HiDreamGenerationStage(PipelineStage):
                     logger.warning(
                         "Short T2I prompt (%d chars): output may be "
                         "uncolored line art; refine it or enable "
-                        "--pe-server-url.", n)
-
-        # Per-output generators created by InputValidationStage
-        batch_generators = getattr(batch, "generator", None) or []
+                        "--pe-server-url.",
+                        n,
+                    )
 
         results = []
         for prompt_idx, (prompt, height, width, seed) in enumerate(
@@ -1249,30 +1276,23 @@ class HiDreamGenerationStage(PipelineStage):
 
             tgt_image_len = h_patches * w_patches
 
-            # Reuse the per-output generators from InputValidationStage
-            # (created on CPU); a list shorter than the prompts falls back
-            # to its first generator.
-            if batch_generators:
-                generator = (
-                    batch_generators[prompt_idx]
-                    if prompt_idx < len(batch_generators)
-                    else batch_generators[0]
-                )
-            else:
-                generator = torch.Generator("cpu")
-                generator.manual_seed(int(seed))
-            noise = init_noise_scale * torch.randn(
-                (1, 3, height, width),
-                generator=generator,
-                device=generator.device,
-                dtype=torch.float32,
-            ).to(device, dtype)
-            z = noise.reshape(1, 3, h_patches, PATCH_SIZE, w_patches, PATCH_SIZE)
-            z = (
-                z.permute(0, 2, 4, 1, 3, 5)
-                .contiguous()
-                .reshape(1, h_patches * w_patches, -1)
+            generator = torch.Generator(device)
+            generator.manual_seed(int(seed))
+            z = draw_initial_noise(
+                init_noise_scale,
+                height,
+                width,
+                h_patches,
+                w_patches,
+                device,
+                dtype,
+                generator,
             )
+
+            # Deterministic TI2I (full-model UniPC, DEV flow_match) re-
+            # injects no per-step noise, so the trajectory is fixed by
+            # the initial draw; a bad draw must be re-rolled.
+            reroll_enabled = not inject_noise and ref_paths is not None
 
             precomputed_image_embeds = None
             precomputed_deepstack_image_embeds = None
@@ -1305,6 +1325,103 @@ class HiDreamGenerationStage(PipelineStage):
                         embeds
                     )
                 x_tgt = x_pred_cond[:, :tgt_image_len]
+
+                if reroll_enabled and step_idx == 0:
+                    out_range_frac = (x_tgt.float().abs() > 1.0).float().mean().item()
+                    best_frac = out_range_frac
+                    best_seed = int(seed) + 1
+                    best_z, best_x_tgt = z, x_tgt
+                    best_embeds = (
+                        precomputed_image_embeds,
+                        precomputed_deepstack_image_embeds,
+                    )
+                    reroll_attempts = 0
+                    while (
+                        best_frac > REROLL_OUT_OF_RANGE_THRESHOLD
+                        and reroll_attempts < REROLL_MAX_ATTEMPTS
+                    ):
+                        reroll_attempts += 1
+                        reroll_seed = int(seed) + 1 + reroll_attempts
+                        logger.warning(
+                            "TI2I seed reroll: step-0 x_pred out-of-range "
+                            "fraction %.3f > %.3f (seed %s); re-rolling "
+                            "to generator seed %d (attempt %d/%d)",
+                            best_frac,
+                            REROLL_OUT_OF_RANGE_THRESHOLD,
+                            seed,
+                            reroll_seed,
+                            reroll_attempts,
+                            REROLL_MAX_ATTEMPTS,
+                        )
+                        reroll_gen = torch.Generator("cpu")
+                        reroll_gen.manual_seed(reroll_seed)
+                        z = draw_initial_noise(
+                            init_noise_scale,
+                            height,
+                            width,
+                            h_patches,
+                            w_patches,
+                            device,
+                            dtype,
+                            reroll_gen,
+                        )
+                        vinputs = (
+                            torch.cat([z, ref_patches], dim=1)
+                            if ref_patches is not None
+                            else z.clone()
+                        )
+                        with torch.autocast(
+                            device_type=device.type,
+                            dtype=dtype,
+                            cache_enabled=False,
+                        ):
+                            x_pred_cond, embeds = self._forward_once(
+                                cond_sample,
+                                vinputs,
+                                t_pixeldit.to(device),
+                                precomputed_image_embeds,
+                                precomputed_deepstack_image_embeds,
+                            )
+                        if embeds is not None:
+                            (
+                                precomputed_image_embeds,
+                                precomputed_deepstack_image_embeds,
+                            ) = embeds
+                        x_tgt = x_pred_cond[:, :tgt_image_len]
+                        out_range_frac = (
+                            (x_tgt.float().abs() > 1.0).float().mean().item()
+                        )
+                        if out_range_frac < best_frac:
+                            best_frac = out_range_frac
+                            best_seed = reroll_seed
+                            best_z, best_x_tgt = z, x_tgt
+                            best_embeds = (
+                                precomputed_image_embeds,
+                                precomputed_deepstack_image_embeds,
+                            )
+                    if reroll_attempts > 0:
+                        if best_frac > REROLL_OUT_OF_RANGE_THRESHOLD:
+                            logger.warning(
+                                "TI2I seed reroll: no draw passed the %.3f "
+                                "threshold after %d attempts; keeping the "
+                                "best (generator seed %d, fraction %.3f)",
+                                REROLL_OUT_OF_RANGE_THRESHOLD,
+                                reroll_attempts,
+                                best_seed,
+                                best_frac,
+                            )
+                        z, x_tgt = best_z, best_x_tgt
+                        (
+                            precomputed_image_embeds,
+                            precomputed_deepstack_image_embeds,
+                        ) = best_embeds
+                        # vinputs must match the kept draw for the
+                        # uncond CFG pass below.
+                        vinputs = (
+                            torch.cat([z, ref_patches], dim=1)
+                            if ref_patches is not None
+                            else z.clone()
+                        )
 
                 v_cond = (x_tgt.float() - z.float()) / sigma
 
