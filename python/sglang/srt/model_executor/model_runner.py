@@ -82,7 +82,7 @@ from sglang.srt.kernel_plugins.amd.binding import (
 )
 from sglang.srt.kernel_plugins.nvidia.binding import install_megakernel
 from sglang.srt.kv_canary.api import install_canary
-from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.kv_canary.runner.canary_manager import CanaryManager, context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -330,6 +330,7 @@ class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     watermark_state: Optional[WatermarkState] = None
+    canary_manager: Optional[CanaryManager] = None
 
     @property
     def sampling_observer(self) -> Optional[SamplingObserver]:
@@ -1040,7 +1041,6 @@ class ModelRunner:
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
         self.canary_manager = install_canary(
-            server_args=self.server_args,
             model_runner=self,
             token_oracle_manager=self._token_oracle_manager,
         )
@@ -2225,6 +2225,12 @@ class ModelRunner:
             logits_output.auxiliary_device_output = observer.after_sample(
                 observer_state,
                 next_token_ids,
+            )
+        if (c := self.canary_manager) is not None:
+            c.on_sampled(
+                logits_output=logits_output,
+                forward_batch=forward_batch,
+                next_token_ids=next_token_ids,
             )
         self.ngram_embedding_manager.update_after_decode(
             next_token_ids=next_token_ids,
