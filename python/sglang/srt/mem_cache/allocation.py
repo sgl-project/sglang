@@ -439,7 +439,7 @@ def alloc_for_extend(
         )
 
     for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
-        req.kv.allocate_extend(seq_len)
+        req.kv.set_row_len(seq_len)
         batch.tree_cache.maybe_hand_to_session(req)
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu

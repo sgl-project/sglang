@@ -1043,10 +1043,10 @@ class ReqKvInfo:
         self.kv_allocated_len = 0
         self.component_evicted_seqlens.clear()
 
-    def allocate_extend(self, seq_len: int) -> None:
-        """An extend holds [0, seq_len) of the row, all of it committed."""
-        self.kv_allocated_len = seq_len
-        self.kv_committed_len = seq_len
+    def set_row_len(self, end: int) -> None:
+        """The row holds exactly [0, end), all of it committed."""
+        self.kv_allocated_len = end
+        self.kv_committed_len = end
 
     def allocate_decode(self, num_tokens: int) -> None:
         """A decode step holds num_tokens more slots and commits them at
@@ -1087,18 +1087,6 @@ class ReqKvInfo:
         self.kv_committed_len = min(self.kv_committed_len, end)
         self.clamp_evicted_seqlens(end)
 
-    def free_tail(self, end: int) -> None:
-        """The tail past end was freed: allocated becomes end exactly, and the
-        committed and evicted lengths past end drop to it."""
-        self.kv_allocated_len = end
-        self.kv_committed_len = min(self.kv_committed_len, end)
-        self.clamp_evicted_seqlens(end)
-
-    def rewind(self, end: int) -> None:
-        """The row goes back to [0, end), all of it committed."""
-        self.kv_committed_len = end
-        self.kv_allocated_len = end
-
     def protect_prefix(self, length: int) -> None:
         """The tree owns [0, length) of the row; the request frees only past it."""
         self.cache_protected_len = length
@@ -1119,12 +1107,9 @@ class ReqKvInfo:
 
     def reset_for_retract(self) -> None:
         """A retracted request, its row already released, starts over: the tree
-        prefix, the committed length and the mamba state are reset. The other
-        fields (allocated and evicted lengths, swa_evict_floor, the host backup
-        and its restore event) keep their values."""
+        prefix, the committed length and the mamba state are reset."""
         assert not self.holds_kv, "expect it is already released"
-        self.cache_protected_len = 0
-        self.cache_inserted_len = 0
+        self.clear_tree_prefix()
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_ping_pong_empty = None

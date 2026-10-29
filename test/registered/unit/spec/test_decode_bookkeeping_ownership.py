@@ -1,12 +1,11 @@
 """Ownership contract for per-request bookkeeping clocks.
 
 Per-request accounting state (`decode_batch_idx` / `extend_batch_idx` iter
-clocks, `kv_committed_len` / `kv_allocated_len` KV watermarks and the
-`ReqKvInfo` methods that write them, `spec_verify_ct`, and the
-`maybe_evict_swa()` call) must only be advanced by
-the reviewed owner sites in _OWNER_SITES; spec-v2 draft workers must not
-repeat any of them (the scheduler-driven free function / resolve path already
-does).
+clocks, the `ReqKvInfo` methods that move the `kv_committed_len` /
+`kv_allocated_len` KV watermarks, `spec_verify_ct`, and the
+`maybe_evict_swa()` call) must only be advanced by the reviewed owner sites
+in _OWNER_SITES; spec-v2 draft workers must not repeat any of them (the
+scheduler-driven free function / resolve path already does).
 A clock that runs fast fires SWA eviction in the overlap race window and
 releases the SWA prefix lock early; neither shows up in e2e CI or the idle
 leak checker, hence this AST-level guard.
@@ -31,15 +30,14 @@ assert _SRT_DIR.is_dir(), f"srt dir not found: {_SRT_DIR}"
 _TRACKED_ATTRS = (
     "decode_batch_idx",
     "extend_batch_idx",
-    "kv_committed_len",
-    "kv_allocated_len",
     "spec_verify_ct",
 )
 _EVICT_METHOD = "maybe_evict_swa"
 # ReqKvInfo methods that write kv_committed_len / kv_allocated_len, counted
-# where a request's kv record calls them.
+# where a request's kv record calls them; test_req_kv_lengths keeps every
+# other writer out.
 _KV_WATERMARK_METHODS = (
-    "allocate_extend",
+    "set_row_len",
     "allocate_decode",
     "allocate_spec_decode",
     "allocate_prealloc",
@@ -48,8 +46,6 @@ _KV_WATERMARK_METHODS = (
     "commit_finished",
     "truncate_committed",
     "truncate",
-    "free_tail",
-    "rewind",
 )
 
 # {(path relative to srt/, scope, kind): mutation count}. Kind is the mutated
@@ -72,29 +68,12 @@ _RESOLVE = (
 )
 _SS = "session/streaming_session.py"
 _OWNER_SITES = {
-    # The watermarks are written only by ReqKvInfo's own methods.
-    (_SB, "ReqKvInfo.allocate_extend", "kv_allocated_len"): 1,
-    (_SB, "ReqKvInfo.allocate_extend", "kv_committed_len"): 1,
-    (_SB, "ReqKvInfo.allocate_decode", "kv_allocated_len"): 1,
-    (_SB, "ReqKvInfo.allocate_decode", "kv_committed_len"): 1,
-    (_SB, "ReqKvInfo.allocate_spec_decode", "kv_allocated_len"): 1,
-    (_SB, "ReqKvInfo.allocate_prealloc", "kv_allocated_len"): 1,
-    (_SB, "ReqKvInfo.commit_prealloc", "kv_committed_len"): 1,
-    (_SB, "ReqKvInfo.commit_decode", "kv_committed_len"): 1,
-    (_SB, "ReqKvInfo.commit_finished", "kv_committed_len"): 1,
-    (_SB, "ReqKvInfo.truncate_committed", "kv_committed_len"): 1,
-    (_SB, "ReqKvInfo.truncate", "kv_allocated_len"): 1,
-    (_SB, "ReqKvInfo.truncate", "kv_committed_len"): 1,
-    (_SB, "ReqKvInfo.free_tail", "kv_allocated_len"): 1,
-    (_SB, "ReqKvInfo.free_tail", "kv_committed_len"): 1,
-    (_SB, "ReqKvInfo.rewind", "kv_committed_len"): 1,
-    (_SB, "ReqKvInfo.rewind", "kv_allocated_len"): 1,
     # non-spec scheduler
     (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
     # kv_allocated_len is settled inside the owned-kv alloc functions (op28).
     ("mem_cache/allocation.py", "alloc_for_extend", "evict"): 1,
-    ("mem_cache/allocation.py", "alloc_for_extend", "allocate_extend"): 1,
+    ("mem_cache/allocation.py", "alloc_for_extend", "set_row_len"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode_default", "evict"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode_default", "allocate_decode"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
@@ -142,16 +121,16 @@ _OWNER_SITES = {
     (
         "beam_search/fork.py",
         "free_member_rows",
-        "rewind",
+        "set_row_len",
     ): 1,
     # A completed dLLM canvas is discarded while the context and slot stay owned.
     (
         "dllm/mixin/scheduler.py",
         "SchedulerDllmMixin._stash_dllm_context",
-        "rewind",
+        "set_row_len",
     ): 1,
     # streaming session tail trimming
-    (_SS, "StreamingSession._free_tail", "free_tail"): 1,
+    (_SS, "StreamingSession._free_tail", "truncate"): 1,
     (_SS, "StreamingSession._trim_overshoot", "truncate"): 1,
     # Inherit the authoritative finished length (not the lagging req clock).
     (_SS, "StreamingSession.try_cache_finished_req", "commit_finished"): 1,

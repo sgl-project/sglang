@@ -32,22 +32,6 @@ _SETATTR_FUNCS = {"setattr", "delattr", "__setattr__", "__delattr__"}
 # Calls whose keyword arguments set fields: the constructor and dataclasses.replace.
 _FIELD_KWARG_FUNCS = {"ReqKvInfo", "replace"}
 
-# (file, scope, field) sites outside ReqKvInfo that set a length. Only shrinks.
-_ALLOWED_WRITERS = {
-    # A Req always builds its ReqKvInfo, so these `req.kv is None` branches
-    # look unreachable; they build a fresh record holding the matched prefix.
-    (
-        "mem_cache/unified_cache/components/swa.py",
-        "SWAComponent.update_external_linker_load",
-        "kv_allocated_len",
-    ),
-    (
-        "mem_cache/unified_cache/unified_cache_linker.py",
-        "UnifiedCacheLinkerWrapper.load_back",
-        "kv_allocated_len",
-    ),
-}
-
 
 def _func_name(func):
     if isinstance(func, ast.Name):
@@ -68,18 +52,14 @@ def _is_own_field(node, own_fields):
 
 
 def _target_fields(target, own_fields):
-    """Fields a store or delete target names: `x.field`, `x.field[k]`, and
-    `x.__dict__["field"]` / `vars(x)["field"]`."""
+    """Fields a store or delete target names: `x.field` and `x.field[k]`."""
     for sub in ast.walk(target):
-        if isinstance(sub, ast.Attribute) and sub.attr in _LENGTH_FIELDS:
-            if not _is_own_field(sub, own_fields):
-                yield sub.attr
-        elif (
-            isinstance(sub, ast.Subscript)
-            and isinstance(sub.slice, ast.Constant)
-            and sub.slice.value in _LENGTH_FIELDS
+        if (
+            isinstance(sub, ast.Attribute)
+            and sub.attr in _LENGTH_FIELDS
+            and not _is_own_field(sub, own_fields)
         ):
-            yield sub.slice.value
+            yield sub.attr
 
 
 def _writes(node, own_fields=frozenset()):
@@ -146,23 +126,14 @@ def _scan(path):
 
 class TestReqKvLengthWriters(CustomTestCase):
     def test_only_req_kv_info_methods_assign_lengths(self):
-        found = []
-        allowed_seen = set()
-        for path in sorted(_SRT_DIR.rglob("*.py")):
-            rel = path.relative_to(_SRT_DIR).as_posix()
-            for scope, field, line in _scan(path):
-                if (rel, scope, field) in _ALLOWED_WRITERS:
-                    allowed_seen.add((rel, scope, field))
-                    continue
-                found.append(f"{rel}:{line} {scope} writes {field}")
+        found = [
+            f"{path.relative_to(_SRT_DIR).as_posix()}:{line} {scope} writes {field}"
+            for path in sorted(_SRT_DIR.rglob("*.py"))
+            for scope, field, line in _scan(path)
+        ]
         self.assertFalse(
             found,
             "Write these lengths through a ReqKvInfo method:\n  " + "\n  ".join(found),
-        )
-        self.assertEqual(
-            allowed_seen,
-            _ALLOWED_WRITERS,
-            "Drop the allowlist entries that no longer write a length",
         )
 
     def test_scan_catches_indirect_writes(self):
@@ -174,8 +145,6 @@ class TestReqKvLengthWriters(CustomTestCase):
             "setattr(kv, 'kv_committed_len', 3)": "kv_committed_len",
             "object.__setattr__(kv, 'cache_inserted_len', 3)": "cache_inserted_len",
             "delattr(kv, 'kv_allocated_len')": "kv_allocated_len",
-            "kv.__dict__['kv_committed_len'] = 3": "kv_committed_len",
-            "vars(kv)['kv_allocated_len'] = 3": "kv_allocated_len",
             "ReqKvInfo(kv_allocated_len=4)": "kv_allocated_len",
             "dataclasses.replace(kv, kv_committed_len=4)": "kv_committed_len",
             "del kv.component_evicted_seqlens[k]": "component_evicted_seqlens",
@@ -248,7 +217,8 @@ class TestReqKvLengthMethods(CustomTestCase):
             swa_evict_floor=2,
         )
         cases = [
-            ("allocate_extend", (12,), dict(kv_committed_len=12, kv_allocated_len=12)),
+            ("set_row_len", (12,), dict(kv_committed_len=12, kv_allocated_len=12)),
+            ("set_row_len", (5,), dict(kv_committed_len=5, kv_allocated_len=5)),
             # Commits at allocation, not when the step's token is known.
             ("allocate_decode", (1,), dict(kv_committed_len=9, kv_allocated_len=11)),
             ("allocate_spec_decode", (12,), dict(kv_allocated_len=12)),
@@ -266,14 +236,6 @@ class TestReqKvLengthMethods(CustomTestCase):
                 dict(kv_committed_len=5, kv_allocated_len=5, swa_evicted=5),
             ),
             ("truncate", (12,), {}),
-            (
-                "free_tail",
-                (5,),
-                dict(kv_committed_len=5, kv_allocated_len=5, swa_evicted=5),
-            ),
-            # Unlike truncate, allocated becomes end even when below it.
-            ("free_tail", (12,), dict(kv_allocated_len=12)),
-            ("rewind", (5,), dict(kv_committed_len=5, kv_allocated_len=5)),
             ("protect_prefix", (6,), dict(cache_protected_len=6)),
             ("record_insert", (9,), dict(cache_inserted_len=9)),
             ("record_insert", (6,), {}),

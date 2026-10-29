@@ -94,7 +94,7 @@ def free_member_rows(group, storage) -> None:
         # release frees this decode region a second time.
         slots = storage.requests.req_to_token[group.all_rows, start:end]
         storage.free_tokens(slots.flatten().unique())
-        leader.kv.rewind(start)
+        leader.kv.set_row_len(start)
     storage.release_rows(group.member_rows_cpu.tolist())
     group.member_rows = None
     group.member_rows_cpu = None

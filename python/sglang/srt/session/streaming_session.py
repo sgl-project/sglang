@@ -277,7 +277,7 @@ class StreamingSession:
         """Free [prefix_len, allocated) before alloc_for_extend overwrites it:
         spec decoding or a retract retry leaves stale indices there."""
         self._free_kv_aligned(kv, prefix_len, kv.kv_allocated_len)
-        kv.free_tail(prefix_len)
+        kv.truncate(prefix_len)
 
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
         """Spec v2 can commit past max_new_tokens; the next turn's input is
