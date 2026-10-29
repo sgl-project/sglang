@@ -40,10 +40,16 @@ if TYPE_CHECKING:
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.hicache_key_scheme import (
+    UnifiedKVPlan,
+    namespace_digest,
+    normalize_dtype,
+    plan_unified_kv,
+)
+from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -321,10 +327,10 @@ class HiCacheController:
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-        if isinstance(mem_pool_device, HybridLinearKVPool):
-            mem_pool_device = mem_pool_device.full_kv_pool
+        # A pool wrapping one token KV view transfers that view's KV.
+        inner = mem_pool_device.layer_router.wrapped_view()
+        if inner is not None:
+            mem_pool_device = inner
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
         self.storage_host_pool = mem_pool_host
@@ -548,6 +554,16 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        key_scheme = get_memory().hicache_storage_key_scheme
+        if key_scheme != "unified" and self.storage_host_pool.layout == "page_unified":
+            raise ValueError(
+                "The page_unified host layout requires unified storage keys "
+                "to distinguish its byte order."
+            )
+        if key_scheme == "unified" and storage_backend != "file":
+            raise NotImplementedError(
+                "The unified key scheme supports only the file storage backend."
+            )
         if get_parallel().attn_dcp_size > 1:
             if self.host_memory_mode == "buffer_only":
                 # Buffer-mode write staging still budgets physical host rows.
@@ -763,12 +779,11 @@ class HiCacheController:
             tp_size = parallel.tp_size
             dp_rank = 0
 
-        # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
         # data. storage only needs rank 0 to write it back.
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-        is_mla_model = isinstance(self.mem_pool_device, MLATokenToKVPool)
+        is_mla_model = isinstance(self.mem_pool_device, MLAKVView)
         is_compressed_mla_model = isinstance(
             self.mem_pool_device, DeepSeekV4TokenToKVPool
         )
@@ -790,6 +805,18 @@ class HiCacheController:
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
         model_name = storage_model_name(model_name, self.storage_host_pool)
+        unified_plan = self._build_unified_plan(model_name, attn_cp_size)
+        unified_chunk_spans = None
+        if unified_plan is not None:
+            # Keys are layer-major/head-minor; the physical page is head-major.
+            # Keep each key paired with its byte span instead of slicing pages
+            # consecutively in key order.
+            layout = self.storage_host_pool.page_unified_layout
+            unified_chunk_spans = [
+                layout.chunk_span(layer_range, head_group)
+                for layer_range in unified_plan.layer_ranges
+                for head_group in range(unified_plan.head_group_num)
+            ]
 
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -807,10 +834,79 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=dp_rank,
             extra_config=storage_backend_extra_config,
+            unified_suffixes=(unified_plan.suffixes if unified_plan else None),
+            unified_chunk_spans=unified_chunk_spans,
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
         )
+
+    def _build_unified_plan(
+        self, model_name: Optional[str], attn_cp_size: int
+    ) -> Optional[UnifiedKVPlan]:
+        """Pair topology-free chunk coordinates with local page ranges."""
+        memory = get_memory()
+        if memory.hicache_storage_key_scheme != "unified":
+            return None
+        parallel = get_parallel()
+        host_pool = self.storage_host_pool
+        if (
+            len(getattr(self.mem_pool_host, "entries", [])) > 1
+            or getattr(host_pool, "page_unified_layout", None) is None
+        ):
+            raise NotImplementedError(
+                "The unified key scheme requires a single page_unified KV pool; "
+                "composite and sidecar pools are not supported."
+            )
+        if host_pool.layer_num != host_pool.end_layer - host_pool.start_layer:
+            raise NotImplementedError(
+                "The unified key scheme requires contiguous model layers "
+                "without packed draft layers."
+            )
+        # Host pools retain physical buffer descriptors, not the device pool.
+        # A hybrid controller can wrap a different pool than its storage anchor.
+        anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
+        device_pool = (
+            anchor_entry.device_pool
+            if anchor_entry is not None
+            else self.mem_pool_device
+        )
+        if getattr(host_pool, "dcp_size", 1) > 1:
+            raise NotImplementedError(
+                "The unified key scheme does not support decode context "
+                "parallelism: storage objects must contain full pages."
+            )
+        plan = plan_unified_kv(
+            model_id=model_name or "",
+            # Logical KV dtype, not the storage view: fp8 variants all store as
+            # uint8 but must land in distinct keyspaces.
+            dtype=normalize_dtype(device_pool.dtype),
+            page_size=self.page_size,
+            rank_replicated=isinstance(device_pool, MLAKVView),
+            local_kv_heads=getattr(host_pool, "head_num", 0),
+            attn_tp_rank=parallel.attn_tp_rank,
+            attn_tp_size=parallel.attn_tp_size,
+            attn_cp_size=attn_cp_size,
+            start_layer=host_pool.start_layer,
+            end_layer=host_pool.end_layer,
+            is_final_stage=parallel.pp_rank == parallel.pp_size - 1,
+            head_group=memory.hicache_storage_head_partition,
+            layer_partition=memory.hicache_storage_layer_partition,
+        )
+        # The pool was sized from the same server arg before any backend
+        # attached; if the two disagree the objects would not match their keys.
+        pool_groups = getattr(host_pool, "head_group_num", 1)
+        if plan.head_group_num != pool_groups:
+            raise ValueError(
+                f"the unified plan cuts {plan.head_group_num} head groups but "
+                f"the host pool was allocated with {pool_groups}."
+            )
+        logger.info(
+            "HiCache unified L3 keys: namespace=%s chunks=%s",
+            namespace_digest(plan.namespace),
+            plan.suffixes,
+        )
+        return plan
 
     def reset(self):
         # Reuse detach's queue wakeups and bounded joins, and fail if any
@@ -987,10 +1083,10 @@ class HiCacheController:
     def _move_write_operation(
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
-        """Keep CPU host indices only for page-first staged write-back."""
+        """Keep CPU host indices only for the staged write-back paths."""
         if (
             self.io_backend == "kernel"
-            and self.mem_pool_host.layout == "page_first"
+            and self.mem_pool_host.layout in ("page_first", "page_unified")
             and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
         ):
             return op.host_indices, op.device_indices, op.pool_transfers
