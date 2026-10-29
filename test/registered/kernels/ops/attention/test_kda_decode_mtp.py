@@ -139,7 +139,7 @@ class TestKdaDecodeMtp(CustomTestCase):
         return output, intermediate, gate, weight
 
     def test_output_norm(self):
-        for num_spec in (0, 2):
+        for num_spec in (0, 2, 7, 8, 11, 15):
             with self.subTest(num_spec=num_spec):
                 raw, raw_states, gate, weight = self._run(4, num_spec, onorm=False)
                 fused, fused_states, _, _ = self._run(4, num_spec, onorm=True)

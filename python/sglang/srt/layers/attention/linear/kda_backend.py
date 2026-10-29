@@ -1756,9 +1756,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
-        # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
-        # specialized per block size and capped at 8 by shared-memory growth.
-        if not 2 <= draft_token_num <= 8:
+        # draft_token_num includes the bonus token and the draft block.
+        if not 2 <= draft_token_num <= 16:
             return False
         if layer.bias is not None or layer.lower_bound is None:
             return False
