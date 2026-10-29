@@ -1373,13 +1373,13 @@ class CPUGraphRunner:
             self._compile_decode_dynamic_graphs()
 
     def _reset_mamba_cache_if_needed(self) -> None:
-
-        mamba_pool = self.model_runner.token_to_kv_pool.layer_router.part_view(
-            STATE_PART
-        )
+        token_to_kv_pool = getattr(self.model_runner, "token_to_kv_pool", None)
+        if token_to_kv_pool is None or not hasattr(token_to_kv_pool, "layer_router"):
+            return
+        mamba_pool = token_to_kv_pool.layer_router.part_view(STATE_PART)
         if mamba_pool is None:
             return
-        mamba_cache = mamba_pool.mamba_cache
+        mamba_cache = getattr(mamba_pool, "mamba_cache", None)
         if mamba_cache is None:
             return
 
@@ -1568,11 +1568,18 @@ class CPUGraphRunner:
                     "top_logprobs_nums",
                     "token_ids_logprobs",
                     "multi_item_delimiter_indices",
+                    "token_indices_to_pool",
+                    "mamba_prefill_track_mask_cpu",
+                    "mamba_track_seqlens_cpu",
                 ]
             )
         for name in metadata_fields:
-            value = getattr(forward_batch, name)
-            setattr(dynamic_forward_batch, name, copy.copy(value))
+            value = getattr(forward_batch, name, None)
+            setattr(
+                dynamic_forward_batch,
+                name,
+                copy.copy(value) if value is not None else None,
+            )
 
     def _compile_decode_dynamic_graph(self, skip_cross_attention: bool) -> Callable:
         with patch_model(
@@ -2294,6 +2301,8 @@ class CPUGraphRunner:
         if forward_batch.contains_mm_inputs():
             # Vision preprocessing depends on Python-side multimodal objects;
             # keep that path eager until it has a tensor-only graph contract.
+            return False
+        if raw_num_tokens > self.dynamic_prefill_max_tokens:
             return False
         if forward_batch.batch_size == 1:
             if raw_num_tokens in self.prefill_graphs_bs1:

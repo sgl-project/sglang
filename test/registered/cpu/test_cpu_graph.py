@@ -62,6 +62,7 @@ def _make_cpu_graph_runner():
     runner.prefill_graphs_bs1 = {}
     runner.prefill_dynamic_graph = None
     runner.prefill_dynamic_graph_bs1 = None
+    runner.dynamic_prefill_max_tokens = 1024
     runner.enable_torch_compile = False
     return runner
 
@@ -577,6 +578,68 @@ class TestCPUGraph(CustomTestCase):
             # When decode is disabled, decode runner should be None
             self.assertIsNone(decode_cap.runner)
 
+    def test_cpu_graph_backend_phase_matrix(self):
+        class MockCPUGraphRunner(CPUGraphRunner):
+            def __init__(self, *args, **kwargs):
+                pass
+
+        for prefill_b in (Backend.FULL, Backend.DISABLED):
+            for decode_b in (Backend.FULL, Backend.DISABLED):
+                model_runner = SimpleNamespace(
+                    device="cpu",
+                    is_generation=True,
+                    is_draft_worker=False,
+                    spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+                    _uses_cpu_graph_attention_backend=lambda: True,
+                    prefill_cuda_graph_runner=None,
+                    server_args=SimpleNamespace(
+                        model_impl="auto", disaggregation_mode="null"
+                    ),
+                    model_config=SimpleNamespace(is_encoder_decoder=False),
+                )
+                with (
+                    patch.object(
+                        graph_setup,
+                        "get_flags",
+                        return_value=SimpleNamespace(
+                            capture=SimpleNamespace(enable_torch_compile=True)
+                        ),
+                    ),
+                    patch.object(
+                        graph_setup,
+                        "get_exec",
+                        return_value=SimpleNamespace(
+                            graph=SimpleNamespace(
+                                cuda_graph_config=CudaGraphConfig(
+                                    prefill=PhaseConfig(backend=prefill_b, max_bs=128),
+                                    decode=PhaseConfig(backend=decode_b, max_bs=4),
+                                )
+                            )
+                        ),
+                    ),
+                    patch.object(graph_setup, "CPUGraphRunner", MockCPUGraphRunner),
+                ):
+                    p_cap = graph_setup.capture_prefill_graph(
+                        model_runner=model_runner, eager_runner=object()
+                    )
+                    model_runner.prefill_cuda_graph_runner = p_cap.runner
+                    d_cap = graph_setup.capture_decode_graph(
+                        model_runner=model_runner, prefill_runner=p_cap.runner
+                    )
+
+                    if prefill_b == Backend.FULL:
+                        self.assertIsInstance(p_cap.runner, MockCPUGraphRunner)
+                    else:
+                        self.assertIsNone(p_cap.runner)
+
+                    if decode_b == Backend.FULL:
+                        self.assertIsInstance(d_cap.runner, MockCPUGraphRunner)
+                    else:
+                        self.assertIsNone(d_cap.runner)
+
+                    if prefill_b == Backend.FULL and decode_b == Backend.FULL:
+                        self.assertIs(p_cap.runner, d_cap.runner)
+
     def test_cpu_graph_compile_backend_can_be_customized(self):
         from sglang.srt.environ import envs
         from sglang.srt.model_executor.cpu_graph_runner import patch_model
@@ -897,6 +960,14 @@ class TestCPUGraph(CustomTestCase):
 
         # Without dynamic fallback graph, 300 tokens cannot run
         runner.prefill_dynamic_graph_bs1 = None
+        self.assertFalse(runner._can_run_prefill_graph(forward_batch))
+
+    def test_prefill_graph_rejects_tokens_exceeding_dynamic_max_tokens(self):
+        runner = _make_cpu_graph_runner()
+        runner.prefill_dynamic_graph = object()
+        runner.dynamic_prefill_max_tokens = 512
+        # 600 tokens exceeds dynamic_prefill_max_tokens (512)
+        forward_batch = _make_cpu_prefill_forward_batch(num_tokens=600, batch_size=2)
         self.assertFalse(runner._can_run_prefill_graph(forward_batch))
 
     def test_capture_prefill_skips_multi_batch_graphs_for_single_token_or_max_bs_one(
