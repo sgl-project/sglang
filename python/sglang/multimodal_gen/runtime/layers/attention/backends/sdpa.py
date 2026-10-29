@@ -350,10 +350,10 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             # FA4's faster sub-tile kernel pays off in captured segments, but
             # its host dispatch loses to cuDNN in eager (including BCG breaks).
             # The BCG scope includes warmup, so FA4 is primed before capture.
+            if not is_in_breakable_cuda_graph():
+                return True
             short_side, long_side = sorted((query.shape[1], key.shape[1]))
-            return (
-                short_side >= 128 or long_side < 128 or not is_in_breakable_cuda_graph()
-            )
+            return short_side >= 128 or long_side < 128
         if query.shape[1] != key.shape[1]:
             return False
         return query.shape[-1] == 64 and query.shape[1] == 1024 and query.shape[0] >= 4
