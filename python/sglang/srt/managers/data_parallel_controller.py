@@ -969,14 +969,11 @@ def run_data_parallel_controller_process(
             "max_req_input_len": controller.max_req_input_len,
             "startup_time": controller.startup_time,
             "kv_hint_sources": controller.local_kv_hint_sources,
+            "kv_event_sources": sorted(
+                controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
+            ),
             SCHEDULER_PIDS_ARG: scheduler_pids,
         }
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
-        ):
-            init_info["kv_event_sources"] = sorted(
-                controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
-            )
         pipe_writer.send(init_info)
         # The primary owns routing for the expanded scheduler set.
         if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_scale_joiner:

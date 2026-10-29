@@ -267,6 +267,52 @@ class TestLocalKvEventSources(CustomTestCase):
             [source["dp_rank"] for source in controller.local_kv_hint_sources], [2, 3]
         )
 
+    def test_controller_forwards_sources_without_grpc(self):
+        """In-process DP workers need raw event endpoints for KVCR inventory."""
+        from sglang.srt.managers import data_parallel_controller as module
+
+        controller = SimpleNamespace(
+            scheduler_procs=[],
+            max_total_num_tokens=64,
+            max_req_input_len=32,
+            startup_time={},
+            local_kv_hint_sources=[{"dp_rank": 0}, {"dp_rank": 1}],
+            local_kv_event_sources=[self._source(1), self._source(0)],
+            event_loop=MagicMock(),
+        )
+        pipe = MagicMock()
+        with (
+            get_context().override_server_args(grpc_port=None),
+            patch.object(module, "DataParallelController", return_value=controller),
+            patch.object(module.setproctitle, "setproctitle"),
+            patch.object(module.faulthandler, "enable"),
+            patch.object(module, "kill_itself_when_parent_died"),
+            patch.object(module.psutil, "Process"),
+            patch.object(module, "load_plugins"),
+            patch.object(module, "publish"),
+            patch.object(module, "configure_logger"),
+            patch.object(
+                module,
+                "get_observability",
+                return_value=SimpleNamespace(enable_trace=False),
+            ),
+            patch.object(
+                module, "get_parallel", return_value=SimpleNamespace(node_rank=0)
+            ),
+            patch.object(
+                module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
+        ):
+            module.run_data_parallel_controller_process(MagicMock(), MagicMock(), pipe)
+
+        info = pipe.send.call_args.args[0]
+        self.assertEqual(info["kv_event_sources"], [self._source(0), self._source(1)])
+        self.assertEqual(info["kv_hint_sources"], [{"dp_rank": 0}, {"dp_rank": 1}])
+
 
 class TestDPBudgetUpdateBudget(CustomTestCase):
     def test_maps_running_plus_waiting_to_total_requests(self):

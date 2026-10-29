@@ -747,8 +747,13 @@ class HiCacheController:
             tp_size = parallel.attn_tp_size
             dp_rank = parallel.attn_dp_rank
         else:
-            tp_rank = parallel.tp_rank
-            tp_size = parallel.tp_size
+            # KVCR offsets TP and CP separately, even when attention DP is off.
+            if self.storage_backend_type == "kvcr" and parallel.attn_cp_size > 1:
+                tp_rank = parallel.attn_tp_rank
+                tp_size = parallel.attn_tp_size
+            else:
+                tp_rank = parallel.tp_rank
+                tp_size = parallel.tp_size
             dp_rank = parallel.dp_rank if parallel.dp_rank is not None else 0
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
