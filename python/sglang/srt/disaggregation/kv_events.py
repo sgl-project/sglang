@@ -290,8 +290,8 @@ class BlockStored(KVCacheEvent):
     # Session that triggered this store. Attribution only: the blocks may be
     # shared with other sessions, and the hash does not depend on it.
     session_id: Optional[str] = None
-    # The LoRA adapter name of the request that stored these blocks.
-    # Set only in the dynamo format.
+    # Public adapter name for router lookup. Published hashes are opaque IDs
+    # scoped to the internal cache namespace, including the adapter load.
     lora_name: Optional[str] = None
 
 

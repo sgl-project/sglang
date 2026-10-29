@@ -35,7 +35,6 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     BatchStrOutput,
     EmbeddingReqInput,
     GenerateReqInput,
-    wrap_as_pickle,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -47,7 +46,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
 )
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
@@ -269,14 +268,17 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
         """
         self.tm.incremental_streaming_output = False
         key = "request_score"
+        hidden_key = "hidden_metric"
         stream = self.tm._wait_one_response(self.state.obj)
-        self.state.customized_info_accumulated[key] = [386.25]
+        first_meta_info = {"finish_reason": None}
+        self.tm.update_request_meta_info(
+            first_meta_info, self.state, {key: [[386.25]]}, 0, None
+        )
+        # Accumulated without being written to meta_info, as a subclass may do.
+        self.state.customized_info_accumulated[hidden_key] = [1.0, 2.0]
         self.state.out_list.extend(
             [
-                {
-                    "output_ids": [1],
-                    "meta_info": {"finish_reason": None, key: [386.25]},
-                },
+                {"output_ids": [1], "meta_info": first_meta_info},
                 {
                     "output_ids": [1, 2],
                     "meta_info": {"finish_reason": {"type": "length"}},
@@ -290,6 +292,7 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(out["output_ids"], [1, 2])
         self.assertEqual(out["meta_info"][key], [386.25])
+        self.assertNotIn(hidden_key, out["meta_info"])
         with self.assertRaises(StopAsyncIteration):
             await anext(stream)
 
@@ -330,6 +333,25 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
                 with self.assertRaises(StopAsyncIteration):
                     await anext(stream)
+
+    async def test_non_stream_abort_with_gateway_error_is_raised(self):
+        """A non-stream abort carrying a gateway status such as 502 must become an HTTP error, not an empty 200."""
+        state = _make_req_state("gateway_abort")
+        state.obj.stream = False
+        self.tm.rid_to_state[state.obj.rid] = state
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "status_code": 502,
+                    "message": "encoder dispatch failed",
+                }
+            }
+        }
+        with self.assertRaises(HTTPException) as ctx:
+            await self.tm._handle_abort_finish_reason(out, state, is_stream=False)
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
 
     async def test_http_timeout_still_checks_disconnection(self):
         request = Mock()
@@ -532,7 +554,7 @@ class TestRequestTpotGating(CustomTestCase):
         for completion_tokens, finished_reason in batches:
             batch_output = _make_batch_str_output(rid, finished_reason)
             batch_output.completion_tokens = [completion_tokens]
-            batch_output.time_stats = wrap_as_pickle([sched_stats])
+            batch_output.time_stats = [sched_stats.to_output_time_stats()]
             asyncio.run(tm._handle_batch_output(batch_output))
         (call,) = tm.metrics_collector.observe_one_finished_request.call_args_list
         return call.kwargs["time_per_output_token"]
@@ -583,7 +605,7 @@ class TestNonStreamingFirstTokenTime(CustomTestCase):
             enable_metrics=True, prefill_finished_time=prefill_finished_time
         )
         batch_output = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
-        batch_output.time_stats = wrap_as_pickle([sched_stats])
+        batch_output.time_stats = [sched_stats.to_output_time_stats()]
         arrival = time.perf_counter()
         asyncio.run(tm._handle_batch_output(batch_output))
         return state.time_stats, arrival
@@ -1222,6 +1244,7 @@ class TestDisconnectAfterDispatchAbortsRequest(CustomTestCase):
         tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
             return_value=[]
         )
+        tm.positional_embeds_transport = Mock()
         tm._dispatch_to_scheduler = Mock()
         rid = "disconnect_zombie"
         obj = _make_generate_obj(rid, is_single=True)

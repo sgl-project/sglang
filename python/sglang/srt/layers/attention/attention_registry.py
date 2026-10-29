@@ -2,6 +2,8 @@ import logging
 import warnings
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     resolved_view,
@@ -24,11 +26,12 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_sail
 
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_sail = is_sail()
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +55,6 @@ def register_attention_backend(name):
 
 @register_attention_backend("flashinfer")
 def create_flashinfer_backend(runner):
-    import torch
-
     if not runner.use_mla_backend:
         from sglang.srt.layers.attention.flashinfer_backend import (
             FlashInferAttnBackend,
@@ -95,29 +96,24 @@ def create_llada2_cfg_flashinfer_backend(runner):
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("trtllm_mla backend can only be used with MLA models.")
+    _, decode_backend = attention_backends_of(resolved_view(runner.server_args))
     if get_parallel().dcp_enabled and get_spec().speculative_algorithm is not None:
-        _, decode_backend = attention_backends_of(resolved_view(runner.server_args))
         if decode_backend == "trtllm_mla":
             raise ValueError(
                 "trtllm_mla cannot serve decode context parallelism with speculative "
                 "decoding: it does not forward the cyclic DCP metadata to its decode "
                 "kernel and returns no rank-local LSE for the cross-rank merge. "
-                "Select cutedsl_mla or tokenspeed_mla."
+                "Select cutedsl_mla."
             )
+    if decode_backend == "cutedsl_mla" and runner.kv_cache_dtype == torch.float8_e4m3fn:
+        from sglang.srt.layers.attention.cutedsl_mla_backend import (
+            CuteDslMLAPrefillBackend,
+        )
+
+        return CuteDslMLAPrefillBackend(runner)
     from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
     return TRTLLMMLABackend(runner)
-
-
-@register_attention_backend("tokenspeed_mla")
-def create_tokenspeed_mla_backend(runner):
-    if not runner.use_mla_backend:
-        raise ValueError("tokenspeed_mla backend can only be used with MLA models.")
-    from sglang.srt.layers.attention.tokenspeed_mla_backend import (
-        TokenspeedMLABackend,
-    )
-
-    return TokenspeedMLABackend(runner)
 
 
 @register_attention_backend("cutedsl_mla")
@@ -154,6 +150,13 @@ def create_ascend_backend(runner):
 
 @register_attention_backend("dsa")
 def create_dsa_backend(runner):
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.attention.dsa_backend import (
+            SailDeepseekSparseAttnBackend,
+        )
+
+        return SailDeepseekSparseAttnBackend(runner)
+
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
     return DeepseekSparseAttnBackend(runner)
@@ -235,6 +238,13 @@ def create_flex_attention_backend(runner):
 
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
+    if _is_sail:
+        from sglang.srt.hardware_backend.sail.attention.flashmla_backend import (
+            SailFlashMLABackend,
+        )
+
+        return SailFlashMLABackend(runner)
+
     from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
     return FlashMLABackend(runner)
@@ -245,10 +255,19 @@ def create_flashattention_v3_backend(runner):
 
     major, minor = get_device_capability()
     if not _is_musa:
-        assert (major == 8 and not runner.use_mla_backend) or major == 9, (
+        assert (
+            major == 8 and (_is_sail or not runner.use_mla_backend)
+        ) or major == 9, (
             "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
             "Please use `--attention-backend flashinfer`."
         )
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.attention.flashattention_backend import (
+                SailFlashAttentionBackend,
+            )
+
+            return SailFlashAttentionBackend(runner)
+
         from sglang.srt.layers.attention.flashattention_backend import (
             FlashAttentionBackend,
         )
@@ -367,7 +386,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     ), "hybrid_gdn can only be used with non-MLA models."
 
     from sglang.srt.configs.dots3 import Dots3Config
-    from sglang.srt.configs.model_config import is_minimax_sparse
+    from sglang.srt.configs.model_config import (
+        is_minimax_sparse,
+        uses_minimax_m3_nvfp4_native_stack,
+    )
 
     if isinstance(runner.model_config.hf_text_config, Dots3Config):
         return runner.model_config.hf_text_config.wrap_attention_backend(
@@ -375,6 +397,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     if is_minimax_sparse(runner.model_config.hf_config):
+        if uses_minimax_m3_nvfp4_native_stack(runner.model_config.quantization):
+            from sglang.srt.layers.attention.minimax_sparse_nvfp4_backend import (
+                MiniMaxSparseNvfp4AttnBackend,
+            )
+
+            return MiniMaxSparseNvfp4AttnBackend(runner)
         from sglang.srt.layers.attention.minimax_sparse_backend import (
             MiniMaxHybridAttnBackend,
             MiniMaxSparseAttnBackend,

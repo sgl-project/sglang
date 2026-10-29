@@ -50,7 +50,19 @@ def pools(request):
     layout, backend = request.param
     publish(ServerArgs(model_path="dummy"), role="test")
     device = make_device_pool([7, 11], start_layer=4)
-    anchor = MHATokenToKVPoolHost(device.full_kv_pool, 2, 0, PAGE, layout)
+    anchor = MHATokenToKVPoolHost(
+        device.full_kv_pool.get_device_pool_infos()[0].buffer_info,
+        2,
+        0,
+        PAGE,
+        layout,
+        device_capacity_tokens=device.full_kv_pool.size
+        if device.full_kv_pool.host_capacity_tokens is None
+        else device.full_kv_pool.host_capacity_tokens,
+        start_layer=device.full_kv_pool.start_layer,
+        end_layer=device.full_kv_pool.end_layer,
+        write_back_staging=device.full_kv_pool.hicache_write_back_staging,
+    )
     host = QSAIndexerPoolHost(device, anchor)
     try:
         yield device, anchor, host, backend
