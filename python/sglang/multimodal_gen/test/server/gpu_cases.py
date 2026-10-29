@@ -791,12 +791,7 @@ else:
             run_perf_check=True,
         ),
     ]
-    # Online ConvRot INT8 smoke cases on the stock BF16 checkpoints. They sit in
-    # the B200 suite because that is where the quantized Wan2.2 smoke cases live;
-    # the JIT kernels also run on H100 (CC 9.0), so the two cases can move to the
-    # H100 1-GPU shard if maintainers prefer. run_perf_check stays False: the
-    # outputs are approximate and the b200.json entries are GB200 placeholders
-    # until the B200 pool has calibrated them.
+    # ConvRot INT8 smoke cases; perf checks stay off until h100.json carries shard-measured entries.
     _CONVROT_INT8_EXTRAS = [
         "--quantization",
         "convrot_int8",
@@ -810,6 +805,7 @@ else:
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
             extras=list(_CONVROT_INT8_EXTRAS),
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "wan22_convrot_int8_i2v",
@@ -817,10 +813,11 @@ else:
             modality="video",
             sampling_params=CONVROT_INT8_I2V_CI_sampling_params,
             extras=list(_CONVROT_INT8_EXTRAS),
+            run_consistency_check=True,
         ),
     ]
 
-ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES + ONE_GPU_CONVROT_INT8_CASES
+ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
 MINIMAX_H3_FOUR_GPU_H100_CASES = [
     DiffusionTestCase(
@@ -1450,6 +1447,7 @@ if not current_platform.is_hip():
     )
 
 ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
+ONE_GPU_CASES += ONE_GPU_CONVROT_INT8_CASES
 TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)
 
 
