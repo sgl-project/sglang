@@ -115,63 +115,8 @@ class NixlPreparedList:
         self.dlist = dlist
 
 
-def create_nixl_agent(
-    *,
-    backend: str,
-    backend_params: Dict[str, str],
-    num_threads: int,
-    gpu_id: int,
-    init_timeout_s: float,
-) -> Any:
-    try:
-        from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
-    except ImportError as e:
-        raise ImportError(
-            "Please install NIXL by following the instructions at "
-            "https://github.com/ai-dynamo/nixl/blob/main/README.md "
-            "to run SGLang with NixlTransferEngine."
-        ) from e
-
-    # NixlKVManager.transfer_worker and _start_bootstrap_thread run concurrently
-    # so we cannot use sync_mode=None which is thread-unsafe.
-    agent_config = nixl_agent_config(
-        backends=[],
-        num_threads=num_threads,
-        sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
-    )
-    agent = nixl_agent(str(uuid.uuid4()), agent_config)
-    backend_params = dict(backend_params)
-    if num_threads > 0:
-        # TODO: Remove this once NIXL passes thread parameters from
-        # nixl_agent_config to explicitly-created backends.
-        if backend == "UCX" or backend == "OBJ":
-            backend_params.setdefault("num_threads", str(num_threads))
-        elif backend == "GDS_MT":
-            backend_params.setdefault("thread_count", str(num_threads))
-        elif backend == "UCCL":
-            backend_params.setdefault("num_cpus", str(num_threads))
-
-    def create_backend():
-        torch.get_device_module(get_device().device).set_device(gpu_id)
-        return agent.create_backend(backend, backend_params)
-
-    run_with_deadline(
-        create_backend,
-        timeout_s=init_timeout_s,
-        what=f"NIXL create_backend({backend!r}, {backend_params})",
-    )
-
-    available_plugins = agent.get_plugin_list()
-    if backend not in available_plugins:
-        raise ValueError(
-            f"NIXL backend '{backend}' not found. Available: {available_plugins}. "
-            f"Please install the required NIXL plugin or choose from: {available_plugins}"
-        )
-    return agent
-
-
 class NixlTransport(Transport):
-    """Transport over a NIXL agent made by create_nixl_agent().
+    """Transport over a NIXL agent made by create().
 
     write() and write_prepared() post without waiting. An ERR that NIXL reports
     for a posted transfer is final and quiescent; a rejected post or an
@@ -188,6 +133,62 @@ class NixlTransport(Transport):
         # Newer NIXL prepares compressed (addr, len, dev_id, stride, count) runs
         # directly; cleared on the first TypeError to expand per block instead.
         self._use_strided_descs = True
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        backend: str,
+        backend_params: Dict[str, str],
+        num_threads: int,
+        gpu_id: int,
+        init_timeout_s: float,
+    ) -> NixlTransport:
+        try:
+            from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
+        except ImportError as e:
+            raise ImportError(
+                "Please install NIXL by following the instructions at "
+                "https://github.com/ai-dynamo/nixl/blob/main/README.md "
+                "to run SGLang with NixlTransferEngine."
+            ) from e
+
+        # NixlKVManager.transfer_worker and _start_bootstrap_thread run concurrently
+        # so we cannot use sync_mode=None which is thread-unsafe.
+        agent_config = nixl_agent_config(
+            backends=[],
+            num_threads=num_threads,
+            sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
+        )
+        agent = nixl_agent(str(uuid.uuid4()), agent_config)
+        backend_params = dict(backend_params)
+        if num_threads > 0:
+            # TODO: Remove this once NIXL passes thread parameters from
+            # nixl_agent_config to explicitly-created backends.
+            if backend == "UCX" or backend == "OBJ":
+                backend_params.setdefault("num_threads", str(num_threads))
+            elif backend == "GDS_MT":
+                backend_params.setdefault("thread_count", str(num_threads))
+            elif backend == "UCCL":
+                backend_params.setdefault("num_cpus", str(num_threads))
+
+        def create_backend():
+            torch.get_device_module(get_device().device).set_device(gpu_id)
+            return agent.create_backend(backend, backend_params)
+
+        run_with_deadline(
+            create_backend,
+            timeout_s=init_timeout_s,
+            what=f"NIXL create_backend({backend!r}, {backend_params})",
+        )
+
+        available_plugins = agent.get_plugin_list()
+        if backend not in available_plugins:
+            raise ValueError(
+                f"NIXL backend '{backend}' not found. Available: {available_plugins}. "
+                f"Please install the required NIXL plugin or choose from: {available_plugins}"
+            )
+        return cls(agent=agent)
 
     @property
     def agent_name(self) -> str:

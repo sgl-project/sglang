@@ -57,7 +57,6 @@ from sglang.srt.disaggregation.nixl.transport import (
     NixlTransport,
     Registration,
     StridedRun,
-    create_nixl_agent,
 )
 from sglang.srt.disaggregation.transport.base import (
     BufferKey,
@@ -640,7 +639,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
 
         self.init_engine()
-        self.transport = NixlTransport(agent=self.agent)
         # Staging rings and DCP pack buffers by base address: they reach
         # register_fn as bare (ptr, size), and their senders hold that base.
         self._staging_keys: Dict[int, NixlBufferKey] = {}
@@ -1990,7 +1988,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         self.kv_args.engine_rank,
                         device_list,
                     )
-        self.agent = create_nixl_agent(
+        self.transport = NixlTransport.create(
             backend=backend,
             backend_params=backend_params,
             num_threads=num_threads,
