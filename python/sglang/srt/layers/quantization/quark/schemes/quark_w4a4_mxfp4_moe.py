@@ -122,16 +122,14 @@ else:
 
 OCP_MX_BLOCK_SIZE = 32
 
-# HIP GPUs without FP4 hardware or an AITER FP4 MoE kernel (e.g. gfx1151 / Strix
-# Halo) cannot run the AITER path: its scales are laid out for gfx950 and its
-# kernels produce garbage there. Run the MoE as W4A16 instead: keep the packed
-# MXFP4 weights and upcast them inside triton_kernels' matmul, with bf16
-# activations. SGLANG_QUARK_MXFP4_MOE_W4A16=0 opts out.
-_use_triton_w4a16 = (
-    _is_hip
-    and not _is_gfx95
-    and not _is_gfx1250
-    and get_bool_env_var("SGLANG_QUARK_MXFP4_MOE_W4A16", "true")
+# gfx1151 (Strix Halo) has neither FP4 hardware nor an AITER FP4 MoE kernel, so
+# the AITER path cannot run there: its scales are laid out for gfx950 and its
+# kernels produce garbage. Run the MoE as W4A16 instead: keep the packed MXFP4
+# weights and upcast them inside triton_kernels' matmul, with bf16 activations.
+# SGLANG_QUARK_MXFP4_MOE_W4A16=0 opts out.
+_is_gfx1151 = _is_hip and "gfx1151" in torch.cuda.get_device_properties(0).gcnArchName
+_use_triton_w4a16 = _is_gfx1151 and get_bool_env_var(
+    "SGLANG_QUARK_MXFP4_MOE_W4A16", "true"
 )
 _TRITON_W4A16_NUM_WARPS = 8
 
