@@ -2346,9 +2346,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # replay still runs them at its eager breaks, except for a linear-attention
         # extend captured in the graph, whose state-pool wait ran only at capture:
         # wait for this stage's host-cache loads before replaying it.
-        linear_extend_in_graph = getattr(
-            self, "use_captured_attn_metadata", False
-        ) and hasattr(self.model_runner.attn_backend, "linear_attn_backend")
+        linear_extend_in_graph = (
+            self.use_captured_attn_metadata
+            and self.model_runner.attn_backend.breakable_cuda_graph_captures_linear_extend
+        )
         if not (self._is_full_backend or linear_extend_in_graph):
             return
         counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
