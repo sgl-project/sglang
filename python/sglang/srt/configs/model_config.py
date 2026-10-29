@@ -452,6 +452,67 @@ def uses_minimax_m3_nvfp4_native_stack(quantization: Optional[str]) -> bool:
     return quantization == "minimax_m3_nvfp4" and get_platform().is_blackwell
 
 
+# v2 checkpoints reuse the v1 arch name; the DASH training stage selects this arch.
+UNLIMITED_OCR_V2_ARCH = "UnlimitedOCRV2ForCausalLM"
+
+
+def is_unlimited_ocr_v2(config) -> bool:
+    """Identify v2 checkpoints by ``training_stage == "dash"``.
+
+    Both versions publish ``UnlimitedOCRForCausalLM``, so the arch alone is not enough.
+    """
+    if _hf_arch(config) not in ("UnlimitedOCRForCausalLM", UNLIMITED_OCR_V2_ARCH):
+        return False
+    sparse_cfg = _hf_attr(config, "sparse_attention_config")
+    if not isinstance(sparse_cfg, dict):
+        return False
+    return sparse_cfg.get("training_stage") == "dash"
+
+
+def get_unlimited_ocr_v2_sparse_config(config) -> dict:
+    """Return the checkpoint's ``sparse_attention_config`` dict, or raise."""
+    sparse_cfg = _hf_attr(config, "sparse_attention_config")
+    if not isinstance(sparse_cfg, dict):
+        raise ValueError(
+            "sparse_attention_config missing; is this an Unlimited-OCR v2 checkpoint?"
+        )
+    return sparse_cfg
+
+
+# Prompt tokens of the costliest gundam page: a marker, the 1024 global view
+# (16 + 1) * 16 + 1, and a 1x16 crop grid (10 + 1) * 160 (configs/unlimited_ocr.py).
+UOCR_V2_MAX_PAGE_PROMPT_TOKENS = 1 + 273 + 1760
+# Prefix, instruction and a reuse window's spliced marker, image and text
+# tails; arbitrary headroom over their ~400 tokens.
+_UOCR_V2_WINDOW_SLACK_TOKENS = 1024
+UOCR_V2_FALLBACK_CONTEXT_LEN = 131072
+
+
+def unlimited_ocr_v2_context_len(
+    *,
+    doc_split: bool,
+    page_window: int,
+    lookahead_pages: int,
+    max_page_tokens: int,
+) -> int:
+    """Default context of an Unlimited-OCR v2 server: its longest window request.
+
+    Retained KV is a window plus a small tail, so the document length never
+    enters. Unsplit, or with no per-page output cap, the window has no bound
+    and the fallback applies. The fallback also caps the estimate: context
+    sizes per-request buffers, and a wider window is rare enough to accept a
+    smaller output budget than ``window * MAX_PAGE_TOKENS``.
+    """
+    if not doc_split or max_page_tokens <= 0:
+        return UOCR_V2_FALLBACK_CONTEXT_LEN
+    needed = (
+        (page_window + lookahead_pages) * UOCR_V2_MAX_PAGE_PROMPT_TOKENS
+        + page_window * max_page_tokens
+        + _UOCR_V2_WINDOW_SLACK_TOKENS
+    )
+    return min(needed, UOCR_V2_FALLBACK_CONTEXT_LEN)
+
+
 def get_minimax_sparse_attention_config(config: PretrainedConfig) -> dict:
     text_cfg = getattr(config, "text_config", None)
     cfg = (
@@ -597,6 +658,7 @@ class ModelConfig:
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
+        uocr_v2_default_context_len: int = UOCR_V2_FALLBACK_CONTEXT_LEN,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -605,6 +667,7 @@ class ModelConfig:
         self.is_draft_model = is_draft_model
         self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
+        self.uocr_v2_default_context_len = uocr_v2_default_context_len
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
@@ -727,6 +790,11 @@ class ModelConfig:
 
         # Config draft model
         self._config_draft_model()
+
+        # Remap the v2 arch before DASH tower, sparse backend and two-group KV
+        # pool selection read it.
+        if is_unlimited_ocr_v2(self.hf_config):
+            self.hf_config.architectures[0] = UNLIMITED_OCR_V2_ARCH
 
         # Mixed FP8/MXFP4 ckpts mark mxfp4 routed experts via this key.
         quantization_config = (
@@ -988,6 +1056,12 @@ class ModelConfig:
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,
+            uocr_v2_default_context_len=unlimited_ocr_v2_context_len(
+                doc_split=not cfg.disable_uocr_doc_split,
+                page_window=max(cfg.uocr_gundam_page_window, cfg.uocr_base_page_window),
+                lookahead_pages=cfg.uocr_doc_lookahead_pages,
+                max_page_tokens=cfg.uocr_max_page_tokens,
+            ),
             **kwargs,
         )
 
@@ -1307,6 +1381,13 @@ class ModelConfig:
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
         derived_context_len = get_context_length(self.hf_text_config)
+        if context_length is None and is_unlimited_ocr_v2(self.hf_config):
+            # Page-local RoPE has no position limit; size for the longest window.
+            context_length = derived_context_len = self.uocr_v2_default_context_len
+            logger.info(
+                "Unlimited-OCR v2: context_length defaults to %d (longest window)",
+                context_length,
+            )
 
         if context_length is not None:
             if context_length > derived_context_len:
@@ -2429,6 +2510,7 @@ multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
     "MiniMaxM3SparseForConditionalGeneration",
+    "UnlimitedOCRV2ForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",

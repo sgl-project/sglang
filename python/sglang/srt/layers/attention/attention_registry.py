@@ -214,6 +214,16 @@ def create_triton_backend(runner):
     return TritonAttnBackend(runner)
 
 
+@register_attention_backend("unlimited_ocr_v2")
+def create_unlimited_ocr_v2_backend(runner):
+    """Build the DASH block-sparse attention backend for Unlimited-OCR v2."""
+    from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (
+        UnlimitedOCRV2AttnBackend,
+    )
+
+    return UnlimitedOCRV2AttnBackend(runner)
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend

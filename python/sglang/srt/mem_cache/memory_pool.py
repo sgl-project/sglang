@@ -5714,6 +5714,19 @@ class MHATokenToKOnlyPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
         self.k_buffer[layer_id][loc] = cache_k
 
+    def move_k_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Copy K rows to new token slots in every layer."""
+        if self.layer_num == 0 or tgt_loc.numel() == 0:
+            return
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_k_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_k_cache src_loc")
+
+        tgt_loc = tgt_loc.reshape(-1).long()
+        src_loc = src_loc.reshape(-1).long()
+        for k_cache in self.k_buffer:
+            k_cache[tgt_loc] = k_cache[src_loc]
+
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError("MHATokenToKOnlyPool does not allocate V")
 
@@ -6249,3 +6262,29 @@ class MiniMaxSparseKVPool(KVCache):
         # Use start_layer to handle pipeline parallelism where layer 0
         # may not be present in this stage's buffer.
         return self.main_pool.get_value_buffer(self.main_pool.start_layer).shape[-1]
+
+
+class UnlimitedOCRV2KVPool(MiniMaxSparseKVPool):
+    """Main K/V plus DASH's single-head index K, with copyable token slots.
+
+    Document KV reuse copies a window's tail into fresh slots of the next window.
+    """
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Move main K/V and sparse index K together for a token relocation."""
+        if tgt_loc.numel() == 0:
+            return
+        for pool in (self.main_pool, self.index_kv_pool):
+            if pool is None or pool.layer_num == 0:
+                continue
+            if pool.kv_cache_layout != "nhd":
+                pool.move_kv_cache(tgt_loc, src_loc)
+                continue
+            # Sub-pools are built without enable_kv_cache_copy; move natively.
+            move_kv_cache_native(pool.k_buffer, pool.v_buffer, tgt_loc, src_loc)
+            if pool.k_scale_buffer is not None:
+                move_kv_cache_native(
+                    pool.k_scale_buffer, pool.v_scale_buffer, tgt_loc, src_loc
+                )
+        if self.index_k_pool is not None:
+            self.index_k_pool.move_k_cache(tgt_loc, src_loc)

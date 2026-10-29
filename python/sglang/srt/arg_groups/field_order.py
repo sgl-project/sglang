@@ -557,5 +557,10 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_layer_partition",
     "engram_config",
     "moe_ascend_ops_config",
+    "disable_uocr_doc_split",
+    "uocr_gundam_page_window",
+    "uocr_base_page_window",
+    "uocr_doc_lookahead_pages",
+    "uocr_max_page_tokens",
 )
 # fmt: on

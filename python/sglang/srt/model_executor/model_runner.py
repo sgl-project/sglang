@@ -185,6 +185,9 @@ from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state imp
     SpecAuxHiddenStateConfig,
     resolve_spec_aux_hidden_state_config,
 )
+from sglang.srt.model_executor.model_runner_components.uocr_greedy_graph import (
+    UocrGreedyGraph,
+)
 from sglang.srt.model_executor.model_runner_components.weight_exporter import (
     WeightExporter,
 )
@@ -328,6 +331,8 @@ class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     watermark_state: Optional[WatermarkState] = None
+    # Unlimited-OCR v2 only; see maybe_init_uocr_greedy_graph.
+    uocr_greedy_graph: Optional[UocrGreedyGraph] = None
 
     @property
     def sampling_observer(self) -> Optional[SamplingObserver]:
@@ -1635,6 +1640,19 @@ class ModelRunner:
         """Return the model layers used by prefill CUDA graph execution."""
         return compute_attention_and_moe_layers(layer_model)
 
+    def maybe_init_uocr_greedy_graph(self) -> None:
+        """Record greedy argmax inside Unlimited-OCR v2 decode graph capture."""
+        # A recapture keeps the recorder and its one registered hook.
+        if self.uocr_greedy_graph is not None:
+            return
+        self.uocr_greedy_graph = UocrGreedyGraph.maybe_create(
+            model_config=self.model_config,
+            max_running_requests=get_schedule().max_running_requests,
+            device=self.device,
+        )
+        if self.uocr_greedy_graph is not None:
+            self.capture_tail_hooks.append(self.uocr_greedy_graph.capture_tail_hook)
+
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None
         capture = capture_decode_graph(model_runner=self)
@@ -2041,6 +2059,13 @@ class ModelRunner:
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            if self.uocr_greedy_graph is not None:
+                self.uocr_greedy_graph.before_forward(
+                    forward_batch,
+                    replays_graph=can_run_graph,
+                    decode_graph_runner=self.decode_cuda_graph_runner,
+                )
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(
@@ -2197,22 +2222,30 @@ class ModelRunner:
             logprob_logits = None
 
         # Sample the next tokens
-        next_token_ids = self.sampler(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.return_logprob,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-            # For prefill, we only use the position of the last token.
-            (
-                forward_batch.positions
-                if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
-            ),
-            **(
-                {"logprob_logits": logprob_logits} if logprob_logits is not None else {}
-            ),
-        )
+        next_token_ids = None
+        if self.uocr_greedy_graph is not None:
+            next_token_ids = self.uocr_greedy_graph.recorded_ids(
+                logits_output, forward_batch, watermark_state=watermark_state
+            )
+        if next_token_ids is None:
+            next_token_ids = self.sampler(
+                logits_output,
+                forward_batch.sampling_info,
+                forward_batch.return_logprob,
+                forward_batch.top_logprobs_nums,
+                forward_batch.token_ids_logprobs,
+                # For prefill, we only use the position of the last token.
+                (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else forward_batch.seq_lens - 1
+                ),
+                **(
+                    {"logprob_logits": logprob_logits}
+                    if logprob_logits is not None
+                    else {}
+                ),
+            )
         if observer_state is not None:
             logits_output.auxiliary_device_output = observer.after_sample(
                 observer_state,

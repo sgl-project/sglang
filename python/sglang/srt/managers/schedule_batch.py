@@ -67,6 +67,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    ClassVar,
     Dict,
     List,
     Literal,
@@ -162,7 +163,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
+    from sglang.srt.sampling.custom_logit_processor import PageGuardState
     from sglang.srt.session.session_controller import Session
+    from sglang.srt.session.uocr_doc_reuse import UocrReqState
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -638,6 +641,10 @@ class MultimodalProcessorOutput(
 
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
+
+    # A ClassVar, so it never goes on the wire. A processor's subclass sets it to
+    # have wrap_shm_features also move large model_specific_data tensors to SHM.
+    shm_model_specific_data: ClassVar[bool] = False
 
     @staticmethod
     def from_dict(d: dict) -> MultimodalProcessorOutput:
@@ -1166,6 +1173,10 @@ class Req(ReqDllmMixin):
             }
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
+        # Running page count of DeepseekOCRNoRepeatNGramLogitProcessor's page guard.
+        self.page_guard_state: Optional[PageGuardState] = None
+        # Unlimited-OCR v2 split-document window state; None for other requests.
+        self.uocr_doc: Optional[UocrReqState] = None
         self.return_hidden_states = return_hidden_states
         self.return_hidden_states_mode = get_return_hidden_states_mode(
             return_hidden_states

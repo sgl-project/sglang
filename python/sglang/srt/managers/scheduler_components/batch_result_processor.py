@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
+    from sglang.srt.managers.scheduler_components.uocr_doc_hooks import UocrDocHooks
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.managers.utils import (
         EmbeddingBatchResult,
@@ -114,6 +115,7 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
+    uocr_doc_hooks: Optional[UocrDocHooks] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -361,6 +363,12 @@ class SchedulerBatchResultProcessor:
                         self.beam_coordinator.commit_prefill(
                             req, up_to_tick=batch.forward_iter
                         )
+                    elif (
+                        self.uocr_doc_hooks is not None
+                        and self.uocr_doc_hooks.consume_spliced_prefill(req)
+                    ):
+                        # The overlap pages' text is already the first outputs.
+                        req.update_finish_state()
                     else:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)

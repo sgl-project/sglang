@@ -94,6 +94,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner.uocr_decode_graph_io import UOCRDecodeGraphIO
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -259,6 +260,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     _restage_skip = False
     _staged_inputs = None
+    # Unlimited-OCR v2 decode input/output relay; None for every other model.
+    uocr_graph_io: Optional[UOCRDecodeGraphIO] = None
+
     _draft_glue_logged = 0
 
     dllm_input_preparation = None
@@ -558,6 +562,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     padding_policy=PaddingPolicy.ZERO,
                 )
             )
+        self.maybe_init_uocr_graph_io(model_runner)
 
         # Captures the per-replay attention-metadata prep into a small CUDA
         # graph; see metadata_glue_graph.py for the correctness contract.
@@ -873,6 +878,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "DP CUDA graph replay requires raw per-rank request counts"
             )
         return max(request_counts)
+
+    def maybe_init_uocr_graph_io(self, model_runner: ModelRunner) -> None:
+        """Relay Unlimited-OCR v2 decode tokens through the captured graphs."""
+        greedy_graph = model_runner.uocr_greedy_graph
+        if greedy_graph is None:
+            return
+        self.uocr_graph_io = UOCRDecodeGraphIO.maybe_create(
+            attn_backend=self.attn_backend,
+            greedy_graph=greedy_graph,
+            num_rows=model_runner.req_to_token_pool.req_to_token.shape[0],
+            device=model_runner.device,
+        )
+        # Runs right after the greedy argmax, which writes the ids it relays; a
+        # recapture's I/O replaces the previous runner's.
+        greedy_graph.bind_relay_tail(
+            self.uocr_graph_io.record_tail if self.uocr_graph_io is not None else None
+        )
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
@@ -1435,6 +1457,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
+                if self.uocr_graph_io is not None:
+                    self.uocr_graph_io.record_prologue(forward_batch)
                 # Debug replay retains this callback beyond the capture scope.
                 with forward_context(
                     ForwardContext(attn_backend=attn_backend),

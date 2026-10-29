@@ -57,6 +57,36 @@ class Mm(msgspec.Struct):
     enable_prefix_mm_cache: A[
         bool, "Enable prefix multimodal cache. Currently only supports mm-only."
     ] = False
+    disable_uocr_doc_split: A[
+        bool,
+        "Unlimited-OCR v2: serve a multi-page document as one request instead of "
+        "splitting it into page windows that reuse the previous window's KV cache. "
+        "Required with --dp-size or --attn-dp-size above 1.",
+    ] = False
+    uocr_gundam_page_window: A[
+        int,
+        "Unlimited-OCR v2: pages one split window transcribes in gundam (crop) "
+        "mode, not counting its lookahead pages. Must be at least 1.",
+    ] = 1
+    uocr_base_page_window: A[
+        int,
+        "Unlimited-OCR v2: pages one split window transcribes in the lighter "
+        "image modes (base, tiny, ...), not counting its lookahead pages. Must "
+        "be at least 1.",
+    ] = 1
+    uocr_doc_lookahead_pages: A[
+        int,
+        "Unlimited-OCR v2: pages a split window reads past its own (the next "
+        "window's first pages), so its last page sees how the next page opens. "
+        "0 disables the lookahead.",
+    ] = 1
+    uocr_max_page_tokens: A[
+        int,
+        "Unlimited-OCR v2: completion tokens one output page may spend before "
+        "the sampler moves on to the next page (and stops after the last one). "
+        "Requires --enable-custom-logit-processor. Also sizes the default "
+        "context length of a split server. 0 disables the cap.",
+    ] = 0
     mm_enable_dp_encoder: A[
         Optional[bool],
         Arg(

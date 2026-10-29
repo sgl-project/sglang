@@ -16,6 +16,7 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ReqKvInfo
+    from sglang.srt.managers.scheduler_components.uocr_doc_hooks import UocrDocHooks
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.kv.storage import KVStorage, SubPoolUsage
@@ -182,6 +183,7 @@ class SchedulerPoolStatsObserver:
     session_controller: Any
     hisparse_coordinator: Any
     enable_hisparse: bool
+    uocr_doc_hooks: Optional[UocrDocHooks] = None
 
     def streaming_session_count(self) -> int:
         return sum(
@@ -194,18 +196,27 @@ class SchedulerPoolStatsObserver:
         records = self.tree_cache.session_records().values()
         return [kv for kv in records if kv.holds_kv]
 
+    def _uocr_held_tokens(self) -> int:
+        # Retained document windows keep only some pages of their rows.
+        return 0 if self.uocr_doc_hooks is None else self.uocr_doc_hooks.held_tokens()
+
     def session_held_tokens(self) -> int:
         page_size = self.tree_cache.page_size
-        return sum(kv_private_tokens(kv, page_size) for kv in self._session_kv_rows())
+        total = sum(kv_private_tokens(kv, page_size) for kv in self._session_kv_rows())
+        return total + self._uocr_held_tokens()
 
     def session_held_swa_tokens(self) -> int:
         page_size = self.tree_cache.page_size
-        return sum(
+        total = sum(
             kv_private_swa_tokens(kv, page_size) for kv in self._session_kv_rows()
         )
+        return total + self._uocr_held_tokens()
 
     def session_held_req_count(self) -> int:
-        return len(self._session_kv_rows())
+        held = len(self._session_kv_rows())
+        if self.uocr_doc_hooks is not None:
+            held += self.uocr_doc_hooks.held_req_count()
+        return held
 
     def session_held_mamba_slots(self) -> int:
         return sum(kv_mamba_slots(kv) for kv in self._session_kv_rows())

@@ -243,6 +243,27 @@ class UnlimitedOCRForCausalLM(nn.Module):
 
         return images_in_this_batch
 
+    def _stack_crop_inputs(
+        self,
+        mm_items: List[MultimodalDataItem],
+        *,
+        has_local_crops: Optional[List[bool]],
+        target_dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Stack the items' local crops and their crop shapes, both on ``device``."""
+        images_crop = (
+            torch.stack([item.images_crop for item in mm_items], dim=0)
+            .type(target_dtype)
+            .to(device=device)
+        )
+        images_spatial_crop = (
+            torch.cat([item.images_spatial_crop for item in mm_items], dim=0)
+            .type(torch.long)
+            .to(device=device)
+        )
+        return images_crop, images_spatial_crop
+
     def _process_image_input(self, mm_items: List[MultimodalDataItem]) -> torch.Tensor:
         """Process multimodal data items into concatenated vision features."""
         target_dtype = self.vision_model.dtype
@@ -251,15 +272,11 @@ class UnlimitedOCRForCausalLM(nn.Module):
             target_dtype
         )
 
-        images_crop = (
-            torch.stack([item.images_crop for item in mm_items], dim=0)
-            .type(target_dtype)
-            .to(device=pixel_values.device)
-        )
-        images_spatial_crop = (
-            torch.cat([item.images_spatial_crop for item in mm_items], dim=0)
-            .type(torch.long)
-            .to(device=pixel_values.device)
+        images_crop, images_spatial_crop = self._stack_crop_inputs(
+            mm_items,
+            has_local_crops=has_local_crops,
+            target_dtype=target_dtype,
+            device=pixel_values.device,
         )
         pixel_values = pixel_values.view(
             pixel_values.shape[0] * pixel_values.shape[1], 1, *pixel_values.shape[2:]

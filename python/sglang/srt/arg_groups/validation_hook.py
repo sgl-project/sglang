@@ -116,6 +116,18 @@ def validate_response_store(server_args: Any) -> None:
         )
 
 
+def validate_doc_split_page_limits(server_args: Any) -> None:
+    """A split window transcribes at least one page."""
+    cfg = resolving_view(server_args)
+    windows = {
+        "--uocr-gundam-page-window": cfg.uocr_gundam_page_window,
+        "--uocr-base-page-window": cfg.uocr_base_page_window,
+    }
+    for flag, window in windows.items():
+        if window < 1:
+            raise ValueError(f"{flag} must be at least 1, got {window}")
+
+
 def check_pipeline_parallel_compat(cfg: Any) -> None:
     """Validate features used with pipeline parallelism."""
     assert cfg.disable_overlap_schedule, (

@@ -421,8 +421,9 @@ class CompletionRequest(PDRoutingFields):
     )
 
     images_config: Optional[Dict] = None
-    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # Per-request processor overrides; MiniCPM-V 4.7 reads them (downsample_mode,
     # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    # Unlimited-OCR v2 reads them as defaults under images_config.
     mm_processor_kwargs: Optional[Dict] = None
 
     # Deprecated: use routed_dp_rank instead
@@ -906,6 +907,15 @@ def _has_message_level_tools(messages: Any) -> bool:
     )
 
 
+class DocSplitOptions(BaseModel):
+    """Options for splitting oversized document requests into page batches."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_batch_pages: Optional[int] = Field(default=None, ge=1)
+    overlap_pages: Optional[int] = Field(default=None, ge=0)
+
+
 class ChatCompletionRequest(PDRoutingFields):
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
@@ -1026,9 +1036,11 @@ class ChatCompletionRequest(PDRoutingFields):
 
     images_config: Optional[Dict] = None
     video_config: Optional[Dict] = None
-    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # Per-request processor overrides; MiniCPM-V 4.7 reads them (downsample_mode,
     # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    # Unlimited-OCR v2 reads them as defaults under images_config.
     mm_processor_kwargs: Optional[Dict] = None
+    doc_split_options: Optional[DocSplitOptions] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
