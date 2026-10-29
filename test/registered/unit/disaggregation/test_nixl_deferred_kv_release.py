@@ -5,6 +5,7 @@ bootstrap thread records the ACK target while a transfer is outstanding; only
 the worker can send that ACK after every handle reaches DONE.
 """
 
+import threading
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
@@ -61,6 +62,18 @@ def _chunk() -> TransferKVChunk:
         prefill_aux_index=None,
         state_indices=None,
     )
+
+
+class _NeverSettlingAgent:
+    def __init__(self, entered: threading.Event):
+        self._entered = entered
+
+    def check_xfer_state(self, handle):
+        self._entered.set()
+        return "PROC"
+
+    def check_remote_metadata(self, agent_name):
+        return True
 
 
 class TestNixlAbortNotification(
@@ -225,6 +238,69 @@ class TestNixlAbortNotification(
         self.assertEqual(manager.agent.transfer.call_count, 2)
         manager.conclude_failure.assert_called_once()
         self.assertEqual(manager._staging_outstanding[ROOM], 0)
+        self.assertEqual(manager._sent, [])
+
+    def test_abort_during_unsettled_transfer_does_not_park_worker(self):
+        """A decode abort must not park a worker on a handle that never settles."""
+        manager = _manager(status=KVPoll.WaitingForInput)
+        manager.enable_staging = False
+        manager._staging_ctx = None
+        manager._staging_outstanding = defaultdict(int)
+        manager.transfer_infos = {}
+        manager.exceptions = {}
+        manager.conclude_failure = MagicMock()
+
+        req = SimpleNamespace(
+            room=ROOM,
+            is_dummy=False,
+            agent_name="decode-a",
+            dst_kv_indices=np.array([1], dtype=np.int32),
+        )
+        dst_info = SimpleNamespace(
+            decode_tp_size=1,
+            requires_dcp_relayout=False,
+            dst_homogeneous_mem_kind="VRAM",
+            kv_xfer_segments=None,
+            dst_kv_ptrs=[0x1000],
+            gpu_id=0,
+        )
+        manager.transfer_infos = {ROOM: {"decode-a": req}}
+        manager.decode_kv_args_table = {"decode-a": dst_info}
+        manager.kv_args = SimpleNamespace(kv_data_ptrs=[0x2000], page_size=1)
+        manager.transfer_source_rank = 0
+        manager.is_mla_backend = False
+        manager.is_hybrid_mla_backend = False
+        manager.attn_tp_size = 1
+        manager.send_kvcache = MagicMock(return_value="kv-handle")
+
+        entered_wait = threading.Event()
+        manager.agent = _NeverSettlingAgent(entered_wait)
+        queue = SimpleNamespace(
+            get=MagicMock(side_effect=(_chunk(), KeyboardInterrupt()))
+        )
+        worker_result = {}
+
+        def run_worker():
+            try:
+                manager.transfer_worker(queue)
+            except BaseException as exc:
+                worker_result["exception"] = exc
+
+        worker = threading.Thread(target=run_worker, daemon=True)
+        with (
+            patch("sglang.srt.disaggregation.nixl.conn.NIXL_ERR_SETTLE_TIMEOUT_S", 0.1),
+            patch("sglang.srt.disaggregation.nixl.conn.NIXL_ERR_SETTLE_POLL_S", 0.001),
+        ):
+            worker.start()
+            self.assertTrue(entered_wait.wait(timeout=2.0))
+            self._dispatch_abort(manager)
+            worker.join(timeout=2.0)
+
+        self.assertFalse(worker.is_alive(), "worker stayed parked after abort")
+        self.assertIsInstance(worker_result.get("exception"), KeyboardInterrupt)
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
+        self.assertEqual(manager._staging_outstanding[ROOM], 1)
+        self.assertIn(ROOM, manager._deferred_ack_poisoned_rooms)
         self.assertEqual(manager._sent, [])
 
 
