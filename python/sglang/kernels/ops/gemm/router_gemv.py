@@ -270,15 +270,22 @@ def _router_gemv_reduce_kernel(
     tl.store(out_ptr + offs, total, mask=mask)
 
 
-_scratch: Dict[Tuple[torch.device, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+_scratch: Dict[
+    Tuple[torch.device, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]
+] = {}
 
 
-def _get_scratch(device: torch.device, n: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    key = (device, n)
+def _get_scratch(
+    device: torch.device, n: int, w_dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # sized for the weight dtype's own tiles, so the CUDA FP32 path keeps a small buffer
+    key = (device, n, w_dtype)
     if key not in _scratch:
-        max_split_k = max(cfg[3] for _, cfg in _CONFIGS + _CUDA_FP32_CONFIGS)
+        configs = _configs(w_dtype)
+        max_split_k = max(cfg[3] for _, cfg in configs)
+        max_m = configs[-1][0]
         _scratch[key] = (
-            torch.empty(max_split_k * _MAX_M * n, dtype=torch.float32, device=device),
+            torch.empty(max_split_k * max_m * n, dtype=torch.float32, device=device),
             torch.zeros(n * _FIXUP_MAX_M // 16, dtype=torch.int32, device=device),
         )
     return _scratch[key]
@@ -310,7 +317,7 @@ def _launch(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, fixup: bool) ->
     m, k = x.shape
     n = w.shape[0]
     block_m, block_n, block_k, split_k, num_warps = _config(m, w.dtype)
-    partials, counter = _get_scratch(x.device, n)
+    partials, counter = _get_scratch(x.device, n, w.dtype)
     m_tiles = triton.cdiv(m, block_m)
     _router_gemv_kernel[(n // block_n, m_tiles, split_k)](
         x,
@@ -347,7 +354,7 @@ def router_gemv_partials(x: torch.Tensor, w: torch.Tensor) -> Optional[torch.Ten
     if m <= _FIXUP_MAX_M:
         return None
     n = w.shape[0]
-    partials, _ = _get_scratch(x.device, n)
+    partials, _ = _get_scratch(x.device, n, w.dtype)
     rows = _launch(x, w, partials, fixup=False)
     split_k = _config(m, w.dtype)[3]
     return partials[: split_k * rows * n].view(split_k, rows, n)[:, :m]
@@ -375,7 +382,7 @@ def router_gemv_partials_swiglu(
     )
     # both kernels launch with 4 warps on their own; sharing that count keeps their layouts
     assert num_warps == 4
-    partials, _ = _get_scratch(x.device, n)
+    partials, _ = _get_scratch(x.device, n, w.dtype)
     m_tiles = triton.cdiv(m, block_m)
     num_gemv = (n // block_n) * m_tiles * split_k
     _router_gemv_swiglu_kernel[(num_gemv + triton.cdiv(m, sw_block_m),)](
