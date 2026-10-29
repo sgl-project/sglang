@@ -207,8 +207,6 @@ auto make_plan(
 template <typename ConfigWave1, typename ConfigWaves = ConfigWave1, typename ConfigMoreCtas = ConfigWaves>
 struct TopkNormal {
   static_assert(ConfigWave1::cluster_size == 1 && ConfigWaves::cluster_size == 1);
-  static constexpr bool HAS_DENSER_TIER = !std::is_same_v<ConfigWaves, ConfigMoreCtas>;
-  static_assert(!HAS_DENSER_TIER || ConfigMoreCtas::target_occupancy > ConfigWaves::target_occupancy);
   static_assert(std::is_same_v<typename ConfigWave1::ValueT, typename ConfigWaves::ValueT>);
   static_assert(std::is_same_v<typename ConfigWave1::OutIdxT, typename ConfigWaves::OutIdxT>);
   static_assert(ConfigWave1::max_topk == ConfigWaves::max_topk);
@@ -252,7 +250,7 @@ struct TopkNormal {
       const auto num_sm = host::runtime::get_sm_count(plan.device.device_id);
       if (plan.args.batch_size <= num_sm) {
         details::run_normal<ConfigWave1>(plan.args);
-      } else if constexpr (HAS_DENSER_TIER) {
+      } else if constexpr (ConfigMoreCtas::target_occupancy > ConfigWaves::target_occupancy) {
         // Residency costs per-CTA throughput always and saves a round only sometimes.
         const auto rounds = [&](uint32_t occupancy) {
           return host::div_ceil(uint64_t{plan.args.batch_size}, uint64_t{num_sm} * occupancy);
