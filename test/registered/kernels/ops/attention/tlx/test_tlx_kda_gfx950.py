@@ -324,6 +324,45 @@ def test_kda_paged_prefill_state_pool(lengths):
 
 
 @requires_prefill
+def test_kda_paged_prefill_host_boundaries_do_not_sync():
+    from sglang.kernels.ops.attention.tlx.kda import gfx950_prefill
+
+    torch.manual_seed(71)
+    lengths, heads = [17, 300, 64, 129], 4
+    q, k, v, g, beta, A_log, dt_bias = _raw_kda_inputs(lengths, heads)
+    boundaries = [0, *accumulate(lengths)]
+    cu_seqlens = torch.tensor(boundaries, device=DEVICE, dtype=torch.int32)
+    initial_state = 0.1 * torch.randn(
+        len(lengths), heads, 128, 128, device=DEVICE, dtype=torch.float32
+    )
+    kwargs = dict(
+        scale=128**-0.5,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=-5.0,
+        beta_is_raw=True,
+    )
+    expected_output, expected_state = kda_paged_prefill(q, k, v, g, beta, **kwargs)
+
+    gfx950_prefill._PREFILL_METADATA_CACHE.clear()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        output, state = kda_paged_prefill(
+            q, k, v, g, beta, cu_seqlens_cpu=boundaries, **kwargs
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.testing.assert_close(output, expected_output, atol=0, rtol=0)
+    torch.testing.assert_close(state, expected_state, atol=0, rtol=0)
+
+    gfx950_prefill._PREFILL_METADATA_CACHE.clear()
+    with pytest.raises(ValueError, match="cu_seqlens_cpu"):
+        kda_paged_prefill(q, k, v, g, beta, cu_seqlens_cpu=boundaries[:-1], **kwargs)
+
+
+@requires_prefill
 @pytest.mark.parametrize(
     "total_tokens,sequences,heads,key_dim,value_dim,dtype_name", PREFILL_SHAPES
 )
