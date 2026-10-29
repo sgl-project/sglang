@@ -3253,24 +3253,15 @@ class DeepseekV4AttnBackend(
                 setattr(core, name, retained[0][: value.shape[0]])
 
     def _share_q_mega_pad_buffer(self, metadata: DSV4Metadata) -> None:
-        # Metadata that a captured graph keeps (one per prefill graph shape, one
-        # per early verify graph) would each hold its own MegaAttention
-        # packed-query buffer for the server's lifetime. Graphs replay one at a
-        # time and nothing writes the buffer's padding, so each starts from the
-        # buffer of the metadata kept before it. A graph that needs more rows
-        # allocates a larger one (MqaAttentionBase._zero_padded_q), and graphs
-        # captured earlier keep theirs. Prefill shapes are captured largest
-        # first, so they share one buffer.
+        # Kept graphs replay one at a time and never write the padding,
+        # so they share one buffer.
         if self._last_kept_metadata is not None:
             metadata.q_mega_pad_buffer = self._last_kept_metadata.q_mega_pad_buffer
         self._last_kept_metadata = metadata
 
     def release_q_mega_pad_buffer(self) -> None:
-        # An eager forward builds its metadata, and with it the MegaAttention
-        # packed-query buffer, anew; the backend keeps that metadata until the
-        # next forward, so the model drops the buffer when its forward ends
-        # instead of holding it between forwards. A buffer a CUDA graph captured
-        # stays: the graph writes and reads it on every replay.
+        # Eager metadata outlives its forward;
+        # drop its buffer unless a graph captured it.
         for metadata in (self.forward_metadata, self.tail_forward_metadata):
             if isinstance(metadata, DSV4Metadata) and not metadata.q_mega_pad_captured:
                 metadata.q_mega_pad_buffer = None

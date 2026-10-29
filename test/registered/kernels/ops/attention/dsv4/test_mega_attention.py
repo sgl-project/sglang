@@ -11,23 +11,21 @@ from sglang.kernels.ops.attention.flash_mla_interface import (
     flash_mla_mega_decode,
     flash_mla_mega_prefill,
 )
-from sglang.srt.layers.attention.deepseek_v4_backend import (
-    DeepseekV4AttnBackend,
-    DSV4Metadata,
-)
+from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
 from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
+    DeepseekV4MegaAttnBackend,
     interleave_output_columns,
     interleave_query_rows,
     pack_query,
     quantize_wo_a,
 )
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner import row_bucket_graph_runner
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.models import deepseek_v4_replay_tail
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4Model,
-    MqaAttentionBase,
     MQALayer,
     _fp8_wo_a_einsum,
 )
@@ -74,7 +72,7 @@ class _MegaQueryLayer:
 
     head_dim = 512
     mega_wq_b_permuted = False
-    _zero_padded_q = MqaAttentionBase._zero_padded_q
+    _zero_packed_q = MQALayer._zero_packed_q
     _forward_mega = MQALayer._forward_mega
 
     def __init__(self):
@@ -110,21 +108,17 @@ def prefill_forward_batch():
     )
 
 
-class _KeptMetadataBackend:
-    """The state DeepseekV4AttnBackend reads to share the packed query buffer
-    between metadata that captured graphs keep, and to switch the late layers
-    onto their tail metadata."""
-
-    _share_q_mega_pad_buffer = DeepseekV4AttnBackend._share_q_mega_pad_buffer
-    enter_late_layer_tail = DeepseekV4AttnBackend.enter_late_layer_tail
-    exit_late_layer_tail = DeepseekV4AttnBackend.exit_late_layer_tail
-    release_q_mega_pad_buffer = DeepseekV4AttnBackend.release_q_mega_pad_buffer
+class _KeptMetadataBackend(DeepseekV4MegaAttnBackend):
+    """A MegaAttention backend with only the state it reads to share the packed
+    query buffer between metadata that captured graphs keep, to switch the late
+    layers onto their tail metadata, and to release the buffer."""
 
     def __init__(self):
         self.forward_metadata = None
         self.tail_forward_metadata = None
         self._last_kept_metadata = None
         self.token_to_kv_pool = SimpleNamespace(request_window=None)
+        self.req_to_token_pool = None
 
 
 class TestMegaPackedQueryBuffer(CustomTestCase):
@@ -305,7 +299,9 @@ class TestMegaPackedQueryBuffer(CustomTestCase):
     def _model_forward(self, backend, forward_batch, run_layers):
         # DeepseekV4Model.forward around stand-in layers: what it does once they
         # return is under test.
-        model = SimpleNamespace(_forward_impl=lambda *args: run_layers())
+        model = SimpleNamespace(
+            _forward_impl=lambda *args: run_layers(), use_mega_attention=True
+        )
         with patch(
             "sglang.srt.models.deepseek_v4.get_attn_backend", return_value=backend
         ):
@@ -399,6 +395,13 @@ class TestMegaPackedQueryBuffer(CustomTestCase):
                 self.assertTrue(torch.equal(p, pack_query_reference(q, 64)))
         self.assertEqual(meta.q_mega_pad_buffer.data_ptr(), warm_ptr)
         self.assertIs(tail.q_mega_pad_buffer, meta.q_mega_pad_buffer)
+
+    def test_forward_end_rejects_a_wrapped_backend(self):
+        # Under a wrapper such as TboAttnBackend the end of the forward must fail,
+        # not skip the release and keep the forward's buffer.
+        backend = TboAttnBackend.init_new(_KeptMetadataBackend)
+        with self.assertRaisesRegex(AssertionError, "TboAttnBackend"):
+            self._model_forward(backend, prefill_forward_batch(), lambda: None)
 
     @contextmanager
     def _row_bucket_runtime(self, backend):
