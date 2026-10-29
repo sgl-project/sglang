@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 import logging
 
+from sglang.srt.hardware_backend.npu.moe import standard_dispatch as ascend_dispatch
 from sglang.srt.hardware_backend.npu.moe.matmul import (
     GroupedMatmul,
     GroupedMatmulSwigluQuant,
@@ -247,10 +248,20 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
         self.quant_config = quant_config
 
     @staticmethod
-    def _set_dispatcher_output_dtype(layer: torch.nn.Module, dtype) -> None:
-        """Set dispatcher output dtype if the layer has a dispatcher."""
-        if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": dtype})
+    def _set_moe_dispatch_dtype(layer: torch.nn.Module, dtype) -> None:
+        """Record the dtype each path must hand to the Ascend grouped matmuls.
+
+        The no-A2A path keeps it on the layer: ``npu_moe_init_routing_v2``'s
+        ``quant_mode`` is chosen there, because the Ascend routing is no longer
+        a dispatcher of its own. Transport dispatchers that pick their own wire
+        format from the same value (DeepEP, Ascend Ops, PPLX, MORI) still get it
+        through ``set_quant_config``, which is the interface they had before the
+        routing moved out.
+        """
+        ascend_dispatch.set_dispatch_dtype(layer, dtype)
+        dispatcher = getattr(layer, "dispatcher", None)
+        if dispatcher is not None and hasattr(dispatcher, "set_quant_config"):
+            dispatcher.set_quant_config({"dispatcher_output_dtype": dtype})
 
     @staticmethod
     def _validate_weight_prefix(layer: torch.nn.Module, weight_prefix: str) -> None:
@@ -439,7 +450,7 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         # The refactored NPU dispatchers currently support BF16 and INT8.
         # Keep dispatch in BF16 and quantize immediately before each GMM.
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "bf16")
+            self._set_moe_dispatch_dtype(layer, "bf16")
 
     def apply(
         self,
@@ -530,7 +541,7 @@ class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
 
         # Set DeepEP dispatcher output dtype
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "bf16")
+            self._set_moe_dispatch_dtype(layer, "bf16")
 
     def _pack_int4(self, weight) -> torch.Tensor:
         """
@@ -677,7 +688,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "int8")
+            self._set_moe_dispatch_dtype(layer, "int8")
 
     def apply(
         self,
@@ -782,7 +793,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "int8")
+            self._set_moe_dispatch_dtype(layer, "int8")
 
     @staticmethod
     def _update_bias(
@@ -914,7 +925,7 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
 
         # Set dispatcher output dtype
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "bf16")
+            self._set_moe_dispatch_dtype(layer, "bf16")
 
     def _pack_to_int32(self, weight: torch.Tensor) -> torch.Tensor:
         assert weight.dim() == 3
@@ -1033,7 +1044,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
         weight.data = npu_format_cast(weight)
 
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "bf16")
+            self._set_moe_dispatch_dtype(layer, "bf16")
 
     def apply(
         self,
@@ -1073,8 +1084,8 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
     ``apply_fused_gmm1_swiglu`` for w13 and ``apply`` only for w2 — hence the
     per-prefix matmul chosen here.
 
-    Where the *activation* quant happens depends on the dispatcher. On
-    ``ascend_tp`` it comes for free from ``npu_moe_init_routing_v2(quant_mode=3)``,
+    Where the *activation* quant happens depends on the transport. On the
+    no-A2A path it comes for free from ``npu_moe_init_routing_v2(quant_mode=3)``,
     which emits the e4m3 payload and e8m0 scale as part of routing. DeepEP has no
     mxfp8 dispatch dtype, so it hands over bf16 and w13 quantises the hidden
     states itself before gmm1.
@@ -1167,7 +1178,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             # DeepEP has no mxfp8 entry in its dispatch dtype table, so let it
             # keep sending bf16; apply_fused_gmm1_swiglu quantises instead.
             dispatcher_dtype = "bf16" if get_moe_a2a_backend().is_deepep() else "mxfp8"
-            self._set_dispatcher_output_dtype(layer, dispatcher_dtype)
+            self._set_moe_dispatch_dtype(layer, dispatcher_dtype)
 
     def apply_fused_gmm1_swiglu(
         self,
@@ -1185,8 +1196,8 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
 
         ``pertoken_scale`` is None when the dispatcher handed over unquantised
         hidden states (the DeepEP path), in which case the activation quant that
-        ascend_tp fuses into routing is done here instead. Both dispatchers
-        therefore reach the kernel below with the same e4m3 + e8m0 input.
+        the no-A2A routing fuses in is done here instead. Both paths therefore
+        reach the kernel below with the same e4m3 + e8m0 input.
         """
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)

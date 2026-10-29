@@ -750,13 +750,21 @@ def test_bias_residual_add_predicates():
     assert not can_use_bias_residual_add(narrow, bias, torch.randn_like(narrow))
 
 
-# MOSSImage keeps the ATen FP32 mean and rounds before gamma.
+# MOSSImage and Ming-Image keep the ATen FP32 mean and round before gamma.
 @torch.no_grad()
 @pytest.mark.parametrize(
-    "shape", [(1, 6620, 3072), (1, 4109, 24, 128), (2, 65, 3072), (1, 13, 128)]
+    "shape,eps",
+    [
+        ((1, 6620, 3072), 1e-6),
+        ((1, 4109, 24, 128), 1e-6),
+        ((2, 65, 3072), 1e-6),
+        ((1, 13, 128), 1e-6),
+        ((1, 4416, 3840), 1e-5),
+        ((1, 4416, 30, 128), 1e-5),
+    ],
 )
 @pytest.mark.parametrize("varying_exponent", [False, True])
-def test_rmsnorm_cast_before_weight_bitexact(shape, varying_exponent):
+def test_rmsnorm_cast_before_weight_bitexact(shape, eps, varying_exponent):
     from sglang.kernels.ops.diffusion import (
         can_use_rmsnorm_cast_before_weight,
         rmsnorm_cast_before_weight_bitexact,
@@ -770,10 +778,10 @@ def test_rmsnorm_cast_before_weight_bitexact(shape, varying_exponent):
         x = (x.float() * torch.exp2(exponents)).to(x.dtype)
     weight = torch.randn(shape[-1], device=DEVICE, dtype=x.dtype)
     expected = (
-        x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+        x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
     ).to(x.dtype) * weight
-    assert can_use_rmsnorm_cast_before_weight(device=x.device, dtype=x.dtype)
-    assert torch.equal(rmsnorm_cast_before_weight_bitexact(x, weight), expected)
+    assert can_use_rmsnorm_cast_before_weight(device=x.device, dtype=x.dtype, eps=eps)
+    assert torch.equal(rmsnorm_cast_before_weight_bitexact(x, weight, eps), expected)
 
 
 @torch.no_grad()
@@ -828,9 +836,12 @@ def test_rmsnorm_cast_before_weight_guards():
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("dim", [128, 256, 3072])
+@pytest.mark.parametrize(
+    "dim,eps",
+    [(128, 1e-6), (256, 1e-6), (3072, 1e-6), (128, 1e-5), (2560, 1e-5), (3840, 1e-5)],
+)
 @pytest.mark.parametrize("rows", [1, 15, 16, 17])
-def test_rmsnorm_cast_before_weight_reduction_boundaries(dim, rows):
+def test_rmsnorm_cast_before_weight_reduction_boundaries(dim, eps, rows):
     from sglang.kernels.ops.diffusion import rmsnorm_cast_before_weight_bitexact
 
     # Nonzero, unaligned storage offsets remain contiguous; the reference
@@ -843,9 +854,9 @@ def test_rmsnorm_cast_before_weight_reduction_boundaries(dim, rows):
         torch.exp2(torch.randint(-12, 12, x.shape, device=DEVICE).float()).to(x.dtype)
     )
     expected = (
-        x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+        x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
     ).to(x.dtype) * weight
-    assert torch.equal(rmsnorm_cast_before_weight_bitexact(x, weight), expected)
+    assert torch.equal(rmsnorm_cast_before_weight_bitexact(x, weight, eps), expected)
 
 
 def _moss_image_norm_eager(x, weight):
