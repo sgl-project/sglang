@@ -7,6 +7,7 @@ import torch
 
 from sglang.kernels.ops.diffusion import fuse_scale_shift_kernel
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.utils import cuda_event_us
 from sglang.utils import is_in_ci
 
 register_cuda_ci(
@@ -31,25 +32,6 @@ CI_WORKLOADS = [
     Workload("ci_s1024_c1536", (1, 1024, 1536), 4),
     Workload("ci_s512_c5120", (1, 512, 5120), 2),
 ]
-
-
-def cuda_event_us(fn, warmups: int, repeats: int, rounds: int) -> float:
-    for _ in range(warmups):
-        fn()
-    torch.cuda.synchronize()
-
-    samples = []
-    for _ in range(rounds):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(repeats):
-            fn()
-        end.record()
-        end.synchronize()
-        samples.append(start.elapsed_time(end) * 1000.0 / repeats)
-    samples.sort()
-    return samples[len(samples) // 2]
 
 
 def benchmark() -> None:

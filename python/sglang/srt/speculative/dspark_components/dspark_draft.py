@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import functools
 import logging
 from typing import TYPE_CHECKING, NamedTuple, Optional
@@ -11,6 +12,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
 from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -21,6 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.spec_info import (
@@ -33,7 +36,7 @@ from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 if TYPE_CHECKING:
-    from sglang.srt.models.dspark import BaseDSparkMarkovHead
+    from sglang.srt.models.dspark import BaseDSparkMarkovHead, VocabShard
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,10 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
     temperatures: torch.Tensor
     # Drafted by argmax: the sampling accept uses a one-hot draft distribution.
     greedy_draft: bool
+    # Set when corrected_logits hold only this rank's padded vocab slice.
+    vocab_shard: Optional[VocabShard] = None
+    # The noise the block was drafted with; the sharded accept draws from it too.
+    noise: Optional[DraftNoise] = None
 
 
 class DraftForwardResult(msgspec.Struct, frozen=True):
@@ -77,6 +84,9 @@ class DraftProposal(msgspec.Struct, frozen=True):
     confidence: Optional[torch.Tensor] = None
     confidence_raw: Optional[torch.Tensor] = None
     folded: bool = False
+    # [bs, gamma + 1] ``[anchor | draft tokens]`` from the draft graph tail; None
+    # when the caller builds them.
+    verify_ids: Optional[torch.Tensor] = None
 
 
 def select_draft_hidden_without_anchor(
@@ -164,6 +174,9 @@ def resolve_draft_params(
     return DraftParams(temperatures, greedy_mask, step_temperatures)
 
 
+# Arbitrary; how often the proposer logs its restage-skip count, in graph steps.
+STAGED_PARAMS_LOG_EVERY = 500
+
 # XORed into the server seed so the draft noise differs from other samplers'.
 _DRAFT_NOISE_DOMAIN = 0x2D2A9C317E44B1F3
 
@@ -179,9 +192,14 @@ class DraftNoise(msgspec.Struct, frozen=True):
     offset: torch.Tensor
 
 
-def step_logits_width(markov_head: BaseDSparkMarkovHead, base_width: int) -> int:
-    # Kept step logits are gathered whole over a sharded vocab.
-    return base_width if markov_head.vocab_shard is None else markov_head.vocab_size
+def step_logits_width(
+    markov_head: BaseDSparkMarkovHead, base_width: int, sharded_accept: bool = False
+) -> int:
+    # Kept step logits are gathered whole over a sharded vocab, unless the
+    # sharded accept reads them on the shards.
+    if markov_head.vocab_shard is None or sharded_accept:
+        return base_width
+    return markov_head.vocab_size
 
 
 def _draft_step(
@@ -195,6 +213,7 @@ def _draft_step(
     noise: DraftNoise,
     step: int,
     logits_out: Optional[torch.Tensor],
+    sharded_accept: bool,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if logits_out is None and len(prev_tokens) == 1:
         # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
@@ -217,7 +236,7 @@ def _draft_step(
         else dict(
             vocab_start=shard.start,
             gather=shard.gather.gather_stacked,
-            gather_logits=shard.gather,
+            gather_logits=None if sharded_accept else shard.gather,
         )
     )
     tokens = MarkovSampleStep.execute(
@@ -247,13 +266,16 @@ def draft_markov_block(
     tp_sync: SpecTpSync,
     logits_out: Optional[torch.Tensor] = None,
     greedy_draft: bool = False,
+    sharded_accept: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
-    written to ``logits_out`` or allocated here; a greedy draft keeps none."""
+    """Returns the drafted tokens and the [bs, gamma, width] step logits, written
+    to ``logits_out`` or allocated here; width is the vocab, or this rank's vocab
+    shard with ``sharded_accept``. A greedy draft keeps no logits."""
     bs, gamma = base_logits.shape[:2]
     if not greedy_draft and logits_out is None:
+        width = step_logits_width(markov_head, base_logits.shape[-1], sharded_accept)
         logits_out = torch.empty(
-            (bs, gamma, step_logits_width(markov_head, base_logits.shape[-1])),
+            (bs, gamma, width),
             dtype=markov_head.step_logits_dtype(base_logits.dtype),
             device=base_logits.device,
         )
@@ -271,6 +293,7 @@ def draft_markov_block(
             noise=noise,
             step=step,
             logits_out=None if greedy_draft else logits_out[:, step],
+            sharded_accept=sharded_accept,
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
@@ -291,6 +314,7 @@ def sample_draft_block(
     device: torch.device,
     tp_sync: SpecTpSync,
     greedy_draft: bool,
+    sharded_accept: bool = False,
 ) -> DraftBlockResult:
     params = resolve_draft_params(
         sampling_info=sampling_info, bs=base_logits.shape[0], device=device
@@ -304,6 +328,7 @@ def sample_draft_block(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
+        sharded_accept=sharded_accept,
     )
     return DraftBlockResult(
         draft_tokens=draft_tokens,
@@ -313,10 +338,17 @@ def sample_draft_block(
         greedy_mask=params.greedy_mask,
         temperatures=params.temperatures,
         greedy_draft=greedy_draft,
+        vocab_shard=markov_head.vocab_shard if sharded_accept else None,
+        noise=noise if sharded_accept else None,
     )
 
 
 class DraftBlockProposer:
+    _staged_params_key = None
+    num_staged_params_skips = 0
+    num_staged_params_calls = 0
+    deferred_commit = None
+
     def __init__(
         self,
         *,
@@ -328,6 +360,7 @@ class DraftBlockProposer:
         tp_sync: SpecTpSync,
         random_seed: int,
         greedy_draft: bool,
+        sharded_accept: bool = False,
         dp_moe_sync: bool = False,
     ) -> None:
         self.draft_model = draft_model
@@ -339,6 +372,7 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._tp_sync = tp_sync
         self._greedy_draft = greedy_draft
+        self._sharded_accept = sharded_accept
         self._noise = DraftNoise(
             key=draft_noise_key(random_seed),
             offset=torch.zeros(
@@ -347,9 +381,26 @@ class DraftBlockProposer:
         )
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        # A local logits subphase, separate from the MoE model's global layout.
+        self._base_logits_layout = resolve_draft_parallel_layout(
+            DraftParallelSpec(
+                tp_execution=(
+                    DraftTPExecution.SINGLE_GROUP
+                    if dp_moe_sync
+                    else DraftTPExecution.TARGET_LAYOUT
+                )
+            )
+        )
+        # SGLANG_DSPARK_DEFER_CONTEXT_KV's staged commit, set by the worker.
+        self.deferred_commit = None
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
+        # (sampler, bs, temperatures, top_ks) last staged: SamplingBatchInfo rebinds
+        # these tensors when the batch changes, never edits them in place
+        self._staged_params_key: Optional[tuple] = None
+        self.num_staged_params_skips = 0
+        self.num_staged_params_calls = 0
         self._num_token_non_padded = (
             torch.empty((1,), dtype=torch.int32, device=self.draft_model_runner.device)
             if enable_num_token_non_padded()
@@ -363,8 +414,36 @@ class DraftBlockProposer:
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
 
+    def _stage_sampling_params(self, draft_sampler, *, bs: int, sampling_info) -> None:
+        """The draft graph's sampling params, restaged only when the sampler, bs or
+        the batch's temperature / top-k tensors changed since the last stage."""
+        key = (
+            draft_sampler,
+            bs,
+            None if sampling_info is None else sampling_info.temperatures,
+            None if sampling_info is None else sampling_info.top_ks,
+        )
+        staged = self._staged_params_key
+        self.num_staged_params_calls += 1
+        skip = (
+            staged is not None
+            and staged[1] == bs
+            and all(staged[i] is key[i] for i in (0, 2, 3))
+        )
+        self.num_staged_params_skips += skip
+        if self.num_staged_params_calls % STAGED_PARAMS_LOG_EVERY == 0:
+            logger.debug(
+                "DSpark draft: sampling params restage skipped on %d of %d steps",
+                self.num_staged_params_skips,
+                self.num_staged_params_calls,
+            )
+        if skip:
+            return
+        draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+        self._staged_params_key = key
+
     def _base_logits_context(self):
-        return draft_tp_context(self._dp_moe_sync)
+        return draft_tp_context(self._base_logits_layout)
 
     def propose(
         self,
@@ -376,6 +455,7 @@ class DraftBlockProposer:
         device: str,
         target_model,
         sampling_info,
+        anchor_prepared: bool = False,
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
@@ -392,10 +472,11 @@ class DraftBlockProposer:
             embed_module=embed_module,
             draft_sampler=draft_sampler,
             sampling_info=sampling_info,
+            anchor_prepared=anchor_prepared,
         )
         draft_block_ids = fwd.draft_block_ids
 
-        confidence = confidence_raw = None
+        confidence = confidence_raw = verify_ids = None
         folded = False
         if (
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
@@ -411,10 +492,18 @@ class DraftBlockProposer:
                 greedy_mask=draft_sampler.params.greedy_mask[:bs],
                 temperatures=draft_sampler.params.temperatures[:bs],
                 greedy_draft=self._greedy_draft,
+                vocab_shard=(
+                    self.draft_model.markov_head.vocab_shard
+                    if self._sharded_accept
+                    else None
+                ),
+                noise=self._noise if self._sharded_accept else None,
             )
             if draft_sampler.confidence_out is not None:
                 confidence = draft_sampler.confidence_out[:bs]
                 confidence_raw = draft_sampler.confidence_raw_out[:bs]
+            if draft_sampler.verify_ids is not None:
+                verify_ids = draft_sampler.verify_ids[:bs]
         else:
             with self._base_logits_context():
                 base_logits, confidence_features = self.draft_model.compute_base_logits(
@@ -431,6 +520,7 @@ class DraftBlockProposer:
                 device=device,
                 tp_sync=self._tp_sync,
                 greedy_draft=self._greedy_draft,
+                sharded_accept=self._sharded_accept,
             )
             if self.draft_model.confidence_head is not None:
                 confidence, confidence_raw = self.draft_model.compute_confidence(
@@ -449,6 +539,7 @@ class DraftBlockProposer:
             confidence=confidence,
             confidence_raw=confidence_raw,
             folded=folded,
+            verify_ids=verify_ids,
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:
@@ -472,10 +563,23 @@ class DraftBlockProposer:
         )
         # Hand-built batch bypasses ForwardBatch.init_new: rebind the write
         # loc to the draft's kernel-facing ids (no-op on plain pools).
-        self.draft_model_runner.kv_index_translator.bind_own_plan(idle_batch)
+        self.draft_model_runner.runner_ids.bind_own_plan(idle_batch)
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)
+
+    def draft_block_ids_view(self, *, bs: int, device) -> torch.Tensor:
+        """The ``[bs, query_token_num]`` draft input ids: mask tokens past column 0."""
+        buf = self._draft_block_ids_buf
+        if buf is None or buf.shape[0] < bs or buf.device != torch.device(device):
+            buf = torch.full(
+                (bs, self.query_token_num),
+                int(self._mask_token_id),
+                dtype=torch.long,
+                device=device,
+            )
+            self._draft_block_ids_buf = buf
+        return buf[:bs]
 
     def _run_forward(
         self,
@@ -488,6 +592,7 @@ class DraftBlockProposer:
         embed_module,
         draft_sampler=None,
         sampling_info=None,
+        anchor_prepared: bool = False,
     ) -> DraftForwardResult:
         gamma = self.gamma
         query_token_num = self.query_token_num
@@ -495,18 +600,9 @@ class DraftBlockProposer:
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
-        buf = self._draft_block_ids_buf
-        if buf is None or buf.shape[0] < bs or buf.device != prefix_lens.device:
-            buf = torch.full(
-                (bs, query_token_num),
-                int(self._mask_token_id),
-                dtype=torch.long,
-                device=device,
-            )
-            self._draft_block_ids_buf = buf
-        draft_block_ids = buf[:bs]
-
-        draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+        draft_block_ids = self.draft_block_ids_view(bs=bs, device=prefix_lens.device)
+        if not anchor_prepared:
+            draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
         draft_positions = positions_2d[:, :query_token_num].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
 
@@ -518,12 +614,12 @@ class DraftBlockProposer:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-        if batch.seq_lens_cpu is not None:
+        if not self.draft_model_runner.attn_backend.needs_cpu_seq_lens:
+            draft_seq_lens_cpu = None
+            draft_seq_lens_sum = None
+        elif batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
-        elif draft_input.nxt_kv_lens_cpu is not None:
-            draft_seq_lens_cpu = draft_input.nxt_kv_lens_cpu
-            draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
         else:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
@@ -547,21 +643,36 @@ class DraftBlockProposer:
             ),
             global_num_token_non_padded_cpu=draft_num_tokens,
         )
-        verify_window.kv_loc_plan.bind(
+        verify_window.iteration_ids.bind(
             draft_forward_batch,
-            self.draft_model_runner.kv_index_translator,
+            self.draft_model_runner.runner_ids,
             cols=slice(0, query_token_num),
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
-        if (
-            draft_sampler is not None
-            and graph_runner is not None
-            and graph_runner.can_run_graph(draft_forward_batch)
-        ):
-            draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+        runs_graph = graph_runner is not None and graph_runner.can_run_graph(
+            draft_forward_batch
+        )
+        if draft_sampler is not None and runs_graph:
+            self._stage_sampling_params(
+                draft_sampler, bs=bs, sampling_info=sampling_info
+            )
+        commit = self.deferred_commit
+        if commit is not None:
+            commit.before_draft_forward(
+                graph_bs=(
+                    graph_runner.capture_bs[
+                        bisect.bisect_left(graph_runner.capture_bs, bs)
+                    ]
+                    if runs_graph
+                    else None
+                )
+            )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
+        if commit is not None:
+            assert draft_out.can_run_graph == runs_graph
+            commit.after_draft_forward(graph_ran=draft_out.can_run_graph)
         logits_output = draft_out.logits_output
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:

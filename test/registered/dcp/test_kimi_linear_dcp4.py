@@ -1,4 +1,4 @@
-"""Four-Blackwell acceptance coverage for Kimi Linear TokenSpeed MLA DCP.
+"""Four-Blackwell acceptance coverage for Kimi Linear CuteDSL MLA DCP.
 
 The captured-shape and eager-shape requests deliberately straddle
 ``--cuda-graph-max-bs-decode``.  This guards both the regular CUDA graph
@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=105, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=110, stage="extra-b", runner_config="4-gpu-b200")
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 CUDA_GRAPH_MAX_BS_DECODE = 256
@@ -37,7 +37,7 @@ def _has_four_blackwell_gpus() -> bool:
 
 @unittest.skipUnless(
     _has_four_blackwell_gpus(),
-    "TokenSpeed MLA DCP acceptance requires four Blackwell GPUs",
+    "CuteDSL MLA DCP acceptance requires four Blackwell GPUs",
 )
 class TestKimiLinearDCP4(GSM8KMixin, CustomTestCase):
     model = KIMI_LINEAR_MODEL
@@ -62,7 +62,7 @@ class TestKimiLinearDCP4(GSM8KMixin, CustomTestCase):
                 "--dcp-size",
                 "4",
                 "--attention-backend",
-                "tokenspeed_mla",
+                "cutedsl_mla",
                 "--kv-cache-dtype",
                 "fp8_e4m3",
                 "--dcp-comm-backend",

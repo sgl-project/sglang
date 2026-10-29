@@ -90,7 +90,7 @@ def test_fp8_dsa_prefix_read_uses_the_hybrid_full_attn_child():
         forward_metadata=SimpleNamespace(page_table_1_flattened=page_table)
     )
     outer = SimpleNamespace(
-        full_attn_backend=child, forward_metadata=None, kv_index_translator=None
+        full_attn_backend=child, forward_metadata=None, runner_ids=None
     )
     read_indices = []
 
@@ -98,11 +98,14 @@ def test_fp8_dsa_prefix_read_uses_the_hybrid_full_attn_child():
         read_indices.append(indices)
         return torch.zeros(len(indices), 1, 4), torch.zeros(len(indices), 1, 2)
 
-    fake_pool = SimpleNamespace(get_mla_kv_buffer=get_mla_kv_buffer)
+    # The layer's typed read, as the active pool's router hands it out.
+    fake_layers = SimpleNamespace(
+        read=lambda layer_id: SimpleNamespace(read_mla=get_mla_kv_buffer)
+    )
     with (
         mock.patch.object(forward_mha, "_use_aiter_gfx95", True),
         mock.patch.object(forward_mha, "get_attn_backend", return_value=outer),
-        mock.patch.object(forward_mha, "get_token_to_kv_pool", return_value=fake_pool),
+        mock.patch.object(forward_mha, "get_kv_layers", return_value=fake_layers),
         mock.patch.object(
             forward_mha,
             "filter_dcp_local_kv_indices",
@@ -110,7 +113,8 @@ def test_fp8_dsa_prefix_read_uses_the_hybrid_full_attn_child():
         ),
     ):
         forward_mha.DeepseekMHAForwardMixin._get_mla_kv_buffer_from_fp8_for_dsa(
-            SimpleNamespace(attn_mha=object()), SimpleNamespace(forward_mode=None)
+            SimpleNamespace(attn_mha=SimpleNamespace(layer_id=0)),
+            SimpleNamespace(forward_mode=None),
         )
 
     assert len(read_indices) == 1 and torch.equal(read_indices[0], page_table)

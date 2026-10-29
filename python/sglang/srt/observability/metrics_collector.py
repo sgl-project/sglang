@@ -144,6 +144,11 @@ class SchedulerStats:
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
+    # Share of the full / SWA KV pool held by decode requests whose KV transfer
+    # is still pending (preallocated, not yet running), on the capacity basis of
+    # full_token_usage / swa_token_usage; the difference is the running batch's share.
+    prealloc_full_token_usage: float = 0.0
+    prealloc_swa_token_usage: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -163,6 +168,9 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    # Host Mamba state pool of hybrid-SSM models; stays 0/0 when there is none.
+    hicache_host_mamba_used_states: int = 0
+    hicache_host_mamba_total_states: int = 0
 
     # Streaming session metrics
     num_streaming_sessions: int = 0
@@ -644,6 +652,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.prealloc_full_token_usage = Gauge(
+            name="sglang:prealloc_full_token_usage",
+            documentation="Share of the full-attention KV pool held by decode requests whose KV transfer is pending (preallocated, not yet running); same capacity basis as sglang:full_token_usage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.prealloc_swa_token_usage = Gauge(
+            name="sglang:prealloc_swa_token_usage",
+            documentation="Share of the SWA KV pool held by decode requests whose KV transfer is pending; same capacity basis as sglang:swa_token_usage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.num_bootstrap_failed_reqs = Counter(
             name="sglang:num_bootstrap_failed_reqs_total",
             documentation="The number of bootstrap failed requests.",
@@ -756,6 +776,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self.hicache_host_total_tokens = Gauge(
                 name="sglang:hicache_host_total_tokens",
                 documentation="Total capacity of the host KV cache in tokens.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_mamba_used_states = Gauge(
+                name="sglang:hicache_host_mamba_used_states",
+                documentation="Number of state slots currently used in the host Mamba cache (hybrid-SSM models only).",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_mamba_total_states = Gauge(
+                name="sglang:hicache_host_mamba_total_states",
+                documentation="Total capacity of the host Mamba cache in state slots (hybrid-SSM models only).",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
@@ -1326,7 +1358,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     ) -> SchedulerMetricsCollectorContext:
         enable_metrics = get_observability().enable_metrics
         parallel = get_parallel()
-        is_stats_logging_rank = parallel.attn_tp_rank == 0
+        is_stats_logging_rank = (
+            parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0
+        )
         current_scheduler_metrics_enabled = enable_metrics and (
             is_stats_logging_rank
             or get_observability().enable_metrics_for_all_schedulers
@@ -1673,6 +1707,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
+        self._log_gauge(self.prealloc_full_token_usage, stats.prealloc_full_token_usage)
+        self._log_gauge(self.prealloc_swa_token_usage, stats.prealloc_swa_token_usage)
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)
@@ -1698,6 +1734,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+            # Non-hybrid models have no host Mamba pool; skip the series rather
+            # than exporting a permanent 0/0.
+            if stats.hicache_host_mamba_total_states > 0:
+                self._log_gauge(
+                    self.hicache_host_mamba_used_states,
+                    stats.hicache_host_mamba_used_states,
+                )
+                self._log_gauge(
+                    self.hicache_host_mamba_total_states,
+                    stats.hicache_host_mamba_total_states,
+                )
 
         # Streaming session metrics
         if self.enable_streaming_session:
@@ -1752,6 +1799,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.startup_available_gpu_memory_gb, startup_available_gpu_memory_gb
         )
+
+
+def tokenizer_metric_labels() -> Dict[str, str]:
+    """The labels on every ``TokenizerMetricsCollector`` metric. The priority
+    and custom labels start empty; each request fills them in."""
+    labels = {
+        "model_name": get_serving().served_model_name,
+        "engine_type": DisaggregationMode.to_engine_type(
+            get_disagg().disaggregation_mode
+        ),
+    }
+    if get_schedule().enable_priority_scheduling:
+        labels["priority"] = ""
+    for label in get_observability().tokenizer_metrics_allowed_custom_labels or ():
+        labels[label] = ""
+    if get_observability().extra_metric_labels:
+        labels.update(get_observability().extra_metric_labels)
+    return labels
 
 
 class TokenizerMetricsCollector(_StatLoggerDIMixin):

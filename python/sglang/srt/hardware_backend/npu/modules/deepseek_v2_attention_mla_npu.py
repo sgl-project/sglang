@@ -631,10 +631,11 @@ def npu_mla_preprocess(
         if (
             get_disagg().disaggregation_mode == "decode"
             and m.mla_preprocess.uses_mlaprolog()
+            and m.mla_preprocess.weight_quant_mode != 2
             and m.w_kc is not None
         ):
             m.w_kc.untyped_storage().resize_(0)
-    # mlaprolog does not require additional calculation of q_lora
+    # MLAProlog returns q_lora; BF16 indexers need it recomputed below.
     if m.mla_preprocess.uses_mlaprolog():
         (
             q_pe,
@@ -648,6 +649,19 @@ def npu_mla_preprocess(
         ) = m.mla_preprocess.forward(
             positions, hidden_states, forward_batch, zero_allocator
         )
+        if m.mla_preprocess.weight_quant_mode == 2 and m.indexer is not None:
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                NPUW8A8Int8DynamicLinearMethod,
+            )
+
+            if not isinstance(
+                getattr(m.indexer.wq_b.scheme, "kernel", None),
+                NPUW8A8Int8DynamicLinearMethod,
+            ):
+                # BF16 indexers need q_lora before INT8 quantization.
+                q = m.fused_qkv_a_proj_with_mqa(hidden_states)[0][..., : m.q_lora_rank]
+                q_lora = m.q_a_layernorm(q)
+                dynamic_scale = None
     else:
         if m.alt_stream is not None:
             mla_event = torch.npu.Event()

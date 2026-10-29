@@ -80,6 +80,9 @@ class QwenImage21EncodingStage(PipelineStage):
         )
         self.text_encoder.model.visual.fp32_position_interpolation = False
         self.text_encoder.model.visual.rotary_pos_emb.recompute_on_device_change = True
+        # (dtype, device) -> latent mean/std, uploaded once: a per-request upload
+        # blocks the host on the VAE encode it should overlap with prompt prep
+        self.latent_stats = {}
         self.image_token_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
         system_message = [
             {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]}
@@ -195,8 +198,13 @@ class QwenImage21EncodingStage(PipelineStage):
                     )
                     pixels = (2 * pixels - 1).to(device=device, dtype=torch.bfloat16)
                     latent = vae.encode(pixels).mode()
-                    mean = latent.new_tensor(ac.latents_mean).view(1, ac.z_dim, 1, 1, 1)
-                    std = latent.new_tensor(ac.latents_std).view(1, ac.z_dim, 1, 1, 1)
+                    stats_key = (latent.dtype, latent.device)
+                    if stats_key not in self.latent_stats:
+                        self.latent_stats[stats_key] = tuple(
+                            latent.new_tensor(values).view(1, ac.z_dim, 1, 1, 1)
+                            for values in (ac.latents_mean, ac.latents_std)
+                        )
+                    mean, std = self.latent_stats[stats_key]
                     conditions.append(
                         ((latent - mean) / std).flatten(2).transpose(1, 2)
                     )

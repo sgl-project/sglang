@@ -439,6 +439,96 @@ def try_fused_scaled_residual_bf16(
     return output
 
 
+@triton.jit
+def _scale_shift_fp32_rows_kernel(
+    x_ptr,
+    scale_ptr,
+    shift_ptr,
+    out_ptr,
+    L,
+    C,
+    scale_constant,
+    scale_stride_b,
+    shift_stride_b,
+    shift_stride_l,
+    BLOCK_L: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    pid_l = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    pid_b = tl.program_id(2)
+    offs_l = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask_c = offs_c < C
+    mask = (offs_l[:, None] < L) & mask_c[None, :]
+    row = pid_b.to(tl.int64) * L + offs_l
+    x = tl.load(x_ptr + row[:, None] * C + offs_c[None, :], mask=mask).to(tl.float32)
+    scale = tl.load(scale_ptr + pid_b * scale_stride_b + offs_c, mask=mask_c).to(
+        tl.float32
+    )
+    shift = tl.load(
+        shift_ptr
+        + pid_b.to(tl.int64) * shift_stride_b
+        + offs_l[:, None].to(tl.int64) * shift_stride_l
+        + offs_c[None, :],
+        mask=mask,
+    ).to(tl.float32)
+    out = x * (scale_constant + scale)[None, :] + shift
+    tl.store(
+        out_ptr + row[:, None] * C + offs_c[None, :],
+        out.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def _fuse_scale_shift_fp32_gfx1250(x, scale, shift, scale_constant):
+    """``x * (scale_constant + scale) + shift`` for bf16 ``x`` and an fp32
+    per-batch ``scale``, i.e. the case where the torch fallback computes every
+    intermediate in fp32. Same fp32 ops without FMA contraction and one final
+    rounding to ``x.dtype``: bit-identical to the fallback followed by
+    ``.to(x.dtype)``. Returns None for anything else."""
+    if x.dim() != 3 or scale.dtype != torch.float32:
+        return None
+    B, L, C = x.shape
+    if scale.dim() == 3 and scale.shape[1] == 1:
+        scale = scale.squeeze(1)
+    if scale.dim() != 2 or scale.shape != (B, C) or scale.stride(1) != 1:
+        return None
+    if shift.dim() == 2:
+        shift = shift.unsqueeze(1)
+    if (
+        shift.dim() != 3
+        or shift.shape[0] != B
+        or shift.shape[2] != C
+        or shift.shape[1] not in (1, L)
+        or shift.stride(2) != 1
+        or shift.dtype not in (torch.bfloat16, torch.float32)
+    ):
+        return None
+    out = torch.empty_like(x)
+    if x.numel() == 0:
+        return out
+    block_l, block_c = 16, 256
+    grid = (triton.cdiv(L, block_l), triton.cdiv(C, block_c), B)
+    _scale_shift_fp32_rows_kernel[grid](
+        x,
+        scale,
+        shift,
+        out,
+        L,
+        C,
+        float(scale_constant),
+        scale.stride(0),
+        shift.stride(0),
+        0 if shift.shape[1] == 1 else shift.stride(1),
+        BLOCK_L=block_l,
+        BLOCK_C=block_c,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    return out
+
+
 def fuse_scale_shift_kernel(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -451,6 +541,9 @@ def fuse_scale_shift_kernel(
     assert x.is_contiguous()
 
     if is_gfx1250_supported() and x.dtype is torch.bfloat16:
+        out = _fuse_scale_shift_fp32_gfx1250(x, scale, shift, scale_constant)
+        if out is not None:
+            return out
         return fuse_scale_shift_kernel_native(
             x, scale, shift, scale_constant, block_l, block_c
         )
@@ -557,6 +650,11 @@ def fuse_scale_shift_kernel(
                 output.copy_(x)
                 return output
 
+        # NVIDIA: rows of up to 1024 channels, 4096 elements per program, 1.5-1.65x
+        # the 128x128 tile on B300 from ~10M elements up (same bytes)
+        if x.is_cuda and not is_hip():
+            block_c = min(1024, triton.next_power_of_2(C))
+            block_l = max(1, 4096 // block_c)
         grid = (triton.cdiv(L, block_l), triton.cdiv(C, block_c), B)
         fuse_scale_shift_kernel_blc_opt[grid](
             x,

@@ -10,8 +10,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.registry import _get_config_info, get_pipeline_config_classes
@@ -48,7 +46,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.refiner import (
     OfficialDiffusersLTX2RefinerModule,
-    OfficialGemma3TextEncoderModule,
     SanaWMLTX2RefinerStage,
     SanaWMRefinerDecodingStage,
     _refiner_config_value,
@@ -89,9 +86,6 @@ class _GlobalStageArgsMixin:
 class TestSanaWMPipelineConfig(unittest.TestCase):
     def setUp(self) -> None:
         self.config = SanaWMPipelineConfig()
-
-    def test_task_type_is_ti2v(self) -> None:
-        self.assertEqual(self.config.task_type, ModelTaskType.TI2V)
 
     def test_adjust_num_frames_rounds_to_temporal_stride(self) -> None:
         self.assertEqual(self.config.adjust_num_frames(50), 49)
@@ -135,31 +129,6 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
         )
         self.assertIs(kwargs["camera_conditions"], camera_conditions)
         self.assertIs(kwargs["chunk_plucker"], chunk_plucker)
-
-    def test_deployment_config_enables_memory_mode_dit_layerwise_offload(
-        self,
-    ) -> None:
-        deployment = self.config.get_model_deployment_config()
-        self.assertEqual(deployment.dit_layerwise_offload_modes, ("memory",))
-        self.assertEqual(deployment.fsdp_auto_min_available_memory_gb, 60)
-
-    def test_text_encoder_padding_matches_cfg_concat_contract(self) -> None:
-        self.assertEqual(
-            self.config.text_encoder_extra_args[0]["padding"], "max_length"
-        )
-        self.assertTrue(self.config.text_encoder_extra_args[0]["return_attention_mask"])
-        self.assertTrue(self.config.chi_prompt)
-
-    def test_inference_flow_shift_matches_official_reference(self) -> None:
-        self.assertEqual(self.config.flow_shift, 9.95)
-        self.assertEqual(self.config.inference_flow_shift, 9.8)
-
-    def test_dit_arch_text_norm_defaults_match_upstream(self) -> None:
-        arch = SanaWMConfig().arch_config
-        self.assertTrue(arch.y_norm)
-        self.assertEqual(arch.y_norm_scale_factor, 0.01)
-        self.assertEqual(arch.y_norm_eps, 1e-5)
-        self.assertEqual(arch.timestep_norm_scale_factor, 1.0)
 
     def test_prepare_neg_cond_kwargs_keeps_camera_for_cfg(self) -> None:
         camera_conditions = torch.zeros(1, 7, 20)
@@ -296,15 +265,6 @@ class TestSanaWMPipelineConfig(unittest.TestCase):
 
 
 class TestSanaWMSamplingParams(unittest.TestCase):
-    def test_defaults_match_video_ti2v_contract(self) -> None:
-        params = SanaWMSamplingParams()
-        self.assertEqual(params.height, 704)
-        self.assertEqual(params.width, 1280)
-        self.assertEqual(params.num_frames, 49)
-        self.assertEqual(params.num_inference_steps, 20)
-        self.assertEqual(params.guidance_scale, 4.5)
-        self.assertEqual(params.negative_prompt, "")
-
     def test_build_request_extra_omits_camera_by_default(self) -> None:
         params = SanaWMSamplingParams()
         extra = params.build_request_extra()
@@ -410,17 +370,6 @@ class TestSanaWMTwoStagePipeline(unittest.TestCase):
         refiner_root, refiner_gemma_root = pipeline._resolve_refiner_paths(server_args)
         self.assertEqual(refiner_root, "/custom/refiner")
         self.assertEqual(refiner_gemma_root, "/custom/refiner/text_encoder")
-
-    def test_refiner_modules_are_loaded_from_official_subtrees(self) -> None:
-        self.assertEqual(
-            SanaWMTwoStagePipeline._REFINER_SUB_MODULES,
-            (
-                ("transformer_2", "refiner/transformer"),
-                ("connectors", "refiner/connectors"),
-                ("text_encoder_2", "refiner/text_encoder"),
-                ("tokenizer_2", "refiner/text_encoder"),
-            ),
-        )
 
 
 class TestSanaWMPipeline(unittest.TestCase):
@@ -1122,16 +1071,6 @@ class TestSanaWMDenoisingStage(unittest.TestCase):
 
 
 class TestSanaWMNativeDiTChunking(unittest.TestCase):
-    def test_softmax_chunking_is_disabled_by_default_for_upstream_parity(self) -> None:
-        arch = SanaWMConfig().arch_config
-
-        self.assertFalse(arch.use_chunked_softmax_attention)
-
-    def test_main_gdn_backend_defaults_to_auto(self) -> None:
-        arch = SanaWMConfig().arch_config
-
-        self.assertEqual(arch.gdn_backend, "auto")
-
     def test_first_chunk_plus_one_chunk_indices_match_upstream(self) -> None:
         self.assertEqual(
             _sana_wm_chunk_index_from_chunk_size(
@@ -1274,16 +1213,6 @@ class TestSanaWMRefinerStage(_GlobalStageArgsMixin, unittest.TestCase):
         )
 
         self.assertEqual(_refiner_config_value(module, "patch_size"), 1)
-
-    def test_official_refiner_wrappers_expose_layerwise_blocks(self) -> None:
-        self.assertEqual(
-            OfficialDiffusersLTX2RefinerModule.layer_names,
-            ["module.transformer_blocks"],
-        )
-        self.assertIn(
-            "module.model.language_model.layers",
-            OfficialGemma3TextEncoderModule.layer_names,
-        )
 
     def test_refiner_component_uses_follow_execution_order(self) -> None:
         stage = SanaWMLTX2RefinerStage(

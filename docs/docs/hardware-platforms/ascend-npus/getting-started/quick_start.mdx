@@ -23,7 +23,7 @@ For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/as
 
 Ensure Docker is installed and the Docker daemon is running on your host machine. Verify with:
 
-```bash
+```shell Command
 docker --version && docker info
 ```
 
@@ -40,10 +40,7 @@ at least **30GB** of free space. If you need to download model weights, check th
 
 <Tip>
 We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version,
-or a daily build tag (e.g., `main-cann9.1.0-a3`) if you need the latest development changes. CANN 9.1.0 has no stable
-image yet, so use the daily build tag for now.
-
-{/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag. */}
+or a daily build tag (e.g., `main-cann9.1.0-a3`) if you need the latest development changes.
 </Tip>
 
 If you have already downloaded model weights to a local path (e.g., `/path/to/model`), mount the path into the container by
@@ -53,10 +50,7 @@ adding `--volume /path/to/model:/path/to/model` to the `docker run` command belo
   <Tab title="Ascend A3 Series">
 
 ```shell Command
-# TODO: CANN 9.1.0 has no stable image yet, so only the daily build tag is
-# available for now. Once the stable image is published, restore the stable
-# release option here.
-export IMAGE=quay.io/ascend/sglang:main-cann9.1.0-a3
+export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -135,7 +129,7 @@ SGLANG_PID=$(pgrep -f "sglang serve")
 kill -SIGINT $SGLANG_PID
 ```
 
-Wait a moment for the server to shut down gracefully. The output should be like the following:
+Wait a few seconds for the server to shut down gracefully. The output should be like the following:
 
 ```log Output
 INFO:     Shutting down

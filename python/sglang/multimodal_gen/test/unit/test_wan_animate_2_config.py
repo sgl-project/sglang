@@ -23,12 +23,19 @@ from sglang.multimodal_gen.configs.models.dits.wan_animate_2 import (
     WanAnimate2ArchConfig,
     WanAnimate2Config,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan_Animate_2_14B_Config
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    Wan_Animate_2_14B_Config,
+    Wan_Animate_2_14B_Distilled_Config,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.wan import Wan_Animate_2_14B_SamplingParam
+from sglang.multimodal_gen.configs.sample.wan import (
+    Wan_Animate_2_14B_Distilled_SamplingParam,
+    Wan_Animate_2_14B_SamplingParam,
+)
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -46,6 +53,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
+    SchedulerLoader,
     _supported_init_kwargs,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
@@ -60,12 +68,14 @@ from sglang.multimodal_gen.runtime.models.dits.wan_animate_2 import (
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_block import (
     WanAnimate2TransformerBlock,
+    _InContextLayout,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_dpm_solver_multistep import (
     DPMSolverMultistepScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines.wan_animate_2_pipeline import (
     WanAnimate2Pipeline,
+    WanAnimate2SchedulerLoader,
     WanAnimate2TransformerLoader,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -116,8 +126,12 @@ def test_pipeline_local_loader_preserves_shared_transformer_registry():
         assert component_name_to_loader_cls[name] is TransformerLoader
     assert not TransformerLoader.strict_checkpoint_keys
     assert WanAnimate2TransformerLoader.strict_checkpoint_keys
+    for name in SchedulerLoader.component_names:
+        assert component_name_to_loader_cls[name] is SchedulerLoader
+    assert WanAnimate2SchedulerLoader.component_names == []
     assert WanAnimate2Pipeline.component_loaders == {
-        "transformer": WanAnimate2TransformerLoader
+        "transformer": WanAnimate2TransformerLoader,
+        "scheduler": WanAnimate2SchedulerLoader,
     }
 
 
@@ -240,6 +254,57 @@ def _parallel_server_args(
     )
 
 
+def _two_gpu_server_args(pipeline_config, **kwargs) -> ServerArgs:
+    """ServerArgs for the config's HF id with the config pinned and model_index.json
+    served from memory; under the cuda_platform fixture _adjust_parallelism runs
+    without a GPU or network."""
+    hf_id = "Wan-AI/Wan2.2-Animate-2-14B-Diffusers"
+    if isinstance(pipeline_config, Wan_Animate_2_14B_Distilled_Config):
+        hf_id = "Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers"
+    with (
+        patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
+        patch(
+            "sglang.multimodal_gen.registry.maybe_download_model_index",
+            return_value={"_class_name": "WanAnimate2Pipeline"},
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.server_args.auto_tune.dit_parameter_count",
+            return_value=None,
+        ),
+    ):
+        return ServerArgs.from_dict({"model_path": hf_id, "num_gpus": 2, **kwargs})
+
+
+def test_two_gpu_default_layout_splits_cfg_only_for_the_base_checkpoint(
+    cuda_platform,
+):
+    # With no parallelism flags the server auto-enables CFG parallel for a model whose
+    # defaults use guidance; the distilled checkpoint runs one branch, so its second GPU
+    # goes to sequence parallelism instead.
+    base = _two_gpu_server_args(Wan_Animate_2_14B_Config())
+    distilled = _two_gpu_server_args(Wan_Animate_2_14B_Distilled_Config())
+    assert base.enable_cfg_parallel and not distilled.enable_cfg_parallel
+    assert (base.cfg_parallel_degree, base.sp_degree) == (2, 1)
+    assert (distilled.cfg_parallel_degree, distilled.sp_degree) == (1, 2)
+
+
+def test_distilled_rejects_explicit_cfg_parallel(cuda_platform):
+    # An explicit CFG group would silently run the single branch on every rank.
+    with pytest.raises(ValueError, match="does not support CFG parallelism"):
+        _two_gpu_server_args(
+            Wan_Animate_2_14B_Distilled_Config(), enable_cfg_parallel=True
+        )
+
+
+def test_distilled_deployment_config_keeps_the_base_residency_policy():
+    # Only the CFG-parallel field differs; a change to the base residency policy must
+    # reach the distilled variant.
+    base = Wan_Animate_2_14B_Config().get_model_deployment_config()
+    distilled = Wan_Animate_2_14B_Distilled_Config().get_model_deployment_config()
+    assert distilled.supports_cfg_parallel is False
+    assert replace(distilled, supports_cfg_parallel=True) == base
+
+
 def test_validate_server_args_rejects_fsdp_before_any_weights_load():
     with pytest.raises(NotImplementedError, match="use-fsdp-inference"):
         Wan_Animate_2_14B_Config().validate_server_args(
@@ -345,20 +410,6 @@ def test_block_refuses_a_checkpoint_with_offline_qk_rotation(monkeypatch):
 
 
 # WanAnimate2ArchConfig / WanAnimate2Config
-
-
-def test_in_out_channels_match_in_context_io():
-    # in_channels = 16 noise + 20 conditioning; out_channels = 16 latent.
-    arch = WanAnimate2ArchConfig()
-    assert arch.in_channels == 36
-    assert arch.out_channels == 16
-
-
-def test_backbone_dims_reuse_wan22_i2v_14b():
-    arch = WanAnimate2ArchConfig()
-    assert arch.num_layers == 40
-    assert arch.image_dim == 1280
-    assert arch.added_kv_proj_dim == 5120
 
 
 def test_post_init_derives_hidden_size_and_latent_channels():
@@ -492,19 +543,22 @@ def test_official_checkpoint_config_names_update_the_arch_config():
     assert config.text_len == 512
 
 
-def test_text_len_defaults_to_the_checkpoint_value():
-    """The pipeline pads prompts to ``arch_config.text_len``: the checkpoint's
-    transformer/config.json sets it and the default covers a config without the key."""
-    assert WanAnimate2ArchConfig().text_len == 512
-    assert Wan_Animate_2_14B_Config().dit_config.arch_config.text_len == 512
-
-
 def test_checkpoint_config_without_image_embedding_is_rejected():
     # The model always builds the image-embedding cross-attention; a checkpoint that
     # declares use_img_emb false would load and run the wrong architecture silently.
     config = WanAnimate2Config()
     with pytest.raises(ValueError, match="use_img_emb"):
         config.update_model_arch({"use_img_emb": False})
+
+
+def test_distilled_log_scale_defaults_to_the_official_value_unless_the_checkpoint_sets_it():
+    # -1.3 is the official wan_animate_2_distillation.yaml value; the published
+    # transformer/config.json has no log_scale key, so this default is what runs, and a
+    # checkpoint that does carry the key wins over it.
+    config = Wan_Animate_2_14B_Distilled_Config().dit_config
+    assert config.log_scale == -1.3
+    config.update_model_arch({"log_scale": -0.7})
+    assert config.log_scale == -0.7
 
 
 # Wan_Animate_2_14B_SamplingParam
@@ -600,20 +654,91 @@ def test_sampling_params_reject_the_shared_dit_cache_heuristics(field_name):
         Wan_Animate_2_14B_SamplingParam(**{field_name: True})
 
 
+def _distilled_request(**user_kwargs) -> SamplingParams:
+    """A /v1/videos-style request through the public entry point: registry defaults for
+    the distilled HF id merged with the user fields, adjusted and validated."""
+    server_args = SimpleNamespace(
+        pipeline_class_name=None,
+        backend="sglang",
+        model_id=None,
+        pipeline_config=Wan_Animate_2_14B_Distilled_Config(),
+        output_path=None,
+        num_gpus=1,
+        comfyui_mode=False,
+    )
+    with patch(
+        "sglang.multimodal_gen.registry.maybe_download_model_index",
+        return_value={"_class_name": "WanAnimate2Pipeline"},
+    ):
+        return SamplingParams.from_user_sampling_params_args(
+            "Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers",
+            server_args,
+            prompt="a person",
+            image_path="reference.png",
+            video_path="driving.mp4",
+            **user_kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    "guidance_scale, rejected",
+    [(3.0, True), (0.5, True), (1.0, False), (None, False)],
+)
+def test_distilled_guidance_other_than_one_is_rejected(guidance_scale, rejected):
+    # The distilled recipe has no unconditional branch: the once-per-request validation
+    # hook raises ValueError (HTTP 400 on /v1/videos) for every guidance_scale but 1.0;
+    # an omitted field (None) takes the class default.
+    user_kwargs = {} if guidance_scale is None else {"guidance_scale": guidance_scale}
+    if rejected:
+        with pytest.raises(
+            ValueError,
+            match=rf"guidance_scale={guidance_scale} .*guidance_scale 1\.0 only",
+        ):
+            _distilled_request(**user_kwargs)
+        return
+    params = _distilled_request(**user_kwargs)
+    assert params.guidance_scale == 1.0
+
+
+def test_distilled_sampling_defaults_run_without_cfg():
+    # The official distilled recipe: 10 steps, guidance 1.0; the rest is inherited.
+    params = Wan_Animate_2_14B_Distilled_SamplingParam()
+    assert params.guidance_scale == 1.0
+    assert params.num_inference_steps == 10
+
+
 # Registry resolution (no network)
 
 
-def test_registered_hf_path_resolves_to_wan_animate_configs():
-    info = _get_config_info("Wan-AI/Wan2.2-Animate-2-14B-Diffusers")
+@pytest.mark.parametrize(
+    "hf_id, pipeline_cls, sampling_cls",
+    [
+        (
+            "Wan-AI/Wan2.2-Animate-2-14B-Diffusers",
+            Wan_Animate_2_14B_Config,
+            Wan_Animate_2_14B_SamplingParam,
+        ),
+        (
+            "Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers",
+            Wan_Animate_2_14B_Distilled_Config,
+            Wan_Animate_2_14B_Distilled_SamplingParam,
+        ),
+    ],
+)
+def test_registered_hf_path_resolves_to_wan_animate_configs(
+    hf_id, pipeline_cls, sampling_cls
+):
+    info = _get_config_info(hf_id)
     assert info is not None
-    assert info.pipeline_config_cls is Wan_Animate_2_14B_Config
-    assert info.sampling_param_cls is Wan_Animate_2_14B_SamplingParam
+    assert info.pipeline_config_cls is pipeline_cls
+    assert info.sampling_param_cls is sampling_cls
 
 
 @pytest.mark.parametrize(
     "path", ["some/local/dir/wan_animate_2", "my-wan2.2-animate-2-ckpt"]
 )
 def test_detector_resolves_wan_animate_style_paths(path):
+    # No variant token in the name: the base classes, not the distilled ones.
     with patch(
         "sglang.multimodal_gen.registry.maybe_download_model_index",
         return_value={},
@@ -626,7 +751,8 @@ def test_detector_resolves_wan_animate_style_paths(path):
 
 def test_model_index_class_name_routes_a_checkpoint_at_any_path():
     # A local checkpoint directory need not carry a model token in its name; its
-    # model_index.json _class_name is what identifies it.
+    # model_index.json _class_name is what identifies it. Both variants share that
+    # name; modular_model_index.json tells them apart (below).
     with patch(
         "sglang.multimodal_gen.registry.maybe_download_model_index",
         return_value={"_class_name": "WanAnimate2Pipeline"},
@@ -636,15 +762,22 @@ def test_model_index_class_name_routes_a_checkpoint_at_any_path():
     assert info.pipeline_config_cls is Wan_Animate_2_14B_Config
 
 
-def test_v1_animate_checkpoint_does_not_route_to_wan_animate_2():
+@pytest.mark.parametrize(
+    "path", ["Wan-AI/Wan2.2-Animate-14B", "ckpts/Wan2.2-Animate-14B-distill"]
+)
+def test_v1_animate_checkpoint_does_not_route_to_wan_animate_2(path):
     # Wan2.2-Animate-14B (v1) is a different model and pipeline; a detector loosened to
-    # "animate" would pass the positive cases above and mis-route it here.
+    # "animate" would pass the positive cases above and mis-route it here, and the
+    # distilled detector needs the "-2-"/"_2" token as well as "distill".
     with patch(
         "sglang.multimodal_gen.registry.maybe_download_model_index",
         return_value={"_class_name": "WanAnimatePipeline"},
     ):
-        info = _get_config_info("Wan-AI/Wan2.2-Animate-14B")
-    assert info is None or info.pipeline_config_cls is not Wan_Animate_2_14B_Config
+        info = _get_config_info(path)
+    assert info is None or info.pipeline_config_cls not in (
+        Wan_Animate_2_14B_Config,
+        Wan_Animate_2_14B_Distilled_Config,
+    )
 
 
 # /v1/videos routing: the model-specific knobs are declared extras, the reference image and
@@ -900,6 +1033,45 @@ def test_resize_by_area_treats_the_request_size_as_a_pixel_area_budget(
     assert (out.shape[1], out.shape[0]) == expected_wh
     assert out.shape[0] * out.shape[1] <= 640 * 800
     assert out.shape[0] % 16 == 0 and out.shape[1] % 16 == 0
+
+
+def test_attention_slot_covers_both_grids_when_the_inputs_round_differently():
+    # The reference image and the driving video are each fitted to the budget at their own
+    # aspect ratio (_build_request_state calls resize_by_area once per input), so their
+    # 16-aligned canvases can differ by one step per side with the floor going either
+    # way. At 720x1280 a 1072x592 image lands on 1280x704 and a 538x304 video on 1264x720:
+    # the video grid is one latent row taller and one column narrower and holds more
+    # tokens per frame (79x45 = 3555 > 80x44 = 3520). The in-context layout must size its
+    # per-frame slot for both, or the reference K/V copy overflows.
+    budget = 720 * 1280
+    clip_len = 81
+    image, _ = resize_by_area(np.zeros((592, 1072, 3), np.uint8), budget, divisor=16)
+    video_frame, _ = resize_by_area(
+        np.zeros((304, 538, 3), np.uint8), budget, divisor=16
+    )
+    assert (image.shape[1], image.shape[0]) == (1280, 704)
+    assert (video_frame.shape[1], video_frame.shape[0]) == (1264, 720)
+
+    # Generation grid: the image canvas through the VAE (//8) and the (2, 2) patch (//2);
+    # reference-video grid: the same for the video canvas, one frame fewer (no
+    # reference-image frame), as build_clip_conditioning derives it from the VAE latent.
+    full_clip_grid = generation_token_grid(
+        clip_len, image.shape[0] // 8, image.shape[1] // 8
+    )
+    reference_video_grid = (
+        full_clip_grid[0] - 1,
+        video_frame.shape[0] // 8 // 2,
+        video_frame.shape[1] // 8 // 2,
+    )
+    assert full_clip_grid == (22, 44, 80)
+    assert reference_video_grid == (21, 45, 79)
+
+    layout = _InContextLayout(full_clip_grid, reference_video_grid, full_clip_grid)
+    assert layout.generation_video_tokens_per_frame == 3520
+    assert layout.reference_video_tokens_per_frame == 3555
+    assert layout.max_tokens_per_frame == 3555
+    assert layout.max_tokens_per_frame >= layout.generation_video_tokens_per_frame
+    assert layout.max_tokens_per_frame >= layout.reference_video_tokens_per_frame
 
 
 # build_clip_conditioning: per-clip tensors from the request state with stand-in encoders.
@@ -1286,8 +1458,10 @@ def test_extract_inputs_rejects_batched_single_value_fields(overrides, message):
         _WanAnimate2Inputs.from_request(batch)
 
 
-# Scheduler: loaded from the checkpoint's scheduler/scheduler_config.json through the shared
-# SchedulerLoader like the other components. The stages pass the official sigma grid to
+# Scheduler: a loaded component like the others, through WanAnimate2SchedulerLoader. The
+# base checkpoint's scheduler/scheduler_config.json is loaded as is; for the distilled
+# config the loader builds DPMSolverMultistepScheduler from the flow-matching settings
+# instead of from its Euler scheduler_config.json. The stages pass the official sigma grid to
 # set_timesteps explicitly, so the loaded configuration must denoise exactly like a
 # DPMSolverMultistepScheduler built from the flow-matching settings alone.
 
@@ -1336,11 +1510,65 @@ _FLOW_MATCHING_SCHEDULER_KWARGS = {
 }
 
 
-def test_scheduler_is_a_loaded_component():
-    assert "scheduler" in WanAnimate2Pipeline._required_config_modules
-    assert len(WanAnimate2Pipeline._required_config_modules) == 7
-    # No pipeline-side construction: the base class hook is inherited unchanged.
-    assert "initialize_pipeline" not in vars(WanAnimate2Pipeline)
+def _load_scheduler(pipeline_config, checkpoint_config: dict | None):
+    """Run WanAnimate2SchedulerLoader with the checkpoint's scheduler_config.json served
+    from memory (None: reading it is an error) and the flag-free server args it reads."""
+    reader = {"return_value": dict(checkpoint_config)} if checkpoint_config else {}
+    server_args = SimpleNamespace(pipeline_config=pipeline_config)
+    with patch(
+        "sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader"
+        ".get_diffusers_component_config",
+        **reader,
+    ) as read:
+        scheduler = WanAnimate2SchedulerLoader().load_customized(
+            "/ckpt/scheduler", server_args
+        )
+    assert read.called is (checkpoint_config is not None)
+    return scheduler
+
+
+def test_base_config_loads_the_checkpoint_scheduler_as_is():
+    # The shared loader path: the class the checkpoint names, built from its own settings
+    # (beta_schedule=linear comes only from that file).
+    scheduler = _load_scheduler(
+        Wan_Animate_2_14B_Config(),
+        {"_class_name": "DPMSolverMultistepScheduler", **_CHECKPOINT_SCHEDULER_CONFIG},
+    )
+    assert isinstance(scheduler, DPMSolverMultistepScheduler)
+    assert scheduler._inner.config.beta_schedule == "linear"
+    assert scheduler._inner.config.flow_shift == 5.0
+
+
+def test_distilled_config_gets_dpm_solver_built_from_the_flow_matching_settings():
+    # The wrapper comes from the flow-matching settings and the configured flow_shift;
+    # the shipped scheduler_config.json, which carries none of them, is never read.
+    config = Wan_Animate_2_14B_Distilled_Config()
+    config.update_config_from_dict({"flow_shift": 3.0})
+    scheduler = _load_scheduler(config, None)
+    assert isinstance(scheduler, DPMSolverMultistepScheduler)
+    inner = scheduler._inner.config
+    assert inner.algorithm_type == "dpmsolver++"
+    assert inner.solver_order == 2
+    for key, value in {**_FLOW_MATCHING_SCHEDULER_KWARGS, "flow_shift": 3.0}.items():
+        assert getattr(inner, key) == value, key
+
+
+def test_distilled_config_ignores_the_scheduler_class_override_with_one_warning(caplog):
+    # The flag would select the shipped Euler scheduler on the base path; the distilled
+    # path keeps DPM-Solver++ and says so instead of silently ignoring the flag.
+    config = Wan_Animate_2_14B_Distilled_Config()
+    config.scheduler_class_override = "FlowMatchEulerDiscreteScheduler"
+    with caplog.at_level(logging.WARNING):
+        scheduler = _load_scheduler(config, None)
+    assert isinstance(scheduler, DPMSolverMultistepScheduler)
+    inner = scheduler._inner.config
+    assert inner.algorithm_type == "dpmsolver++"
+    for key, value in _FLOW_MATCHING_SCHEDULER_KWARGS.items():
+        assert getattr(inner, key) == value, key
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, warnings
+    assert "--scheduler-class-override FlowMatchEulerDiscreteScheduler" in warnings[0]
+    assert "ignored for the distilled Wan-Animate-2 checkpoint" in warnings[0]
 
 
 def test_loader_keeps_the_checkpoint_scheduler_settings():

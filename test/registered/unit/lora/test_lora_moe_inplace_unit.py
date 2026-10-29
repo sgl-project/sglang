@@ -74,7 +74,7 @@ class FusedMoEWithLoRAInplaceTest(unittest.TestCase):
         from sglang.srt.lora.layers import FusedMoEWithLoRA
 
         base_layer = _make_base_layer(quant_method)
-        lora_backend = types.SimpleNamespace()
+        lora_backend = types.SimpleNamespace(name="triton")
         self.assertTrue(base_layer.moe_runner_config.inplace)
         layer = FusedMoEWithLoRA(base_layer, lora_backend)
         return layer, base_layer

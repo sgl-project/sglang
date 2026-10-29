@@ -39,6 +39,7 @@ from torch import nn
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import (
@@ -360,7 +361,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                     if (
                         deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                         and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
-                        and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
+                        and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                     ):
                         block_scale = weight_scale
                         use_deep_gemm_bmm = True

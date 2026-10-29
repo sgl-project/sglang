@@ -5,19 +5,26 @@ Ported from the official repository (``modeling_hunyuan_image_3.py``).
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 
-def timestep_embedding(t, dim, max_period=10000):
-    half = dim // 2
-    freqs = torch.exp(
+@lru_cache(maxsize=8)
+def _timestep_freqs(half, max_period, device):
+    # host-built as in the reference, uploaded once per device
+    return torch.exp(
         -math.log(max_period)
         * torch.arange(start=0, end=half, dtype=torch.float32)
         / half
-    ).to(device=t.device)
+    ).to(device=device)
+
+
+def timestep_embedding(t, dim, max_period=10000):
+    half = dim // 2
+    freqs = _timestep_freqs(half, max_period, t.device)
     args = t[:, None].float() * freqs[None]
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
     if dim % 2:

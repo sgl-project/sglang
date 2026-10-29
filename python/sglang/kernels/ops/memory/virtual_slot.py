@@ -28,7 +28,7 @@ import triton.language as tl
 # `.item()`, no tensor branching); runs on the scheduler thread.
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["v_pages_ptr"])
 def alloc_bind_inplace_kernel(
     v_pages_ptr,  # in: [N] int64 — virtual page ids
     v2p_ptr,  # in/out: int64 — virtual_to_physical table
@@ -126,7 +126,7 @@ def free_unbind_inplace_kernel(
     tl.store(p2v_ptr + p, -1, mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["v_pages_ptr", "p_pages_ptr"])
 def bind_inplace_kernel(
     v_pages_ptr,  # in: [N] int64 — virtual page ids
     p_pages_ptr,  # in: [N] int64 — physical page ids to bind them to

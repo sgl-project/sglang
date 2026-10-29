@@ -91,5 +91,35 @@ def test_empty_mhc_view_clears_idle_dispatch() -> None:
     torch.testing.assert_close(buf_weights, torch.zeros_like(buf_weights))
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="Requires Blackwell GPU (sm_100+)",
+)
+@pytest.mark.parametrize("scale", [1.0, 2.5, 1.0 / 3.0])
+def test_topk_weight_scale_matches_torch_multiply(scale: float) -> None:
+    torch.manual_seed(7)
+    num_tokens, padded_max, hidden, top_k = 198, 256, 5120, 6
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    topk_idx = torch.randint(0, 384, (num_tokens, top_k), device="cuda").int()
+    topk_weights = torch.rand(num_tokens, top_k, device="cuda", dtype=torch.float32)
+    buf_x = torch.empty(padded_max, hidden, device="cuda", dtype=torch.float8_e4m3fn)
+    buf_x_sf = torch.empty(padded_max, hidden // 128, device="cuda", dtype=torch.int32)
+    buf_idx = torch.empty(padded_max, top_k, device="cuda", dtype=torch.int64)
+    buf_weights = torch.empty(padded_max, top_k, device="cuda", dtype=torch.float32)
+    mega_moe_pre_dispatch(
+        x,
+        topk_idx,
+        topk_weights,
+        buf_x,
+        buf_x_sf,
+        buf_idx,
+        buf_weights,
+        topk_weight_scale=scale,
+    )
+    expected = topk_weights * scale
+    assert torch.equal(buf_weights[:num_tokens], expected)
+    assert torch.all(buf_weights[num_tokens:] == 0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

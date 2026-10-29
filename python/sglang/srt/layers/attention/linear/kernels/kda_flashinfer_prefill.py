@@ -77,9 +77,13 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     def __init__(self):
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             raise ValueError("FlashInfer KDA prefill requires SM100 or SM103")
-        from flashinfer.kda import recurrent_kda
+        from flashinfer import kda
 
-        self._recurrent_kda = recurrent_kda
+        self._recurrent_kda = kda.recurrent_kda
+        # Older FlashInfer installations retain the eager BCG break.
+        self.prefill_graph_wrapper_cls = getattr(
+            kda, "RecurrentKDAPrefillWrapper", None
+        )
 
     def decode(self, *args, **kwargs):
         raise NotImplementedError("FlashInferKDAPrefillKernel is prefill-only")
@@ -121,7 +125,9 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             g=g[:, : q.shape[1]].contiguous(),
             beta=beta[:, : q.shape[1]].contiguous(),
             A_log=A_log.reshape(-1).float().contiguous(),
-            dt_bias=dt_bias.reshape(q.shape[2], 128).float().contiguous(),
+            # FlashInfer's grouped-CTA recurrent kernel (extends with a cached prefix)
+            # indexes dt_bias as a flat [H*K] tensor and asserts a unit leading stride.
+            dt_bias=dt_bias.reshape(-1).float().contiguous(),
             initial_state=ssm_states,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,

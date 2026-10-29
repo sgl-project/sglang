@@ -106,7 +106,7 @@ The Triton selector and state kernels live in `sglang/kernels/ops/sampling/texts
 
 Default-on and enforce-all modes require a server key. A server key without either mode remains available only to requests that opt in.
 
-Use a regular config file readable only by the server account for keys; inline JSON is visible in the process command line. Launch-command, request-log, server-info, and crash-payload rendering redacts key fields and the `--watermark-config` value. Process command lines, client request bodies, and process or GPU core dumps remain separate secret-bearing surfaces.
+Use a regular config file readable only by the server account for keys; inline JSON is visible in the process command line. Launch-command, server-info, and crash-payload rendering redacts key fields and the `--watermark-config` value. Request logs redact watermark keys only when `--enable-watermark` is set. Process command lines, client request bodies, and process or GPU core dumps remain separate secret-bearing surfaces.
 
 ## Per-request control
 

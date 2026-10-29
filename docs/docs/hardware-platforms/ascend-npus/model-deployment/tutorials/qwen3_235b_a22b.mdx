@@ -34,7 +34,7 @@ by this document and may introduce breaking changes.
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 \`<br/>`--speculative-draft-model-path /path/to/draft-model-weights \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
-| Context Parallelism           | `--enable-prefill-cp \`<br/>`--attn-cp-size 2 \`<br/>`--moe-dp-size 2`          |
+| Context Parallelism           | `--enable-prefill-cp \`<br/>`--cp-strategy zigzag \`<br/>`--attn-cp-size 2 \`<br/>`--moe-dp-size 2`          |
 
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
@@ -94,6 +94,7 @@ online platform. You can directly pull it.
 The following command is based on the stable release tag `v0.5.18-cann9.0.0-a3`.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
+{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 
@@ -266,6 +267,7 @@ PD disaggregation is required. The following command is based on the **W8A8** qu
 
 <Warning>
 **Constraints:**
+- `--cp-strategy` is required when `--enable-prefill-cp` is enabled (e.g., `--cp-strategy zigzag`)
 - Prefill side must set `--max-running-requests 1` (PCP only supports batch_size=1)
 - `--attn-cp-size` must evenly divide `--tp-size`; each CP rank occupies `tp_size / cp_size` NPUs
 </Warning>
@@ -298,6 +300,7 @@ python3 -m sglang.launch_server \
     --base-gpu-id 0 \
     --tp-size 16 \
     --enable-prefill-cp \
+    --cp-strategy zigzag \
     --attn-cp-size 2 \
     --moe-dp-size 2 \
     --max-running-requests 1 \
@@ -313,6 +316,7 @@ Key parameters for PCP:
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | `--enable-prefill-cp` | flag | Enable PCP feature |
+| `--cp-strategy` | zigzag | Context sharding layout (required with `--enable-prefill-cp`) |
 | `--attn-cp-size` | 2 | Split context across 2 CP ranks (each rank handles half the sequence) |
 | `--moe-dp-size` | 2 | MoE DP size, should match `--attn-cp-size` |
 | `--max-running-requests` | 1 | Required by PCP (batch_size=1 constraint) |
@@ -353,9 +357,29 @@ python3 -m sglang.launch_server \
     --dist-init-addr <DECODE_HOST_IP>:6688
 ```
 
+3. Launch the SGLang Router (on any reachable node):
+
+```bash Router
+#============================================================
+# Before running, update the following variables:
+#   PREFILL_HOST_IP: prefill node IP address
+#   DECODE_HOST_IP: decode node IP address
+#   ROUTER_HOST_IP: router node IP address
+#============================================================
+
+python3 -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://<PREFILL_HOST_IP>:8000 8995 \
+    --decode http://<DECODE_HOST_IP>:8001 \
+    --host <ROUTER_HOST_IP> \
+    --port 6689
+```
+
 <Tip>
 `ASCEND_MF_STORE_URL` on both nodes must point to the same KV store (typically the prefill node IP).
-`ASCEND_USE_FIA=True` enables fast interconnect aggregation for KV transfer.
+`ASCEND_USE_FIA=True` switches the Ascend attention backend to the FIA path, which PCP prefill
+attention requires (the non-FIA CP path is not implemented).
 PCP is a prefill-only feature; the decode side needs no CP-related flags.
 </Tip>
 

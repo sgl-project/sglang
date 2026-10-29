@@ -2,9 +2,10 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 import unittest
+from unittest.mock import Mock
 
 import torch
 
@@ -13,7 +14,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    BaseMultiModalProcessorOutput,
+)
 
 
 class _StubProcessor(BaseMultimodalProcessor):
@@ -42,6 +46,24 @@ class TestPrecomputedEmbeddingValidation(unittest.TestCase):
             mm_items=items,
         )
         return self.processor.get_validated_mm_data([], embeddings)
+
+    def test_precomputed_input_preserves_caller_hash_and_offsets(self):
+        payload = {
+            "format": "precomputed_embedding",
+            "feature": torch.zeros(2, 4),
+            "offsets": [(1, 2)],
+            "hash": 123,
+        }
+        self.processor.use_cuda_ipc = False
+        self.processor._resolve_processor = Mock(return_value=(None, None))
+        items, _, _ = self.processor.process_and_combine_mm_data(
+            BaseMultiModalProcessorOutput(
+                input_text="", input_ids=[7, 99, 99, 8], images=[payload]
+            ),
+            None,
+        )
+        self.assertEqual(items[0].hash, payload["hash"])
+        self.assertEqual(items[0].offsets, payload["offsets"])
 
     def test_accepts_exact_multi_item_layout(self):
         image_embedding = torch.zeros(5, 4)

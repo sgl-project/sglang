@@ -27,8 +27,8 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
 
 | Impl | Prefill | Decode | CG decode | Hardware gate (test box: H200 SM9.0) |
 |---|---|---|---|---|
-| `flashmla_sparse` | ✓ | ✓ | ✓ | SM>=9.0 + `sgl_kernel.flash_mla` |
-| `flashmla_kv` | ✓ | ✓ | ✓ | SM>=9.0 + `sgl_kernel.flash_mla` |
+| `flashmla_sparse` | ✓ | ✓ | ✓ | SM>=9.0 + `sgl-flash-mla` |
+| `flashmla_kv` | ✓ | ✓ | ✓ | SM>=9.0 + `sgl-flash-mla` |
 | `fa3` | ✓ | ✓ | ✓ | SM>=9.0 + `sglang.kernels.ops.attention.flash_attention` |
 | `tilelang` | ✓ (topk=2048 dedicated fixture) | ✓ (topk=2048 dedicated fixture) | skipped: not yet wired into CG runner | `tilelang_sparse_fwd` asserts `topk == 2048`; the topk=2048 fixture instance (`build_dsa_sparse_attention_fixture(..., index_topk=2048)`) is used by `test_sparse_tilelang_prefill_case` / `test_sparse_tilelang_decode_case`. The default-topk impl-variant matrix still skips tilelang with the same reason. **SM10.x container gate**: on Blackwell the tilelang JIT generates `wait_wgmma` which the container's MMA template doesn't ship (`KNOWN_FAILURES.md §2`); `dsa_impl_capability("tilelang")` skips on `major >= 10`. Set `SGLANG_TEST_DSA_TILELANG_FORCE=1` to override after re-imaging. |
 | `trtllm` | skipped: SM<10 | skipped: SM<10 | skipped: SM<10 | TRT-LLM Gen FMHA/MLA requires Blackwell (SM>=10.0). |
@@ -60,7 +60,7 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
 - **Page size other than 1 (HIP legacy) or 64 (CUDA)** — the DSA indexer
   hard-asserts the page size: HIP legacy at `dsa/dsa_indexer.py:547-548,
   724-725` (`assert page_size == 1`); CUDA at `dsa/dsa_indexer.py:550, 727,
-  946, 1095` and `dsa/index_buf_accessor.py:436` (`assert page_size == 64`).
+  946, 1095` and `kvcache/dsa_index_k_cache.py:436` (`assert page_size == 64`).
   The `dsa/transform_index.py:53, 79, 100, 121` helpers also assert
   `page_size == 1`.
 - **`Unsupported {forward_batch.forward_mode=}`** — `forward_extend`

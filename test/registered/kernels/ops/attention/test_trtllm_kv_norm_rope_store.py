@@ -5,10 +5,10 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import fused_norm_rope_inplace_triton
 from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
     fused_k_norm_rope_uniform_fp8,
 )
+from sglang.kernels.ops.attention.dsv4.rope import fused_norm_rope_inplace_triton
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")

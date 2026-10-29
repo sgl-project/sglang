@@ -198,6 +198,9 @@ def build_client_warmup_reqs(
         return_warmup_result=True,
         server_based_warmup=True,
     )
+    if warmup_reqs:
+        # include real-path compile prewarms, whose is_warmup is deliberately false
+        warmup_reqs[-1].extra["warmup_last"] = True
     warmup_total = sum(1 for req in warmup_reqs if req.is_warmup)
     for req in warmup_reqs:
         if req.is_warmup:
@@ -434,6 +437,7 @@ class SchedulerWarmupMixin:
         req = get_first_generation_req(req_or_group)
         if req is not None:
             warmup_req = req.copy_as_warmup(self.server_args.warmup_steps)
+            warmup_req.extra["warmup_last"] = True
             recv_reqs.insert(0, (identity, warmup_req))
             self._warmup_total = 1
             self._warmup_processed = 0

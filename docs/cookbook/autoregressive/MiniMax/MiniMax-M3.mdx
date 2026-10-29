@@ -1,7 +1,6 @@
 ---
 title: MiniMax-M3
 description: "Deploy MiniMax-M3 with SGLang — a ~428B-param (23B activated) multimodal Mixture-of-Experts reasoning model with MiniMax Sparse Attention and 1M context, MXFP8 on NVIDIA Blackwell & AMD Instinct, bf16 on Hopper."
-tag: NEW
 ---
 
 ## Deployment

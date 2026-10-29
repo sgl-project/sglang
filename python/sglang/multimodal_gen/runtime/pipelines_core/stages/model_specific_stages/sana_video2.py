@@ -221,9 +221,6 @@ class SanaVideo2DenoisingStage(PipelineStage):
     def component_uses(self, server_args, stage_name=None):
         return [ComponentUse(self._component_stage_name(stage_name), "transformer")]
 
-    def default_workload_iterations(self, batch, num_inference_steps):
-        return num_inference_steps
-
     @torch.no_grad()
     def forward(self, batch, server_args):
         self.begin_declared_component_use(

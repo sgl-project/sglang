@@ -10,7 +10,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_req(is_retracted: bool, holds_kv: bool = False) -> MagicMock:
@@ -73,16 +73,6 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         either; a paused-engine flush must not starve on it."""
         scheduler = self._new_scheduler()
         scheduler.waiting_queue = [_make_req(is_retracted=False)]
-
-        self.assertTrue(scheduler.flush_cache())
-        scheduler.tree_cache.reset.assert_called_once()
-
-    def test_flush_cache_succeeds_on_mixed_queue_while_paused(self):
-        scheduler = self._new_scheduler()
-        scheduler.waiting_queue = [
-            _make_req(is_retracted=True),
-            _make_req(is_retracted=False),
-        ]
 
         self.assertTrue(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_called_once()

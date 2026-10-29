@@ -5,20 +5,22 @@
 //! as protobuf, so a column added here reaches both the same way. No Axum,
 //! SSE, Tonic, or scheduler-channel details.
 
+use std::sync::Arc;
+
 use sglang_api_types::api::v1 as api;
 
 use super::CoreError;
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
-use crate::message::response::{ChunkEvent, ChunkExtras};
+use crate::message::response::{ChunkEvent, ChunkExtras, CustomizedInfo, WeightVersionSpan};
 use crate::message::types::TokenIds;
 
 /// Canonical transport-neutral output payload for generation events.
 ///
 /// The runtime correlation ID is deliberately absent: it is an implementation
 /// detail used for scheduler routing, while adapters obtain the client-visible
-/// identity from [`crate::api_server::core::CoreCall::public_id`]. Runtime-only
+/// identity from [`crate::api_server::handlers::CoreCall::public_id`]. Runtime-only
 /// response variants such as raw control bytes are likewise hidden by
-/// [`crate::api_server::core::CoreCall`].
+/// [`crate::api_server::handlers::CoreCall`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoreOutput {
     pub(crate) token_ids: TokenIds,
@@ -26,6 +28,9 @@ pub(crate) struct CoreOutput {
     pub(crate) prompt_tokens: u32,
     pub(crate) cached_tokens: u32,
     pub(crate) reasoning_tokens: u64,
+    /// The launch weight version, which frames report until a terminal one's
+    /// spans name the last; stamped by the core call.
+    pub(crate) weight_version: Option<Arc<str>>,
     pub(crate) text: String,
     pub(crate) completion_tokens: u64,
     pub(crate) stop_token_trimmed: bool,
@@ -52,6 +57,7 @@ impl From<ChunkEvent> for CoreOutput {
             prompt_tokens,
             cached_tokens,
             reasoning_tokens,
+            weight_version: None,
             text,
             completion_tokens,
             stop_token_trimmed,
@@ -86,6 +92,9 @@ impl CoreOutput {
         if delta.finish_reason.is_some() {
             self.finish_reason = delta.finish_reason.clone();
             self.stop_token_trimmed = delta.stop_token_trimmed;
+        }
+        if delta.weight_version.is_some() {
+            self.weight_version = delta.weight_version.clone();
         }
 
         let Some(delta_extras) = delta.extras.as_deref() else {
@@ -153,6 +162,20 @@ impl CoreOutput {
             extras.hidden_val = delta_extras.hidden_val.clone();
             extras.hidden_lens = delta_extras.hidden_lens.clone();
         }
+        if !delta_extras.weight_versions.is_empty() {
+            extras.weight_versions = delta_extras.weight_versions.clone();
+        }
+        // A request's media counts never change; a frame without them (a
+        // scheduler abort) keeps the ones the stream reported.
+        for (count, delta_count) in [
+            (&mut extras.image_tokens, delta_extras.image_tokens),
+            (&mut extras.audio_tokens, delta_extras.audio_tokens),
+            (&mut extras.video_tokens, delta_extras.video_tokens),
+        ] {
+            if delta_count != 0 {
+                *count = delta_count;
+            }
+        }
     }
 }
 
@@ -185,6 +208,25 @@ impl CoreEvent {
 }
 
 impl CoreOutput {
+    /// Move this delta's `customized_info` out. Only native `/generate`
+    /// reports it, so the fold above does not accumulate it.
+    pub(crate) fn take_customized_info(&mut self) -> CustomizedInfo {
+        self.extras
+            .as_deref_mut()
+            .map(|extras| std::mem::take(&mut extras.customized_info))
+            .unwrap_or_default()
+    }
+
+    /// The scheduler's decode latency for a finished non-streaming request,
+    /// whose first token this frontend does not see. It rides only that
+    /// request's terminal delta and is read off it there (for a model package's
+    /// [`GenerateHook`](crate::GenerateHook)), so [`append_delta`](Self::append_delta)
+    /// does not fold it into the cumulative output.
+    pub(crate) fn scheduler_decode_latency(&self) -> Option<std::time::Duration> {
+        let seconds = self.extras.as_deref()?.decode_latency?;
+        std::time::Duration::try_from_secs_f64(seconds).ok()
+    }
+
     /// One `/generate` frame. `index` is the batch position (batch form only);
     /// `e2e_latency` rides the terminal frame only.
     ///
@@ -207,6 +249,7 @@ impl CoreOutput {
                 ids: self.token_ids,
             }),
             index,
+            prompt_token_ids: None,
         }
     }
 
@@ -219,11 +262,22 @@ impl CoreOutput {
             e2e_latency,
             cached_tokens: self.cached_tokens,
             reasoning_tokens: self.reasoning_tokens,
+            weight_version: self.weight_version.as_deref().map(str::to_owned),
             ..Default::default()
         };
         let Some(extras) = self.extras.as_deref() else {
             return meta;
         };
+
+        meta.weight_versions =
+            visible_weight_versions(&extras.weight_versions, self.completion_tokens);
+        if let Some(span) = meta.weight_versions.last() {
+            meta.weight_version = Some(span.version.clone());
+        }
+        let nonzero = |count: u32| (count != 0).then_some(count);
+        meta.image_tokens = nonzero(extras.image_tokens);
+        meta.audio_tokens = nonzero(extras.audio_tokens);
+        meta.video_tokens = nonzero(extras.video_tokens);
 
         // Python always sets input and output token logprobs together, including
         // the empty input list emitted by a disaggregated decode node.
@@ -276,6 +330,24 @@ impl CoreOutput {
         }
         meta
     }
+}
+
+/// Python's `add_weight_versions_to_meta_info`: the spans that start inside
+/// the completion (and the first one, even for an empty completion), each
+/// clipped to it.
+fn visible_weight_versions(
+    spans: &[WeightVersionSpan],
+    completion_tokens: u64,
+) -> Vec<api::WeightVersionSpan> {
+    spans
+        .iter()
+        .filter(|span| span.start == 0 || span.start < completion_tokens)
+        .map(|span| api::WeightVersionSpan {
+            version: span.version.clone(),
+            start: span.start as i64,
+            end: span.end.min(completion_tokens) as i64,
+        })
+        .collect()
 }
 
 /// A decoded-text column becomes the entries' text source only when populated.
@@ -393,6 +465,29 @@ fn matched_value(matched: &Matched) -> api::Matched {
     api::Matched { value: Some(value) }
 }
 
+/// One case of `testdata/frame_metadata.json` (built by Python's
+/// `build_rust_frame_metadata_fixture`), and the events its frame decodes to.
+#[cfg(test)]
+pub(crate) fn frame_metadata_case(name: &str) -> (serde_json::Value, Vec<ChunkEvent>) {
+    use crate::message::response::{for_each_chunk, frame_decode_batch_cols};
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../../testdata/frame_metadata.json")).unwrap();
+    let case = fixture[name].clone();
+    let bytes = |hex: &serde_json::Value| -> Vec<u8> {
+        let hex = hex.as_str().unwrap_or_default();
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    };
+    let data = bytes(&case["data"]);
+    let framed = frame_decode_batch_cols(&bytes(&case["header"]), &[data.as_slice()]);
+    let mut events = Vec::new();
+    assert!(for_each_chunk(&framed[1..], |event| events.push(event)).ok);
+    (case, events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +553,79 @@ mod tests {
         );
         assert!(opt_texts(&[]).is_none());
         assert_eq!(opt_texts(&texts), Some(texts.as_slice()));
+    }
+
+    /// The weight-version and media-count columns, as Python's
+    /// `push_generation` and `push_abort` send them, render the `meta_info`
+    /// keys Python's TokenizerManager derives from the same values
+    /// (`testdata/frame_metadata.json`, built by
+    /// `build_rust_frame_metadata_fixture`): spans on a terminal frame, clipped
+    /// to the completion the client received, the launch version before one,
+    /// and only nonzero media counts, also behind a frame's logprob columns;
+    /// the scheduler's decode latency reaches its row, and only the abort is
+    /// marked as ended outside the output stream.
+    #[test]
+    fn frame_metadata_matches_python() {
+        let keys = |output: &CoreOutput| {
+            let meta = json(&output.meta_info("rid", None));
+            let mut keys = serde_json::Map::new();
+            for key in [
+                "weight_version",
+                "weight_versions",
+                "image_tokens",
+                "audio_tokens",
+                "video_tokens",
+            ] {
+                if let Some(value) = meta.get(key) {
+                    keys.insert(key.into(), value.clone());
+                }
+            }
+            serde_json::Value::Object(keys)
+        };
+        let launch = Some(Arc::<str>::from("launch"));
+
+        for name in ["batch", "logprob_batch"] {
+            let (batch, events) = super::frame_metadata_case(name);
+            assert_eq!(events.len(), 2);
+            for event in events {
+                let rid = event.rid.as_str().to_owned();
+                assert!(!event.extras.as_deref().is_some_and(|e| e.abort_output));
+                let completion_tokens = event.token_ids.len() as u64;
+                let mut output = CoreOutput::from(event);
+                output.weight_version = launch.clone();
+                output.completion_tokens = completion_tokens;
+                assert_eq!(keys(&output), batch["meta_info"][&rid], "{name} {rid}");
+                assert_eq!(
+                    output.scheduler_decode_latency(),
+                    batch["decode_latencies"][&rid]
+                        .as_f64()
+                        .map(std::time::Duration::from_secs_f64),
+                    "{name} {rid}"
+                );
+                if rid == "logprobs" {
+                    let meta = json(&output.meta_info(&rid, None));
+                    assert_eq!(
+                        meta["output_token_logprobs"],
+                        serde_json::json!([[-0.5, 7, null], [-0.25, 8, null]])
+                    );
+                }
+            }
+        }
+
+        // A scheduler abort folds into what the stream already sent, and its
+        // spans are clipped to those tokens.
+        let (abort, mut events) = super::frame_metadata_case("abort");
+        let mut aborted = CoreOutput {
+            weight_version: launch.clone(),
+            completion_tokens: abort["completion_tokens"].as_u64().unwrap(),
+            ..Default::default()
+        };
+        let event = events.pop().unwrap();
+        assert!(event.extras.as_deref().is_some_and(|e| e.abort_output));
+        let mut delta = CoreOutput::from(event);
+        delta.weight_version = launch;
+        aborted.append_delta(&delta);
+        assert_eq!(keys(&aborted), abort["meta_info"]);
     }
 
     /// A trimmed stop token stays in the accumulated `token_ids` but out of the

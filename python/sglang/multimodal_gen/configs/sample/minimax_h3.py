@@ -29,6 +29,9 @@ def _optional_unit_float(value: Any, field_name: str) -> float | None:
 @dataclass
 class MiniMaxH3SamplingParams(SamplingParams):
     min_num_inference_steps: ClassVar[int] = 1
+    # Single-partition releases name their partition; None infers it from
+    # --model-variant or the model path.
+    release_partition: ClassVar[str | None] = None
 
     height: int = 512
     width: int = 896
@@ -110,7 +113,9 @@ class MiniMaxH3SamplingParams(SamplingParams):
         file delivery, while the public H3 contract correctly requires it.
         """
         selected_variant = getattr(server_args, "model_variant", None)
-        if selected_variant is not None:
+        if self.release_partition is not None:
+            selected_partition = self.release_partition
+        elif selected_variant is not None:
             selected_partition = str(selected_variant).strip().lower()
         else:
             selected_path = server_args.model_subfolder or server_args.model_path
@@ -378,4 +383,33 @@ class FastH3SamplingParams(MiniMaxH3SamplingParams):
             )
 
 
-__all__ = ["FastH3SamplingParams", "MiniMaxH3SamplingParams"]
+@dataclass
+class FastH3OmniSamplingParams(MiniMaxH3SamplingParams):
+    """FastH3 Omni 8-Step V1: eight PDD forwards over ordered references."""
+
+    release_partition: ClassVar[str | None] = "ref2va"
+    num_inference_steps: int = 8
+    task: str | None = "ref2va"
+    quality: str = "lossless"
+    # Trained with target-only flow: references stay clean.
+    imgvid_cond_noise_aug_for_inference: float | None = 1.0
+    audio_cond_noise_aug_for_inference: float | None = 1.0
+
+    def _validate(self) -> None:
+        super()._validate()
+        if self.num_inference_steps != 8:
+            raise ValueError(
+                "FastH3 Omni is distilled for exactly eight PDD forwards; got "
+                f"num_inference_steps={self.num_inference_steps}."
+            )
+        if self.task is not None and self.task.strip().lower() != "ref2va":
+            raise ValueError(
+                f"FastH3 Omni is distilled for ref2va only (got task={self.task!r})."
+            )
+
+
+__all__ = [
+    "FastH3OmniSamplingParams",
+    "FastH3SamplingParams",
+    "MiniMaxH3SamplingParams",
+]

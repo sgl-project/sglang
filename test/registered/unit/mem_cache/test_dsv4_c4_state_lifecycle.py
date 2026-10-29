@@ -11,10 +11,16 @@ from sglang.srt.mem_cache.allocation import alloc_req_slots
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _storage(req_pool):
+    # A static table's rows, with no recurrent state behind them.
+    return StaticKVStorage(req_pool, SimpleNamespace(state=None, storage=None))
 
 
 def _request(req_pool_idx=None, *, reused=False):
@@ -111,19 +117,21 @@ class TestUnifiedC4StateLifecycle(unittest.TestCase):
         reused = _request()
 
         # First admission: a brand-new slot, so its C4 ring must be cleared.
-        (reused_idx,) = alloc_req_slots(req_pool, [reused], None)
+        (reused_idx,) = alloc_req_slots(_storage(req_pool), None, [reused], None)
         hook.assert_called_once_with([reused_idx])
 
         # Chunked continuation reuses the same slot -- clearing it here would
         # wipe the state captured by the previous chunk.
         hook.reset_mock()
         _mark_reused(reused)
-        self.assertEqual(alloc_req_slots(req_pool, [reused], None), [reused_idx])
+        self.assertEqual(
+            alloc_req_slots(_storage(req_pool), None, [reused], None), [reused_idx]
+        )
         hook.assert_not_called()
 
         # Mixed batch: only the newly allocated slot is reported.
         fresh = _request()
-        indices = alloc_req_slots(req_pool, [reused, fresh], None)
+        indices = alloc_req_slots(_storage(req_pool), None, [reused, fresh], None)
         self.assertEqual(indices[0], reused_idx)
         self.assertNotEqual(indices[1], reused_idx)
         hook.assert_called_once_with([indices[1]])
@@ -154,7 +162,7 @@ class TestUnifiedC4StateLifecycle(unittest.TestCase):
 
     def test_req_pool_without_hook_is_unchanged(self):
         req_pool = ReqToTokenPool(2, 16, "cpu", enable_memory_saver=False)
-        (idx,) = alloc_req_slots(req_pool, [_request()], None)
+        (idx,) = alloc_req_slots(_storage(req_pool), None, [_request()], None)
         self.assertGreater(idx, 0)
 
 

@@ -37,23 +37,21 @@ fn check(fixture: &Value) {
     let revision = fixture["revision"].as_str().unwrap();
     let formatter = formatter(model, fixture);
     let tokenizer = cached_tokenizer(model, revision);
-    // The fixture records Python's DeepSeek-V4 profile; the checkpoint's encoder must agree.
-    if let (ChatFormatter::DeepSeekV4(profile), Some(_)) = (&formatter, &tokenizer) {
-        let checkpoint = select_chat_formatter(&ChatFormatterOptions {
+    // Formatters that encode their own prompts (DeepSeek) need the checkpoint's tokenizer.
+    let encoder = tokenizer.as_ref().and_then(|_| {
+        select_chat_formatter(&ChatFormatterOptions {
             tokenizer_path: model.into(),
             revision: Some(revision.into()),
             ..Default::default()
-        });
-        assert!(
-            matches!(checkpoint.0, Some(ChatFormatter::DeepSeekV4(p)) if p == *profile),
-            "{model}: the checkpoint resolves another DeepSeek-V4 profile"
-        );
-    }
+        })
+        .0
+    });
     for case in fixture["cases"].as_array().unwrap() {
         let name = format!("{model} {}", case["name"]);
         let outcome = check_case(
             &formatter,
             tokenizer.as_ref(),
+            encoder.as_ref(),
             &fixture["bos_token_id"],
             case,
         );
@@ -71,6 +69,7 @@ fn check(fixture: &Value) {
 fn check_case(
     formatter: &ChatFormatter,
     tokenizer: Option<&Tokenizer>,
+    encoder: Option<&ChatFormatter>,
     bos: &Value,
     case: &Value,
 ) -> Result<(), String> {
@@ -92,7 +91,12 @@ fn check_case(
     let Some(tokenizer) = tokenizer else {
         return Ok(());
     };
-    let ids = encode(tokenizer, &prompt, &prefix, bos);
+    let ids = match encoder
+        .and_then(|encoder| encoder.encode_request(case["request"].clone(), &defaults))
+    {
+        Some(ids) => ids.map_err(|error| error.to_string())?,
+        None => encode(tokenizer, &prompt, &prefix, bos),
+    };
     let digest = ids.iter().fold(Sha256::new(), |hash, id| {
         hash.chain_update(id.to_le_bytes())
     });

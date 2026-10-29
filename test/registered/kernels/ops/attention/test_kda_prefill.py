@@ -20,7 +20,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=300, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=45, stage="base-c", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=150, stage="base-c", runner_config="8-gpu-b300")
 
 
 def _ptx_supported():

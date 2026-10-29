@@ -63,9 +63,19 @@ def get_capture_lora_variant() -> Optional[str]:
     return _capture_lora_variant
 
 
-def _set_capture_lora_variant(variant: Optional[str]) -> None:
+@contextmanager
+def capture_lora_variant(variant: Optional[str]):
+    """Scope the "lora"/"nolora" label so later captures cannot inherit it.
+
+    None denotes a single graph serving both variants.
+    """
     global _capture_lora_variant
+    previous = _capture_lora_variant
     _capture_lora_variant = variant
+    try:
+        yield
+    finally:
+        _capture_lora_variant = previous
 
 
 def get_capture_attention_variant() -> Optional[str]:

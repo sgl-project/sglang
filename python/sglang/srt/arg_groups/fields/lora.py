@@ -65,7 +65,7 @@ class Lora(msgspec.Struct):
     ] = None
     max_loras_per_batch: A[
         int,
-        "Maximum number of adapters for a running batch, include base-only request.",
+        "GPU pool capacity in distinct adapter IDs, including None for base-model requests. With pipeline parallelism, shared across all in-flight microbatches.",
     ] = 8
     lora_eviction_policy: A[
         str,
@@ -78,7 +78,7 @@ class Lora(msgspec.Struct):
         str,
         Arg(
             help="Choose the kernel backend for multi-LoRA serving.",
-            choices=["triton", "csgmv", "ascend", "torch_native"],
+            choices=["triton", "csgmv", "ascend", "torch_native", "triton_v2"],
         ),
     ] = "csgmv"
     max_lora_chunk_size: A[

@@ -13,6 +13,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.beam_detector import BeamDetector
 from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
@@ -59,6 +60,7 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,7 @@ class FunctionCallParser:
 
     ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
         "apertus2509": Apertus2509Detector,
+        "beam": BeamDetector,
         "cohere_command4": CohereCommand4Detector,
         "deepseekv3": DeepSeekV3Detector,
         "deepseekv31": DeepSeekV31Detector,
@@ -84,6 +87,7 @@ class FunctionCallParser:
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
+        "flint": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
         "k2_horizon": K2V3Detector,
         "kimi_k2": KimiK2Detector,
@@ -115,11 +119,20 @@ class FunctionCallParser:
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
         "iquest_q1": IQuestQ1Detector,
+        "response_template": ResponseTemplateToolDetector,
     }
 
     def __init__(
-        self, tools: List[Tool], tool_call_parser: str, tokenizer=None, tool_choice=None
+        self,
+        tools: List[Tool],
+        tool_call_parser: str,
+        tokenizer=None,
+        tool_choice=None,
+        prefix: str = "",
+        constrained: bool = False,
     ):
+        self.tools = tools
+        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -127,6 +140,12 @@ class FunctionCallParser:
                 sig = inspect.signature(detector_class)
                 if "tokenizer" in sig.parameters:
                     kwargs["tokenizer"] = tokenizer
+            if issubclass(detector_class, ResponseTemplateToolDetector):
+                if prefix:
+                    kwargs["prefix"] = prefix
+                kwargs["constrained"] = constrained
+                # Forced calls are parsed in the format of the tag for these tools.
+                kwargs["tools"] = self.structural_tag_tools()
             detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
@@ -139,8 +158,6 @@ class FunctionCallParser:
             tool_choice = ToolChoice(function={"name": tool_choice["name"]})
         self._required_tool_parser = detector.get_required_tool_parser(tool_choice)
         self.detector = self._required_tool_parser or detector
-        self.tools = tools
-        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
 
     def owns_tool_format(self) -> bool:
         return (
@@ -160,24 +177,42 @@ class FunctionCallParser:
         Returns:
             True if the text contains a tool call, False otherwise
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return False
         return self.detector.has_tool_call(text)
 
-    def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
+    def parse_non_stream(
+        self, full_text: str, *, preserve_incomplete: bool = False
+    ) -> Tuple[str, list[ToolCallItem]]:
         """
         One-time parsing of the full text to extract tool calls.
 
         Args:
             full_text: The complete text to parse
+            preserve_incomplete: Keep a call that a response-template parser
+                recognized but the text cut off, as streaming does
 
         Returns:
             A tuple containing:
             - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
             - A list of tool calls parsed from the text
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return full_text, []
+        if preserve_incomplete and isinstance(
+            self.detector, ResponseTemplateToolDetector
+        ):
+            normal_text, streamed = self.parse_stream_chunk(full_text)
+            end_text, end_calls = self.parse_stream_end()
+            calls: dict[int, ToolCallItem] = {}
+            for call in [*streamed, *end_calls]:
+                if call.tool_index not in calls:
+                    calls[call.tool_index] = call.model_copy()
+                else:
+                    merged = calls[call.tool_index]
+                    merged.name = call.name or merged.name
+                    merged.parameters += call.parameters
+            return normal_text + end_text, list(calls.values())
         has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
@@ -198,7 +233,7 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return chunk_text, []
         final_normal_text = ""
         final_calls = []
@@ -218,7 +253,7 @@ class FunctionCallParser:
         Text a detector held back waiting for a marker (which can no longer
         arrive) is released as normal text; see BaseFormatDetector.finish().
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return "", []
         sp_result = self.detector.finish(self.tools)
         return sp_result.normal_text, sp_result.calls
@@ -275,6 +310,18 @@ class FunctionCallParser:
             at_least_one=at_least_one,
         )
 
+    def structural_tag_tools(self) -> List[Tool]:
+        """The tools as structural tags constrain them: all strict at the
+        PARAMETER strict level."""
+        if self.tool_strict_level < ToolStrictLevel.PARAMETER or not self.tools:
+            return self.tools
+        return [
+            tool.model_copy(
+                update={"function": tool.function.model_copy(update={"strict": True})}
+            )
+            for tool in self.tools
+        ]
+
     def get_structure_constraint(
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
@@ -297,6 +344,18 @@ class FunctionCallParser:
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
+        structural_tag_tools = self.structural_tag_tools()
+        if isinstance(self.detector, ResponseTemplateToolDetector):
+            structural_tag = self.detector.validate_structure_constraint_request(
+                tool_choice,
+                parallel_tool_calls,
+                should_constrain_auto,
+                tools=structural_tag_tools,
+                thinking_mode=thinking_mode,
+            )
+            if structural_tag is not None:
+                return ("structural_tag", structural_tag)
+            should_constrain_auto = False
 
         try:
             if (
@@ -337,18 +396,6 @@ class FunctionCallParser:
                     return ("structural_tag", structural_tag)
 
             if is_required or should_constrain_auto:
-                structural_tag_tools = self.tools
-                if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
-                    structural_tag_tools = [
-                        tool.model_copy(
-                            update={
-                                "function": tool.function.model_copy(
-                                    update={"strict": True}
-                                )
-                            }
-                        )
-                        for tool in self.tools
-                    ]
                 structural_tag = self.detector.get_structural_tag(
                     tools=structural_tag_tools,
                     thinking_mode=thinking_mode,

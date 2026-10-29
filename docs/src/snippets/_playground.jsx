@@ -1019,6 +1019,7 @@ export const Playground = ({ config }) => {
               // server warns it away (only EAGLE/EAGLE3 honor it).
               || head === "--speculative-adaptive"
               || head === "--speculative-dspark-block-size"
+              || head === "--speculative-use-block-verification"
               || head === "--enable-linear-replayssm-spec"
               || head === "--linear-replayssm-cache-len"
               || head === "--speculative-ngram-max-bfs-breadth";
@@ -1488,6 +1489,12 @@ export const Playground = ({ config }) => {
           }
           const backendOption = backendOptions.find((o) => o.id === backend);
           adds.push(...(backendOption?.flags || []), ...(fc.requiredFlags || []));
+          // A decode server disables its radix cache unless this flag is set, and
+          // sglang rejects --enable-hierarchical-cache with the radix cache off.
+          if (pdMode === "decode"
+            && !h.hasFlag(flags, "--disaggregation-decode-enable-radix-cache")) {
+            adds.push("--disaggregation-decode-enable-radix-cache");
+          }
           flags = h.insertBeforeTail(flags, adds);
           env = [
             ...env,
@@ -1570,10 +1577,10 @@ export const Playground = ({ config }) => {
           && (value.backend === null || value.backend === derived.backend)
           && h.hasFlag(flags, "--enable-unified-cache-external-linker")
           && !h.hasFlag(flags, "--enable-hierarchical-cache")) return { flags, env };
-        const linkerConfig = h.findFlagArg(flags, "--hicache-storage-backend-extra-config");
+        const linkerConfig = h.findFlagArg(flags, "--unified-cache-external-linker-config");
         const optimisticPrefill = h.findFlagArg(flags, "--optimistic-prefill-attempts");
         const ownedHeads = [
-          ...(inherited ? ["--hicache-storage-backend-extra-config"] : []),
+          ...(inherited ? ["--unified-cache-external-linker-config"] : []),
           ...(ownsOptimisticPrefill ? ["--optimistic-prefill-attempts"] : []),
           "--enable-unified-cache-external-linker",
           "--unified-cache-external-linker-backend",
@@ -1610,7 +1617,7 @@ export const Playground = ({ config }) => {
           ...((roleOverride && roleOverride.flags) || []),
           ...(ownsOptimisticPrefill && optimisticPrefill ? [`--optimistic-prefill-attempts ${optimisticPrefill}`] : []),
           ...(inherited && backend === "mori" && linkerConfig
-            ? [`--hicache-storage-backend-extra-config ${linkerConfig}`] : []),
+            ? [`--unified-cache-external-linker-config ${linkerConfig}`] : []),
         ]);
         const extraEnv = [...(fc.requiredEnv || []), ...((roleOverride && roleOverride.env) || [])];
         if (inherited && backend === "mori" && standalone) extraEnv.push(standalone);

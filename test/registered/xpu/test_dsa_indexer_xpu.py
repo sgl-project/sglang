@@ -388,7 +388,7 @@ class TestDSAIndexerXPU(CustomTestCase):
     # Test: indexer forward — extend mode
     # ------------------------------------------------------------------
 
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
     def test_forward_extend_mode(self, mock_act_quant):
         """Indexer forward in EXTEND mode calls sgl_kernel.fp8_mqa_logits on XPU."""
 
@@ -444,7 +444,7 @@ class TestDSAIndexerXPU(CustomTestCase):
     # Test: indexer forward — decode mode
     # ------------------------------------------------------------------
 
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
     def test_forward_decode_mode(self, mock_act_quant):
         """Indexer forward in DECODE mode calls sgl_kernel.fp8_paged_mqa_logits on XPU."""
 

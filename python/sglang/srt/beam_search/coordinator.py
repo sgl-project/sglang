@@ -63,6 +63,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
@@ -110,6 +111,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
 
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
+
+    def _storage(self):
+        """Where member rows and their token ids are taken and given back."""
+        return kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
     @staticmethod
     def request_beam_width(recv_req) -> int:
@@ -328,7 +333,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             self._finish_group(group)
 
     def _spawn_member_rows(self, group: BeamGroup, leader: Req) -> None:
-        rows = self.req_to_token_pool.alloc_rows(group.beam_width - 1)
+        rows = self._storage().take_rows(group.beam_width - 1)
         assert rows is not None, (
             f"Beam member spawn needs {group.beam_width - 1} req-to-token slots "
             f"but only {self.req_to_token_pool.available_size()} are free; the "
@@ -469,12 +474,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return
         # Plain free(), never a nested free_group: an inner begin/end pair
         # inside the decode path's group double-frees.
-        allocator = self.token_to_kv_pool_allocator
+        storage = self._storage()
         for entry in staged:
             orphans = collect_orphan_slots(entry.old_mapping, entry.new_mapping)
             if orphans.numel():
                 group.slots_freed += orphans.numel()
-                allocator.free(orphans)
+                storage.free_tokens(orphans)
 
     def _finish_group(self, group: BeamGroup) -> None:
         # The leader carries the best sequence's finish reason.
@@ -511,7 +516,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         # Staged orphans are unreachable from every row, so the group-wide
         # dedup free below would miss them.
         self._reclaim_orphans(group)
-        free_member_rows(group, self.req_to_token_pool, self.token_to_kv_pool_allocator)
+        free_member_rows(group, self._storage())
 
     def _retire_group(self, group: BeamGroup) -> None:
         # Exactly once per group, so the O(1) live gate stays accurate.

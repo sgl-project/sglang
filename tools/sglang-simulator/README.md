@@ -221,6 +221,14 @@ Supported predictors:
 Relative predictor paths are resolved from the simulator configuration location.
 Environment variables in paths use `${NAME}` syntax.
 
+## Collect baselines and train an ML predictor
+
+Use [collect_baseline](src/sglang_simulator/tools/collect_baseline/README.md) to capture request traces
+and synchronized batch steps from a real SGLang server. Then use
+[train_ml_time_predictor](src/sglang_simulator/tools/train_ml_time_predictor/README.md) to train an
+18-feature latency model. Installing the package provides `sglang-simulator-collect`
+and `sglang-simulator-train`, including a small collected training example.
+
 ## Workload formats
 
 The Autobench trace format uses timestamps in milliseconds:

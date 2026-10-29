@@ -34,7 +34,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _mock_model_runner(seq_len_fill_value: int = 1) -> MagicMock:
@@ -238,6 +238,30 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # Seeded sampling asserts positions rows == sampled (real) rows.
         self.assertEqual(fb.positions.shape[0], fb.batch_size)
 
+    def test_tbo_decode_child_pads_its_requests_with_its_tokens(self):
+        """An extend child keeps its requests."""
+        for mode, bs in ((ForwardMode.DECODE, 2), (ForwardMode.EXTEND, 1)):
+            with self.subTest(mode=mode):
+                fb = ForwardBatch(
+                    forward_mode=mode,
+                    batch_size=1,
+                    input_ids=torch.tensor([11]),
+                    req_pool_indices=torch.tensor([5]),
+                    seq_lens=torch.tensor([7]),
+                    out_cache_loc=torch.tensor([3]),
+                    seq_lens_sum=7,
+                    positions=torch.tensor([6]),
+                    seq_lens_cpu=torch.tensor([7]),
+                )
+                fb.tbo_padded_len = 2
+                fb._pad_tbo_child_inputs(_mock_model_runner())
+
+                self.assertEqual(fb.input_ids.shape[0], 2)
+                self.assertEqual(fb.out_cache_loc.shape[0], 2)
+                self.assertEqual(fb.batch_size, bs)
+                self.assertEqual(fb.req_pool_indices.shape[0], bs)
+                self.assertEqual(fb.seq_lens.shape[0], bs)
+
     def test_extend_post_forward_unpads_positions(self):
         fb = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
@@ -297,6 +321,39 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens_cpu, [4])
         self.assertEqual(fb.extend_prefix_lens_cpu, [0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0])
+
+    def test_padding_leaves_lists_held_by_pre_planned_metadata_intact(self):
+        """Padding must not grow host lists that metadata planned before it holds."""
+        spec_info = MagicMock()
+        spec_info.num_tokens_per_req = 2
+        spec_info.is_draft_input.return_value = False
+        planned_seq_lens = [2, 2]
+        planned_prefix_lens = [5, 6]
+        planned_logprob_start_lens = [0, 0]
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            batch_size=2,
+            input_ids=torch.arange(4),
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([7, 8]),
+            seq_lens_sum=15,
+            out_cache_loc=torch.arange(4),
+            positions=torch.arange(4),
+            seq_lens_cpu=torch.tensor([7, 8]),
+            extend_seq_lens=torch.tensor([2, 2], dtype=torch.int32),
+            extend_prefix_lens=torch.tensor([5, 6]),
+            extend_seq_lens_cpu=planned_seq_lens,
+            extend_prefix_lens_cpu=planned_prefix_lens,
+            extend_logprob_start_lens_cpu=planned_logprob_start_lens,
+            spec_info=spec_info,
+        )
+
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=6, bs=3)
+
+        self.assertEqual(fb.extend_seq_lens_cpu, [2, 2, 2])
+        self.assertEqual(planned_seq_lens, [2, 2])
+        self.assertEqual(planned_prefix_lens, [5, 6])
+        self.assertEqual(planned_logprob_start_lens, [0, 0])
 
 
 class TestDraftScopeMlpSync(CustomTestCase):

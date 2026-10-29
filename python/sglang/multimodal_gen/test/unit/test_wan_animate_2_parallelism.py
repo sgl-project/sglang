@@ -6,6 +6,7 @@ Single-process and CPU only, in the style of ``test_sp_shard.py`` / ``test_usp_r
 shape helpers are called directly. The parallelism rejections live in ``test_wan_animate_2_config.py``.
 """
 
+import math
 from collections import OrderedDict
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -236,6 +237,93 @@ def test_attention_pads_tokens_into_the_slots_the_block_mask_admits():
     assert all(valid(qi, ki) for qi in gen_slots for ki in gen_slots)
     assert all(valid(qi, reference_start + ki) for qi in (4, 5) for ki in (0, 1))
     assert not any(valid(qi, reference_start + ki) for qi in (0, 1) for ki in (0, 1))
+
+
+def test_attention_slots_fit_a_reference_frame_wider_than_the_generation_frame():
+    # resize_by_area fits the reference image and the driving video to the pixel budget
+    # independently, so the reference video's grid can hold more tokens per frame than the
+    # generation grid (720x1280 with 16:9-ish inputs: 79x45 against 80x44). The slot must
+    # then take the reference frame's width, or the reference K/V copy raises "The expanded
+    # size of the tensor (4) must match the existing size (5)".
+    layout = _InContextLayout((2, 2, 2), (1, 1, 5), (2, 2, 2))
+    captured = {}
+
+    def fake_flex_attention(q, k, v, *, block_mask, score_mod):
+        captured.update(q=q, k=k, v=v)
+        return torch.zeros_like(q)
+
+    batch, heads, dim = 1, 2, 8
+
+    def tokens(values, scale):
+        base = torch.tensor(values, dtype=torch.float32).view(1, len(values), 1, 1)
+        return (base * scale).expand(batch, len(values), heads, dim).clone()
+
+    # Generation frames 0 (1..4) and 1 (5..8) of 4 tokens each; one 5-token reference frame.
+    gen_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+    q, k, v = tokens(gen_ids, 1.0), tokens(gen_ids, 10.0), tokens(gen_ids, 100.0)
+    reference_k = tokens([1, 2, 3, 4, 5], 1000.0)
+    reference_v = tokens([1, 2, 3, 4, 5], 10000.0)
+    with patch(f"{_BLOCK}._flex_attention_compiled", side_effect=fake_flex_attention):
+        out = WanAnimate2TransformerBlock._in_context_attention(
+            SimpleNamespace(log_scale=0.0),
+            q,
+            k,
+            v,
+            reference_k,
+            reference_v,
+            "SENTINEL_BLOCK_MASK",
+            layout,
+        )
+
+    assert tuple(out.shape) == (batch, 8, heads, dim)
+    q_padded = captured["q"].transpose(1, 2)
+    k_padded = captured["k"].transpose(1, 2)
+    v_padded = captured["v"].transpose(1, 2)
+
+    def slot(t, i):
+        return t[0, i, 0, 0].item()
+
+    # Generation tokens sit at the 5-token stride, slot 4 of each frame empty.
+    assert [slot(q_padded, i) for i in range(10)] == [1, 2, 3, 4, 0, 5, 6, 7, 8, 0]
+    assert [slot(k_padded, i) for i in range(10)] == [
+        10,
+        20,
+        30,
+        40,
+        0,
+        50,
+        60,
+        70,
+        80,
+        0,
+    ]
+    assert q_padded[:, 10:].abs().sum() == 0
+    # The five reference tokens fill their slot.
+    reference_start = layout.padded_generation_video_len
+    assert [slot(k_padded, reference_start + i) for i in range(5)] == [
+        1000,
+        2000,
+        3000,
+        4000,
+        5000,
+    ]
+    assert [slot(v_padded, reference_start + i) for i in range(5)] == [
+        10000,
+        20000,
+        30000,
+        40000,
+        50000,
+    ]
+    assert k_padded[:, 10:reference_start].abs().sum() == 0
+    assert k_padded[:, reference_start + 5 :].abs().sum() == 0
+
+    # The mask routes frame-1 queries to all five reference slots and frame-0 queries to none.
+    valid = _mask_probe(layout.block_mask_fn())
+    assert all(valid(qi, reference_start + ki) for qi in range(5, 9) for ki in range(5))
+    assert not any(
+        valid(qi, reference_start + ki) for qi in range(4) for ki in range(5)
+    )
+    assert not any(valid(qi, reference_start + 5) for qi in range(5, 9))
 
 
 def test_in_context_attention_hands_flex_a_score_mod_only_when_log_scale_is_nonzero():
@@ -570,6 +658,43 @@ def test_layout_pads_the_full_clip_geometry_to_128_token_blocks(
         layout.padded_reference_video_len,
         layout.padded_kv_len,
     ) == expected
+
+
+@pytest.mark.parametrize(
+    "full_clip_grid, reference_video_grid, expected_tokens_per_frame",
+    [
+        # 720x1280 budget, 1072x592 image and 538x304 video: the video's canvas (1264x720)
+        # is one latent row taller and one column narrower than the image's (1280x704),
+        # 79x45 = 3555 tokens against 80x44 = 3520; the slot takes the larger.
+        ((22, 44, 80), (21, 45, 79), 3555),
+        # Mirror case, the video's grid is the smaller: the generation grid sizes the slot.
+        ((22, 45, 79), (21, 44, 80), 3555),
+        # Equal grids: unchanged.
+        ((22, 44, 80), (21, 44, 80), 3520),
+    ],
+)
+def test_layout_slot_is_the_larger_of_the_two_grids_tokens_per_frame(
+    full_clip_grid, reference_video_grid, expected_tokens_per_frame
+):
+    layout = _InContextLayout(full_clip_grid, reference_video_grid, full_clip_grid)
+    full_clip_f = full_clip_grid[0]
+    assert layout.max_tokens_per_frame == expected_tokens_per_frame
+    assert layout.max_tokens_per_frame >= layout.generation_video_tokens_per_frame
+    assert layout.max_tokens_per_frame >= layout.reference_video_tokens_per_frame
+    assert (
+        layout.max_generation_video_num_tokens
+        == full_clip_f * expected_tokens_per_frame
+    )
+    assert (
+        layout.max_reference_video_num_tokens
+        == (full_clip_f - 1) * expected_tokens_per_frame
+    )
+    assert layout.padded_generation_video_len == (
+        math.ceil(layout.max_generation_video_num_tokens / 128) * 128
+    )
+    assert layout.padded_reference_video_len == (
+        math.ceil(layout.max_reference_video_num_tokens / 128) * 128
+    )
 
 
 class _KvTaggingTransformer:

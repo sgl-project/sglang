@@ -264,9 +264,7 @@ class JetBlock(nn.Module):
         assert isinstance(get_attn_backend().linear_attn_backend, MambaAttnBackendBase)
         linear_attn_backend = get_attn_backend().linear_attn_backend
         forward_metadata = linear_attn_backend.forward_metadata
-        layer_cache = linear_attn_backend.req_to_token_pool.mamba2_layer_cache(
-            self.layer_id
-        )
+        layer_cache = linear_attn_backend.state_layer_cache(self.layer_id)
 
         qkvabz, _ = self.qkvabz_proj(hidden_states)
         q, k, v, a, beta, z = qkvabz.split(

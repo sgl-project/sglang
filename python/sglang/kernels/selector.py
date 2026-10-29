@@ -96,8 +96,3 @@ def get_kernel(op: str, backend: Optional[KernelBackend] = None) -> Callable:
     call resolves and imports the backend; later calls hit the cache.
     """
     return _resolve(op, backend)
-
-
-def clear_cache() -> None:
-    """Drop the resolved-callable cache (used by tests)."""
-    _resolve.cache_clear()

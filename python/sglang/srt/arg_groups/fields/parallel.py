@@ -245,7 +245,19 @@ class Parallel(msgspec.Struct):
         "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
         "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
         "sequence-sharded activations with no extra communication volume. "
-        "Prefill only; Qwen3 dense; requires tp_size > 1 and NVLink/NVSwitch.",
+        "Prefill only; supports Qwen3 dense and Muse Spark ModelOpt NVFP4 with "
+        "TP4/EP4 or TP8/EP8 with FlashInfer A2A or MegaMoE. "
+        "Muse Spark requires the FlashInfer TRT-LLM MoE runner and "
+        "NVLink/NVSwitch.",
+    ] = False
+    enable_megamoe_for_layernorm_sp: A[
+        bool,
+        "Use fused MegaMoE for Muse Spark NVFP4 TP4/EP4 or TP8/EP8 LayerNorm-SP prefill, "
+        "including BF16 excluded layers. Decode retains the FlashInfer TRT-LLM "
+        "MoE runner and all-reduce, sharing expert weights with prefill. "
+        "Requires --enable-layernorm-sp, DeepGEMM with post-expert normalization, "
+        "and NVLink/NVSwitch. "
+        "No FlashInfer A2A backend is required when enabled.",
     ] = False
     disable_attn_tp_gather: A[
         bool,

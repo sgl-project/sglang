@@ -84,7 +84,7 @@ ATTENTION_BACKEND_CHOICES = [
     "flashmla",
     "trtllm_mla",
     "cutedsl_mla",
-    "tokenspeed_mla",
+    "tokenspeed_mla",  # Deprecated alias for "cutedsl_mla"
     "trtllm_mha",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
     "minicpm_flashattn",
@@ -150,6 +150,9 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "marlin",
     "humming",
     "experimental_sgl_marlin",
+    "lora_cutedsl",
+    "lora_triton",
+    "lora_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
     "megamoe",
     "intel_xpu",
@@ -234,7 +237,6 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "flashmla",
     "cutedsl_mla",
     "trtllm_mla",
-    "tokenspeed_mla",
 ]
 add_chunked_prefix_cache_attention_backend = (
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append

@@ -141,7 +141,6 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator.unique_name = "test"
     coordinator.hpu_communicator = None
     coordinator.xpu_communicator = None
-    coordinator.npu_communicator = None
     coordinator.qr_comm = None
     coordinator.pymscclpp_comm = None
     coordinator.torch_symm_mem_comm = None
@@ -430,7 +429,6 @@ def _read_group_descs(group_name):
             use_torch_symm_mem_all_reduce=False,
             use_hpu_communicator=False,
             use_xpu_communicator=False,
-            use_npu_communicator=False,
             use_message_queue_broadcaster=False,
             group_name=group_name,
         )

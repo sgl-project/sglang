@@ -10,8 +10,8 @@ import torch
 from sglang.kernels.ops.communication.all_reduce_fusion import (
     moe_finalize_shared_gate_all_reduce,
 )
-from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.kernels.ops.moe.shared_expert_gate import shared_expert_gate
+from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )

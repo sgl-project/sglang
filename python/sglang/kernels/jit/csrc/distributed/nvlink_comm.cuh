@@ -583,33 +583,11 @@ struct NVLinkComm {
   // specialized for each world size
   template <uint32_t kWorldSize>
   static void
-  all_reduce_push(CommunicatorRef comm, TensorView in, TensorView out, tvm::ffi::Optional<TensorView> residual) {
-    return run_push<Primitive::AR, kWorldSize>(comm->get_push_obj(), in, out, residual);
-  }
-  template <uint32_t kWorldSize>
-  static void
   all_gather_push(CommunicatorRef comm, TensorView in, TensorView out, tvm::ffi::Optional<TensorView> residual) {
     return run_push<Primitive::AG, kWorldSize>(comm->get_push_obj(), in, out, residual);
   }
-  template <uint32_t kWorldSize>
-  static void
-  reduce_scatter_push(CommunicatorRef comm, TensorView in, TensorView out, tvm::ffi::Optional<TensorView> residual) {
-    return run_push<Primitive::RS, kWorldSize>(comm->get_push_obj(), in, out, residual);
-  }
 
   // only compile once for each world size
-  template <uint32_t kPullUnroll>
-  static void all_reduce_pull(
-      CommunicatorRef comm,  // only pull is needed
-      TensorView in,
-      TensorView out,
-      tvm::ffi::Optional<TensorView> residual,
-      int64_t in_mc_ptr,
-      int64_t out_mc_ptr,
-      uint32_t num_blocks_hint) {
-    return run_pull<Primitive::AR, kPullUnroll>(
-        comm->get_pull_obj(), in, out, residual, in_mc_ptr, out_mc_ptr, num_blocks_hint);
-  }
   template <uint32_t kPullUnroll>
   static void all_gather_pull(
       CommunicatorRef comm,  // only pull is needed
@@ -620,16 +598,6 @@ struct NVLinkComm {
       uint32_t num_blocks_hint) {
     return run_pull<Primitive::AG, kPullUnroll>(
         comm->get_pull_obj(), in, out, residual, 0, out_mc_ptr, num_blocks_hint);
-  }
-  template <uint32_t kPullUnroll>
-  static void reduce_scatter_pull(
-      CommunicatorRef comm,  // only pull is needed
-      TensorView in,
-      TensorView out,
-      tvm::ffi::Optional<TensorView> residual,
-      int64_t in_mc_ptr,
-      uint32_t num_blocks_hint) {
-    return run_pull<Primitive::RS, kPullUnroll>(comm->get_pull_obj(), in, out, residual, in_mc_ptr, 0, num_blocks_hint);
   }
 };
 

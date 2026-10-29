@@ -12,6 +12,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from triton import knobs
 from triton.runtime.jit import JITFunction
 
 from sglang.kernels.kda_kernels.layernorm_modulate_triton import (
@@ -174,12 +175,33 @@ def _float(n=4096, offset=0):
 
 
 @torch.no_grad()
-def test_toy_wrapper_replays():
+@pytest.mark.parametrize("has_launch_hooks", [True, False])
+def test_toy_wrapper_replays(monkeypatch, has_launch_hooks):
+    if not has_launch_hooks:
+        monkeypatch.setattr(fast_launch, "knobs", None)
     toy = _Counted(_copy_out)
     for _ in range(3):
         x = _float()
         assert torch.equal(toy.fn(x), x)
     assert toy.calls == 1
+
+
+@torch.no_grad()
+def test_launch_hooks_see_replayed_launches():
+    toy = _Counted(_copy_out)
+    toy.fn(_float())  # records
+    seen = []
+
+    def hook(metadata):
+        seen.append(metadata.get()["name"])
+
+    knobs.runtime.launch_enter_hook.add(hook)
+    try:
+        x = _float()
+        assert torch.equal(toy.fn(x), x)
+    finally:
+        knobs.runtime.launch_enter_hook.remove(hook)
+    assert seen == ["_copy_kernel"] and toy.calls == 1
 
 
 def _copy_out_through_view(x):

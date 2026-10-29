@@ -8,9 +8,8 @@ use sglang_api_types::api::v1 as api;
 use tonic::{Code, Status};
 
 use super::service::ResponseStream;
-use crate::api_server::core::{
-    CoreCall, CoreError, CoreErrorKind, CoreEvent, CoreOutput, recv_indexed,
-};
+use crate::api_server::core::{CoreError, CoreErrorKind, CoreEvent, CoreOutput};
+use crate::api_server::handlers::{CoreCall, recv_indexed};
 
 pub(super) struct StreamOptions {
     /// `stream` as sent: false folds each item to its one terminal frame.
@@ -180,6 +179,7 @@ mod tests {
                     kind: CoreErrorKind::NotFound,
                     message: "missing".into(),
                     legacy_http_status: 404,
+                    output: Box::default(),
                 },
                 Code::NotFound,
             ),
@@ -188,6 +188,7 @@ mod tests {
                     kind: CoreErrorKind::FailedPrecondition,
                     message: "not ready".into(),
                     legacy_http_status: 412,
+                    output: Box::default(),
                 },
                 Code::FailedPrecondition,
             ),
@@ -201,6 +202,7 @@ mod tests {
                     kind: CoreErrorKind::DeadlineExceeded,
                     message: "late".into(),
                     legacy_http_status: 504,
+                    output: Box::default(),
                 },
                 Code::DeadlineExceeded,
             ),

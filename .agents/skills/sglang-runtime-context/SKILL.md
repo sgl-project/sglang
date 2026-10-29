@@ -15,7 +15,7 @@ One container owns process-static runtime state: `sglang.srt.runtime_context.Run
 | runtime flags | `get_flags()` | state that is *not* a pure function of config: `capture` (cuda-graph lifecycle), `moe` (ACTIVE backends, swappable), `dp` (DP-attention runtime flags) | materialized at subsystem init; groups offer `override()` for tests |
 | resources | `get_resources()`, `get_stream(name)`, `get_buffer(name, factory)` | process-level handles: graph pools, EPLB state, EP dispatcher state, named side streams, workspace buffers | lazy; cleared by `reset_context()` |
 | per-forward | `get_forward()` | forward-scoped flags (multi-stream switch, MoE output buffer, attn-TP inputs, extend-in-batch) | contextvar-backed; `scoped(**kw)` restores on exit; new threads see defaults |
-| parallel | `get_parallel()` | one spelling per name: ranks and group handles are the live topology (`@property`, read-through); every other name, sizes included, is a leaf of the parallel config bag | ranks/groups: after dist init; leaves: after publish |
+| parallel | `get_parallel()` | one spelling per name: scoped override, then permanent stamp, then published parallel config leaf | ranks: stamped at publish; group handles: stamped at distributed init; configured and derived widths: after publish |
 
 `reset_context()` (unit-test teardown) drops the published config and installs fresh
 flags/resources/forward tiers.
@@ -87,13 +87,12 @@ with what the operator typed, not with what resolution decided.**
   `ModelRunner.update_model_fields` overrides `model_path` / `load_format` for
   the target runner.
 - **Late launcher-stage resolution (pre-publish)**: a few rules cannot run inside
-  `__post_init__` — LoRA normalization, and the auto-parser detection that needs a
+  `ServerArgs.resolve_once` — LoRA normalization, and the auto-parser detection that needs a
   tokenizer/chat-template load. They are resolution, not mutation, and they
   **declare** via `arg_groups.overrides.declare_resolution(server_args, source,
   **fields)`, the same call the rest of the pipeline makes; there is no
   `declare_late_resolution` any more. *When* a declaration is made is not
-  something the code marks — the guardrails that used to read that marker
-  cover these sites through the ordinary keyword scan instead. The declaration lands
+  something the code marks. The declaration lands
   in the stash on that very object, so every holder of it carries the decision —
   the HTTP server, the multi-tokenizer workers it is serialized for, the
   schedulers it forks — and each of them publishes bags projected from it. The
@@ -135,16 +134,23 @@ bag to override at all.
   instance: **constructor arguments** (`ModelRunner(draft_attention_backend=...)`,
   `MMEncoder(gpu_id=...)`) and **runner attributes holding the resolved value**
   (`model_runner.kv_cache_dtype_str`, `prefill_attention_backend_str`,
-  `num_fused_shared_experts`, `linear_attn_backends`) — threaded to consumers as
+  `linear_attn_backends`) — threaded to consumers as
   arguments, never backfilled onto a shared object. A per-runner choice also stays
   *out* of the bags: recording it there is how a second runner inherits the first
-  one's answer, which is exactly the bug `linear_attn_backends` replaced. The one sanctioned bend in that rule is
-  *scoped*: `ModelRunner._load_format_scope` exposes the draft's
-  `--speculative-draft-load-format` through `get_model().override(load_format=...)`
-  for exactly the duration of the draft build, because model construction
-  reads that bag leaf — the override restores on exit, so nothing outlives
-  the scope. When there is a runner in hand, read its
-  stamp; that is a different rule from "read the instance".
+  one's answer, which is exactly the bug `linear_attn_backends` replaced. The two
+  sanctioned bends in that rule are *scoped*. `ModelRunner._load_format_scope`
+  exposes the draft's `--speculative-draft-load-format` through
+  `get_model().override(load_format=...)` for exactly the duration of the draft
+  build, because model construction reads that bag leaf — the override restores
+  on exit, so nothing outlives the scope. The shared-expert layout is another scoped view:
+  `get_model().shared_experts` selects the immutable `SharedExpertsConfig` owned
+  by the loaded model (`model.shared_experts_config`). The loader binds it for
+  construction, and runners bind it for execution, warmup and graph capture.
+  Both the fused count and ordinary TopK slot count belong to this object;
+  neither is a separately mutable flag. A scope selects a built layout and
+  restores the previous reference on exit, including exceptions. It cannot
+  resize weights, buffers or a captured graph. When the model is in hand, read
+  its owned config directly (as the routed-experts capturer does).
 - **Per-instance boundaries** — the tokenizer-manager family, everything under
   `entrypoints/`, and the tokenizer-process multimodal processors read the bags.
   The old justification for keeping them on `self.server_args` ("several
@@ -178,8 +184,8 @@ bag to override at all.
 
 ### Four ways a config sweep breaks something no test runs
 
-Each of these shipped in a review round and cost a real defect; each now has a
-guard, named here so the next sweep checks the same four things by hand first.
+Each of these shipped in a review round and cost a real defect. Where a test
+guards one it is named; the next sweep checks all four by hand first.
 
 1. **The other implementations of an interface.** Dropping a parameter means
    auditing implementers, not just callers: `CustomSpecAlgo` is the plugin
@@ -191,7 +197,8 @@ guard, named here so the next sweep checks the same four things by hand first.
    `publish` says nothing about whether a given read runs before it. Spawned
    workers (`MMEncoder` for encoder DP/TP, the Ray scheduler actor) start with
    an empty context, so a bag read above the publish raises only there.
-   Guard: `test_publish_precedes_bag_reads.py`.
+   Guarded on the launch path only (`test_pre_publish_readers.py`); other
+   entries, spawned workers included, are checked by review.
 3. **The role namespace a process publishes under.** `ROLE_NAMESPACE_SETS`
    narrows what each role may read; the DP controller is audited for `exec`
    alone. A helper that reaches for another namespace passes every default-mode
@@ -201,7 +208,9 @@ guard, named here so the next sweep checks the same four things by hand first.
    means enumerating the others: HTTP, gRPC and in-process `Engine` each have
    their own server-info and model-info, and each passes its own tests while
    its users lose the field.
-   Guard: `test_effective_state_surfaces.py`.
+   Guarded for server info across HTTP, both gRPC roles and the Rust frontend
+   (`TestServerInfoTransportParity` in `entrypoints/test_server_info.py`);
+   `Engine.get_server_info` and model info are checked by review.
 
 A fifth, from the same rounds: the accessor **name itself**. Called as an
 object member (`manager.get_disagg()`), or shadowed by a same-named import
@@ -223,12 +232,13 @@ slack (`>= len(...) - 1`) or compared key names instead of value sources.
 
 ### `get_parallel()`: one spelling per name
 
-**There is no `.config` hop.** Ranks and group handles are `@property`
-read-through over the canonical getters, so they answer with the live process
-groups. Everything else — `tp_size`, `pp_size`, `attn_cp_size`, `dcp_size`,
-`moe_dp_size` included, alongside config-only leaves like `nccl_port`,
-`dp_size`, `ep_size`, `dwdp_size` — is answered from the
-published `parallel` bag. Reading a leaf before publish raises a `ValueError`
+**There is no `.config` hop.** `ParallelContext._read` answers every name in
+one order: a scoped override, then a permanent stamp, then the published
+`parallel` bag leaf. `publish` stamps ranks from the launcher; distributed init
+stamps group handles and validates their widths. Configured widths such as
+`tp_size`, `pp_size`, `attn_cp_size`, `dcp_size` and `moe_dp_size`, and config-only
+leaves such as `nccl_port`, `dp_size`, `ep_size` and `dwdp_size`, fall back to the
+published bag. Reading a config leaf before publish raises a `ValueError`
 naming the namespace; an unknown name is an `AttributeError`.
 
 A size reads from the configuration because the groups are built at exactly the
@@ -245,37 +255,32 @@ configured widths — checked at every assignment to `_TP` / `_PP` / `_ATTN_CP` 
   coordinators keep their construction width. Those are different names, not two
   answers to one name.
 
-DCP keeps its own pair: `get_parallel().attn_dcp_size` / `.dcp_enabled` answer the
-*effective* topology (`1` / `False` with no group installed), while `dcp_size` is
+DCP keeps its own pair: `get_parallel().attn_dcp_size` / `.dcp_enabled` are derived
+from the published configuration unless explicitly overridden; `dcp_size` is
 what the launch requested.
 
 A process-global seed field-read of one of these sizes
 (`get_server_args().tp_size`, or an alias of it) is a read-ratchet failure. A
 `server_args` the object was *handed* is a different thing and not a ratchet
 matter — see "Reads that legitimately stay on a ServerArgs instance".
-Fail-loud is narrower: before dist init, a live *rank/group* read raises. The six
+Fail-loud is narrower: an unstamped rank or group handle with no declared default
+raises; ranks are available after publish, before dist init. The six
 parallel quotients are not live reads at all — `attn_tp_size`, `attn_dp_size`,
 `attn_dcp_size`, `moe_ep_size`, `moe_tp_size`, `dcp_enabled` are a function of the
 configured leaves, computed once at publish into bag leaves, and answered
 override → stamp → published leaf. So `dcp_enabled` means "the launch configured
-DCP" (`dcp_size > 1`), not "a DCP group is installed here"; in a scheduler the
-stamp makes the two identical, in a process that publishes without dist init they
-differ. `test_a_topology_is_stated_by_naming_the_width` and its neighbours in
-`test_runtime_context.py` pin this; they replaced
+DCP" (`dcp_size > 1`), not "a DCP group is installed here". Normal distributed
+initialization builds the groups to match the configured widths; it does not
+restamp these DCP leaves. `test_a_topology_is_stated_by_naming_the_width` and its
+neighbours in `test_runtime_context.py` pin this; they replaced
 `test_attn_dcp_defaults_when_group_is_uninitialized`. One consequence for tests:
 overriding a leaf no longer moves its quotient — state a topology by publishing a
 config, or by naming the width. After init,
 only the DCP group is optional (`_DCP` exists only when `dcp_size > 1`; attn-CP and
-moe-DP always install, as size-1 aliases if unused). The `config` hop is
-deliberately dynamo-traceable (a plain property over a slot, no
-`object.__getattribute__`); gate helpers like `enable_moe_dense_fully_dp()` run inside
+moe-DP always install, as size-1 aliases if unused). Bare parallel leaf reads are
+dynamo-traceable; gate helpers like `enable_moe_dense_fully_dp()` run inside
 compiled model forwards (`test_parallel_config_leaves_trace_under_torch_compile` pins
 this).
-
-A third surface carries the same names: `ParallelState` (`self.ps` / `mr.ps`), the
-frozen per-process snapshot built once in `Scheduler.__init__` from these configured
-sizes plus this process's ranks, and handed down (draft runners included). Prefer it
-where an object was handed one; it is not a global accessor.
 
 ### Reading config: the seed is off limits
 
@@ -322,12 +327,13 @@ where an object was handed one; it is not a global accessor.
   follows a post-publish override. Two questions are *not* that, and have their
   own spelling: the width of the MoE communicator you are about to collectively
   operate on is `get_moe_cp_size()` (the `_MOE_DP = _ATTN_CP` alias makes it
-  differ), and the effective DCP topology is `get_parallel().attn_dcp_size` /
-  `.dcp_enabled` (`1` / `False` when no group is installed), which does not need
-  dist init to answer.
+  differ), and DCP's derived width and enablement are
+  `get_parallel().attn_dcp_size` / `.dcp_enabled` (published configuration
+  unless explicitly overridden).
 - **this runner's resolved value** → the runner
   (`prefill_attention_backend_str`, `kv_cache_dtype_str`,
-  `draft_attention_backend`, `num_fused_shared_experts` on the model).
+  `draft_attention_backend`); for what the model's layers bake in at
+  construction, the layer (`num_fused_shared_experts` on a MoE block).
 
 `self.server_args.field` is still right for handed per-instance config (see
 "Reads that legitimately stay on a ServerArgs instance" above for the full set —
@@ -335,10 +341,9 @@ per-instance boundaries and whole-object passes; there are no per-runner config
 copies to read any more). The allow-list is `GrammarManager` and `MMEncoder`;
 what sits beside it is residue, not a family — and not for one single reason:
 
-- the tokenizer-manager family and `entrypoints/` **read the bags**; what is
-  left of them in the exposure ratchet is a handful of individually-dispositioned
-  pairs, not a family awaiting conversion. Read the ratchet for the current set
-  rather than assuming a directory is off-limits;
+- the tokenizer-manager family and `entrypoints/` **read the bags**; review a new
+  instance read there against the raw-input contract rather than assuming a
+  directory is off-limits;
 - `GrammarManager` is a handed instance for its residual `self.server_args`
   reads, but backend selection is **not** on the instance any more:
   `create_grammar_backend` reads `get_exec().kernel.grammar_backend`, and
@@ -384,15 +389,15 @@ if you do it, say so in the test.
 
 ### Mid-resolution reads (inside the pipeline only)
 
-Resolution runs in `__post_init__` and **writes nothing onto the record**: a
-handler declares (`self._declare` / `declare_resolution`), the declaration goes
+Resolution runs in `ServerArgs.resolve_once` and **writes nothing onto the record**: a
+handler declares (`declare_resolution`), the declaration goes
 into the stash, and the fields keep what the caller passed. So a mid-resolution
 read of a field answers with the *raw input* — every reader in the pipeline goes
 through a view instead:
 
-- `resolving_view(server_args)` / `self._resolved()` — the live view (walks the
+- `resolving_view(server_args)` — the live view (walks the
   stash per read). This is what handlers and hooks bind, conventionally as
-  `cfg = resolving_view(self)` at the top of the handler.
+  `cfg = resolving_view(server_args)` at the top of the handler.
 - `resolved_view(server_args)` — snapshots the overlay when built, which is what
   a post-process pass wants: it reads the state at *its* slot.
 
@@ -451,13 +456,18 @@ Never assign `server_args` fields from model code. Declare instead
   its checkpoint drives (shared-experts fusion) is a question the *loader* asks
   the model class — `shared_experts_fusion_disable_reason(hf_config,
   quant_config)`, a classmethod answering without an instance — at the single
-  model-instantiation point, and
-  `install_shared_experts_fusion_decision` writes the answer to the ACTIVE moe
-  flag before that model's layers build and read it
-  (`is_shared_experts_fusion_disabled`, config-intent fallback).
-  `draft_model_build_scope` brackets every draft build and routes the draft's
-  answer to the speculative leaf, so a draft's decision never overwrites the
-  target's. A process-level load-time fact (the sm80 dtype fallback —
+  model-instantiation point, together with how many shared experts it fuses
+  (`num_fusable_shared_experts(hf_config)`; an entry class without both hooks
+  fuses none). `resolve_shared_experts_config` returns one immutable config;
+  the loader scopes it through `get_model().override(shared_experts=config)`
+  while building and retains it on the resulting model. `num_shared_topk_slots`
+  derives from the fused count and frozen Waterfill policy, so ordinary routing
+  and Waterfill cannot both claim the shared slots. `TopK`/`HashTopK` retain the
+  same config; `top_k` counts only routed experts at construction.
+  `draft_model_build_scope` still selects draft boundary/MMA preferences; it
+  does not save shared-expert flags. Target and draft each own their layout.
+  These values have model lifetime, so they do not belong in `get_forward()`.
+  A process-level load-time fact (the sm80 dtype fallback —
   device-driven, identical for every runner) records directly via
   `get_context().override`.
 
@@ -466,12 +476,12 @@ dataclass. A declaration against a non-whitelisted field fails at its slot.
 
 ### Load-time vs resolution-time (critical)
 
-`__post_init__` runs in the launcher process before any model/platform import. Logic that
+`ServerArgs.resolve_once` runs in the launcher process before any model/platform import. Logic that
 consults an **extensible registry** (e.g. out-of-tree platforms registering attention
 backends in `init_backend()`, which runs at `model_runner` import) must stay at load time
 (ModelRunner init), writing through `get_context().override()`. Before moving any
 load-time logic into resolution, verify everything it reads is already complete at
-construction time.
+resolution time.
 
 ## Runtime flags (`get_flags()`)
 
@@ -499,8 +509,8 @@ Named slots + two keyed-lazy registries:
   side stream is `"lora_side"`. Two call sites may share a name only if their work belongs
   on one stream — sharing across roles serializes intended overlap.
 - `get_buffer(name, factory)` — get-or-create a named persistent buffer. Grow-only or
-  per-device semantics manage their `resources.buffers` entries directly (see tokenspeed /
-  SM120 split / Marlin workspace). Buffer names are per-backend today; do not silently
+  per-device semantics manage their `resources.buffers` entries directly (see SM120
+  split / Marlin workspace). Buffer names are per-backend today; do not silently
   share.
 - Singletons with manager semantics (EP dispatcher buffers, EPLB recorder/metadata, graph
   memory pool) keep their owning accessors/classes as facades; only the *state* lives in a
@@ -543,8 +553,9 @@ ONE thread — do not design for TBO threads that don't exist.
   them explicitly on the mock; `MagicMock(spec=...)` raises on attributes that only
   exist post-`__init__`, which is the fastest way to find a missed stub.
 - `reset_context()` in teardown when a test publishes outside a scoped override.
-- `ServerArgs(model_path="dummy")` early-returns the pipeline (few declarations, no
-  strict guard) — fine for lightweight fixtures.
+- `ServerArgs(model_path="dummy")` resolves through the pipeline's early return (few
+  declarations) — fine for lightweight fixtures. The strict guard still applies once
+  `resolve_once` has run, as it does at `publish`.
 - **Asserting what resolution decided reads `resolution_result(sa, "field")`**, not
   `sa.field`: the field is the raw input. Assert the field only when the point of
   the case *is* that the record stayed pristine (the FA4 page-size and waterfill
@@ -553,7 +564,7 @@ ONE thread — do not design for TBO threads that don't exist.
   pytest run lets a context published by an earlier file mask a missing-publish bug in a
   later one.
 
-## Guardrails (these fail CI; what to do when they fire)
+## Guardrails and review rules
 
 1. **Strict mutation guard** (always on, and with no exception): bare
    `server_args.x = ...` after resolution raises unconditionally in
@@ -563,10 +574,9 @@ ONE thread — do not design for TBO threads that don't exist.
    resolved config with `get_context().override`; hand a per-runner value to its
    runner as a constructor argument. Projected bags are sealed the same way (leaf
    assignment raises).
-2. **Mutation ratchet** (`test_server_args_mutation_ratchet.py`, exact pin 0 over the whole
-   package minus the pipeline / multimodal_gen): textual scan for assignment forms. Never
-   raise the baseline.
-3. **No-copy contract** (`test_server_args_no_instance_mutation_entry.py`): neither
+2. **No textual mutation ratchet**: the strict guard above is the only mutation
+   check.
+3. **No-copy contract** (review only, no automated guard): neither
    `ServerArgs.override` nor `ServerArgs.derive` exists, and nothing in the package
    calls either form. Rerouting a writer to the bags means flipping **all its readers
    in the same commit** (no transitional dual-write).
@@ -577,23 +587,23 @@ ONE thread — do not design for TBO threads that don't exist.
    runner's stamp — not `get_server_args().field`, which the read ratchet below pins
    at zero. `runtime_context.get_server_args()` is only for the
    whole-object shapes (dumps, provenance, a hand-off to a callee that takes a config).
-5. **Global config read ratchet** (`test_global_config_read_ratchet.py`): baselines are
-   **0** for both the direct `get_server_args().field` and the alias form (function-local
+5. **Global config read check** (`test_global_config_read_ratchet.py`): no business code
+   reads a field off `get_server_args()`, directly or through an alias (function-local
    — including local copies of an alias, `cfg = sa` — module-level, or parked on an
    instance attribute, plus the `getattr(..., "field")` spelling of each; a name
-   computed at runtime or indirection deeper than a local name copy is census-tool
-   territory, per the test's docstring). The scanner matches `get_server_args` by its
+   computed at runtime or indirection deeper than a local name copy is outside the
+   check, per the test's docstring). The scanner matches `get_server_args` by its
    literal name — bare or module-qualified (`ctx.get_server_args()`) — and
    `TestNoRenamedAccessorImports` in the same file *bans* `import ... as` renames of it,
    which is what makes literal-name matching sound. Exempt by owner
    module only (`runtime_context.py`, `server_args.py`, `arg_groups/`). Two classes,
-   no more: `TestGlobalConfigReadRatchet` holds the two baselines and
+   no more: `TestGlobalConfigReads` holds the zero check and
    `TestNoRenamedAccessorImports` holds the ban. There is no configured-size registry
    here any longer — `get_parallel()` has one spelling per name, so a size read is not a
    choice between two answers and nothing needs registering.
-6. **Module-state ratchet** (`test_module_state_ratchet.py`): `global` statements in the
-   flag-owning layers are pinned by name. A new module-level runtime global belongs on a
-   flags group / resources slot instead; migrating a pinned survivor must shrink the pin.
+6. **Module-state rule** (review only, no automated guard): a new module-level
+   runtime global in the flag-owning layers belongs on a flags group / resources slot
+   instead.
 7. **Namespace coverage** (`test_server_args_namespaces.py`,
    `test_runtime_context_config_bags.py`): every `ServerArgs` field resolves to a
    namespace — from the `arg_groups/fields/` class that declares it — and the
@@ -649,8 +659,7 @@ Key source files: `python/sglang/srt/runtime_context.py` (the container, every t
 `python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
 `declare_resolution` and the spellings around it), `python/sglang/srt/server_args.py` (`NS` metadata,
 `Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
-`test/registered/unit/` (`test_server_args_mutation_ratchet.py`,
-`test_global_config_read_ratchet.py`,
-`test_module_state_ratchet.py`, `test_server_args_namespaces.py`,
+`test/registered/unit/` (`test_global_config_read_ratchet.py`,
+`test_server_args_namespaces.py`,
 `test_runtime_context.py` — the last one doubles
 as executable documentation of every tier's semantics).

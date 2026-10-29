@@ -733,5 +733,88 @@ def test_topk_v2_split_duplicate_scores(batch: int, seq: int, nvals: int) -> Non
         _assert_topk_values(scores[row], out[row], k)
 
 
+@pytest.mark.skipif(not is_hip(), reason="ROCm zero-candidate overflow shortcut")
+@pytest.mark.parametrize("k", [1024, 2048])
+@pytest.mark.parametrize(
+    "batch,seq",
+    [
+        (8, 8192),  # Register2
+        (8, 16384),  # Register4
+        (68, 65536),  # Streaming: below this batch's split floor
+        (56, 262400),  # Split: late values land in the last long chunk
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_zero_candidates_graph_replay(batch: int, seq: int, k: int) -> None:
+    """Only a proven all-+0 candidate bucket may bypass overflow refinement.
+
+    The row itself is not constant: k-1 positive scores are above the bucket,
+    and negative scores are below it. More than 2048 +0 candidates precede
+    the final positions, where a small positive value must win the last slot.
+    These positions are also late within the last split chunk; atomic staging
+    order is deliberately not assumed. Reuse one graph across +0, nonzero,
+    and +0 inputs to exercise the persistent split counters as well.
+    """
+    device = "cuda"
+    scores_cpu = torch.zeros((batch, seq), dtype=torch.float32)
+    scores_cpu[:, : k - 1] = 2.0
+    scores_cpu[:, k + 128 : k + 640] = -1.0
+    assert (scores_cpu[0] == 0).sum() > 2048
+    scores = scores_cpu.to(device)
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    page_table = (
+        torch.arange((seq + PAGE_SIZE - 1) // PAGE_SIZE, device=device)
+        .to(torch.int32)
+        .expand(batch, -1)
+        .contiguous()
+    )
+    metadata = _plan(lengths)
+    out = torch.full((batch, k), -2, dtype=torch.int32, device=device)
+
+    def transform():
+        topk_transform_paged_v2(scores, lengths, page_table, out, PAGE_SIZE, metadata)
+
+    # Compile and initialize persistent scratch outside graph capture.
+    for _ in range(3):
+        transform()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        transform()
+
+    # Both positives round to binary16 +0 but must survive exact fp32 ranking.
+    # Write bits directly so CPU DAZ/FTZ cannot erase the subnormal test input.
+    scores_cpu_bits = scores_cpu.view(torch.int32)
+    for late_bits, negative_zero in [
+        (0, False),
+        (0x31800000, False),  # 2**-28
+        (0, False),
+        (1, False),  # smallest positive fp32 subnormal
+        (0, False),
+        (0, True),
+        (0, False),
+        (0x31800000, True),
+        (0, False),
+    ]:
+        scores_cpu_bits[:, -2] = -2147483648 if negative_zero else 0
+        scores_cpu_bits[:, -1] = late_bits
+        scores.copy_(scores_cpu)
+        assert torch.equal(
+            scores[:, -2:].view(torch.int32).cpu(),
+            scores_cpu[:, -2:].view(torch.int32),
+        )
+        out.fill_(-2)
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        # Identity page mapping makes outputs raw indices. The CPU oracle
+        # preserves subnormals and permits any legal, unique equal-score set.
+        out_cpu = out.cpu()
+        if late_bits != 0:
+            assert (out_cpu == seq - 1).any(dim=1).all()
+        for row in range(batch):
+            _assert_topk_values(scores_cpu[row], out_cpu[row], k)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

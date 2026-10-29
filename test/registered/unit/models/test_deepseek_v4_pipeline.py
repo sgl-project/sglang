@@ -11,7 +11,7 @@ from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.deepseek_common import moe_transport
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestPipelineCompletion(unittest.TestCase):
