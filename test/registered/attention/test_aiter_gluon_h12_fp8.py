@@ -478,6 +478,19 @@ class TestFp8QAsmSelection(CustomTestCase):
             with self.subTest(qlen=qlen):
                 self.assertFalse(self._selected(verify_qlen=qlen))
 
+    def test_folded_window_is_opt_in(self):
+        self.assertEqual(envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.get(), 4)
+        for qlen in (5, 8):
+            with self.subTest(qlen=qlen):
+                self.assertTrue(self._selected(verify_qlen=qlen, max_verify_qlen=8))
+        self.assertFalse(self._selected(verify_qlen=8, max_verify_qlen=7))
+
+    def test_rejects_window_beyond_the_fold(self):
+        for max_qlen in (0, 9):
+            with self.subTest(max_qlen=max_qlen):
+                with self.assertRaises(ValueError):
+                    self._selected(max_verify_qlen=max_qlen)
+
     def test_requires_gfx950_h12_zero_pad_fp8(self):
         for override in (
             dict(gfx95=False),

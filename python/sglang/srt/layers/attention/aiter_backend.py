@@ -111,6 +111,8 @@ _use_fp8_prefill_attn = (
 
 # Max qlen limitation of the asm ps kernels to handle q with bf16 dtype
 _MLA_ASM_PS_MAX_QLEN = 4
+# 16 padded heads times the window must fit aiter's 128-row fold.
+_MLA_FP8_Q_ASM_FOLD_MAX_QLEN = 8
 
 
 def _fp8_q_asm_mla_selected(
@@ -124,9 +126,15 @@ def _fp8_q_asm_mla_selected(
     dcp_world_size: int,
     verify_qlen: int,
     gfx95: bool,
+    max_verify_qlen: int = _MLA_ASM_PS_MAX_QLEN,
 ) -> bool:
     # The native 16-head fp8-Q kernel covers up to _MLA_ASM_PS_MAX_QLEN tokens;
-    # a wider verify window is remapped onto a slower kernel and stays on Gluon.
+    # a wider window folds onto the 32-head kernel, which wins only at long context.
+    if not 1 <= max_verify_qlen <= _MLA_FP8_Q_ASM_FOLD_MAX_QLEN:
+        raise ValueError(
+            f"fp8-Q asm MLA max verify qlen must be in "
+            f"[1, {_MLA_FP8_Q_ASM_FOLD_MAX_QLEN}], got {max_verify_qlen}"
+        )
     return (
         enabled
         and num_head == 12
@@ -136,7 +144,7 @@ def _fp8_q_asm_mla_selected(
         and verify_backend == "asm"
         and dcp_world_size <= 1
         and gfx95
-        and 1 <= verify_qlen <= _MLA_ASM_PS_MAX_QLEN
+        and 1 <= verify_qlen <= max_verify_qlen
     )
 
 
@@ -739,11 +747,12 @@ class AiterAttnBackend(AttentionBackend):
                 dcp_world_size=self.dcp_world_size,
                 verify_qlen=self.num_draft_tokens or 1,
                 gfx95=is_gfx95_supported(),
+                max_verify_qlen=envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.get(),
             )
             if self.use_mla_fp8_q_asm:
                 logger.info(
                     "aiter MLA: decode/verify use the FP8-Q ASM kernel (qlen<=%s)",
-                    _MLA_ASM_PS_MAX_QLEN,
+                    envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.get(),
                 )
 
             use_any_mla_persist = self._mla_ps_kernel_enabled() or self.use_mla_dcp_asm
