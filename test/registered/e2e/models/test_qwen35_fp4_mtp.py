@@ -14,9 +14,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=720, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=670, stage="base-c", runner_config="4-gpu-b200")
 
-QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
+QWEN35_FP4_MODEL = "nvidia/Qwen3.5-122B-A10B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}
 
 MTP_BASE_ARGS = [

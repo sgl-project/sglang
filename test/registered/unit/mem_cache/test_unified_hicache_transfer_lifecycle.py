@@ -46,19 +46,24 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _swa_allocation_callbacks,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import build_tri_pool
+from sglang.test.tree_slots import tree_slots_of
+from sglang.test.unified_allocator_fixtures import (
+    build_test_unified_pools,
+    build_tri_pool,
+    pin_every_band,
+)
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 PAGE = 4
 D2H = ("controller", "write")
@@ -83,7 +88,7 @@ def _rust_inspector(params, _components):
 
 
 def _unified_swa_bundle(*, tokens: int = 64):
-    return init_unified_swa_pools(
+    return build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,
@@ -116,14 +121,14 @@ class _Rows:
 
     def __init__(self, bundle):
         self.allocator = bundle.token_to_kv_pool_allocator
-        self.full = bundle.token_to_kv_pool.full_kv_pool.get_key_buffer(0)
-        self.swa = bundle.token_to_kv_pool.swa_kv_pool.get_key_buffer(0)
+        self.full = bundle.token_to_kv_pool.layer_router.view("full").get_key_buffer(0)
+        self.swa = bundle.token_to_kv_pool.layer_router.view("swa").get_key_buffer(0)
 
     def full_rows(self, ids: torch.Tensor) -> torch.Tensor:
-        return self.allocator.full_attn_allocator.translate_kv_loc(ids.to(torch.int64))
+        return self.allocator.full_attn_allocator.ids.translate(ids.to(torch.int64))
 
     def swa_rows(self, ids: torch.Tensor) -> torch.Tensor:
-        return self.allocator.translate_loc_from_full_to_swa(ids)
+        return self.allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(ids)
 
     def markers(self, base: int, count: int) -> torch.Tensor:
         # One value per token row; float16 holds these integers exactly.
@@ -166,15 +171,17 @@ def _recorded_stream():
 
 def _record_moves(allocator, log: list) -> None:
     """Log every compaction copy on either side into `log`, then perform it."""
-    for side in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
-        kvcache = side._kvcache
-        move = kvcache.move_physical_pages
+    arena = allocator.arena
+    move = arena.move_units
+    sides = {allocator.full_attn_allocator.sub_pool_name}
+    sides.add(allocator.swa_attn_allocator.sub_pool_name)
 
-        def recorded(dst, src, page_size, *, move=move, name=side.sub_pool_name):
+    def recorded(name, dst, src):
+        if name in sides:
             log.append(("move", name))
-            return move(dst, src, page_size)
+        return move(name, dst, src)
 
-        kvcache.move_physical_pages = recorded
+    arena.move_units = recorded
 
 
 class _ConfigCase(unittest.TestCase):
@@ -238,7 +245,7 @@ class TestFloatSwaReservation(_ConfigCase):
     ):
         bundle, allocator = build_tri_pool(page_size=PAGE)
         full, swa = allocator.full_attn_allocator, allocator.swa_attn_allocator
-        states = bundle.req_to_token_pool.mamba_allocator
+        states = allocator.state_slots
         mamba = allocator.mamba_allocator
         resident = allocator.alloc(4 * PAGE)
         # The Mamba end is full: its next slot needs the float to move.
@@ -408,7 +415,9 @@ class _UnifiedHiCacheCase(_ConfigCase):
             page_size=PAGE,
             disable=False,
             sliding_window_size=self.window,
-            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            tree_slots=tree_slots_of(
+                (ComponentType.FULL, ComponentType.SWA), window=self.window
+            ),
         )
         with mock.patch.dict(
             _TREE_CORE_REGISTRY, {"python": _python_inspector, "rust": _rust_inspector}
@@ -420,10 +429,9 @@ class _UnifiedHiCacheCase(_ConfigCase):
         atexit.unregister(cache.shutdown)
         self.addCleanup(cache.release_host_resources)
         controller = cache.cache_controller
-        # The scheduler's gate: rows stay put until host copies are acknowledged.
-        self.allocator.set_host_transfer_move_gate(
-            lambda: not controller.has_inflight_device_transfers()
-        )
+        # The scheduler's pin source: rows stay put until host copies are
+        # acknowledged.
+        pin_every_band(self.allocator, controller.has_inflight_device_transfers)
         self.cache = cache
         self.controller = controller
         # Compaction and frees wait through this stand-in stream.

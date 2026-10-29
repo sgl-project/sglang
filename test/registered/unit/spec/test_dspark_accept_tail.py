@@ -13,7 +13,7 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 BS, STRIDE, VOCAB = 3, 5, 50
@@ -136,6 +136,11 @@ class _NoSiteTpSync(_RecordingTpSync):
         return False
 
 
+class _AllSitesTpSync(_RecordingTpSync):
+    def enabled(self, site):
+        return True
+
+
 def _verify_out(logits):
     # A static verify graph's output always carries the target hidden states.
     return SimpleNamespace(
@@ -195,16 +200,26 @@ class TestFusedStaticAcceptTail(CustomTestCase):
 
     def test_accept_site_broadcast_keeps_separate_ops(self):
         # Rank 0's results are broadcast between the ops; one kernel would skip it.
-        class _AllSites(_RecordingTpSync):
-            def enabled(self, site):
-                return True
-
-        sync = _AllSites()
+        sync = _AllSitesTpSync()
         epilogue = self._static_accept(fused=True, simulated=None, tp_sync=sync)
         self.assertFalse(epilogue._serves_accept_tail(BS))
         self.assertEqual(
             [site for site, _ in sync.calls], [SpecTpSyncSite.DSPARK_ACCEPT_GRAPH] * 3
         )
+
+    def test_accept_site_broadcast_keeps_separate_ops_under_simulate_fold(self):
+        # A simulated run keeps the separate ops that real serving runs here.
+        epilogue = DsparkVerifyEpilogue(
+            max_bs=BS + 1,
+            verify_num_draft_tokens=STRIDE,
+            device="cpu",
+            tp_sync=_AllSitesTpSync(),
+            simulated_correct_len=torch.tensor([1]),
+            simulate_fold=True,
+            fused_accept_tail=True,
+        )
+        self.assertTrue(epilogue.simulate_fold)
+        self.assertFalse(epilogue._serves_accept_tail(BS))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
