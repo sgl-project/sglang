@@ -54,7 +54,8 @@ class ChainAdmissionRules(msgspec.Struct, frozen=True, kw_only=True):
     """
 
     window: Literal["none", "split", "joint"]
-    # Full-token equivalents one new state slot takes from the shared bytes; 0: no state.
+    # FULL-token conversion used only by fixed/split admission. Joint policies
+    # keep raw state slots and do not use this conversion.
     state_slot_cost: int = 0
 
 
@@ -109,17 +110,6 @@ class _InterimPolicy:
             c, tree_cache, num_tokens
         )
 
-    def mamba_full_cache_donor(self, c: ChainAllocator):
-        return None
-
-    def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
-        """Each sub-pool's (capacity, available units) as observers report
-        them, by sub-pool name: tokens, or slots for a state sub-pool."""
-        raise NotImplementedError
-
-    def memo_violations(self, c: ChainAllocator) -> List[str]:
-        return []
-
     def prefill_state_fits(
         self,
         c,
@@ -171,6 +161,26 @@ class _InterimPolicy:
             + min(b.min_page * b.page_bytes for b in snapshot.bands)
             <= snapshot.total_bytes
         )
+
+    def _state_slot_cost(self, c: ChainAllocator) -> int:
+        """Logical token equivalents of one state slot in the shared arena."""
+        token_page_bytes = sum(
+            band.entry_bytes_per_page for band in (c.full_attn_allocator, *c._windows)
+        )
+        return -(
+            -c.mamba_allocator.entry_bytes_per_page * c.page_size // token_page_bytes
+        )
+
+    def mamba_full_cache_donor(self, c: ChainAllocator):
+        return None
+
+    def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
+        """Each sub-pool's (capacity, available units) as observers report
+        them, by sub-pool name: tokens, or slots for a state sub-pool."""
+        raise NotImplementedError
+
+    def memo_violations(self, c: ChainAllocator) -> List[str]:
+        return []
 
 
 class _OwnerEndPolicy(_InterimPolicy):
@@ -230,18 +240,6 @@ class _OwnerEndPolicy(_InterimPolicy):
             else 0,
         )
 
-    def _state_slot_cost(self, c: ChainAllocator) -> int:
-        """Full-token-equivalents of shared-gap bytes ONE mamba state consumes; the
-        prefill planner reserves this so admission stays inside the JOINT budget,
-        rounded UP. The `dcp_size` factor is there because that budget is in widened
-        tokens, one of which is `entry_bytes / dcp_size` local bytes.
-        """
-        return -(
-            -c.mamba_allocator.entry_bytes_per_page
-            * get_parallel().attn_dcp_size
-            // c.full_attn_allocator.entry_bytes
-        )
-
 
 class _WindowPolicy(_InterimPolicy):
     """A window band binds the owner's virtual pages: the joint views."""
@@ -262,8 +260,14 @@ class _WindowPolicy(_InterimPolicy):
         legacy_capacities = full_max_total_num_tokens is not None
         self._empty_shared_gap_bytes = fa._current_gap_bytes()
         if legacy_capacities:
-            self._size_full = int(full_max_total_num_tokens)
-            self._size_swa = int(swa_max_total_num_tokens)
+            # Sizing supplies physical rows per rank. All policy capacity and
+            # usage views count the widened logical tokens the bands allocate.
+            self._size_full = (
+                int(full_max_total_num_tokens) * fa.page_size // fa.pool_page_size
+            )
+            self._size_swa = (
+                int(swa_max_total_num_tokens) * sa.page_size // sa.pool_page_size
+            )
         else:
             self._size_full = fa.available_size()
             self._size_swa = min(
@@ -845,12 +849,6 @@ class _FloatChainPolicy(_WindowPolicy):
         c.full_attn_allocator.flush_for_allocation()
         relieve_for_alloc(c.mamba_allocator, target_size)
 
-    def _state_slot_cost(self, c: ChainAllocator) -> int:
-        """Full-token-equivalents one mamba/conv slot removes from the shared buffer:
-        a tri-pool token costs e_f + e_s bytes, and the quotient is rounded UP."""
-        e_tok = c.full_attn_allocator.entry_bytes + c.swa_attn_allocator.entry_bytes
-        return -(-c.mamba_allocator.entry_bytes_per_page // e_tok)
-
     def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
         # State competes for the shared gap too; keep the split token admission
         # plus the state-slot gate until one reservation prices all three.
@@ -862,8 +860,8 @@ class _FloatChainPolicy(_WindowPolicy):
         self, c: ChainAllocator, *, full_capacity, swa_capacity
     ):
         return (
-            (full_capacity, c.conserve_full_available_size()),
-            (swa_capacity, c.conserve_swa_available_size()),
+            (self._size_full, c.conserve_full_available_size()),
+            (self._size_swa, c.conserve_swa_available_size()),
         )
 
     def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
@@ -1150,8 +1148,8 @@ class _MultiWindowPolicy(_WindowPolicy):
 
     def swa_capacity_and_available(self, c, *, full_capacity, swa_capacity):
         return (
-            (full_capacity, c.conserve_full_available_size()),
-            (swa_capacity, c.conserve_swa_available_size()),
+            (self._size_full, c.conserve_full_available_size()),
+            (self._size_swa, c.conserve_swa_available_size()),
         )
 
     def usage(self, c):
