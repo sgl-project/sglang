@@ -2493,6 +2493,7 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
+    SGLANG_GDN_REPLAYSSM_VERIFY_NUM_STAGES = EnvInt(3)
 
     # ===================================================================
     # Plugin system

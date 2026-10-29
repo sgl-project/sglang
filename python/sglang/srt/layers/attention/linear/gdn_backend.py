@@ -586,6 +586,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
         backends = model_runner.linear_attn_backends
+        self._replayssm_verify_num_stages = (
+            envs.SGLANG_GDN_REPLAYSSM_VERIFY_NUM_STAGES.get()
+        )
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = GDNKernelDispatcher(
@@ -2084,6 +2087,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            num_stages=self._replayssm_verify_num_stages,
             block_v=64,
             num_warps=1,
             **({"wait_for_gate_producer": True} if wait_for_gate_producer else {}),
