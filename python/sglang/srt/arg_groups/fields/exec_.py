@@ -545,7 +545,7 @@ class ExecMamba(msgspec.Struct):
     linear_attn_backend: A[
         str,
         Arg(
-            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend. The Helion backend is KDA-only.",
+            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend. The Helion backend is KDA-only. The tlx backend is KDA-only and gfx950-only; its prefill needs a TLX-capable Triton (e.g. ROCm Triton with the uTLX plugin).",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = "triton"

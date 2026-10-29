@@ -456,10 +456,12 @@ def handle_linear_attn_backend(server_args: Any):
                 "EAGLE tree verify. Got "
                 f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
             )
-        if decode not in ("triton", "flashinfer"):
+        # The ring is written by the verify kernel and replayed into the pool on
+        # commit; tlx decode never touches the ring, only the committed state.
+        if decode not in ("triton", "flashinfer", "tlx"):
             raise ValueError(
-                "--enable-linear-replayssm-spec requires the triton or "
-                "flashinfer linear-attn decode backend, got "
+                "--enable-linear-replayssm-spec requires the triton, flashinfer "
+                "or tlx linear-attn decode backend, got "
                 f"--linear-attn-decode-backend={decode!r}."
             )
         from sglang.srt.speculative.ragged_verify import (

@@ -149,10 +149,24 @@ class KDAKernelDispatcher:
             )
 
             self.decode_kernel = FlashInferKDAKernel()
+        elif decode_backend.is_tlx():
+            if not is_hip():
+                raise ValueError("KDA TLX backend requires ROCm")
+            from sglang.kernels.ops.attention.tlx.kda import decode_available
+
+            if decode_available():
+                from sglang.srt.layers.attention.linear.kernels.kda_tlx import (
+                    TlxKDAKernel,
+                )
+
+                self.decode_kernel = TlxKDAKernel()
+            else:
+                self.decode_kernel = triton_kernel
+                rank0_log("TLX KDA decode needs gfx950; falling back to Triton decode.")
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
-                "KDA supports 'triton', 'helion', 'cutedsl', or 'flashinfer'."
+                "KDA supports 'triton', 'helion', 'cutedsl', 'flashinfer', or 'tlx'."
             )
 
         # target_verify kernel, selected via --linear-attn-verify-backend (defaults
@@ -259,12 +273,30 @@ class KDAKernelDispatcher:
                 rank0_log(
                     "NVIDIA KDA prefill needs SM100; falling back to Triton extend."
                 )
+        elif prefill_backend.is_tlx():
+            if not is_hip():
+                raise ValueError("KDA TLX backend requires ROCm")
+            from sglang.kernels.ops.attention.tlx.kda import prefill_available
+
+            if prefill_available():
+                from sglang.srt.layers.attention.linear.kernels.kda_tlx import (
+                    TlxKDAKernel,
+                )
+
+                self.extend_kernel = TlxKDAKernel()
+            else:
+                self.extend_kernel = triton_kernel
+                rank0_log(
+                    "TLX KDA prefill needs gfx950 and a TLX-capable Triton (e.g. "
+                    "ROCm Triton with the uTLX plugin) with async copy enabled; "
+                    "falling back to Triton extend."
+                )
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
                 "KDA supports 'triton', 'helion', 'flashinfer', 'flashkda', 'cutedsl', "
-                "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
-                "SM100, ptx_kda SM100 or SM103)."
+                "'nvidia_kda', 'ptx_kda', or 'tlx' (cutedsl/nvidia_kda prefill need "
+                "SM100, ptx_kda SM100 or SM103, tlx gfx950)."
             )
 
         self.supports_packed_decode = getattr(
@@ -522,7 +554,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # One-shot; emitted at the first fused-decode interception below.
         self._fused_override_notice = (
             "K3 fused KDA decode engaged: --linear-attn-decode-backend "
-            f"{decode_backend} only picks the fallback kernel for shapes "
+            f"{decode_backend.value} only picks the fallback kernel for shapes "
             "the fused kernel does not cover."
         )
         self._fused_chain_verify_fn = None
@@ -857,6 +889,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                         )
 
                 if core_attn_out is not None:
+                    if self._fused_override_notice is not None:
+                        rank0_log(
+                            f"{self._fused_override_notice} "
+                            "SGLANG_ROCM_K3_KDA_FUSED_BACKEND=none disables it."
+                        )
+                        self._fused_override_notice = None
                     layer._k3_onorm_consumed = True
                     self._track_mamba_state_decode(
                         forward_batch,
