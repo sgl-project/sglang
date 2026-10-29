@@ -499,9 +499,9 @@ def _apply_wo_a_bf16_matmul(
         )
         and _hip.wo_a_split_k_allowed()
     )
-    # 8 groups save the einsum's output copy at every prefill row count; 2 and 4
-    # groups keep their measured range
-    cuda_prefill_min_rows = 1 if o.shape[1] == 8 else 4096
+    # 4 and 8 groups save the einsum's output copy at every prefill row count;
+    # 2 groups keep their measured range
+    cuda_prefill_min_rows = 4096 if o.shape[1] == 2 else 1
     if (
         (
             fast_path
