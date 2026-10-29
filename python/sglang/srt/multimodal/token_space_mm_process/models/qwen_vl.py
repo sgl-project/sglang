@@ -4,9 +4,6 @@ from types import MappingProxyType
 
 import torch
 from transformers import BatchFeature
-from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
-    Qwen3OmniMoeProcessorKwargs,
-)
 from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
     Qwen3VLVideoProcessor,
 )
@@ -104,14 +101,12 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
     mm_feature_fields = frozenset(
         {"pixel_values", "pixel_values_videos", "input_features"}
     )
-    media_processor_kwargs_type = None
 
     # Adapted from sglang.srt.multimodal.processors.qwen_vl.QwenVLImageProcessor.__init__;
     # token IDs go to mm_token_expansion_params instead of MultimodalSpecialTokens.
     def __init__(self, hf_config, processor, *, mm_process_config=None):
         self.model_type = hf_config.model_type
         if self.model_type == "qwen3_omni_moe":
-            self.media_processor_kwargs_type = Qwen3OmniMoeProcessorKwargs
             hf_config = hf_config.thinker_config
 
         super().__init__(hf_config, processor, mm_process_config=mm_process_config)
@@ -145,11 +140,8 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         self, processor, *, image_device=None, video_device=None
     ) -> dict:
         """Per-modality options as the HF processor call merges them, plus the config."""
-        kwargs_type = (
-            self.media_processor_kwargs_type or processor.valid_processor_kwargs
-        )
         processor_kwargs = processor._merge_kwargs(
-            kwargs_type,
+            processor.valid_processor_kwargs,
             tokenizer_init_kwargs=processor.tokenizer.init_kwargs,
             return_tensors="pt",
             padding=True,
@@ -164,7 +156,12 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
             image_kwargs["device"] = image_device
             video_kwargs.setdefault("device", image_device)
             # The legacy call's common `device` reaches audio only where HF accepts it.
-            if "device" in kwargs_type.__annotations__["audio_kwargs"].__annotations__:
+            if (
+                "device"
+                in processor.valid_processor_kwargs.__annotations__[
+                    "audio_kwargs"
+                ].__annotations__
+            ):
                 audio_kwargs.setdefault("device", image_device)
         if video_device is not None:
             video_kwargs["device"] = video_device
@@ -366,11 +363,9 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         mm_token_type_ids only when the processor returns them, and no
         video_metadata. A single unpadded request needs no attention_mask.
         """
-        kwargs_type = (
-            self.media_processor_kwargs_type or processor.valid_processor_kwargs
-        )
         text_kwargs = processor._merge_kwargs(
-            kwargs_type, tokenizer_init_kwargs=processor.tokenizer.init_kwargs
+            processor.valid_processor_kwargs,
+            tokenizer_init_kwargs=processor.tokenizer.init_kwargs,
         )["text_kwargs"]
         output = {"input_ids": torch.tensor([input_ids], dtype=torch.long)}
         if text_kwargs.get("return_mm_token_type_ids", False):
