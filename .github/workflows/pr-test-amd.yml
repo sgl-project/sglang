@@ -257,8 +257,12 @@ jobs:
   # the opt-in extra suite.
   call-pr-test-amd-extra:
     name: call-pr-test-amd-extra
-    needs: [check-changes]
+    needs: [check-changes, call-gate]
+    # always() keeps the skipped call-gate on schedule runs from skipping this job.
     if: |
+      always() && !cancelled() &&
+      needs.check-changes.result == 'success' &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
       (github.event_name == 'schedule' || inputs.run_all_tests == true) &&
       !(inputs.target_stage || inputs.target_stage_select)
     strategy:
