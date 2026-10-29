@@ -1,5 +1,3 @@
-"""KV cache event tests for UnifiedRadixCache."""
-
 import unittest
 from array import array
 from unittest import mock
@@ -174,7 +172,6 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
         )
 
     def test_lora_external_ids_separate_adapter_loads(self):
-        """External IDs distinguish loads; routers match tokens and public names."""
         lora_names, _reqs = make_lora_names(
             **{
                 "uuid-a": "adapter-a",
@@ -207,7 +204,6 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
                 for h in self._event_hashes(base)
             ],
         )
-        # Another load of the same public name has distinct external IDs.
         self.assertNotEqual(
             self._event_hashes(store_then_evict("user|uuid-a2")),
             self._event_hashes(lora_a),
@@ -385,7 +381,6 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
         self.assertCountEqual(self._event_hashes(removed_cpu), stored_hashes)
 
     def test_hicache_storage_prefetch_publishes_host_only_suffix(self):
-        """A storage-prefetch refill has no write-through ack to publish it."""
         from sglang.srt.mem_cache.utils import get_hash_str, hash_str_to_int64
 
         cache, _, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -403,7 +398,6 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
         self.assertFalse(result.host_insert_dropped)
         self.assertIsNotNone(result.inserted_host_node)
 
-        # The recorder coalesces the parent-linked pages into one event.
         stored_cpu = self._stored_events(cache, StorageMedium.CPU)
         self.assertEqual(len(stored_cpu), 1)
         self.assertEqual(list(stored_cpu[0].token_ids), tokens)
@@ -441,7 +435,6 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
             [[1, 2], [3, 4]],
         )
 
-        # Both split fragments must be published as one parent-linked batch.
         stored_cpu = self._stored_events(cache, StorageMedium.CPU)
         self.assertEqual(len(stored_cpu), 1)
         self.assertEqual(list(stored_cpu[0].token_ids), [1, 2, 3, 4])

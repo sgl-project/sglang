@@ -59,6 +59,9 @@ def _backend(page_size=_PAGE_SIZE, dcp_size=1, kv_shape=(1024, 1, 576)):
         sliding_window_size=None,
         use_sliding_window_kv_pool=False,
         token_to_kv_pool=pool,
+        kv_layers=types.SimpleNamespace(
+            read=lambda layer_id: types.SimpleNamespace(key=lambda: kv_buffer)
+        ),
         req_to_token=req_to_token,
         device="cpu",
     )

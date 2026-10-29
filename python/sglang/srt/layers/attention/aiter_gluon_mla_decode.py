@@ -105,7 +105,7 @@ class GluonMlaDecode:
         qk_rope_head_dim: int,
     ):
         self.mla_decode_fwd = mla_decode_fwd
-        self.token_to_kv_pool = backend.token_to_kv_pool
+        self.backend = backend
         self.req_to_token = backend.req_to_token
         self.page_size = backend.page_size
         # The first layer that runs this kernel; set on the first forward.
@@ -178,7 +178,7 @@ class GluonMlaDecode:
             )
             self.seq_lens = forward_batch.seq_lens[:bs].to(torch.int32)
             self.cu_seqlens_q = torch.arange(bs + 1, dtype=torch.int32, device=q.device)
-        kv_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_buffer = self.backend.kv_layers.read(layer.layer_id).key()
         kv_buffer = kv_buffer.view(
             -1, self.page_size, kv_buffer.shape[-2], kv_buffer.shape[-1]
         )
