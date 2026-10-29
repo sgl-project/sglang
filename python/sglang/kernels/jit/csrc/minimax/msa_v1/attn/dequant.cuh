@@ -310,26 +310,26 @@ inline void gather_dequant_pair(
   auto PS = SymbolicSize{"payload_page_stride"};
   auto SS = SymbolicSize{"scale_page_stride"};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   TensorMatcher({P, H, kPageSize, kPackedHeadDim})
       .with_strides({PS, kPageSize * kPackedHeadDim, kPackedHeadDim, 1})
       .with_dtype<uint8_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(packed_k)
       .verify(packed_v);
   TensorMatcher({P, H, kPageSize, kScaleGroups})
       .with_strides({SS, kPageSize * kScaleGroups, kScaleGroups, 1})
       .with_dtype<uint8_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(scale_k)
       .verify(scale_v);
-  TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device).verify(global_scale);
-  TensorMatcher({B, M}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(page_table);
-  TensorMatcher({Q, H, kTopK}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(topk);
-  TensorMatcher({Q}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(query_seq_lens);
-  TensorMatcher({Q, H, kTopK, kPageSize, kHeadDim}).with_dtype<uint8_t>().with_device<kDLCUDA>(device).verify(output_k);
-  TensorMatcher({Q, H, kTopK, kPageSize, kHeadDim}).with_dtype<uint8_t>().with_device<kDLCUDA>(device).verify(output_v);
+  TensorMatcher({1}).with_dtype<float>().with_device<kDLGPU>(device).verify(global_scale);
+  TensorMatcher({B, M}).with_dtype<int32_t>().with_device<kDLGPU>(device).verify(page_table);
+  TensorMatcher({Q, H, kTopK}).with_dtype<int32_t>().with_device<kDLGPU>(device).verify(topk);
+  TensorMatcher({Q}).with_dtype<int32_t>().with_device<kDLGPU>(device).verify(query_seq_lens);
+  TensorMatcher({Q, H, kTopK, kPageSize, kHeadDim}).with_dtype<uint8_t>().with_device<kDLGPU>(device).verify(output_k);
+  TensorMatcher({Q, H, kTopK, kPageSize, kHeadDim}).with_dtype<uint8_t>().with_device<kDLGPU>(device).verify(output_v);
 
   const int32_t q_len_per_req = static_cast<int32_t>(q_len_per_req_arg);
   CHECK_HOST(q_len_per_req > 0);
@@ -374,22 +374,22 @@ inline void full_page_dequant(
   auto PS = SymbolicSize{"payload_page_stride"};
   auto SS = SymbolicSize{"scale_page_stride"};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   TensorMatcher({P, kPageSize, kPackedHeadDim})
       .with_strides({PS, kPackedHeadDim, 1})
       .with_dtype<uint8_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(packed);
   TensorMatcher({P, kPageSize, kScaleGroups})
       .with_strides({SS, kScaleGroups, 1})
       .with_dtype<uint8_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(scale);
-  TensorMatcher({1}).with_dtype<float>().with_device<kDLCUDA>(device).verify(global_scale);
-  TensorMatcher({B, M}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(page_table);
-  TensorMatcher({B}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(seq_lens);
-  TensorMatcher({P, kPageSize, kHeadDim}).with_dtype<uint8_t>().with_device<kDLCUDA>(device).verify(output);
+  TensorMatcher({1}).with_dtype<float>().with_device<kDLGPU>(device).verify(global_scale);
+  TensorMatcher({B, M}).with_dtype<int32_t>().with_device<kDLGPU>(device).verify(page_table);
+  TensorMatcher({B}).with_dtype<int32_t>().with_device<kDLGPU>(device).verify(seq_lens);
+  TensorMatcher({P, kPageSize, kHeadDim}).with_dtype<uint8_t>().with_device<kDLGPU>(device).verify(output);
 
   const int64_t batch = B.unwrap();
   CHECK_HOST(batch > 0 && batch <= kMaxFullPageBatch)

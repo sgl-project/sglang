@@ -92,7 +92,7 @@ void shuffle_weighted_sum_cuda(
   static_assert(std::is_same_v<index_t, int32_t> || std::is_same_v<index_t, int64_t>);
   static_assert(kTopK >= 0 && kThreads > 0 && kThreads <= 1024);
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
   auto rows = SymbolicSize{"input_rows"};
   auto tokens = SymbolicSize{"output_rows"};
   auto width = SymbolicSize{"width"};

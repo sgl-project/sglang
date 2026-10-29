@@ -737,24 +737,24 @@ inline void wo_a_fused_run(
   // the attention backend pads to 64 heads and 512 x local heads when it does not.
   SymbolicSize XS0 = {"x_row_stride"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({T, kGroups, kGroupK})  //
       .with_strides({XS0, kGroupK, 1})
       .with_dtype<bf16_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(x);
   TensorMatcher({kGroups, kNOut / kGroups, kGroupK})  //
       .with_dtype<bf16_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(w);
   TensorMatcher({-1, kRopeDim})  //
       .with_dtype<fp32_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(freqs);
   TensorMatcher({T})  //
       .with_dtype<int32_t, int64_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(positions);
   // Exactly one output form: quantized, or the pre-quantization bf16. Both at
   // once would make the epilogue write twice for a result no caller wants.
@@ -763,16 +763,16 @@ inline void wo_a_fused_run(
   if (q.has_value()) {
     TensorMatcher({T, kNOut})  //
         .with_dtype<fp8_e4m3_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(q.value());
     TensorMatcher({kScaleBytes})  //
         .with_dtype<uint8_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(scales.value());
   } else {
     TensorMatcher({T, kNOut})  //
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device_)
+        .with_device<kDLGPU>(device_)
         .verify(y.value());
   }
 

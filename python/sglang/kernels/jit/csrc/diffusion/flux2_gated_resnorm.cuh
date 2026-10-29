@@ -199,7 +199,7 @@ struct Kernel {
     using namespace host;
     auto rows = SymbolicSize{"rows"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({rows, kHidden})
         .with_dtype<bf16_t>()

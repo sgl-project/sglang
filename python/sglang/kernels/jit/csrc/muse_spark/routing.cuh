@@ -293,7 +293,7 @@ void fused_muse_spark_routing(
   SymbolicSize E{"num_experts"};
   SymbolicSize K{"topk"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({T, E}).with_dtype<fp32_t>().with_device(device_).verify(gating_output);
   TensorMatcher({E}).with_dtype<fp32_t>().with_device(device_).verify(bias);

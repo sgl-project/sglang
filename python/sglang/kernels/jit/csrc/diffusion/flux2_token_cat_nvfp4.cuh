@@ -90,7 +90,7 @@ struct Kernel {
     auto rows = SymbolicSize{"rows"};
     auto padded_rows = SymbolicSize{"padded_rows"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({rows, kAttentionHidden}).with_dtype<bf16_t>().with_device(device).verify(attention);
     TensorMatcher({rows, kMlpHidden}).with_dtype<bf16_t>().with_device(device).verify(mlp);

@@ -323,7 +323,7 @@ struct VdnDeltaFactorsKernel {
     auto dtype = SymbolicDType{};
     dtype.set_options<fp32_t>();
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     for (const auto tensor : {A, B, transition, injection, alpha}) {
       dtype.verify(tensor.dtype());
       device.verify(tensor.device());

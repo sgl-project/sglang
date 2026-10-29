@@ -640,7 +640,7 @@ struct MuseSparkNormResidual {
     auto G = SymbolicSize{"gate_dim"};
     auto device_ = SymbolicDevice{};
     H.set_value(kHidden);
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({M, H}).with_dtype<bf16_t>().with_device(device_).verify(branch);
     TensorMatcher({M, H}).with_dtype<fp32_t>().with_device(device_).verify(stream);

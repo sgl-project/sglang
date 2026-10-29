@@ -612,7 +612,7 @@ struct ArSconvNormKernel {
     auto Wd = SymbolicSize{"W"};
     auto W1s = SymbolicSize{"W_minus_1"};
     auto dev = SymbolicDevice{};
-    dev.set_options<kDLCUDA>();
+    dev.set_options<kDLGPU>();
     Wd.set_value(W);
     W1s.set_value(W - 1);
 
@@ -737,7 +737,7 @@ struct ArSconvNormVerifyKernel {
     auto Wd = SymbolicSize{"W"};
     auto W1s = SymbolicSize{"W_minus_1"};
     auto dev = SymbolicDevice{};
-    dev.set_options<kDLCUDA>();
+    dev.set_options<kDLGPU>();
     Wd.set_value(W);
     W1s.set_value(W - 1);
 

@@ -259,7 +259,7 @@ struct NormScaleShiftKernel {
     using namespace host;
     auto N = SymbolicSize{"num_rows"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, kHidden}).with_dtype<bf16_t>().with_device(device).verify(x).verify(y);
     TensorMatcher({kHidden}).with_dtype<bf16_t>().with_device(device).verify(scale).verify(shift);
@@ -298,7 +298,7 @@ struct ScaleResidualNormScaleShiftKernel {
     using namespace host;
     auto N = SymbolicSize{"num_rows"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, kHidden})
         .with_dtype<bf16_t>()
@@ -343,7 +343,7 @@ struct NormScaleShiftFp8Kernel {
     using namespace host;
     auto N = SymbolicSize{"num_rows"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, kHidden}).with_dtype<bf16_t>().with_device(device).verify(x).verify(y);
     TensorMatcher({N, kHidden}).with_dtype<fp8_e4m3_t>().with_device(device).verify(quantized);
@@ -387,7 +387,7 @@ struct ScaleResidualNormScaleShiftFp8Kernel {
     using namespace host;
     auto N = SymbolicSize{"num_rows"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, kHidden})
         .with_dtype<bf16_t>()
@@ -435,7 +435,7 @@ struct BiasScaleResidualNormScaleShiftKernel {
     using namespace host;
     auto N = SymbolicSize{"num_rows"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, kHidden})
         .with_dtype<bf16_t>()
@@ -483,7 +483,7 @@ struct BiasMulAddKernel {
     using namespace host;
     auto N = SymbolicSize{"num_rows"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, kHidden}).with_dtype<bf16_t>().with_device(device).verify(x).verify(residual).verify(y);
     TensorMatcher({kHidden}).with_dtype<bf16_t>().with_device(device).verify(input_bias).verify(gate);
@@ -527,7 +527,7 @@ struct ScaleResidualNormScaleShiftNvfp4Kernel {
     auto N = SymbolicSize{"num_rows"};
     auto NP = SymbolicSize{"num_rows_padded"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, kHidden}).with_dtype<bf16_t>().with_device(device).verify(x).verify(residual).verify(res_out);
     TensorMatcher({kHidden})

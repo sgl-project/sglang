@@ -623,7 +623,7 @@ struct DSV3FusedAGemmKernel {
     auto device = SymbolicDevice{};
     K.set_value(kHdIn);
     N.set_value(kHdOut);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     // mat_a: [num_tokens, hd_in] row-major; output: [num_tokens, hd_out] row-major;
     // mat_b: [hd_in, hd_out] column-major (weight.T), i.e. strides {1, hd_in}.

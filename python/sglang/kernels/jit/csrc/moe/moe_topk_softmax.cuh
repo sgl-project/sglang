@@ -644,7 +644,7 @@ void topk_softmax(
   auto N = SymbolicSize{"num_tokens"};
   auto E = SymbolicSize{"num_experts"};
   auto K = SymbolicSize{"topk"};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   TensorMatcher({N, E}).with_dtype<T>().with_device(device).verify(gating_output);
   TensorMatcher({N, K}).with_dtype<fp32_t>().with_device(device).verify(topk_weights);

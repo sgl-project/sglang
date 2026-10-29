@@ -894,16 +894,16 @@ struct MoeFinalizeAllReduceKernel {
     auto P = SymbolicSize{"num_permuted_rows"};
     auto TK = SymbolicSize{"num_expanded"};
     SymbolicDevice device;
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({T, kHiddenDim})
         .with_strides({kHiddenDim, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLGPU>(device)
         .verify(out);
     TensorMatcher({P, kHiddenDim})
         .with_strides({kHiddenDim, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLGPU>(device)
         .verify(gemm2_out);
     if constexpr (kTopK == 0) {
       CHECK_HOST(P.unwrap() == T.unwrap()) << "plain input must be [num_tokens, hidden]";
@@ -911,10 +911,10 @@ struct MoeFinalizeAllReduceKernel {
       TensorMatcher({T, kTopK})
           .with_strides({kTopK, 1})
           .with_dtype<WeightT>()
-          .template with_device<kDLCUDA>(device)
+          .template with_device<kDLGPU>(device)
           .verify(expert_weights);
       TK.set_value(T.unwrap() * kTopK);
-      TensorMatcher({TK}).with_strides({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(permuted_idx);
+      TensorMatcher({TK}).with_strides({1}).with_dtype<int32_t>().with_device<kDLGPU>(device).verify(permuted_idx);
     }
     CHECK_HOST(add_residual.has_value() == residual_out.has_value());
     if (add_residual.has_value()) {
@@ -922,7 +922,7 @@ struct MoeFinalizeAllReduceKernel {
       TensorMatcher({T, kHiddenDim})
           .with_strides({kHiddenDim, 1})
           .with_dtype<bf16_t>()
-          .with_device<kDLCUDA>(device)
+          .with_device<kDLGPU>(device)
           .verify(add_residual.value())
           .verify(residual_out.value());
     }
@@ -930,43 +930,43 @@ struct MoeFinalizeAllReduceKernel {
       TensorMatcher({T, kHiddenDim})
           .with_strides({kHiddenDim, 1})
           .with_dtype<bf16_t>()
-          .with_device<kDLCUDA>(device)
+          .with_device<kDLGPU>(device)
           .verify(shared_output.value());
     }
     if constexpr (kGatedShared) {
       CHECK_HOST(shared_output.has_value() && shared_gate.has_value());
-      TensorMatcher({T}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(shared_gate.value());
+      TensorMatcher({T}).with_dtype<fp32_t>().with_device<kDLGPU>(device).verify(shared_gate.value());
     }
     if (norm_weight.has_value()) {
       TensorMatcher({kHiddenDim})
           .with_strides({1})
           .with_dtype<bf16_t>()
-          .with_device<kDLCUDA>(device)
+          .with_device<kDLGPU>(device)
           .verify(norm_weight.value());
     }
     const auto num_tokens = static_cast<uint32_t>(T.unwrap());
     if constexpr (kQuant) {
       CHECK_HOST(num_tokens <= 128) << "the quant epilogue writes one 128-row scale tile";
       CHECK_HOST(norm_weight.has_value());
-      TensorMatcher({T, kHiddenDim}).with_dtype<fp8_e4m3_t>().with_device<kDLCUDA>(device).verify(quantized.value());
+      TensorMatcher({T, kHiddenDim}).with_dtype<fp8_e4m3_t>().with_device<kDLGPU>(device).verify(quantized.value());
       TensorMatcher({(kHiddenDim / 32) * 128})
           .with_dtype<uint8_t>()
-          .with_device<kDLCUDA>(device)
+          .with_device<kDLGPU>(device)
           .verify(scales.value());
     }
     if constexpr (kMhc) {
       static_assert(kHiddenDim == 5120);
       if (norm_weight.has_value() || kCollapse) {
-        TensorMatcher({T, 4}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(pre.value());
-        TensorMatcher({T, kHiddenDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(normalized.value());
+        TensorMatcher({T, 4}).with_dtype<fp32_t>().with_device<kDLGPU>(device).verify(pre.value());
+        TensorMatcher({T, kHiddenDim}).with_dtype<bf16_t>().with_device<kDLGPU>(device).verify(normalized.value());
       }
       TensorMatcher({T, 4, kHiddenDim})
           .with_dtype<bf16_t>()
-          .with_device<kDLCUDA>(device)
+          .with_device<kDLGPU>(device)
           .verify(mhc_out.value())
           .verify(residual.value());
-      TensorMatcher({T, 4}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(post.value());
-      TensorMatcher({T, 4, 4}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(comb.value());
+      TensorMatcher({T, 4}).with_dtype<fp32_t>().with_device<kDLGPU>(device).verify(post.value());
+      TensorMatcher({T, 4, 4}).with_dtype<fp32_t>().with_device<kDLGPU>(device).verify(comb.value());
     }
     CHECK_HOST(num_tokens > 0) << "num_tokens must be positive";
     CHECK_HOST(reinterpret_cast<uintptr_t>(gemm2_out.data_ptr()) % 16 == 0) << "gemm2_out must be 16B aligned";

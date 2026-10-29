@@ -433,7 +433,7 @@ struct EsSm100MXFP8BlockscaledGroupQuant {
     auto N_SF_Alinged = SymbolicSize{"num_tokens_sf_aligned"};
     auto D_SF = SymbolicSize{"hidden_size_sf"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, D}).with_strides({D, 1}).with_dtype<DType>().with_device(device).verify(input);
     TensorMatcher({G}).with_dtype<int>().with_device(device).verify(tokens_per_expert);

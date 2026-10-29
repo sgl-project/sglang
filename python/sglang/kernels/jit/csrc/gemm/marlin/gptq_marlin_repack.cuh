@@ -321,7 +321,7 @@ void gptq_marlin_repack(
   bqw_dim0.set_value(size_k / pack_factor);
   bqw_dim1.set_value(size_n);
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
   TensorMatcher({bqw_dim0, bqw_dim1}).with_dtype<int32_t>().with_device(device_).verify(b_q_weight);
 
   // Validate out

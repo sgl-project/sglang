@@ -143,7 +143,7 @@ struct Kernel {
     auto R = SymbolicSize{"rows"};
     auto C = SymbolicSize{"channels"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({R, C}).with_dtype<bf16_t>().with_device(device).ensure_alignment(kAlign).verify(out).verify(x);
     TensorMatcher({C}).with_dtype<bf16_t>().with_device(device).ensure_alignment(kAlign).verify(gamma).verify(bias);
     const int64_t rows = R.unwrap(), channels = C.unwrap();

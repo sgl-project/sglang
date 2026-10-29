@@ -965,7 +965,7 @@ void moe_wna16_marlin_gemm(
 
   // Verify device and strides
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
   TensorMatcher({-1, -1}).with_dtype<scalar_t>().with_device(device).verify(a);
   if constexpr (kHasInactivePrefixCount) {
     TensorMatcher({2}).with_dtype<int32_t>().with_device(device).ensure_alignment(8).verify(num_tokens_post_padded);

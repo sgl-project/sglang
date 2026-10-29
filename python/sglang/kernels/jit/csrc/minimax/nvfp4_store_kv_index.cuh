@@ -215,7 +215,7 @@ void nvfp4_store_kv_index(
   auto in_dtype = SymbolicDType{};
   auto indice_dtype = SymbolicDType{};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   constexpr int64_t kPayloadBytes = kHeadDim / 2;
   constexpr int64_t kScaleBytes = kHeadDim / kNvfp4BlockSize;

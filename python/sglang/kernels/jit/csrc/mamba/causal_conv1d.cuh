@@ -568,7 +568,7 @@ void causal_conv1d_fwd(
   auto seqlen_sym = SymbolicSize{"seqlen"};
   auto width_sym = SymbolicSize{"width"};
   auto device_sym = SymbolicDevice{};
-  device_sym.set_options<kDLCUDA>();
+  device_sym.set_options<kDLGPU>();
 
   // Only the innermost stride is pinned: the Python wrapper makes `x` unit-stride
   // in its last dimension, everything else is carried through as a stride.
@@ -682,7 +682,7 @@ void causal_conv1d_update(
   auto state_len_sym = SymbolicSize{"state_len"};
   auto entries_sym = SymbolicSize{"conv_state_entries"};
   auto device_sym = SymbolicDevice{};
-  device_sym.set_options<kDLCUDA>();
+  device_sym.set_options<kDLGPU>();
 
   TensorMatcher({batch_sym, dim_sym, seqlen_sym})
       .with_strides({-1, -1, -1})

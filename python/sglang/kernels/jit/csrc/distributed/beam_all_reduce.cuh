@@ -207,7 +207,7 @@ struct BeamAllReduceNorm {
       TensorMatcher({rows, Hidden})
           .with_strides({Hidden, 1})
           .with_dtype<bf16_t>()
-          .with_device<kDLCUDA>(device)
+          .with_device<kDLGPU>(device)
           .ensure_alignment(16)
           .verify(tensor);
     };
@@ -215,7 +215,7 @@ struct BeamAllReduceNorm {
       TensorMatcher({Hidden})
           .with_strides({1})
           .with_dtype<bf16_t>()
-          .with_device<kDLCUDA>(device)
+          .with_device<kDLGPU>(device)
           .ensure_alignment(16)
           .verify(tensor);
     };
@@ -225,7 +225,7 @@ struct BeamAllReduceNorm {
       TensorMatcher({rows, TopK, Hidden})
           .with_strides({TopK * Hidden, Hidden, 1})
           .with_dtype<bf16_t>()
-          .with_device<kDLCUDA>(device)
+          .with_device<kDLGPU>(device)
           .ensure_alignment(16)
           .verify(input);
     matrix(residual);

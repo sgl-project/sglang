@@ -847,7 +847,7 @@ void gptq_marlin_gemm(
   auto K = SymbolicSize{"K"};
   auto N = SymbolicSize{"N"};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   // Verify a: [M, K]
   auto lda = SymbolicSize{"lda"};
