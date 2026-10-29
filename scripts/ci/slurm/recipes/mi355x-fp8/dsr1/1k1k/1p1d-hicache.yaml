@@ -1,0 +1,155 @@
+# MI355X DeepSeek-R1-0528 (native FP8) 2-node 1P1D disaggregation recipe with
+# HiCache (hierarchical KV cache) enabled on the PREFILL role.
+#
+# This is the disaggregated counterpart of the single-instance registered test
+# test/registered/amd/test_deepseek_r1_hicache_mi35x.py (added in #26395, moved
+# to the nightly suite in #26478). The HiCache flag set below is that test's,
+# with two deliberate deviations called out under `wide_ep` and `runtime`.
+#
+# WHY PREFILL ONLY:
+#   * A PD decode server never prefills, so a prefix cache there has no work.
+#   * AMD's own guidance for MI355X + MORI is prefill-only ("HiCache is not
+#     recommended on the decode role with MORI").
+#   * It is not expressible anyway: arg_groups/pd_disaggregation_hook.py forces
+#     disable_radix_cache=True on a decode server unless
+#     --disaggregation-decode-enable-radix-cache is passed, and
+#     server_args._handle_cache_compatibility then raises on
+#     enable-hierarchical-cache + disable-radix-cache.
+#   The prefill KV sender is HiCache-aware: disaggregation/prefill.py computes
+#   the early-send boundary as len(prefix_indices) - host_hit_length, so decode
+#   still receives the full KV range including L2/L3 cache hits.
+#
+# NOTE ON THE PERF NUMBERS: the sweep runs --dataset-name random, which samples
+# distinct ShareGPT conversations per request, so there is ~zero cross-request
+# prefix reuse. This leg therefore measures HiCache OVERHEAD, not benefit, and
+# is expected to sit at or slightly below the non-HiCache legs. Its value is the
+# correctness gate: does HiCache-in-PD break R1 generation. The 8-shot GSM8K
+# prefix in the accuracy gate is the only part that exercises prefix reuse.
+#
+# Consumed by:
+#   * scripts/ci/slurm/process_result.py reads `resources` and
+#     `backend.sglang_config` (TP/EP/DP + worker counts) for the summary table.
+#   * scripts/ci/slurm/launch_mi355x.sh reads `runtime` and `bench`.
+
+resources:
+  prefill_workers: 1
+  decode_workers: 1
+
+backend:
+  sglang_config:
+    prefill:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+    decode:
+      tensor-parallel-size: 8
+      expert-parallel-size: 1
+      data-parallel-size: 1
+
+# Model-specific docker env + sglang server args (generic launcher path; keeps
+# R1 off the hardcoded DeepSeek-V4 parser branch in launch_mi355x.sh). The three
+# env vars are the ROCm DSR1-0528 requirements carried over from #26395:
+#   SGLANG_USE_AITER=1                  -> aiter prefill/decode path
+#   ROCM_QUICK_REDUCE_QUANTIZATION=NONE -> keep allreduce fp16/bf16
+#   SGLANG_AITER_FP8_PREFILL_ATTN=0     -> the FP8 prefill kernel
+#                                          (flash_attn_varlen_func) is
+#                                          incompatible with DSR1-0528 at
+#                                          page_size=64
+model:
+  env:
+    SGLANG_USE_AITER: 1
+    ROCM_QUICK_REDUCE_QUANTIZATION: NONE
+    SGLANG_AITER_FP8_PREFILL_ATTN: 0
+    SAFETENSORS_FAST_GPU: 1
+  server_args:
+    - --context-length
+    - 65536
+    - --max-prefill-tokens
+    - 32768
+    - --watchdog-timeout
+    - 1200
+    - --enable-metrics
+    - --enable-cache-report
+    # Anything containing a space or a quote MUST live here rather than in
+    # wide_ep.*_extra_flags: server_args is shlex-quoted into a bash array and
+    # expanded as "${MODEL_SERVER_ARGS[@]}", whereas the extra_flags strings are
+    # word-split by the entry script.
+    - --model-loader-extra-config
+    - '{"enable_multithread_load": true, "num_threads": 64}'
+
+runtime:
+  image: lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260820
+  attention_backend: aiter
+  # RoCE HCAs MORI uses for cross-node KV transfer.
+  ib_devices: rdma0,rdma1,rdma2,rdma3
+  prefill_port: 30025
+  decode_port: 30026
+  prefill_bootstrap_port: 8998
+  decode_bootstrap_port: 9001
+  lb_port: 8000
+  mem_fraction_static: 0.85
+  # DEVIATION FROM THE OTHER MI355X RECIPES (which all use 256): 64 matches the
+  # registered DSR1 HiCache test, the only known-green R1+HiCache config on this
+  # hardware, and pairs with SGLANG_AITER_FP8_PREFILL_ATTN=0 above. It also
+  # drops the MORI KV transfer granularity 4x versus every previously validated
+  # recipe -- this is the first thing to A/B if the leg is slow or flaky.
+  page_size: 64
+  max_running_requests: 256
+  chunked_prefill_size: 32768
+  # swa_full_tokens_ratio intentionally omitted: R1 has no SWA, and the generic
+  # launcher branch drops --swa-full-tokens-ratio when the key is absent.
+  #
+  # Required for HiCache: --disable-radix-cache is otherwise hardcoded into both
+  # role flag strings, and hicache + disable-radix-cache is a hard ValueError.
+  # HiCache L1 *is* the radix cache. Only the prefill role is affected in
+  # practice (see the WHY PREFILL ONLY note above).
+  disable_radix_cache: false
+  wide_ep:
+    # Applies to both roles; PD requires a matching KV dtype on each side.
+    kv_cache_dtype: fp8_e4m3
+    # Mirrors the registered test. Leaves GPU headroom for the L2 staging path.
+    prefill_mem_fraction_static: 0.6
+    # Every token here must be space- and quote-free (see the server_args note).
+    #
+    # DEVIATION: the registered test uses --hicache-ratio 2. A ratio is relative
+    # to the DEVICE pool, which in this PD layout is far larger than in that
+    # single-instance test -- ratio 2 would ask for well over 1 TB of pinned
+    # host memory across the 8 ranks and trip the "Not enough host memory
+    # available" ValueError in memory_pool_host.py. --hicache-size is an
+    # absolute per-rank GB budget and overrides the ratio.
+    prefill_extra_flags: "--enable-hierarchical-cache --hicache-size 64 --hicache-io-backend kernel --hicache-mem-layout page_first --hicache-write-policy write_through --hicache-storage-backend file --hicache-storage-prefetch-policy best_effort"
+    prefill_extra_env:
+      # L3 tier. /tmp is the container's overlayfs on node-local NVMe and is
+      # reclaimed by `docker run --rm`. It must NOT be /host_home: that Weka
+      # share is 24 GB total and holds every leg's logs.
+      SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR: /tmp/hicache-l3
+      # The file evictor is OFF unless one of these is set, and write_through
+      # over a full sweep writes on the order of 70 GB. Setting them also makes
+      # rank 0 the sole storage owner, collapsing the 8-way write amplification
+      # that MLA models otherwise incur (all ranks share one filename).
+      SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE: 64G
+      SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE: 512G
+      SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE: 1
+
+bench:
+  # bench_serving --max-concurrency sweep; one result JSON per concurrency.
+  concurrencies: [1, 8, 16, 32, 64, 128, 256]
+  num_prompts_factor: 4      # num-prompts = concurrency * factor
+  random_range_ratio: 1.0
+
+  # Correctness gate run through the PD path before the perf sweep
+  # (full GSM8K, 8-shot, accuracy > 0.93). A regression here fails the nightly
+  # even when throughput looks fine ("fast but wrong").
+  #
+  # method is deliberately left at the default few_shot: the run_eval branch
+  # does not pass --api and would drive R1 through the chat template, where the
+  # reasoning preamble gets truncated at --max-tokens and GSM8K collapses to ~0.
+  accuracy:
+    enabled: true
+    num_shots: 8
+    num_questions: 1319    # full GSM8K test set
+    # Threshold matches the registered DSR1-0528 tests. Measured 0.959 on the
+    # first 2-node validation run of this recipe (g29 prefill / g53 decode,
+    # image v0.5.17-rocm720-mi35x-20260820, Invalid 0.000), so ~2.9 points of
+    # headroom.
+    threshold: 0.93
