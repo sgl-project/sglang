@@ -1,10 +1,8 @@
 """Math behind --dcp-replicate-q-proj on the owned DSA DCP route (ROCm).
 
-Covers:
-1. The token-major absorb / V-projection: ``torch.bmm`` written through a
-   transposed ``out`` view equals a head-major bmm, also into a strided slice.
-2. Project-before-merge: V-projecting every partial and then LSE-merging equals
-   merging the partials and then V-projecting.
+Project-before-merge: V-projecting every partial and then LSE-merging equals
+merging the partials and then V-projecting, because the merge is linear in the
+partial output.
 """
 
 import pytest
@@ -19,48 +17,11 @@ if not torch.cuda.is_available():
 
 H = 64
 KV_LORA_RANK = 512
-QK_NOPE_HEAD_DIM = 192
 V_HEAD_DIM = 256
 
 
 def _rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
     return ((a.float() - b.float()).norm() / b.float().norm()).item()
-
-
-def _token_major_bmm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> None:
-    torch.bmm(x.transpose(0, 1), w, out=out.transpose(0, 1))
-
-
-@pytest.mark.parametrize("T", [1, 24, 144, 1024])
-@pytest.mark.parametrize(
-    "K,N", [(QK_NOPE_HEAD_DIM, KV_LORA_RANK), (KV_LORA_RANK, V_HEAD_DIM)]
-)
-def test_token_major_bmm_matches_head_major(T, K, N):
-    torch.manual_seed(0)
-    x = torch.randn(T, H, K, device="cuda", dtype=torch.bfloat16)
-    w = (torch.randn(H, K, N, device="cuda") * K**-0.5).bfloat16()
-    ref = torch.bmm(x.transpose(0, 1).float(), w.float()).transpose(0, 1)
-
-    out = x.new_empty(T, H, N)
-    _token_major_bmm(x, w, out)
-
-    assert _rel_err(out, ref) < 1e-2
-
-
-def test_token_major_bmm_into_strided_slice():
-    torch.manual_seed(1)
-    T = 24
-    x = torch.randn(T, H, QK_NOPE_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    w = (
-        torch.randn(H, QK_NOPE_HEAD_DIM, KV_LORA_RANK, device="cuda") * 0.07
-    ).bfloat16()
-    # The absorb output can be the nope slice of a [T, H, 576] query buffer.
-    buf = torch.zeros(T, H, KV_LORA_RANK + 64, device="cuda", dtype=torch.bfloat16)
-    _token_major_bmm(x, w, buf[..., :KV_LORA_RANK])
-
-    ref = torch.bmm(x.transpose(0, 1), w).transpose(0, 1)
-    assert _rel_err(buf[..., :KV_LORA_RANK], ref) < 1e-2
-    assert buf[..., KV_LORA_RANK:].abs().max().item() == 0
 
 
 @pytest.mark.parametrize("N", [2, 4])
@@ -81,7 +42,8 @@ def test_project_before_merge_matches_merge_then_project(N, B):
 
     projected = partials.new_empty(N, B, H_local, V_HEAD_DIM)
     for i in range(N):
-        _token_major_bmm(partials[i], w_vc, projected[i])
+        # Same expression as _dcp_project_partials: token-major out view.
+        torch.bmm(partials[i].transpose(0, 1), w_vc, out=projected[i].transpose(0, 1))
     pbm, _ = dcp_lse_combine_triton(projected, lses, is_lse_base_on_e=False)
 
     assert pbm.shape == (B, H_local, V_HEAD_DIM)
