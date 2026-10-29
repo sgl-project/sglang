@@ -27,16 +27,17 @@ class TestEmptyViewCapture(CustomTestCase):
     def test_nested_empty_views_release_base_and_preserve_metadata(self):
         base = torch.empty((19, 16, 256), dtype=torch.bfloat16, device="cuda")
         view = base[..., 256:]
-        shape, stride = view.shape, view.stride()
-        ref = weakref.ref(base)
-        result = _weak_ref_if_tensor(([view], (view.transpose(0, 1),)))
-        del view, base
+        transposed = view.transpose(0, 1)
+        metadata = [(item.shape, item.stride()) for item in (view, transposed)]
+        base_ref = weakref.ref(base)
+        result = _weak_ref_if_tensor(([view], (transposed,)))
+        del view, transposed, base
         gc.collect()
-        self.assertIsNone(ref())
-        self.assertEqual(result[0][0].shape, shape)
-        self.assertEqual(result[0][0].stride(), stride)
-        self.assertEqual(result[0][0].dtype, torch.bfloat16)
-        for item in (result[0][0], result[1][0]):
+        self.assertIsNone(base_ref())
+        for item, (shape, stride) in zip((result[0][0], result[1][0]), metadata):
+            self.assertEqual(item.shape, shape)
+            self.assertEqual(item.stride(), stride)
+            self.assertEqual(item.dtype, torch.bfloat16)
             self.assertEqual(item.untyped_storage().nbytes(), 0)
             self.assertEqual(item.device.type, "cuda")
 
