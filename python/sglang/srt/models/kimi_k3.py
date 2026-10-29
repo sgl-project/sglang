@@ -3425,6 +3425,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             kv_b_weight = _get_k3_dense_weight(self_attn.kv_b_proj)
             scale_folded_into_weight = False
+            kv_b_tensor_scale = None
             if _is_hip and kv_b_weight.dtype in (
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
@@ -3432,22 +3433,24 @@ class KimiK3LinearForCausalLM(nn.Module):
                 scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
                 if isinstance(scale, torch.Tensor) and scale.numel() > 1:
                     from sglang.srt.models.kimi_k3_rocm_quant import (
-                        _k3_channel_fp8_to_bf16,
+                        k3_kv_b_for_absorb,
                     )
 
                     # Fold the per-channel scale while dim 0 is still the
                     # channel axis it indexes, i.e. before the head split.
-                    kv_b_weight = _k3_channel_fp8_to_bf16(
-                        self_attn.kv_b_proj, kv_b_weight
+                    kv_b_weight, kv_b_tensor_scale = k3_kv_b_for_absorb(
+                        module=self_attn.kv_b_proj, weight=kv_b_weight
                     )
-                    scale_folded_into_weight = True
+                    scale_folded_into_weight = kv_b_tensor_scale is None
             w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
             kv_b_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
-            if _is_hip and (
+            if kv_b_tensor_scale is not None:
+                self_attn.w_scale = kv_b_tensor_scale
+            elif _is_hip and (
                 scale_folded_into_weight
                 or not (
                     isinstance(kv_b_scale, torch.Tensor) and kv_b_scale.numel() == 1

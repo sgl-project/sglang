@@ -20,6 +20,7 @@ from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention, _is_unquantized_merg
 from sglang.srt.models.kimi_k3_rocm_quant import (
     _k3_channel_fp8_to_bf16,
     k3_kda_inproj_fp8_tail_rows,
+    k3_kv_b_for_absorb,
     k3_merge_kda_inproj_fp8,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -103,6 +104,51 @@ class TestMergeDtypeGuard(CustomTestCase):
         check that only asks whether the operands match each other."""
         weights = [torch.zeros(4, 4, dtype=torch.float32) for _ in range(2)]
         self.assertFalse(_is_unquantized_mergeable(weights))
+
+
+@mock.patch("sglang.srt.models.deepseek_common.utils._use_aiter_gfx95", True)
+class TestKvBForAbsorb(CustomTestCase):
+    """The MLA absorb BMMs take one scalar w_scale, so on gfx950 + AITER kv_b is
+    requantized to per-tensor FP8; the kill switch keeps the BF16 dequant."""
+
+    def test_default_requantizes_to_one_tensor_scale(self):
+        weight, scale, _ = _per_channel_fp8(out_features=8, in_features=16)
+        module = SimpleNamespace(weight_scale=scale.squeeze(1))
+
+        q, tensor_scale = k3_kv_b_for_absorb(module=module, weight=weight)
+
+        self.assertEqual((q.dtype, q.shape), (weight.dtype, weight.shape))
+        self.assertEqual(tensor_scale.numel(), 1)
+        # The largest channel spans the full FP8 range, so nothing clips.
+        self.assertEqual(q.float().abs().max().item(), torch.finfo(q.dtype).max)
+        # Error is bounded by one FP8 step at the tensor-wide scale.
+        exact = weight.float() * scale
+        err = (q.float() * tensor_scale - exact).abs().max()
+        self.assertLess(err.item(), 0.07 * exact.abs().max().item())
+
+    def test_kill_switch_keeps_the_bf16_dequant(self):
+        weight, scale, _ = _per_channel_fp8(out_features=8, in_features=16)
+        module = SimpleNamespace(weight_scale=scale.squeeze(1))
+
+        with envs.SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8.override(False):
+            out, tensor_scale = k3_kv_b_for_absorb(module=module, weight=weight)
+
+        self.assertIsNone(tensor_scale)
+        torch.testing.assert_close(out, _k3_channel_fp8_to_bf16(module, weight))
+
+    def test_no_requant_where_the_absorb_has_no_fp8_kernel(self):
+        """Off gfx950 + AITER the absorb dequantizes an FP8 w_kc/w_vc to BF16,
+        so a requant would add its error for no speedup."""
+        weight, scale, _ = _per_channel_fp8(out_features=8, in_features=16)
+        module = SimpleNamespace(weight_scale=scale.squeeze(1))
+
+        with mock.patch(
+            "sglang.srt.models.deepseek_common.utils._use_aiter_gfx95", False
+        ):
+            out, tensor_scale = k3_kv_b_for_absorb(module=module, weight=weight)
+
+        self.assertIsNone(tensor_scale)
+        torch.testing.assert_close(out, _k3_channel_fp8_to_bf16(module, weight))
 
 
 def _quark_fp8_linear(out_features: int, in_features: int = 16):
