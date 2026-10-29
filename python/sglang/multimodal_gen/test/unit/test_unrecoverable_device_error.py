@@ -1,28 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A forward error that breaks the device must not leave the server serving.
+"""A non-OOM device error (#38167) must exit the worker instead of serving on a
+broken device while /health still reports ok."""
 
-After a non-OOM CUDA driver error (sgl-project/sglang#38167), every later request
-either ran 5x slower or failed on a caching-allocator assert, while /health kept
-reporting ok. Such an error now rejects later requests and turns /health 503.
-"""
-
-import asyncio
-import pickle
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
 
-from sglang.multimodal_gen.runtime.entrypoints import http_server
 from sglang.multimodal_gen.runtime.managers import gpu_worker as gpu_worker_module
+from sglang.multimodal_gen.runtime.managers import scheduler as scheduler_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import (
     GPUWorker,
     _is_unrecoverable_device_error,
 )
-from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 
 # the two errors reported in #38167, verbatim
 _DRIVER_ERROR = "CUDA driver error: device not ready"
@@ -77,12 +68,6 @@ def worker(monkeypatch):
     monkeypatch.setattr(
         type(gpu_worker_module.current_platform), "is_mps", lambda self: False
     )
-    # single-GPU replica: an OOM stays a request-level error
-    monkeypatch.setattr(
-        gpu_worker_module,
-        "get_replica_group",
-        lambda: SimpleNamespace(world_size=1),
-    )
     worker = GPUWorker.__new__(GPUWorker)
     worker.is_output_rank = True
     worker.server_args = SimpleNamespace(
@@ -90,11 +75,11 @@ def worker(monkeypatch):
     )
     worker._realtime_sessions = SimpleNamespace(attach=lambda req: None)
     worker._release_warmup_pool = lambda req: None
-    worker._record_output_peak_memory = lambda *args, **kwargs: None
+    worker._record_output_peak_memory = Mock()
     return worker, device
 
 
-def _forward_raising(worker, error):
+def _forward_raising(worker, error, propagate_forward_errors=False):
     req = SimpleNamespace(
         request_id="req",
         is_warmup=False,
@@ -114,112 +99,72 @@ def _forward_raising(worker, error):
         return_req=False,
         save_output_paths=lambda output_batch: None,
         error_context="request req",
+        propagate_forward_errors=propagate_forward_errors,
     )
 
 
-def test_driver_error_marks_the_worker_and_skips_empty_cache(worker):
+@pytest.mark.parametrize("propagate", [False, True])
+@pytest.mark.parametrize("message", [_DRIVER_ERROR, _ALLOCATOR_ASSERT])
+def test_device_error_exits_the_worker(worker, message, propagate):
     worker, device = worker
 
-    output = _forward_raising(worker, RuntimeError(_DRIVER_ERROR))
+    # must escape the scheduler's request-level `except Exception` handlers
+    with pytest.raises(SystemExit, match="restart the server") as exc_info:
+        _forward_raising(worker, RuntimeError(message), propagate)
 
-    assert output.device_unrecoverable
-    assert _DRIVER_ERROR in worker.unrecoverable_device_error
+    assert message in str(exc_info.value.__cause__)
     # empty_cache on a broken allocator can raise out of the error handler
     device.empty_cache.assert_not_called()
+    worker._record_output_peak_memory.assert_not_called()
 
 
-def test_oom_keeps_the_worker_serving(worker):
-    worker, device = worker
-
-    output = _forward_raising(worker, torch.OutOfMemoryError("CUDA out of memory"))
-
-    assert not output.device_unrecoverable
-    assert worker.unrecoverable_device_error is None
-    device.empty_cache.assert_called_once_with()
+class _Exited(Exception):
+    pass
 
 
-def _scheduler(unrecoverable_device_error):
-    scheduler = Scheduler.__new__(Scheduler)
-    scheduler._async_output_save = False
-    scheduler.worker = SimpleNamespace(
-        is_sleeping=lambda: False,
-        unrecoverable_device_error=unrecoverable_device_error,
-        execute_forward=Mock(return_value=OutputBatch()),
+def test_scheduler_process_exits_on_device_error(monkeypatch):
+    for name in (
+        "initialize_current_platform",
+        "kill_itself_when_parent_died",
+        "configure_logger",
+        "globally_suppress_loggers",
+        "_bind_worker_to_gpu_numa_node",
+        "set_cuda_arch",
+        "set_musa_arch",
+        "init_diffusion_tracing",
+    ):
+        monkeypatch.setattr(gpu_worker_module, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gpu_worker_module.PortArgs, "from_server_args", lambda server_args: None
     )
-    return scheduler
 
+    class _BrokenDeviceScheduler:
+        def __init__(self, *args, **kwargs):
+            pass
 
-@pytest.mark.parametrize("num_reqs", [1, 3])
-def test_scheduler_rejects_generation_without_forward(num_reqs):
-    scheduler = _scheduler(f"request earlier: {_DRIVER_ERROR}")
-    reqs = [SimpleNamespace(is_warmup=False) for _ in range(num_reqs)]
-
-    result = scheduler._handle_generation(reqs, allow_dynamic_batching=True)
-
-    outputs = result if isinstance(result, list) else [result]
-    assert len(outputs) == num_reqs
-    for output in outputs:
-        assert output.device_unrecoverable
-        assert _DRIVER_ERROR in output.error
-        assert "restart the server" in output.error
-    scheduler.worker.execute_forward.assert_not_called()
-
-
-def test_rejected_request_group_gets_one_reply():
-    scheduler = _scheduler(f"request earlier: {_DRIVER_ERROR}")
-    group = [SimpleNamespace(is_warmup=False) for _ in range(2)]
-
-    result = scheduler._handle_generation(group, allow_dynamic_batching=False)
-
-    assert isinstance(result, OutputBatch)
-    assert result.device_unrecoverable
-
-
-def _client_replying(reply):
-    socket = MagicMock()
-    socket.send = AsyncMock()
-    socket.recv = AsyncMock(return_value=pickle.dumps(reply))
-    client = AsyncSchedulerClient()
-    client.context = SimpleNamespace(socket=lambda _socket_type: socket)
-    client.server_args = SimpleNamespace(
-        scheduler_rpc_timeout=None, scheduler_endpoints=["tcp://scheduler"]
-    )
-    client.request_logger = MagicMock()
-    return client
-
-
-def _health_status(client, monkeypatch):
-    monkeypatch.setattr(http_server, "async_scheduler_client", client)
-    warmup_done = asyncio.Event()
-    warmup_done.set()
-    request = SimpleNamespace(
-        app=SimpleNamespace(
-            state=SimpleNamespace(
-                server_warmup_done=warmup_done,
-                worker_processes=[],
-                disagg_server=None,
-                broker_task=None,
+        def event_loop(self):
+            raise gpu_worker_module._FatalDeviceError(
+                "Unrecoverable device error; restart the server."
             )
-        )
+
+    monkeypatch.setattr(scheduler_module, "Scheduler", _BrokenDeviceScheduler)
+
+    events = []
+
+    def exit_(code):
+        events.append(("exit", code))
+        # the real os._exit never returns; raising lets the test continue
+        raise _Exited(code)
+
+    monkeypatch.setattr(gpu_worker_module.os, "_exit", exit_)
+    monkeypatch.setattr(
+        gpu_worker_module.gc, "collect", lambda: events.append(("cleanup",))
     )
-    response = asyncio.run(http_server.health(request))
-    return 200 if isinstance(response, dict) else response.status_code
 
+    with pytest.raises(_Exited):
+        gpu_worker_module.run_scheduler_process(
+            local_rank=0, rank=0, server_args=SimpleNamespace(), pipe_writer=Mock()
+        )
 
-def test_unrecoverable_reply_turns_health_unhealthy(monkeypatch):
-    error = f"Error executing request req: {_DRIVER_ERROR}"
-    client = _client_replying(OutputBatch(error=error, device_unrecoverable=True))
-
-    asyncio.run(client.forward(object()))
-
-    assert client.unrecoverable_device_error == error
-    assert _health_status(client, monkeypatch) == 503
-
-
-def test_ordinary_request_error_keeps_health_ok(monkeypatch):
-    client = _client_replying(OutputBatch(error="height must be divisible by 16"))
-
-    asyncio.run(client.forward(object()))
-
-    assert client.unrecoverable_device_error is None
-    assert _health_status(client, monkeypatch) == 200
+    # exits at the process boundary before cleanup can touch the broken device
+    assert events[0] == ("exit", 1)

@@ -154,7 +154,6 @@ def test_generation_waits_for_capacity_before_forward(grouped):
 
     scheduler.worker = SimpleNamespace(
         is_sleeping=lambda: False,
-        unrecoverable_device_error=None,
         execute_forward=Mock(side_effect=forward),
         take_deferred_finalize=lambda: lambda: None,
     )
@@ -189,7 +188,6 @@ def test_generation_with_one_pending_finalize_still_overlaps():
     )
     scheduler.worker = SimpleNamespace(
         is_sleeping=lambda: False,
-        unrecoverable_device_error=None,
         execute_forward=Mock(return_value=OutputBatch()),
         take_deferred_finalize=lambda: lambda: None,
     )

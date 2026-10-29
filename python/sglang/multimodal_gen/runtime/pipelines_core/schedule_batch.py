@@ -483,8 +483,6 @@ class OutputBatch:
     rollout_trajectory_data: RolloutTrajectoryData | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
-    # the error left the device unusable; the HTTP server turns unhealthy on it
-    device_unrecoverable: bool = False
     output_file_paths: list[str] | None = None
     # encoded image per output when the request sets return_image_bytes
     output_image_bytes: list[bytes | None] | None = None
