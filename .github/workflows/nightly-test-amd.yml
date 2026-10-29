@@ -1686,8 +1686,8 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU MI30x tests: DeepSeek V3 (including FP8 KV + MTP),
-  # Kimi-K2-Instruct-0905 and the MoRI EP configs.
+  # 8-GPU MI30x tests moved out of PR CI: DeepSeek V3, Kimi-K2-Instruct-0905
+  # and the MoRI EP configs.
   # ==============================================================================
 
   nightly-8-gpu:

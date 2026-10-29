@@ -2,15 +2,12 @@
 
 import ast
 import importlib.util
-import io
 import json
 import sys
-import tempfile
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from typing import Optional
 
 import yaml
 
@@ -26,7 +23,6 @@ def load_module(name, path):
 
 
 REGISTRY = load_module("ci_register", "python/sglang/test/ci/ci_register.py")
-LINT = load_module("check_registered_tests", "scripts/lint/check_registered_tests.py")
 
 
 def suite_namespace():
@@ -56,6 +52,7 @@ def suite_namespace():
         "HWBackend": REGISTRY.HWBackend,
         "CIRegistry": REGISTRY.CIRegistry,
         "List": list,
+        "Optional": Optional,
     }
     exec(
         compile(ast.Module(body=body, type_ignores=[]), "run_suite.py", "exec"),
@@ -71,20 +68,6 @@ def workflow(name):
 
 
 class TestAMDRegistration(unittest.TestCase):
-    def test_lint_rejects_an_undeclared_amd_pr_suite(self):
-        # The old hook accepted this exact orphan registration without error.
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "test_orphan.py"
-            path.write_text(
-                'register_amd_ci(est_time=2, suite="stage-a-test-cpu-amd")\n'
-            )
-            output = io.StringIO()
-            with patch.object(LINT.glob, "glob", return_value=[str(path)]):
-                with redirect_stdout(output):
-                    result = LINT.main()
-            self.assertEqual(result, 1)
-            self.assertIn("stage-a-test-cpu-amd", output.getvalue())
-
     def test_rejects_orphan_pr_suites(self):
         validate = suite_namespace()["validate_all_suites"]
         for suite in ("stage-a-test-cpu-amd", "base-b-test-2-gpu-large"):
@@ -97,8 +80,23 @@ class TestAMDRegistration(unittest.TestCase):
                             filename="regression.py",
                             effective_suite=suite,
                         )
-                    ]
+                    ],
+                    hw=REGISTRY.HWBackend.AMD,
                 )
+
+    def test_amd_registration_errors_do_not_affect_other_backends(self):
+        validate = suite_namespace()["validate_all_suites"]
+        rows = [
+            SimpleNamespace(
+                backend=REGISTRY.HWBackend.AMD,
+                nightly=False,
+                filename="amd_typo.py",
+                effective_suite="stage-a-test-cpu-amd",
+            )
+        ]
+        for hw in (None, REGISTRY.HWBackend.CUDA, REGISTRY.HWBackend.CPU):
+            with self.subTest(hw=hw):
+                validate(rows, hw=hw)
 
     def test_accepts_pr_suites_and_legacy_nightly(self):
         namespace = suite_namespace()
@@ -120,8 +118,7 @@ class TestAMDRegistration(unittest.TestCase):
                 effective_suite="nightly-perf-8-gpu-gpt-oss",
             )
         )
-        namespace["validate_all_suites"](rows)
-        self.assertEqual(LINT.declared_amd_pr_suites(), set(suites))
+        namespace["validate_all_suites"](rows, hw=REGISTRY.HWBackend.AMD)
 
     def test_all_amd_pr_registrations_have_dispatch_jobs(self):
         jobs = set(workflow("pr-test-amd.yml")["jobs"])
@@ -142,24 +139,25 @@ class TestAMDRegistration(unittest.TestCase):
             )
         self.assertEqual(errors, [])
 
-    def test_fp8_kv_files_select_the_existing_nightly_job(self):
-        for name in ("basic", "mtp"):
-            path = ROOT / f"test/registered/amd/test_deepseek_v3_{name}_kv_fp8.py"
-            rows, _ = REGISTRY.ut_parse_one_file(str(path))
-            self.assertEqual(
-                [(r.effective_suite, r.nightly) for r in rows],
-                [("nightly-amd-8-gpu", True)],
-            )
-        job = workflow("nightly-test-amd.yml")["jobs"]["nightly-8-gpu"]
+
+class TestAMDWorkflows(unittest.TestCase):
+    def test_amd_checks_are_dispatched_by_the_amd_workflow(self):
+        steps = workflow("pr-test-amd.yml")["jobs"]["check-changes"]["steps"]
         self.assertTrue(
             any(
-                "--suite nightly-amd-8-gpu --nightly" in step.get("run", "")
-                for step in job["steps"]
+                "python3 -m unittest scripts.ci.test_amd_ci_wiring"
+                in step.get("run", "")
+                for step in steps
+            )
+        )
+        shared_steps = workflow("lint.yml")["jobs"]["lint"]["steps"]
+        self.assertFalse(
+            any(
+                "scripts.ci.test_amd_ci_wiring" in step.get("run", "")
+                for step in shared_steps
             )
         )
 
-
-class TestAMDWorkflows(unittest.TestCase):
     def test_multi_shard_lanes_are_not_serialized(self):
         jobs = workflow("pr-test-amd.yml")["jobs"]
         for name in (

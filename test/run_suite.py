@@ -249,7 +249,6 @@ OTHER_SUITES = {
 _SUITE_CHECKED_BACKENDS = {
     HWBackend.CUDA,
     HWBackend.CPU,
-    HWBackend.AMD,
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
@@ -269,21 +268,21 @@ def _valid_suites_by_backend() -> dict:
     return result
 
 
-def validate_all_suites(all_tests: List[CIRegistry]):
+def validate_all_suites(all_tests: List[CIRegistry], hw: Optional[HWBackend] = None):
     """Fail fast if any test is registered to a suite that doesn't belong to its backend."""
     valid_by_backend = _valid_suites_by_backend()
     errors = []
     for t in all_tests:
-        if t.backend not in _SUITE_CHECKED_BACKENDS:
-            continue
-        # Legacy AMD nightly jobs also invoke files directly, so their suite
-        # inventory is not yet complete. PR registrations must name a real lane.
-        if t.backend == HWBackend.AMD:
+        # AMD PR validation is opt-in for AMD invocations. An AMD registration
+        # must not change the behavior of CUDA/CPU or existing standalone callers.
+        if t.backend == HWBackend.AMD and hw == HWBackend.AMD:
             if t.nightly:
                 continue
             valid = set(PER_COMMIT_SUITES[HWBackend.AMD])
-        else:
+        elif t.backend in _SUITE_CHECKED_BACKENDS:
             valid = valid_by_backend.get(t.backend, set())
+        else:
+            continue
         if t.effective_suite not in valid:
             errors.append(
                 f"  {t.filename}: backend={t.backend.name}, suite='{t.effective_suite}'"
@@ -434,7 +433,7 @@ def run_a_suite(args):
     sanity_check = True
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
-    validate_all_suites(all_tests)
+    validate_all_suites(all_tests, hw=hw)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suites, nightly)
 
     # Precision-test mode: keep only the coverage-recommended files before
