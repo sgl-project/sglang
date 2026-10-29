@@ -124,7 +124,7 @@ jobs:
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # TEMP: disabled for single-case verification; restore to ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -139,7 +139,7 @@ jobs:
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # TEMP: disabled for single-case verification; restore to ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -155,7 +155,7 @@ jobs:
   # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
   nightly-4-npu-a3:
     name: nightly-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # TEMP: disabled for single-case verification; restore to ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -171,7 +171,7 @@ jobs:
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # TEMP: disabled for single-case verification; restore to ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -186,7 +186,7 @@ jobs:
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # TEMP: disabled for single-case verification; restore to ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -201,7 +201,7 @@ jobs:
 
   nightly-perf-2-npu-a3:
     name: nightly-perf-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # TEMP: disabled for single-case verification; restore to ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -217,7 +217,7 @@ jobs:
 
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # TEMP: disabled for single-case verification; restore to ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -233,7 +233,7 @@ jobs:
 
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # TEMP: disabled for single-case verification; restore to ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -251,7 +251,7 @@ jobs:
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # TEMP: disabled for single-case verification; restore to ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -266,9 +266,28 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
+  # TEMP: single-case verification job for qwen3_6_27b_w8a8_1p_in3k5_out1k5_50ms_gpqa.
+  # TEMP: Remove this job and restore the case's register_npu_ci suite to
+  # "nightly-acc-2-npu-a3" once debugging is done.
+  temp-acc-27b-gpqa-npu-a3:
+    name: temp-acc-27b-gpqa-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-2-
+      test_type: 'accuracy'
+      test_suite: temp-acc-27b-gpqa
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a3'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # TEMP: disabled for single-case verification; restore to ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -301,7 +320,7 @@ jobs:
 #       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # TEMP: disabled for single-case verification; restore to ${{ !cancelled() }}
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
@@ -349,7 +368,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # TEMP: disabled for single-case verification; restore to ${{ !cancelled() }}
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
@@ -392,6 +411,7 @@ jobs:
       - nightly-perf-16-npu-a3
       - nightly-acc-2-npu-a3
       - nightly-acc-16-npu-a3
+      - temp-acc-27b-gpqa-npu-a3 # TEMP: single-case verification
 #       - nightly-acc-4-npu-a5 # TEMP: disabled with job above (A5 power maintenance)
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
@@ -414,7 +434,8 @@ jobs:
             "${{ needs.nightly-perf-4-npu-a3.result }}" \
             "${{ needs.nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "${{ needs.nightly-acc-16-npu-a3.result }}"; do
+            "${{ needs.nightly-acc-16-npu-a3.result }}" \
+            "${{ needs.temp-acc-27b-gpqa-npu-a3.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
             # "${{ needs.nightly-acc-4-npu-a5.result }}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
@@ -446,7 +467,8 @@ jobs:
             "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
             "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
             "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
+            "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}" \
+            "temp-acc-27b-gpqa-npu-a3:${{ needs.temp-acc-27b-gpqa-npu-a3.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
             # "nightly-acc-4-npu-a5:${{ needs.nightly-acc-4-npu-a5.result }}"; do
             suite="${entry%%:*}"
