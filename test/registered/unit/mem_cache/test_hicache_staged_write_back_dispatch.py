@@ -364,7 +364,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         window outruns the splice left by a device prefix of 6."""
         handle = CacheRequestHandle("r", 0)
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
-        pipeline._cache = mock.Mock()
+        pipeline._cache = mock.Mock(page_size=swa_page_size)
         pipeline._cache.components = {}
         pipeline._swa_component = SimpleNamespace(
             pool_name=PoolName.SWA,
