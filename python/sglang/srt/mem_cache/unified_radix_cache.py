@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
@@ -212,6 +213,11 @@ class UnifiedRadixCache(BasePrefixCache):
     ):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.logical_page_size = params.page_size
+        if self.token_to_kv_pool_allocator is not None:
+            self.logical_page_size = self.token_to_kv_pool_allocator.page_size
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
         self.disable = params.disable
 
         if params.enable_metrics:

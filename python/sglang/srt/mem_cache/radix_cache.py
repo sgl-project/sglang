@@ -33,6 +33,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -300,13 +301,17 @@ class RadixCache(BasePrefixCache):
             self.init_metrics_collector()
 
         if self.token_to_kv_pool_allocator:
+            self.logical_page_size = self.token_to_kv_pool_allocator.page_size
             dev = self.token_to_kv_pool_allocator.device
             if isinstance(dev, (str, torch.device)):
                 self.device = torch.device(dev)
             else:
                 self.device = torch.device("cpu")
         else:
+            self.logical_page_size = self.page_size
             self.device = torch.device("cpu")
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
 
         self.eviction_strategy = get_eviction_strategy(
             "lru" if self.disable else self.eviction_policy,

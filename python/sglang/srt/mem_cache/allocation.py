@@ -17,6 +17,14 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import (
+    _ceil_group_count,
+    from_cp_sharded_expanded_indices,
+    get_cp_sharded_padded_allocation_lengths,
+    get_cp_sharded_padded_allocation_size,
+    get_cp_sharded_padded_cache_transfer_indices,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
     available_and_evictable_str,
@@ -24,7 +32,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-from sglang.srt.runtime_context import attention_backends, get_parallel
+from sglang.srt.runtime_context import attention_backends, get_parallel, get_schedule
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -387,26 +395,105 @@ def alloc_for_extend(
             alloc_page_size,
         )
     elif alloc_page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        alloc_extend_num_tokens = batch.extend_num_tokens
+        if is_cp_sharded_padded():
+            alloc_extend_num_tokens = get_cp_sharded_padded_allocation_size(
+                alloc_extend_num_tokens,
+                prefix_lens=prefix_lens_cpu,
+                extend_lens=extend_lens_cpu,
+            )
+        out_cache_loc = alloc_token_slots(batch.tree_cache, alloc_extend_num_tokens)
     else:
         # Paged allocation - build last_loc
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.full((1,), -1, device=batch.device))
             for t in prefix_tensors
         ]
+        # Capacity views are separate from the logical lengths written below.
+        alloc_prefix_lens = prefix_lens_device
+        alloc_prefix_lens_cpu = prefix_lens_cpu
+        alloc_seq_lens = batch.seq_lens
+        alloc_seq_lens_cpu = batch.seq_lens_cpu
+        alloc_extend_num_tokens = batch.extend_num_tokens
+        if is_cp_sharded_padded():
+            # Allocator continuation uses the last physical row, preserving -1.
+            page_size = get_schedule().page_size
+            last_loc = [
+                torch.where(
+                    value > 0,
+                    (
+                        get_cp_sharded_padded_cache_transfer_indices(value) // page_size
+                        + 1
+                    )
+                    * page_size
+                    - 1,
+                    value,
+                )
+                for value in last_loc
+            ]
+            alloc_prefix_lens = get_cp_sharded_padded_allocation_lengths(
+                alloc_prefix_lens
+            )
+            alloc_prefix_lens_cpu = get_cp_sharded_padded_allocation_lengths(
+                alloc_prefix_lens_cpu
+            )
+            alloc_seq_lens = get_cp_sharded_padded_allocation_lengths(alloc_seq_lens)
+            alloc_seq_lens_cpu = get_cp_sharded_padded_allocation_lengths(
+                alloc_seq_lens_cpu
+            )
+            alloc_extend_num_tokens = int(
+                (alloc_seq_lens_cpu - alloc_prefix_lens_cpu).sum()
+            )
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
-            prefix_lens=prefix_lens_device,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
+            prefix_lens=alloc_prefix_lens,
+            prefix_lens_cpu=alloc_prefix_lens_cpu,
+            seq_lens=alloc_seq_lens,
+            seq_lens_cpu=alloc_seq_lens_cpu,
             last_loc=torch.cat(last_loc),
-            extend_num_tokens=batch.extend_num_tokens,
+            extend_num_tokens=alloc_extend_num_tokens,
             req_pool_indices=req_pool_indices_device,
             batch=batch,
         )
 
     # Write to req_to_token_pool
+    if is_cp_sharded_padded():
+        # Rollback owns physical rows; the request table and caller need cache ids.
+        physical_out_cache_loc = out_cache_loc
+        strategy = get_cp_strategy()
+        page_size = get_schedule().page_size
+        c = strategy.cp_size
+        group_size = c * page_size
+        prefixes = prefix_lens_cpu.tolist()
+        lengths = (prefix_lens_cpu + extend_lens_cpu).tolist()
+        outputs = []
+        offset = 0
+        # Reuse the old prefix tail, then project only freshly allocated pages.
+        for indices, prefix, length in zip(prefix_tensors, prefixes, lengths):
+            start = _ceil_group_count(prefix, group_size) * group_size
+            end = _ceil_group_count(length, group_size) * group_size
+            old_tail = min(length, start) - prefix
+            if old_tail:
+                outputs.append(
+                    indices[-1].to(
+                        device=out_cache_loc.device, dtype=out_cache_loc.dtype
+                    )
+                    + torch.arange(
+                        1,
+                        old_tail + 1,
+                        device=out_cache_loc.device,
+                        dtype=out_cache_loc.dtype,
+                    )
+                )
+            local_count = (end - start) // c
+            if local_count:
+                outputs.append(
+                    from_cp_sharded_expanded_indices(
+                        out_cache_loc[offset : offset + local_count]
+                    )[: length - start].to(out_cache_loc.dtype)
+                )
+            offset += local_count
+        out_cache_loc = torch.cat(outputs) if outputs else out_cache_loc.new_empty((0,))
     write_cache_indices(
         out_cache_loc,
         req_pool_indices_device,
@@ -426,6 +513,8 @@ def alloc_for_extend(
             target_seq_lens_cpu=batch.seq_lens_cpu,
         )
     except Exception:
+        if is_cp_sharded_padded():
+            out_cache_loc = physical_out_cache_loc
         storage.free_tokens(out_cache_loc)
         raise
 
