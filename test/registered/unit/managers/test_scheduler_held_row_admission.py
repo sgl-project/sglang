@@ -10,7 +10,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
@@ -21,8 +21,12 @@ NUM_ROWS = 4
 
 
 class _Req:
+    release_mm_prefix_hold = Req.release_mm_prefix_hold
+
     def __init__(self, holds_row):
         self.kv = SimpleNamespace(holds_kv=holds_row)
+        self.multimodal_inputs = None
+        self.mm_prefix_hold = None
         self.beam_group = None
         self.token_indices_to_pool = None
         self.inflight_middle_chunks = 0
