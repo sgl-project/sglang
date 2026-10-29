@@ -564,7 +564,6 @@ export const Playground = ({ config }) => {
           cpOn: cpEnabledIn(flags),
           cpStrategy: bakedCpStrategy(flags) || "interleave",
           effTp: h.parseIntFlagAny(flags, h.TP_HEADS),
-          hicacheOn: h.hasFlag(flags, "--enable-hierarchical-cache"),
         });
         // The runtime derives the prefill-CP size as attn_cp_size = tp/dp
         // (a mismatched --attn-cp-size is overridden), so with DP-Attention
@@ -1717,6 +1716,8 @@ export const Playground = ({ config }) => {
           ...(sel || {}),
           ...flagSelectFacts(value, derived),
           dpAttnOn: h.dpAttnOnIn(flags),
+          cpOn: cpEnabledIn(flags),
+          hicacheOn: hasFlag(flags, "--enable-hierarchical-cache"),
           pdMode: h.findFlagArg(flags, "--disaggregation-mode") || "off",
         };
         for (const spec of (fc || [])) {
@@ -2638,6 +2639,7 @@ export const Playground = ({ config }) => {
   //              knob opts out via `freeSize: true`.
   //   effTp    — effective TP degree (override else derived).
   //   pdMode   — live PD-Disagg role; gates the decode-only HiSparse card.
+  //   hicacheOn — the composed command enables HiCache.
   const attnDelta   = deltas.attention || {};
   const attnDerived = derivedMap.attention || {};
   const attnKnobs   = ((pgFeatures.attention || {}).knobs) || [];
@@ -2695,6 +2697,8 @@ export const Playground = ({ config }) => {
     : null;
   const constraintBase = {
     ...base, dpAttnOn, cpOn, cpStrategy, cpSizeTarget, effTp, pdMode,
+    hicacheOn: !!constraintEffective
+      && hasFlag(constraintEffective.flags, "--enable-hierarchical-cache"),
     effCp: constraintEffective && cpEnabledIn(constraintEffective.flags)
       ? parseIntFlag(constraintEffective.flags, "--attn-cp-size") : 1,
     workerNnodes: baseCell?.nnodes ?? parseNnodes(base.nodes), specAlgorithm,
