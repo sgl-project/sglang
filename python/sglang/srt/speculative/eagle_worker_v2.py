@@ -1875,9 +1875,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
                 # Same runner class as the startup target verify graph on OOT.
                 TargetGraphRunnerCls = _select_spec_graph_runner_cls(
-                    builtin_runner_cls=lambda: (
-                        DecodeCudaGraphRunner
-                    ),
+                    builtin_runner_cls=lambda: DecodeCudaGraphRunner,
                     oot_runner_cls=current_platform.get_graph_runner_cls,
                 )
             if TargetGraphRunnerCls is not None:

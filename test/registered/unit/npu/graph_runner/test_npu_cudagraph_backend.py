@@ -48,7 +48,7 @@ def _make_eagle_draft_runner(
     # _build_eagle_draft_update_payload read only the fields set below.
     # index_topk: is_deepseek_dsa requires arch match AND index_topk present
     # in the HF config, so a DSA mock must carry both.
-    runner = EAGLEDraftCudaGraphRunner.__new__(EAGLDraftCudaGraphRunner)
+    runner = EAGLEDraftCudaGraphRunner.__new__(EAGLEDraftCudaGraphRunner)
     runner.device_module = _device_module_stub()
     runner.speculative_num_steps = speculative_num_steps
     runner.raw_bs = raw_bs
