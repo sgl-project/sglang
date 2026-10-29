@@ -20,9 +20,8 @@ SGLang supports the following Ascend inference hardware:
 
 <Note>
 Throughout these docs, **A3 Series** and **950PR/DT Series** are used as shorthand for the hardware above.
-Docker image tags use `a3` for the A3 Series. For example, `main-cann9.1.0-a3`.
-{/* TODO: CANN 9.1.0 has no stable image yet, so the example temporarily uses the daily build tag. Once the stable image is published, switch it back to a stable release tag. */}
-Tags for the 950PR/DT Series use `950`. For example, `main-cann9.1.0-950`.
+Docker image tags use `a3` for the A3 Series. For example, `cann9.1.0-a3-B105`.
+Tags for the 950PR/DT Series use `950`. For example, `cann9.1.0-950-B105`.
 
 On the A3 Series, each card has 2 dies, giving 16 devices per node.
 Benchmark pages use "Cards" to refer to physical cards, so `Cards: 4` on the A3 Series means `--tp-size 8`.
