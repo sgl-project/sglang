@@ -179,9 +179,6 @@ class _PrefillReq:
     def update_finish_state(self):
         return None
 
-    def mark_request_header_stale(self):
-        pass
-
 
 class _DecodeReq:
     def __init__(self):
@@ -288,7 +285,6 @@ class TestPrefillSkippedOutput(CustomTestCase):
         req.return_sampling_mask = True
         batch = SimpleNamespace(
             reqs=[req],
-            decoding_reqs=None,
             return_logprob=False,
             return_hidden_states=False,
             return_hidden_states_mode=CaptureHiddenMode.NULL,

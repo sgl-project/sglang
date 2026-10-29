@@ -29,7 +29,6 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -83,7 +82,7 @@ class _FakeReq:
         self.cached_tokens_host = 0
         self.cached_tokens_storage = 0
         self.retraction_count = 0
-        self._request_header_stale = True
+        self.request_header_retraction_count = None
         self.time_stats = None
         self.return_hidden_states = False
         self.return_routed_experts = False
@@ -96,11 +95,6 @@ class _FakeReq:
         self.multimodal_inputs = None
         self.customized_info = customized_info
         self.weight_version_events = []
-
-    def take_request_header_stale(self):
-        stale = self._request_header_stale
-        self._request_header_stale = False
-        return stale
 
     def finished(self):
         return self._finished
@@ -589,10 +583,10 @@ class TestOutputStreamerDecodeLatency(unittest.TestCase):
         self.assertEqual(python_mode.decode_latencies, {})
 
 
-def _metered_req(rid="r"):
+def _metered_req():
     sampling_params = SamplingParams()
     sampling_params.normalize(None)
-    req = Req(rid, "", array("q", [1, 2, 3]), sampling_params, stream=True)
+    req = Req("r", "", array("q", [1, 2, 3]), sampling_params, stream=True)
     req.time_stats.set_metrics_collector(Mock())
     return req
 
@@ -609,56 +603,6 @@ def _streamer(outputs, enable_hicache_storage=lambda: False):
     )
 
 
-def _result_processor(streamer, **fields):
-    return SchedulerBatchResultProcessor(
-        **{
-            **{f.name: None for f in dataclasses.fields(SchedulerBatchResultProcessor)},
-            "is_generation": True,
-            "model_config": SimpleNamespace(self_opened_think_start_ids=None),
-            "token_to_kv_pool_allocator": Mock(),
-            "output_streamer": streamer,
-            **fields,
-        }
-    )
-
-
-def _run_prefill_result(processor, reqs, decoding_reqs=None):
-    batch = SimpleNamespace(
-        reqs=reqs,
-        decoding_reqs=decoding_reqs,
-        spec_algorithm=SpeculativeAlgorithm.NONE,
-        return_logprob=False,
-        return_hidden_states=False,
-        return_hidden_states_mode=CaptureHiddenMode.NULL,
-        spec_info=None,
-        prefill_stats=None,
-    )
-    result = SimpleNamespace(
-        copy_done=None,
-        auxiliary_host_output=None,
-        routed_experts_output=None,
-        indexer_topk_output=None,
-        logits_output=SimpleNamespace(customized_info=None, sampling_mask_output=None),
-        next_token_ids=torch.tensor([7] * len(reqs)),
-        extend_input_len_per_req=None,
-        extend_logprob_start_len_per_req=None,
-        skipped_output_comm=False,
-        can_run_cuda_graph=False,
-    )
-    with (
-        patch(
-            "sglang.srt.managers.scheduler_components."
-            "batch_result_processor.checkpoint_kv_cache"
-        ),
-        patch(
-            "sglang.srt.managers.scheduler_components."
-            "batch_result_processor.get_memory",
-            return_value=SimpleNamespace(enable_hisparse=False),
-        ),
-    ):
-        processor.process_batch_result_prefill(batch, result)
-
-
 class TestOutputStreamerRequestHeader(unittest.TestCase):
     def setUp(self):
         _enter_streamer_scope(self)
@@ -673,7 +617,7 @@ class TestOutputStreamerRequestHeader(unittest.TestCase):
         observability.start()
         self.addCleanup(observability.stop)
 
-    def test_meta_carries_time_stats_only_with_metrics_on(self):
+    def test_header_carries_time_stats_only_with_metrics_on(self):
         """With metrics on a request's header carries its time stats, None for
         a request whose own metrics are off; with metrics off it carries none."""
         timed = SchedulerReqTimeStats(enable_metrics=True)
@@ -689,161 +633,47 @@ class TestOutputStreamerRequestHeader(unittest.TestCase):
         self.assertIsNone(time_stats(True, SchedulerReqTimeStats()))
         self.assertIsNone(time_stats(False, timed))
 
-    def test_output_after_reprefill_carries_current_header(self):
-        """A request's header goes out with its first output, and again with
-        the first output after each prefill result or retraction, so the output
-        after a re-prefill carries the new retraction count and queue time even
-        when an output went out between the retraction and the re-prefill."""
+    def test_header_goes_out_on_first_output_retraction_and_finish(self):
+        """A request's header goes out with its first output, with the first
+        output after each retraction, and with its finished row; other rows
+        carry none, so they keep the values last sent."""
         self._set_metrics(True)
         outputs = []
         streamer = _streamer(outputs)
-        processor = _result_processor(streamer)
         req = _metered_req()
         req.cached_tokens = 2
 
-        def prefill_result():
-            _run_prefill_result(processor, [req])
-            return outputs[-1].request_headers
-
-        def decode_result():
-            req.output_ids.append(8)
+        def output(finished=False):
+            req.output_ids.append(7)
+            if finished:
+                req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
             streamer.stream_output([req], False)
             return outputs[-1].request_headers
 
-        [first] = prefill_result()
+        [first] = output()
         self.assertEqual(
             (first.prompt_tokens, first.cached_tokens, first.retraction_count),
             (3, 2, 0),
         )
-        self.assertIsNone(decode_result())
+        self.assertIsNone(output())
 
         req.reset_for_retract()
         # The overlap schedule outputs the retracted request's last decode step.
-        [retracted] = decode_result()
+        [retracted] = output()
         self.assertEqual(retracted.retraction_count, 1)
-        # Re-admission adds the second wait to the queue time, and the re-prefill
-        # clears the retracted mark (prepare_for_extend).
+        # Re-admission adds the second wait to the queue time.
         req.time_stats.queue_duration_s += 0.5
         req.is_retracted = False
-        [reprefilled] = prefill_result()
-        self.assertEqual(reprefilled.retraction_count, 1)
-        self.assertEqual(reprefilled.time_stats.queue_time, 0.5)
-        self.assertIsNone(decode_result())
+        self.assertIsNone(output())
 
-    def test_output_after_prebuilt_carries_current_header(self):
-        """PD decode: the first output after a prebuilt result carries fresh
-        header, so a rebootstrapped request reports its new transfer's cached
-        tokens even when an output went out since its retraction."""
-        outputs = []
-        streamer = _streamer(outputs)
-        processor = _result_processor(
-            streamer, disaggregation_mode=DisaggregationMode.DECODE
-        )
-        req = _metered_req()
-        req.cached_tokens = 2
-        req.output_ids.append(7)
-
-        def prebuilt_result():
-            with patch(
-                "sglang.srt.managers.scheduler_components."
-                "batch_result_processor.get_disagg",
-                return_value=SimpleNamespace(
-                    disaggregation_decode_enable_radix_cache=False
-                ),
-            ):
-                processor.process_batch_result_prebuilt(
-                    SimpleNamespace(reqs=[req], return_logprob=False)
-                )
-            return outputs[-1].request_headers
-
-        def decode_result():
-            req.output_ids.append(8)
-            streamer.stream_output([req], False)
-            return outputs[-1].request_headers
-
-        [first] = prebuilt_result()
-        self.assertEqual(first.cached_tokens, 2)
-        self.assertIsNone(decode_result())
-
-        req.reset_for_retract()
-        # The overlap schedule outputs the retracted request's last decode step.
-        decode_result()
-        # The rebootstrap's transfer reports the prefill node's cache hit anew.
-        req.cached_tokens = 5
-        req.is_retracted = False
-        [resumed] = prebuilt_result()
-        self.assertEqual(resumed.cached_tokens, 5)
-
-    def test_output_after_dllm_block_carries_current_header(self):
-        """dLLM: each block is an extend that can change cached_tokens, so the
-        output after each block result carries a fresh header."""
-        from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
-
-        outputs = []
-        streamer = _streamer(outputs)
-        scheduler = SimpleNamespace(
-            dllm_config=SimpleNamespace(
-                requires_separate_context_encoding=False,
-                first_done_first_out_mode=False,
-                block_size=2,
-            ),
-            metrics_reporter=Mock(num_generated_tokens=0),
-            token_to_kv_pool_allocator=Mock(),
-            output_streamer=streamer,
-            _finish_dllm_request_if_needed=lambda req: None,
-        )
-        req = _metered_req()
-
-        def block_result(cached_tokens):
-            req.cached_tokens = cached_tokens
-            fill_len = len(req.origin_input_ids) + len(req.output_ids) + 2
-            req.full_untruncated_fill_ids = array("q", [0] * fill_len)
-            req.extend_end = fill_len
-            batch = SimpleNamespace(
-                reqs=[req],
-                forward_mode=SimpleNamespace(is_dllm_extend=lambda: True),
-                batch_size=lambda: 1,
-                return_logprob=False,
-                prefill_stats=None,
-                dp_cooperation_info=None,
-            )
-            result = SimpleNamespace(
-                copy_done=None,
-                accept_length_per_req_cpu=None,
-                dllm_algo_state=None,
-                next_token_ids=[torch.tensor([7, 8])],
-                can_run_cuda_graph=False,
-            )
-            SchedulerDllmMixin.process_batch_result_dllm(scheduler, batch, result)
-            return outputs[-1].request_headers
-
-        [first] = block_result(2)
-        self.assertEqual(first.cached_tokens, 2)
-        [second] = block_result(3)
-        self.assertEqual(second.cached_tokens, 3)
-
-    def test_mixed_batch_decode_row_keeps_its_header(self):
-        """A decode row riding in an extend batch (mixed chunk, or a decode batch
-        DP attention converted) ran no prefill, so its header is not resent;
-        the prefill row's is."""
-        outputs = []
-        streamer = _streamer(outputs)
-        processor = _result_processor(streamer)
-        decoding = _metered_req("decoding")
-        decoding.output_ids.append(5)
-        streamer.stream_output([decoding], False)
-        prefilling = _metered_req("prefilling")
-
-        _run_prefill_result(processor, [prefilling, decoding], decoding_reqs=[decoding])
-
-        prefill_header, decode_header = outputs[-1].request_headers
-        self.assertIsNotNone(prefill_header)
-        self.assertIsNone(decode_header)
+        [finished] = output(finished=True)
+        self.assertEqual(finished.retraction_count, 1)
+        self.assertEqual(finished.time_stats.queue_time, 0.5)
 
     def test_finished_output_carries_current_header(self):
         """A finished output carries the request's current header even when a
-        value changed with no flag set: HiCache storage attached mid-request adds
-        the storage keys to cached_tokens_details."""
+        value changed after the last one was sent: HiCache storage attached
+        mid-request adds the storage keys to cached_tokens_details."""
         attached = False
         outputs = []
         streamer = _streamer(outputs, enable_hicache_storage=lambda: attached)

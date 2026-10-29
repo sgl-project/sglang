@@ -1394,8 +1394,9 @@ class Req(ReqDllmMixin):
         self.retraction_count = 0
         self.retraction_mb_id = None
 
-        # Set when RequestOutputHeader may have changed since the last output.
-        self._request_header_stale = True
+        # The retraction_count of the last RequestOutputHeader sent; None before
+        # the first output.
+        self.request_header_retraction_count: Optional[int] = None
 
         # For observability
         self.metrics_collector = metrics_collector
@@ -1485,14 +1486,6 @@ class Req(ReqDllmMixin):
             ) = self.multimodal_inputs.compute_mm_token_counts()
             self.mm_token_counts_ready = True
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
-
-    def mark_request_header_stale(self) -> None:
-        self._request_header_stale = True
-
-    def take_request_header_stale(self) -> bool:
-        stale = self._request_header_stale
-        self._request_header_stale = False
-        return stale
 
     def inherit_mm_token_counts(self, other: Req) -> None:
         """Reuse counts from the request whose media history is shared."""
@@ -2073,7 +2066,6 @@ class Req(ReqDllmMixin):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
-        self.mark_request_header_stale()
 
         self.prefix_len = 0
         self.routed_experts = None

@@ -1583,8 +1583,9 @@ FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 class RequestOutputHeader(
     msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
 ):
-    """A request's output header: values that change only at a few lifecycle points.
-    The scheduler sends it when it changes; the tokenizer keeps the latest."""
+    """A request's per-request output values, as opposed to per-step ones.
+    The scheduler sends it on a request's first output, its first output after
+    each retraction and its finished row; the tokenizer keeps the latest."""
 
     prompt_tokens: int
     cached_tokens: int
@@ -1707,9 +1708,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
-    # By row, the request's header when it is new since the request's last
-    # output or when the row finishes, else None; the whole field is None when
-    # no row carries one.
+    # By row, the request's header on the rows that send it (see
+    # RequestOutputHeader), else None; the whole field is None when no row
+    # carries one.
     request_headers: Optional[List[Optional[RequestOutputHeader]]] = None
 
     # Rust server mode only: per-step header columns of

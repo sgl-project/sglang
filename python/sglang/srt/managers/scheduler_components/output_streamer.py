@@ -550,12 +550,16 @@ class _GenerationStreamAccumulator:
                 else len(output_ids_)
             )
 
-            # The tokenizer keeps each request's latest header. A finished row
-            # always carries it, so the final output reflects any late change.
-            stale = req.take_request_header_stale()
-            if stale or req.finished():
+            # The tokenizer keeps each request's latest header. It goes out with the
+            # first output, the first output after each retraction, and the
+            # finished row, so the final output reports the final values.
+            if (
+                req.request_header_retraction_count != req.retraction_count
+                or req.finished()
+            ):
                 self.request_headers.append(self.build_request_header(req))
                 self.has_request_header = True
+                req.request_header_retraction_count = req.retraction_count
             else:
                 self.request_headers.append(None)
 

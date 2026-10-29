@@ -122,7 +122,6 @@ class SchedulerBatchResultProcessor:
             self.token_to_kv_pool_allocator.free_group_begin()
         for req in batch.reqs:
             req.time_stats.set_decode_prebuilt_finish_time()
-            req.mark_request_header_stale()
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
@@ -305,11 +304,8 @@ class SchedulerBatchResultProcessor:
 
             # Check finish conditions
             logprob_pt = 0
-            # Decode reqs in a mixed batch, or every req of a converted decode batch.
-            decoding_req_ids = {id(req) for req in batch.decoding_reqs or ()}
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                is_decoding = id(req) in decoding_req_ids
                 should_commit_output = (
                     not req.finished()
                     and not req.is_retracted
@@ -355,8 +351,6 @@ class SchedulerBatchResultProcessor:
 
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
-                    if not is_decoding:
-                        req.mark_request_header_stale()
 
                     if discard_finish_reason is not None:
                         req.to_finish = discard_finish_reason
@@ -378,7 +372,8 @@ class SchedulerBatchResultProcessor:
                     # so the next spec prepare_for_decode reserves from the right base.
                     if (
                         not req.finished()
-                        and is_decoding
+                        and batch.decoding_reqs
+                        and req in batch.decoding_reqs
                         and not batch.spec_algorithm.is_none()
                     ):
                         req.kv.kv_committed_len += 1
@@ -388,7 +383,7 @@ class SchedulerBatchResultProcessor:
                             self._maybe_collect_indexer_topk(req)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.request_finished(req)
-                        if is_decoding:
+                        if batch.decoding_reqs and req in batch.decoding_reqs:
                             self._prepare_kv_cache_release(req)
                         release_kv_cache(
                             req,
@@ -396,7 +391,7 @@ class SchedulerBatchResultProcessor:
                             checkpoint=discard_finish_reason is None,
                         )
                         req.time_stats.set_completion_time()
-                    elif not is_decoding:
+                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         checkpoint_kv_cache(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)

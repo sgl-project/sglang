@@ -43,9 +43,6 @@ class _Req:
             set_completion_time=Mock(),
         )
 
-    def mark_request_header_stale(self):
-        pass
-
     def finished(self):
         return self.finished_reason is not None
 

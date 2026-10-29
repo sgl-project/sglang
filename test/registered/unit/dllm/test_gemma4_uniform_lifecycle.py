@@ -53,9 +53,6 @@ class _Req:
     def is_dllm_prefill(self):
         return self.dllm_phase_prefill
 
-    def mark_request_header_stale(self):
-        pass
-
     def update_finish_state(self, new_accepted_len=1):
         if self.finish_on_update:
             self.finished_reason = object()

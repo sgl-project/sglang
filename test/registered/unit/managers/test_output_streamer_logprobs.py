@@ -36,7 +36,7 @@ class _FakeReq:
         self.reasoning_tokens = 0
         self.cached_tokens = 0
         self.retraction_count = 0
-        self._request_header_stale = True
+        self.request_header_retraction_count = None
         self.time_stats = None
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
@@ -56,11 +56,6 @@ class _FakeReq:
             output_token_ids_logprobs_val=[[-0.5]],
             output_token_ids_logprobs_idx=[[42]],
         )
-
-    def take_request_header_stale(self):
-        stale = self._request_header_stale
-        self._request_header_stale = False
-        return stale
 
     def finished(self):
         return False
