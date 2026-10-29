@@ -446,6 +446,9 @@ class ModelRunner:
         self._sampling_observer: Optional[SamplingObserver] = None
         self._forward_observer: Optional[ForwardObserver] = None
         self.sampling_prewarm_result = SamplingPrewarmResult()
+        self.eager_runner = None
+        self.prefill_cuda_graph_runner = None
+        self.decode_cuda_graph_runner = None
 
         self.init_startup_observability()
 
