@@ -43,6 +43,11 @@ class SailFlashMLABackend(FlashMLABackend):
 
     def __init__(self, model_runner: ModelRunner, **kwargs):
         super().__init__(model_runner, **kwargs)
+        # FlashMLABackend leaves the translator to bind_and_verify_backends,
+        # which only reaches top-level backends; on SAIL this instance is wrapped
+        # by SailHybridAttnBackend, so wire it here. Runners without the unified
+        # pool (predating the translator) keep the triton path below.
+        self.kv_index_translator = getattr(model_runner, "kv_index_translator", None)
         if self.is_fp8_kvcache:
             raise NotImplementedError(
                 "FP8 KV cache is not supported by FlashMLA on SAIL."
@@ -76,11 +81,10 @@ class SailFlashMLABackend(FlashMLABackend):
         else:
             max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
 
-        if self.kv_index_translator.reads_are_translated:
+        translator = self.kv_index_translator
+        if translator is not None and translator.reads_are_translated:
             assert self.page_size == PAGE_SIZE
-            self.kv_index_translator.copy_page_table(
-                plan, out=self.cuda_graph_kv_indices[:bs]
-            )
+            translator.copy_page_table(plan, out=self.cuda_graph_kv_indices[:bs])
         else:
             create_flashmla_kv_indices_triton[
                 (
