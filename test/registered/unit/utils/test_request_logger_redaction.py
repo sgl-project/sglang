@@ -1,5 +1,6 @@
-"""Watermark secrets stay redacted in request logs, and the redaction walk is
-bounded by max_length instead of the prompt length."""
+"""Watermark secrets stay redacted in request logs, the redaction walk is
+bounded by max_length instead of the prompt length, and OpenAI payload logs
+below level 3 summarize tool schemas."""
 
 import json
 import unittest
@@ -7,6 +8,7 @@ from unittest import mock
 
 import msgspec
 
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils import request_logger
@@ -127,6 +129,42 @@ class TestRequestLogRedaction(CustomTestCase):
         self.assertIs(redact_watermark_secrets(ids_tuple), ids_tuple)
         redacted = redact_watermark_secrets([{"watermark_key": SECRET}])
         self.assertEqual(redacted, [{"watermark_key": "<redacted>"}])
+
+
+class TestOpenAIRequestToolLogging(CustomTestCase):
+    def test_tool_schemas_logged_only_at_level_3(self):
+        def tool(name):
+            return {
+                "type": "function",
+                "function": {"name": name, "description": f"{name}-schema-text"},
+            }
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "system", "content": "s", "tools": [tool("in_message")]},
+                {"role": "user", "content": "u"},
+            ],
+            tools=[tool("top_a"), tool("top_b")],
+        )
+        for fmt in ("text", "json"):
+            for level in (2, 3):
+                logger = request_logger.RequestLogger(
+                    log_requests=True,
+                    log_requests_level=level,
+                    log_requests_format=fmt,
+                    log_requests_target=None,
+                )
+                target = mock.Mock()
+                logger.targets = [target]
+                logger.log_openai_received_request(req)
+                out = target.info.call_args.args[0]
+                for name in ("in_message", "top_a", "top_b"):
+                    self.assertIn(name, out)
+                    if level == 3:
+                        self.assertIn(f"{name}-schema-text", out)
+                    else:
+                        self.assertNotIn(f"{name}-schema-text", out)
 
 
 if __name__ == "__main__":

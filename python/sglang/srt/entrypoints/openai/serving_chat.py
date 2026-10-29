@@ -735,7 +735,9 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> list[int] | None:
         """Encode messages for custom chat_encoding_spec values.
 
-        Returns prompt_ids if handled, None to use default encoding.
+        Returns prompt_ids if handled, None to use default encoding. `messages`
+        is this request's own dump: an encoder that returns None must leave it
+        unchanged, since the default encoding reads it next.
         """
         if self._encoding_adapter is not None:
             return self._encoding_adapter.encode_messages(
@@ -2046,7 +2048,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         prompt_ids = self._encode_messages(
-            copy.deepcopy(messages),
+            messages,
             request,
             thinking_mode,
             tools=tools,
@@ -2076,7 +2078,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
         elif self.chat_encoding_spec is not None:
             # dsv32 encoding path
-            messages = copy.deepcopy(messages)
             for msg in messages:
                 if msg.get("content") is None:
                     msg["content"] = ""
@@ -2132,7 +2133,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages = self._canonicalize_tool_message_order(
                     messages, sort_text_runs=self.is_minimax_m3
                 )
-            for msg_dict in copy.deepcopy(messages):
+            for msg_dict in messages:
                 if msg_dict.get("content") is None:
                     msg_dict["content"] = ""
 
