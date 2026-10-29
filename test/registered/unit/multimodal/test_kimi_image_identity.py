@@ -28,6 +28,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalInputs,
 )
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.cache import snapshot_media
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import (
@@ -46,7 +47,8 @@ _LEGACY_COLLIDING_FEATURES = (23990, 59582)
 
 class _IdentityOnly(KimiGridMMDataMixin):
     def __init__(self, preprocess_config):
-        self.processor_fingerprint = json.dumps(preprocess_config, sort_keys=True)
+        payload = json.dumps(preprocess_config, sort_keys=True).encode()
+        self.processor_fingerprint = "sha256:" + hashlib.sha256(payload).hexdigest()
         self.hf_config = None
 
 
@@ -165,6 +167,65 @@ class TestKimiImageIdentity(CustomTestCase):
             self.assertIsNotNone(item.identity)
             identities.append(item.identity)
         self.assertEqual(len(set(identities)), 3)
+
+    def test_prepared_inputs_do_not_alias_other_formats_or_metadata(self):
+        """equal tensors need different cache keys when the encoder contract differs"""
+        processor = _IdentityOnly({})
+        feature = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        reference = _image_item(
+            [1, 4, 4], feature=feature, fmt=MultimodalInputFormat.PROCESSOR_OUTPUT
+        )
+        processor.assign_kimi_image_identities([reference], None)
+        cache = MultiModalStaticCache(1024)
+        cached = EmbeddingResult(embedding=torch.ones(4, 4))
+        cache.set(reference.cache_key, cached)
+
+        changed_format = _image_item(
+            [1, 4, 4], feature=feature, fmt=MultimodalInputFormat.PRECOMPUTED_EMBEDDING
+        )
+        changed_format.feature = None
+        changed_format.precomputed_embeddings = feature
+        changed_metadata = _image_item(
+            [1, 4, 4], feature=feature, fmt=MultimodalInputFormat.PROCESSOR_OUTPUT
+        )
+        changed_metadata.model_specific_data["position_ids"] = torch.arange(4)
+        for item in (changed_format, changed_metadata):
+            with self.subTest(format=item.format, metadata=item.model_specific_data):
+                processor.assign_kimi_image_identities([item], None)
+                self.assertIsNone(cache.get_single(item.cache_key))
+
+        repeat = _image_item(
+            [1, 4, 4],
+            feature=feature.clone(),
+            fmt=MultimodalInputFormat.PROCESSOR_OUTPUT,
+        )
+        processor.assign_kimi_image_identities([repeat], None)
+        self.assertIs(cache.get_single(repeat.cache_key), cached)
+
+    def test_prepared_inputs_use_common_identity_without_snapshot(self):
+        """prepared features stay on their device instead of taking the raw-media snapshot path"""
+        processor = _IdentityOnly({})
+        item = _image_item(
+            [1, 4, 4],
+            feature=torch.arange(16).reshape(4, 4),
+            fmt=MultimodalInputFormat.PROCESSOR_OUTPUT,
+        )
+        expected = _image_item(
+            [1, 4, 4],
+            feature=item.feature.clone(),
+            fmt=MultimodalInputFormat.PROCESSOR_OUTPUT,
+        )
+        expected.bind_processor_fingerprint(processor.processor_fingerprint)
+        expected.set_pad_value()
+        with patch(
+            "sglang.srt.multimodal.processors.kimi_common.snapshot_media",
+            side_effect=AssertionError(
+                "prepared inputs must not be snapshotted to CPU"
+            ),
+        ):
+            processor.assign_kimi_image_identities([item], None)
+        self.assertEqual(item.cache_key, expected.cache_key)
+        self.assertEqual(item.pad_values, expected.pad_values)
 
     def test_same_pixels_different_grid_gives_different_key(self):
         processor = _IdentityOnly({"in_patch_limit": 16384})
