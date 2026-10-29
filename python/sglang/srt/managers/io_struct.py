@@ -2374,7 +2374,7 @@ class ProfileReq(BaseReq, kw_only=True):
     num_steps: Optional[int] = None
     # The activities to record. The choices are ["CPU", "GPU", "MEM", "RPD"]
     activities: Optional[List[str]] = None
-    # Whether profile by stages (e.g., prefill and decode) separately
+    # Profile prefill and decode separately; requires a positive num_steps.
     profile_by_stage: bool = False
     # Whether to record source information (file and line number) for the ops.
     with_stack: Optional[bool] = None
@@ -2389,6 +2389,10 @@ class ProfileReq(BaseReq, kw_only=True):
     profile_stages: Optional[List[str]] = None
     # Add iteration-level annotations (KV / request aggregates) for roofline-style analysis
     detailed_annotations: bool = False
+
+    def __post_init__(self):
+        if self.profile_by_stage and (self.num_steps is None or self.num_steps <= 0):
+            raise ValueError("profile_by_stage requires a positive num_steps")
 
 
 class ProfileReqOutput(BaseReq, kw_only=True):

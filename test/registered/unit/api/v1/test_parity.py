@@ -34,6 +34,8 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     BaseReq,
     GenerateReqInput,
+    ProfileReq,
+    ProfileReqType,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams as PySamplingParams
 
@@ -133,6 +135,34 @@ class TestCrossLanguageFixtures(CustomTestCase):
         silently by a lookup-by-name; make it a failure."""
         for case in load_fixtures():
             self.assertTrue(hasattr(api_types, case["type"]), case["type"])
+
+
+class TestProfileRequestValidation(CustomTestCase):
+    def test_stage_profiling_requires_positive_steps(self):
+        """Invalid stage profiles are rejected before request handling."""
+        adapter = TypeAdapter(ProfileReq)
+        for payload in (
+            {"profile_by_stage": True},
+            {"profile_by_stage": True, "num_steps": 0},
+            {"profile_by_stage": True, "num_steps": -1},
+            {"profile_by_stage": True, "req_type": 2},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    adapter.validate_json(json.dumps(payload))
+        self.assertEqual(
+            adapter.validate_json(
+                '{"profile_by_stage": true, "num_steps": 3}'
+            ).num_steps,
+            3,
+        )
+        self.assertIsNone(adapter.validate_json("{}").num_steps)
+        with self.assertRaises(ValueError):
+            ProfileReq(profile_by_stage=True)
+        self.assertEqual(
+            ProfileReq(req_type=ProfileReqType.STOP_PROFILE).req_type,
+            ProfileReqType.STOP_PROFILE,
+        )
 
 
 class TestHiCacheRequestParity(CustomTestCase):
