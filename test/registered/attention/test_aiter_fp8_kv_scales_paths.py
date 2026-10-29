@@ -278,7 +278,7 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
             ),
             kv_indices=prefix_loc,
             custom_mask=None,
-            mask_indptr=torch.zeros(batch + 1, dtype=torch.int64, device=_DEVICE),
+            mask_indptr=None,
             max_extend_len=num_draft,
         )
         forward_batch = SimpleNamespace(
