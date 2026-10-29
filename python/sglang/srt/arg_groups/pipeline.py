@@ -286,6 +286,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
         handle_moe_kernel_config,
+        resolve_ascend_ops_speculative_draft,
         validate_deepep_v2_dispatch_token_budget,
         validate_deepep_v2_speculative_draft,
         validate_flashinfer_a2a_token_budget,
@@ -304,6 +305,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
     run_hook(handle_speculative_decoding, server_args)
+    run_post_process_pass(server_args, resolve_ascend_ops_speculative_draft)
 
     from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
 
@@ -352,16 +354,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_model_capability_adjustments, server_args)
 
     # needs the resolved CUDA-graph, attention-backend and speculative settings
-    from sglang.srt.kernel_plugins.amd.binding import (
-        handle_amd_monokernel,
-    )
+    from sglang.srt.kernel_plugins.amd.binding import handle_monokernel
     from sglang.srt.kernel_plugins.nvidia.binding import (
         handle_nvidia_megakernel,
     )
 
     # first, so a server with both kernel flags gets every reason in one error
     run_hook(handle_nvidia_megakernel, server_args)
-    run_hook(handle_amd_monokernel, server_args)
+    run_hook(handle_monokernel, server_args)
 
     finalize_cuda_graph_prefill_max_context(server_args)
 
