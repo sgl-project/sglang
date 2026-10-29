@@ -628,6 +628,7 @@ class TpModelWorker(BaseTpWorker):
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        pp_loras: Optional[set[Optional[str]]] = None,
         return_iteration_ids: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
@@ -655,6 +656,7 @@ class TpModelWorker(BaseTpWorker):
                 self.model_runner,
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
+                pp_loras=pp_loras,
             )
             if folded is not None:
                 apply_folded_extend(folded, forward_batch)
