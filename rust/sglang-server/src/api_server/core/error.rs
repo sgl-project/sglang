@@ -4,6 +4,8 @@
 use http::StatusCode;
 use sglang_api_types::api::v1 as api;
 
+use super::CoreOutput;
+
 /// Protocol-independent error category used by transport adapters.
 ///
 /// The set intentionally follows operation semantics rather than HTTP or gRPC
@@ -40,6 +42,11 @@ pub(crate) enum CoreError {
     #[error("{0}")]
     Cancelled(String),
 
+    /// A DP rank did not answer a control request within the fan-out's
+    /// deadline (see [`super::fanout`]).
+    #[error("{0}")]
+    DeadlineExceeded(String),
+
     /// The internal producer disappeared before returning a terminal result.
     ///
     /// This is a server-side failure, not evidence that the caller cancelled.
@@ -53,11 +60,16 @@ pub(crate) enum CoreError {
     /// `Failed`; retaining the legacy code only lets the HTTP adapter preserve
     /// existing behavior while another adapter maps it into its own status
     /// space. New core failures should use the semantic variants above.
+    ///
+    /// `output` is the request's terminal output, abort finish reason
+    /// included, for the one surface that reports the abort as an output: a
+    /// native `/generate` stream (see [`Self::into_rejected_output`]).
     #[error("{message}")]
     RuntimeRejected {
         kind: CoreErrorKind,
         message: String,
         legacy_http_status: u16,
+        output: Box<CoreOutput>,
     },
 
     /// The runtime replied with an unexpected or malformed result.
@@ -77,6 +89,7 @@ impl CoreError {
             Self::Unavailable => CoreErrorKind::Unavailable,
             Self::Overloaded(_) => CoreErrorKind::ResourceExhausted,
             Self::Cancelled(_) => CoreErrorKind::Cancelled,
+            Self::DeadlineExceeded(_) => CoreErrorKind::DeadlineExceeded,
             Self::ResponseTruncated => CoreErrorKind::Internal,
             Self::RuntimeRejected { kind, .. } => *kind,
             Self::InvalidResponse(_) | Self::Internal(_) => CoreErrorKind::Internal,
@@ -86,7 +99,11 @@ impl CoreError {
     /// Translate the scheduler's inherited HTTP-coded failure into a semantic
     /// category once, at the runtime boundary. HTTP can retain the exact legacy
     /// status while other adapters consume [`Self::kind`].
-    pub(super) fn from_runtime_rejection(message: String, legacy_http_status: u16) -> Self {
+    pub(crate) fn from_runtime_rejection(
+        message: String,
+        legacy_http_status: u16,
+        output: CoreOutput,
+    ) -> Self {
         let kind = match legacy_http_status {
             404 => CoreErrorKind::NotFound,
             408 | 504 => CoreErrorKind::DeadlineExceeded,
@@ -101,6 +118,19 @@ impl CoreError {
             kind,
             message,
             legacy_http_status,
+            output: Box::new(output),
+        }
+    }
+
+    /// The terminal output of a scheduler-side abort that carried an error
+    /// status, finish reason and counts included; any other failure comes
+    /// back as is. Python's server ends a native `/generate` stream on that
+    /// output as a normal frame, so a client reads the abort from
+    /// `meta_info.finish_reason`, not from an error item.
+    pub(crate) fn into_rejected_output(self) -> Result<CoreOutput, Self> {
+        match self {
+            Self::RuntimeRejected { output, .. } => Ok(*output),
+            error => Err(error),
         }
     }
 
@@ -165,10 +195,15 @@ mod tests {
             499
         );
         assert_eq!(
+            CoreError::DeadlineExceeded("late".into()).http_status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(
             CoreError::RuntimeRejected {
                 kind: CoreErrorKind::InvalidArgument,
                 message: "runtime rejected request".into(),
                 legacy_http_status: 432,
+                output: Box::default(),
             }
             .http_status()
             .as_u16(),

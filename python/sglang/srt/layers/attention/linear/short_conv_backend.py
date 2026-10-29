@@ -94,7 +94,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+        mamba_cache = self.state_pool.mamba_cache
         # conv[0] == conv_state: [n_layers, n_slots, conv_dim, conv_kernel - 1]
         self.conv_states_shape = mamba_cache.conv[0].shape
 
@@ -199,7 +199,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         ``forward_batch`` is accepted for interface parity with the unit-test
         mock and is not otherwise required here.
         """
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        layer_cache = self.state_layer_cache(layer_id)
         md = self.forward_metadata
 
         # Slot indices are cached ONCE per step in init_forward_metadata /

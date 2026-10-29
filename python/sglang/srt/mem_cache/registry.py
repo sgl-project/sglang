@@ -99,19 +99,24 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         return create_unified_radix_cache(ctx)
 
     if get_memory().enable_lmcache:
+        from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
         from sglang.srt.mem_cache.storage.lmcache.lmcache_unified_radix_cache import (
             LMCacheUnifiedRadixCache,
         )
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
-        tree_components = []
-        if not is_pure_swa:
-            tree_components.append(ComponentType.FULL)
-        if ctx.is_hybrid_swa:
-            tree_components.append(ComponentType.SWA)
-        if ctx.is_hybrid_ssm:
-            tree_components.append(ComponentType.MAMBA)
-        params.tree_components = tuple(tree_components)
+        allocator = params.token_to_kv_pool_allocator
+        storage = kv_storage_of(
+            params.req_to_token_pool,
+            allocator,
+            shape=_static_tree_shape(ctx, allocator),
+        )
+        # A pure-window model keeps no full-attention prefix in LMCache.
+        params.tree_slots = tuple(
+            slot
+            for slot in storage.tree_slots(window_reach=params.draft_swa_window)
+            if not (is_pure_swa and slot.family == TREE_TOKEN)
+        )
         return LMCacheUnifiedRadixCache(
             params,
             model_config=ctx.model_config,
@@ -146,6 +151,22 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     return create_unified_radix_cache(ctx)
 
 
+def _static_tree_shape(ctx: TreeCacheBuildContext, allocator):
+    """What static pools tell their prefix tree (a unified pool's plan says it
+    itself): which slots the model has, its window layers' attention window,
+    and the token interval a cached recurrent state is valid at."""
+    from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape
+    from sglang.srt.runtime_context import mamba_cache_chunk_size
+
+    return StaticPoolShape(
+        has_window=ctx.is_hybrid_swa,
+        has_state=ctx.is_hybrid_ssm,
+        token_capacity=allocator.size,
+        window=ctx.params.sliding_window_size,
+        checkpoint_interval=mamba_cache_chunk_size() if ctx.is_hybrid_ssm else None,
+    )
+
+
 def create_unified_radix_cache(
     ctx: TreeCacheBuildContext,
     *,
@@ -159,34 +180,37 @@ def create_unified_radix_cache(
         if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
             raise ValueError("Host-pool retraction does not support pure-SWA models.")
 
-    from sglang.srt.mem_cache.unified_cache.components import ComponentType
+    from sglang.srt.mem_cache.kv.plan import TREE_BLOCK, TREE_STATE, TreeSlot
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-    tree_components = [ComponentType.FULL]
-    if ctx.is_hybrid_swa:
-        tree_components.append(ComponentType.SWA)
-    if ctx.is_hybrid_ssm:
-        tree_components.append(ComponentType.MAMBA)
+    allocator = params.token_to_kv_pool_allocator
+    storage = kv_storage_of(
+        params.req_to_token_pool,
+        allocator,
+        shape=_static_tree_shape(ctx, allocator),
+    )
+    tree_slots = list(storage.tree_slots(window_reach=params.draft_swa_window))
 
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
             C128SidecarComponent,
         )
 
-        tree_components.append(ComponentType.C128)
+        tree_slots.append(TreeSlot(component="C128", family=TREE_BLOCK))
         params.component_registry_override = {
             **(params.component_registry_override or {}),
-            ComponentType.C128: C128SidecarComponent,
+            TREE_BLOCK: C128SidecarComponent,
         }
 
-    params.tree_components = tuple(tree_components)
+    params.tree_slots = tuple(tree_slots)
     if use_mlx() and ctx.is_hybrid_ssm:
         from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
             MlxAuxiliaryStateComponent,
         )
 
         params.component_registry_override = {
-            ComponentType.MAMBA: MlxAuxiliaryStateComponent,
+            TREE_STATE: MlxAuxiliaryStateComponent,
         }
     cache = (cache_class or UnifiedRadixCache)(params)
     if (
@@ -198,35 +222,26 @@ def create_unified_radix_cache(
             cache.cache_controller.layer_done_counter
         )
     elif get_memory().enable_unified_cache_external_linker:
-        backend = get_memory().unified_cache_external_linker_backend
-        if backend == "mooncake":
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
-                MooncakeDirectLinker,
-            )
-
-            linker_cls = MooncakeDirectLinker
-        elif backend == "mori":
-            from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
-                UMBPDirectLinker,
-            )
-
-            linker_cls = UMBPDirectLinker
-        else:
-            raise ValueError(
-                f"Unknown unified cache external linker backend: {backend!r}"
-            )
-
-        cache.init_cache_linker(
-            linker_cls(
-                server_args,
-                params,
-                components=set(cache.components),
-                forward_stream=ctx.tp_worker.model_runner.forward_stream,
-            )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.unified_cache.linker_factory import (
+            create_unified_cache_linker,
+            get_startup_linker_config,
         )
-        counter = cache.linker.layer_done_counter
+
+        linker = create_unified_cache_linker(
+            server_args,
+            params,
+            backend=get_memory().unified_cache_external_linker_backend,
+            config=get_startup_linker_config(),
+            components=set(cache.components),
+            forward_stream=ctx.tp_worker.model_runner.forward_stream,
+        )
+        cache.init_cache_linker(linker)
+        counter = linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         kvcache.register_layer_transfer_counter(counter)
+        if PoolName.MAMBA in linker.pools:
+            kvcache.layer_router.load_parts_layer_wise()
         ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
     return cache
 
