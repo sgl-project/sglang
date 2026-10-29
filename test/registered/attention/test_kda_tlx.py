@@ -62,12 +62,14 @@ def _case(lengths, decode, seed=20261028):
         query_start_loc=torch.nn.functional.pad(
             lens.cumsum(0, dtype=torch.int32), (1, 0)
         ),
+        lengths=list(lengths),
     )
 
 
 def _extend(kernel, case, pool, **kwargs):
     # chunk_kda writes its output into v, so every run gets its own qkv.
     q, k, v = _split_qkv(case["qkv"].clone())
+    kwargs = {"extend_seq_lens_cpu": case["lengths"], **kwargs}
     return kernel.extend(
         q,
         k,
@@ -163,6 +165,27 @@ def test_extend_routes_uncovered_calls_to_triton(kwargs, uses_tlx):
         _extend(TlxKDAKernel(), case, case["pool"].clone(), **kwargs)
     assert tlx.called == uses_tlx
     assert base.called != uses_tlx
+
+
+@requires_prefill
+@pytest.mark.parametrize(
+    "extra, expected",
+    [
+        ({"extend_seq_lens_cpu": [100, 30]}, [0, 100, 130]),
+        ({"extend_seq_lens_cpu": [100, 29]}, None),
+        ({"extend_seq_lens_cpu": [130]}, None),
+        ({"extend_seq_lens_cpu": None}, None),
+    ],
+    ids=["consistent", "wrong-total", "wrong-count", "absent"],
+)
+def test_extend_passes_host_boundaries_only_when_consistent(extra, expected):
+    case = _case([100, 30], decode=False)
+    with patch(
+        "sglang.kernels.ops.attention.tlx.kda.gfx950_prefill.kda_paged_prefill",
+        return_value=(None, None),
+    ) as tlx:
+        _extend(TlxKDAKernel(), case, case["pool"].clone(), **extra)
+    assert tlx.call_args.kwargs["cu_seqlens_cpu"] == expected
 
 
 @requires_prefill

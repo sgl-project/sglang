@@ -3,7 +3,9 @@
 ``gfx950_prefill`` (``attention.kda_paged_prefill``) is a TLX kernel.
 ``gfx950_decode`` (``attention.kda_recurrent_decode``) uses no TLX primitive and
 compiles on any Triton. Both are upstream's code reformatted for this
-repository: re-vendor them rather than patching them here.
+repository, plus one local change to ``gfx950_prefill``: ``kda_paged_prefill``
+takes ``cu_seqlens_cpu``. Carry it over when re-vendoring until it lands
+upstream; otherwise re-vendor rather than patch here.
 """
 
 from __future__ import annotations

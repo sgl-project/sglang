@@ -6,6 +6,7 @@
 # (https://github.com/facebookexperimental/triton/pull/4243),
 # commit 7d38f0a (7d38f0a66999481017732b395d0c607c12a79770),
 # file third_party/tlx/ops/kernels/kda/gfx950_prefill.py.
+# Local change, to be upstreamed: kda_paged_prefill's cu_seqlens_cpu.
 
 """Stateful chunk-parallel Kimi Delta Attention prefill for gfx950.
 
@@ -28,6 +29,7 @@ TLX local-memory async copies stage the walk's per-chunk operands.
 from __future__ import annotations
 
 import functools
+from collections.abc import Sequence
 from itertools import pairwise
 
 import torch
@@ -68,9 +70,16 @@ _PREFILL_METADATA_CACHE = []
 
 
 def _prepare_prefill_metadata(
-    cu_seqlens: torch.Tensor, device: torch.device, total_tokens: int
+    cu_seqlens: torch.Tensor,
+    device: torch.device,
+    total_tokens: int,
+    cu_seqlens_cpu: Sequence[int] | None = None,
 ):
-    """Cache the latest packed schedule by tensor identity and version."""
+    """Cache the latest packed schedule by tensor identity and version.
+
+    With ``cu_seqlens_cpu``, the same boundaries on the host, the schedule is
+    built and uploaded without synchronizing the device.
+    """
     version = cu_seqlens._version
     if _PREFILL_METADATA_CACHE:
         source, cached_version, cached_device, cached_tokens, value = (
@@ -83,7 +92,12 @@ def _prepare_prefill_metadata(
         ):
             return value
 
-    boundaries = cu_seqlens.detach().to(device="cpu", dtype=torch.int64).tolist()
+    if cu_seqlens_cpu is None:
+        boundaries = cu_seqlens.detach().to(device="cpu", dtype=torch.int64).tolist()
+    else:
+        boundaries = [int(boundary) for boundary in cu_seqlens_cpu]
+        if len(boundaries) != cu_seqlens.numel():
+            raise ValueError("cu_seqlens_cpu must have as many entries as cu_seqlens")
     if not boundaries or boundaries[0] != 0 or boundaries[-1] != total_tokens:
         raise ValueError(
             "cu_seqlens must start at zero and end at the packed token count"
@@ -99,11 +113,17 @@ def _prepare_prefill_metadata(
     ):
         cu_device = cu_device.to(device=device, dtype=torch.int32).contiguous()
     pairs = _chunk_pairs(boundaries, CHUNK_SIZE)
-    chunk_indices = (
-        torch.tensor(pairs, dtype=torch.int32, device=device)
-        if pairs
-        else torch.empty((0, 2), dtype=torch.int32, device=device)
-    )
+    if not pairs:
+        chunk_indices = torch.empty((0, 2), dtype=torch.int32, device=device)
+    elif cu_seqlens_cpu is None:
+        chunk_indices = torch.tensor(pairs, dtype=torch.int32, device=device)
+    else:
+        # A pageable host-to-device copy would synchronize the stream.
+        chunk_indices = (
+            torch.tensor(pairs, dtype=torch.int32)
+            .pin_memory()
+            .to(device, non_blocking=True)
+        )
     value = (cu_device, chunk_indices)
     _PREFILL_METADATA_CACHE[:] = [cu_seqlens, version, device, total_tokens, value]
     return value
@@ -1375,6 +1395,7 @@ def kda_paged_prefill(
     beta_is_raw: bool = False,
     state_pool: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
+    cu_seqlens_cpu: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run KDA prefill and return output plus final state.
 
@@ -1391,6 +1412,9 @@ def kda_paged_prefill(
     state returned as a new tensor, or a ``state_pool`` [slots, H, V, K] with
     ``state_indices`` [N] naming each sequence's slot. A pool is updated in
     place and returned as the final state.
+
+    ``cu_seqlens_cpu``, the values of ``cu_seqlens`` on the host, lets the
+    chunk schedule be built without synchronizing the device.
     """
     use_qk_l2norm_and_gate = A_log is not None
     if use_qk_l2norm_and_gate and dt_bias is None:
@@ -1416,7 +1440,7 @@ def kda_paged_prefill(
     if not paged:
         initial_state = initial_state.contiguous()
     cu_seqlens, chunk_indices = _prepare_prefill_metadata(
-        cu_seqlens, q.device, total_tokens
+        cu_seqlens, q.device, total_tokens, cu_seqlens_cpu
     )
     num_chunks = chunk_indices.shape[0]
     num_sequences = cu_seqlens.numel() - 1

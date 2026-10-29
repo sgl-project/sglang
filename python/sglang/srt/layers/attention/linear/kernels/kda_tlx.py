@@ -1,4 +1,5 @@
 import logging
+from itertools import accumulate
 from typing import Optional
 
 import torch
@@ -202,6 +203,14 @@ class TlxKDAKernel(TritonKDAKernel):
             kda_paged_prefill,
         )
 
+        seq_lens = kwargs.get("extend_seq_lens_cpu")
+        cu_seqlens_cpu = None
+        if (
+            seq_lens is not None
+            and len(seq_lens) == query_start_loc.numel() - 1
+            and sum(seq_lens) == q.shape[1]
+        ):
+            cu_seqlens_cpu = [0, *accumulate(seq_lens)]
         output, _ = kda_paged_prefill(
             q,
             k,
@@ -216,5 +225,6 @@ class TlxKDAKernel(TritonKDAKernel):
             beta_is_raw=beta_is_raw,
             state_pool=ssm_states,
             state_indices=cache_indices,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
         return output
