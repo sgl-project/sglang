@@ -80,7 +80,6 @@ def get_token_num_per_seq(
         return None
 
 
-# TODO: may smartly disable TBO when batch size is too small b/c it will slow down
 def compute_split_seq_index(
     forward_mode: ForwardMode,
     num_tokens: int,
@@ -396,39 +395,42 @@ class TboCudaGraphRunnerPlugin:
         )
 
 
+def _tbo_threshold_reject_reason(
+    *,
+    forward_mode: ForwardMode,
+    num_tokens: int,
+    split_seq_index: int,
+    extend_lens: Optional[Sequence[int]],
+    token_num_per_seq: Optional[int],
+) -> Optional[str]:
+    overlap = get_exec().overlap
+    if overlap.tbo_admission_policy != "threshold":
+        return None
+    if forward_mode.is_idle() or forward_mode.is_prebuilt():
+        return None
+
+    if forward_mode.is_decode() or forward_mode.is_target_verify():
+        threshold = overlap.tbo_decode_token_threshold
+    else:
+        threshold = overlap.tbo_prefill_token_threshold
+    if num_tokens < threshold:
+        return "batch_too_small"
+
+    split_token_index = compute_split_token_index(
+        split_seq_index=split_seq_index,
+        forward_mode=forward_mode,
+        extend_seq_lens=extend_lens,
+        token_num_per_seq=token_num_per_seq,
+    )
+    min_child_tokens = min(split_token_index, num_tokens - split_token_index)
+    if min_child_tokens == 0:
+        return "empty_child"
+    if min_child_tokens < overlap.tbo_min_child_tokens:
+        return "child_too_small"
+    return None
+
+
 class TboDPAttentionPreparer:
-    def _admit_by_threshold(
-        self,
-        batch: ScheduleBatch,
-        num_tokens: int,
-        token_num_per_seq: Optional[int],
-    ) -> tuple[bool, str]:
-        overlap = get_exec().overlap
-        if overlap.tbo_admission_policy != "threshold":
-            return True, "none"
-        if batch.forward_mode.is_idle() or batch.forward_mode.is_prebuilt():
-            return True, "none"
-
-        if batch.forward_mode.is_decode() or batch.forward_mode.is_target_verify():
-            threshold = overlap.tbo_decode_token_threshold
-        else:
-            threshold = overlap.tbo_prefill_token_threshold
-        if num_tokens < threshold:
-            return False, "batch_too_small"
-
-        split_token_index = compute_split_token_index(
-            split_seq_index=self.local_tbo_split_seq_index,
-            forward_mode=batch.forward_mode,
-            extend_seq_lens=batch.extend_seq_lens,
-            token_num_per_seq=token_num_per_seq,
-        )
-        child_tokens = (split_token_index, num_tokens - split_token_index)
-        if min(child_tokens) == 0:
-            return False, "empty_child"
-        if min(child_tokens) < overlap.tbo_min_child_tokens:
-            return False, "child_too_small"
-        return True, "none"
-
     def prepare_all_gather(
         self,
         local_batch: ScheduleBatch,
@@ -438,8 +440,6 @@ class TboDPAttentionPreparer:
         enable_two_batch_overlap = is_tbo_enabled()
 
         self.enable_two_batch_overlap = enable_two_batch_overlap
-        self.local_tbo_disable_reason = "none"
-        self.last_disable_reason = "none"
 
         # Short-circuit when TBO is off: prepare_mlp_sync_batch_raw invokes
         # this preparer unconditionally for the forward_mode all-gather, but
@@ -447,7 +447,6 @@ class TboDPAttentionPreparer:
         # (e.g. MIXED from enable_mixed_chunk).
         if not enable_two_batch_overlap:
             self.local_tbo_split_seq_index = None
-            self.local_tbo_disable_reason = "feature_disabled"
             return False, self._compute_local_forward_mode(local_batch)
 
         if local_batch is not None:
@@ -479,14 +478,22 @@ class TboDPAttentionPreparer:
                 and enable_a2a_moe
                 and (resolved_deepep_mode.is_low_latency())
             )
-            if self.local_tbo_split_seq_index is None:
-                self.local_tbo_disable_reason = "forward_mode_unsupported"
-            elif not local_can_run_tbo:
-                self.local_tbo_disable_reason = "backend_unsupported"
-            else:
-                local_can_run_tbo, self.local_tbo_disable_reason = (
-                    self._admit_by_threshold(local_batch, num_tokens, token_num_per_seq)
+            if local_can_run_tbo and (
+                reason := _tbo_threshold_reject_reason(
+                    forward_mode=local_batch.forward_mode,
+                    num_tokens=num_tokens,
+                    split_seq_index=self.local_tbo_split_seq_index,
+                    extend_lens=local_batch.extend_lens,
+                    token_num_per_seq=token_num_per_seq,
                 )
+            ):
+                local_can_run_tbo = False
+                if _tbo_debug:
+                    logger.info(
+                        "TBO rejected locally: reason=%s num_tokens=%s",
+                        reason,
+                        num_tokens,
+                    )
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True
@@ -496,67 +503,22 @@ class TboDPAttentionPreparer:
         return local_can_run_tbo, local_forward_mode
 
     def compute_output(self, partial_global_info_cpu):
-        local_can_run_tbo_aggregated = min(partial_global_info_cpu[:, 4].tolist())
-        forward_modes = partial_global_info_cpu[:, 5].tolist()
+        local_can_run_tbo_aggregated = min(partial_global_info_cpu[:, 0].tolist())
+        forward_modes = partial_global_info_cpu[:, 1].tolist()
 
         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
             forward_modes
-        )
-        active_token_counts = [
-            int(num_tokens)
-            for num_tokens, forward_mode in zip(
-                partial_global_info_cpu[:, 0].tolist(), forward_modes
-            )
-            if forward_mode not in (ForwardMode.IDLE.value, ForwardMode.PREBUILT.value)
-        ]
-        threshold_rejected = (
-            get_exec().overlap.tbo_admission_policy == "threshold"
-            and bool(active_token_counts)
-            and forward_mode_agree
-            and min(active_token_counts) < self._threshold_for_mode(global_forward_mode)
         )
 
         can_run_tbo = (
             self.enable_two_batch_overlap
             and local_can_run_tbo_aggregated
             and forward_mode_agree
-            and not threshold_rejected
         )
-
-        if can_run_tbo:
-            self.last_disable_reason = "none"
-        elif not self.enable_two_batch_overlap:
-            self.last_disable_reason = "feature_disabled"
-        elif not forward_mode_agree:
-            self.last_disable_reason = "forward_mode_disagreement"
-        elif threshold_rejected:
-            self.last_disable_reason = "batch_too_small"
-        elif partial_global_info_cpu.shape[0] == 1:
-            self.last_disable_reason = self.local_tbo_disable_reason
-        else:
-            # The local capability vote is reduced across DP ranks. Keep the
-            # reason rank-invariant without adding another collective field.
-            self.last_disable_reason = "dp_rank_ineligible"
-
-        if _tbo_debug:
-            logger.info(
-                "TBO admission enabled=%s mode=%s parent_tokens=%s reason=%s",
-                can_run_tbo,
-                global_forward_mode,
-                active_token_counts,
-                self.last_disable_reason,
-            )
 
         tbo_split_seq_index = self.local_tbo_split_seq_index if can_run_tbo else None
         global_forward_mode = global_forward_mode if can_run_tbo else None
         return tbo_split_seq_index, global_forward_mode
-
-    @staticmethod
-    def _threshold_for_mode(forward_mode: ForwardMode) -> int:
-        overlap = get_exec().overlap
-        if forward_mode.is_decode() or forward_mode.is_target_verify():
-            return overlap.tbo_decode_token_threshold
-        return overlap.tbo_prefill_token_threshold
 
     @staticmethod
     def _compute_local_forward_mode(local_batch):
@@ -920,7 +882,6 @@ class TboForwardBatchPreparer:
                 attn_tp_sequence_sharded=batch.attn_tp_sequence_sharded,
                 encoder_swa_replay=batch.encoder_swa_replay,
                 tbo_split_seq_index=None,
-                tbo_disable_reason=batch.tbo_disable_reason,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
                 original_global_num_tokens_cpu=None,

@@ -21,8 +21,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import (
-    TboDPAttentionPreparer,
     TboForwardBatchPreparer,
+    _tbo_threshold_reject_reason,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_context, get_device, get_parallel
@@ -112,7 +112,6 @@ class TestTboChildrenDummyTokenMask(CustomTestCase):
             seq_lens_sum=bs,
             spec_info=None,
         )
-        parent.tbo_disable_reason = "batch_too_small"
         with (
             get_context().override_server_args(
                 attention_backend="fa3", moe_dense_tp_size=None
@@ -129,7 +128,6 @@ class TestTboChildrenDummyTokenMask(CustomTestCase):
                 out_num_token_non_padded_cpu=0,
             )
         self.assertEqual(child.global_num_token_non_padded_cpu, 0)
-        self.assertEqual(child.tbo_disable_reason, "batch_too_small")
 
     def test_capture_count_falls_back_to_physical_rows(self):
         batch = _make_decode_capture_batch(num_tokens=8)
@@ -156,105 +154,89 @@ class TestTboChildrenDummyTokenMask(CustomTestCase):
 
 
 class TestTboAdmissionPolicy(CustomTestCase):
-    def _admit(
+    def _reject_reason(
         self,
         *,
         num_tokens,
         threshold,
         min_child_tokens,
+        policy="threshold",
         forward_mode=ForwardMode.DECODE,
-        extend_seq_lens=None,
+        extend_lens=None,
+        split_seq_index=None,
     ):
-        preparer = TboDPAttentionPreparer()
-        preparer.local_tbo_split_seq_index = num_tokens // 2
-        batch = SimpleNamespace(
-            forward_mode=forward_mode,
-            extend_seq_lens=extend_seq_lens,
-        )
         with get_context().override_server_args(
             enable_two_batch_overlap=True,
-            tbo_admission_policy="threshold",
+            tbo_admission_policy=policy,
             tbo_prefill_token_threshold=threshold,
             tbo_decode_token_threshold=threshold,
             tbo_min_child_tokens=min_child_tokens,
         ):
-            token_num_per_seq = 1 if forward_mode.is_decode() else None
-            return preparer._admit_by_threshold(batch, num_tokens, token_num_per_seq)
+            return _tbo_threshold_reject_reason(
+                forward_mode=forward_mode,
+                num_tokens=num_tokens,
+                split_seq_index=(
+                    num_tokens // 2 if split_seq_index is None else split_seq_index
+                ),
+                extend_lens=extend_lens,
+                token_num_per_seq=1 if forward_mode.is_decode() else None,
+            )
 
     def test_small_batch_is_rejected(self):
         self.assertEqual(
-            self._admit(num_tokens=8, threshold=16, min_child_tokens=1),
-            (False, "batch_too_small"),
+            self._reject_reason(num_tokens=8, threshold=16, min_child_tokens=1),
+            "batch_too_small",
         )
 
     def test_child_minimum_is_enforced(self):
         self.assertEqual(
-            self._admit(num_tokens=8, threshold=0, min_child_tokens=8),
-            (False, "child_too_small"),
+            self._reject_reason(num_tokens=8, threshold=0, min_child_tokens=8),
+            "child_too_small",
         )
 
     def test_empty_child_is_rejected(self):
         self.assertEqual(
-            self._admit(num_tokens=1, threshold=0, min_child_tokens=0),
-            (False, "empty_child"),
+            self._reject_reason(num_tokens=1, threshold=0, min_child_tokens=0),
+            "empty_child",
         )
 
     def test_prefill_uses_prefill_threshold(self):
         self.assertEqual(
-            self._admit(
+            self._reject_reason(
                 num_tokens=8,
                 threshold=16,
                 min_child_tokens=1,
                 forward_mode=ForwardMode.EXTEND,
-                extend_seq_lens=[4, 4],
+                extend_lens=[4, 4],
+                split_seq_index=1,
             ),
-            (False, "batch_too_small"),
+            "batch_too_small",
+        )
+
+    def test_prefill_child_split_uses_extend_lens(self):
+        self.assertEqual(
+            self._reject_reason(
+                num_tokens=20,
+                threshold=16,
+                min_child_tokens=12,
+                forward_mode=ForwardMode.EXTEND,
+                extend_lens=[10, 10],
+                split_seq_index=1,
+            ),
+            "child_too_small",
         )
 
     def test_always_policy_preserves_current_admission(self):
-        preparer = TboDPAttentionPreparer()
-        preparer.local_tbo_split_seq_index = 4
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE,
-            extend_seq_lens=None,
-        )
-        with get_context().override_server_args(
-            enable_two_batch_overlap=True,
-            tbo_admission_policy="always",
-            tbo_decode_token_threshold=1024,
-            tbo_min_child_tokens=1024,
-        ):
-            self.assertEqual(
-                preparer._admit_by_threshold(batch, 8, 1),
-                (True, "none"),
+        self.assertIsNone(
+            self._reject_reason(
+                num_tokens=8, threshold=1024, min_child_tokens=1024, policy="always"
             )
+        )
 
     def test_balanced_batch_is_admitted(self):
-        self.assertEqual(
-            self._admit(num_tokens=32, threshold=16, min_child_tokens=8),
-            (True, "none"),
+        self.assertIsNone(
+            self._reject_reason(num_tokens=32, threshold=16, min_child_tokens=8)
         )
-
-    def test_global_threshold_uses_token_column(self):
-        preparer = TboDPAttentionPreparer()
-        preparer.enable_two_batch_overlap = True
-        preparer.local_tbo_split_seq_index = 4
-        info = torch.tensor(
-            [
-                [8, 0, 0, 0, 1, ForwardMode.DECODE.value],
-                [0, 0, 0, 0, 1, ForwardMode.IDLE.value],
-            ],
-            dtype=torch.int64,
-        )
-        with get_context().override_server_args(
-            enable_two_batch_overlap=True,
-            tbo_admission_policy="threshold",
-            tbo_decode_token_threshold=16,
-        ):
-            split_seq_index, global_forward_mode = preparer.compute_output(info)
-        self.assertIsNone(split_seq_index)
-        self.assertIsNone(global_forward_mode)
-        self.assertEqual(preparer.last_disable_reason, "batch_too_small")
 
 
 if __name__ == "__main__":

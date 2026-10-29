@@ -770,3 +770,16 @@ def check_two_batch_overlap(server_args: Any):
             "(moe_a2a_backend='none'), attention DP (--attn-dp-size) is required "
             "(DeepSeek-V4 non-EP DP TBO path)."
         )
+
+    if (
+        min(
+            cfg.tbo_prefill_token_threshold,
+            cfg.tbo_decode_token_threshold,
+            cfg.tbo_min_child_tokens,
+        )
+        < 0
+    ):
+        raise ValueError(
+            "--tbo-prefill-token-threshold, --tbo-decode-token-threshold and "
+            "--tbo-min-child-tokens must be non-negative"
+        )

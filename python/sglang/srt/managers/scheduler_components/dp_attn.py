@@ -156,7 +156,6 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
-    tbo_disable_reason: str = "none"
     prefill_cuda_graph_max_prefix_len: int = 0
     # Every request in the local batch is a health-check probe.
     is_health_check: bool = False
@@ -343,7 +342,6 @@ def _update_gather_batch(
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
-        batch.tbo_disable_reason = mlp_sync_info.tbo_disable_reason
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
@@ -658,10 +656,9 @@ def prepare_mlp_sync_batch_raw(
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
-                mlp_sync_info.tp0_info_cpu,
+                mlp_sync_info.tp0_info_cpu[:, 4:6],
             )
         )
-        mlp_sync_info.tbo_disable_reason = tbo_preparer.last_disable_reason
     # Decide whether to emit idle batch
     if skip_all_gather:
         # Skip idle batch when attn-dp=1 (and always under DWDP: ranks run independently)
