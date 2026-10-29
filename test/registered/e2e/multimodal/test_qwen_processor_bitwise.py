@@ -240,7 +240,10 @@ async def _capture(checkout, manifest_path, route):
         local_files_only=True,
     )
     if route == "candidate":
-        from sglang.srt.managers.multimodal_processor import get_mm_processor
+        from sglang.srt.managers.multimodal_processor import (
+            get_mm_processor,
+            import_processors,
+        )
         from sglang.srt.multimodal.token_space_mm_process.models.qwen_vl import (
             QwenTokenSpaceProcessStrategy,
         )
@@ -251,6 +254,7 @@ async def _capture(checkout, manifest_path, route):
             TokenSpaceSGLangProcessor,
         )
 
+        import_processors("sglang.srt.multimodal.token_space_mm_process.models")
         processor = get_mm_processor(
             hf_config, server_args, hf_processor, None, skip_mm_pool=True
         )
