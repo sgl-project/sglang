@@ -649,6 +649,8 @@ class TestFusedDraftDecision(CustomTestCase):
         attn_cp_size=1,
         attn_dp_size=1,
         dcp_size=1,
+        draft_mla=False,
+        draft_hf_config=None,
         hicache=False,
         retraction_backup=None,
         draft_parallel_layout=None,
@@ -701,7 +703,11 @@ class TestFusedDraftDecision(CustomTestCase):
                 head_dim=64,
                 v_head_dim=64,
                 dtype=torch.bfloat16,
-                attention_arch=AttentionArch.MHA,
+                attention_arch=AttentionArch.MLA if draft_mla else AttentionArch.MHA,
+                kv_lora_rank=8,
+                qk_rope_head_dim=4,
+                hf_config=draft_hf_config
+                or SimpleNamespace(architectures=["BailingMoeForCausalLMNextN"]),
             ),
         )
         memory = SimpleNamespace(
@@ -899,6 +905,59 @@ class TestFusedDraftDecision(CustomTestCase):
         # A draft with no backend of its own inherits the target's trtllm_mha.
         decision = self._decide(target_backends=("trtllm_mha", "trtllm_mha"))
         self.assertIsNotNone(decision.placement)
+
+    def test_mla_draft_storage_matches_its_dcp_execution(self):
+        """An MLA draft reader shards KV; its storage must not expand those pages."""
+        for width in (2, 4):
+            with self.subTest(dcp=width):
+                decision = self._decide(dcp_size=width, draft_mla=True)
+                self.assertIsNotNone(decision.placement, decision.declined)
+                self.assertEqual(decision.placement.region("full").token_replicas, 1)
+
+    def test_dsa_draft_placement_preserves_platform_execution_policy(self):
+        """DSA NextN stays replicated on CUDA and sharded on ROCm."""
+        from transformers import PretrainedConfig
+
+        config = PretrainedConfig(
+            architectures=["DeepseekV3ForCausalLMNextN"], index_topk=256
+        )
+        for hip, replicas in ((False, 4), (True, 1)):
+            with (
+                self.subTest(hip=hip),
+                patch("sglang.srt.configs.model_config.is_hip", return_value=hip),
+            ):
+                decision = self._decide(
+                    dcp_size=4, draft_mla=True, draft_hf_config=config
+                )
+                self.assertEqual(
+                    decision.placement.region("full").token_replicas, replicas
+                )
+
+    def test_npu_mla_draft_preserves_global_slot_layout(self):
+        """Ascend draft attention does not consume the target's DCP metadata."""
+        with patch("sglang.srt.configs.model_config.is_npu", return_value=True):
+            decision = self._decide(dcp_size=4, draft_mla=True)
+        self.assertEqual(decision.placement.region("full").token_replicas, 4)
+
+    def test_private_mla_pool_pages_match_its_execution(self):
+        """A sharded MLA draft must not multiply its physical page size by DCP."""
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.runtime_context import publish
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(model_path="dummy", device="cpu", page_size=64)
+        args._mamba_cache_chunk_size = 64
+        publish(args, role="tokenizer")
+        cfg = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        cfg.is_draft_worker = True
+        cfg.use_mla_backend = True
+        cfg.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["BailingMoeForCausalLMNextN"])
+        )
+        for width in (2, 4):
+            with self.subTest(dcp=width), get_parallel().override(attn_dcp_size=width):
+                self.assertEqual(cfg.loc_space_scale, 1)
+                self.assertEqual(cfg.pool_page_size, 64)
 
     def test_dcp_prices_a_replicated_draft_region(self):
         for algorithm in ("DSPARK", "EAGLE"):

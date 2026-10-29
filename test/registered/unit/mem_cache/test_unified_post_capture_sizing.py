@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     setup_allocator_context,
@@ -141,8 +142,158 @@ def _capacities(bundle) -> dict:
     return out
 
 
+def _mla_draft_bundle(dcp_size):
+    from transformers import PretrainedConfig
+
+    from sglang.srt.configs.model_config import AttentionArch
+    from sglang.srt.mem_cache.layout.fused_draft import (
+        PlacementContext,
+        draft_kv_profile,
+        place_fused_draft,
+    )
+
+    mc = SimpleNamespace(
+        hf_config=PretrainedConfig(architectures=["BailingMoeForCausalLMNextN"]),
+        is_hybrid_swa=False,
+        num_nextn_predict_layers=None,
+        attention_arch=AttentionArch.MLA,
+        kv_lora_rank=8,
+        qk_rope_head_dim=8,
+        linear_attn_registry_result=None,
+    )
+    placement = place_fused_draft(
+        profile=draft_kv_profile(mc, num_layers=1, attn_tp_size=1, dcp_size=dcp_size),
+        num_runners=1,
+        ctx=PlacementContext(host_names=("full", "mamba"), dcp_size=dcp_size),
+        store_dtype=torch.float16,
+    ).placement
+    return build_test_unified_pools(
+        device="cuda",
+        kv_cache_dtype=torch.float16,
+        page_size=64,
+        start_layer=0,
+        end_layer=2,
+        full_attention_layer_ids=[0],
+        head_num=1,
+        head_dim=8,
+        use_mla_backend=True,
+        kv_lora_rank=8,
+        qk_rope_head_dim=8,
+        mamba_layer_ids=[1],
+        max_mamba_cache_size=16,
+        mamba2_cache_params=SimpleNamespace(
+            layers=[1],
+            shape=SimpleNamespace(conv=[(3, 8)], temporal=(1, 4, 8)),
+            dtype=SimpleNamespace(conv=torch.float16, temporal=torch.float32),
+        ),
+        total_bytes=1 << 20,
+        max_num_reqs=2,
+        model_context_len=512,
+        fused_draft=placement,
+        lazy_compaction=False,
+    )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-class TestUnifiedPostCaptureSizing(unittest.TestCase):
+class TestUnifiedPostCaptureSizing(CustomTestCase):
+    def test_mla_draft_dcp_reader_matches_writes_after_relocation(self):
+        """DCP readers and graph writes must agree on a draft's moved KV pages."""
+        from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
+        from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+        from sglang.srt.mem_cache.kv.layout.mla import DraftMLAView
+
+        for factor in (1, 2, 4):
+            for rank in range(factor):
+                with (
+                    self.subTest(dcp=factor, rank=rank),
+                    get_parallel().override(
+                        attn_dcp_size=factor,
+                        attn_dcp_rank=rank,
+                        dcp_size=factor,
+                        dcp_rank=rank,
+                        dcp_enabled=factor > 1,
+                    ),
+                ):
+                    bundle = _mla_draft_bundle(factor)
+                    alloc = bundle.token_to_kv_pool_allocator
+                    first = alloc.alloc(64 * factor)
+                    live = alloc.alloc(64 * factor)
+                    table = torch.zeros(
+                        (2, live.numel()), dtype=torch.int32, device="cuda"
+                    )
+                    table[1] = live.int()
+                    view = DraftMLAView(
+                        arena=bundle.arena,
+                        host_spec=bundle.storage.plan.owner().spec,
+                        layer_lanes={0: 0},
+                        page_size=64,
+                    )
+                    runner = RunnerIds(
+                        req_to_token=table,
+                        token_to_kv_pool_allocator=alloc,
+                        token_to_kv_pool=view,
+                        page_size=64,
+                        device="cuda",
+                        is_draft_worker=True,
+                    )
+                    k = torch.arange(live.numel(), device="cuda", dtype=torch.float32)
+                    k = (
+                        (k % 31)
+                        .to(torch.float16)[:, None, None]
+                        .expand(-1, 1, 16)
+                        .contiguous()
+                    )
+                    layer = SimpleNamespace(layer_id=0)
+                    req = torch.tensor([1], dtype=torch.int64, device="cuda")
+                    lens = torch.tensor([64], dtype=torch.int32, device="cuda")
+                    backends = [
+                        object.__new__(cls)
+                        for cls in (TRTLLMMLABackend, CuteDslMLABackend)
+                    ]
+                    outputs = [
+                        torch.zeros((1, 64), dtype=torch.int32, device="cuda")
+                        for _ in backends
+                    ]
+                    for backend in backends:
+                        backend.page_size, backend.req_to_token, backend.runner_ids = (
+                            64,
+                            table,
+                            runner,
+                        )
+
+                    def write_and_read():
+                        loc = runner.ids_in("full", live)
+                        view.set_mla_kv_buffer(
+                            layer,
+                            KVWriteLoc(loc, physical=True),
+                            k[..., :8],
+                            k[..., 8:],
+                        )
+                        for backend, output in zip(backends, outputs):
+                            backend._fill_dcp_block_kv_indices(output, req, lens)
+
+                    write_and_read()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        write_and_read()
+                    before = runner.ids_in("full", live)[rank].item()
+                    alloc.free(first)
+                    k.add_(7)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    after = runner.ids_in("full", live)[rank].item()
+                    self.assertNotEqual(before, after)
+                    for output in outputs:
+                        rows = output[0, 0].long() * 64 + torch.arange(
+                            64, device="cuda"
+                        )
+                        torch.testing.assert_close(
+                            view.kv_buffer[0][rows], k[rank::factor]
+                        )
+                    alloc.free(live)
+                    self.assertEqual(alloc.verify_byte_accounting(), [])
+
     def setUp(self):
         setup_allocator_context()
 

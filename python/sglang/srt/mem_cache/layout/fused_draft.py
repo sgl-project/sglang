@@ -245,6 +245,8 @@ class DraftLayerSet(msgspec.Struct, frozen=True, kw_only=True):
     geometry: Any
     # LAYER_WINDOW only: how many tokens back the layers read.
     window: Optional[int] = None
+    # Resolved by the attention implementation, before storage is planned.
+    dcp_size: int = 1
 
 
 class DraftKVProfile(msgspec.Struct, frozen=True, kw_only=True):
@@ -566,13 +568,16 @@ def draft_kv_profile(
     *,
     num_layers: int,
     attn_tp_size: int,
+    dcp_size: int = 1,
     num_depths: Optional[int] = None,
 ) -> DraftKVProfile:
-    """The profile of a draft `ModelConfig`, heads divided by attn_tp the way
-    the target divides its own (drafts never join the DCP group).
-    ``num_depths`` overrides the config's `num_nextn_predict_layers`."""
+    """The draft's layer geometry and execution width, before storage placement.
+
+    ``dcp_size`` is the ambient DCP width; each attention kind resolves whether
+    it executes on that group. ``num_depths`` overrides the checkpoint depth.
+    """
     from sglang.srt.configs.hybrid_arch import mambaish_config
-    from sglang.srt.configs.model_config import AttentionArch
+    from sglang.srt.configs.model_config import AttentionArch, mla_attention_dcp_size
 
     mc = draft_model_config
     if num_depths is None:
@@ -588,6 +593,11 @@ def draft_kv_profile(
     if full_ids:
         kinds[LAYER_FULL] = DraftLayerSet(
             layer_ids=full_ids,
+            dcp_size=(
+                mla_attention_dcp_size(mc.hf_config, dcp_size=dcp_size, is_nextn=True)
+                if mc.attention_arch == AttentionArch.MLA
+                else 1
+            ),
             geometry=DraftMLAGeometry(
                 kv_lora_rank=int(mc.kv_lora_rank),
                 qk_rope_head_dim=int(mc.qk_rope_head_dim),
@@ -705,9 +715,14 @@ def place_fused_draft(
             store_dtype=store_dtype,
             kv_dtype=kv_dtype,
         )
-        if kind in (LAYER_FULL, LAYER_WINDOW) and ctx.dcp_size > 1:
+        if kind in (LAYER_FULL, LAYER_WINDOW):
+            if layers.dcp_size not in (1, ctx.dcp_size):
+                raise ValueError(
+                    f"draft DCP width {layers.dcp_size} must be one or match "
+                    f"the owner DCP width {ctx.dcp_size}"
+                )
             regions[name] = msgspec.structs.replace(
-                regions[name], token_replicas=ctx.dcp_size
+                regions[name], token_replicas=ctx.dcp_size // layers.dcp_size
             )
     return FusedDraftDecision(
         placement=FusedDraftPlacement.from_counts(

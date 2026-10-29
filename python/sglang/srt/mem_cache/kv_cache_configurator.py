@@ -19,7 +19,6 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import (
     ModelConfig,
-    dsa_draft_shards_under_dcp,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -30,6 +29,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    mla_attention_dcp_size,
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
@@ -546,15 +546,21 @@ class KVCacheConfigurator:
     # Note(kpham-sgl):
     # 1. A replicated draft indexes the allocator's virtual locs raw, so its pools
     #    span and page that space; the sharded target translates and stays per-rank.
-    #    A ROCm DSA draft runs under DCP itself and shards like the target.
+    #    A draft that executes DCP shards like the target.
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
         dcp_size = get_parallel().attn_dcp_size
-        replicated_draft = self.is_draft_worker and not dsa_draft_shards_under_dcp(
-            self.model_config.hf_config, dcp_size
+        if not self.is_draft_worker:
+            return 1
+        execution_width = (
+            mla_attention_dcp_size(
+                self.model_config.hf_config, dcp_size=dcp_size, is_nextn=True
+            )
+            if self.use_mla_backend
+            else 1
         )
-        return dcp_size if (replicated_draft and dcp_size > 1) else 1
+        return dcp_size // execution_width
 
     @property
     def pool_page_size(self) -> int:
@@ -569,8 +575,8 @@ class KVCacheConfigurator:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
-        # Draft pools are replicated, not DCP-sharded, yet consume the shared
-        # allocator's virtual locs in [0, max_total * dcp_size) untranslated.
+        # Only drafts that execute without DCP need the full logical token
+        # domain; DCP drafts retain the target's per-rank capacity.
         loc_scale = self.loc_space_scale
         max_total_num_tokens *= loc_scale
         if full_max_total_num_tokens is not None:
@@ -1157,6 +1163,7 @@ class KVCacheConfigurator:
             aux.draft_model_config,
             num_layers=int(aux.draft_kv_num_layers),
             attn_tp_size=self.draft_attn_tp_size,
+            dcp_size=get_parallel().attn_dcp_size,
             # A DFLASH-family draft config inherits the target's NEXTN depth
             # count; its draft is one block, replicated per runner.
             num_depths=None if self.spec_algorithm.is_eagle() else 1,
