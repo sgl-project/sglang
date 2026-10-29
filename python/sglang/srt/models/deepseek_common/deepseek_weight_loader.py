@@ -62,7 +62,7 @@ from sglang.srt.models.deepseek_common.utils import (
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils import bind_or_assign, log_info_on_rank0
 
 if _use_aiter_gfx95:
@@ -551,7 +551,7 @@ class DeepseekV2WeightLoaderMixin:
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
-        extra_config = orjson.loads(get_global_server_args().model_loader_extra_config)
+        extra_config = orjson.loads(get_model().model_loader_extra_config)
         if extra_config.get("load_tp_by_experts", False):
             self._ep_to_tp_transform_all_layers()
 
@@ -860,7 +860,6 @@ class DeepseekV2WeightLoaderMixin:
         Processes one layer at a time to keep peak memory overhead to ~1/num_layers.
         Reuses intermediate buffers across layers for parameters of the same shape.
         """
-        import torch.distributed as dist
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 

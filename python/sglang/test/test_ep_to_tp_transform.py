@@ -104,37 +104,51 @@ def _generate_checkpoint_weights(
         weights.append((f"{pfx}.post_attention_layernorm.weight", rand(H)))
 
         # Attention (no q_lora_rank → uses q_proj directly)
-        weights.append((f"{pfx}.self_attn.q_proj.weight", rand(n_heads * (qk_nope + qk_rope), H)))
-        weights.append((f"{pfx}.self_attn.kv_a_proj_with_mqa.weight", rand(kv_lora + qk_rope, H)))
+        weights.append(
+            (f"{pfx}.self_attn.q_proj.weight", rand(n_heads * (qk_nope + qk_rope), H))
+        )
+        weights.append(
+            (f"{pfx}.self_attn.kv_a_proj_with_mqa.weight", rand(kv_lora + qk_rope, H))
+        )
         weights.append((f"{pfx}.self_attn.kv_a_layernorm.weight", rand(kv_lora)))
-        weights.append((f"{pfx}.self_attn.kv_b_proj.weight", rand(n_heads * (qk_nope + v_head), kv_lora)))
+        weights.append(
+            (
+                f"{pfx}.self_attn.kv_b_proj.weight",
+                rand(n_heads * (qk_nope + v_head), kv_lora),
+            )
+        )
         weights.append((f"{pfx}.self_attn.o_proj.weight", rand(H, n_heads * v_head)))
 
-        is_moe = (
-            i >= config.first_k_dense_replace and i % config.moe_layer_freq == 0
-        )
+        is_moe = i >= config.first_k_dense_replace and i % config.moe_layer_freq == 0
 
         if is_moe:
             # Gate / router
             weights.append((f"{pfx}.mlp.gate.weight", rand(config.n_routed_experts, H)))
             weights.append(
-                (f"{pfx}.mlp.gate.e_score_correction_bias", rand(config.n_routed_experts))
+                (
+                    f"{pfx}.mlp.gate.e_score_correction_bias",
+                    rand(config.n_routed_experts),
+                )
             )
 
             # Routed experts
             for e in range(config.n_routed_experts):
-                weights.append((f"{pfx}.mlp.experts.{e}.gate_proj.weight", rand(I_moe, H)))
-                weights.append((f"{pfx}.mlp.experts.{e}.up_proj.weight", rand(I_moe, H)))
-                weights.append((f"{pfx}.mlp.experts.{e}.down_proj.weight", rand(H, I_moe)))
+                weights.append(
+                    (f"{pfx}.mlp.experts.{e}.gate_proj.weight", rand(I_moe, H))
+                )
+                weights.append(
+                    (f"{pfx}.mlp.experts.{e}.up_proj.weight", rand(I_moe, H))
+                )
+                weights.append(
+                    (f"{pfx}.mlp.experts.{e}.down_proj.weight", rand(H, I_moe))
+                )
 
             # Shared expert (DSv3 always has exactly 1)
             assert config.n_shared_experts == 1
             weights.append(
                 (f"{pfx}.mlp.shared_experts.gate_proj.weight", rand(I_moe, H))
             )
-            weights.append(
-                (f"{pfx}.mlp.shared_experts.up_proj.weight", rand(I_moe, H))
-            )
+            weights.append((f"{pfx}.mlp.shared_experts.up_proj.weight", rand(I_moe, H)))
             weights.append(
                 (f"{pfx}.mlp.shared_experts.down_proj.weight", rand(H, I_moe))
             )
@@ -234,7 +248,9 @@ def _generate_nvfp4_checkpoint_weights(
         return torch.randint(0, 256, shape, generator=gen, dtype=torch.uint8)
 
     def rand_fp8_scale(*shape):
-        return torch.randn(*shape, generator=gen, dtype=torch.float32).to(torch.float8_e4m3fn)
+        return torch.randn(*shape, generator=gen, dtype=torch.float32).to(
+            torch.float8_e4m3fn
+        )
 
     def rand_scalar():
         return torch.randn(1, generator=gen, dtype=torch.float32).squeeze(0).abs()
@@ -250,36 +266,84 @@ def _generate_nvfp4_checkpoint_weights(
         weights.append((f"{pfx}.post_attention_layernorm.weight", rand_bf16(H)))
 
         # Attention (BF16, excluded from quant)
-        weights.append((f"{pfx}.self_attn.q_proj.weight", rand_bf16(n_heads * (qk_nope + qk_rope), H)))
-        weights.append((f"{pfx}.self_attn.kv_a_proj_with_mqa.weight", rand_bf16(kv_lora + qk_rope, H)))
-        weights.append((f"{pfx}.self_attn.kv_a_layernorm.weight", rand_bf16(kv_lora)))
-        weights.append((f"{pfx}.self_attn.kv_b_proj.weight", rand_bf16(n_heads * (qk_nope + v_head), kv_lora)))
-        weights.append((f"{pfx}.self_attn.o_proj.weight", rand_bf16(H, n_heads * v_head)))
-
-        is_moe = (
-            i >= config.first_k_dense_replace and i % config.moe_layer_freq == 0
+        weights.append(
+            (
+                f"{pfx}.self_attn.q_proj.weight",
+                rand_bf16(n_heads * (qk_nope + qk_rope), H),
+            )
         )
+        weights.append(
+            (
+                f"{pfx}.self_attn.kv_a_proj_with_mqa.weight",
+                rand_bf16(kv_lora + qk_rope, H),
+            )
+        )
+        weights.append((f"{pfx}.self_attn.kv_a_layernorm.weight", rand_bf16(kv_lora)))
+        weights.append(
+            (
+                f"{pfx}.self_attn.kv_b_proj.weight",
+                rand_bf16(n_heads * (qk_nope + v_head), kv_lora),
+            )
+        )
+        weights.append(
+            (f"{pfx}.self_attn.o_proj.weight", rand_bf16(H, n_heads * v_head))
+        )
+
+        is_moe = i >= config.first_k_dense_replace and i % config.moe_layer_freq == 0
 
         if is_moe:
             # Gate / router (BF16)
-            weights.append((f"{pfx}.mlp.gate.weight", rand_bf16(config.n_routed_experts, H)))
             weights.append(
-                (f"{pfx}.mlp.gate.e_score_correction_bias", rand_bf16(config.n_routed_experts))
+                (f"{pfx}.mlp.gate.weight", rand_bf16(config.n_routed_experts, H))
+            )
+            weights.append(
+                (
+                    f"{pfx}.mlp.gate.e_score_correction_bias",
+                    rand_bf16(config.n_routed_experts),
+                )
             )
 
             # Routed experts — NVFP4 layout
             for e in range(config.n_routed_experts):
                 # gate/up: weight [I, H//2] uint8, scale [I, H//gs] fp8
                 for proj in ("gate_proj", "up_proj"):
-                    weights.append((f"{pfx}.mlp.experts.{e}.{proj}.weight", rand_uint8(I_moe, H // 2)))
-                    weights.append((f"{pfx}.mlp.experts.{e}.{proj}.weight_scale", rand_fp8_scale(I_moe, H // gs)))
-                    weights.append((f"{pfx}.mlp.experts.{e}.{proj}.weight_scale_2", rand_scalar()))
-                    weights.append((f"{pfx}.mlp.experts.{e}.{proj}.input_scale", rand_scalar()))
+                    weights.append(
+                        (
+                            f"{pfx}.mlp.experts.{e}.{proj}.weight",
+                            rand_uint8(I_moe, H // 2),
+                        )
+                    )
+                    weights.append(
+                        (
+                            f"{pfx}.mlp.experts.{e}.{proj}.weight_scale",
+                            rand_fp8_scale(I_moe, H // gs),
+                        )
+                    )
+                    weights.append(
+                        (f"{pfx}.mlp.experts.{e}.{proj}.weight_scale_2", rand_scalar())
+                    )
+                    weights.append(
+                        (f"{pfx}.mlp.experts.{e}.{proj}.input_scale", rand_scalar())
+                    )
                 # down: weight [H, I//2] uint8, scale [H, I//gs] fp8
-                weights.append((f"{pfx}.mlp.experts.{e}.down_proj.weight", rand_uint8(H, I_moe // 2)))
-                weights.append((f"{pfx}.mlp.experts.{e}.down_proj.weight_scale", rand_fp8_scale(H, I_moe // gs)))
-                weights.append((f"{pfx}.mlp.experts.{e}.down_proj.weight_scale_2", rand_scalar()))
-                weights.append((f"{pfx}.mlp.experts.{e}.down_proj.input_scale", rand_scalar()))
+                weights.append(
+                    (
+                        f"{pfx}.mlp.experts.{e}.down_proj.weight",
+                        rand_uint8(H, I_moe // 2),
+                    )
+                )
+                weights.append(
+                    (
+                        f"{pfx}.mlp.experts.{e}.down_proj.weight_scale",
+                        rand_fp8_scale(H, I_moe // gs),
+                    )
+                )
+                weights.append(
+                    (f"{pfx}.mlp.experts.{e}.down_proj.weight_scale_2", rand_scalar())
+                )
+                weights.append(
+                    (f"{pfx}.mlp.experts.{e}.down_proj.input_scale", rand_scalar())
+                )
 
             # Shared expert (DSv3 always has exactly 1)
             # When fused, shared experts become extra rows in FusedMoE and need
@@ -423,7 +487,6 @@ def _create_model_and_load(
 
 
 class TestEpToTpTransform(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         server_args = ServerArgs(model_path="dummy")
@@ -593,13 +656,19 @@ class TestEpToTpTransform(unittest.TestCase):
         qc = _make_nvfp4_config()
 
         with _MOCK_BLACKWELL:
-            tp_snapshot = _create_model_and_load(config, weights, ep_load=False, quant_config=qc)
-            ep_snapshot = _create_model_and_load(config, weights, ep_load=True, quant_config=qc)
+            tp_snapshot = _create_model_and_load(
+                config, weights, ep_load=False, quant_config=qc
+            )
+            ep_snapshot = _create_model_and_load(
+                config, weights, ep_load=True, quant_config=qc
+            )
 
         self.assertEqual(set(tp_snapshot.keys()), set(ep_snapshot.keys()))
 
         # Sanity: both block and per-tensor scale params must be present
-        block_keys = [k for k in tp_snapshot if "weight_scale" in k and "scale_2" not in k]
+        block_keys = [
+            k for k in tp_snapshot if "weight_scale" in k and "scale_2" not in k
+        ]
         per_tensor_keys = [k for k in tp_snapshot if "scale_2" in k]
         self.assertTrue(len(block_keys) > 0, "No block scale params found")
         self.assertTrue(len(per_tensor_keys) > 0, "No per-tensor scale params found")
@@ -629,16 +698,25 @@ class TestEpToTpTransform(unittest.TestCase):
         try:
             server_args.disable_shared_experts_fusion = False
 
-            with patch.object(
-                DeepseekV3ForCausalLM,
-                "determine_num_fused_shared_experts",
-                _force_fuse,
-            ), _MOCK_BLACKWELL:
+            with (
+                patch.object(
+                    DeepseekV3ForCausalLM,
+                    "determine_num_fused_shared_experts",
+                    _force_fuse,
+                ),
+                _MOCK_BLACKWELL,
+            ):
                 tp_snapshot = _create_model_and_load(
-                    config, weights, ep_load=False, quant_config=qc,
+                    config,
+                    weights,
+                    ep_load=False,
+                    quant_config=qc,
                 )
                 ep_snapshot = _create_model_and_load(
-                    config, weights, ep_load=True, quant_config=qc,
+                    config,
+                    weights,
+                    ep_load=True,
+                    quant_config=qc,
                 )
         finally:
             server_args.disable_shared_experts_fusion = old_flag
@@ -726,7 +804,6 @@ class TestEpToTpTransform(unittest.TestCase):
         finally:
             server_args.disable_shared_experts_fusion = old_flag
 
-
     def test_ep_to_tp_flashinfer_trtllm(self):
         """EP→TP transform must work with flashinfer_trtllm backend layout.
 
@@ -772,16 +849,24 @@ class TestEpToTpTransform(unittest.TestCase):
 
         with _MOCK_FLASHINFER_TRTLLM, _MOCK_BLACKWELL:
             tp_snapshot = _create_model_and_load(
-                config, weights, ep_load=False, quant_config=qc,
+                config,
+                weights,
+                ep_load=False,
+                quant_config=qc,
             )
             ep_snapshot = _create_model_and_load(
-                config, weights, ep_load=True, quant_config=qc,
+                config,
+                weights,
+                ep_load=True,
+                quant_config=qc,
             )
 
         self.assertEqual(set(tp_snapshot.keys()), set(ep_snapshot.keys()))
 
         # Sanity: both block and per-tensor scale params must be present
-        block_keys = [k for k in tp_snapshot if "weight_scale" in k and "scale_2" not in k]
+        block_keys = [
+            k for k in tp_snapshot if "weight_scale" in k and "scale_2" not in k
+        ]
         per_tensor_keys = [k for k in tp_snapshot if "scale_2" in k]
         self.assertTrue(len(block_keys) > 0, "No block scale params found")
         self.assertTrue(len(per_tensor_keys) > 0, "No per-tensor scale params found")

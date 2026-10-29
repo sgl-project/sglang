@@ -80,6 +80,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_global_dwdp_manager,
+    get_model,
     get_parallel,
     get_server_args,
     process_model_config,
@@ -432,14 +433,16 @@ class FusedMoE(torch.nn.Module):
         # When flag is true, load weights as-if using EP instead, then redistribute
         # via all_to_all after loading. This results in better disk IO patterns.
         # Only applies to pure TP (ep_size==1); with real EP this is a no-op.
-        extra_config = orjson.loads(get_global_server_args().model_loader_extra_config)
+        extra_config = orjson.loads(get_model().model_loader_extra_config)
         self._ep_load_for_tp = (
             extra_config.get("load_tp_by_experts", False) and self.moe_ep_size == 1
         )
         if self._ep_load_for_tp:
             self._orig_moe_tp_size = self.moe_tp_size
             self._orig_moe_tp_rank = self.moe_tp_rank
-            self._orig_intermediate_size_per_partition = intermediate_size // self.moe_tp_size
+            self._orig_intermediate_size_per_partition = (
+                intermediate_size // self.moe_tp_size
+            )
             self.moe_ep_size = self.moe_tp_size
             self.moe_ep_rank = self.moe_tp_rank
             self.moe_tp_size = 1
@@ -1238,7 +1241,7 @@ class FusedMoE(torch.nn.Module):
 
         tp_size = self._orig_moe_tp_size
         tp_rank = self._orig_moe_tp_rank
-        tp_group = get_tp_group().device_group
+        tp_group = get_parallel().tp_group.device_group
         num_shared = self.num_fused_shared_experts
         num_routed_local = self.num_local_experts - num_shared
 
@@ -1299,7 +1302,7 @@ class FusedMoE(torch.nn.Module):
                 param.data = torch.empty(0, dtype=data.dtype, device=data.device)
                 del data, routed
 
-                recv_buf = param._ep_to_tp_buf[:num_routed_local * tp_size]
+                recv_buf = param._ep_to_tp_buf[: num_routed_local * tp_size]
                 dist.all_to_all_single(recv_buf, send_buf, group=tp_group)
                 del send_buf
 
@@ -1308,15 +1311,23 @@ class FusedMoE(torch.nn.Module):
                         # Shared experts also have fused [gate | up] — shard each half
                         shared_half = shared.shape[shard_dim] // 2
                         shared_shard = shared_half // tp_size
-                        sg = shared.narrow(shard_dim, tp_rank * shared_shard, shared_shard)
-                        su = shared.narrow(shard_dim, shared_half + tp_rank * shared_shard, shared_shard)
+                        sg = shared.narrow(
+                            shard_dim, tp_rank * shared_shard, shared_shard
+                        )
+                        su = shared.narrow(
+                            shard_dim,
+                            shared_half + tp_rank * shared_shard,
+                            shared_shard,
+                        )
                         shared_sliced = torch.cat([sg, su], dim=shard_dim).contiguous()
                         del sg, su
                     else:
                         shard_size = shared.shape[shard_dim] // tp_size
-                        shared_sliced = shared.narrow(shard_dim, tp_rank * shard_size, shard_size).contiguous()
+                        shared_sliced = shared.narrow(
+                            shard_dim, tp_rank * shard_size, shard_size
+                        ).contiguous()
                     del shared
-                    param._ep_to_tp_buf[num_routed_local * tp_size:] = shared_sliced
+                    param._ep_to_tp_buf[num_routed_local * tp_size :] = shared_sliced
                     del shared_sliced
             else:
                 # Expert-only dimension (scales with no intermediate dim to shard)
@@ -1327,12 +1338,12 @@ class FusedMoE(torch.nn.Module):
                 param.data = torch.empty(0, dtype=data.dtype, device=data.device)
                 del data, routed
 
-                recv_buf = param._ep_to_tp_buf[:num_routed_local * tp_size]
+                recv_buf = param._ep_to_tp_buf[: num_routed_local * tp_size]
                 dist.all_gather_into_tensor(recv_buf, routed_contig, group=tp_group)
                 del routed_contig
 
                 if num_shared > 0:
-                    param._ep_to_tp_buf[num_routed_local * tp_size:] = shared
+                    param._ep_to_tp_buf[num_routed_local * tp_size :] = shared
                     del shared
 
             # Clone buffer into param so the buffer can be reused for the next layer
@@ -1346,11 +1357,15 @@ class FusedMoE(torch.nn.Module):
         self.moe_ep_rank = 0
         num_routed_total = self.num_experts - num_shared
         self.num_local_experts = num_routed_total + num_shared
-        self.intermediate_size_per_partition = self._orig_intermediate_size_per_partition
+        self.intermediate_size_per_partition = (
+            self._orig_intermediate_size_per_partition
+        )
 
         # Update MoeRunnerConfig (mutable dataclass, referenced by runners)
         self.moe_runner_config.num_local_experts = self.num_local_experts
-        self.moe_runner_config.intermediate_size_per_partition = self.intermediate_size_per_partition
+        self.moe_runner_config.intermediate_size_per_partition = (
+            self.intermediate_size_per_partition
+        )
 
         # Mark transform as complete so forward() can verify
         self._ep_load_for_tp = False
@@ -1367,10 +1382,18 @@ class FusedMoE(torch.nn.Module):
         """
         is_triton = self.use_triton_kernels
 
-        if "w13_weight" in param_name and "scale" not in param_name and "bias" not in param_name:
+        if (
+            "w13_weight" in param_name
+            and "scale" not in param_name
+            and "bias" not in param_name
+        ):
             # w13_weight: non-triton [E, 2*I, H], triton [E, H, 2*I]
             return 2 if is_triton else 1
-        elif "w2_weight" in param_name and "scale" not in param_name and "bias" not in param_name:
+        elif (
+            "w2_weight" in param_name
+            and "scale" not in param_name
+            and "bias" not in param_name
+        ):
             # w2_weight: non-triton [E, H, I], triton [E, I, H]
             return 1 if is_triton else 2
         elif "w13_weight_bias" in param_name:
