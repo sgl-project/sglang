@@ -275,9 +275,15 @@ class TestROPE(CustomTestCase):
                 key.view(*lead_shape, num_kv_heads, head_size),
             )
 
-        def single_test(query, key, cos_shape, unsqueeze_dim, sincos_dtype):
-            cos = torch.rand(*cos_shape).to(sincos_dtype)
-            sin = torch.rand(*cos_shape).to(sincos_dtype)
+        def single_test(
+            query, key, cos_shape, unsqueeze_dim, sincos_dtype, strided_cache=False
+        ):
+            cache_width = cos_shape[-1] * (2 if strided_cache else 1)
+            cos = torch.rand(*cos_shape[:-1], cache_width).to(sincos_dtype)
+            sin = torch.rand(*cos_shape[:-1], cache_width).to(sincos_dtype)
+            if strided_cache:
+                cos = cos[..., ::2]
+                sin = sin[..., ::2]
             query_clone = query.clone()
             key_clone = key.clone()
 
@@ -355,6 +361,19 @@ class TestROPE(CustomTestCase):
                     (batch_size, seq_len, head_size),
                     -2,
                     sincos_dtype,
+                )
+                # q/k and cos/sin all have a non-unit stride in the feature dimension
+                single_test(
+                    torch.randn(batch_size, seq_len, num_heads, 2 * head_size).to(
+                        dtype
+                    )[..., ::2],
+                    torch.randn(batch_size, seq_len, num_kv_heads, 2 * head_size).to(
+                        dtype
+                    )[..., ::2],
+                    (batch_size, seq_len, head_size),
+                    2,
+                    sincos_dtype,
+                    strided_cache=True,
                 )
 
     def test_apply_multidimensional_rope(self):
