@@ -291,25 +291,35 @@ class _Block(nn.Module):
         self.norm1, self.norm2 = _RMSNorm(dim), _RMSNorm(dim)
         self.q_norm, self.k_norm = _RMSNorm(dim // heads), _RMSNorm(dim // heads)
         self.proj = nn.ModuleDict(
-            {name: nn.Linear(dim, dim, bias=False) for name in ("q", "k", "v", "o")}
+            {
+                "qkv": nn.Linear(dim, 3 * dim, bias=False),
+                "o": nn.Linear(dim, dim, bias=False),
+            }
         )
         self.proj["ffn_up_gate"] = nn.Linear(dim, 2 * ffn_dim, bias=False)
         self.proj["ffn_down"] = nn.Linear(ffn_dim, dim, bias=False)
 
-    def forward(self, x, rope, modulation, attn_mask_meta=None):
+    def forward(self, x, rope, modulation, attn_mask_meta=None, fuse_qkv=False):
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
         y = _norm_modulate(self.norm1, x, scale_a, shift_a)
-        dtype = self.proj["q"].weight.dtype
+        dtype = self.proj["qkv"].weight.dtype
         y = y.to(dtype)
-        q = _norm_rope(self.q_norm, self.proj["q"](y), rope, self.heads)
-        k = _norm_rope(self.k_norm, self.proj["k"](y), rope, self.heads)
+        if fuse_qkv:
+            q, k, v = self.proj["qkv"](y).chunk(3, -1)
+        else:
+            q, k, v = (
+                nn.functional.linear(y, weight)
+                for weight in self.proj["qkv"].weight.chunk(3)
+            )
+        q = _norm_rope(self.q_norm, q, rope, self.heads)
+        k = _norm_rope(self.k_norm, k, rope, self.heads)
         x = residual_gate_add(
             x,
             self.proj["o"](
                 _attention(
                     q,
                     k,
-                    self.proj["v"](y),
+                    v,
                     None,
                     self.heads,
                     self.attention,
@@ -392,7 +402,11 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_layer]
     _fsdp_forward_methods = ("prepare_conditioning",)
     _compile_conditions = []
-    param_names_mapping = {}
+    param_names_mapping = {
+        r"^layers\.(\d+)\.proj\.q\.weight$": (r"layers.\1.proj.qkv.weight", 0, 3),
+        r"^layers\.(\d+)\.proj\.k\.weight$": (r"layers.\1.proj.qkv.weight", 1, 3),
+        r"^layers\.(\d+)\.proj\.v\.weight$": (r"layers.\1.proj.qkv.weight", 2, 3),
+    }
     reverse_param_names_mapping = {}
     _supported_attention_backends = {
         AttentionBackendEnum.FA,
@@ -524,6 +538,7 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         encoder_attention_mask=None,
         prepared_conditioning: MOSSImageConditioning | None = None,
         skip_layers=(),
+        fuse_qkv=False,
     ):
         skip_layers = validate_skip_layers(skip_layers, self.config.num_layers)
         if (
@@ -597,7 +612,7 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
             x = torch.cat((group_video, group.text), 1)
             rope = group.rope
-            layer_kwargs = {}
+            layer_kwargs = {"fuse_qkv": fuse_qkv}
             if self._sequence_parallel:
                 x, shard = shard_seq(x)
                 rope = tuple(shard_like(part, shard) for part in rope)

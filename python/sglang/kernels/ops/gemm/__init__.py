@@ -525,3 +525,27 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="gemm.muse_spark_router_gemv",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl:router_gemv_cute",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.router_gemv:router_gemv",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gemm_bf16x3_cublas",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",
+        capabilities=CUDA_ONLY,
+    )
+)
