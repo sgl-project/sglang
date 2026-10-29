@@ -861,6 +861,10 @@ class DFlashDraftModel(nn.Module):
         self.block_size = draft_config.resolve_block_size(default=16)
         self.candidate_selector: Optional[nn.Module] = None
         self.lilicorr: Optional[nn.Module] = None
+        # muP targets (Inkling) divide the final hidden by this before their LM
+        # head, and drafts train against that folded head. The worker sets it
+        # from the target config; base-logit projections divide by it once.
+        self.logits_mup_width_multiplier: Optional[float] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
         self.quantizable = self.supports_quantization or self.is_nemotron_35_draft
         self.embed_tokens: Optional[VocabParallelEmbedding] = None
@@ -1472,6 +1476,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
         candidate_ids / unary_logits [N, K]."""
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
+        if self.logits_mup_width_multiplier:
+            hidden = hidden / self.logits_mup_width_multiplier
         ids, vals, _ = candidate_topk(
             hidden, self.lm_head, self.candidate_selector.top_k
         )
