@@ -2913,6 +2913,7 @@ class Scheduler(
         if isinstance(mm_inputs, MMInputsProcessError):
             raise _MultimodalInputProcessingError(mm_inputs.message)
         if isinstance(mm_inputs, MultimodalInputs):
+            mm_inputs.validate()
             return mm_inputs
 
         if get_mm().enable_broadcast_mm_inputs_process:

@@ -765,13 +765,7 @@ class MultimodalInputs:
                 item.feature = None
 
     @staticmethod
-    def from_processor_output(
-        obj: MultimodalProcessorOutput, *, requires_mm_token_modalities: bool = False
-    ):
-        mm_items = obj.mm_items
-        assert isinstance(mm_items, list)
-        mm_items = [item for item in mm_items if item.is_valid()]
-
+    def _validate_item_offsets(mm_items: List[MultimodalDataItem]) -> None:
         missing_offsets = [
             item.modality.name.lower() for item in mm_items if not item.offsets
         ]
@@ -780,6 +774,19 @@ class MultimodalInputs:
             raise ValueError(
                 f"Invalid multimodal input: missing token offsets for {modalities} item(s)"
             )
+
+    def validate(self) -> None:
+        self._validate_item_offsets(self.mm_items)
+
+    @staticmethod
+    def from_processor_output(
+        obj: MultimodalProcessorOutput, *, requires_mm_token_modalities: bool = False
+    ):
+        mm_items = obj.mm_items
+        assert isinstance(mm_items, list)
+        mm_items = [item for item in mm_items if item.is_valid()]
+
+        MultimodalInputs._validate_item_offsets(mm_items)
 
         # try reconstructing from cuda-ipc
         reconstruct_device = None
