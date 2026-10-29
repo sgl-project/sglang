@@ -99,6 +99,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -1266,6 +1267,7 @@ class ModelRunner:
                 num_tokens=self.runner_ids.capture_token_capacity(
                     self.max_token_pool_size
                 ),
+                max_req_len=self.max_req_len,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1555,6 +1557,19 @@ class ModelRunner:
             if size_full is not None:
                 return size_full
         return self.effective_max_total_num_tokens
+
+    @property
+    def max_req_len(self):
+        """Longest request this engine accepts, in tokens.
+
+        The scheduler refuses anything longer, so this also bounds how many rows
+        a single forward can route when chunked prefill is off.
+        """
+        kv_capacity = (
+            self.effective_logical_max_total_num_tokens
+            * page_interleave_shard_size(self.token_to_kv_pool_allocator)
+        )
+        return min(self.model_config.context_len - 1, kv_capacity - 1)
 
     def _load_format_scope(self, load_format: Optional[str]):
         """Make this runner's load format the published one while it loads.

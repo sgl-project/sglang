@@ -565,10 +565,7 @@ class TpModelWorker(BaseTpWorker):
                 kv_capacity,
                 self.model_config.context_len,
             )
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            kv_capacity - 1,
-        )
+        max_req_len = self.model_runner.max_req_len
         max_req_input_len = max_req_len - 5
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size

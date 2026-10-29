@@ -28,6 +28,29 @@ def _is_scattered_a2a_backend() -> bool:
     return backend.is_deepep() or backend.is_deepep_v2() or backend.is_ascend_ops()
 
 
+def _device_cache_rows(
+    *,
+    chunked_prefill_size: Optional[int],
+    max_prefill_tokens: int,
+    max_req_len: int,
+    max_running_requests: int,
+    num_dp_ranks: int,
+) -> int:
+    """Rows the device cache must hold for one forward, across all DP ranks.
+
+    ``BaseDeviceCache.capture`` has no bounds check, so an under-sized buffer
+    crashes the step. Chunking caps a forward at ``chunked_prefill_size``;
+    without it the input budget is soft (``PrefillAdder`` admits a first request
+    past it) and the real ceiling is ``max_req_len``, the longest request the
+    engine accepts.
+    """
+    if chunked_prefill_size and chunked_prefill_size > 0:
+        prefill_rows = chunked_prefill_size
+    else:
+        prefill_rows = max(max_prefill_tokens, max_req_len)
+    return max(prefill_rows, max_running_requests) * num_dp_ranks
+
+
 class RoutedExpertsCapturer(BaseTopkCapturer):
     """Capturer for routed experts with host buffer.
 
@@ -44,6 +67,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         model: torch.nn.Module,
         model_config: ModelConfig,
         num_tokens: int,
+        max_req_len: int,
         max_running_requests: int,
         device: str,
     ) -> Optional["RoutedExpertsCapturer"]:
@@ -55,6 +79,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         return RoutedExpertsCapturer(
             model_config,
             num_tokens=num_tokens,
+            max_req_len=max_req_len,
             max_running_requests=max_running_requests,
             num_fused_shared_experts=num_fused_shared_experts,
             device=device,
@@ -64,6 +89,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         self,
         model_config: ModelConfig,
         num_tokens: int,
+        max_req_len: int,
         max_running_requests: int,
         num_fused_shared_experts: int,
         device: str,
@@ -77,9 +103,12 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         # and otherwise overflows on dp_rank > 0 when max_running_requests >
         # chunked_prefill_size.
         # FIXME: spec decoding's num_verify_tokens is still not accounted for.
-        max_batch_size = max(
-            get_schedule().chunked_prefill_size * get_parallel().num_dp_ranks,
-            max_running_requests * get_parallel().num_dp_ranks,
+        max_batch_size = _device_cache_rows(
+            chunked_prefill_size=get_schedule().chunked_prefill_size,
+            max_prefill_tokens=get_schedule().max_prefill_tokens,
+            max_req_len=max_req_len,
+            max_running_requests=max_running_requests,
+            num_dp_ranks=get_parallel().num_dp_ranks,
         )
 
         super().__init__(
