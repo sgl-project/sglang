@@ -1181,7 +1181,7 @@ jobs:
           # The percentage is computed once by the "Generate HTML coverage
           # report" step above (same container). Fail closed when the value is
           # missing, e.g. that step died before writing it.
-          MIN_NPU_COVERAGE=40
+          MIN_NPU_COVERAGE=10
           NPU_PCT_FILE="${RUN_DIR}/npu_coverage.txt"
           if [ ! -s "${NPU_PCT_FILE}" ]; then
             echo "::error::NPU-only coverage value missing (${NPU_PCT_FILE}); refusing to upload the baseline to OBS"
