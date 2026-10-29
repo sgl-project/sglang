@@ -202,38 +202,29 @@ class TestTokenSpaceDevices(CustomTestCase):
 
     def test_video_requests_use_the_configured_video_device(self):
         # As in process_mm_data: a video request runs all its media on that device.
-        for config_device, spec_device, expected in (
+        for config_device, strategy_device, expected in (
             (None, None, None),
             (None, "cpu", "cpu"),
             ("cpu", None, "cpu"),
             ("cuda:1", "cpu", "cuda:1"),
         ):
 
-            class _Spec(TokenSpaceServingSpec):
-                video_preprocessing_device = spec_device
+            class _Strategy(TokenSpaceProcessStrategy):
+                video_preprocessing_device = strategy_device
 
             mm_process_config = (
                 {}
                 if config_device is None
                 else {"video_preprocessing_device": config_device}
             )
-            server_args = ServerArgs(
-                model_path="dummy",
-                mm_process_config=mm_process_config,
-                enable_token_space_processor=True,
-                mm_processor_worker_num=1,
-            )
-            publish(server_args, role="test")
-            wrapper = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
-                TokenSpaceProcessStrategy, _Spec
-            )(
+            processor = TokenSpaceProcessor.for_strategy(_Strategy)(
                 None,
-                server_args,
                 PreTrainedTokenizerFast(tokenizer_object=_empty_tokenizer()),
-                None,
+                processor_config=MultimodalProcessorConfig(
+                    mm_process_config=mm_process_config, mm_processor_worker_num=1
+                ),
             )
-            self.addCleanup(wrapper.shutdown)
-            wrapper._image_device = "cuda:5"
+            self.addCleanup(processor.shutdown)
             for video_data, image_device, video_device in (
                 (["video"], expected or "cuda:5", expected),
                 (None, "cuda:5", None),
@@ -241,18 +232,34 @@ class TestTokenSpaceDevices(CustomTestCase):
                 with (
                     self.subTest(
                         config_device=config_device,
-                        spec_device=spec_device,
+                        strategy_device=strategy_device,
                         video=bool(video_data),
                     ),
-                    patch.object(wrapper._core, "process", AsyncMock()) as process,
+                    patch.object(
+                        processor,
+                        "_load_media_lists",
+                        AsyncMock(return_value=([], [], [])),
+                    ) as load,
+                    patch.object(
+                        processor, "_process_items", AsyncMock(side_effect=_Stop)
+                    ) as process_items,
+                    self.assertRaises(_Stop),
                 ):
                     asyncio.run(
-                        wrapper.process_mm_data_async(
-                            image_data=["image"], video_data=video_data, input_ids=[1]
+                        processor.process(
+                            ["image"],
+                            video_data,
+                            input_ids=[1],
+                            image_device="cuda:5",
                         )
                     )
-                self.assertEqual(process.call_args.kwargs["image_device"], image_device)
-                self.assertEqual(process.call_args.kwargs["video_device"], video_device)
+                self.assertEqual(
+                    load.call_args.kwargs["video_decode_device"], video_device
+                )
+                self.assertEqual(
+                    process_items.call_args.args[1],
+                    {"image_device": image_device, "video_device": video_device},
+                )
 
     def test_videos_decode_on_cpu_only_when_their_device_is_cpu(self):
         """The decode device can change pixels, so the trainer must decode as rollout did."""
