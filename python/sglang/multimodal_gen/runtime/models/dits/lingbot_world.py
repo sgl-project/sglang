@@ -59,8 +59,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
-    apply_flashinfer_rope_qk_inplace,
+    RotaryEmbedding,
     get_rotary_pos_embed,
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
@@ -295,6 +294,12 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            use_precomputed_cache=False,
+            is_neox_style=False,
+        )
 
     def forward(
         self,
@@ -307,26 +312,21 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         current_start: int = 0,
         cache_start: int | None = None,
         update_cache_only: bool = False,
+        complex_freqs: torch.Tensor | None = None,
     ):
         cos, sin = freqs_cis[:2]
         cos_sin_cache = freqs_cis[2] if len(freqs_cis) > 2 else None
-        if _is_cuda and q.dim() == 4 and q.shape == k.shape:
-            if cos_sin_cache is None:
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-            roped_query, roped_key = apply_flashinfer_rope_qk_inplace(
-                q, k, cos_sin_cache, is_neox=False
-            )
-            roped_query = roped_query.type_as(v)
-            roped_key = roped_key.type_as(v)
-        else:
-            roped_query = _apply_rotary_emb(q, cos, sin, is_neox_style=False).type_as(v)
-            roped_key = _apply_rotary_emb(k, cos, sin, is_neox_style=False).type_as(v)
+        roped_query, roped_key = self.rotary_emb(
+            query=q,
+            key=k,
+            cos=cos,
+            sin=sin,
+            cos_sin_cache=cos_sin_cache,
+            complex_freqs=complex_freqs,
+        )
+        roped_query = roped_query.type_as(v)
+        roped_key = roped_key.type_as(v)
+
         forward_batch = get_forward_context().forward_batch
         seq_splits = None
         uniform_seq_splits = False
@@ -589,7 +589,12 @@ class LingBotWorldTransformerBlock(nn.Module):
             elementwise_affine=True,
             dtype=torch.float32,
         )
-
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.dim_head,
+            rotary_dim=self.dim_head,
+            use_precomputed_cache=False,
+            is_neox_style=False,
+        )
         cross_attn_backends = {
             b for b in supported_attention_backends if not b.is_sparse
         }
@@ -637,6 +642,7 @@ class LingBotWorldTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, ...],
         c2ws_plucker_emb: torch.Tensor | None = None,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -673,18 +679,7 @@ class LingBotWorldTransformerBlock(nn.Module):
         value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
-        elif USE_AITER:
+        if USE_AITER:
             query_shape = query.shape
             key_shape = key.shape
             num_tokens = query.shape[:-2].numel()
@@ -704,9 +699,13 @@ class LingBotWorldTransformerBlock(nn.Module):
             query = q_sbhd.view(query_shape)
             key = k_sbhd.view(key_shape)
         else:
-            query = _apply_rotary_emb(query, cos, sin, is_neox_style=False)
-            key = _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-
+            query, key = self.rotary_emb(
+                query=query,
+                key=key,
+                cos=cos,
+                sin=sin,
+                complex_freqs=complex_freqs,
+            )
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -999,6 +998,8 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         else:
             if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
+            # Built once per forward, not per block; forward_cuda ignores it.
+            complex_freqs = torch.complex(freqs_cis[0], freqs_cis[1]).unsqueeze(-2)
             for block in self.blocks:
                 hidden_states = block(
                     hidden_states,
@@ -1006,6 +1007,7 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                     timestep_proj,
                     freqs_cis,
                     c2ws_plucker_emb,
+                    complex_freqs=complex_freqs,
                 )
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
@@ -1336,6 +1338,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         c2ws_plucker_emb: torch.Tensor | None = None,
         cam_conditioner_scale_shift: tuple[torch.Tensor, torch.Tensor] | None = None,
         update_cache_only: bool = False,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -1366,6 +1369,7 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             current_start,
             cache_start,
             update_cache_only=update_cache_only,
+            complex_freqs=complex_freqs,
         )
         if update_cache_only:
             return hidden_states
@@ -1849,6 +1853,8 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
         cam_conditioner_scale_shifts = self._prepare_cam_conditioner_scale_shifts(
             c2ws_plucker_emb, forward_batch
         )
+        # Built once per forward, not per block; forward_cuda ignores it.
+        complex_freqs = torch.complex(freqs_cis[0], freqs_cis[1]).unsqueeze(-2)
 
         for block_index, block in enumerate(self.blocks):
             hidden_states = block(
@@ -1869,6 +1875,7 @@ class CausalLingBotWorldTransformer3DModel(CausalWanTransformer3DModel):
                 ),
                 update_cache_only=skip_final_projection
                 and block_index == len(self.blocks) - 1,
+                complex_freqs=complex_freqs,
             )
 
         if skip_final_projection:

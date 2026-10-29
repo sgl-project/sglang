@@ -55,8 +55,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
-    apply_flashinfer_rope_qk_inplace,
+    RotaryEmbedding,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
@@ -605,6 +604,13 @@ class WanTransformerBlock(nn.Module):
             dtype=torch.float32,
         )
 
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.dim_head,
+            rotary_dim=self.dim_head,
+            is_neox_style=False,
+            use_precomputed_cache=False,
+        )
+
         # 2. Cross-attention
         cross_attn_backends = {
             b for b in supported_attention_backends if not b.is_sparse
@@ -940,6 +946,8 @@ class WanTransformerBlock(nn.Module):
         ffn_residual: tuple[torch.Tensor, torch.Tensor] | None = None,
         defer_ffn_residual: bool = False,
         text_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """``ffn_residual`` is the previous block's (ff_output, gate), still to be added
         to ``hidden_states``; ``defer_ffn_residual`` hands this block's back the same way.
@@ -984,7 +992,12 @@ class WanTransformerBlock(nn.Module):
         attn_output = self._attend_qk_filled(query, key, value, rope_cos_sin_cache)
         if attn_output is None:
             attn_output = self._self_attention(
-                query, key, value, freqs_cis, rope_cos_sin_cache
+                query,
+                key,
+                value,
+                freqs_cis,
+                rope_cos_sin_cache,
+                complex_freqs=complex_freqs,
             )
         attn_output = attn_output.flatten(2)
         return self._cross_and_ffn(
@@ -1007,6 +1020,8 @@ class WanTransformerBlock(nn.Module):
         value: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         query, key, value, roped = self._norm_qk(
             query, key, value, self.local_num_heads, rope_cos_sin_cache
@@ -1016,21 +1031,6 @@ class WanTransformerBlock(nn.Module):
         cos, sin = freqs_cis
         if roped:
             pass
-        elif _is_cuda and query.shape == key.shape:
-            # The concatenated cache only depends on freqs_cis, which is fixed
-            # for the whole forward; the transformer builds it once per call.
-            cos_sin_cache = rope_cos_sin_cache
-            if cos_sin_cache is None:
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
         elif USE_AITER:
             query_shape = query.shape
             key_shape = key.shape
@@ -1051,9 +1051,13 @@ class WanTransformerBlock(nn.Module):
             query = q_sbhd.view(query_shape)
             key = k_sbhd.view(key_shape)
         else:
-            query, key = (
-                _apply_rotary_emb(query, cos, sin, is_neox_style=False),
-                _apply_rotary_emb(key, cos, sin, is_neox_style=False),
+            query, key = self.rotary_emb(
+                query=query,
+                key=key,
+                complex_freqs=complex_freqs,
+                cos=cos,
+                sin=sin,
+                cos_sin_cache=rope_cos_sin_cache,
             )
 
         if (
@@ -1166,6 +1170,12 @@ class WanTransformerBlock_VSA(nn.Module):
             dtype=torch.float32,
         )
 
+        self.rotary_emb = RotaryEmbedding(
+            head_size=dim_head,
+            rotary_dim=dim_head,
+            is_neox_style=False,
+            use_precomputed_cache=False,
+        )
         # 2. Cross-attention
         cross_attn_backends = {
             b for b in supported_attention_backends if not b.is_sparse
@@ -1217,6 +1227,8 @@ class WanTransformerBlock_VSA(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -1250,22 +1262,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
-            # The concatenated cache only depends on freqs_cis, which is fixed
-            # for the whole forward; the transformer builds it once per call.
-            cos_sin_cache = rope_cos_sin_cache
-            if cos_sin_cache is None:
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
-        elif USE_AITER:
+        if USE_AITER:
             query_shape = query.shape
             key_shape = key.shape
             num_tokens = query.shape[:-2].numel()
@@ -1285,9 +1282,13 @@ class WanTransformerBlock_VSA(nn.Module):
             query = q_sbhd.view(query_shape)
             key = k_sbhd.view(key_shape)
         else:
-            query, key = (
-                _apply_rotary_emb(query, cos, sin, is_neox_style=False),
-                _apply_rotary_emb(key, cos, sin, is_neox_style=False),
+            query, key = self.rotary_emb(
+                query=query,
+                key=key,
+                complex_freqs=complex_freqs,
+                cos=cos,
+                sin=sin,
+                cos_sin_cache=rope_cos_sin_cache,
             )
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
@@ -1599,6 +1600,11 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 if freqs_cos is not None
                 else None
             )
+            complex_freqs = (
+                torch.complex(freqs_cos.float(), freqs_sin.float()).unsqueeze(-2)
+                if freqs_cos is not None
+                else None
+            )
 
         # token-major straight from the patchify GEMM, no [B, C, T, H, W] round trip
         hidden_states = self.patch_embedding(hidden_states, tokens=True).contiguous()
@@ -1631,6 +1637,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_states.device,
             )
             freqs_cis = (freqs_cos.float(), freqs_sin.float())
+            complex_freqs = torch.complex(
+                freqs_cos.float(), freqs_sin.float()
+            ).unsqueeze(-2)
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.dim() == 2:
@@ -1738,6 +1747,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         rope_cos_sin_cache=rope_cos_sin_cache,
                         ffn_residual=ffn_residual,
                         defer_ffn_residual=True,
+                        complex_freqs=complex_freqs,
                         **kv_kwargs,
                     )
                 hidden_states = self.blocks[-1](
@@ -1747,6 +1757,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     freqs_cis,
                     rope_cos_sin_cache=rope_cos_sin_cache,
                     ffn_residual=ffn_residual,
+                    complex_freqs=complex_freqs,
                     **text_kv_kwargs[-1],
                 )
             else:
@@ -1757,6 +1768,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         timestep_proj,
                         freqs_cis,
                         rope_cos_sin_cache=rope_cos_sin_cache,
+                        complex_freqs=complex_freqs,
                         **kv_kwargs,
                     )
             # if teacache is enabled, we need to cache the original hidden states
