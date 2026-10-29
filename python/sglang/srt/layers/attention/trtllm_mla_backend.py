@@ -17,6 +17,9 @@ from sglang.kernels.ops.attention.fixup_zero_kv import (
     _jit_fixup_module,
     fixup_zero_kv_rows,
 )
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
+)
 from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
 )
@@ -131,8 +134,10 @@ def grow_multi_ctas_kv_counter_buffer_if_needed(
 def _quantize_fp8_qkv(q, k, v, layer):
     q = q.to(torch.float8_e4m3fn)
 
+    # K/V that arrive in fp8 were packed at unit scale (pack_extend_kv /
+    # pack_prefix_chunk_kv); keep them as they are.
     k_scale = getattr(layer, "k_scale_float", None)
-    if k_scale is None:
+    if k_scale is None or k.dtype == torch.float8_e4m3fn:
         k_scale = 1.0
     if k_scale != 1.0:
         assert hasattr(layer, "k_scale"), "k_scale is not set"
@@ -144,7 +149,7 @@ def _quantize_fp8_qkv(q, k, v, layer):
         k = k.to(torch.float8_e4m3fn)
 
     v_scale = getattr(layer, "v_scale_float", None)
-    if v_scale is None:
+    if v_scale is None or v.dtype == torch.float8_e4m3fn:
         v_scale = 1.0
     if v_scale != 1.0:
         assert hasattr(layer, "v_scale"), "v_scale is not set"
@@ -332,6 +337,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and self.qk_rope_head_dim == 64
             and can_use_set_mla_kv_concat_q_fp8()
         )
+        # forward_mha discovers the fp8 prefill hooks below dynamically. Without
+        # an fp8 KV cache (or without RoPE dims to pack) the ragged kernel reads
+        # bf16 Q/K/V, so hide them and keep forward_mha's default bf16 path.
+        if self.data_type != torch.float8_e4m3fn or self.qk_rope_head_dim == 0:
+            self.pack_extend_kv = None
+            self.pack_prefix_chunk_kv = None
+            self.prepare_chunked_prefill_qkv = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -1099,6 +1111,50 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         )
+
+    def _runs_ragged_fp8_prefill(self) -> bool:
+        """Whether this extend runs the fp8 ragged prefill kernel, not the
+        flashinfer fallback (which reads bf16 Q/K/V)."""
+        metadata = self.forward_prefill_metadata
+        return metadata is not None and not metadata.fallback_to_flashinfer_impl
+
+    def pack_extend_kv(
+        self,
+        *,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Build the current chunk's fp8 K = [k_nope | k_pe] and fp8 V in one
+        launch, or return None to keep the bf16 concat (flashinfer fallback)."""
+        if not self._runs_ragged_fp8_prefill():
+            return None
+        return mla_kv_pack_quantize_fp8(k_nope, k_pe, v, enable_pdl=False)
+
+    def pack_prefix_chunk_kv(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pack a prefix chunk's K = [k_nope | k_pe] and V into contiguous
+        unit-scale fp8 in one launch. Bit-identical to the concat followed by
+        ``.to(torch.float8_e4m3fn)`` in _quantize_fp8_qkv for finite inputs.
+        The ragged prefill kernel consuming K/V launches without PDL."""
+        return mla_kv_pack_quantize_fp8(k_nope, k_pe, v, enable_pdl=False)
+
+    def prepare_chunked_prefill_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cast Q to fp8 once for the causal pass and every prefix pass, which
+        would otherwise each re-cast the same bf16 Q."""
+        if self._runs_ragged_fp8_prefill():
+            q = q.to(torch.float8_e4m3fn)
+        return q, k, v
 
     def _set_kv_and_concat_q_fused(
         self,

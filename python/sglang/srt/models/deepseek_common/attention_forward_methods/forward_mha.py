@@ -289,6 +289,14 @@ class DeepseekMHAForwardMixin:
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
 
+        # Backends whose kernel reads fp8 K/V build them in one launch instead
+        # of a bf16 concat followed by per-tensor casts.
+        pack_extend_kv = getattr(backend, "pack_extend_kv", None)
+        if pack_extend_kv is not None:
+            packed_kv = pack_extend_kv(k_nope=k_nope, k_pe=k_pe, v=v)
+            if packed_kv is not None:
+                return q, *packed_kv, forward_batch
+
         k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
 
