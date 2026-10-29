@@ -16,7 +16,6 @@ from collections import defaultdict
 from unittest import mock
 
 import torch
-from unified_tree_core_inspector import UnifiedTreeCoreInspector
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
@@ -28,7 +27,11 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.kits.unified_radix_cache.unified_tree_core_inspector import (
+    UnifiedTreeCoreInspector,
+)
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 FULL = ComponentType.FULL
 NODE_LEN = 4
@@ -42,7 +45,9 @@ def _inspector_registry():
         return UnifiedTreeCoreInspector(params, components)
 
     def rust_factory(params, _components):
-        from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+        from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
+            RustUnifiedTreeCoreInspector,
+        )
 
         return RustUnifiedTreeCoreInspector(params)
 
@@ -81,7 +86,7 @@ def make_cache(serialize_load_back: bool, tree_core_backend: str):
         token_to_kv_pool_allocator=allocator,
         page_size=1,
         eviction_policy="lru",
-        tree_components=(FULL,),
+        tree_slots=tree_slots_of((FULL,)),
         hicache_serialize_load_back=serialize_load_back,
         tree_core_backend=tree_core_backend,
     )
