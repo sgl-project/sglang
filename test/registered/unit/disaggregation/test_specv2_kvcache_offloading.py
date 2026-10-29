@@ -107,6 +107,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.req_to_token_pool = req_to_token_pool
     manager.token_to_kv_pool_allocator = allocator
     manager.kv_cache = MagicMock()
+    manager._unified_window = False
     manager.page_size = page_size
     manager.tree_cache = tree_cache
     manager.offloaded_state = WeakKeyDict()
