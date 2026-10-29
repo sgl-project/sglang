@@ -52,7 +52,7 @@ _use_aiter = _is_hip and (
     get_bool_env_var("SGLANG_USE_AITER") or _is_gfx95 or is_gfx1250_supported()
 )
 _is_shuffle_moe_mxfp4 = _use_aiter and _is_gfx95
-_aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
+_aiter_k3_opt = _use_aiter and envs.SGLANG_OPT_HIP_K3_AITER.get()
 if _use_aiter:
     from aiter.ops.shuffle import (
         moe_shuffle_scale,

@@ -11,8 +11,6 @@ included; anything less and a token's routing would depend on the batch size.
 Run:  SGLANG_USE_AITER=1 pytest test/registered/kernels/ops/moe/test_moe_route_radix4.py -v
 """
 
-import sys
-
 import pytest
 import torch
 
@@ -254,7 +252,7 @@ def test_select_experts_preserves_offset_fp32_bias(
     with (
         get_context().override_server_args(),
         envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False),
-        envs.SGLANG_K3_RADIX4_TOPK.override(radix4),
+        envs.SGLANG_OPT_HIP_K3_RADIX4_TOPK.override(radix4),
     ):
         weights, ids, _ = select_experts(
             torch.zeros((num_tokens, 8), device="cuda"), scores, config
@@ -358,4 +356,6 @@ def test_route_radix4_coverage():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    import sys
+
+    sys.exit(pytest.main([__file__]))
