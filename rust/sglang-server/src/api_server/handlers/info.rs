@@ -27,6 +27,7 @@ impl CoreHandle {
             disaggregation_mode: metadata.disaggregation_mode,
             model_type: metadata.model_type.clone(),
             architectures: metadata.architectures.clone(),
+            launch_fields: metadata.launch_model_info.clone(),
         }
     }
 
@@ -120,6 +121,7 @@ mod tests {
                 startup_ready: false,
                 is_disaggregation: false,
                 mm_limits: Vec::new(),
+                multimodal: false,
                 metrics: None,
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata {
@@ -167,6 +169,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Vec::new(),
+                multimodal: false,
                 metrics: None,
                 metadata: CoreMetadata {
                     deployment_info: crate::message::config::DeploymentInfo {

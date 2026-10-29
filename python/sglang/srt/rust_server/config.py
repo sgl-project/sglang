@@ -36,7 +36,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.utils.common import build_server_info
+from sglang.srt.utils.common import build_model_info_fields, build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.version import __version__
 
@@ -196,13 +196,17 @@ def _build_server_args(
         tokenizer_model_max_length=_tokenizer_model_max_length(
             scheduler.tokenizer, mc.context_len
         ),
-        # Launch-time facts Python's /server_info reports from
-        # scheduler_info / the package — stamped here so the rust endpoint
-        # can serve them statically (no scheduler round-trip).
+        # Launch-time facts Python's /server_info and /model_info report from
+        # scheduler_info / the package / the model — stamped here so the rust
+        # endpoints can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
         deployment_info=json.dumps(deployment_info),
         launch_server_info=_launch_server_info(scheduler),
+        launch_model_info=json.dumps(
+            msgspec_to_builtins(build_model_info_fields(mc, scheduler.server_args)),
+            default=str,
+        ),
         load_snapshot_path=shm_writer.path if shm_writer else None,
         load_snapshot_dp_size=shm_writer.dp_size if shm_writer else 0,
         load_snapshot_dp_rank=shm_writer.dp_rank if shm_writer else 0,
@@ -293,11 +297,13 @@ def _partition_cores(
 ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
     """Split this rank's allowed cores into ``(launch_cores, server_cores)``.
 
-    Pure computation — no affinity is changed here. Both sets are a subset
-    of this rank's NUMA-local cores (when affinity/NUMA bind is on), so the
-    partition stays NUMA-local. Returns ``(None, None)`` (server runs
-    unpinned, confined only by the process affinity) when the platform has
-    no affinity API or too few cores to split.
+    ``launch_cores`` are left out of ``server_cores``, so the scheduler thread
+    always finds cores no frontend thread can take; the scheduler thread itself
+    is not pinned to them. Pure computation — no affinity is changed here.
+    Both sets are a subset of this rank's NUMA-local cores (when affinity/NUMA
+    bind is on), so the partition stays NUMA-local. Returns ``(None, None)``
+    (server runs unpinned, confined only by the process affinity) when the
+    platform has no affinity API or too few cores to split.
     """
     if not hasattr(os, "sched_getaffinity"):
         return None, None
@@ -335,7 +341,7 @@ def _partition_cores(
     )
     server_cores = allowed[reserve : reserve + pool_budget]
     logger.info(
-        "rust server cores=%s, scheduler launch cores=%s",
+        "rust server cores=%s, cores kept free for the scheduler=%s",
         server_cores,
         launch_cores,
     )

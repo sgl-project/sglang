@@ -132,6 +132,12 @@ class L2TransferEngine:
         own_stream = stream in (self.host_to_device_stream, self.device_to_host_stream)
         # A caller's stream prepares indices in order with its own copies.
         index_stream = self.index_stream if own_stream else stream
+        # The host layout keeps one finish event per key, and a newer event
+        # covers an older one only on the same stream: a caller's stream keeps
+        # its own entry beside the engine stream's.
+        layout_key = (
+            (id(self), transfer_key) if own_stream else (id(self), transfer_key, stream)
+        )
         try:
             with device_module.stream(index_stream):
                 # Index preparation can read producer-owned device indices. On its
@@ -155,8 +161,7 @@ class L2TransferEngine:
         finally:
             for domain in reversed(domains):
                 domain.release_layout(
-                    ack_finish if finish_recorded else None,
-                    (id(self), transfer_key),
+                    ack_finish if finish_recorded else None, layout_key
                 )
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
