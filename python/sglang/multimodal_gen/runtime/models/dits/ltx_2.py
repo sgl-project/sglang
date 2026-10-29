@@ -17,7 +17,6 @@ from sglang.kernels.ops.diffusion import (
     LTX2_RMS_NORM_MODULATE,
     BitExactFusionGate,
     can_use_fused_rmsnorm_modulation,
-    can_use_head_gate_mul,
     can_use_linear_gelu,
     can_use_ltx2_qknorm_split_rope_cuda,
     can_use_modulate_scale_shift_cuda,
@@ -1033,13 +1032,7 @@ class LTX2Attention(nn.Module):
         if self.to_gate_logits is not None:
             gate_logits, _ = self.to_gate_logits(gate_input)
             gate = torch.sigmoid(gate_logits)
-            b, t = out.shape[:2]
-            if can_use_head_gate_mul(out, gate):
-                out = head_gate_mul(out, gate)
-            else:
-                out = out.view(b, t, self.local_heads, self.dim_head)
-                out = out * (2.0 * gate.unsqueeze(-1))
-                out = out.view(b, t, self.local_heads * self.dim_head)
+            out = head_gate_mul(out, gate)
 
         out_flat = out.flatten(2)
         out_proj, _ = self.to_out[0](out_flat)

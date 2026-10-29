@@ -51,5 +51,19 @@ def test_head_gate_mul_rejects_strided_or_mismatched_inputs() -> None:
     assert not can_use_head_gate_mul(out.float(), gate)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("strided", [False, True])
+def test_head_gate_mul_fallback_matches_eager(dtype, strided):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    for _ in range(2):
+        x = torch.randn(2, 12, 4, 8, device="cuda", dtype=dtype)
+        gate = torch.rand(2, 12, 4, device="cuda", dtype=dtype)
+        if strided:
+            x, gate = x[:, ::2], gate[:, ::2]
+        expected = (x * (2.0 * gate.unsqueeze(-1))).flatten(2)
+        assert torch.equal(head_gate_mul(x, gate), expected)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

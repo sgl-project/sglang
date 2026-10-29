@@ -58,6 +58,9 @@ def can_use_head_gate_mul(x: torch.Tensor, gate: torch.Tensor) -> bool:
 @replay_launches
 def head_gate_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """``x * (2 * gate)`` per head, returned as ``[B, T, H * D]``."""
+    if not can_use_head_gate_mul(x, gate):
+        x = x.view(*gate.shape, -1)
+        return (x * (2.0 * gate.unsqueeze(-1))).flatten(2)
     x = x.view(x.shape[0], x.shape[1], -1)
     hidden = int(x.shape[-1])
     num_heads = int(gate.shape[-1])
