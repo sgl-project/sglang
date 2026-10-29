@@ -138,8 +138,7 @@ def _dcp_entry_copies(
     src_token_indices: npt.NDArray[np.int64],
     dst_token_indices: npt.NDArray[np.int64],
 ) -> List[Copy]:
-    """Each (key, offset) source copied token by token into its destination entry
-    over shared token groups; a zero-width entry moves nothing."""
+    """Each (key, offset) source copied token by token over shared token groups."""
     units = group_units(
         *group_concurrent_contiguous(src_token_indices, dst_token_indices)
     )
@@ -158,7 +157,6 @@ def _dcp_entry_copies(
 def _buffer_devices(
     *, keys: BufferKeys, kv_mem_kinds: Sequence[str], gpu_id: int
 ) -> Dict[BufferKey, int]:
-    """GPU index of each buffer, or -1 for host memory: aux always, KV per its kind."""
     return dict(
         keys.pair(
             [-1 if kind == "DRAM" else gpu_id for kind in kv_mem_kinds],
@@ -272,7 +270,6 @@ def _require_posted(
     post_msg: str,
     create_error: type = Exception,
 ) -> List[NixlHandle]:
-    """`handles` once every transfer was created and posted; raises otherwise."""
     _raise_if_not_created(handles, error_type=create_error, error_msg=create_msg)
     _raise_if_rejected(handles, error_msg=post_msg)
     return handles
@@ -950,7 +947,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             error_type=RuntimeError,
             error_msg="Failed to create prepared state transfer",
         )
-        # The chunk owns the handle before a rejected post raises, so it settles too.
+        # The chunk owns the handle before a failed post raises, so it settles too.
         yield from handles
         _raise_if_rejected(handles, error_msg="Failed to post prepared state transfer")
 
@@ -994,6 +991,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         )
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
+        """Register a staging buffer with the NIXL agent."""
         key = NixlBufferKey(BufferKind.STAGING, len(self._staging_keys))
         self.transport.register(key, ptr, size, self.kv_args.gpu_id)
         self._staging_keys[ptr] = key
@@ -2097,6 +2095,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_keys: Sequence[BufferKey],
     ) -> List[Handle]:
         """Generic KV cache transfer supporting both MHA and MLA architectures.
+        Used by both send_kvcache and maybe_send_extra.
 
         ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
@@ -2130,9 +2129,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 f"dst[{j}]={dst_item_lens[j]}"
                             )
                 # DSA index-K elision leaves a 0-row buffer on every shared-topk
-                # layer. Neither side registered it, so a descriptor built from
-                # it would fail in initialize_xfer(); drop it when either peer
-                # elided the entry.
+                # layer. Neither side registered it, so a copy naming it would
+                # fail; drop it when either peer elided the entry.
                 layers_params = [
                     (i, j, item_lens[i])
                     for i, j in pairs
@@ -2415,8 +2413,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_item_len: int,
         staging_buffer=None,
     ) -> Optional[List[Handle]]:
-        """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode).
-        ``dst_staging_offset`` is the chunk's allocation inside the peer's ring."""
+        """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
             compute_head_slice_params,
             compute_staging_layout,
@@ -2872,7 +2869,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         src_keys: Sequence[BufferKey],
         dst_keys: Sequence[BufferKey],
     ) -> List[Handle]:
-        # Zero bases make the helper's addresses offsets into each entry.
+        # Zero pointers make the helper's addresses offsets into each entry.
         blocks = self._get_mha_head_slice_blocks(
             src_ptrs=[0] * len(src_keys),
             src_item_lens=src_state_item_lens,
@@ -2887,7 +2884,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             "Using SWA state head-slice transfer for different attention TP sizes: "
             f"prefill={self.attn_tp_size}, decode={decode_tp_size}."
         )
-        # The blocks follow the K-then-V entry order the PP helper selects.
+        # Head-slice blocks follow the K-then-V entry order.
         src_k, src_v, dst_k, dst_v, _ = self.get_mha_kv_ptrs_with_pp(
             list(range(len(src_keys))),
             list(range(len(dst_keys))),

@@ -65,7 +65,7 @@ def _nixl_device_id(device: int) -> int:
 
 
 def _expand_runs(runs: np.ndarray) -> np.ndarray:
-    """One (addr, len, dev_id) descriptor per block of Nx5 runs."""
+    """Expand Nx5 runs into one (addr, len, dev_id) descriptor per block."""
     parts = []
     for addr, length, dev_id, stride, count in runs.tolist():
         out = np.empty((count, 3), dtype=np.uint64)
@@ -123,7 +123,6 @@ def create_nixl_agent(
     gpu_id: int,
     init_timeout_s: float,
 ) -> Any:
-    """Create a NIXL agent with one `backend` on GPU `gpu_id`."""
     try:
         from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
     except ImportError as e:
@@ -133,8 +132,8 @@ def create_nixl_agent(
             "to run SGLang with NixlTransferEngine."
         ) from e
 
-    # The protocol's transfer workers and bootstrap thread call the agent
-    # concurrently, so sync_mode=None, which is thread-unsafe, is ruled out.
+    # NixlKVManager.transfer_worker and _start_bootstrap_thread run concurrently
+    # so we cannot use sync_mode=None which is thread-unsafe.
     agent_config = nixl_agent_config(
         backends=[],
         num_threads=num_threads,
@@ -186,7 +185,8 @@ class NixlTransport(Transport):
         # region share one engine registration.
         self._registrations: Dict[BufferKey, _Region] = {}
         self._remotes: Dict[str, NixlRemoteBuffers] = {}
-        # Older NIXL rejects Nx5 strided runs; cleared on the first TypeError.
+        # Newer NIXL prepares compressed (addr, len, dev_id, stride, count) runs
+        # directly; cleared on the first TypeError to expand per block instead.
         self._use_strided_descs = True
 
     @property
@@ -346,7 +346,7 @@ class NixlTransport(Transport):
 
     @staticmethod
     def _descs(base: int, device: int, offsets: np.ndarray, copy: Copy) -> np.ndarray:
-        # uint64: Intel XPU addresses set bit 63.
+        # uint64: Intel XPU addresses have bit 63 set and overflow int64.
         out = np.empty((len(offsets), 3), dtype=np.uint64)
         out[:, 0] = np.uint64(base) + offsets.astype(np.uint64, copy=False)
         out[:, 1] = copy.ranges[:, 2]
@@ -360,15 +360,18 @@ class NixlTransport(Transport):
         *,
         allow_expansion: bool = True,
     ) -> NixlPreparedList:
-        """Prepare a NIXL dlist over local buffers (remote None) or a peer's.
+        """Prepare a NIXL dlist handle from runs over local buffers (remote None)
+        or a peer's.
 
-        Without strided-run support NIXL needs one descriptor per block; with
+        Tries the strided API first and falls back to expanding one descriptor
+        per block when the installed NIXL rejects the Nx5 layout; with
         allow_expansion False that raises TypeError instead.
         """
         peer_name = "" if remote is None else remote.agent_name
         located = [self._locate(remote, r.key) for r in runs]
         # The protocol prepares one memory kind per list (see _kv_xfer_mem_segments).
         kind = _mem_kind(located[0][1])
+        # uint64: Intel XPU addresses have bit 63 set and overflow int64.
         array = np.array(
             [
                 (base + r.offset, r.length, _nixl_device_id(device), r.stride, r.count)
