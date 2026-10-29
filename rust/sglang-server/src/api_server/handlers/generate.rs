@@ -10,7 +10,6 @@ use tokio::sync::{mpsc, oneshot};
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RequestKind};
 use crate::message::response::ResponseItem;
-use crate::multi_modality::worker::MediaError;
 use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission};
 use crate::utils::error::Error;
 
@@ -146,10 +145,7 @@ impl CoreHandle {
             self.inner.mm_processor.get(),
         )
         .await
-        .map_err(|error| match error {
-            MediaError::Client(message) => CoreError::InvalidArgument(message),
-            MediaError::Server(message) => CoreError::Internal(message),
-        })
+        .map_err(CoreError::from)
     }
 }
 
@@ -465,6 +461,7 @@ mod tests {
     use crate::message::multimodal::MmItem;
     use crate::message::request::MmData;
     use crate::message::response::ChunkEvent;
+    use crate::multi_modality::worker::MediaError;
     use crate::tokenizer_manager::wiring::TmEvent;
     use bytes::Bytes;
     use std::time::Duration;
@@ -1012,7 +1009,7 @@ mod tests {
                 &self,
                 _input_ids: TokenIds,
                 _mm: MmData,
-            ) -> Result<crate::multi_modality::worker::MmProcessOutput, String> {
+            ) -> Result<crate::multi_modality::worker::MmProcessOutput, MediaError> {
                 unreachable!("rejected during admission")
             }
 
