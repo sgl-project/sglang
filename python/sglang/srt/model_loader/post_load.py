@@ -128,9 +128,7 @@ def stage_module_for_post_load(
     if process_device.type == "meta":
         raise ValueError("process_device cannot be meta")
 
-    # Resolve device aliases (e.g. npu -> npu:0) before comparing residency.
-    # Otherwise resident weights enter the restore-copy path unnecessarily;
-    # Ascend NZ transpose views cannot be copied back with copy_.
+    # Resolve npu/cuda aliases to avoid restore-copying already-resident NZ views.
     process_device = torch.empty(0, device=process_device).device
 
     original_slots: dict[_SlotKey, _TensorState] = {}

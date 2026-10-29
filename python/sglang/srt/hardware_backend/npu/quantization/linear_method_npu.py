@@ -57,14 +57,11 @@ def _get_float4_e2m1fn_x2_dtype():
 def _prepare_mxfp4_w4a8_bias(
     bias: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
-    """Match the A8W4 ``npu_quant_matmul`` bias contract."""
+    """A8W4 matmul requires BF16 bias with shape [1, N]."""
     if bias is None:
         return None
-    if bias.dtype != torch.bfloat16:
-        bias = bias.to(torch.bfloat16)
-    if bias.dim() == 1:
-        bias = bias.unsqueeze(0)
-    return bias
+    bias = bias.to(torch.bfloat16)
+    return bias.unsqueeze(0) if bias.ndim == 1 else bias
 
 
 class _NPULinearMethodBase(LinearMethodBase):
@@ -426,28 +423,9 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
 
 
 class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
-    """NPU W4A8 online quantization: MXFP4 weights + MXFP8 activations.
+    """Quantize complete FP16/BF16 Linear weights to MXFP4 during loading.
 
-    This is a *true* W4(weight) A8(activation) path: it mirrors the offline
-    ``W4A8_MXFP`` kernel (``NPUMXFP4W4A8OfflineLinearMethod``) exactly — the only
-    difference is that the FP4 weights are produced online from BF16/FP16
-    (round-to-nearest, no calibration) instead of being loaded from a msmodelslim
-    checkpoint. An earlier version of this method ran a *dual-level* scheme that
-    also compressed the activation to FP4 (W4A4 compute via
-    ``npu_dual_level_quant_matmul``); that was a large accuracy regression — 4-bit
-    activations — so it was replaced with the single-level FP8-activation path
-    below, aligned with the offline W4A8 implementation.
-
-    Weight quantization (process_weights_after_loading):
-        BF16/FP16 weight → npu_dynamic_mx_quant(dst=float4_e2m1fn_x2) → packed FP4
-        + UE8M0 block scale → npu_format_cast to FRACTAL_NZ → transpose [in//2, out]
-
-    Inference (apply):
-        BF16/FP16 activation → npu_dynamic_mx_quant(dst=float8_e4m3fn)  (A8, FP8)
-        → npu_quant_matmul(x2_dtype=float4_e2m1fn_x2, group_sizes=[0, 0, block])
-
-    Hardware: A5 NPU + a recent torch_npu with the FP4 npu_quant_matmul
-    (same requirement as the offline W4A8 path — see that class's docstring).
+    Inference uses the offline packed-weight layout with dynamic MXFP8 inputs.
     """
 
     def create_weights(
@@ -493,8 +471,6 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         layer._npu_online_dense_loader = loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Conversion already happened during loading; never repack a prepared
-        # weight or accept a partially loaded/reloaded floating-point source.
         layer._npu_online_dense_loader.finish_post_load()
 
     def _quantize_weights(self, layer: torch.nn.Module) -> None:
@@ -561,8 +537,6 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        # A8W4 requires BF16 bias with shape [1, out_features]. Qwen3 text
-        # layers normally have no bias; Qwen3.5 vision QKV projections do.
         quant_bias = _prepare_mxfp4_w4a8_bias(bias)
 
         # True W4(weight)A8(activation) matmul, identical to the offline path.
@@ -675,7 +649,6 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        # Keep the offline path on the same A8W4 bias contract as online.
         quant_bias = _prepare_mxfp4_w4a8_bias(bias)
 
         # W4(weight)A8(activation) matmul.

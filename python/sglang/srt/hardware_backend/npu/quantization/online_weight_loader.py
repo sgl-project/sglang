@@ -1,9 +1,4 @@
-"""Completion-tracked loading for online MXFP4 weights on Ascend.
-
-Adapted from the loading lifecycle in sgl-project/sglang#29048. The existing
-shard-aware loaders still perform TP slicing and expert placement. Only complete
-logical weights are converted; FP4 packing and scale encoding stay in the kernels.
-"""
+"""Online MXFP4 loading via native shard loaders; adapted from sglang#29048."""
 
 import threading
 from typing import Callable
@@ -16,27 +11,19 @@ from sglang.srt.layers.quantization.dequantization import copy_missing_attrs
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 
 
-def validate_source_dtype(dtype: torch.dtype) -> None:
-    if dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(
-            f"Online MXFP4 loading requires FP16/BF16 weights, got {dtype}."
-        )
-
-
 class _NPUOnlineWeightLoader:
-    """One logical weight's loading/converted/ready_reload lifecycle.
+    """Load one logical weight, convert on completion, and validate before reload."""
 
-    No floating-point Parameter is retained in loader state. The lock covers
-    copying AND conversion so concurrent checkpoint workers cannot quantize an
-    incomplete source, or write to a source while it is being converted.
-    """
-
-    def __init__(self, layer, weight_name, params_dtype, load_device, on_complete):
-        validate_source_dtype(params_dtype)
+    def __init__(self, layer, weight_name, params_dtype, load_weight, on_complete):
+        if params_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                f"Online MXFP4 loading requires FP16/BF16 weights, got {params_dtype}."
+            )
         self.layer = layer
         self.weight_name = weight_name
         self.params_dtype = params_dtype
-        self.load_device = load_device
+        self.load_device = torch.get_default_device()
+        self.load_weight = load_weight
         self.on_complete = on_complete
         self.lock = threading.Lock()
         self.state = "loading"
@@ -64,7 +51,8 @@ class _NPUOnlineWeightLoader:
         setattr(self.layer, self.weight_name, source)
         return source
 
-    def _load(self, loaded_weight, shard_keys, copy_weight):
+    def _load(self, loaded_weight, shard_keys, *args, **kwargs):
+        # Copy and conversion share the lock: checkpoint workers may overlap.
         with self.lock:
             reloading = self.state == "ready_reload"
             if reloading:
@@ -92,11 +80,9 @@ class _NPUOnlineWeightLoader:
                     f"Unexpected source layout for online {self.weight_name}."
                 )
             try:
-                # Let the native loader slice TP/EP shards before copying to
-                # the device; never stage a full global checkpoint tensor here.
                 counter = CopyNumelCounter()
                 with counter:
-                    copy_weight(source, loaded_weight)
+                    self.load_weight(source, loaded_weight, *args, **kwargs)
                 copied = self.loaded_numel + counter.copied_numel
                 if counter.copied_numel == 0 or copied > self.target_numel:
                     raise RuntimeError(
@@ -106,7 +92,6 @@ class _NPUOnlineWeightLoader:
                 self.loaded_numel = copied
                 self.loaded_shards.update(shard_keys)
                 if copied == self.target_numel:
-                    self.state = "quantizing"
                     self.on_complete()
                     prepared = getattr(self.layer, self.weight_name)
                     if prepared.is_meta or prepared.dtype == self.params_dtype:
@@ -115,8 +100,7 @@ class _NPUOnlineWeightLoader:
                         )
                     copy_missing_attrs(source, prepared)
                     self.prepared_layout = (tuple(prepared.shape), prepared.dtype)
-                    # Model loaders may cache old Parameter handles. They must not
-                    # retain a floating-point backing allocation after conversion.
+                    # Cached Parameter handles must not retain the source storage.
                     if prepared is not source:
                         source.data = torch.empty(
                             0, device=source.device, dtype=source.dtype
@@ -150,37 +134,29 @@ class NPUOnlineDenseWeightLoader(_NPUOnlineWeightLoader):
         self, layer, params_dtype, original_weight_loader: Callable, on_complete
     ):
         super().__init__(
-            layer, "weight", params_dtype, torch.get_default_device(), on_complete
+            layer, "weight", params_dtype, original_weight_loader, on_complete
         )
-        self.original_weight_loader = original_weight_loader
 
     def weight_loader(self, param, loaded_weight, loaded_shard_id=None):
-        # The caller may hold a stale meta or packed Parameter from params_dict.
-        # Always resolve the current floating-point source from the layer instead.
+        # Ignore cached handles; _load resolves the current source from the layer.
         keys = (
             set(loaded_shard_id)
             if isinstance(loaded_shard_id, tuple)
             else {loaded_shard_id}
         )
         kwargs = {} if loaded_shard_id is None else {"loaded_shard_id": loaded_shard_id}
-        self._load(
-            loaded_weight,
-            keys,
-            lambda source, value: self.original_weight_loader(source, value, **kwargs),
-        )
+        self._load(loaded_weight, keys, **kwargs)
 
 
 class NPUOnlineMoEWeightLoader:
     def __init__(self, layer, params_dtype, original_weight_loader: Callable):
-        validate_source_dtype(params_dtype)
         self.layer = layer
-        self.original_weight_loader = original_weight_loader
         self.weights = {
             prefix: _NPUOnlineWeightLoader(
                 layer,
                 f"{prefix}_weight",
                 params_dtype,
-                torch.get_default_device(),
+                original_weight_loader,
                 lambda prefix=prefix: getattr(
                     layer, f"{prefix}_kernel"
                 ).process_weights_after_loading(layer, prefix),
@@ -211,16 +187,11 @@ class NPUOnlineMoEWeightLoader:
                 self.layer._weight_loader_expert_ids(current, expert_id)
             )
             if not destinations:
-                # Nonlocal experts must not allocate a source or start a reload,
-                # even when local weights have already been converted.
+                # Nonlocal experts must not allocate or start a reload.
                 return
             args = (weight_name, shard_id, expert_id)
             keys = {(destination, shard_id) for destination in destinations}
-        self.weights[prefix]._load(
-            loaded_weight,
-            keys,
-            lambda source, value: self.original_weight_loader(source, value, *args),
-        )
+        self.weights[prefix]._load(loaded_weight, keys, *args)
 
     def finish_post_load(self):
         for loader in self.weights.values():

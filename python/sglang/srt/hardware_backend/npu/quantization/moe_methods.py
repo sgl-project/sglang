@@ -288,12 +288,7 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
 #  NPUW4A8MXFP4MoEMethod
 # ---------------------------------------------------------------------------
 class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
-    """W4A8 MoE with packed MXFP4 weights and MXFP8 activations.
-
-    Serves the offline ModelSlim ``W4A8_MXFP`` checkpoints and the online
-    ``--quantization mxfp_w4a8`` entry point; ``process_weights_after_loading``
-    tells them apart by expert-weight dtype.
-    """
+    """Shared W4A8 MXFP kernels for online and ModelSlim MoE weights."""
 
     # Dispatch wire format required by the W4A8 MXFP GMMs: low-latency
     # dispatch quantizes activations to MXFP8 (E8M0 block scales); normal
@@ -318,33 +313,6 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             quant_dtype=torch.float8_e4m3fn
         )
 
-    @staticmethod
-    def _quantize_weight_online(
-        weight: torch.Tensor, weight_prefix: str, fp4_dtype: torch.dtype
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Quantize BF16/FP16 experts [E, N, K] to packed MXFP4 [E, N, K//2].
-
-        The returned e8m0 block scale is already pair-split as [E, N, K//64, 2];
-        an offline checkpoint instead stores it flat as [E, N, K//32].
-        """
-        if weight.dtype not in (torch.float16, torch.bfloat16):
-            logger.warning(
-                "NPUW4A8MXFP4MoEMethod: %s_weight dtype %s is not float16/bfloat16; "
-                "casting to bfloat16 before MXFP4 quantization.",
-                weight_prefix,
-                weight.dtype,
-            )
-            weight = weight.to(torch.bfloat16)
-        if not weight.is_npu:
-            weight = weight.to(f"npu:{torch.npu.current_device()}")
-        return torch.ops.npu.npu_dynamic_mx_quant(
-            weight,
-            dst_type=fp4_dtype,
-            round_mode="rint",
-            scale_alg=2,
-            dst_type_max=7.25,
-        )
-
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
@@ -355,16 +323,19 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
 
         weight = getattr(layer, f"{weight_prefix}_weight")
-        online = weight.data.dtype in (torch.float16, torch.bfloat16)
-        if online:
-            # Online entry: UnquantizedFusedMoEMethod created BF16 experts and no
-            # scale parameter, so make both here and share the re-layout below.
-            packed, block_scale = self._quantize_weight_online(
-                weight.data, weight_prefix, fp4_dtype
+        if weight.dtype in (torch.float16, torch.bfloat16):
+            source = weight.data
+            if not source.is_npu:
+                source = source.to(f"npu:{torch.npu.current_device()}")
+            packed, block_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                source,
+                dst_type=fp4_dtype,
+                round_mode="rint",
+                scale_alg=2,
+                dst_type_max=7.25,
             )
-            # Online quantization returns [E, N, K/64, 2], while the shared
-            # helper expects flat checkpoint scales or an already prepared
-            # [E, K/64, N, 2] layout. Flatten the online pairs before delegation.
+            del source
+            # Normalize online [E, N, K/64, 2] scales to the checkpoint layout.
             if block_scale.dim() == 4:
                 block_scale = block_scale.flatten(-2)
             weight = Parameter(packed, requires_grad=False)
@@ -378,16 +349,6 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         weight.data, weight_scale.data = prepare_w4a8_mxfp_weight(
             weight.data, weight_scale.data
         )
-        if online:
-            logger.debug(
-                "Prepared online W4A8 MXFP MoE %s: packed weight=%s %s, scale=%s %s.",
-                weight_prefix,
-                tuple(weight.shape),
-                weight.dtype,
-                tuple(weight_scale.shape),
-                weight_scale.dtype,
-            )
-
         if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(dict(self.DISPATCHER_QUANT_CONFIG))
 

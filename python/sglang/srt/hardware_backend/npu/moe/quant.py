@@ -44,18 +44,12 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
         else:
             raise ValueError(f"Unsupported dynamic quant dtype: {quant_dtype}")
 
-    @property
-    def _op(self):
-        # torch.ops.npu is empty without torch_npu, so binding the op here rather
-        # than in __init__ keeps every MoE method that holds a quantizer
-        # constructible on CPU CI.
-        return getattr(torch.ops.npu, self._op_name)
-
     def __call__(
         self, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        quantized, scale = self._op(hidden_states, dst_type=self.quant_dtype)
-        return quantized, scale
+        # Resolve lazily so construction does not require torch_npu.
+        op = getattr(torch.ops.npu, self._op_name)
+        return op(hidden_states, dst_type=self.quant_dtype)
 
 
 class HiddenStatesStaticQuant(BaseHiddenStatesQuant):

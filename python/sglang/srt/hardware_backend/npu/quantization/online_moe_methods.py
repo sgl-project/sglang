@@ -72,12 +72,7 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
 
 
 class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
-    """Online W4A8 MXFP FusedMoE entry point (``--quantization mxfp_w4a8``).
-
-    W13 and W2 allocate lazily and convert independently as soon as all local
-    shards arrive. The final pass only validates completion; inference keeps
-    using the existing packed MXFP4 kernels and unquantized MoE orchestration.
-    """
+    """Online W4A8 MXFP with lazy, independent W13/W2 loading and conversion."""
 
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
         super().__init__()
@@ -96,8 +91,7 @@ class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
         load_device = torch.get_default_device()
         original_loader = extra_weight_attrs["weight_loader"]
         loader = NPUOnlineMoEWeightLoader(layer, params_dtype, original_loader)
-        # Reuse the unquantized shapes/attributes without allocating the entire
-        # local floating-point model. Ignored layers never enter this subclass.
+        # Reuse native weight shapes and attributes without allocating storage.
         with torch.device("meta"):
             super().create_weights(
                 layer,
@@ -129,10 +123,7 @@ class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
     ):
         backend = get_moe_runner_backend()
         if not (backend.is_auto() or backend.is_ascend()):
-            # Same trap as the MXFP8 entry point: subclassing
-            # UnquantizedFusedMoEMethod puts this method on FusedMoE's shard-swap
-            # list, so a flashinfer backend would load every expert with gate and
-            # up swapped and gmm1 would compute silu(up) * gate silently.
+            # Other runners may swap gate/up shards during loading.
             raise ValueError(
                 "W4A8 MXFP MoE on Ascend requires --moe-runner-backend 'auto' or "
                 f"'ascend', got {backend.value!r}."
@@ -143,5 +134,3 @@ class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
         moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
-        # Inherited apply() consults this; aiter is CUDA/ROCm-only.
-        self._aiter_runner = None
