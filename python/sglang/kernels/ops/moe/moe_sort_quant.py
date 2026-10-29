@@ -22,9 +22,9 @@ import torch
 import triton
 import triton.language as tl
 
-# Measured on gfx950 (E=128, top-4, in a CUDA graph): one launch beats aiter's sort up to
+# measured on gfx950 (E=128, top-4, in a CUDA graph): one launch beats aiter's sort up to
 # MAX_TOKENS and aiter's sort + quant up to MAX_QUANT_TOKENS; past those the histogram
-# every CTA recomputes (it grows with M * topk) costs more than the launches it saves.
+# every CTA recomputes (it grows with M * topk) costs more than the launches it saves
 MAX_TOKENS = 1024
 MAX_QUANT_TOKENS = 768
 _EXPERTS_PER_CTA = 16
@@ -251,7 +251,7 @@ def moe_sort_quant(
     else:
         d, scalen_pad = 32, 8
         x = a1 = a1_scale = sorted_ids  # unused pointers
-    # Measured on gfx950: 8 tokens per CTA sort-only, 2 with the quant (row-load bound).
+    # measured on gfx950: 8 tokens per CTA sort-only, 2 with the quant (row-load bound)
     tb = 2 if quant else 8
     num_tok_cta = triton.cdiv(m, tb)
     num_buf = triton.cdiv(moe_buf.numel(), _BUF_BLOCK)

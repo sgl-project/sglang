@@ -24,7 +24,7 @@ __device__ __forceinline__ i32x8 cat(u32x4 a, u32x4 b) {
     return i32x8{(int)a[0], (int)a[1], (int)a[2], (int)a[3], (int)b[0], (int)b[1], (int)b[2], (int)b[3]};
 }
 
-// bid: the CTA's index among the GEMM's N / (16 NT) CTAs
+// bid is the CTA's index among the GEMM's N / (16 NT) CTAs.
 template <int MT, int NT, int STEPS, int WAVES, bool XLDS>
 __device__ __forceinline__ void gemm_body(const Args& a, const int bid) {
     constexpr int TILE = MT * 256, OUT = NT * TILE, THREADS = WAVES * 64;

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MoE sorting plus the MXFP4 stage1 activation quant for prefill-sized batches on the
-aiter MoE runner (gfx950), in four launches in place of aiter's multi-phase sort, per-token
-quant and scale sort. Outputs equal aiter's bit for bit; the scale rows of padding slots
-are 0, as aiter's coalesced scale sort writes them.
+"""MoE sorting plus the MXFP4 stage1 activation quant for prefill-sized batches (gfx950).
+
+Four launches replace aiter's multi-phase sort, per-token quant and scale sort on the aiter
+MoE runner. Outputs equal aiter's bit for bit; the scale rows of padding slots are 0, as
+aiter's coalesced scale sort writes them.
 
   count:  the expert histogram of each chunk of _CHUNK_TOKENS tokens
   prefix: per expert, its pairs in earlier chunks and in all chunks
@@ -20,8 +21,8 @@ import triton.language as tl
 
 from sglang.kernels.ops.moe.moe_sort_quant import _fp4_pair
 
-# Measured on gfx950 (E=128, top-4, hidden 6144, 2k-32k tokens): 32-token chunks, one token
-# per place CTA and 64-group row loads (vs one masked full-row load) were fastest.
+# measured on gfx950 (E=128, top-4, hidden 6144, 2k-32k tokens): 32-token chunks, one token
+# per place CTA and 64-group row loads (vs one masked full-row load) were fastest
 _CHUNK_TOKENS = 32
 _EXPERTS_PER_PREFIX_CTA = 4
 _GROUPS_PER_LOAD = 64
