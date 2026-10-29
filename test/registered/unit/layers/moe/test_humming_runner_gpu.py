@@ -1,4 +1,4 @@
-"""SM90 numerical regressions for the Humming two-GEMM MoE runner."""
+"""GPU numerical regressions for the Humming two-GEMM MoE runner."""
 
 import json
 import math
@@ -13,6 +13,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 class TestHummingRunnerGPU(CustomTestCase):
@@ -20,18 +21,25 @@ class TestHummingRunnerGPU(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
-        if get_device_sm() != 90:
-            raise unittest.SkipTest("Humming runner GPU regression requires SM90")
 
     def test_indexed_two_gemms_with_different_m_tiles(self):
+        if get_device_sm() != 90:
+            self.skipTest("Distinct WGMMA M tiles require SM90")
         self._check_indexed_two_gemms(static_scales=False)
 
     def test_indexed_two_gemms_with_static_scales(self):
         # Secondary input scales need block-scaled MMA (SM100+), so SM90
         # covers the static per-tensor scales of both GEMMs.
+        if get_device_sm() != 90:
+            self.skipTest("Static WGMMA regression targets SM90")
         self._check_indexed_two_gemms(static_scales=True)
 
-    def _check_indexed_two_gemms(self, static_scales):
+    def test_indexed_two_gemms_with_secondary_scales(self):
+        if get_device_sm() // 10 not in (10, 11):
+            self.skipTest("Secondary-scale UMMA regression requires SM100/SM110 family")
+        self._check_indexed_two_gemms(static_scales=False, secondary_scales=True)
+
+    def _check_indexed_two_gemms(self, static_scales, secondary_scales=False):
         from humming.schema import HummingInputSchema, HummingWeightSchema
         from humming.utils.weight import dequantize_weight
 
@@ -59,7 +67,18 @@ class TestHummingRunnerGPU(CustomTestCase):
             ("w2", hidden_size, intermediate_size),
         ):
             sublayer_input_schema = input_schema
-            if static_scales:
+            if secondary_scales:
+                sublayer_input_schema = HummingInputSchema(
+                    a_dtype="float8e4m3",
+                    input_quant_mode="static_tensor_dynamic_group",
+                    input_scale_group_size=32,
+                    input_scale_dtype="float8e8m0",
+                )
+                layer.register_buffer(
+                    f"{sublayer}_input_scale_2",
+                    torch.tensor([0.7 if sublayer == "w13" else 1.3], device="cuda"),
+                )
+            elif static_scales:
                 sublayer_input_schema = HummingInputSchema(
                     a_dtype="float8e4m3",
                     input_quant_mode="static_tensor",
@@ -120,25 +139,38 @@ class TestHummingRunnerGPU(CustomTestCase):
             "compute_config": compute_config,
             "compute_config_str": json.dumps(compute_config),
         }
-        # Fix distinct legal M tiles: heuristics may choose the same tile on H100.
-        for sublayer, block_m in (("w13", 32), ("w2", 48)):
-            selected = {
-                "mma_type": "wgmma",
-                "block_shape": (block_m, 128, 128),
-                "warp_shape": (block_m, 32, 128),
-                "num_stages": 3,
-                "use_warp_spec": True,
-                "use_tma": True,
-                "use_tma_a": False,
-                "use_tma_as": False,
-                "use_tma_as2": False,
-                "use_tma_c": False,
-                # Direct output gives deterministic eager/graph comparisons.
-                "use_stream_k": False,
-            }
-            tuning = [[0, 1 << 30, selected]]
-            configs[f"{sublayer}_tuning_config"] = tuning
-            configs[f"{sublayer}_tuning_config_str"] = json.dumps(tuning)
+        if secondary_scales:
+            for sublayer in ("w13", "w2"):
+                meta = layer.humming_metas[sublayer]
+                self.assertTrue(meta.use_block_scaled_mma)
+                self.assertTrue(meta.has_input_scale_2)
+                tuning = humming_runner.HummingMethod.get_default_tuning_configs(
+                    layer, gemm_type="indexed", sublayer_name=sublayer
+                )
+                for _, _, selected in tuning:
+                    selected["use_stream_k"] = False
+                configs[f"{sublayer}_tuning_config"] = tuning
+                configs[f"{sublayer}_tuning_config_str"] = json.dumps(tuning)
+        else:
+            # Fix distinct legal M tiles: heuristics may choose the same tile on H100.
+            for sublayer, block_m in (("w13", 32), ("w2", 48)):
+                selected = {
+                    "mma_type": "wgmma",
+                    "block_shape": (block_m, 128, 128),
+                    "warp_shape": (block_m, 32, 128),
+                    "num_stages": 3,
+                    "use_warp_spec": True,
+                    "use_tma": True,
+                    "use_tma_a": False,
+                    "use_tma_as": False,
+                    "use_tma_as2": False,
+                    "use_tma_c": False,
+                    # Direct output gives deterministic eager/graph comparisons.
+                    "use_stream_k": False,
+                }
+                tuning = [[0, 1 << 30, selected]]
+                configs[f"{sublayer}_tuning_config"] = tuning
+                configs[f"{sublayer}_tuning_config_str"] = json.dumps(tuning)
         runner.humming_gemm_configs["indexed"] = configs
         inputs = torch.randn(
             num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
@@ -156,11 +188,46 @@ class TestHummingRunnerGPU(CustomTestCase):
                 return (values.float() / scale).clamp(-448, 448).to(
                     torch.float8_e4m3fn
                 ).float() * scale
+            if secondary_scales:
+                grouped = values.float().reshape(*values.shape[:-1], -1, 32)
+                secondary = getattr(layer, f"{sublayer}_input_scale_2")
+                raw_scale = (
+                    grouped.abs().amax(dim=-1, keepdim=True) / 448.0
+                ).clamp_min(1e-30)
+                # E8M0 group scales round up to the next power of two.
+                scale = (
+                    torch.exp2(torch.ceil(torch.log2(raw_scale / secondary)))
+                    * secondary
+                )
+                return (
+                    (grouped / scale).to(torch.float8_e4m3fn).float() * scale
+                ).reshape_as(values)
             grouped = values.float().reshape(*values.shape[:-1], -1, 128)
             scales = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / 448.0
             return (
                 (grouped / scales).to(torch.float8_e4m3fn).float() * scales
             ).reshape_as(values)
+
+        if secondary_scales:
+            for sublayer, width in (("w13", hidden_size), ("w2", intermediate_size)):
+                probe = inputs[:, :width].contiguous()
+                _, group_scale, secondary = runner._prepare_input(
+                    probe, sublayer_name=sublayer
+                )
+                expected_secondary = getattr(layer, f"{sublayer}_input_scale_2")
+                torch.testing.assert_close(secondary, expected_secondary)
+                raw_scale = (
+                    probe.float().reshape(num_tokens, -1, 32).abs().amax(dim=-1) / 448.0
+                ).clamp_min(1e-30)
+                expected_exponents = (
+                    torch.ceil(torch.log2(raw_scale / expected_secondary)) + 127
+                ).to(torch.uint8)
+                torch.testing.assert_close(
+                    group_scale.view(torch.uint8).reshape_as(expected_exponents),
+                    expected_exponents,
+                    rtol=0,
+                    atol=0,
+                )
 
         quantized_inputs = quantize_reference(inputs, "w13")
         reference = torch.zeros_like(inputs, dtype=torch.float32)
