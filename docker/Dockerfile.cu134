@@ -911,7 +911,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
 
-RUN python3 -m pip install --no-deps "setuptools-rust>=1.11" "setuptools-scm>=8.0" \
+RUN python3 -m pip install -c /sgl-workspace/constraints.txt "setuptools-rust>=1.11" "setuptools-scm>=8.0" \
     && cd /sgl-workspace/sglang/python \
     && python3 -c 'import torch; assert torch.__version__.startswith("2.15."), torch.__version__' \
     && SGLANG_BUILD_RUST_EXTS=mem_cache python3 setup.py build_rust --inplace \
