@@ -223,45 +223,142 @@ def _capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
 
-class RequestWindow:
-    def __init__(
-        self,
-        pool_factory,
-        *,
-        num_slots,
-        layers,
-        page_size,
-        capacity,
-        workspace_rows: Optional[int] = None,
-    ):
-        self.capacity = ((capacity + page_size - 1) // page_size) * page_size
-        self.page_size = page_size
-        self.pool_factory = pool_factory
-        self.num_slots = num_slots
-        self.rows = num_slots * self.capacity
+class PackedWindowView(msgspec.Struct, frozen=True, kw_only=True):
+    """Nonallocating view of packed pages consumed by attention and PD."""
 
-        self.state = pool_factory(self.rows + page_size, layers)
+    size: int
+    page_size: int
+    kv_layout: KVLayout
+    dtype: torch.dtype
+    kv_buffer: tuple[torch.Tensor, ...]
+
+
+class RequestWindowSpec(msgspec.Struct, frozen=True, kw_only=True):
+    """Request-owned ring and fixed workspace extents, including padding pages."""
+
+    num_slots: int
+    layers: int
+    page_size: int
+    capacity: int
+    workspace_rows: int
+    kv_layout: KVLayout
+
+    def __post_init__(self):
+        if (
+            min(
+                self.num_slots,
+                self.layers,
+                self.page_size,
+                self.capacity,
+                self.workspace_rows,
+            )
+            < 1
+        ):
+            raise ValueError("request-window extents must be positive")
+        if self.capacity % self.page_size or self.workspace_rows % self.page_size:
+            raise ValueError("request-window extents must contain whole pages")
+
+    @property
+    def request_parts(self):
+        from sglang.srt.mem_cache.kv.decl import RequestPartDecl, TensorPartDecl
+
+        layers = tuple(range(self.layers))
+        return (
+            RequestPartDecl(
+                part=TensorPartDecl(
+                    name="pages",
+                    shape=(
+                        self.capacity // self.page_size,
+                        self.kv_layout.page_bytes(self.page_size),
+                    ),
+                    dtype=torch.uint8,
+                    layer_ids=layers,
+                )
+            ),
+            RequestPartDecl(
+                part=TensorPartDecl(
+                    name="tags",
+                    shape=(self.capacity,),
+                    dtype=torch.int64,
+                    layer_ids=layers,
+                    reset_value=-1,
+                )
+            ),
+        )
+
+    @property
+    def state_pages(self):
+        # The historical state pool reserves a dummy page in its requested size
+        # and another in the backing. PD page numbering includes both.
+        return self.num_slots * self.capacity // self.page_size + 2
+
+    @property
+    def tag_rows(self):
+        return self.num_slots * self.capacity + self.page_size
+
+    @property
+    def workspace_pages(self):
+        return self.workspace_rows // self.page_size + 1
+
+    @property
+    def nbytes(self):
+        page_bytes = self.kv_layout.page_bytes(self.page_size)
+        return (
+            self.layers * self.state_pages + self.workspace_pages
+        ) * page_bytes + self.layers * self.tag_rows * 8
+
+    @classmethod
+    def create(
+        cls, *, num_slots, layers, page_size, capacity, workspace_rows, kv_layout
+    ):
+        return cls(
+            num_slots=num_slots,
+            layers=layers,
+            page_size=page_size,
+            capacity=-(-capacity // page_size) * page_size,
+            workspace_rows=-(-workspace_rows // page_size) * page_size,
+            kv_layout=kv_layout,
+        )
+
+
+def request_window_workspace_rows(
+    num_slots: int, window: int, draft_tokens: int
+) -> int:
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.runtime_context import get_exec, get_schedule
+    from sglang.srt.utils.common import get_cuda_graph_max_batch_size
+
+    graph_config = get_exec().graph.cuda_graph_config
+    prefill = graph_config.prefill if graph_config is not None else None
+    graph_rows = (
+        get_cuda_graph_max_batch_size(max(prefill.bs))
+        if prefill is not None and prefill.backend == Backend.BREAKABLE and prefill.bs
+        else 0
+    )
+    return (num_slots + 1) * window + max(
+        get_schedule().chunked_prefill_size or 0,
+        graph_rows,
+        (num_slots + 1) * (1 + draft_tokens),
+    )
+
+
+class RequestWindow:
+    def __init__(self, spec: RequestWindowSpec, *, state, tags, workspace):
+        self.spec = spec
+        self.capacity = spec.capacity
+        self.page_size = spec.page_size
+        self.num_slots = spec.num_slots
+        self.rows = spec.num_slots * spec.capacity
+        self.state = state
         self.zero_row = self.rows
         self.sink_row = self.rows + 1
-        self.tags = torch.full(
-            (layers, self.rows + page_size),
-            -1,
-            dtype=torch.int64,
-            device=self.state.kv_buffer[0].device,
-        )
-        self.workspace = None
-        if workspace_rows:
-            self._ensure_workspace(workspace_rows)
+        if tags.shape != (spec.layers, spec.tag_rows):
+            raise ValueError("request-window tags do not match the declared extent")
+        self.tags = tags
+        self.workspace = workspace
         self.layout = None
         self.prepared = None
         self._idle_layout = None
-
-    def _ensure_workspace(self, rows: int) -> None:
-        if self.workspace is not None and self.workspace.size >= rows:
-            return
-        assert not _capturing(), "request-window workspace must be sized before capture"
-        size = ((rows + self.page_size - 1) // self.page_size) * self.page_size
-        self.workspace = self.pool_factory(size, 1)
 
     def row_loc(self, slots, positions):
         return slots * self.capacity + positions % self.capacity
@@ -284,16 +381,14 @@ class RequestWindow:
     def activate(self, layout):
         if self.layout is layout:
             return
-        self.layout = layout
-        self.prepared = None
-        if self.workspace is None:
-            self._ensure_workspace(layout.size)
-        elif self.workspace.size < layout.size:
+        if self.workspace.size < layout.size:
             # Captured graphs hold the workspace address; growing it strands them.
             raise RuntimeError(
                 f"request-window workspace too small: {self.workspace.size} rows "
                 f"for a layout of {layout.size}"
             )
+        self.layout = layout
+        self.prepared = None
 
     def activate_idle(self, num_rows: int) -> torch.Tensor:
         """Activate a layout for an idle forward, whose attention metadata is
