@@ -218,6 +218,7 @@ class Spec(msgspec.Struct):
         Arg(
             help="The quantization method for speculative model.",
             choices=QUANTIZATION_CHOICES,
+            resolvable=True,
         ),
     ] = None
     # Internal provenance used after the public draft quantization inherits the
