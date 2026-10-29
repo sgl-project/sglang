@@ -697,7 +697,6 @@ class TestTritonAttention(CustomTestCase):
         big = torch.zeros(pad + num_slots, 1, D, dtype=dtype, device=device)
         kv_buffer = big[pad:]
 
-        torch.manual_seed(0)
         q = torch.randn(B * E, H_Q, D, dtype=dtype, device=device)
         kv = torch.randn(B, P + E, 1, D, dtype=dtype, device=device)
         k_ext = kv[:, P:].reshape(B * E, 1, D)
