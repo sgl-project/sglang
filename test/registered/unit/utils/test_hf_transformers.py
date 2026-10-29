@@ -276,14 +276,16 @@ class TestNormalizeRopeScalingCompat(CustomTestCase):
         self.assertEqual(llm_cfg.rope_scaling["type"], "dynamic")
 
     def test_no_crash_on_non_dict_rope_scaling(self):
-        cfg = PretrainedConfig()
-        cfg.rope_scaling = "not_a_dict"
+        # Since transformers 5.21 a PretrainedConfig rejects a non-dict here
+        # itself; the helper's own guard is what this case covers.
+        cfg = SimpleNamespace(rope_scaling="not_a_dict")
         normalize_rope_scaling_compat(cfg)
         self.assertEqual(cfg.rope_scaling, "not_a_dict")
 
     def test_no_crash_on_dict_without_rope_type(self):
-        cfg = PretrainedConfig()
-        cfg.rope_scaling = {"factor": 4.0}
+        # A PretrainedConfig standardizes `rope_scaling` on assignment since
+        # transformers 5.21, which would add `rope_type` before the helper runs.
+        cfg = SimpleNamespace(rope_scaling={"factor": 4.0})
         normalize_rope_scaling_compat(cfg)
         self.assertNotIn("type", cfg.rope_scaling)
 
@@ -955,20 +957,22 @@ class TestGemma4AttentionOverrides(CustomTestCase):
 
 
 class TestNormalizeTpStyle(CustomTestCase):
-    """Every style a shipped TP plan can name must normalize; a tied-embedding
-    plan naming an unknown one stops the model loading at all."""
+    """Every style a shipped TP plan can name must normalize; a plan naming an
+    unknown one stops the model loading at all."""
 
-    def test_tied_embedding_plan_normalizes(self):
+    def test_shipped_plan_styles_normalize(self):
         from transformers import AutoConfig
+        from transformers.distributed.tensor_parallel import ALL_PARALLEL_STYLES
 
         from sglang.srt.models.transformers import _normalize_tp_style
 
-        plan = AutoConfig.for_model(
-            "llama", tie_word_embeddings=True
-        ).base_model_tp_plan
-        self.assertIn("embedding_rowwise", plan.values())
-        for pattern, style in plan.items():
-            with self.subTest(pattern=pattern):
+        # transformers injects `embed_tokens: embedding_rowwise` into every
+        # model plan at init and names PLE tables `embedding_colwise`.
+        styles = set(AutoConfig.for_model("llama").base_model_tp_plan.values())
+        styles |= {"embedding_rowwise", "embedding_colwise"}
+        for style in sorted(styles):
+            with self.subTest(style=style):
+                self.assertIn(style, ALL_PARALLEL_STYLES)
                 _normalize_tp_style(style)
 
     def test_unknown_style_still_raises(self):
