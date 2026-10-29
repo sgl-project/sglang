@@ -1,20 +1,31 @@
-"""Embedding-model capabilities resolved from model architecture and server intent.
+"""Embedding capabilities resolved from checkpoint configuration and server intent.
 
 This module is deliberately declarative.  Server-argument resolution, model
 implementations, documentation, and benchmarks can consume the same contract
 without each reimplementing a partial list of embedding architectures.
+Rerank input formatting is selected explicitly by the same resolved spec.
 """
 
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from sglang.srt.configs.nemotron35_reranker import is_nemotron35_reranker_config
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 
 class EmbeddingTask(str, Enum):
     NONE = "none"
     EMBED = "embed"
     CLASSIFY = "classify"
+
+
+class RerankInputFormat(str, Enum):
+    DEFAULT = "default"
+    QUERY_DOCUMENT_CHAT = "query_document_chat"
 
 
 class PoolingStrategy(str, Enum):
@@ -83,6 +94,7 @@ class EmbeddingModelSpec:
     safe_disable_radix_cache: bool = False
     safe_disable_chunked_prefill: bool = False
     safe_disable_kv_cache: bool = False
+    rerank_input_format: RerankInputFormat = RerankInputFormat.DEFAULT
 
     @property
     def bcg_eligibility(self) -> BCGEligibility:
@@ -97,6 +109,7 @@ class EmbeddingModelSpec:
 
         return {
             "family": self.family,
+            "rerank_input_format": self.rerank_input_format.value,
             "task": self.task.value,
             "execution": self.execution.value,
             "attention": self.attention.value,
@@ -295,8 +308,9 @@ def resolve_embedding_model_spec(
     *,
     is_embedding_requested: bool,
     is_embedding_gemma: bool,
+    hf_config: "PretrainedConfig | None" = None,
 ) -> EmbeddingModelSpec:
-    """Resolve a conservative embedding capability description.
+    """Resolve capabilities from architecture, optional checkpoint config and intent.
 
     Unknown architectures remain ``NONE`` unless the caller explicitly asks
     for embedding mode.  This preserves today's CausalLM behavior while
@@ -310,6 +324,32 @@ def resolve_embedding_model_spec(
 
     if is_embedding_gemma:
         return _embedding_gemma_spec()
+
+    if (
+        "Mistral3ForSequenceClassification" in architecture_set
+        and hf_config is not None
+        and is_nemotron35_reranker_config(hf_config.to_dict())
+    ):
+        return EmbeddingModelSpec(
+            family="mistral3_reranker",
+            task=EmbeddingTask.CLASSIFY,
+            execution=EmbeddingExecution.MULTIMODAL,
+            attention=AttentionPattern.BIDIRECTIONAL,
+            pooling=PoolingStrategy.MEAN,
+            normalize=False,
+            postprocessor="model_defined",
+            tokenizer_special_tokens="model_default",
+            supports_dimensions=False,
+            supports_token_embeddings=False,
+            supports_multimodal=True,
+            requires_embedding_flag=False,
+            auto_enable_embedding=True,
+            bidirectional_attention=True,
+            bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+            safe_disable_radix_cache=True,
+            safe_disable_chunked_prefill=True,
+            rerank_input_format=RerankInputFormat.QUERY_DOCUMENT_CHAT,
+        )
 
     if architecture_set & _CLASSIFICATION_ARCHITECTURES:
         return EmbeddingModelSpec(
