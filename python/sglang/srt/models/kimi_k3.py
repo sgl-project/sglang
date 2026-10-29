@@ -19,6 +19,10 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.gemm.k3_shared_situ import (
+    can_use_k3_shared_situ,
+    k3_shared_situ,
+)
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
@@ -148,6 +152,7 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
     get_bool_env_var,
+    get_device_sm,
     rank0_log,
     set_weight_attrs,
 )
@@ -1344,7 +1349,7 @@ class KimiK3MoE(nn.Module):
         finally:
             route_quant_handoff.clear()
 
-    def _forward_shared(self, gate_up, shared_output):
+    def _forward_shared(self, gate_up, shared_output, *, activated=None):
         shared = self.shared_experts
         if TYPE_CHECKING:
             assert shared is not None and isinstance(
@@ -1352,7 +1357,7 @@ class KimiK3MoE(nn.Module):
             )
         assert shared is not None
         _k3_bf16_gemm(
-            shared.act_fn(gate_up),
+            shared.act_fn(gate_up) if activated is None else activated,
             shared.down_proj.weight,
             out=shared_output,
         )
@@ -1383,14 +1388,66 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
+        shared_activated = None
+        if (
+            num_tokens == 1
+            and hidden_size == 7168
+            and self._front_sizes == [1536, 896, 3584]
+            and self._front_fp32
+            and hidden_states.dtype == torch.bfloat16
+            and self._front_w.dtype == torch.bfloat16
+            and self.alt_stream is not None
+            and get_device_sm() == 107
+            and k3_ar_fusion.enabled()
+            and k3_ar_fusion.gemm_ag_up_fits(1)
+        ):
+            activation = self.shared_experts.act_fn
+            shared_weight = self._front_w[:1536]
+            joint_front = (
+                self.tp_size == 8
+                and isinstance(activation, SituAndMul)
+                and can_use_k3_shared_situ(hidden_states, shared_weight)
+            )
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.alt_stream):
+                if joint_front:
+                    gate_up, shared_activated = k3_shared_situ(
+                        hidden_states,
+                        shared_weight,
+                        activation.beta,
+                        activation.linear_beta,
+                    )
+                else:
+                    front = _k3_bf16_gemm(
+                        hidden_states, self._front_w[:2432], out_dtype=torch.float32
+                    )
+            if joint_front:
+                # Router and latent accumulate in FP32.
+                combined = k3_ar_fusion.gemm_ag_down_proj(
+                    hidden_states, self._front_w[1536:]
+                )
+                router_logits, routed_input = combined.split([896, 3584], dim=-1)
+            else:
+                routed_input = k3_ar_fusion.gemm_ag_down_proj(
+                    hidden_states, self._front_w[2432:]
+                )
+            current_stream.wait_stream(self.alt_stream)
+            if joint_front:
+                gate_up.record_stream(current_stream)
+                shared_activated.record_stream(current_stream)
+            else:
+                front.record_stream(current_stream)
+                gate_up, router_logits = front.split([1536, 896], dim=-1)
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
@@ -1422,6 +1479,16 @@ class KimiK3MoE(nn.Module):
                 and self.fuse_ar_norm
                 and k3_ar_fusion.finalize_push_fits(num_tokens)
             )
+            # BS1: stage shared partials with the deferred latent finalize so
+            # both ride one collective.
+            joint_finalize = (
+                defer_finalize
+                and get_device_sm() == 107
+                and num_tokens == 1
+                and hidden_size == 2 * k3_ar_fusion.NORM_DIM
+                and self.moe_hidden_size == k3_ar_fusion.NORM_DIM
+                and k3_ar_fusion.finalize_push_fits(3 * num_tokens)
+            )
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             if defer_finalize:
@@ -1431,10 +1498,13 @@ class KimiK3MoE(nn.Module):
             else:
                 self._forward_routed(hidden_states, router_logits, routed_input, latent)
             with torch.cuda.stream(self.alt_stream):
-                self._forward_shared(gate_up, shared_output)
+                self._forward_shared(gate_up, shared_output, activated=shared_activated)
                 # low-SM pull so the side-stream AR leaves the SMs to the
                 # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
-                k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
+                if not joint_finalize:
+                    k3_ar_fusion.all_reduce_low_sm(
+                        shared_output, num_blocks=4, unroll=8
+                    )
             current_stream.wait_stream(self.alt_stream)
             # The latent AR must stay serialized after the shared AR (both
             # reuse the v2 pull semaphores); the join above does it.
@@ -1443,7 +1513,7 @@ class KimiK3MoE(nn.Module):
                 # covers every latent row
                 fused_norm = True
                 k3_ar_fusion.finalize_all_reduce_push_norm(
-                    latent,
+                    buf if joint_finalize else latent,
                     deferred.gemm2_out,
                     deferred.expanded_idx_to_permuted_idx,
                     deferred.expert_weights,
@@ -1472,7 +1542,7 @@ class KimiK3MoE(nn.Module):
                     prefix_sum,
                 )
         else:  # single collective over the flat [latent | shared] pair
-            self._forward_shared(gate_up, shared_output)
+            self._forward_shared(gate_up, shared_output, activated=shared_activated)
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
             if self.fuse_ar_norm and k3_ar_fusion.enabled():
                 fused_norm = True

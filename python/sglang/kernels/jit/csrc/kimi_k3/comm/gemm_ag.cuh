@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 namespace sglang {
@@ -36,7 +37,86 @@ struct ProducerParams {
   uint32_t rank;
 };
 
-template <uint32_t K, uint32_t N, uint32_t M, uint32_t N_SPLIT, bool kUsePDL>
+// Tensor-core producer (N_SPLIT = 8, 4 <= M <= 8): A = the block's 8 weight rows,
+// B = the M tokens. K is permuted within each 32-wide chunk (same map for A and
+// B) so every thread issues 16B loads.
+SGL_DEVICE void mma_bf16_m16n8k16(float (&d)[4], uint32_t a0, uint32_t a2, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+      "{%0, %1, %2, %3};"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a0), "r"(0u), "r"(a2), "r"(0u), "r"(b0), "r"(b1));
+}
+
+template <uint32_t K, uint32_t N, uint32_t M, bool kUsePDL>
+SGL_DEVICE void
+gemm_ag_mma_producer(const ProducerParams& params, const bf16_t* __restrict__ x, const bf16_t* __restrict__ weight) {
+  using namespace device;
+  constexpr uint32_t kNSplit = 8;
+  constexpr uint32_t kNLocal = N / kWorld;
+  constexpr uint32_t kWarps = (K / kVecSize) / kWarpThreads;
+  constexpr uint32_t kChunks = K / 32;
+  static_assert(M <= 8);
+  static_assert(kChunks % kWarps == 0, "K chunks must split evenly over the warps");
+  constexpr uint32_t kChunksPerWarp = kChunks / kWarps;
+
+  const uint32_t bx = blockIdx.x;
+  const uint32_t tx = threadIdx.x;
+  const uint32_t lane = tx % kWarpThreads;
+  const uint32_t warp = tx / kWarpThreads;
+  const uint32_t g = lane / 4;
+  const uint32_t t = lane % 4;
+  const bf16_t* w_row = weight + static_cast<int64_t>(params.rank * kNLocal + bx * kNSplit + g) * K;
+
+  // weight prefetch before the PDL wait (input-independent addresses)
+  uint4 w_vec[kChunksPerWarp];
+#pragma unroll
+  for (uint32_t c = 0; c < kChunksPerWarp; ++c) {
+    w_vec[c] = *reinterpret_cast<const uint4*>(w_row + (warp * kChunksPerWarp + c) * 32 + 8 * t);
+  }
+
+  PDLWaitPrimary<kUsePDL>();
+  const uint32_t phase = params.counter[0].get() & 1;
+
+  uint4 x_vec[kChunksPerWarp];
+#pragma unroll
+  for (uint32_t c = 0; c < kChunksPerWarp; ++c) {
+    x_vec[c] = g < M ? *reinterpret_cast<const uint4*>(x + g * K + (warp * kChunksPerWarp + c) * 32 + 8 * t)
+                     : make_uint4(0, 0, 0, 0);
+  }
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (uint32_t c = 0; c < kChunksPerWarp; ++c) {
+    mma_bf16_m16n8k16(acc, w_vec[c].x, w_vec[c].y, x_vec[c].x, x_vec[c].y);
+    mma_bf16_m16n8k16(acc, w_vec[c].z, w_vec[c].w, x_vec[c].z, x_vec[c].w);
+  }
+
+  // D[g][2t, 2t + 1] = out[token 2t, 2t + 1][column g]
+  __shared__ float s_part[kWarps][8][kNSplit];
+  s_part[warp][2 * t][g] = acc[0];
+  s_part[warp][2 * t + 1][g] = acc[1];
+  __syncthreads();
+  constexpr uint32_t kNumPairs = M * kNSplit / 2;
+  if (tx < kNumPairs) {
+    const uint32_t m = (2 * tx) / kNSplit;
+    const uint32_t n = (2 * tx) % kNSplit;
+    float lo = 0.f, hi = 0.f;
+#pragma unroll
+    for (uint32_t w = 0; w < kWarps; ++w) {
+      lo += s_part[w][m][n];
+      hi += s_part[w][m][n + 1];
+    }
+    const auto pair = cast<bf16x2_t>(fp32x2_t{lo, hi});
+    auto bits = *reinterpret_cast<const uint32_t*>(&pair);
+    if (bits == 0) bits = 0x8000u;  // -0.0 in the first element: never all-zero
+    const uint32_t elem = (params.rank * M + m) * kNLocal + bx * kNSplit + n;
+    const auto base = reinterpret_cast<bf16_t*>(params.ws_mc + phase * params.half_bytes);
+    ptx::multimem_store_relaxed(reinterpret_cast<uint32_t*>(base + elem), bits);
+  }
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+template <uint32_t K, uint32_t N, uint32_t M, uint32_t N_SPLIT, bool kUsePDL, bool kFP32 = false>
 __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
     const __grid_constant__ ProducerParams params,
     const bf16_t* __restrict__ x,         // [M, K]
@@ -54,6 +134,12 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
   static_assert(M * N_SPLIT <= kGemvBlock, "output tile must fit one thread each for the final reduce");
   static_assert(N_SPLIT % 2 == 0, "epilogue stores adjacent column pairs");
 
+  // Note(kpham-sgl): the tensor-core path targets the spec-decode verify batch
+  // (4 <= M <= 8). Plain decode (M <= 2) stays on CUDA cores, where tensor cores
+  // measured 0.1-0.3 us slower on Rubin.
+  if constexpr (N_SPLIT == 8 && !kFP32 && M >= 4 && M <= 8) {
+    return gemm_ag_mma_producer<K, N, M, kUsePDL>(params, x, weight);
+  }
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
   // this rank's rows of the replicated [N, K] weight, sliced HERE (the
@@ -105,22 +191,36 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
       packed.x += lo;
       packed.y += hi;
     }
-    const auto pair = cast<bf16x2_t>(packed);
-    auto bits = *reinterpret_cast<const uint32_t*>(&pair);
-    if (bits == 0) bits = 0x8000u;  // -0.0 in the first element: never all-zero
-    const uint32_t m = (2 * tx) / N_SPLIT;
-    const uint32_t n = (2 * tx) % N_SPLIT;  // even column within the tile
-    // bf16 index in the phase half's dense [world][M][N / world] prefix;
-    // one multicast store lands this rank's pair on EVERY peer
-    const uint32_t elem = (params.rank * M + m) * kNLocal + bx * N_SPLIT + n;
-    const auto base = reinterpret_cast<bf16_t*>(params.ws_mc + phase * params.half_bytes);
-    const auto dst = reinterpret_cast<uint32_t*>(base + elem);
-    ptx::multimem_store_relaxed(dst, bits);
+    if constexpr (kFP32) {
+      const uint32_t m = (2 * tx) / N_SPLIT;
+      const uint32_t n = (2 * tx) % N_SPLIT;
+      const uint32_t elem = (params.rank * M + m) * kNLocal + bx * N_SPLIT + n;
+      const auto base = reinterpret_cast<uint32_t*>(params.ws_mc + phase * params.half_bytes);
+      auto lo = __float_as_uint(packed.x);
+      auto hi = __float_as_uint(packed.y);
+      // Negative zero is numerically zero but distinct from the empty marker.
+      if (lo == 0) lo = 0x80000000u;
+      if (hi == 0) hi = 0x80000000u;
+      ptx::multimem_store_relaxed(base + elem, lo);
+      ptx::multimem_store_relaxed(base + elem + 1, hi);
+    } else {
+      const auto pair = cast<bf16x2_t>(packed);
+      auto bits = *reinterpret_cast<const uint32_t*>(&pair);
+      if (bits == 0) bits = 0x8000u;  // -0.0 in the first element: never all-zero
+      const uint32_t m = (2 * tx) / N_SPLIT;
+      const uint32_t n = (2 * tx) % N_SPLIT;  // even column within the tile
+      // bf16 index in the phase half's dense [world][M][N / world] prefix;
+      // one multicast store lands this rank's pair on EVERY peer
+      const uint32_t elem = (params.rank * M + m) * kNLocal + bx * N_SPLIT + n;
+      const auto base = reinterpret_cast<bf16_t*>(params.ws_mc + phase * params.half_bytes);
+      const auto dst = reinterpret_cast<uint32_t*>(base + elem);
+      ptx::multimem_store_relaxed(dst, bits);
+    }
   }
   PDLTriggerSecondary<kUsePDL>();
 }
 
-// Consumer: Lamport spin + add3, one 16B vector (8 bf16) per thread.
+// Consumer: Lamport spin + BF16 add3 or FP32 gather, one 16B vector per thread.
 
 struct ConsumerParams {
   uint8_t* ws_local;      // LOCAL VA of the push workspace base (poll + reset)
@@ -129,21 +229,23 @@ struct ConsumerParams {
   uint32_t half_bytes;    // bytes per phase half (world_size * slot_bytes)
   const bf16_t* b;        // [M, N]
   const bf16_t* c;        // may be null
-  bf16_t* out;            // [M, N]
+  void* out;              // [M, N], bf16 add3 or float gather
   uint32_t num_rows;      // M
 };
 
-template <uint32_t N, bool kHasC, bool kUsePDL>
+template <uint32_t N, bool kHasC, bool kUsePDL, bool kFP32 = false>
 __global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) {
   using namespace device;
-  using vec_t = AlignedVector<bf16x2_t, kSpinVec / 2>;  // 8 bf16 as 4 pairs
+  constexpr uint32_t kSpinVec = kFP32 ? 4 : 8;
+  using output_t = std::conditional_t<kFP32, float, bf16_t>;
+  using vec_t = std::conditional_t<kFP32, AlignedVector<float, 4>, AlignedVector<bf16x2_t, 4>>;
   constexpr uint32_t kNLocal = N / kWorld;
   static_assert(N % kSpinVec == 0, "rows must stay 16B aligned");
   static_assert(kNLocal % kSpinVec == 0, "a vector must never cross a rank block");
   const auto bx = blockIdx.x;
   const auto tx = threadIdx.x;
   const uint32_t tid = bx * kSpinBlock + tx;
-  const uint32_t elem = tid * kSpinVec;  // first bf16 of this thread's vector
+  const uint32_t elem = tid * kSpinVec;  // first element of this thread's vector
   const uint32_t phase = params.counter[bx].get() & 1;
 
   PDLTriggerSecondary<kUsePDL>();
@@ -165,25 +267,30 @@ __global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) 
     const auto col = elem % N;
     // out[row, col] lives at half[col / kNLocal][row][col % kNLocal] of the
     // dense [world][M][N / world] prefix of the current phase half
-    const auto base = reinterpret_cast<bf16_t*>(params.ws_local + phase * params.half_bytes);
+    const auto base = reinterpret_cast<output_t*>(params.ws_local + phase * params.half_bytes);
     const auto src = base + ((col / kNLocal) * params.num_rows + row) * kNLocal + col % kNLocal;
     vec_t b_vec, c_vec;
-    b_vec.load(params.b + elem);
-    if constexpr (kHasC) c_vec.load(params.c + elem);
-    // spin until all 4 packed pairs of the vector have landed
+    if constexpr (!kFP32) {
+      b_vec.load(params.b + elem);
+      if constexpr (kHasC) c_vec.load(params.c + elem);
+    }
     uint4 raw;
     do {
       ptx::ld_relaxed_16B(raw, src, 0);
     } while (raw.x == 0 || raw.y == 0 || raw.z == 0 || raw.w == 0);
     const auto& gathered = *reinterpret_cast<const vec_t*>(&raw);
-    vec_t out_vec;
+    if constexpr (kFP32) {
+      gathered.store(static_cast<float*>(params.out) + elem);
+    } else {
+      vec_t out_vec;
 #pragma unroll
-    for (uint32_t j = 0; j < kSpinVec / 2; ++j) {
-      using Trait = DTypeTrait<bf16x2_t>;
-      out_vec[j] = Trait::add(gathered[j], b_vec[j]);
-      if constexpr (kHasC) out_vec[j] = Trait::add(out_vec[j], c_vec[j]);
+      for (uint32_t j = 0; j < kSpinVec / 2; ++j) {
+        using Trait = DTypeTrait<bf16x2_t>;
+        out_vec[j] = Trait::add(gathered[j], b_vec[j]);
+        if constexpr (kHasC) out_vec[j] = Trait::add(out_vec[j], c_vec[j]);
+      }
+      out_vec.store(static_cast<bf16_t*>(params.out) + elem);
     }
-    out_vec.store(params.out + elem);
     AlignedVector<uint32_t, 4> zero;
     zero.fill(0);
     zero.store(src);
@@ -200,7 +307,7 @@ using host::distributed::CommunicatorRef;
 // spin consumer launched with PDL right behind it). Any (K, N) that passes
 // the kernels' static_asserts works; Kimi-K3 uses (3584, 7168).
 
-template <uint32_t K, uint32_t N, uint32_t kMaxM, bool kUsePDL>
+template <uint32_t K, uint32_t N, uint32_t kMaxM, bool kUsePDL, uint32_t kSplitN = 2, bool kFP32 = false>
 struct GEMMAGKernel {
   using TensorView = tvm::ffi::TensorView;
 
@@ -213,7 +320,8 @@ struct GEMMAGKernel {
   // the old kNumProducerBlocks <= push.num_blocks bound; the producer now reads
   // a single phase counter, so the grid is free and 112 blocks did not even
   // fill one per SM.
-  static constexpr uint32_t N_SPLIT = 2;
+  // SM107 BS1 uses eight columns per block (selected by the Python dispatch).
+  static constexpr uint32_t N_SPLIT = kSplitN;
   static constexpr uint32_t kNLocal = N / gemm_ag::kWorld;
   static constexpr uint32_t kGemvBlock = K / gemm_ag::kVecSize;
   static constexpr uint32_t kNumProducerBlocks = kNLocal / N_SPLIT;
@@ -223,12 +331,18 @@ struct GEMMAGKernel {
 
   template <std::size_t... I>
   static constexpr auto make_table(std::index_sequence<I...>) {
-    return std::array<GemvFn, kMaxM + 1>{nullptr, gemm_ag::gemm_ag_gemv_kernel<K, N, I + 1, N_SPLIT, kUsePDL>...};
+    return std::array<GemvFn, kMaxM + 1>{
+        nullptr, gemm_ag::gemm_ag_gemv_kernel<K, N, I + 1, N_SPLIT, kUsePDL, kFP32>...};
   }
   static constexpr auto kGemvTable = make_table(std::make_index_sequence<kMaxM>{});
 
   static void
-  run(CommunicatorRef ref, TensorView x, TensorView weight, TensorView b, std::optional<TensorView> c, TensorView out) {
+  run(CommunicatorRef ref,
+      TensorView x,
+      TensorView weight,
+      std::optional<TensorView> b,
+      std::optional<TensorView> c,
+      TensorView out) {
     using namespace host;
     const auto& push = ref.get()->get_push_obj();
 
@@ -237,16 +351,20 @@ struct GEMMAGKernel {
     device.set_options<kDLCUDA>();
     TensorMatcher({M, K}).with_dtype<bf16_t>().with_device(device).verify(x);
     TensorMatcher({N, K}).with_dtype<bf16_t>().with_device(device).verify(weight);
-    TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(b);
+    CHECK_HOST(b.has_value() != kFP32) << "the BF16 add3 epilogue takes b; the FP32 gather does not";
+    if (b.has_value()) {
+      TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(b.value());
+    }
     if (c.has_value()) {
       TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(c.value());
     }
-    TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(out);
+    using output_t = std::conditional_t<kFP32, float, bf16_t>;
+    TensorMatcher({M, N}).with_dtype<output_t>().with_device(device).verify(out);
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
     CHECK_HOST(num_tokens >= 1 && num_tokens <= kMaxM);
     CHECK_HOST(push.world_size == gemm_ag::kWorld) << "the kernel is compiled for TP" << gemm_ag::kWorld;
     CHECK_HOST(push.mc_workspace != nullptr) << "requires a multicast-capable push plane";
-    CHECK_HOST(int64_t(num_tokens) * kNLocal * 2 <= push.slot_bytes)
+    CHECK_HOST(int64_t(num_tokens) * kNLocal * sizeof(output_t) <= push.slot_bytes)
         << "staging slice exceeds the push slot size " << push.slot_bytes;
     // The producer grid is no longer bound to the counter array: it reads only
     // counter[0] (see gemm_ag_gemv_kernel). The consumer grid still is.
@@ -271,18 +389,18 @@ struct GEMMAGKernel {
         .counter = push.counter,
         .num_counters = push.num_blocks,
         .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
-        .b = static_cast<const bf16_t*>(b.data_ptr()),
+        .b = b.has_value() ? static_cast<const bf16_t*>(b.value().data_ptr()) : nullptr,
         .c = c.has_value() ? static_cast<const bf16_t*>(c.value().data_ptr()) : nullptr,
-        .out = static_cast<bf16_t*>(out.data_ptr()),
+        .out = out.data_ptr(),
         .num_rows = num_tokens,
     };
-    const auto num_vecs = num_tokens * N / gemm_ag::kSpinVec;
+    const auto num_vecs = num_tokens * N / (16 / sizeof(output_t));
     const auto num_consumers = host::div_ceil(num_vecs, gemm_ag::kSpinBlock);
     CHECK_HOST(num_consumers + 1 <= push.num_blocks);
     // use last block to clean up the counter
     const auto num_consumer_blocks = num_consumers + 1;
     using gemm_ag::spin_add3_kernel;
-    const auto kernel = c.has_value() ? spin_add3_kernel<N, 1, kUsePDL> : spin_add3_kernel<N, 0, kUsePDL>;
+    const auto kernel = c.has_value() ? spin_add3_kernel<N, 1, kUsePDL, kFP32> : spin_add3_kernel<N, 0, kUsePDL, kFP32>;
     host::LaunchKernel(num_consumer_blocks, gemm_ag::kSpinBlock, device.unwrap())
         .enable_pdl(kUsePDL)(kernel, consumer_params);
   }

@@ -24,6 +24,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.ops.communication.all_reduce_residual import _COMM_MAP
+from sglang.srt.utils.common import get_device_sm
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -41,8 +42,10 @@ MAX_TOKENS = 12
 
 
 @cache_once
-def _jit_module() -> Module:
-    args = make_cpp_args(K, N, MAX_TOKENS, is_arch_support_pdl())
+def _jit_module(split_n: int = 2, k: int = K, n: int = N, fp32: bool = False) -> Module:
+    args = make_cpp_args(
+        k, n, 1 if fp32 else MAX_TOKENS, is_arch_support_pdl(), split_n, fp32
+    )
     cls = f"GEMMAGKernel<{args}>"
     return load_jit(
         "kimi_k3_gemm_ag",
@@ -62,7 +65,9 @@ def _gemm_ag_op(
     c: Optional[torch.Tensor],
     out: torch.Tensor,
 ) -> None:
-    _jit_module().run(_COMM_MAP[world_size], x, weight, b, c, out)
+    # Rubin BS1: 112 producer blocks beat the GB300-tuned 448-block grid.
+    split_n = 8 if x.shape[0] == 1 and get_device_sm() == 107 else 2
+    _jit_module(split_n).run(_COMM_MAP[world_size], x, weight, b, c, out)
 
 
 def gemm_ag_up_proj(
@@ -80,4 +85,30 @@ def gemm_ag_up_proj(
     row block); ``b`` / ``c`` / ``out`` are [M, 7168] (``out`` is
     output-only)."""
     _gemm_ag_op(world_size, x, weight, b, c, out)
+    return out
+
+
+@register_custom_op(mutates_args=["out"])
+def _gemm_ag_down_op(
+    world_size: int,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _jit_module(4, N, weight.shape[0], True).run(
+        _COMM_MAP[world_size], x, weight, None, None, out
+    )
+
+
+def gemm_ag_down_proj(
+    world_size: int,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """BS1 TP8 FP32-gathered GEMV: [1, 7168] @ [N, 7168].T, N = weight rows.
+
+    Input and weight are contiguous BF16; output preserves FP32 accumulation.
+    """
+    _gemm_ag_down_op(world_size, x, weight, out)
     return out
