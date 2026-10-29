@@ -1748,7 +1748,6 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
                 sinks=sinks,
-                slopes=slopes,
             )
 
         if not self.use_mla:
@@ -2526,7 +2525,6 @@ class AscendAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
-        slopes: Optional[torch.Tensor] = None,
     ):
         """Share KV preparation and FIA dispatch for MTP and NGRAM verification."""
         is_ngram = _is_ngram_verify(forward_batch.spec_info)
@@ -2535,11 +2533,10 @@ class AscendAttnBackend(AttentionBackend):
             or layer.attn_type != AttentionType.DECODER
             or layer.logit_cap != 0
             or sinks is not None
-            or slopes is not None
         ):
             raise ValueError(
                 "NGRAM on Ascend requires full decoder attention without "
-                "attention sinks, ALiBi, or logit capping."
+                "attention sinks or logit capping."
             )
         draft_tokens = (
             int(forward_batch.spec_info.draft_token_num)
