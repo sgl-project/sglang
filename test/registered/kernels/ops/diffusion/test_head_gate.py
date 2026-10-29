@@ -66,5 +66,12 @@ def test_head_gate_mul_preserves_reference_paths(dtype, strided, device):
         assert torch.equal(head_gate_mul(x, gate), expected)
 
 
+def test_head_gate_mul_preserves_broadcast_gates():
+    x = torch.randn(2, 12, 4, 8)
+    gate = torch.rand(1, 12, 4)
+    expected = (x * (2.0 * gate.unsqueeze(-1))).flatten(2)
+    assert torch.equal(head_gate_mul(x, gate), expected)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
