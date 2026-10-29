@@ -12,6 +12,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -88,6 +90,10 @@ def make_host_pool(dtype, layout):
     # Device pointers (needed for backup kernel path)
     device_pool = make_device_pool(dtype)
     host.device_pool = device_pool
+    host.buffer_info = MambaStateBufferInfo(
+        temporal=device_pool.mamba_cache.temporal,
+        conv=tuple(device_pool.mamba_cache.conv),
+    )
     host.temporal_device_ptrs = torch.tensor(
         [device_pool.mamba_cache.temporal[i].data_ptr() for i in range(NUM_LAYERS)],
         dtype=torch.uint64,
@@ -343,6 +349,91 @@ def test_mamba_kernel_full_indices(dtype, layout):
         )
     torch.cuda.synchronize()
     assert_device_matches_host(host, device_pool, host_indices, load_indices)
+
+
+@pytest.mark.parametrize(
+    "layout,io_backend",
+    [
+        ("page_first", "kernel"),
+        ("page_first_direct", "kernel"),
+        ("page_first_direct", "direct"),
+    ],
+)
+@pytest.mark.parametrize("kind", ["dense", "strided", "conv_only"])
+def test_captured_mamba_state_round_trip(layout, io_backend, kind):
+    """Transfer must preserve checkpoint bytes without reading the device pool.
+
+    Unified state is strided and short-conv-only models have no temporal payload.
+    Both still carry registered extra checkpoint rows through the same restore.
+    """
+    pool = object.__new__(MambaPool)
+    pool.mamba_layer_ids = [7, 11]
+    if kind == "strided":
+        temporal = torch.empty(6, 2, 64, device=DEVICE).transpose(0, 1)
+        conv = torch.empty(6, 2, 64, 4, device=DEVICE).transpose(0, 1)
+    else:
+        width = 0 if kind == "conv_only" else 64
+        temporal = torch.empty(2, 6, width, device=DEVICE)
+        conv = torch.empty(2, 6, 64, 4, device=DEVICE)
+    extra = torch.arange(6 * 8, device=DEVICE).reshape(6, 8)
+    sibling = SimpleNamespace(
+        iter_transfer_state_entries=lambda: iter((("extra", extra, None, None),))
+    )
+    pool._slot_siblings = (sibling,)
+    pool.mamba_cache = MambaPool.State(conv=[conv], temporal=temporal)
+    (info,) = pool.get_device_pool_infos()
+    info.buffer_info.validate(layer_ids=info.layer_ids)
+    host = MambaPoolHost(
+        info.buffer_info,
+        host_to_device_ratio=2,
+        host_size=0,
+        device_capacity=6,
+        layout=layout,
+    )
+    try:
+        assert host.size == 13
+        del pool.mamba_cache
+        del pool._slot_siblings
+        assert host.device_pool is None
+
+        index_device = "cpu" if io_backend == "direct" else DEVICE
+        device_indices = torch.tensor([1, 4], device=index_device)
+        host_indices = torch.tensor(
+            [0, 2], device="cpu" if io_backend == "direct" else DEVICE
+        )
+        buffers = (temporal, conv)
+        for buffer in buffers:
+            buffer.copy_(
+                torch.arange(buffer.numel(), device=DEVICE).reshape(buffer.shape)
+            )
+        expected = [buffer[:, device_indices].clone() for buffer in buffers]
+        extra_expected = extra[device_indices].clone()
+        # Controllers run transfers on a dedicated stream. CUDA batch copies
+        # reject the legacy default stream used by ordinary tensor operations.
+        transfer_stream = torch.cuda.Stream()
+        transfer_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(transfer_stream):
+            host.backup_from_device_all_layer(
+                pool, host_indices, device_indices, io_backend
+            )
+        transfer_stream.synchronize()
+        for buffer in buffers:
+            buffer.zero_()
+        extra.zero_()
+        transfer_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(transfer_stream):
+            for layer in range(2):
+                host.load_to_device_per_layer(
+                    pool, host_indices, device_indices, layer, io_backend
+                )
+        transfer_stream.synchronize()
+        for buffer, original in zip(buffers, expected):
+            assert torch.equal(buffer[:, device_indices], original)
+            assert not torch.count_nonzero(buffer[:, [0, 2, 3, 5]])
+        assert torch.equal(extra[device_indices], extra_expected)
+        assert not torch.count_nonzero(extra[[0, 2, 3, 5]])
+    finally:
+        host.destroy()
 
 
 if __name__ == "__main__":

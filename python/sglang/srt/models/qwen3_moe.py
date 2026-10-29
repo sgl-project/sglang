@@ -28,7 +28,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -256,13 +255,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if isinstance(quant_config, GGUFConfig):
             norm_topk_prob = False
 
-        self.topk = TopK(
-            top_k=config.num_experts_per_tok,
-            renormalize=norm_topk_prob,
-            use_grouped_topk=False,
-            layer_id=layer_id,
-        )
-
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
@@ -291,6 +283,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             quant_config=gate_quant_config,
             prefix=add_prefix("gate", prefix),
         )
+        self.topk = self._make_topk(config, layer_id, norm_topk_prob)
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         if is_deepep_class_backend():
             # TODO: we will support tp < ep in the future
@@ -304,6 +301,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self._mega_top_k = config.num_experts_per_tok
         self._mega_intermediate_size = config.moe_intermediate_size
         self._mega_hidden_size = config.hidden_size
+
+    def _make_topk(
+        self, config: Qwen3MoeConfig, layer_id: int, norm_topk_prob: bool
+    ) -> TopK:
+        return TopK(
+            top_k=config.num_experts_per_tok,
+            renormalize=norm_topk_prob,
+            use_grouped_topk=False,
+            layer_id=layer_id,
+        )
 
     def forward(
         self,
@@ -356,10 +363,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -394,14 +397,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=(
-                    forward_batch.moe_num_token_non_padded()
-                    if forward_batch is not None
-                    else None
-                ),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
             assert TopKOutputChecker.format_is_standard(topk_output), (
                 "MegaMoE pre-dispatch consumes raw topk ids/weights; "
@@ -440,10 +435,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -507,12 +498,12 @@ class Qwen3MoeAttention(nn.Module):
         prefix: str = "",
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        sliding_window_size: int = -1,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.start_layer = start_layer
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.config = config
@@ -543,8 +534,7 @@ class Qwen3MoeAttention(nn.Module):
             self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -553,8 +543,7 @@ class Qwen3MoeAttention(nn.Module):
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -604,6 +593,7 @@ class Qwen3MoeAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=sliding_window_size,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -835,11 +825,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
-        self.self_attn = Qwen3MoeAttention(
+        self.self_attn = self._make_attention(
+            config,
+            layer_id,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
             start_layer=start_layer,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
@@ -847,7 +838,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             head_dim=head_dim,
             rms_norm_eps=rms_norm_eps,
             attention_bias=attention_bias,
-            config=config,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
             dual_chunk_attention_config=dual_chunk_attention_config,
@@ -856,39 +846,63 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        # Qwen3MoE all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
-        is_next_layer_sparse = True
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
-        if self.is_layer_sparse:
-            self.mlp = Qwen3MoeSparseMoeBlock(
-                layer_id=self.layer_id,
-                config=config,
-                quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
-            )
-        else:
-            self.mlp = Qwen3MoeMLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
-                reduce_results=False,
-            )
+        self.mlp = self._make_mlp(
+            config, quant_config, add_prefix("mlp", prefix), alt_stream
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    def _make_attention(
+        self, config: Qwen3MoeConfig, layer_id: int, **kwargs
+    ) -> Qwen3MoeAttention:
+        return Qwen3MoeAttention(config=config, layer_id=layer_id, **kwargs)
+
+    def _make_mlp(
+        self,
+        config: Qwen3MoeConfig,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+        alt_stream: Optional[torch.cuda.Stream],
+    ) -> nn.Module:
+        if self.is_layer_sparse:
+            return Qwen3MoeSparseMoeBlock(
+                layer_id=self.layer_id,
+                config=config,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+        return Qwen3MoeMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=prefix,
+            reduce_results=False,
+        )
+
+    @staticmethod
+    def stage_facts(config: Qwen3MoeConfig, layer_id: int):
+        """The stages a Qwen3-MoE layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers)."""
+        # Qwen3MoE all layers are sparse and have no nextn now
+        is_layer_sparse = True
+        is_next_layer_sparse = True
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_layer_sparse,
+                next_layer_sparse=is_next_layer_sparse,
             ),
         )
 
@@ -1007,6 +1021,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+    model_cls = Qwen3MoeModel
 
     def __init__(
         self,
@@ -1018,7 +1033,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen3MoeModel(
+        self.model = self.model_cls(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(

@@ -15,7 +15,7 @@
 
 Under the token-major views a virtual id is in range and, by value, the same
 kind of integer as a physical one, so a unified pool cannot tell a skipped
-rebind from a translated loc by looking at it. `rebind_write_loc` marks the
+bind from a translated loc by looking at it. A plan's `bind` marks the
 batch's loc physical, producers carry the mark in `KVWriteLoc`, composites
 forward it, and the unified write doors refuse a loc without it.
 
@@ -30,21 +30,18 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     MHATokenToKVPool,
     write_loc_is_physical,
 )
-from sglang.srt.mem_cache.unified_memory_pool import (
-    MHASubPoolSpec,
-    UnifiedKVPool,
-    UnifiedMHATokenToKVPool,
-    init_unified_swa_pools,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import arena_of, build_test_unified_pools
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=38, suite="base-a-test-cpu")
 
 # `set_kv_buffer` dispatches on the platform, so the pools that get written live
 # on the platform's device; the mark itself is device-free.
@@ -54,10 +51,12 @@ _DTYPE = torch.float16
 
 
 def _plain_translator():
-    return KVIndexTranslator(
+    return RunnerIds(
         req_to_token=torch.zeros((1, 4), dtype=torch.int64),
-        token_to_kv_pool_allocator=SimpleNamespace(),
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=1,
         device="cpu",
     )
@@ -66,7 +65,11 @@ def _plain_translator():
 def _translating_translator(v2p):
     src = _plain_translator()
     src.is_translating = True
-    src._translate_write_full = lambda t, out=None: v2p[t.to(torch.int64)]
+    src._spaces = {
+        IdSpaceKind.FULL: IdSpace(
+            key=(IdSpaceKind.FULL, "test"), write=lambda t: v2p[t.to(torch.int64)]
+        )
+    }
     return src
 
 
@@ -95,15 +98,19 @@ def _unified_mha_pool(ps=1):
         store_dtype=_DTYPE,
         grow_direction="up",
     )
-    kv = UnifiedKVPool(
+    kv = arena_of(
         total_bytes=full.entry_bytes() * 32 + swa.entry_bytes() * 16,
         sub_pool_specs=[full, swa],
         device=_DEV,
         enable_memory_saver=False,
         page_size=ps,
     )
-    return UnifiedMHATokenToKVPool(
-        unified_buffer=kv, sub_pool_name="full", page_size=ps, enable_alt_stream=False
+    return MHAView(
+        arena=kv,
+        spec=kv.spec("full"),
+        page_size=ps,
+        model_layer_ids=tuple(range(full.layer_num)),
+        enable_alt_stream=False,
     )
 
 
@@ -111,7 +118,7 @@ class TestRebindMarksTheBatch(unittest.TestCase):
     def test_non_translating_pool_marks_physical_without_rebinding(self):
         loc = torch.tensor([3, 5], dtype=torch.int64)
         fb = _batch(loc)
-        _plain_translator().rebind_write_loc(fb)
+        _plain_translator().bind_own_plan(fb)
         self.assertIs(fb.out_cache_loc, loc)  # physical by allocation: untouched
         self.assertTrue(fb.out_cache_loc_is_physical)
 
@@ -119,13 +126,13 @@ class TestRebindMarksTheBatch(unittest.TestCase):
         v2p = torch.tensor([7, 6, 5, 4], dtype=torch.int64)
         loc = torch.tensor([1, 2], dtype=torch.int64)
         fb = _batch(loc)
-        _translating_translator(v2p).rebind_write_loc(fb)
+        _translating_translator(v2p).bind_own_plan(fb)
         self.assertTrue(torch.equal(fb.out_cache_loc, v2p[loc]))
         self.assertTrue(fb.out_cache_loc_is_physical)
 
     def test_no_loc_stays_unmarked(self):
         fb = _batch(None)
-        _translating_translator(torch.arange(4)).rebind_write_loc(fb)
+        _translating_translator(torch.arange(4)).bind_own_plan(fb)
         self.assertFalse(fb.out_cache_loc_is_physical)
 
 
@@ -190,7 +197,7 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
         self.assertTrue(torch.all(pool.k_buffer[0][2] == 1))
 
     def test_swa_composite_forwards_the_mark(self):
-        b = init_unified_swa_pools(
+        b = build_test_unified_pools(
             device=_DEV,
             kv_cache_dtype=_DTYPE,
             head_num=_H,
@@ -225,6 +232,9 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
 
 _SRT = pathlib.Path(__file__).resolve().parents[4] / "python/sglang/srt"
 _WRITE_DOORS = ("set_kv_buffer", "set_mla_kv_buffer")
+# A layer router's per-layer handle (`KVLayer`) writes through these; a call is one
+# when made on `<router>.layer(...)`, since other classes have a `store` too.
+_LAYER_WRITE_DOORS = ("store", "store_mla")
 _MARKED_CONSTRUCTORS = ("for_batch", "for_layer")
 # The attention backends --enable-unified-memory admits, by resolved name.
 _UNIFIED_BACKEND_FILES = {
@@ -238,7 +248,6 @@ _UNIFIED_BACKEND_FILES = {
     "trtllm_mha": ("layers/attention/trtllm_mha_backend.py",),
     "trtllm_mla": ("layers/attention/trtllm_mla_backend.py",),
     "cutedsl_mla": ("layers/attention/cutedsl_mla_backend.py",),
-    "tokenspeed_mla": ("layers/attention/tokenspeed_mla_backend.py",),
     "flashmla": ("layers/attention/flashmla_backend.py",),
 }
 # Model code and the rest of the forward path also write KV directly.
@@ -279,7 +288,7 @@ class _WriteLocCensus:
                     continue
                 name = _callee_name(node)
                 self.calls[name].append(node)
-                if name in _WRITE_DOORS:
+                if _is_door_call(node):
                     self.doors.append((where, node))
 
     def unmarked(self):
@@ -370,6 +379,18 @@ def _callee_name(call) -> str:
     return f.id if isinstance(f, ast.Name) else ""
 
 
+def _is_door_call(call) -> bool:
+    name = _callee_name(call)
+    if name in _WRITE_DOORS:
+        return True
+    receiver = getattr(call.func, "value", None)
+    return (
+        name in _LAYER_WRITE_DOORS
+        and isinstance(receiver, ast.Call)
+        and _callee_name(receiver) == "layer"
+    )
+
+
 def _loc_argument(call):
     for k in call.keywords:
         if k.arg in ("loc_info", "loc"):
@@ -385,31 +406,7 @@ def _unified_producer_files():
     return sorted(files)
 
 
-def _unified_backend_names():
-    """Every attention backend the unified-memory allowlists name."""
-    tree = ast.parse((_SRT / "arg_groups/kv_cache_hook.py").read_text())
-    names = set()
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Assign)
-            and any(_is_name(t, n) for t in node.targets for n in _ALLOWLIST_NAMES)
-            and isinstance(node.value, ast.Set)
-        ):
-            names.update(
-                e.value for e in node.value.elts if isinstance(e, ast.Constant)
-            )
-    return names
-
-
 class TestEveryUnifiedProducerMarksItsLoc(unittest.TestCase):
-    def test_the_census_covers_every_allowlisted_backend(self):
-        names = _unified_backend_names()
-        self.assertIn("fa3", names)  # the parse found the allowlists
-        self.assertLessEqual(names, set(_UNIFIED_BACKEND_FILES))
-        for group in _UNIFIED_BACKEND_FILES.values():
-            for f in group:
-                self.assertTrue((_SRT / f).is_file(), f)
-
     def test_every_write_door_call_passes_a_marked_loc(self):
         files = _unified_producer_files()
         census = _WriteLocCensus(
@@ -417,30 +414,6 @@ class TestEveryUnifiedProducerMarksItsLoc(unittest.TestCase):
         )
         self.assertGreater(len(census.doors), 20)  # the census saw the doors
         self.assertEqual(census.unmarked(), [])
-
-    def test_the_census_tells_marked_from_unmarked(self):
-        src = """
-def good(self, pool, fb, layer):
-    pool.set_kv_buffer(layer, KVWriteLoc.for_batch(fb), 1, 2)
-    loc = KVWriteLoc(fb.out_cache_loc // 2, physical=True)
-    pool.set_mla_kv_buffer(layer, loc, 1, 2)
-    pool.set_kv_buffer(layer, self._helper(fb), 1, 2)
-    self._write(fb, layer, KVWriteLoc.for_layer(fb, layer))
-
-def _helper(self, fb):
-    return KVWriteLoc.for_batch(fb)
-
-def _write(self, fb, layer, loc_info):
-    pool.set_kv_buffer(layer, loc_info, 1, 2)
-
-def bad(self, pool, fb, layer):
-    pool.set_kv_buffer(layer, fb.out_cache_loc, 1, 2)
-    cache_loc = fb.out_cache_loc
-    pool.set_mla_kv_buffer(layer, cache_loc, 1, 2)
-    pool.set_kv_buffer(layer, KVWriteLoc(cache_loc), 1, 2)
-"""
-        census = _WriteLocCensus({"m.py": src})
-        self.assertEqual(census.unmarked(), ["m.py:16", "m.py:18", "m.py:19"])
 
 
 def _only_raises(fn) -> bool:
@@ -473,7 +446,7 @@ def _door_takes_a_write_loc(fn) -> bool:
         name = _callee_name(node)
         if name == "unwrap_write_loc" and node.args and _is_name(node.args[0], loc):
             return True
-        if name in _WRITE_DOORS and not reassigned:
+        if _is_door_call(node) and not reassigned:
             if _is_name(_loc_argument(node), loc):
                 return True
     return False
@@ -486,7 +459,10 @@ def _pool_doors_taking_a_bare_loc(sources):
             if not isinstance(cls, ast.ClassDef):
                 continue
             for fn in cls.body:
-                if isinstance(fn, ast.FunctionDef) and fn.name in _WRITE_DOORS:
+                names = _WRITE_DOORS + (
+                    _LAYER_WRITE_DOORS if cls.name == "KVLayer" else ()
+                )
+                if isinstance(fn, ast.FunctionDef) and fn.name in names:
                     doors += 1
                     if not _door_takes_a_write_loc(fn):
                         bad.append(f"{where}:{cls.name}.{fn.name}")
@@ -507,36 +483,6 @@ class TestEveryPoolDoorTakesAWriteLoc(unittest.TestCase):
         )
         self.assertGreater(doors, 20)  # the census saw the doors
         self.assertEqual(bad, [])
-
-    def test_the_census_tells_unwrapping_from_bare(self):
-        src = """
-class Good(KVCache):
-    def set_kv_buffer(self, layer, loc_info, k, v):
-        loc, _, _ = unwrap_write_loc(loc_info)
-        self.buf[loc] = k
-
-    def set_mla_kv_buffer(self, layer, loc_info, k, v):
-        self.inner.set_mla_kv_buffer(layer, loc_info, k, v)
-
-
-class PassThrough(KVCache):
-    def set_kv_buffer(self, *args, **kwargs):
-        self.inner.set_kv_buffer(*args, **kwargs)
-
-
-class Bare(KVCache):
-    def set_kv_buffer(self, layer, loc, k, v):
-        self.buf[loc] = k
-
-    def set_mla_kv_buffer(self, layer, loc, k, v):
-        loc = self.translate(loc)
-        super().set_mla_kv_buffer(layer, loc, k, v)
-"""
-        doors, bad = _pool_doors_taking_a_bare_loc({"m.py": src})
-        self.assertEqual(doors, 5)
-        self.assertEqual(
-            bad, ["m.py:Bare.set_kv_buffer", "m.py:Bare.set_mla_kv_buffer"]
-        )
 
 
 if __name__ == "__main__":

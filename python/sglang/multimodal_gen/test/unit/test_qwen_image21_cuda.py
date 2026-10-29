@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
     QwenImage21DenoisingStage,
 )
@@ -316,7 +319,9 @@ def test_graph_replay_uses_new_request_prefix(model, edit, sample_count):
         ):
             model(**first)
             stage._bcg_run(runner, first, model)
-        assert len(runner.entries) == 1
+        # warmup captures every text bucket for a single cached prefix
+        captured = len(stage._bcg_text_buckets()) if sample_count == 1 else 1
+        assert len(runner.entries) == captured
         with (
             torch.no_grad(),
             set_forward_context(
@@ -328,7 +333,7 @@ def test_graph_replay_uses_new_request_prefix(model, edit, sample_count):
             model(**second)
             expected = model(**second)
             actual = stage._bcg_run(runner, second, model)
-        assert len(runner.entries) == 1
+        assert len(runner.entries) == captured
         torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
     finally:
         runner.reset()
@@ -507,10 +512,15 @@ def test_cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps(
     ):
         for key in ("key", "value"):
             torch.testing.assert_close(actual[key], reference[key], atol=0, rtol=0)
-            assert (
-                actual[key].untyped_storage().nbytes()
-                == actual[key].numel() * actual[key].element_size()
-            )
+            # an image prefix lives in the packed buffer it is attended from;
+            # a text prefix is a compact copy that pins nothing else
+            storage = actual[key].untyped_storage()
+            if edit and qkv_gate.verified:
+                assert storage.data_ptr() == actual["qkv"].untyped_storage().data_ptr()
+            else:
+                assert (
+                    storage.nbytes() == actual[key].numel() * actual[key].element_size()
+                )
 
     runner = DiffusionBreakableCudaGraphRunner(actual_model, torch.device("cuda"))
     try:
@@ -519,6 +529,109 @@ def test_cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps(
             kwargs["hidden_states"].add_(0.1)
             expected = actual_model(**kwargs)
             torch.testing.assert_close(runner(**kwargs), expected, atol=0, rtol=0)
+    finally:
+        runner.reset()
+
+
+def prompt_inputs_hd128(seed, text_tokens):
+    kwargs = inputs_hd128(seed, False)
+    kwargs["encoder_hidden_states"] = torch.randn(
+        1, text_tokens, 16, device="cuda", dtype=torch.bfloat16
+    )
+    kwargs["layouts"] = [
+        build_layout([False] * text_tokens, [(1, 4, 4)], (16, 56, 56), "cuda")
+    ]
+    return kwargs
+
+
+@pytest.mark.parametrize("edit", [False, True])
+@torch.no_grad()
+def test_cached_steps_copy_the_prefix_only_for_text(
+    bf16_model_hd128, edit, monkeypatch
+):
+    # Cached steps of an image prefix project into the buffer kept by the prefill and
+    # write only the target rows; a text prefix is still copied into a fresh buffer.
+    for name in ("_QK_ROPE_CUDA_FUSION", "_KV_PACK_CUDA_FUSION", "_QKV_PACK_FUSION"):
+        monkeypatch.setattr(model_module, name, BitExactFusionGate(f"test {name}"))
+    packs = []
+    original = model_module.qknorm_complex_rope_pack_
+
+    def record(q, k_out, v_out, *args):
+        packs.append((args[3].shape[1], k_out.untyped_storage().data_ptr()))
+        return original(q, k_out, v_out, *args)
+
+    monkeypatch.setattr(model_module, "qknorm_complex_rope_pack_", record)
+    kwargs = inputs_hd128(13, edit)
+    with set_forward_context(None, None):
+        for timestep in (700, 300, 10):
+            kwargs["timestep"].fill_(timestep)
+            bf16_model_hd128(**kwargs)
+    if not model_module._QKV_PACK_FUSION.verified:
+        pytest.skip("cuBLAS picked a different kernel for the packed projection")
+    caches = kwargs["prefix_caches"][0]
+    prefill, cached = packs[: len(caches)], packs[len(caches) :]
+    prefix_rows = caches[0]["key"].shape[1]
+    assert [rows for rows, _ in prefill] == [prefix_rows] * len(caches)
+    if edit:
+        kept = [cache["qkv"].untyped_storage().data_ptr() for cache in caches]
+        assert cached == [(0, ptr) for ptr in kept] * 2
+    else:
+        assert all("qkv" not in cache for cache in caches)
+        assert [rows for rows, _ in cached] == [prefix_rows] * 2 * len(caches)
+
+
+@pytest.mark.parametrize("kv_pack", ["cuda", "triton", "eager"])
+@torch.no_grad()
+def test_padded_prefix_replays_one_graph_across_prompt_lengths(
+    bf16_model_hd128, monkeypatch, kv_pack
+):
+    # each K/V packing path must skip the pad rows so the replay matches the
+    # unpadded eager forward bit for bit
+    disabled = BitExactFusionGate("reference")
+    disabled.disable()
+    if kv_pack != "cuda":
+        monkeypatch.setattr(model_module, "_KV_PACK_CUDA_FUSION", disabled)
+    if kv_pack == "eager":
+        monkeypatch.setattr(model_module, "_KV_ROPE_FUSION", disabled)
+    monkeypatch.setattr(
+        DenoisingStage, "_bcg_text_buckets", staticmethod(lambda: (8, 16))
+    )
+    model = bf16_model_hd128
+    stage = object.__new__(QwenImage21DenoisingStage)
+    runner = DiffusionBreakableCudaGraphRunner(model, torch.device("cuda"))
+    replays = []
+    replay = runner.replay
+    monkeypatch.setattr(
+        runner,
+        "replay",
+        lambda entry, kwargs: replays.append(entry) or replay(entry, kwargs),
+    )
+    try:
+        warmup = prompt_inputs_hd128(3, 4)
+        with set_forward_context(
+            None,
+            None,
+            Req(sampling_params=QwenImage21SamplingParams(), is_warmup=True),
+        ):
+            model(**warmup)
+            stage._bcg_run(runner, warmup, model)
+        assert len(runner.entries) == 2
+        replays.clear()
+        lengths = (2, 7, 8, 13, 16)
+        for seed, text_tokens in enumerate(lengths, start=20):
+            kwargs = prompt_inputs_hd128(seed, text_tokens)
+            with set_forward_context(
+                None, None, Req(sampling_params=QwenImage21SamplingParams())
+            ):
+                model(**kwargs)
+                kwargs["timestep"].fill_(300.0)
+                expected = model(**kwargs)
+                padded = stage._bcg_pad_prompt_kwargs(kwargs, current_model=model)
+                torch.testing.assert_close(model(**padded), expected, atol=0, rtol=0)
+                actual = stage._bcg_run(runner, kwargs, model)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert len(replays) == len(lengths)
+        assert len(runner.entries) == 2
     finally:
         runner.reset()
 

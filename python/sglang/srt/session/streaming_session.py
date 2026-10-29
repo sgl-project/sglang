@@ -4,14 +4,13 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-import torch
-
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
     TreeLock,
 )
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
@@ -82,10 +81,19 @@ class StreamingSession:
         if slot is None or not slot.kv.holds_kv:
             return None
         if req.to_finish is not None:
+            req.release_mm_inputs_on_abort()
             req.session.abort_req()
             req.session = None
             return None
         return slot
+
+    def will_lend_record(self, req: Optional[Req]) -> bool:
+        """Whether req has a slot record to borrow. Unlike find_active_slot, it
+        leaves a pre-aborted req attached."""
+        if not _is_streaming(req) or req.to_finish is not None:
+            return False
+        slot = self.slots.get(req.session.session_id)
+        return slot is not None and slot.kv.holds_kv
 
     def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
         """Returns a MatchResult iff the request hits an active session slot;
@@ -138,12 +146,8 @@ class StreamingSession:
 
         self._free_tail(req.kv, prefix_len)
 
-        device_indices = self.cache.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :prefix_len
-        ].to(dtype=torch.int64)
-
         return MatchResult(
-            device_indices=device_indices,
+            device_prefix_len=prefix_len,
             last_device_node=slot.virtual_node,
             last_host_node=slot.virtual_node,
             best_match_node=slot.virtual_node,
@@ -166,6 +170,7 @@ class StreamingSession:
             # Hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
             req.lock, slot.lock = slot.lock, None
+            req.release_mm_inputs_on_abort()
             req.session.abort_req()
             return False
 
@@ -188,10 +193,8 @@ class StreamingSession:
         return True
 
     def try_checkpoint(self, req: Req, *, up_to: int, **kwargs) -> bool:
-        """A turn on the slot's record publishes nothing of its own, so only
-        the chunk cursor is kept. The exception is the first prompt: the slot
-        publishes it for other requests to share, and its lock follows the
-        insert."""
+        # A turn publishes nothing of its own, except the first prompt: the slot
+        # publishes it for other requests to share, and its lock follows the insert.
         slot = self.borrowed_slot(req)
         if slot is None:
             return False
@@ -199,11 +202,6 @@ class StreamingSession:
             req.lock, slot.lock = slot.lock, None
             self.cache.checkpoint_into_tree(req, up_to=up_to, **kwargs)
             self._lock_to_slot(req, slot)
-            return True
-        kv_indices = self.cache.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, :up_to
-        ]
-        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return True
 
     # -- Record ownership --
@@ -245,22 +243,29 @@ class StreamingSession:
 
         if slot.kv.holds_kv:
             self.cache.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
-            self.cache.req_to_token_pool.free(slot)
+            kv_storage_of(
+                self.cache.req_to_token_pool,
+                self.cache.token_to_kv_pool_allocator,
+                tree_cache=self.cache,
+            ).release_row(slot)
 
         self._free_slot_mamba(slot)
 
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
         """Return a session slot's mamba pool state to the allocator."""
-        mamba_allocator = getattr(self.cache.req_to_token_pool, "mamba_allocator", None)
+        mamba_allocator = self.cache.token_to_kv_pool_allocator.state_slots
         if mamba_allocator is None:
             return
         if slot.kv.holds_mamba:
             mamba_allocator.free(slot.kv.mamba_pool_idx.unsqueeze(0))
             slot.kv.mamba_pool_idx = None
         if slot.kv.mamba_ping_pong_track_buffer is not None:
-            indices = slot.kv.mamba_ping_pong_track_buffer
-            mamba_allocator.free(indices[indices != -1])
+            buffer = slot.kv.mamba_ping_pong_track_buffer
+            for position, empty in enumerate(slot.kv.mamba_ping_pong_empty):
+                if not empty:
+                    mamba_allocator.free(buffer[position : position + 1])
             slot.kv.mamba_ping_pong_track_buffer = None
+            slot.kv.mamba_ping_pong_empty = None
 
     # -- Internal helpers (streaming body bits) --
 
@@ -293,9 +298,9 @@ class StreamingSession:
     def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
         """Free [ceil_align(target), end): paged free returns whole pages, so
         the partial page stays until release_session."""
-        if end <= target:
-            return
         start = target
         if self.cache.page_size > 1:
             start = ceil_align(start, self.cache.page_size)
+        if end <= start:
+            return
         self.cache.free_kv_row(kv, [(start, end)])

@@ -51,6 +51,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_flags,
+    get_model,
     get_parallel,
 )
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
@@ -138,15 +139,17 @@ def _allocate_decode_buffers(
             pp_proxy_tensors = {
                 "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
-            if not is_mhc:
-                # Only Kimi K3 supplies num_blocks: its PP bank is token-major
-                # [T, blocks, H]. Other models use [T, H].
-                residual_shape = (
-                    (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
-                    if pp_proxy_residual_num_blocks is not None
-                    else (max_num_token, hidden_size)
+            if pp_proxy_residual_num_blocks is not None:
+                # Only Kimi K3 supplies num_blocks: its attention-residual bank
+                # is token-major [T, blocks, H] and takes the residual's place.
+                pp_proxy_tensors["attn_res_bank"] = torch.zeros(
+                    (max_num_token, pp_proxy_residual_num_blocks, hidden_size),
+                    dtype=dtype,
                 )
-                pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
+            elif not is_mhc:
+                pp_proxy_tensors["residual"] = torch.zeros(
+                    (max_num_token, hidden_size), dtype=dtype
+                )
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
@@ -202,6 +205,7 @@ def _allocate_decode_buffers(
     return SimpleNamespace(
         input_ids=input_ids,
         input_embeds=input_embeds,
+        ragged_verify_layout=None,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens_cpu,
@@ -241,7 +245,17 @@ class BaseRunner(ABC):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
+    def model_context(self):
+        """Select the layout owned by this runner's current model."""
+        return get_model().override(
+            shared_experts=self.model_runner.model.shared_experts_config
+        )
+
     def warmup(self) -> None:
+        with self.model_context():
+            self._warmup()
+
+    def _warmup(self) -> None:
         """Run kernel warmup + autotune once, gated by mr._kernel_warmed_up."""
         mr = self.model_runner
         if getattr(mr, "_kernel_warmed_up", False):
@@ -367,7 +381,11 @@ class BaseRunner(ABC):
 
         mr = self.model_runner
         tokens_per_req = mr.decode_num_tokens_per_req()
-        capture_bs, _ = get_batch_sizes_to_capture(mr, tokens_per_req)
+        capture_bs, _ = get_batch_sizes_to_capture(
+            mr,
+            tokens_per_req,
+            gathered_buffer_required=any(mr.decode_graph_gather_requirements()),
+        )
         if not capture_bs:
             return None
         return max(capture_bs) * tokens_per_req
@@ -662,7 +680,6 @@ class BaseRunner(ABC):
 
         forward_batch = ForwardBatch(
             forward_mode=capture_forward_mode,
-            out_cache_loc_is_physical=True,
             batch_size=batch_size,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -698,6 +715,7 @@ class BaseRunner(ABC):
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
+        mr.runner_ids.bind_runner_slots(forward_batch)
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(
@@ -745,7 +763,9 @@ class BaseRunner(ABC):
 
         torch.get_device_module(mr.device).synchronize()
         get_parallel().tp_group.barrier()
-        with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
+        with forward_context(
+            ForwardContext(attn_backend=mr.attn_backend), forward_batch=forward_batch
+        ):
             with run_ctx or empty_context():
                 run_once()
 

@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
 from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ class _GatedLaunchServer:
 
 
 def _build_app(server: _GatedLaunchServer) -> FastAPI:
-    app = FastAPI()
+    app = FastAPI(**fastapi_telemetry_disabled_kwargs())
 
     @app.get("/health")
     def health():

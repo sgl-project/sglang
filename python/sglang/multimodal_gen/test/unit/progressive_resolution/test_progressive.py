@@ -5,6 +5,7 @@ import argparse
 import dataclasses
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -217,6 +218,15 @@ class TestStageTransitionHelpers(unittest.TestCase):
 
         self.assertEqual(transitions, {2: 2, 3: 4})
 
+    def test_find_transition_steps_keeps_unreached_threshold_before_last_step(self):
+        transitions = find_transition_steps(
+            torch.tensor([1.0, 0.0]),
+            {1: 1.0, 2: 0.5},
+            n_steps=1,
+        )
+
+        self.assertEqual(transitions, {2: 0})
+
     def test_reset_scheduler_clears_solver_state(self):
         scheduler = SimpleNamespace(
             config=SimpleNamespace(solver_order=2),
@@ -322,6 +332,19 @@ class TestProgressiveStageHelpers(unittest.TestCase):
         self.assertEqual(flux2_stage._latent_scale_factor(flux2_args), 16)
         self.assertEqual(wan_stage._latent_scale_factor(wan_args), 8)
         self.assertEqual(ideogram_stage._latent_scale_factor(ideogram_args), 16)
+
+    def test_wan_dual_transformer_is_passed_to_base_stage(self):
+        transformer_2 = object()
+        with mock.patch.object(
+            ProgressiveDenoisingStage, "__init__", return_value=None
+        ) as base_init:
+            WanProgressiveDenoisingStage(
+                transformer=object(),
+                scheduler=object(),
+                transformer_2=transformer_2,
+            )
+
+        self.assertIs(base_init.call_args.kwargs["transformer_2"], transformer_2)
 
 
 class TestLatentAdapters(unittest.TestCase):
@@ -477,6 +500,7 @@ class TestIdeogram4OnResolutionChange(unittest.TestCase):
             "ideogram4_neg_attn_mask": neg_attn_mask,
             "ideogram4_neg_attn_mask_meta": None,
             "ideogram4_neg_llm_features": neg_llm_features,
+            "ideogram4_llm_cond": {"positive": torch.zeros(1)},
         }
 
     def test_resolution_change_doubles_image_tokens(self):
@@ -537,6 +561,8 @@ class TestIdeogram4OnResolutionChange(unittest.TestCase):
             ctx.extra["ideogram4_neg_llm_features"].shape,
             (B, new_num_img, self._LLM_DIM),
         )
+        # LLM conditioning projected at the old sequence length is dropped
+        self.assertEqual(ctx.extra["ideogram4_llm_cond"], {})
 
     def test_text_portion_is_unchanged_after_resolution_change(self):
         B = 1

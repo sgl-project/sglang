@@ -9,7 +9,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **kwargs):
@@ -139,7 +139,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         req = _make_req(rid, "", list(range(uncached + cached)))
         req.full_untruncated_fill_ids = req.origin_input_ids[:]
         req.num_matched_prefix_tokens = cached
-        req.prefix_indices = list(range(cached))
+        req.prefix_len = cached
         req.time_stats.wait_queue_entry_time = arrived
         return req
 

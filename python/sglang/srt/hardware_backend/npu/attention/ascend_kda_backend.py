@@ -151,7 +151,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
     ):
         """Run KDA decode against the native channel-first Ascend cache."""
         assert isinstance(mixed_qkv, torch.Tensor)
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
@@ -241,7 +241,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
-        cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        cache = self.state_layer_cache(layer.layer_id)
         conv_states = cache.conv[0]
         ssm_states = cache.temporal
 
@@ -319,12 +319,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
-        """Apply the Ascend prefill gate contract.
-
-        The checkpoint was validated with FP32 gate activation before
-        ``chunk_kda``. Keeping this platform override here leaves the shared
-        GPU model/backend paths unchanged.
-        """
+        """Activate raw gate and beta projections in FP32 for Ascend prefill."""
         preactivated_g = fused_kda_gate_npu(
             g.flatten(-2),
             layer.A_log,
@@ -332,7 +327,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             gate_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
         )
-        return preactivated_g, beta, None, None
+        return preactivated_g, beta.float().sigmoid(), None, None
 
     def _forward_target_verify(
         self,
@@ -348,7 +343,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         query_start_loc = metadata.query_start_loc
         cache_indices = metadata.mamba_cache_indices
 
-        cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        cache = self.state_layer_cache(layer.layer_id)
         intermediate_state = cache.intermediate_ssm
         if intermediate_state is None:
             raise RuntimeError(
@@ -358,7 +353,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         draft_token_num = forward_batch.spec_info.draft_token_num
         batch_size = query_start_loc.shape[0] - 1
         num_dense_tokens = batch_size * draft_token_num
-        ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        ragged_layout = forward_batch.ragged_verify_layout
         if ragged_layout is None and seq_len == num_dense_tokens:
             dense_token_indices = None
             dense_qkv = mixed_qkv.view(batch_size, draft_token_num, -1)
@@ -515,7 +510,7 @@ class AscendKDAHybridLinearAttnBackend:
                     ]
                 )
 
-                mamba_caches = self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+                mamba_caches = self.linear_attn_backend.state_pool.get_speculative_mamba2_params_all_layers()
 
                 conv_states = mamba_caches.conv[0]
                 ssm_states = mamba_caches.temporal

@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
@@ -23,6 +24,11 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     PlatformEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_gfx942_supported,
+    is_gfx1250_supported,
+)
 
 logger = init_logger(__name__)
 
@@ -65,20 +71,6 @@ class RocmPlatform(Platform):
     @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         return torch.cuda.get_device_properties(device_id).total_memory
-
-    @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable CUDA graph. "
-                "Since enforce-eager is enabled, async output processor cannot be used"
-            )
-            return False
-        return True
-
-    @classmethod
-    def log_warnings(cls) -> None:
-        pass  # ROCm-specific warnings can be added here
 
     @classmethod
     def get_current_memory_usage(cls, device: torch.device | None = None) -> float:
@@ -143,6 +135,26 @@ class RocmPlatform(Platform):
                     "AITER Sage backend only supports bf16/fp16 inputs but got dtype=%s.",
                     dtype,
                 )
+
+        elif selected_backend == AttentionBackendEnum.AITER_QUANT:
+            # Arch family only; whether the selected quant format has a kernel
+            # row on this arch is checked when the impl is constructed.
+            if not (is_gfx95_supported() or is_gfx942_supported()):
+                raise ValueError(
+                    "aiter_quant requires a gfx950- or gfx942-class arch, got "
+                    f"{cls.get_device_name()}."
+                )
+            if dtype is not torch.bfloat16:
+                # mha_v4 quantizes from BF16 operands and rejects every other
+                # input dtype, fp16 included.
+                logger.warning(
+                    "AITER quant backend takes BF16 inputs, which it quantizes "
+                    "to the selected format, but got dtype=%s. Proceeding "
+                    "anyway; aiter will reject the call.",
+                    dtype,
+                )
+            logger.info("Using aiter_quant attention backend on ROCm.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_quant.AITERQuantBackend"
 
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
@@ -244,6 +256,15 @@ class RocmPlatform(Platform):
                     exc_info=True,
                 )
 
+        if is_gfx1250_supported():
+            count = cls._force_math_sdpa_in_attention(vae)
+            if count > 0:
+                logger.info(
+                    "Pinned %d VAE attention modules to the math SDPA backend "
+                    "(AOTriton fails above head_dim 256 on gfx1250)",
+                    count,
+                )
+
         use_bf16 = envs.SGLANG_USE_ROCM_VAE_CONV2D_BF16
         use_conv2d = envs.SGLANG_USE_ROCM_VAE_CONV2D or use_bf16
         if use_conv2d:
@@ -258,6 +279,35 @@ class RocmPlatform(Platform):
                 )
 
         return vae
+
+    @staticmethod
+    def _force_math_sdpa_in_attention(module: torch.nn.Module) -> int:
+        """Wrap VAE attention forwards so SDPA resolves to the math backend.
+
+        On gfx1250, AOTriton's flash and mem_efficient SDPA backends fail when
+        head_dim > 256. On ROCm 10.0 (AOTriton 0.13.50) the VAE returns wrong
+        values with no error. On ROCm 10.1 (0.14.50) it raises
+        hipErrorProfilerNotInitialized after the full denoise.
+        """
+        count = 0
+        for child in module.modules():
+            if getattr(child, "_sgl_math_sdpa", False):
+                continue
+            has_qkv = hasattr(child, "to_qkv") or all(
+                getattr(child, a, None) is not None for a in ("to_q", "to_k", "to_v")
+            )
+            if not has_qkv:
+                continue
+            original = child.forward
+
+            def wrapped(*args, _orig=original, **kwargs):
+                with sdpa_kernel(SDPBackend.MATH):
+                    return _orig(*args, **kwargs)
+
+            child.forward = wrapped
+            child._sgl_math_sdpa = True
+            count += 1
+        return count
 
     @staticmethod
     def _replace_groupnorm(module: torch.nn.Module, aiter_gn_cls: type) -> int:
@@ -395,6 +445,8 @@ class RocmPlatform(Platform):
                 x,
                 cache_x=None,
                 *,
+                residual=None,
+                skip_bias=False,
                 _padding=padding,
                 _stride=stride,
                 _kt=kt,
@@ -407,14 +459,17 @@ class RocmPlatform(Platform):
                     pad[4] -= cache_x.shape[2]
                 x = F.pad(x, pad)
                 x = x.to(self.weight.dtype)
-                return RocmPlatform._conv3d_as_batched_conv2d(
+                # Same contract as WanCausalConv3d.forward: skip_bias leaves the bias
+                # to a following fused norm, residual is added to the conv output.
+                out = RocmPlatform._conv3d_as_batched_conv2d(
                     x,
                     self._weight_2d,
-                    self.bias,
+                    None if skip_bias else self.bias,
                     _stride,
                     _kt,
                     compute_bf16=_bf16,
                 )
+                return out if residual is None else out + residual
 
             def _patched_halo_conv_forward(
                 self,
