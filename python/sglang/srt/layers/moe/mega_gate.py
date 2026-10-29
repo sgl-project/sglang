@@ -110,6 +110,8 @@ def _ones(num_experts: int, device: torch.device) -> torch.Tensor:
 
 
 def _physical_dispatch_maps(info) -> tuple[torch.Tensor, torch.Tensor]:
+    if info.mega_gate_maps is not None:
+        return info.mega_gate_maps
     if info.ep_dispatch_algorithm == "static":
         rank_map = info.partial_logical_to_rank_dispatch_physical_map
         return rank_map.to(torch.int32)[:, None], _ones(len(rank_map), rank_map.device)
