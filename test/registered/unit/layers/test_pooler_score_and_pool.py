@@ -6,10 +6,12 @@ via forward_batch.multi_item_delimiter_indices (pre-computed by the caller).
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 
+from sglang.srt.layers import pooler as pooler_module
 from sglang.srt.layers.pooler import (
     EmbeddingPoolerOutput,
     Pooler,
@@ -172,6 +174,57 @@ class TestScoreAndPool(CustomTestCase):
         pooled = pooler(hidden, fb).embeddings
 
         torch.testing.assert_close(pooled, torch.tensor([[2.0], [9.0]]))
+
+    def test_mean_pooling_short_request_after_long_one(self):
+        """On NVIDIA GPUs (segmented reduction), a short request packed after a
+        long, large-valued one keeps its mean; a running-sum difference would
+        cancel it away."""
+        torch.manual_seed(0)
+        lens = [4096, 1, 3]
+        long = 1e4 + torch.randn(lens[0], 8)
+        short = torch.randn(sum(lens[1:]), 8) * 1e-3
+        hidden = torch.cat([long, short])
+        fb = _make_forward_batch(extend_seq_lens=lens)
+        pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=False)
+
+        with patch.object(pooler_module, "_is_cuda", True):
+            pooled = pooler(hidden, fb).embeddings
+
+        expected = torch.stack(
+            [chunk.double().mean(0) for chunk in hidden.split(lens)]
+        ).float()
+        torch.testing.assert_close(pooled, expected, rtol=1e-5, atol=1e-6)
+
+    def test_mean_pooling_keeps_a_nan_in_its_request(self):
+        """On NVIDIA GPUs a NaN row (in a request or in padding past the last
+        request) leaves the other requests' means finite."""
+        lens = [2, 3, 1]
+        hidden = torch.arange(8, dtype=torch.bfloat16).unsqueeze(-1).repeat(1, 4)
+        hidden[3] = float("nan")  # inside request 1
+        hidden[7] = float("nan")  # padding row
+        fb = _make_forward_batch(extend_seq_lens=lens)
+        pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=False)
+
+        with patch.object(pooler_module, "_is_cuda", True):
+            pooled = pooler(hidden, fb).embeddings
+
+        self.assertEqual(pooled.dtype, torch.bfloat16)
+        self.assertEqual(pooled.isnan().any(-1).tolist(), [False, True, False])
+        self.assertEqual(pooled[0].tolist(), [0.5] * 4)
+        self.assertEqual(pooled[2].tolist(), [5.0] * 4)
+
+    def test_mean_pooling_paths_agree_on_ordinary_inputs(self):
+        """Other devices keep the cumsum; both paths give the same means."""
+        torch.manual_seed(1)
+        lens = [5, 1, 7]
+        hidden = torch.randn(sum(lens), 8)
+        fb = _make_forward_batch(extend_seq_lens=lens)
+        pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=False)
+        means = {}
+        for on_cuda in (True, False):
+            with patch.object(pooler_module, "_is_cuda", on_cuda):
+                means[on_cuda] = pooler(hidden, fb).embeddings
+        torch.testing.assert_close(means[True], means[False], rtol=1e-5, atol=1e-6)
 
     def test_empty_delimiter_indices(self):
         """Empty delimiter tensor per request -> returns list with empty tensor."""

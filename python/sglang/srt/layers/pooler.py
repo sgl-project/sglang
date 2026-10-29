@@ -12,9 +12,12 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+_is_cuda = is_cuda()
 
 
 class PoolingType(IntEnum):
@@ -65,6 +68,8 @@ def pool_hidden_states(
         return hidden_states[first_token_flat_indices]
     elif pooling_type == PoolingType.MEAN:
         prompt_lens = forward_batch.extend_seq_lens
+        if _is_cuda:
+            return _segment_mean(hidden_states, prompt_lens)
         end_indices = torch.cumsum(prompt_lens, dim=0) - 1
         cumulative_hidden_states = torch.cumsum(hidden_states, dim=0)
         sums = cumulative_hidden_states[end_indices]
@@ -328,3 +333,22 @@ class CrossEncodingPooler(nn.Module):
         scores = self.default_activation_function(pooled_output).squeeze(-1)
 
         return EmbeddingPoolerOutput(embeddings=scores)
+
+
+def _segment_mean(
+    hidden_states: torch.Tensor, prompt_lens: torch.Tensor
+) -> torch.Tensor:
+    """Per-request means with a segmented reduction (NVIDIA GPUs), summed in at
+    least FP32. A cumsum over the token dim runs a sequential scan per hidden
+    column (13 ms for ~75k tokens x 2048 in FP32 on an RTX 5090), and
+    differencing its prefixes loses short requests packed after long ones to
+    cancellation. Each request reduces only its own rows, so a NaN stays in its
+    request; rows past the requests (padding) form a last segment that is
+    dropped."""
+    data = hidden_states
+    if data.dtype in (torch.float16, torch.bfloat16):
+        data = data.float()
+    padding = hidden_states.shape[0] - prompt_lens.sum(dim=0, keepdim=True)
+    lengths = torch.cat([prompt_lens, padding])
+    means = torch.segment_reduce(data, "mean", lengths=lengths, axis=0)
+    return means[:-1].to(hidden_states.dtype)
