@@ -989,7 +989,7 @@ class TestTriFactorySizing(unittest.TestCase):
             mamba2_cache_params=cp,
             full_max_total_num_tokens=64,
             swa_max_total_num_tokens=32,
-            max_mamba_cache_size=4,
+            max_mamba_cache_size=20,
             model_context_len=16,
             extra_max_context_len=4,
             max_num_reqs=4,
@@ -1147,7 +1147,7 @@ class TestTriFactorySizing(unittest.TestCase):
                                 cfg,
                                 "get_schedule",
                                 return_value=SimpleNamespace(
-                                    max_mamba_cache_size=4,
+                                    max_mamba_cache_size=20,
                                     disable_overlap_schedule=False,
                                     mamba_full_memory_ratio=None,
                                 ),
@@ -1313,7 +1313,8 @@ class TestTriFactorySizing(unittest.TestCase):
         want = (
             64 * plan.sub_pool("full").spec.entry_bytes()
             + 32 * plan.sub_pool("swa").spec.entry_bytes()
-            + 4 * plan.sub_pool("mamba").spec.entry_bytes()
+            + self._factory_kwargs()["max_mamba_cache_size"]
+            * plan.sub_pool("mamba").spec.entry_bytes()
             + plan.sink_bytes()
         )
         self.assertEqual(pool.total_bytes, want)

@@ -13,10 +13,6 @@ class StateSlotStrategy(msgspec.Struct, frozen=True, kw_only=True):
     lazy: bool = False
     skip_decode_lock: bool = False
 
-    def __post_init__(self):
-        if self.lazy and (not self.overlap or not self.extra_buffer):
-            raise ValueError("lazy state tracking requires overlapping extra buffers")
-
     @property
     def tracking_slots(self) -> int:
         return get_mamba_tracking_slots(
@@ -31,8 +27,8 @@ class StateSlotStrategy(msgspec.Struct, frozen=True, kw_only=True):
 
     def slots_per_request(self) -> int:
         if not self.radix_cache or self.decode_only:
-            return 1 + self.initial_tracking_slots
+            return 1 + self.tracking_slots
         # Prefill can hold an active slot and two radix checkpoints. With
         # tracked buffers, skipping the decode lock removes one checkpoint.
         checkpoints = 1 if self.skip_decode_lock and self.extra_buffer else 2
-        return 1 + checkpoints + self.initial_tracking_slots
+        return 1 + checkpoints + self.tracking_slots

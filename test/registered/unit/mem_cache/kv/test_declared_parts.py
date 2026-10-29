@@ -915,6 +915,27 @@ class TestDeclaredParts(CustomTestCase):
                 plan.sub_pool("mamba").spec.entry_bytes(),
             )
 
+    def test_runtime_budget_adapter_returns_the_declared_plan_sizes(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        _, plan, _ = _build(state=True)
+        cfg = SimpleNamespace(
+            _unified_plan=plan,
+            _unified_sized=None,
+            _unified_window_and_state=lambda: (False, True),
+            _unified_request_rows=lambda **kwargs: (4, 0),
+            _apply_token_constraints=lambda tokens: tokens,
+            model_config=SimpleNamespace(context_len=64, sliding_window_size=None),
+            attn_dp_size=1,
+        )
+        from sglang.srt.runtime_context import get_schedule
+
+        with get_schedule().override(max_running_requests=3):
+            config = KVCacheConfigurator._unified_config_from_budget(cfg, 1 << 20)
+        self.assertEqual(config.max_total_num_tokens, cfg._unified_sized.full_tokens)
+        self.assertEqual(config.unified_total_bytes, cfg._unified_sized.total_bytes)
+        self.assertGreater(config.max_running_requests, 0)
+
     def test_state_slot_strategy_sizes_floor_and_acquisition_together(self):
         from sglang.srt.mem_cache.kv.state_policy import StateSlotStrategy
 
@@ -926,7 +947,7 @@ class TestDeclaredParts(CustomTestCase):
                 StateSlotStrategy(
                     extra_buffer=True, overlap=True, lazy=True, skip_decode_lock=True
                 ),
-                3,
+                4,
                 1,
             ),
             (StateSlotStrategy(extra_buffer=True, decode_only=True), 2, 1),
