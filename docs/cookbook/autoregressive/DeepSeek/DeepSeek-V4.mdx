@@ -809,6 +809,8 @@ python3 -m sglang.launch_server \
 
 **TP8 + HiCache, concurrency 32–48:** the same command with HiCache DRAM offload added. `--hicache-ratio` is the host/device token ratio; `1.5` is what stays under a ~2.7 TB host DRAM budget at TP8. The same five flags appear in the two DP commands below.
 
+For long-lived prefixes, the smaller SWA host pool may fill before the full-KV host pool. Set `--hicache-swa-ratio` alongside an explicit `--hicache-ratio` to grow only the SWA host pool; for example, `--hicache-ratio 2 --hicache-swa-ratio 4`. Check the startup host-pool allocation lines and available host RAM on every rank before increasing it.
+
 ```bash Command
   --enable-hierarchical-cache \
   --hicache-ratio 1.5 \
