@@ -7,7 +7,9 @@ use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter};
 use serde_json::{Value, json};
 
 use super::glm53::valid_documents;
-use super::pydantic_dump::{engine_message, normalize_tools, pydantic_bool, split_continuation};
+use super::pydantic_dump::{
+    continues_final_message, engine_message, normalize_tools, pydantic_bool, split_continuation,
+};
 use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
@@ -66,7 +68,7 @@ pub(crate) fn render(
         .into_iter()
         .map(|message| template_message(message, content_parts))
         .collect::<Result<Vec<_>, _>>()?;
-    let prefix = split_continuation(&mut messages, &request)?;
+    let prefix = split_continuation(&mut messages, continues_final_message(&request)?);
     // The template raises on a later system turn, which Dynamo would demote to a user turn.
     if messages.iter().skip(1).any(|m| m["role"] == "system") {
         return Err("System message must be at the beginning.".into());

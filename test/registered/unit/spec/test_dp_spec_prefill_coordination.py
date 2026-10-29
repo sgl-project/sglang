@@ -281,7 +281,7 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                         hidden_states=object(), mm_input_embeds=None
                     ),
                     next_token_ids=object(),
-                    kv_loc_plan=None,
+                    iteration_ids=None,
                 )
                 verify_input = object()
 
