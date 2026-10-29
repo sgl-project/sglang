@@ -18,8 +18,12 @@ AITER kernels want. The conversions live here; ``kimi_k3.py`` calls every entry
 point behind ``_is_hip`` and keeps the checkpoint's own layout otherwise.
 """
 
+from typing import Optional
+
 import torch
 from torch import nn
+
+from sglang.srt.environ import envs
 
 
 def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Tensor:
@@ -43,3 +47,87 @@ def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Te
     return (weight.to(torch.float32) * weight_scale.to(torch.float32)).to(
         torch.bfloat16
     )
+
+
+def _is_quark_channel_fp8(module: nn.Module) -> bool:
+    """Quark per-channel FP8 with dynamic activations, before post-processing."""
+    from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    if not (
+        isinstance(module.quant_method, QuarkLinearMethod)
+        and isinstance(module.scheme, QuarkW8A8Fp8)
+    ):
+        return False
+    weight, scale = module.weight, module.weight_scale
+    return (
+        module.scheme.weight_qscheme == "per_channel"
+        and not module.scheme.is_static_input_scheme
+        and weight.dim() == 2
+        and weight.dtype == torch.float8_e4m3fn
+        and isinstance(scale, torch.Tensor)
+        and scale.numel() == weight.shape[0]
+    )
+
+
+def k3_kda_inproj_fp8_tail_rows(
+    *, wide_rows: int, f_a_proj: nn.Module, b_proj: nn.Module, f_b_proj: nn.Module
+) -> int:
+    """Rows fused_qkvg_proj reserves after [q,k,v,g] for [f_a | b | pad], or 0.
+
+    Reserving them at init lets k3_merge_kda_inproj_fp8 fill them in place. A
+    post-load row-cat would free the wide weight and allocate a slightly larger
+    one per layer, which strands caching-allocator segments that empty_cache
+    cannot return (~1 GB per GPU at Kimi-K3 TP8).
+    """
+    if not envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get():
+        return 0
+    if not all(_is_quark_channel_fp8(m) for m in (f_a_proj, b_proj, f_b_proj)):
+        return 0
+    rows = f_a_proj.weight.shape[0] + b_proj.weight.shape[0]
+    # N % 64 == 0 keeps AITER's preshuffled FP8 GEMM (use_aiter_bpreshuffle_gemm).
+    return rows + (-(wide_rows + rows)) % 64
+
+
+def k3_merge_kda_inproj_fp8(
+    *,
+    qkvg_proj: nn.Module,
+    qkvg_sizes: list[int],
+    f_a_proj: nn.Module,
+    b_proj: nn.Module,
+    f_b_proj: nn.Module,
+) -> Optional[tuple[list[int], torch.Tensor]]:
+    """Write Quark FP8 [f_a | b | pad] rows and channel scales into qkvg_proj.
+
+    Fills the tail reserved by k3_kda_inproj_fp8_tail_rows in place. Returns
+    (split sizes of the merged output, BF16 f_b for the tiny GEMM), or None
+    when no tail was reserved. Must run before ``process_weights_after_loading``,
+    while weights are [out, in].
+    """
+    weight = qkvg_proj.weight.data
+    wide = sum(qkvg_sizes)
+    tail = weight.shape[0] - wide
+    if tail == 0:
+        return None
+    scale = qkvg_proj.weight_scale.data
+    mods = (qkvg_proj, f_a_proj, b_proj, f_b_proj)
+    n_fa, n_b = f_a_proj.weight.shape[0], b_proj.weight.shape[0]
+    if not (
+        all(_is_quark_channel_fp8(m) for m in mods)
+        and f_a_proj.weight.shape[1] == b_proj.weight.shape[1] == weight.shape[1]
+        and tail >= n_fa + n_b
+    ):
+        raise RuntimeError(
+            "fused_qkvg_proj reserved a [f_a | b] tail but the KDA in-proj "
+            "weights are not the Quark per-channel FP8 layout it was sized for."
+        )
+    fa_end, b_end = wide + n_fa, wide + n_fa + n_b
+    weight[wide:fa_end].copy_(f_a_proj.weight.data)
+    weight[fa_end:b_end].copy_(b_proj.weight.data)
+    weight[b_end:].zero_()
+    scale[wide:fa_end].copy_(f_a_proj.weight_scale.data.reshape(-1))
+    scale[fa_end:b_end].copy_(b_proj.weight_scale.data.reshape(-1))
+    scale[b_end:].fill_(1.0)
+    sizes = [*qkvg_sizes, n_fa, n_b, tail - n_fa - n_b]
+    f_b = _k3_channel_fp8_to_bf16(f_b_proj, f_b_proj.weight.data).contiguous()
+    return sizes, f_b

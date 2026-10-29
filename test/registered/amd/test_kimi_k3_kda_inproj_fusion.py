@@ -9,22 +9,29 @@ to the fused decode kernel's shape gate.
 
 The two paths run different GEMM kernels (N=6288 has no tuned aiter config,
 N=6144 does), so they agree to bf16 rounding, not bitwise.
+
+Quark per-channel FP8 instead moves the [f_a | b] rows into fused_qkvg_proj, so
+every batch size runs the merged FP8 GEMM; it must match the split linears.
 """
 
+import copy
 import unittest
 from types import SimpleNamespace
 
 import torch
 
 from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
+from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
 from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
     _merge_weights_as_views,
 )
+from sglang.srt.models.kimi_k3_rocm_quant import k3_kda_inproj_fp8_tail_rows
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 HIDDEN = 7168
 HEADS_TP = 12  # num_heads / tp8
@@ -134,6 +141,7 @@ class TestKimiK3KDAInProjFusion(CustomTestCase):
             _qkvgbfa_sizes=self.all_sizes,
             _qkvgbfa_bs_limit=256,
             _qkvgbfa_layer=None,
+            _qkvgbfa_in_qkvg_proj=False,
             _bfa_f_b_w=self.f_b_w,
             _bfa_alt_stream=None,
             fused_qkvg_proj=SimpleNamespace(
@@ -154,6 +162,137 @@ class TestKimiK3KDAInProjFusion(CustomTestCase):
             fake_attention, x, defer_f_b=False
         )
         torch.testing.assert_close(eager_gate, expected_gate)
+
+
+class _QuarkFp8Linear(torch.nn.Module):
+    """Quark per-channel FP8 linear with dynamic per-token activations."""
+
+    def __init__(self, rows, cols, device):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.randn(rows, cols, device=device).to(torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        self.weight_scale = torch.nn.Parameter(
+            torch.rand(rows, device=device) * 1e-3 + 1e-4, requires_grad=False
+        )
+        self.scheme = QuarkW8A8Fp8(
+            {"qscheme": "per_channel"}, {"qscheme": "per_channel", "is_dynamic": True}
+        )
+        self.scheme.out_dtype = torch.bfloat16
+        self.quant_method = QuarkLinearMethod(None)
+        self.bias = None
+
+    def dequant(self) -> torch.Tensor:
+        return self.weight.float() * self.weight_scale.view(-1, 1)
+
+    def forward(self, x):
+        return self.quant_method.apply(self, x, None), None
+
+
+def _relative_error(got: torch.Tensor, want: torch.Tensor) -> float:
+    return ((got.float() - want.float()).norm() / want.float().norm()).item()
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.version.hip is not None,
+    "ROCm Quark FP8 GEMM",
+)
+class TestKimiK3QuarkFp8KDAInProj(CustomTestCase):
+    """Real K3 TP8 shapes through the Quark FP8 kernels the loader picks."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(0)
+        dev = torch.device("cuda", 0)
+        split = SimpleNamespace(
+            use_full_rank_gate=True,
+            split_sizes=[3 * PROJ_TP, PROJ_TP],
+            fused_qkvg_proj=_QuarkFp8Linear(WIDE, HIDDEN, dev),
+            f_a_proj=_QuarkFp8Linear(HEAD_DIM, HIDDEN, dev),
+            b_proj=_QuarkFp8Linear(HEADS_TP, HIDDEN, dev),
+            f_b_proj=_QuarkFp8Linear(PROJ_TP, HEAD_DIM, dev),
+            _bfa_w=None,
+            _qkvgbfa_sizes=None,
+        )
+        cls.exact = {
+            name: getattr(split, name).dequant()
+            for name in ("fused_qkvg_proj", "f_a_proj", "b_proj", "f_b_proj")
+        }
+        merged = copy.deepcopy(split)
+        # fused_qkvg_proj with the [f_a | b | pad] rows reserved at init.
+        tail = k3_kda_inproj_fp8_tail_rows(
+            wide_rows=WIDE,
+            f_a_proj=merged.f_a_proj,
+            b_proj=merged.b_proj,
+            f_b_proj=merged.f_b_proj,
+        )
+        wide = merged.fused_qkvg_proj
+        for param in (wide.weight, wide.weight_scale):
+            pad = param.data.new_empty((tail, *param.shape[1:]))
+            param.data = torch.cat([param.data, pad])
+        merged.__dict__.update(
+            _qkvgbfa_layer=None,
+            _qkvgbfa_bs_limit=256,
+            _qkvgbfa_in_qkvg_proj=False,
+            _bfa_f_b_w=None,
+            _derived_weight_cache_error=None,
+        )
+        cls.merged_rows = KimiK3DeltaAttention._merge_kda_inproj_fp8_hip(merged)
+        # The loader's process_weights_after_loading pass, after post_load_weights.
+        for attn in (split, merged):
+            for name in ("fused_qkvg_proj", "f_a_proj", "b_proj", "f_b_proj"):
+                linear = getattr(attn, name)
+                linear.scheme.process_weights_after_loading(linear)
+        cls.split, cls.merged = split, merged
+
+    def test_merged_rows_replace_the_wide_weight(self):
+        """The merged rows must be fused_qkvg_proj's only copy, not a second one."""
+        self.assertTrue(self.merged_rows)
+        self.assertIsNone(self.merged._qkvgbfa_layer)
+        weight = self.merged.fused_qkvg_proj.weight
+        self.assertEqual(weight.shape[0], HIDDEN)
+        self.assertEqual(weight.shape[1], sum(self.merged._qkvgbfa_sizes))
+        self.assertEqual(weight.shape[1] % 64, 0)
+
+    def test_merged_matches_split_projections(self):
+        # Spans SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS, which Quark FP8 ignores.
+        for tokens in (1, 8, 64, 256, 257, 1024, 4096):
+            with self.subTest(tokens=tokens):
+                x = torch.randn(tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
+                qkv, beta, f_a, g = KimiK3DeltaAttention.forward_qkvbfg_fused(
+                    self.merged, x, defer_f_b=True
+                )
+                forget_gate = KimiK3DeltaAttention.forward_qkvbfg_fused(self.merged, x)[
+                    2
+                ]
+                want_qkv, _, _, want_g = KimiK3DeltaAttention.forward_qkvbfg_fused(
+                    self.split, x
+                )
+                want_f_a = self.split.f_a_proj(x)[0]
+                # Same FP8 bytes, channel scales and per-token activation quant;
+                # only the GEMM tiling may differ (bitwise on aiter 285579b62).
+                for name, got, want in (
+                    ("qkv", qkv, want_qkv),
+                    ("g", g, want_g),
+                    ("f_a", f_a, want_f_a),
+                ):
+                    rel = _relative_error(got, want)
+                    self.assertLess(rel, TOL / 2, f"{name} rel err {rel:.2e}")
+                # beta now quantizes its activation (the split b_proj is BF16)
+                # and f_b runs in BF16 (the split f_b_proj quantizes f_a). The
+                # e4m3 activation alone costs ~2.7% here, as for qkv.
+                exact_f_a = x.float() @ self.exact["f_a_proj"].t()
+                for name, got, want in (
+                    ("beta", beta, x.float() @ self.exact["b_proj"].t()),
+                    (
+                        "forget_gate",
+                        forget_gate,
+                        exact_f_a @ self.exact["f_b_proj"].t(),
+                    ),
+                ):
+                    rel = _relative_error(got, want)
+                    self.assertLess(rel, 0.05, f"{name} rel err {rel:.2e}")
 
 
 if __name__ == "__main__":
