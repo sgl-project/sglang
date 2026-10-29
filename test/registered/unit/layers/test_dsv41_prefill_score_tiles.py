@@ -427,6 +427,17 @@ class TestPrefillScoreBudget(CustomTestCase):
         self.assertEqual(value, 2 << 30)
         self.assertEqual(calls, {"reads": 1, "empty_cache": 0})
 
+    def test_enough_rows_per_tile_skip_the_reclaim(self):
+        """Below the cap but at least _RECLAIM_BELOW_ROWS rows of the widest
+        score row: the first read stands."""
+        row = mqa_logits_row_bytes(485_000)
+        value, calls = self.budget(reads=(300 * row,))
+        self.assertEqual(value, 300 * row)
+        self.assertEqual(calls, {"reads": 1, "empty_cache": 0})
+        value, calls = self.budget(reads=(100 * row, 400 * row))
+        self.assertEqual(value, 400 * row)
+        self.assertEqual(calls, {"reads": 2, "empty_cache": 1})
+
     def test_low_free_memory_returns_unused_blocks_and_reads_again(self):
         """A running server's allocator holds nearly all free memory: the second
         read, after empty_cache, decides."""

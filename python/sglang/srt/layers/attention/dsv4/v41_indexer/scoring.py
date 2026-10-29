@@ -25,6 +25,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_budget_bytes,
     mqa_logits_needs_budget_check,
+    mqa_logits_row_bytes,
     mqa_logits_static_budget_bytes,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -41,6 +42,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
 _DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
+# Below this many rows of the widest score row per tile, tiles get slow enough to
+# be worth returning the allocator's unused blocks before reading free memory.
+_RECLAIM_BELOW_ROWS = 256
 
 
 def _capturing() -> bool:
@@ -57,7 +61,9 @@ def prefill_score_budget_bytes(
 ) -> int:
     """Budget for one score tile and its declared scratch: the static budget
     under graph capture, else a share of the memory the forward can allocate,
-    at most the fixed cap. Small forwards skip the query."""
+    at most the fixed cap. Small forwards skip the query, and the allocator's
+    cache is emptied first only when free memory alone would leave tiles of
+    fewer than ``_RECLAIM_BELOW_ROWS`` rows."""
     cap = _DEEP_GEMM_SCORE_BUDGET_BYTES
     if not mqa_logits_needs_budget_check(num_rows=num_rows, num_cols=max_seq_len):
         return cap
@@ -65,7 +71,8 @@ def prefill_score_budget_bytes(
     if _capturing():
         return min(cap, mqa_logits_static_budget_bytes(device_index=index))
     budget = min(cap, mqa_logits_budget_bytes(device_index=index, allow_sync=True))
-    if budget < cap:
+    wanted = min(num_rows, _RECLAIM_BELOW_ROWS) * mqa_logits_row_bytes(max_seq_len)
+    if budget < min(cap, wanted):
         # Free device memory leaves out the caching allocator's unused blocks, and
         # a running server's allocator ends up holding nearly all of it, which would
         # shrink every tile to a few rows. Return those blocks and read again, so
