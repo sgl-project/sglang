@@ -29,6 +29,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_ring_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
+from sglang.kernels.ops.speculative.dspark.sharded_accept_hip import (
+    accept_sampling_sharded,
+)
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_partials_graph,
     simulated_bonus_sample,
@@ -199,15 +202,11 @@ class TargetVerifyExecutor:
             self.verify_epilogue.note_static_verify(bs)
             return self.verify_epilogue.read_accept(bs)
 
-        simulate = self._simulated_correct_len is not None
-        # Simulated acceptance overwrites correct_len below, so a sampling accept
-        # (draft/target softmax + rejection) would be computed only to be discarded.
-        accept_sampling_info = None if simulate else sampling_info
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
             draft_block=draft_block,
-            sampling_info=accept_sampling_info,
+            sampling_info=sampling_info,
             draft_input=draft_input,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
@@ -217,7 +216,7 @@ class TargetVerifyExecutor:
             rejection_noise=self._rejection_noise,
         )
         greedy_bonus = simulate_bonus_sampling_info is None and (
-            accept_sampling_info is None or accept_sampling_info.is_all_greedy
+            sampling_info is None or sampling_info.is_all_greedy
         )
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
@@ -642,18 +641,13 @@ class DsparkVerifyEpilogue:
         self.out_tokens_buf = torch.zeros(
             (self.max_bs, self.stride), dtype=torch.int64, device=device
         )
-        # Under the accept-site broadcast the fused tail serves only simulate_fold,
-        # whose broadcast inputs (length, draw) the kernel can take.
-        self._tail_broadcasts = bool(fused_accept_tail) and tp_sync.enabled(
+        # The accept-site broadcast runs between the separate ops, so it keeps them.
+        self._fused_accept_tail = bool(fused_accept_tail) and not tp_sync.enabled(
             SpecTpSyncSite.DSPARK_ACCEPT_GRAPH
-        )
-        self._fused_accept_tail = bool(fused_accept_tail) and (
-            self.simulate_fold or not self._tail_broadcasts
         )
         if fused_accept_tail and not self._fused_accept_tail:
             logger.info(
-                "DSpark fused accept tail off: the accept-site TP broadcast is "
-                "selected without SGLANG_DSPARK_SIMULATE_FOLD."
+                "DSpark fused accept tail off: the accept-site TP broadcast is selected."
             )
         self._accept_tail_bs = (int(accept_tail_min_bs), int(accept_tail_max_bs))
         self._accept_tail_logged: set[int] = set()
@@ -843,24 +837,17 @@ class DsparkVerifyEpilogue:
         self, *, candidates, logits, seq_lens, verify_lens, gated: bool
     ) -> Optional[torch.Tensor]:
         """The greedy ``_accept`` and gated commit lengths in one launch; under
-        simulate_fold the argmax is skipped and the bonus select runs in the tail."""
+        simulate_fold the bonus select runs in the tail."""
         bs = candidates.shape[0]
-        target_predict = bonus_in = bonus_parts = None
-        if not self.simulate_fold:
-            target_predict = _row_argmax(logits, fused=self._fused_argmax).view(-1)
-        elif self._tail_broadcasts:
-            bonus_in = self.sim_bonus(logits, bs)
-            # Rank 0's length and draw, as build_accept_outs broadcasts them.
-            self._tp_sync.sync(
-                SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, self.simulated_correct_len
-            )
-            self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus_in)
-        else:
+        # Under simulate_fold the tail does not read the argmax; it still runs as served.
+        target_predict = _row_argmax(logits, fused=self._fused_argmax).view(-1)
+        bonus_parts = None
+        if self.simulate_fold:
             bonus_parts = (
                 *simulated_bonus_partials_graph(**self._sim_bonus_args(logits, bs)),
                 logits.shape[1],
             )
-        self._log_accept_tail(bs, bonus_in=bonus_in)
+        self._log_accept_tail(bs)
         static_accept_tail(
             candidates=candidates,
             target_predict=target_predict,
@@ -874,7 +861,6 @@ class DsparkVerifyEpilogue:
             new_seq_lens_out=self.new_seq_lens_buf,
             out_tokens_out=self.out_tokens_buf,
             simulated_correct_len=self.simulated_correct_len,
-            bonus_in=bonus_in,
             bonus_parts=bonus_parts,
             gated_commit_lens_out=self.gated_commit_lens_buf if gated else None,
         )
@@ -895,7 +881,7 @@ class DsparkVerifyEpilogue:
         """The simulated row's bonus from the buffers begin_sim_bonus staged; graph-safe."""
         return simulated_bonus_sample_graph(**self._sim_bonus_args(logits, bs))
 
-    def _log_accept_tail(self, bs: int, *, bonus_in) -> None:
+    def _log_accept_tail(self, bs: int) -> None:
         """Once per captured batch size, from the branch that launches the kernel."""
         if (
             bs in self._accept_tail_logged
@@ -905,10 +891,9 @@ class DsparkVerifyEpilogue:
             return
         self._accept_tail_logged.add(bs)
         logger.info(
-            "DSpark verify graph bs=%d: fused accept tail (bonus=%s, tp-broadcast=%s)",
+            "DSpark verify graph bs=%d: fused accept tail (bonus=%s)",
             bs,
             "sim-fold" if self.simulate_fold else "argmax",
-            "inputs" if bonus_in is not None else "off",
         )
 
     def note_static_verify(self, bs: int) -> None:
@@ -1237,6 +1222,33 @@ def _simulated_rows(correct_len: torch.Tensor, rows_per_request: int) -> torch.T
     )
 
 
+def _accepts_on_shards(
+    draft_block: DraftBlockResult, sampling_info, block_verification: bool
+) -> bool:
+    # The sharded accept is a Triton chain rule on temperature-only target
+    # probabilities; block verification and top-k/top-p need the whole vocab.
+    # A SimpleNamespace stand-in (unit tests) has no vocab_shard.
+    shard = getattr(draft_block, "vocab_shard", None)
+    return (
+        shard is not None
+        and not getattr(draft_block, "greedy_draft", False)
+        and not block_verification
+        and not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+    )
+
+
+def _whole_vocab_logits(draft_block: DraftBlockResult, vocab_size: int) -> torch.Tensor:
+    logits = draft_block.corrected_logits
+    shard = getattr(draft_block, "vocab_shard", None)
+    if shard is None:
+        return logits
+    # Kept on the shards, but this batch needs the whole vocab.
+    bs, gamma_rows, width = logits.shape
+    whole = shard.gather(logits.reshape(bs * gamma_rows, width))[:, :vocab_size]
+    return whole.contiguous().view(bs, gamma_rows, vocab_size)
+
+
 _blockwise_rejection_noted = False
 
 
@@ -1270,9 +1282,10 @@ def _draft_probs(draft_block: DraftBlockResult, vocab: int, device) -> torch.Ten
         )
         draft_probs.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
         return draft_probs
-    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+    corrected_logits = _whole_vocab_logits(draft_block, vocab)
+    bs, gamma_rows, vocab = corrected_logits.shape
     draft_probs = SoftmaxTemp.execute(
-        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+        logits=corrected_logits.reshape(bs * gamma_rows, vocab),
         temperatures=draft_block.temperatures,
         rows_per_request=gamma_rows,
     ).view(bs, gamma_rows, vocab)
@@ -1305,7 +1318,23 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
         )
-    if _blockwise_rejection_applies(
+    if _accepts_on_shards(draft_block, sampling_info, block_verification):
+        # Block-wise rejection scans the whole draft vocab. This kernel is the
+        # same chain rule and reads the draft logits on the local shard.
+        shard = draft_block.vocab_shard
+        sampled = accept_sampling_sharded(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_logits=draft_block.corrected_logits,
+            temperatures=draft_block.temperatures,
+            vocab_start=shard.start,
+            width=shard.width,
+            gather_stacked=shard.gather.gather_stacked,
+            key=draft_block.noise.key,
+            offset=draft_block.noise.offset,
+            verify_lens=cutoff_verify_lens,
+        )
+    elif _blockwise_rejection_applies(
         sampling_info=sampling_info,
         rejection_noise=rejection_noise,
         block_verification=block_verification,
