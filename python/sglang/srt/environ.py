@@ -597,6 +597,10 @@ class Envs:
     SGLANG_OPT_ROCM_SPEC_SOFTMAX_TOP_P = EnvBool(
         SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
     )
+    # ROCm DSpark sampling accept: the classic chain over many blocks a request.
+    SGLANG_OPT_ROCM_DSPARK_CHAIN_REJECTION = EnvBool(
+        SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
+    )
     # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
     # greedy accept and its bookkeeping as one kernel.
     SGLANG_DSPARK_FUSED_ACCEPT_TAIL = EnvBool(

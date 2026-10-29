@@ -21,6 +21,7 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.utils import is_hip, is_npu
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 if _is_npu:
     from sgl_kernel_npu.sample import chain_speculative_sampling_triton
@@ -144,6 +145,15 @@ def _accept_sampling_core(
     if block_verification:
         # Startup validation rejects NPU, whose sampler has no block mode.
         sampling_fn = partial(sampling_fn, block_verification=True)
+    elif _is_hip and envs.SGLANG_OPT_ROCM_DSPARK_CHAIN_REJECTION.get():
+        from sglang.kernels.ops.speculative.chain_rejection import (
+            chain_rejection_sampling,
+            chain_rejection_supported,
+        )
+
+        # each request's vocabulary over many blocks, not one
+        if chain_rejection_supported(target_probs, draft_probs):
+            sampling_fn = _chain_rejection_fn(chain_rejection_sampling)
     sampling_fn(
         predicts=predicts,
         accept_index=accept_index,
@@ -168,6 +178,21 @@ def _accept_sampling_core(
     else:
         cap_trim_lens = torch.zeros_like(correct_len)
     return correct_len, cap_trim_lens, accept_index, predicts
+
+
+def _chain_rejection_fn(kernel):
+    """``chain_speculative_sampling_triton``'s keywords onto ``chain_rejection_sampling``."""
+
+    def run(*, predicts, accept_index, accept_token_num, candidates, retrive_index,
+            uniform_samples, uniform_samples_for_final_sampling, target_probs,
+            draft_probs, **_unused):  # fmt: skip
+        kernel(
+            predicts, accept_index, accept_token_num, candidates, retrive_index,
+            uniform_samples, uniform_samples_for_final_sampling, target_probs,
+            draft_probs,
+        )  # fmt: skip
+
+    return run
 
 
 def accept_sampling(
