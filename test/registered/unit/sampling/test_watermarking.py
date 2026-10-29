@@ -27,7 +27,6 @@ from sglang.srt.sampling.watermarking.detector import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-
 # ---------------------------------------------------------------------------
 # parse_watermark_key
 # ---------------------------------------------------------------------------
@@ -159,9 +158,7 @@ class TestLoadWatermarkConfigInline(CustomTestCase):
 class TestLoadWatermarkConfigFile(CustomTestCase):
     def test_reads_valid_config_from_file(self):
         payload = json.dumps({"context_window": 8})
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
             tmp.write(payload)
             tmp_path = tmp.name
         try:
