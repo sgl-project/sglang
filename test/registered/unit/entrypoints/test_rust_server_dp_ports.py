@@ -5,13 +5,21 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from sglang.srt import rust_extensions
+from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
+from sglang.srt.disaggregation.base.conn import BaseKVBootstrapServer
+from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
+from sglang.srt.entrypoints import engine
 from sglang.srt.entrypoints.engine import node_hosts_rust_server
+from sglang.srt.environ import envs
+from sglang.srt.managers import disagg_service
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.rust_server import server as rust_server
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _scheduler_for_typed_config():
@@ -21,6 +29,8 @@ def _scheduler_for_typed_config():
             context_len=2048,
             vocab_size=1000,
             is_multimodal=False,
+            is_image_understandable_model=False,
+            is_audio_understandable_model=False,
             hf_config=SimpleNamespace(model_type=None),
             get_default_sampling_params=lambda: {},
         ),
@@ -37,6 +47,7 @@ def _scheduler_for_typed_config():
         tokenizer=None,
         max_total_num_tokens=1024,
         load_snapshot_writer=None,
+        rust_server_endpoints=[{"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}],
     )
 
 
@@ -70,6 +81,10 @@ def _scheduler_for_typed_config():
             "limit_mm_data_per_request",
             [("video", 1), ("image", 2)],
         ),
+        # The server loads the scheduler's tokenizer copy and reports the
+        # launched path.
+        ({"tokenizer_path": "/public"}, "tokenizer_path", "tokenizer"),
+        ({"tokenizer_path": "/public"}, "public_tokenizer_path", "/public"),
     ],
     ids=[
         "native-grpc",
@@ -83,6 +98,8 @@ def _scheduler_for_typed_config():
         "priority-on",
         "mm-limits-unset",
         "mm-limits-keep-order",
+        "loaded-tokenizer",
+        "public-tokenizer",
     ],
 )
 def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):
@@ -115,6 +132,9 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         extension.ServerArgs.call_args.kwargs["deployment_info"]
     )
     assert deployment_info["kv_event_sources"] == [{"endpoint": "tcp://127.0.0.1:5557"}]
+    assert deployment_info["rust_server_endpoints"] == [
+        {"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}
+    ]
 
 
 @pytest.mark.parametrize(
@@ -153,10 +173,17 @@ def test_deployment_info_reports_listener_dp_rank(server_args, ranks, expected):
 
 
 @pytest.mark.parametrize("enable_metrics", [False, True])
-def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
+def test_typed_config_carries_tokenizer_metrics(enable_metrics):
     extension = MagicMock()
     with (
-        get_context().override_server_args(enable_metrics=enable_metrics),
+        get_context().override_server_args(
+            enable_metrics=enable_metrics,
+            served_model_name="m",
+            enable_priority_scheduling=True,
+            extra_metric_labels={"cluster": "c"},
+            bucket_inter_token_latency=[0.001, 0.01],
+            generation_tokens_buckets=["custom", "10", "1"],
+        ),
         get_parallel().override(attn_dp_rank=0, dp_rank=None),
         patch.dict("os.environ", {"PROMETHEUS_MULTIPROC_DIR": "/tmp/prom"}),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
@@ -168,11 +195,53 @@ def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
         )
 
     metrics = extension.ServerArgs.call_args.kwargs["metrics"]
-    if enable_metrics:
-        extension.MetricsConfig.assert_called_once_with(multiproc_dir="/tmp/prom")
-        assert metrics is extension.MetricsConfig.return_value
-    else:
+    if not enable_metrics:
         assert metrics is None
+        return
+    assert metrics is extension.MetricsConfig.return_value
+    extension.MetricsConfig.assert_called_once_with(
+        multiproc_dir="/tmp/prom",
+        labels={
+            "model_name": "m",
+            "engine_type": "unified",
+            "priority": "",
+            "cluster": "c",
+        },
+        priority_label=True,
+        bucket_time_to_first_token=None,
+        bucket_inter_token_latency=[0.001, 0.01],
+        bucket_e2e_request_latency=None,
+        # The default rule keeps the Rust side's defaults; others resolve here.
+        bucket_prompt_tokens=None,
+        bucket_generation_tokens=[1.0, 10.0],
+    )
+
+
+@pytest.mark.parametrize("enable_metrics", [False, True])
+def test_rust_mode_main_process_reports_startup_time(enable_metrics):
+    # A model package's override of the collector class, installed after
+    # the engine module was imported.
+    collector_cls = MagicMock()
+    with (
+        get_context().override_server_args(
+            enable_metrics=enable_metrics, served_model_name="m"
+        ),
+        patch.object(
+            engine.metrics_collector, "TokenizerMetricsCollector", collector_cls
+        ),
+    ):
+        sink = engine._rust_server_startup_time_sink()
+        sink({"load_weight": 1.0})
+
+    if not enable_metrics:
+        collector_cls.assert_not_called()
+        return
+    collector_cls.assert_called_once_with(
+        labels={"model_name": "m", "engine_type": "unified"}
+    )
+    collector_cls.return_value.emit_startup_time.assert_called_once_with(
+        {"load_weight": 1.0}
+    )
 
 
 @pytest.mark.parametrize(
@@ -236,6 +305,37 @@ def test_dp_leaders_reuse_node_local_ports(
         assert ports == [30000 + offset for offset in expected]
 
 
+def test_plain_dp_replicas_bind_their_own_ports():
+    # Each replica is its own TP group led by TP rank 0, so the replica index
+    # must separate the ports.
+    with (
+        get_context().override_server_args(
+            tp_size=2, dp_size=2, host="0.0.0.0", port=30000
+        ),
+        patch.object(rust_extensions, "load_rust_extension") as extension,
+        patch.object(rust_server, "_partition_cores", return_value=(None, None)),
+        patch.object(rust_server, "_build_server_args"),
+    ):
+        scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(),
+            model_config=SimpleNamespace(is_multimodal=False),
+        )
+        ports = []
+        for dp_rank in range(2):
+            with get_parallel().override(
+                tp_rank=0,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                attn_dp_rank=0,
+                dp_rank=dp_rank,
+            ):
+                ports.append(rust_server.RustServer.launch(scheduler).http_port)
+
+        calls = extension.return_value.Server.call_args_list
+        assert [c.kwargs["port_offset"] for c in calls] == [0, 1]
+        assert ports == [30000, 30001]
+
+
 @pytest.mark.parametrize(
     "pp_size,expected",
     [(1, [True, False, True, False]), (2, [True, True, False, False])],
@@ -261,6 +361,81 @@ def test_scale_joiner_hosts_listener():
         ep_join_mode="scale",
     ):
         assert node_hosts_rust_server()
+
+
+class _HttpRegistry(CommonKVBootstrapServer):
+    def __init__(self, host, port):
+        raise AssertionError("the Rust server serves this registry")
+
+
+class _OwnBootstrapServer(BaseKVBootstrapServer):
+    def __init__(self, host, port):
+        self.address = (host, port)
+
+
+@pytest.mark.parametrize(
+    "server_class,bootstrap_port,expected",
+    [
+        (_HttpRegistry, 8998, 31000),
+        (_HttpRegistry, 31000, 31000),
+        (_HttpRegistry, 33000, ValueError),
+        (_OwnBootstrapServer, 8998, 8998),
+        (_OwnBootstrapServer, 33000, 33000),
+    ],
+    ids=[
+        "http-registry-default",
+        "http-registry-shared",
+        "http-registry-separate",
+        "backend-bootstrap-server-default",
+        "backend-bootstrap-server-separate",
+    ],
+)
+def test_rust_prefill_bootstrap_port_alias(server_class, bootstrap_port, expected):
+    args = ServerArgs(
+        model_path="dummy",
+        port=31000,
+        disaggregation_mode="prefill",
+        disaggregation_bootstrap_port=bootstrap_port,
+    )
+    with (
+        envs.SGLANG_RUST_SERVER.override(True),
+        patch.object(disagg_service, "get_kv_class", return_value=server_class),
+    ):
+        if expected is ValueError:
+            with pytest.raises(ValueError, match="conflicts with --port"):
+                handle_pd_disaggregation(args)
+            return
+        handle_pd_disaggregation(args)
+    assert resolving_view(args).disaggregation_bootstrap_port == expected
+
+
+@pytest.mark.parametrize(
+    "mode,server_class,starts",
+    [
+        ("prefill", _HttpRegistry, False),
+        ("prefill", _OwnBootstrapServer, True),
+        ("decode", _OwnBootstrapServer, False),
+    ],
+    ids=["http-registry", "backend-bootstrap-server", "decode"],
+)
+def test_rust_mode_starts_only_a_bootstrap_server_rust_cannot_serve(
+    mode, server_class, starts
+):
+    with (
+        get_context().override_server_args(
+            host="127.0.0.1",
+            disaggregation_mode=mode,
+            disaggregation_transfer_backend="nixl",
+            disaggregation_bootstrap_port=33000,
+        ),
+        patch.object(disagg_service, "get_kv_class", return_value=server_class),
+    ):
+        server = disagg_service.start_disagg_service_for_rust_server()
+
+    if starts:
+        assert server.address == ("127.0.0.1", 33000)
+    else:
+        assert server is None
 
 
 if __name__ == "__main__":

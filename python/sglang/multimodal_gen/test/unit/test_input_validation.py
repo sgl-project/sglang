@@ -210,7 +210,7 @@ class TestFlux2ConditionImagePreprocess(unittest.TestCase):
         )
 
         self.assertEqual(processed_size, (expected_width, expected_height))
-        self.assertTrue(torch.equal(processed, expected))
+        self.assertTrue(torch.equal(processed.cpu(), expected))
 
     @patch.object(Flux2Pipeline, "add_standard_ti2i_stages")
     def test_runtime_pipeline_uses_flux2_image_processor(self, mock_add_stages):

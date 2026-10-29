@@ -28,7 +28,7 @@ from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _LayerModel:
@@ -148,6 +148,44 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             self.assertEqual(ple._get_prefetch_buffer(16, ids).shape[0], 16)
             self.assertEqual(list(ple._graph_prefetch_buffers), [16])
 
+    def test_qsa_capture_reuses_the_warmup_bridge(self):
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            breakable_cuda_graph as bcg,
+        )
+        from sglang.srt.models import qwen4_exp
+
+        batch = SimpleNamespace(rows=8, forward_mode=ForwardMode.EXTEND)
+        context = SimpleNamespace(forward_batch=batch)
+        layer = SimpleNamespace(_qsa_prefill_topk_bridges=[])
+        layer._compute_qsa_topk_indices_eager = (
+            lambda hidden_states, forward_batch, **kw: hidden_states[
+                : forward_batch.rows
+            ]
+        )
+        call = partial(
+            qwen4_exp.Qwen4ExpAttentionDecoderLayer._compute_qsa_topk_indices,
+            layer,
+            positions=None,
+            forward_batch=batch,
+        )
+        capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
+        x = torch.full((8, 2), 3, dtype=torch.int32)
+        with (
+            patch.object(
+                qwen4_exp, "get_tc_piecewise_forward_context", return_value=context
+            ),
+            patch.object(qwen4_exp, "is_in_breakable_cuda_graph", return_value=True),
+        ):
+            call(x)  # warmup allocates
+            with patch.object(bcg, "_current_capture_var") as active:
+                active.get.return_value = capture
+                captured = call(x[:6])
+            batch.rows = 2
+            x.fill_(5)
+            capture.cuda_graph._break_fns[0]()
+        self.assertEqual(len(layer._qsa_prefill_topk_bridges), 1)
+        self.assertEqual(captured.tolist(), [[5, 5]] * 2 + [[0, 0]] * 4)
+
     def test_ple_replay_uses_live_request_layout(self):
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
             breakable_cuda_graph as bcg,
@@ -164,7 +202,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             global_num_token_non_padded_cpu=None,
         )
         context = SimpleNamespace(forward_batch=batch)
-        capture = Mock(_barrier_fn=None, cuda_graph=SimpleNamespace(_break_fns=[]))
+        capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
         pool = Mock(get_mamba_indices=lambda indices: indices)
         cases = [([8], [0] * 8), ([4, 4], [0] * 4 + [1] * 4)]
         with (
@@ -181,14 +219,16 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 batch.extend_seq_lens_cpu = lengths
                 batch.req_pool_indices = torch.arange(1, len(lengths) + 1)
                 if lengths == [8]:
-                    holder = qwen4_exp._breakable_prepare_ple_batch(
+                    holder = qwen4_exp._BreakablePLEBatch()
+                    qwen4_exp._breakable_prepare_ple_batch(
                         input_ids=torch.arange(8),
                         ngram_size=None,
                         ngram_eos_token_id=None,
+                        holder=holder,
                     )
-                else:
-                    for replay in capture.cuda_graph._break_fns:
-                        replay()
+                    self.assertIsNone(holder.batch)
+                for replay in capture.cuda_graph._break_fns:
+                    replay()
                 self.assertEqual(holder.batch.req_indices.tolist(), expected)
 
     def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):

@@ -74,7 +74,9 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         disaggregation_mode=None,
         enable_overlap=False,
         enable_overlap_mlx=False,
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(
+            think_end_ids=None, self_opened_think_start_ids=None
+        ),
         token_to_kv_pool_allocator=None,
         tree_cache=None,
         hisparse_coordinator=None,
@@ -241,6 +243,43 @@ class TestReasoningTokenAccounting(CustomTestCase):
         self.assertEqual(req.reasoning_tokens, 2)
         self.assertTrue(req._is_reasoning_over)
 
+    def test_unforced_reply_that_opens_thinking_counts_reasoning(self):
+        """Adaptive thinking is not forced, so the model emits the start tag itself;
+        that reasoning must be counted rather than reported as 0."""
+        req = _make_req(terminate_after=99)
+        processor = _make_processor()
+        processor.model_config.think_end_ids = [9]
+        processor.model_config.self_opened_think_start_ids = [5]
+
+        for token in [5, 10, 10, 9, 11, 11]:
+            processor._maybe_update_reasoning_tokens(req, token)
+
+        self.assertEqual(req.reasoning_tokens, 4)
+
+    def test_unforced_reply_without_start_tag_has_no_reasoning(self):
+        processor = _make_processor()
+        processor.model_config.think_end_ids = [9]
+        processor.model_config.self_opened_think_start_ids = [5]
+        # A direct answer, and a multi-turn reply opening with a stray closer.
+        for output in ([11, 5, 10, 9], [9, 11, 11]):
+            req = _make_req(terminate_after=99)
+            for token in output:
+                processor._maybe_update_reasoning_tokens(req, token)
+            self.assertEqual(req.reasoning_tokens, 0)
+
+    def test_unforced_reasoning_spans_multi_token_steps(self):
+        req = _make_req(terminate_after=99)
+        processor = _make_processor()
+        processor.model_config.think_end_ids = [8, 9]
+        processor.model_config.self_opened_think_start_ids = [4, 5]
+
+        processor._maybe_update_reasoning_tokens(req, [4])
+        processor._maybe_update_reasoning_tokens(req, [5, 10, 8])
+        processor._maybe_update_reasoning_tokens(req, [9, 11, 11])
+
+        self.assertEqual(req.reasoning_tokens, 5)
+        self.assertTrue(req._is_reasoning_over)
+
     def test_disagg_rebootstrap_does_not_recount_boundary(self):
         req = _make_req(terminate_after=99)
         req.require_reasoning = True
@@ -314,6 +353,7 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
             tree.supports_mamba.return_value = True
             tree.claim_kv_row.return_value = False
             tree.token_to_kv_pool_allocator.page_size = 1
+            tree.logical_page_size = 1
             processor = replace(
                 _make_processor(),
                 tree_cache=tree,

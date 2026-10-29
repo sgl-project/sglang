@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Literal, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.index_logits import index_logits_dtype
 from sglang.kernels.ops.attention.dsv4.trtllm_metadata import pack_sparse_tail
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -23,6 +24,9 @@ from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
     DeepseekV4MegaAttnBackend,
 )
 from sglang.srt.layers.attention.dsv4.metadata import copy_unless_aliased
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    make_persistent_multi_ctas_kv_counter_buffer,
+)
 from sglang.srt.runtime_context import (
     get_buffer,
     get_context,
@@ -31,11 +35,11 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
+    max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils import ceil_align, ceil_div
+from sglang.srt.utils import ceil_align, ceil_div, print_info_once
 
 try:
-    import flashinfer.mla._core as _fi_core
     from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 except ImportError as exc:
     _flashinfer_import_error = exc
@@ -65,11 +69,6 @@ def _get_trtllm_workspace_buffer(device: torch.device) -> torch.Tensor:
     )
 
 
-_trtllm_semaphore_installed = False
-# Capacity is in query rows: requests x draft tokens for decode, sum_q for prefill.
-_trtllm_semaphore_rows: int = 0
-
-
 def _trtllm_query_row_capacity(model_runner: ModelRunner) -> int:
     """Bound query rows across prefill chunks and speculative decode batches.
 
@@ -81,63 +80,44 @@ def _trtllm_query_row_capacity(model_runner: ModelRunner) -> int:
         schedule.max_prefill_tokens or 0,
         max_prefill_buffer_tokens(),
     )
-    spec = get_spec()
+    # Adaptive spec may widen the draft up to its launch-time max.
     rows_per_req = (
-        (spec.speculative_num_draft_tokens or 1)
-        if spec.speculative_algorithm is not None
+        (max_speculative_num_draft_tokens() or 1)
+        if get_spec().speculative_algorithm is not None
         else 1
     )
     rows = max(rows, (schedule.max_running_requests or 0) * rows_per_req)
     return max(rows, 1)
 
 
-def _install_persistent_trtllm_semaphores(capacity_rows: int) -> None:
-    """FlashInfer sizes its counter buffer by request count while the kernel
-    indexes it by query row; install one sized by rows (remove once FlashInfer
-    accepts a caller-owned buffer)."""
-    global _trtllm_semaphore_installed, _trtllm_semaphore_rows
+def _get_trtllm_counter_buffer(
+    model_runner: ModelRunner, device: torch.device
+) -> torch.Tensor:
+    """Return the zeroed multi-CTA KV counter buffer shared by all launches.
+
+    Without it FlashInfer zeroes a fresh buffer before every launch. The kernel
+    resets its counters at the end of each launch, and launches run in order on
+    the forward stream, as the shared workspace already assumes. Decode passes
+    one query row per FlashInfer request, so the size bound is in query rows;
+    the model's head count bounds the per-rank query heads, floored at the
+    64-head query pad.
+    """
     if _flashinfer_import_error is not None:
         raise ImportError(
             "--dsv4-attn-backend trtllm requires FlashInfer sparse MLA support"
         ) from _flashinfer_import_error
-    _trtllm_semaphore_rows = max(_trtllm_semaphore_rows, capacity_rows)
-    if _trtllm_semaphore_installed:
-        return
-    _orig = _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer
-    # Allocate once outside graph capture. Stream ordering and the kernel's
-    # counter reset make one shared buffer safe across launches.
-    state: dict = {}
-
-    def _patched(batch_size, num_qo_heads, sm_count, device):
-        buf = state.get("buf")
-        if buf is None or buf.device != device:
-            assert not torch.cuda.is_current_stream_capturing(), (
-                "persistent trtllm semaphore buffer must be created outside "
-                "graph capture (first call is expected during eager warmup)"
-            )
-            buf = _orig(_trtllm_semaphore_rows, num_qo_heads, sm_count, device)
-            state["buf"] = buf
-        return buf
-
-    _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer = _patched
-    _trtllm_semaphore_installed = True
-    logger.info(
-        "trtllm-gen multi-CTA semaphores: single persistent buffer sized for "
-        "%d query rows, shared across launches (flashinfer sizing WAR).",
-        _trtllm_semaphore_rows,
+    return get_buffer(
+        "trtllm_dsv4_multi_ctas_kv_counter",
+        lambda: make_persistent_multi_ctas_kv_counter_buffer(
+            device,
+            max(64, model_runner.model_config.num_attention_heads),
+            max(
+                _trtllm_query_row_capacity(model_runner),
+                model_runner.req_to_token_pool.req_to_token.shape[0]
+                * (max_speculative_num_draft_tokens() or 1),
+            ),
+        ),
     )
-
-
-def _check_trtllm_query_rows(num_rows: int) -> None:
-    # A plain exception, not assert: an over-capacity launch scribbles past
-    # the semaphore buffer, so this must fire even under python -O.
-    if num_rows > _trtllm_semaphore_rows:
-        raise RuntimeError(
-            f"trtllm-gen launch with {num_rows} query rows exceeds the persistent "
-            f"semaphore capacity of {_trtllm_semaphore_rows} rows derived from "
-            "--chunked-prefill-size / --max-prefill-tokens / "
-            "--max-running-requests; lower --chunked-prefill-size."
-        )
 
 
 def _tail_refresh_layers(
@@ -169,14 +149,17 @@ def _refresh_indexed_tail(
     lens: torch.Tensor,
 ) -> None:
     """Write this layer's top-k into the shared indexed table and its lens."""
-    assert extra_indices is not None
     rows = table.shape[0]
     extra_indices = extra_indices[:rows]
     width = extra_indices.shape[-1]
     assert table.shape == (rows, SWA_WINDOW + width), f"{table.shape=} {width=}"
+    tail = table[:, SWA_WINDOW:]
+    # Lens were set per step; the indexer wrote the tail in place.
     if compress_ratio == 4 and core._c4_topk_writes_table():
-        # Lens were set per step; the indexer wrote the tail in place.
-        copy_unless_aliased(table[:, SWA_WINDOW:], extra_indices)
+        copy_unless_aliased(tail, extra_indices)
+        return
+    if extra_indices.data_ptr() == tail.data_ptr():
+        assert extra_indices.stride() == tail.stride()
         return
     pack_sparse_tail(
         extra_indices,
@@ -196,10 +179,6 @@ class TrtllmSparseTablePool:
         self._kwargs = int32_kwargs
         self._bufs: dict = {}
 
-    @staticmethod
-    def _pad_rows(rows: int) -> int:
-        return ceil_align(rows, 64)
-
     def _parent(self, role: str, numel: int, fill: int) -> torch.Tensor:
         buf = self._bufs.get(role)
         if buf is None or buf.numel() < numel:
@@ -212,7 +191,7 @@ class TrtllmSparseTablePool:
         return buf
 
     def preallocate(self, role: str, rows: int, fill: int, width: int = 0) -> None:
-        self._parent(role, self._pad_rows(rows) * max(width, 1), fill)
+        self._parent(role, ceil_align(rows, 64) * max(width, 1), fill)
 
     def view(
         self,
@@ -223,11 +202,14 @@ class TrtllmSparseTablePool:
         width: int = 0,
         *,
         rows_written_by_caller: bool = False,
+        constant: bool = False,
     ) -> torch.Tensor:
         """Rows [:rows] come from ``src``, from the caller (who then writes every
         column the kernel can read), or are re-inerted; rows [rows, rows_pad)
-        are always re-inerted."""
-        rows_pad = self._pad_rows(rows)
+        are re-inerted too. A ``constant`` view re-inerts nothing: its rows keep
+        their fill or the caller writes them before any read, and the kernel
+        reads no row past ``rows``."""
+        rows_pad = ceil_align(rows, 64)
         numel = rows_pad * max(width, 1)
         padded = self._parent(role, numel, fill)[:numel]
         if width:
@@ -237,7 +219,7 @@ class TrtllmSparseTablePool:
             padded[:rows].copy_(src)
         elif rows_written_by_caller:
             padded[rows:].fill_(fill)
-        else:
+        elif not constant:
             padded.fill_(fill)
         return padded[:rows]
 
@@ -246,6 +228,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
     """DSV4 attention through the trtllm-gen sparse MLA kernel."""
 
     trtllm_attn: bool = True
+    # FlashInfer kernel choice (--dsv4-trtllm-flashinfer-backend); set in __init__.
+    trtllm_fi_backend: str = "trtllm-gen"
 
     def __init__(
         self,
@@ -255,7 +239,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         topk=0,
         speculative_num_steps=0,
     ):
-        _install_persistent_trtllm_semaphores(_trtllm_query_row_capacity(model_runner))
         super().__init__(
             model_runner,
             skip_prefill=skip_prefill,
@@ -275,6 +258,17 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             "context parallelism (attn_cp_size > 1) yet."
         )
         self.trtllm_workspace_buffer = _get_trtllm_workspace_buffer(self.device)
+        self.trtllm_counter_buffer = _get_trtllm_counter_buffer(
+            model_runner, self.device
+        )
+        self.trtllm_fi_backend = get_exec().kernel.dsv4_trtllm_flashinfer_backend
+        if self.trtllm_fi_backend == "auto":
+            from flashinfer.mla._core import _resolve_dsv4_sparse_mla_backend
+
+            # This backend runs only on SM10x; FlashInfer raises for an SM10x
+            # outside SM100/SM103/SM107 (SM12x's "auto" is another call surface).
+            resolved = _resolve_dsv4_sparse_mla_backend(self.device, "auto")
+            print_info_once(f"DSv4 trtllm attention: FlashInfer 'auto' -> {resolved!r}")
         self.trtllm_graph_output_buffer: torch.Tensor | None = None
         self.trtllm_eager_output_buffer: torch.Tensor | None = None
         # (buffer, rows, real rows) whose pad tail is already zero (kernel writes [:real]).
@@ -283,17 +277,22 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         self._tail_refresh_layers = _tail_refresh_layers(
             cfg.compress_ratios, cfg.index_source_layer_ids
         )
-        # topk_v2 writes the c4 tail in place only when no ratio-1/2 layer shares the table.
+        # The indexer writes its top-k into the table tail when every top-k kernel it
+        # may run takes a row stride: c4 topk_v2; on V4.1 bf16 logits, DeepSelect,
+        # topk_bf16_small or torch.
+        if self.low_ratios:
+            writes = not self.has_c4 and index_logits_dtype() == torch.bfloat16
+        else:
+            writes = self.dsa_topk_backend.should_use_topk_v2()
         self.trtllm_topk_writes_table = (
-            self.dsa_topk_backend.should_use_topk_v2()
-            and not get_exec().features.enable_return_indexer_topk
-            and not self.low_ratios
+            writes and not get_exec().features.enable_return_indexer_topk
         )
 
         # Preallocate every role at its maximum so nothing is allocated while serving.
         self.trtllm_table_pool = TrtllmSparseTablePool(self.cuda_int32_kwargs)
+        # Adaptive spec may widen the draft later; capture cannot grow the pool.
         max_decode_rows = self.req_to_token.shape[0] * (
-            self.speculative_num_draft_tokens or 1
+            max_speculative_num_draft_tokens() or 1
         )
         max_prefill_rows = _trtllm_query_row_capacity(model_runner)
         w4 = ceil_align(self.index_topk, PAGE_INDEX_ALIGNED_SIZE)
@@ -306,11 +305,13 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         )
         pool = self.trtllm_table_pool
         pool.preallocate("d_swa_lens", max_decode_rows, fill=SWA_WINDOW)
+        pool.preallocate("d_swa_lens_wide", max_decode_rows, fill=SWA_WINDOW)
         pool.preallocate("p_swa", max_prefill_rows, fill=-1, width=SWA_WINDOW)
         pool.preallocate("p_swa_lens", max_prefill_rows, fill=SWA_WINDOW)
         if self.has_c4 or self.low_ratios:
             pool.preallocate("d_c4", max_decode_rows, fill=-1, width=SWA_WINDOW + w4)
-            pool.preallocate("d_c4_lens", max_decode_rows, fill=SWA_WINDOW)
+            for ratio in self.low_ratios + ((4,) if self.has_c4 else ()):
+                pool.preallocate(f"d_c{ratio}_lens", max_decode_rows, fill=SWA_WINDOW)
             pool.preallocate("p_c4", max_prefill_rows, fill=-1, width=SWA_WINDOW + w4)
             pool.preallocate("p_c4_lens", max_prefill_rows, fill=SWA_WINDOW)
         if self.has_c128:
@@ -481,7 +482,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         attn_sink: torch.Tensor,
         extra_indices: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Sparse MLA decode; uniform multi-token metadata runs VarSeq."""
+        """Sparse MLA decode, one query token per row with per-token causal seq_lens."""
 
         bs, num_heads, head_dim = q.shape
         assert head_dim == 512
@@ -498,8 +499,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             )
             q = q[:n_meta_rows]
             bs = n_meta_rows
-        if extra_indices is not None:
-            extra_indices = extra_indices[:bs]
 
         # Only indexed tails and lens vary by layer; other table data is prebuilt.
         if compress_ratio == 0:
@@ -510,9 +509,11 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sparse_indices = core_attn_metadata.trtllm_c128_indices
             sparse_topk_lens = core_attn_metadata.trtllm_c128_lens
         else:
-            # Ratios 1, 2 and 4 share one indexed table.
+            # Ratios 1, 2 and 4 share one indexed table, each with its own lens.
             sparse_indices = core_attn_metadata.trtllm_c4_indices
-            sparse_topk_lens = core_attn_metadata.trtllm_c4_lens
+            sparse_topk_lens = getattr(
+                core_attn_metadata, f"trtllm_c{compress_ratio}_lens"
+            )
         assert sparse_indices is not None and sparse_topk_lens is not None, (
             "trtllm decode requires metadata built with "
             "init_trtllm_sparse_buffers (decode-mode DSV4AttnMetadata)"
@@ -524,7 +525,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             assert sparse_topk_lens.shape[0] > bs, f"{sparse_topk_lens.shape=}"
             sparse_topk_lens = sparse_topk_lens[:bs]
 
-        if compress_ratio in (1, 2, 4) and self._refreshes_tail(layer.layer_id):
+        refreshed = compress_ratio in (1, 2, 4) and self._refreshes_tail(layer.layer_id)
+        if refreshed:
             _refresh_indexed_tail(
                 core_attn_metadata,
                 compress_ratio,
@@ -546,59 +548,33 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         if seq_lens.shape[0] != bs:
             assert seq_lens.shape[0] > bs, f"{seq_lens.shape=} {bs=}"
             seq_lens = seq_lens[:bs]
-        # Uniform verify/draft-extend metadata uses VarSeq; ragged verify uses dense per-token.
-        seq_lens_req = core_attn_metadata.trtllm_seq_lens_req
         if core_attn_metadata.swa_page_indices.shape[1] > SWA_WINDOW:
             # DSpark attends noncausally to its window plus the whole draft block;
             # dense rows bounded by the block's visible length, all from SWA storage.
-            assert seq_lens_req is None, "DSpark draft blocks use dense rows"
             compressed_kv_cache = swa_kv_cache
             seq_lens = core_attn_metadata.swa_topk_lengths[:bs]
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
-        _check_trtllm_query_rows(bs)
 
-        cum_seq_lens_q = core_attn_metadata.trtllm_cum_seq_lens_q
-        common = dict(
+        out = trtllm_batch_decode_sparse_mla_dsv4(
+            query=q_fp8.view(bs, 1, num_heads, 512),
             swa_kv_cache=swa_kv_cache,
             workspace_buffer=self.trtllm_workspace_buffer,
+            multi_ctas_kv_counter_buffer=self.trtllm_counter_buffer,
             sparse_indices=sparse_indices,
             compressed_kv_cache=compressed_kv_cache,
             sparse_topk_lens=sparse_topk_lens,
+            seq_lens=seq_lens,
+            out=None if out_pad_tail is None else out_pad_tail[:bs, None],
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             sinks=attn_sink,
             kv_layout="HND",
-            backend="trtllm-gen",
+            backend=self.trtllm_fi_backend,
+            # The kernel loads sparse_topk_lens before griddepcontrol.wait, so it
+            # must not overlap this layer's tail write (pack or in-place top-k).
+            enable_pdl=False if refreshed else None,
         )
-        out_arg = None if out_pad_tail is None else out_pad_tail[:bs]
-        if seq_lens_req is not None:
-            # Builders use a fixed num_tokens_per_req, so ragged rows cannot reach here.
-            n_req = seq_lens_req.shape[0]
-            assert n_req > 0 and bs % n_req == 0, (
-                f"non-uniform multi-token batch reached the trtllm decode "
-                f"path: {bs=} {n_req=}"
-            )
-            q_len = bs // n_req
-            assert cum_seq_lens_q is not None
-            assert cum_seq_lens_q.shape == (n_req + 1,), (
-                f"{cum_seq_lens_q.shape=} {n_req=}"
-            )
-            out = trtllm_batch_decode_sparse_mla_dsv4(
-                query=q_fp8,
-                seq_lens=seq_lens_req,
-                out=out_arg,
-                cum_seq_lens_q=cum_seq_lens_q,
-                max_q_len=q_len,
-                **common,
-            )
-        else:
-            out = trtllm_batch_decode_sparse_mla_dsv4(
-                query=q_fp8.view(bs, 1, num_heads, 512),
-                seq_lens=seq_lens,
-                out=None if out_arg is None else out_arg.view(bs, 1, num_heads, 512),
-                **common,
-            )
         if out_pad_tail is not None:
             return out_pad_tail
         return out.view(bs, num_heads, 512)
@@ -645,8 +621,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
 
         # Layer-invariant tables were built before the indexer ran.
         swa_indices = core.trtllm_prefill_swa_indices
-        assert swa_indices is not None
         assert swa_indices.shape == (sum_q, SWA_WINDOW), f"{swa_indices.shape=}"
+        refreshed = False
         if extra_indices is None:
             sparse_indices = swa_indices
             sparse_topk_lens = core.trtllm_prefill_swa_lens
@@ -666,6 +642,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
                     sparse_indices,
                     sparse_topk_lens,
                 )
+                refreshed = True
                 core.trtllm_tail_needs_pack = False
 
         assert sparse_topk_lens is not None
@@ -679,7 +656,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         bmm1_scale, bmm2_scale = self._get_trtllm_bmm_scales(layer)
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
-        _check_trtllm_query_rows(sum_q)
 
         out_padded = None
         out_arg = None
@@ -696,6 +672,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             query=q_fp8,
             swa_kv_cache=swa_kv_cache,
             workspace_buffer=self.trtllm_workspace_buffer,
+            multi_ctas_kv_counter_buffer=self.trtllm_counter_buffer,
             sparse_indices=sparse_indices,
             compressed_kv_cache=compressed_kv_cache,
             sparse_topk_lens=sparse_topk_lens,
@@ -705,7 +682,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             bmm2_scale=bmm2_scale,
             sinks=attn_sink,
             kv_layout="HND",
-            backend="trtllm-gen",
+            backend=self.trtllm_fi_backend,
+            enable_pdl=False if refreshed else None,  # as in decode
         )
         return out_padded if out_padded is not None else out.view(sum_q, num_heads, 512)
 

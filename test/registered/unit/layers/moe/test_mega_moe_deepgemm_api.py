@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_modu
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import (
     get_context,
@@ -33,7 +34,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDeepGemmMegaMoeApi(CustomTestCase):
@@ -140,6 +141,28 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertIs(buffers[2], buffers[3])
         self.assertIsNot(buffers[0], buffers[2])
         self.assertEqual(deep_gemm.get_symm_buffer_for_mega_moe.call_count, 2)
+
+    def test_buffer_cache_separates_activation_contracts(self):
+        self.deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=lambda *args, **kw: object()
+        )
+        group = object()
+        with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):
+            buffers = [
+                mega_moe._get_mega_moe_symm_buffer(
+                    group,
+                    num_experts=8,
+                    num_max_tokens_per_rank=64,
+                    num_topk=2,
+                    hidden=128,
+                    intermediate_hidden=256,
+                    mma_type="nvfp4xnvfp4",
+                    activation=activation,
+                )
+                for activation in ("swiglu", "swigluoai", "swiglu")
+            ]
+        self.assertIs(buffers[0], buffers[2])
+        self.assertIsNot(buffers[0], buffers[1])
 
     def test_buffer_allocation_without_sm_override(self):
         deep_gemm = self.deep_gemm
@@ -456,8 +479,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
     @staticmethod
     def _mega_gate_reference(x, weight, top_k, **kwargs):
-        if not torch.isfinite(x).all():
-            raise ValueError("MegaGate rejects nonfinite GEMM inputs")
+        unmasked = x if kwargs["mask"] is None else x[kwargs["mask"]]
+        if not torch.isfinite(unmasked).all():
+            raise ValueError("MegaGate rejects nonfinite scores on unmasked rows")
         scores = torch.log1p(torch.exp(x.float() @ weight.float().T)).sqrt()
         if kwargs["unmapped_topk_idx"] is not None:
             ids = kwargs["unmapped_topk_idx"]
@@ -546,18 +570,29 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 self.assertFalse(supported(moe))
 
             hidden = torch.zeros((32, 256), dtype=torch.bfloat16)
+            use = mega_gate_runtime.should_use_mega_gate
+            decode = SimpleNamespace(forward_mode=ForwardMode.DECODE)
             with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(False):
-                self.assertFalse(mega_gate_runtime.should_use_mega_gate(moe, hidden))
+                self.assertFalse(use(moe, hidden, decode))
             with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True):
-                self.assertTrue(mega_gate_runtime.should_use_mega_gate(moe, hidden))
+                self.assertTrue(use(moe, hidden, decode))
+                for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.EXTEND):
+                    self.assertTrue(
+                        use(moe, hidden, SimpleNamespace(forward_mode=mode))
+                    )
                 self.assertFalse(
-                    mega_gate_runtime.should_use_mega_gate(moe, hidden.float())
-                )
-                self.assertFalse(
-                    mega_gate_runtime.should_use_mega_gate(
-                        moe, torch.zeros((4096, 256), dtype=torch.bfloat16)
+                    use(
+                        moe,
+                        hidden,
+                        SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2),
                     )
                 )
+                self.assertFalse(use(moe, hidden.float(), decode))
+                with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                    16
+                ):
+                    self.assertFalse(use(moe, hidden, decode))
+                self.assertFalse(use(moe, hidden, None))
 
     def test_mega_gate_routes_vision_hash_and_padding(self):
         for is_hash in (False, True):

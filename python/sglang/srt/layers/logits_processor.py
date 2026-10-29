@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.activation.softcap import (
+    cast_to_float32_logits,
     gathered_softcap_logits,
 )
 from sglang.kernels.ops.activation.softcap import (
@@ -68,7 +69,10 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.utils.common import (
+    async_d2h,
     is_cpu,
+    is_gfx1250_supported,
+    is_hip,
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
@@ -78,6 +82,19 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+# On gfx1250, torch.mm for a bf16 lm_head is slower than aiter's GEMM.
+_use_aiter_lm_head = is_hip() and envs.SGLANG_USE_AITER.get() and is_gfx1250_supported()
+if _use_aiter_lm_head:
+    from aiter.tuned_gemm import tgemm
+
+
+def _aiter_lm_head_ok(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (
+        _use_aiter_lm_head
+        and hidden_states.dim() == 2
+        and hidden_states.dtype == weight.dtype == torch.bfloat16
+    )
+
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
@@ -215,6 +232,25 @@ def autotune_dummy_run_mode(*, run_lm_head: bool):
 
 
 @dataclasses.dataclass
+class _TypedCustomizedInfo:
+    """A ``customized_info`` value with one row per request of the batch."""
+
+    # Host lists once the scheduler materializes the batch's rows.
+    rows: Union[torch.Tensor, List[Any]]
+    # Recorded after the rows' copy to the host; reading the rows waits on it.
+    ready: Optional[torch.Event] = None
+
+
+class TokenCustomizedInfo(_TypedCustomizedInfo):
+    """``[batch_size, width]``: one value per emitted token, stored at that
+    token's output position. A speculative step stores its accepted tokens'."""
+
+
+class RequestCustomizedInfo(_TypedCustomizedInfo):
+    """``[batch_size]``: one value per request, stored once at its first output."""
+
+
+@dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logits of the next tokens.       shape: [#seq, vocab_size]
@@ -226,6 +262,12 @@ class LogitsProcessorOutput:
 
     # Original flattened token indices when only a subset of hidden rows is captured.
     hidden_states_token_indices: Optional[torch.Tensor] = None
+
+    # Post-norm last-layer hidden states of every token, kept under full capture
+    # when `hidden_states` holds the aux hidden states
+    # (--enable-return-aux-hidden-states).
+    # For in-process consumers of this output; not copied into the response path.
+    last_hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -284,6 +326,26 @@ class LogitsProcessorOutput:
 
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
+
+    def own_customized_info(self) -> None:
+        """Copy this forward's typed customized_info rows to the host.
+
+        Producers may publish views of CUDA-graph or persistent buffers, and a
+        graph replay hands back its capture-time dict, so the next forward
+        rewrites them before the scheduler reads the result.
+        """
+        if not self.customized_info:
+            return
+        owned = dict(self.customized_info)
+        ready = None
+        for key, value in owned.items():
+            if isinstance(value, _TypedCustomizedInfo):
+                if ready is None and value.rows.device.type != "cpu":
+                    ready = torch.get_device_module(value.rows.device).Event()
+                owned[key] = type(value)(async_d2h(value.rows), ready)
+        if ready is not None:
+            ready.record()
+        self.customized_info = owned
 
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
@@ -464,6 +526,9 @@ class LogitsProcessor(nn.Module):
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
             config, "enable_lm_head_fp32", False
         )
+        self.use_fp32_lm_head_output = getattr(
+            config, "enable_lm_head_output_fp32", False
+        )
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
@@ -491,6 +556,17 @@ class LogitsProcessor(nn.Module):
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
+        features = get_exec().features
+        self.keep_last_hidden_states = features.aux_hidden_state_capture is not None
+        # Capture-only mode: how many layers the model must capture, when
+        # --return-aux-hidden-state-layer-ids names them.
+        layer_ids = features.return_aux_hidden_state_layer_ids
+        self.expected_aux_hidden_states = (
+            len(layer_ids)
+            if self.keep_last_hidden_states and layer_ids is not None
+            else None
+        )
+        self._aux_hidden_states_checked = False
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
@@ -547,6 +623,11 @@ class LogitsProcessor(nn.Module):
             forward_mode=logits_metadata.forward_mode,
         )
 
+        if self.expected_aux_hidden_states is not None:
+            self._check_aux_hidden_states(
+                aux_hidden_states, hidden_states, logits_metadata
+            )
+
         # Setwise scoring (CausalLM): read label-token logprobs AT each anchor
         # position instead of the last token. Takes precedence over the MIS
         # delimiter path; the two are mutually exclusive for generation.
@@ -598,6 +679,9 @@ class LogitsProcessor(nn.Module):
             sample_indices,
             logits_metadata,
         )
+        last_hidden_states_to_store = self._get_last_hidden_states_to_store(
+            hidden_states, aux_hidden_states, logits_metadata
+        )
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
@@ -611,6 +695,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                last_hidden_states=last_hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
 
@@ -628,6 +713,7 @@ class LogitsProcessor(nn.Module):
         logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            last_hidden_states=last_hidden_states_to_store,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
         logprobs_result.write_input_to(logits_output)
@@ -872,6 +958,53 @@ class LogitsProcessor(nn.Module):
 
         return hidden_states_to_store
 
+    def _get_last_hidden_states_to_store(
+        self,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: Optional[AuxHiddenStates],
+        logits_metadata: LogitsMetadata,
+    ) -> Optional[torch.Tensor]:
+        if (
+            self.keep_last_hidden_states
+            and aux_hidden_states is not None
+            and logits_metadata.capture_hidden_mode.is_full()
+        ):
+            return hidden_states
+        return None
+
+    def _check_aux_hidden_states(
+        self,
+        aux_hidden_states: Optional[AuxHiddenStates],
+        hidden_states: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+    ) -> None:
+        """Fail at the first forward if the model captured fewer layers than asked.
+
+        Most models cannot capture their last layer: the hooks capture a layer's
+        output as the next layer's input, and nothing follows the last one.
+        """
+        if (
+            self._aux_hidden_states_checked
+            or logits_metadata.forward_mode.is_idle()
+            or hidden_states.shape[0] == 0
+        ):
+            return
+        expected = self.expected_aux_hidden_states
+        if aux_hidden_states is None:
+            captured = 0
+        elif isinstance(aux_hidden_states, torch.Tensor):
+            captured = aux_hidden_states.shape[-1] / hidden_states.shape[-1]
+        else:
+            captured = len(aux_hidden_states)
+        if captured != expected:
+            raise ValueError(
+                f"The model captured {captured:g} aux hidden states, but "
+                f"--return-aux-hidden-state-layer-ids names {expected} layers. A "
+                "layer this model cannot capture, usually its last layer, is the "
+                "likely cause."
+            )
+        self._aux_hidden_states_checked = True
+
     def _get_logits(
         self,
         hidden_states: torch.Tensor,
@@ -1091,7 +1224,9 @@ class LogitsProcessor(nn.Module):
             )
             # A shared FP32 buffer must not change the lm_head's output precision.
             # Keep the same rounding as the unbuffered path unless FP32 is enabled.
-            if use_mm_out_dtype and self.use_fp32_lm_head:
+            if use_mm_out_dtype and (
+                self.use_fp32_lm_head or self.use_fp32_lm_head_output
+            ):
                 logits = torch.mm(
                     hidden_states,
                     lm_head.weight.T,
@@ -1115,6 +1250,8 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
+            elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
+                logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
@@ -1279,6 +1416,9 @@ class LogitsProcessor(nn.Module):
             logits.shape
         ):
             assert logits_buffer.dtype == torch.float
+            if logits.is_cuda and logits.dtype in (torch.float16, torch.bfloat16):
+                # Measured on GB300: torch's dtype-casting copy_ is ~2.8x slower.
+                return cast_to_float32_logits(logits, logits_buffer)
             logits_buffer.copy_(logits)
             logits = logits_buffer
         else:

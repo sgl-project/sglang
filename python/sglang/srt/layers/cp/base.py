@@ -25,10 +25,12 @@ The strategy implementation is split across:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 
+from sglang.srt.arg_groups.choices import add_cp_kv_layout_choices
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -96,6 +98,7 @@ class ContextParallelStrategy(ABC):
 
     name: str
     kind: ContextParallelStrategyKind
+    cp_kv_sharded: bool = False
 
     def __init__(self, cp_size: int):
         self.cp_size = cp_size
@@ -244,15 +247,52 @@ def _is_dsa_active() -> bool:
     return False
 
 
-_STRATEGY: Optional[ContextParallelStrategy] = None
+_REGISTERED_CP_KV_LAYOUTS: dict[
+    str, tuple[Callable[..., ContextParallelStrategy], ContextParallelStrategyKind]
+] = {}
+
+
+def register_cp_kv_layout(
+    name: str,
+    factory: Callable[..., ContextParallelStrategy],
+    *,
+    kind: ContextParallelStrategyKind,
+) -> None:
+    """Register a KV layout factory for its compatible compute kind."""
+    _REGISTERED_CP_KV_LAYOUTS[name] = (factory, kind)
+    add_cp_kv_layout_choices([name])
+
+
+# None is uninitialized; False caches a configured-disabled strategy.
+_STRATEGY: ContextParallelStrategy | Literal[False] | None = None
+
+
+@contextmanager
+def disable_cp_strategy():
+    """Suspend the cached target strategy while a TP-only draft runs.
+
+    Pair with a runtime topology scope that disables prefill CP so lazy lookup
+    cannot reconstruct the target strategy. Restore it even if draft work fails.
+    """
+    global _STRATEGY
+    strategy = _STRATEGY
+    _STRATEGY = None
+    try:
+        yield
+    finally:
+        _STRATEGY = strategy
 
 
 def init_cp_strategy(
-    *, enable_prefill_cp: bool, cp_size: int, cp_strategy: str
+    *,
+    enable_prefill_cp: bool,
+    cp_size: int,
+    cp_strategy: str,
+    cp_kv_layout: str | None = None,
 ) -> None:
     """Bind the CP strategy for this process.
 
-    Takes the three values: resolution calls this from inside `__post_init__`,
+    Takes the configuration values: resolution calls this from inside `__post_init__`,
     where the bags do not exist yet, and `get_cp_strategy` calls it lazily in a
     worker, which reads them off the published bags. Each caller reads from the
     source it has.
@@ -260,15 +300,25 @@ def init_cp_strategy(
     global _STRATEGY
 
     if not enable_prefill_cp:
-        _STRATEGY = None
+        _STRATEGY = False
         return
 
     if cp_size <= 1:
-        _STRATEGY = None
+        _STRATEGY = False
         return
 
     kind = ContextParallelStrategyKind.from_string(cp_strategy)
-    if kind == ContextParallelStrategyKind.ZIGZAG:
+    if cp_kv_layout is not None:
+        if cp_kv_layout not in _REGISTERED_CP_KV_LAYOUTS:
+            raise ValueError(f"Unknown cp_kv_layout={cp_kv_layout!r}")
+        factory, layout_kind = _REGISTERED_CP_KV_LAYOUTS[cp_kv_layout]
+        if kind != layout_kind:
+            raise ValueError(
+                f"KV layout {cp_kv_layout!r} requires --cp-strategy "
+                f"{layout_kind.cli_value}"
+            )
+        _STRATEGY = factory(cp_size=cp_size)
+    elif kind == ContextParallelStrategyKind.ZIGZAG:
         from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 
         _STRATEGY = ZigzagCPStrategy(cp_size=cp_size)
@@ -289,6 +339,10 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
     re-run ``ServerArgs.__post_init__`` because the pickled instance bypasses
     ``__init__``. Lazy init lets worker processes recover the singleton from
     global server args.
+
+    Configured-disabled processes cache False; setting _STRATEGY to None allows
+    lazy initialization again. A failed configuration read leaves the singleton
+    uninitialized.
     """
     global _STRATEGY
 
@@ -299,15 +353,22 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
             enable_prefill_cp = parallel.enable_prefill_cp
             cp_size = parallel.attn_cp_size
             cp_strategy = parallel.cp_strategy
+            cp_kv_layout = parallel.cp_kv_layout
         except (AssertionError, AttributeError, RuntimeError, ValueError):
             return None
-        if enable_prefill_cp:
-            init_cp_strategy(
-                enable_prefill_cp=True,
-                cp_size=cp_size,
-                cp_strategy=cp_strategy,
-            )
-    return _STRATEGY
+        init_cp_strategy(
+            enable_prefill_cp=enable_prefill_cp,
+            cp_size=cp_size,
+            cp_strategy=cp_strategy,
+            cp_kv_layout=cp_kv_layout,
+        )
+    return None if _STRATEGY is False else _STRATEGY
+
+
+def is_cp_sharded_padded() -> bool:
+    """Whether the configured strategy selects rank-local KV storage."""
+    strategy = get_cp_strategy()
+    return strategy is not None and strategy.cp_kv_sharded
 
 
 def get_cp_strategy_kind() -> ContextParallelStrategyKind:

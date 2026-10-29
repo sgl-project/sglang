@@ -9,6 +9,7 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
@@ -42,38 +43,85 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 
 class TestTokenizedReqInputMsgpack(unittest.TestCase):
-    def test_rust_tokenized_generate_schema_stays_in_lockstep(self):
-        """Compare the Rust wire declaration with the imported Python schema."""
-        rust_path = (
-            Path(__file__).resolve().parents[4]
-            / "rust/sglang-server/src/message/io_struct.rs"
-        )
-        source = rust_path.read_text()
-        start = source.index("pub(super) TokenizedGenerateReqInput<'a> {")
-        end = source.index("\n    }\n}", start)
-        rust_fields = (
+    _RUST_IO_STRUCT = (
+        Path(__file__).resolve().parents[4]
+        / "rust/sglang-server/src/message/io_struct.rs"
+    )
+
+    @staticmethod
+    def _rust_fields(body: str) -> tuple:
+        # `wire_struct!` emits `rid` and `http_worker_ipc` (the `BaseReq`
+        # header) before the declared fields.
+        return (
             "rid",
             "http_worker_ipc",
-            *re.findall(r"^\s*([a-z][a-z0-9_]*):", source[start:end], re.MULTILINE),
+            *re.findall(r"^\s*([a-z][a-z0-9_]*):", body, re.MULTILINE),
         )
-        python_fields = TokenizedGenerateReqInput.__struct_fields__
 
-        self.assertEqual(python_fields[: len(rust_fields)], rust_fields)
+    def _assert_lockstep(self, python_cls, rust_fields):
+        """The Rust struct encodes positionally: its fields must be a prefix of
+        the Python schema, and Python must default every field Rust omits."""
+        python_fields = python_cls.__struct_fields__
+        self.assertEqual(
+            python_fields[: len(rust_fields)], rust_fields, python_cls.__name__
+        )
         self.assertTrue(
             all(
                 default is not msgspec.NODEFAULT
-                for default in TokenizedGenerateReqInput.__struct_defaults__[
-                    len(rust_fields) :
-                ]
+                for default in python_cls.__struct_defaults__[len(rust_fields) :]
             ),
-            "Rust may omit only a defaulted suffix of the Python wire schema",
+            f"{python_cls.__name__}: Rust may omit only a defaulted suffix of "
+            "the Python wire schema",
         )
+
+    def test_rust_tokenized_generate_schema_stays_in_lockstep(self):
+        """Compare the Rust wire declaration with the imported Python schema."""
+        source = self._RUST_IO_STRUCT.read_text()
+        start = source.index("pub(super) TokenizedGenerateReqInput<'a> {")
+        end = source.index("\n    }\n}", start)
+        self._assert_lockstep(
+            TokenizedGenerateReqInput, self._rust_fields(source[start:end])
+        )
+
+    def test_rust_control_messages_stay_in_lockstep(self):
+        """Every control message the Rust frontend sends (the
+        `control_messages!` block) must decode into its Python namesake."""
+        source = self._RUST_IO_STRUCT.read_text()
+        start = source.index("control_messages! {")
+        block = source[start : source.index("\n}\n", start)]
+        messages = re.findall(
+            # A field-less `Name {}` opens and closes on one line.
+            r"^    ([A-Z][A-Za-z0-9]*) \{(\}|.*?^    \})",
+            block,
+            re.MULTILINE | re.DOTALL,
+        )
+        # Every declaration in the block must be parsed (a drifted layout
+        # would otherwise escape the check), and the set is pinned so adding
+        # a message means extending this test.
+        declared = re.findall(r"^    ([A-Z][A-Za-z0-9]*)\b", block, re.MULTILINE)
+        names = [name for name, _ in messages]
+        self.assertEqual(names, declared)
+        self.assertEqual(
+            set(names),
+            {
+                "AbortReq",
+                "GetInternalStateReq",
+                "FlushCacheReqInput",
+                "CheckWeightsReqInput",
+                "ClearHiCacheReqInput",
+                "DetachHiCacheStorageReqInput",
+                "AttachHiCacheStorageReqInput",
+                "ProfileReq",
+            },
+        )
+        for name, body in messages:
+            self._assert_lockstep(getattr(io_struct, name), self._rust_fields(body))
 
     def _make_mm_inputs(self, device="cpu"):
         return MultimodalProcessorOutput(

@@ -63,6 +63,7 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     _rope_fq4,
+    fused_low_ratio_compress_supported,
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
@@ -120,8 +121,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    _current_capture_var,
     eager_on_graph,
-    is_capturing,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -141,14 +142,12 @@ from sglang.srt.speculative.ragged_verify import (
     compute_target_verify_graph_key,
     compute_uniform_extend_lengths,
     read_ragged_verify_mode,
-    resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
-    from sgl_kernel.flash_mla import FlashMLASchedMeta
-
+    from sglang.kernels.ops.attention.flash_mla_interface import FlashMLASchedMeta
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -205,15 +204,17 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
         return None
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
+    if target_size == curr_size:
+        return x  # F.pad would still copy
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
 
 
 def _create_flashmla_metadata():
     if get_platform().is_sm120 or _is_xpu:
         return None
-    import sgl_kernel.flash_mla as flash_mla
+    from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
 
-    return flash_mla.get_mla_metadata()[0]
+    return get_mla_metadata()[0]
 
 
 # FlashMLA's head64 sm100 decode scheduling constants; not exported, so they hold
@@ -274,6 +275,13 @@ def _maybe_precompute_flashmla_sched_meta(
     flashmla_metadata.num_splits = num_splits
 
 
+def _flashmla_v41_splits_kv(
+    indices: torch.Tensor, extra_indices: Optional[torch.Tensor], min_topk: int
+) -> bool:
+    extra_topk = 0 if extra_indices is None else extra_indices.shape[-1]
+    return indices.shape[-1] + extra_topk >= min_topk
+
+
 def _low_ratio_source_projections(
     layer, x, q_lora, positions, bufs, run_compressor, run_indexer
 ):
@@ -298,10 +306,13 @@ def _low_ratio_source_projections(
         return
 
     if run_compressor and layer.compressor is not None:
-        kv, score = layer.compressor.project(x[:real])
-        put("kv", kv)
-        if score is not None:
-            put("score", score)
+        if layer.compressor.use_fused_gate:
+            put("kv_score", layer.compressor.project_fused(x[:real]))
+        else:
+            kv, score = layer.compressor.project(x[:real])
+            put("kv", kv)
+            if score is not None:
+                put("score", score)
     if run_indexer and layer.indexer is not None:
         # Only the captured consumers read these; a full top-k layer projects
         # once inside its eager break (_index_q_and_weights), so skip them there.
@@ -310,15 +321,25 @@ def _low_ratio_source_projections(
         put("w", indexer.head_weights(x[:real]))
 
 
-def _prefill_graph_full_topk(layer, x, q_lora, pos):
+def _prefill_graph_full_topk(layer, x, q_lora, pos, table):
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    return get_attn_backend()._prefill_graph_full_topk_break(
-        layer, x, q_lora, pos, forward_batch
+    get_attn_backend()._prefill_graph_full_topk_break(
+        layer, x, q_lora, pos, forward_batch, table
     )
 
 
 _bcg_prefill_graph_full_topk = eager_on_graph(True)(_prefill_graph_full_topk)
 _bcg_low_ratio_source_projections = eager_on_graph(True)(_low_ratio_source_projections)
+
+
+def _first_rows(act, n: int):
+    """First ``n`` rows of ``act``, cut field by field for HIP's quantized activations
+    (``Mxfp8Activation``, ``Fp8GridActivation``), which refuse a slice."""
+    if isinstance(act, msgspec.Struct):
+        return msgspec.structs.replace(
+            act, **{k: getattr(act, k)[:n] for k in act.__struct_fields__}
+        )
+    return act[:n]
 
 
 def _as_int_list(values) -> Optional[List[int]]:
@@ -416,10 +437,12 @@ class DSV4AttnMetadata:
     c2_sparse_page_indices: Optional[torch.Tensor] = field(init=False, default=None)
     c2_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
 
-    # Combined decode tables; trtllm_c4_* is shared by ratios 1, 2 and 4.
+    # Combined decode tables; ratios 1, 2 and 4 share trtllm_c4_indices, not the lens.
     trtllm_swa_lens: Optional[torch.Tensor] = None
     trtllm_c4_indices: Optional[torch.Tensor] = None
     trtllm_c4_lens: Optional[torch.Tensor] = None
+    trtllm_c1_lens: Optional[torch.Tensor] = None
+    trtllm_c2_lens: Optional[torch.Tensor] = None
     trtllm_c128_indices: Optional[torch.Tensor] = None
     trtllm_c128_lens: Optional[torch.Tensor] = None
     # trtllm prefill tables, built once per chunk before the indexer runs.
@@ -429,15 +452,14 @@ class DSV4AttnMetadata:
     trtllm_prefill_c4_indices: Optional[torch.Tensor] = None
     trtllm_prefill_c4_lens: Optional[torch.Tensor] = None
     trtllm_prefill_c128: Optional[tuple] = None
-    # Uniform verify / draft-extend query metadata; tensors so replay copies in place.
-    trtllm_seq_lens_req: Optional[torch.Tensor] = None
-    trtllm_cum_seq_lens_q: Optional[torch.Tensor] = None
     # Backend-owned TrtllmSparseTablePool (duck-typed: import cycle); shared, never copied.
     trtllm_table_pool: Optional[object] = None
-    # trtllm topk_v2 path: c4_sparse_page_indices aliases the combined table's tail.
+    # The top-k kernels take a row stride: c{1,2,4}_sparse_page_indices alias the tail.
     trtllm_topk_writes_table: bool = False
     # Late-layer tail: the first indexed layer packs the table even if not an index source.
     trtllm_tail_needs_pack: bool = False
+    # trtllm: the small-metadata kernel zeroed empty ratio-2 lengths, wrote d_c{1,2}_lens.
+    low_ratio_lengths_zeroed: bool = False
 
     c0_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c1_flashmla_metadata: Optional[FlashMLASchedMeta] = field(
@@ -551,8 +573,23 @@ class DSV4AttnMetadata:
 
     def _c4_topk_writes_table(self) -> bool:
         # topk_v2 aliases the table tail unless a raw-indices channel exists;
-        # that reroutes the indexer to the stride-unaware v1 kernel.
-        return self.trtllm_topk_writes_table and self.c4_sparse_raw_indices is None
+        # that reroutes the indexer to the stride-unaware v1 kernel. Without c4
+        # (V4.1) the flag covers only the ratio-1/2 decode writers.
+        return (
+            self.has_c4
+            and self.trtllm_topk_writes_table
+            and self.c4_sparse_raw_indices is None
+        )
+
+    def _topk_writes_table(self, ratio: int) -> bool:
+        if ratio == 4:
+            return self._c4_topk_writes_table()
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            skip_low_ratio_indexer,
+        )
+
+        # A skipped indexer's all-position indices differ per ratio: own buffer, packed.
+        return self.trtllm_topk_writes_table and not skip_low_ratio_indexer(ratio)
 
     def _has_trtllm_indexed_table(self) -> bool:
         # Ratios 1, 2 and 4 all select index_topk entries into one shared table.
@@ -561,6 +598,8 @@ class DSV4AttnMetadata:
     def _zero_empty_low_ratio_lengths(self) -> None:
         # FlashMLA clamps empty compressed histories to one length;
         # trtllm needs zero, since a -1 entry still adds to the softmax denominator.
+        if self.low_ratio_lengths_zeroed:
+            return
         for ratio in self.low_ratios:
             if ratio == 1:
                 continue  # seq_lens_casual >= 1, so a ratio-1 history is never empty
@@ -582,43 +621,44 @@ class DSV4AttnMetadata:
         pool = self.trtllm_table_pool
         assert pool is not None, "trtllm metadata requires the table pool"
 
-        # Not pool-backed: both are read outside this step (eager prefill per-layer reads).
-        n_pad = ceil_align(num_tokens, 64)
-        if n_pad != num_tokens:
-
-            def _tile_padded_step(fill, src, width=None):
-                shape = (n_pad,) if width is None else (n_pad, width)
-                buf = torch.full(shape, fill, **self.cuda_int32_kwargs)
-                buf[:num_tokens].copy_(src)
-                return buf[:num_tokens]
-
-            self.seq_lens_casual = _tile_padded_step(1, self.seq_lens_casual)
-            self.swa_page_indices = _tile_padded_step(
-                -1, self.swa_page_indices, width=swa_width
+        # seq_lens_casual and swa_page_indices need no tile pad: the dense per-token
+        # call reads rows [:num_tokens] only.
+        if swa_width > SWA_WINDOW:
+            self.trtllm_swa_lens = pool.view(
+                "d_swa_lens_wide", num_tokens, fill=SWA_WINDOW, constant=True
             )
-        wide_swa = swa_width > SWA_WINDOW
-        self.trtllm_swa_lens = pool.view(
-            "d_swa_lens", num_tokens, fill=SWA_WINDOW, rows_written_by_caller=wide_swa
-        )
-        if wide_swa:
             torch.clamp(self.swa_topk_lengths, min=SWA_WINDOW, out=self.trtllm_swa_lens)
+        else:
+            # Every row reads all SWA_WINDOW slots, so the role is never written.
+            self.trtllm_swa_lens = pool.view(
+                "d_swa_lens", num_tokens, fill=SWA_WINDOW, constant=True
+            )
         self._zero_empty_low_ratio_lengths()
         if self._has_trtllm_indexed_table():
             assert swa_width == SWA_WINDOW
-            # The tail and lens are refreshed per layer;
-            # when topk_v2 writes the c4 tail itself, the lens are set once per step.
+            # Each index source refreshes the tail and its ratio's lens; when the
+            # indexer writes the tail itself, the lens are set once per step.
             self.trtllm_c4_indices = pool.view(
-                "d_c4", num_tokens, fill=-1, width=SWA_WINDOW + self._c4_table_width()
+                "d_c4",
+                num_tokens,
+                fill=-1,
+                width=SWA_WINDOW + self._c4_table_width(),
+                constant=True,
             )
             self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
-            self.trtllm_c4_lens = pool.view(
-                "d_c4_lens", num_tokens, fill=SWA_WINDOW, rows_written_by_caller=True
-            )
-            if self._c4_topk_writes_table():
-                torch.add(
-                    self.c4_sparse_topk_lengths, SWA_WINDOW, out=self.trtllm_c4_lens
+            for ratio in self.low_ratios + ((4,) if self.has_c4 else ()):
+                lens = pool.view(
+                    f"d_c{ratio}_lens", num_tokens, fill=SWA_WINDOW, constant=True
                 )
-                self.c4_sparse_page_indices = self.trtllm_c4_indices[:, SWA_WINDOW:]
+                setattr(self, f"trtllm_c{ratio}_lens", lens)
+                topk_lengths = self.sparse_topk_lengths(ratio)
+                if topk_lengths is not None and self._topk_writes_table(ratio):
+                    if ratio == 4 or not self.low_ratio_lengths_zeroed:
+                        torch.add(topk_lengths, SWA_WINDOW, out=lens)
+                    # Sources of every ratio share the tail; _tail_refresh_layers
+                    # ensures a layer reads the last source of its own ratio.
+                    tail = self.trtllm_c4_indices[:, SWA_WINDOW:]
+                    setattr(self, f"c{ratio}_sparse_page_indices", tail)
 
         if self.c128_page_indices is not None:
             assert swa_width == SWA_WINDOW
@@ -704,28 +744,6 @@ class DSV4AttnMetadata:
             torch.add(self.c128_topk_lengths_clamp1[:num_tokens], SWA_WINDOW, out=lens)
             self.trtllm_prefill_c128 = (table, lens)
 
-    def init_trtllm_uniform_qmeta(self, q_len: int) -> None:
-        """Build uniform multi-token query metadata once per forward step."""
-
-        assert q_len > 1
-        num_tokens = self.seq_lens_casual.shape[0]
-        assert num_tokens > 0 and num_tokens % q_len == 0, (
-            f"uniform trtllm query layout requires whole request groups: "
-            f"{num_tokens=} {q_len=}"
-        )
-        num_reqs = num_tokens // q_len
-        # Per-request KV length is its last token's causal length;
-        # floored at q_len, as the kernel requires (padded outputs are discarded).
-        self.trtllm_seq_lens_req = (
-            self.seq_lens_casual[q_len - 1 :: q_len].clamp(min=q_len).contiguous()
-        )
-        self.trtllm_cum_seq_lens_q = torch.arange(
-            0,
-            (num_reqs + 1) * q_len,
-            q_len,
-            **self.cuda_int32_kwargs,
-        )
-
     def copy_(self, other: DSV4AttnMetadata) -> None:
         copy_metadata(
             src=other,
@@ -767,10 +785,10 @@ class DSV4AttnMetadata:
                 "trtllm_swa_lens",
                 "trtllm_c4_indices",
                 "trtllm_c4_lens",
+                "trtllm_c1_lens",
+                "trtllm_c2_lens",
                 "trtllm_c128_indices",
                 "trtllm_c128_lens",
-                "trtllm_seq_lens_req",
-                "trtllm_cum_seq_lens_q",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
@@ -794,6 +812,7 @@ class DSV4AttnMetadata:
                 "trtllm_topk_writes_table",
                 # Eager-prefill tail flag; decode metadata never sets it.
                 "trtllm_tail_needs_pack",
+                "low_ratio_lengths_zeroed",
             ],
         )
 
@@ -823,10 +842,10 @@ class DSV4AttnMetadata:
             "trtllm_swa_lens",
             "trtllm_c4_indices",
             "trtllm_c4_lens",
+            "trtllm_c1_lens",
+            "trtllm_c2_lens",
             "trtllm_c128_indices",
             "trtllm_c128_lens",
-            "trtllm_seq_lens_req",
-            "trtllm_cum_seq_lens_q",
         ]
         reference_assign_fields = [
             "page_table",
@@ -998,16 +1017,11 @@ class DSV4AttnMetadata:
             )
 
     def init_flashmla_related(
-        self,
-        is_prefill: bool = False,
-        low_ratio_buffers=None,
-        create_flashmla_metadata: bool = True,
-        alloc_c4_raw_indices: Optional[bool] = None,
+        self, is_prefill: bool = False, low_ratio_buffers=None, trtllm: bool = False
     ):
         # trtllm never launches FlashMLA: no schedule metadata, no raw c4 indices.
-        _mk = _create_flashmla_metadata if create_flashmla_metadata else (lambda: None)
-        if alloc_c4_raw_indices is None:
-            alloc_c4_raw_indices = is_prefill
+        _mk = (lambda: None) if trtllm else _create_flashmla_metadata
+        alloc_c4_raw_indices = is_prefill and not trtllm
         assert self.index_topk in (512, 1024), (
             f"unexpected index_topk={self.index_topk}; "
             "supported: 512 (small) or 1024 (large)"
@@ -1049,6 +1063,7 @@ class DSV4AttnMetadata:
             self.c2_sparse_topk_lengths, self.c2_sparse_page_indices = (
                 low_ratio_buffers[6:8]
             )
+            self.low_ratio_lengths_zeroed = trtllm  # built with zero_empty=trtllm
             self.c1_flashmla_metadata = _mk()
             self.c2_flashmla_metadata = _mk()
             return
@@ -1170,11 +1185,6 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
 
 
-# The replayed context limit when the prefill graph's metadata is built at a fixed
-# width (no two-level candidates); the candidate window, 2,048 blocks of 8 tokens.
-_PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
-
-
 def _prefill_graph_max_seq_len() -> Optional[int]:
     from sglang.srt.runtime_context import get_exec
 
@@ -1196,6 +1206,9 @@ class DSV4Metadata:
     # Shared by all low-ratio source layers; graph replay refreshes them live.
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
+    # The prefill graph's int32 [2, request slots]: each request's first row and row
+    # count, for the captured ratio-2 compressor. Slots past the batch hold no rows.
+    low_ratio_extend_offsets: Optional[torch.Tensor] = None
     # Each low ratio's index-K slots (scoring.prefill_k_slots), gathered once by the
     # extend's metadata builder; the late-layer tail's metadata reads the same dict.
     low_ratio_k_slots: Optional[Dict[int, torch.Tensor]] = None
@@ -1248,6 +1261,10 @@ class DSV4Metadata:
         )
         maybe_copy_inplace(
             self.low_ratio_pos_i64, src=static_metadata.low_ratio_pos_i64
+        )
+        maybe_copy_inplace(
+            self.low_ratio_extend_offsets,
+            src=static_metadata.low_ratio_extend_offsets,
         )
         self.low_ratio_k_slots = static_metadata.low_ratio_k_slots
         self.low_ratio_index_plans = static_metadata.low_ratio_index_plans
@@ -1396,6 +1413,17 @@ class DeepseekV4AttnBackend(
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
+        if is_cuda():
+            from sglang.kernels.ops.attention import flash_mla_interface
+
+            self._swa_interleaved = (
+                self.token_to_kv_pool.get_swa_key_layout().is_interleaved
+            )
+            self._flash_mla_with_kvcache = functools.partial(
+                flash_mla_interface.flash_mla_with_kvcache,
+                use_legacy=not self._swa_interleaved,
+            )
+            self._flashmla_split_kv_min_topk = flash_mla_interface.SPLIT_KV_MIN_TOPK
         # The C4 state ring is addressed per SWA page, so a page holds whole windows.
         assert self.token_to_kv_pool.swa_page_size % SWA_WINDOW == 0
         self.hisparse_coordinator = model_runner.hisparse_coordinator
@@ -1529,7 +1557,7 @@ class DeepseekV4AttnBackend(
         # feed only asserts) except in these cases.
         for bad, why in (
             (not self.is_dspark_draft, "not the DSpark draft runner"),
-            (self.trtllm_attn, "trtllm-gen attention"),
+            (self.needs_cpu_seq_lens, "host sequence lengths"),
             (self.online_c128_mtp.enabled(), "online c128 MTP"),
             (self.token_to_kv_pool.request_window is not None, "a request window"),
             (get_parallel().attn_cp_size != 1, "context parallelism"),
@@ -1560,7 +1588,7 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         bs: int,
     ) -> Optional[RaggedVerifyLayout]:
-        layout = resolve_ragged_verify_layout(forward_batch)
+        layout = forward_batch.ragged_verify_layout
         if layout is None:
             return None
         if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
@@ -1690,7 +1718,7 @@ class DeepseekV4AttnBackend(
         max_seq_len: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        seq_lens_cpu: List[int],
+        seq_lens_cpu: Optional[List[int]],
         out_cache_loc: torch.Tensor,
         num_tokens: int,
         extend_seq_lens: torch.Tensor,
@@ -1828,6 +1856,17 @@ class DeepseekV4AttnBackend(
             metadata.low_ratio_pos_i64 = core_attn_metadata.positions_casual.to(
                 torch.int64
             )
+            # One slot per request the bucket can hold. DP padding extends
+            # extend_seq_lens past the requests; those rows belong to no slot.
+            num_reqs = extend_start_loc.shape[0]
+            offsets = torch.zeros(
+                (2, min(self.req_to_token.shape[0], padded_num_tokens)),
+                dtype=torch.int32,
+                device=extend_seq_lens.device,
+            )
+            offsets[0, :num_reqs] = extend_start_loc
+            offsets[1, :num_reqs] = extend_seq_lens[:num_reqs]
+            metadata.low_ratio_extend_offsets = offsets
         return metadata
 
     @property
@@ -2330,13 +2369,13 @@ class DeepseekV4AttnBackend(
         block_size: int,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4Metadata:
-        if seq_lens_cpu is None:
-            seq_lens_cpu_list = seq_lens.tolist()
-        else:
-            seq_lens_cpu_list = [int(x) for x in seq_lens_cpu.tolist()]
         lengths = compute_uniform_extend_lengths(
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu_list,
+            seq_lens_cpu=(
+                None
+                if seq_lens_cpu is None
+                else [int(x) for x in seq_lens_cpu.tolist()]
+            ),
             extend_len=block_size,
         )
         extend_seq_lens = self._draft_block_extend_lens(lengths.extend_seq_lens_cpu)
@@ -2408,8 +2447,6 @@ class DeepseekV4AttnBackend(
             need_compress=True,
             num_groups=bs,
         )
-        if self.trtllm_attn and not is_ragged:
-            core_attn_metadata.init_trtllm_uniform_qmeta(num_draft_tokens)
         indexer_metadata = (
             self.init_forward_metadata_indexer(
                 core_attn_metadata, use_prefill_cuda_graph=graph_backed
@@ -2563,8 +2600,6 @@ class DeepseekV4AttnBackend(
             is_prefill=True,
             num_groups=batch_size,
         )
-        if self.trtllm_attn:
-            core_attn_metadata.init_trtllm_uniform_qmeta(num_tokens_per_req)
         if swa_out_cache_loc is not None:
             # Captures store_cache's cached path instead of a per-layer
             # in-graph mapping translate.
@@ -2787,7 +2822,6 @@ class DeepseekV4AttnBackend(
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
-        uses_cpu_seq_lens = self.needs_cpu_seq_lens or self.is_dspark_draft
 
         if in_capture:
             # Captured graph does no real cache writes, so synthesize a dummy
@@ -2802,15 +2836,15 @@ class DeepseekV4AttnBackend(
             else:
                 out_cache_loc = None
             actual_forward_mode = forward_batch.forward_mode
-            seq_lens_sum = int(seq_lens.sum().item())
-            seq_lens_cpu = seq_lens.cpu() if uses_cpu_seq_lens else None
+            seq_lens_cpu = seq_lens.cpu() if self.needs_cpu_seq_lens else None
         else:
             out_cache_loc = forward_batch.out_cache_loc
             actual_forward_mode = getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
             )
-            seq_lens_sum = forward_batch.seq_lens_sum
-            seq_lens_cpu = forward_batch.seq_lens_cpu if uses_cpu_seq_lens else None
+            seq_lens_cpu = (
+                forward_batch.seq_lens_cpu if self.needs_cpu_seq_lens else None
+            )
 
         if actual_forward_mode == ForwardMode.IDLE:
             logger.debug(
@@ -2820,9 +2854,8 @@ class DeepseekV4AttnBackend(
             )
             device = seq_lens.device
             seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
-            if uses_cpu_seq_lens:
+            if self.needs_cpu_seq_lens:
                 seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
-            seq_lens_sum = bs
             req_pool_indices = torch.zeros(
                 bs, dtype=req_pool_indices.dtype, device=device
             )
@@ -2881,15 +2914,29 @@ class DeepseekV4AttnBackend(
                 # live inputs before attention. copy_ onto itself is a no-op.
                 core = captured_metadata.core_attn_metadata
                 dspark_swa_buffers = (core.swa_page_indices, core.swa_topk_lengths)
-            temp_metadata = self.init_forward_metadata_dspark_draft_block(
-                max_seq_len=chosen_max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                out_cache_loc=out_cache_loc_padded,
-                block_size=block_size,
-                dspark_swa_buffers=dspark_swa_buffers,
+            # The draft graph also rebuilds the trtllm tables from them (unless a
+            # request window keeps its SWA indices out of the graph).
+            self.trtllm_defer_tables = (
+                self.trtllm_attn
+                and dspark_swa_buffers is not None
+                and self.token_to_kv_pool.request_window is None
             )
+            try:
+                temp_metadata = self.init_forward_metadata_dspark_draft_block(
+                    max_seq_len=chosen_max_seq_len,
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    out_cache_loc=out_cache_loc_padded,
+                    block_size=block_size,
+                    dspark_swa_buffers=dspark_swa_buffers,
+                )
+                if self.trtllm_defer_tables:
+                    temp_metadata.core_attn_metadata.trtllm_swa_lens = (
+                        core.trtllm_swa_lens
+                    )
+            finally:
+                self.trtllm_defer_tables = False
         elif bucket == _GraphBucket.TARGET_VERIFY:
             verify_bs = _get_target_verify_bs(forward_batch)
             ragged_layout = self._resolve_verify_layout(forward_batch, bs=bs)
@@ -3297,6 +3344,13 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=max_seq_len,
             use_prefill_cuda_graph=True,
         )
+        if self._prefill_graph_translates_swa_loc(self.forward_metadata):
+            # Every layer's store reads this buffer; replay refreshes it in place.
+            self.forward_metadata.core_attn_metadata.swa_out_cache_loc = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                ).to(torch.int32)
+            )
         self._activate_request_window()
         with_tail = (
             self.enable_decoder_swa_bounded_replay
@@ -3317,9 +3371,17 @@ class DeepseekV4AttnBackend(
                 )
         return self.forward_metadata
 
+    def _prefill_graph_translates_swa_loc(self, metadata: DSV4Metadata) -> bool:
+        return (
+            metadata.core_attn_metadata.swa_out_cache_loc is None
+            and self.token_to_kv_pool.request_window is None
+            and self.token_to_kv_pool.swa_req_ring_size is None
+        )
+
     def _prefill_graph_context_width(self, forward_batch: ForwardBatch) -> int:
-        """One context width for the full rows' and the late-layer tail's metadata."""
-        if self._prefill_graph_replays_any_context():
+        """One context width for the full rows' and the late-layer tail's metadata:
+        the live context, unless c4/c128 compress metadata is captured at a width."""
+        if not self.has_c4 and not self.has_c128:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
                 return int(seq_lens_cpu.max().item())
@@ -3362,13 +3424,14 @@ class DeepseekV4AttnBackend(
             bufs = {
                 "q": zeros(num_tokens, heads, dim, dtype=torch.bfloat16),
                 "w": zeros(num_tokens, heads, dtype=torch.bfloat16),
-                "kv": zeros(
-                    num_tokens,
-                    latent,
-                    dtype=torch.bfloat16 if ratio == 1 else torch.float32,
-                ),
             }
-            if ratio == 2:
+            if ratio == 1:
+                bufs["kv"] = zeros(num_tokens, latent, dtype=torch.bfloat16)
+            elif fused_low_ratio_compress_supported():
+                # The fused compressor reads | kv | score | rows.
+                bufs["kv_score"] = zeros(num_tokens, 2 * latent, dtype=torch.float32)
+            else:
+                bufs["kv"] = zeros(num_tokens, latent, dtype=torch.float32)
                 bufs["score"] = zeros(num_tokens, latent, dtype=torch.float32)
             # Keep the previous allocations alive: captured graphs still hold them.
             sets[ratio] = [bufs] + (have or [])
@@ -3395,6 +3458,12 @@ class DeepseekV4AttnBackend(
         )
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
+        if self._prefill_graph_translates_swa_loc(static_metadata):
+            capture_metadata.core_attn_metadata.swa_out_cache_loc.copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    metadata_batch.out_cache_loc
+                )
+            )
         self.prefill_graph_replay_batch = forward_batch
         self.forward_metadata = capture_metadata
         self._activate_request_window()
@@ -3550,9 +3619,10 @@ class DeepseekV4AttnBackend(
             # extend past them; an eager break in the late-layer tail sees fewer, and
             # there extend_seq_lens still spans the whole extend.
             n = min(hoisted_pos.shape[0], positions.shape[0])
-            x, positions = x[:n], positions[:n]
-            if q_lora is not None:
-                q_lora = q_lora[:n]
+            if n < positions.shape[0]:
+                x, positions = _first_rows(x, n), positions[:n]
+                if q_lora is not None:
+                    q_lora = _first_rows(q_lora, n)
             req, pos = hoisted_req[:n], hoisted_pos[:n]
         if (
             forward_batch.forward_mode.is_extend()
@@ -3568,9 +3638,19 @@ class DeepseekV4AttnBackend(
                 layer, x, q_lora, pos, bufs, run_compressor, captured_index
             )
             if run_compressor and layer.compressor is not None:
-                self._low_ratio_compress_torch(
-                    layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
-                )
+                if layer.compressor.use_fused_gate:
+                    self._low_ratio_compress_fused(
+                        layer,
+                        x,
+                        req,
+                        pos,
+                        projected=bufs["kv_score"],
+                        extend_offsets=meta.low_ratio_extend_offsets.unbind(),
+                    )
+                else:
+                    self._low_ratio_compress_torch(
+                        layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
+                    )
             if run_indexer and layer.indexer is not None:
                 if captured_index:
                     # Captured: sparse scores of the published blocks only, so
@@ -3578,11 +3658,23 @@ class DeepseekV4AttnBackend(
                     self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
                 else:
                     # Eager break: dense scoring over the live context; the
-                    # candidate source hands its block table to the consumers.
-                    out = _bcg_prefill_graph_full_topk(layer, x, q_lora, pos)
-                    if layer.indexer.is_candidate_source:
+                    # candidate source writes its block table for the consumers.
+                    if not layer.indexer.is_candidate_source:
+                        _bcg_prefill_graph_full_topk(layer, x, q_lora, pos, None)
+                    else:
+                        candidates = self.prefill_candidates
+                        rows = x.shape[0]
+                        table = candidates.prefill_graph_table(layer.layer_id, rows)
+                        # A capture records the table it is given; the warmup
+                        # before it allocates one.
+                        assert (
+                            table is not None or _current_capture_var.get() is None
+                        ), "candidate table not allocated before capture"
+                        _bcg_prefill_graph_full_topk(layer, x, q_lora, pos, table)
+                        if table is None:  # first run: the break allocated the buffers
+                            table = candidates.prefill_graph_table(layer.layer_id, rows)
                         self.forward_metadata.candidate_metadata = (
-                            self.prefill_candidates.bind_prefill_graph_table(out)
+                            candidates.bind_prefill_graph_table(table)
                         )
             return
         if run_compressor and layer.compressor is not None:
@@ -3737,10 +3829,11 @@ class DeepseekV4AttnBackend(
         )
 
     def _low_ratio_compress_fused(
-        self, layer, x, req, pos, *, draft_len=1, extend_offsets=None
+        self, layer, x, req, pos, *, draft_len=1, extend_offsets=None, projected=None
     ) -> None:
         """Decode or target-verify; an extend batch passes ``extend_offsets``, the int32
-        (first row, row count) of each request."""
+        (first row, row count) of each request. ``projected`` is the compressor's
+        projection of ``x`` when the caller already has it."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
             index_k_norm_rope_pack_store,
         )
@@ -3769,7 +3862,7 @@ class DeepseekV4AttnBackend(
         if layer.compress_ratio == 1:
             # At ratio 1, c1_out_loc equals the int64 raw_out_loc supplied by the scheduler.
             latent = c1_decode_norm_rope_store(
-                compressor.wkv(x),
+                compressor.wkv(x) if projected is None else projected,
                 compressor.norm.weight.data,
                 pos,
                 core.raw_out_loc,
@@ -3785,7 +3878,7 @@ class DeepseekV4AttnBackend(
             # KVAndScore rows use | kv | score |, addressed as req * ring_size + pos % ring_size.
             state = pool.get_attention_compress_states(layer_id)
             args = (
-                compressor.project_fused(x),
+                compressor.project_fused(x) if projected is None else projected,
                 state.kv_score_buffer.kv_score,
                 compressor.norm.weight.data,
                 pos,
@@ -3951,7 +4044,7 @@ class DeepseekV4AttnBackend(
                     loc=slots,
                     cache_k=layer.indexer.index_keys(latent, freqs),
                 )
-        if pool.get_extra_key_layout(layer.layer_id) is KVLayout.V41_FP4:
+        if pool.get_extra_key_layout(layer.layer_id).is_fp4:
             # The fp4 cache stores e2m1 codes: the kernel rotates the tail and
             # rounds once, with no fake quantization in between.
             pool.set_extra_key_buffer_fused(
@@ -4128,23 +4221,6 @@ class DeepseekV4AttnBackend(
             return
         self.forward_metadata.candidate_metadata = published
 
-    def _prefill_graph_replays_any_context(self) -> bool:
-        """Whether a prefill graph replay admits any context length: with two-level
-        candidates only c4/c128 compress metadata would be captured at a width."""
-        return self.low_ratio_prefill_graph and not self.has_c4 and not self.has_c128
-
-    @property
-    def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
-        """DeepSeek-V4.1's fixed metadata width without two-level candidates; prefill
-        context parallelism builds its own metadata and needs none."""
-        if (
-            self.low_ratios != (1, 2)
-            or get_parallel().attn_cp_size > 1
-            or self._prefill_graph_replays_any_context()
-        ):
-            return None
-        return _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN
-
     def _prefill_graph_seq_limit(self) -> Optional[int]:
         """The replayed context limit: cuda_graph_config[prefill].max_seq_len when
         the user sets it, else this backend's default."""
@@ -4153,10 +4229,12 @@ class DeepseekV4AttnBackend(
             return max_seq_len
         return self.prefill_cuda_graph_default_max_seq_len
 
-    def _prefill_graph_full_topk_break(self, layer, x, q_lora, pos, forward_batch):
+    def _prefill_graph_full_topk_break(
+        self, layer, x, q_lora, pos, forward_batch, table
+    ):
         """One full top-k layer at an eager break of the prefill graph, over the live
         batch at any context length: writes the sparse indices the attention break
-        reads, and the candidate source returns its table for the captured consumers."""
+        reads and, for the candidate source, the table the captured consumers read."""
         indexer = layer.indexer
         real = forward_batch.global_num_token_non_padded_cpu
         if real is None:
@@ -4179,10 +4257,8 @@ class DeepseekV4AttnBackend(
         )
         if not indexer.is_candidate_source:
             self.full_topk_indexer.topk_prefill(inputs)
-            return ()
-        return self.prefill_candidates.publish_prefill_graph(
-            inputs, x.shape[0], shared=is_capturing()
-        )
+            return
+        self.prefill_candidates.publish_prefill_graph(inputs, x.shape[0], table)
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Idle never trusts its metadata, which may be stale or unset: it writes
@@ -4461,9 +4537,16 @@ class DeepseekV4AttnBackend(
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
                 else:
-                    from sgl_kernel.flash_mla import flash_mla_with_kvcache
+                    flash_mla_with_kvcache = self._flash_mla_with_kvcache
 
-                if self.is_dsv41:
+                if self.is_dsv41 and (
+                    not self._swa_interleaved
+                    or _flashmla_v41_splits_kv(
+                        swa_page_indices,
+                        extra_indices,
+                        self._flashmla_split_kv_min_topk,
+                    )
+                ):
                     _maybe_precompute_flashmla_sched_meta(
                         flashmla_metadata,
                         q=q,
@@ -4510,7 +4593,9 @@ class DeepseekV4AttnBackend(
         if _is_xpu:
             from sgl_kernel import flash_mla_sparse_fwd
         else:
-            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+            from sglang.kernels.ops.attention.flash_mla_interface import (
+                flash_mla_sparse_fwd,
+            )
 
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
@@ -4772,7 +4857,7 @@ class DeepseekV4AttnBackend(
     def expand_prefill_casually(
         self,
         num_tokens: int,
-        seq_lens: List[int],
+        seq_lens: Optional[List[int]],
         extend_seq_lens: List[int],
         req_pool_indices: torch.Tensor,
         padded_num_tokens: Optional[int],
@@ -4980,8 +5065,16 @@ class DeepseekV4AttnBackend(
         )
 
         if need_compress:
+            lens, pool, rows = (), self.trtllm_table_pool, out_loc.numel()
+            if small_metadata and self.trtllm_attn:  # the kernel writes the table lens
+                lens = [
+                    pool.view(f"d_c{r}_lens", rows, SWA_WINDOW, constant=True)
+                    for r in (1, 2)
+                ]
             low_ratio_buffers = (
-                build_low_ratio_metadata(seq_lens_casual, out_loc, self.index_topk)
+                build_low_ratio_metadata(
+                    seq_lens_casual, out_loc, self.index_topk, lens, SWA_WINDOW
+                )
                 if small_metadata
                 else None
             )
@@ -4989,8 +5082,7 @@ class DeepseekV4AttnBackend(
             core_attn_metadata.init_flashmla_related(
                 is_prefill=is_prefill,
                 low_ratio_buffers=low_ratio_buffers,
-                create_flashmla_metadata=not self.trtllm_attn,
-                alloc_c4_raw_indices=is_prefill and not self.trtllm_attn,
+                trtllm=self.trtllm_attn,
             )
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
@@ -5103,6 +5195,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         inner_fb = SimpleNamespace(
             batch_size=forward_batch.batch_size,
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             # Propagate the real runtime mode so inner backends can detect IDLE
             # and apply their idle substitution.
             actual_forward_mode=getattr(

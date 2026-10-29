@@ -598,8 +598,6 @@ struct FusedNormRopeKernel {
   static_assert(
       !(kIsIndexer && kLayout != deepseek_v4::KVLayout::V4), "the V4.1 layouts are FlashMLA (head_dim=512) caches");
   static_assert(!(kIsIndexer && kUniformFp8Store), "uniform fp8 store only for flashmla head_dim=512");
-  static_assert(!(kBf16Store && kUniformFp8Store));
-  static_assert(!(kUniformFp8Store && kLayout != deepseek_v4::KVLayout::V4), "the uniform fp8 store is a V4 cache");
   static constexpr int64_t kIndexerBytes = 132 * kPageSize;
   static constexpr int64_t kFlashMLABytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
   static_assert(kLayout != deepseek_v4::KVLayout::V4 || kFlashMLABytes == host::div_ceil(584 * kPageSize, 576) * 576);

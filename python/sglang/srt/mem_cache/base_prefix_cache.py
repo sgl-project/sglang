@@ -18,6 +18,8 @@ from typing import (
 
 import torch
 
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -58,6 +60,7 @@ class PrefixCacheTrait(Protocol):
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
+    logical_page_size: int
     disable: bool
 
 
@@ -504,11 +507,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
         # Adjacent pieces whose seam falls inside one (DCP-widened) page would
         # free that page twice; the allocator rejects that, so merge them first.
+        global_page_size = self.logical_page_size
         free_kv_row_segments(
             allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
             swa_evicted_seqlen=kv.get_evicted_seqlen(ComponentType.SWA),
-            swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
+            swa_dead_lo=kv.swa_dead_lo(global_page_size),
         )
 
     @abstractmethod
@@ -687,24 +691,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             return None
         return max(self.sliding_window_size, self.draft_swa_window)
 
-    def evict_sliding_windows(
-        self, req: Req, pre_len: int, *, eviction_interval: int = 1
-    ) -> None:
-        """Slide request-owned windows at the scheduler's safe eviction frontier."""
-        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
-
-        free_swa_out_of_window_slots(
-            req,
-            pre_len,
-            sliding_window_size=self.swa_retain_window,
-            page_size=self.page_size,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            supports_prefix_sharing=self.supports_prefix_sharing(),
-            retain_floor=self.swa_retain_floor(req),
-            eviction_interval=eviction_interval,
-        )
-
     def swa_retain_floor(self, req) -> int | None:
         # A match lands on a state checkpoint rather than on the tail, so a cache
         # that pairs SWA with mamba/conv checkpoints has to keep the window behind
@@ -737,5 +723,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
+        if is_cp_sharded_padded():
+            available_size = from_cp_sharded(available_size)
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"

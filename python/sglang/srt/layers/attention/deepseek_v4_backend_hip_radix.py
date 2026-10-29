@@ -57,7 +57,9 @@ from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     opus_sparse_prefill,
 )
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
+from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.amd.binding import is_metadata_unread
 from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -86,7 +88,6 @@ from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
-    UnifiedKvMetadata,
     copy_metadata,
     maybe_copy_inplace,
 )
@@ -105,20 +106,15 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.monokernels.runtime import is_metadata_unread
-from sglang.srt.monokernels.spec import StepMetadata
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_spec,
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import ceil_align, is_gfx95_supported
 
 if TYPE_CHECKING:
-    from sgl_kernel.flash_mla import FlashMLASchedMeta
-
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
         FP4DecodeWorkspace,
         FP4KWriteMetadata,
@@ -126,6 +122,7 @@ if TYPE_CHECKING:
         FP4RowgroupDecodeWorkspace,
         FP4RowgroupPrefillWorkspace,
     )
+    from sglang.kernels.ops.attention.flash_mla_interface import FlashMLASchedMeta
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -159,6 +156,9 @@ _OPUS_PREFILL_MIN_TOKENS = 1024
 _OPUS_PREFILL_MAX_ROWS_PER_TOKEN = {1: 256, 2: 128}
 # One ratio's bf16 workspace stays within 1 GiB.
 _OPUS_PREFILL_MAX_WORKSPACE_ROWS = 1 << 20
+# DeepSeek-V4.1's prefill graph metadata width when the user sets no
+# cuda_graph_config[prefill].max_seq_len; longer contexts run eager.
+_PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
 
 
 @dataclass
@@ -245,13 +245,131 @@ def _create_flashmla_metadata():
 
     if is_hip():
         return None
-    import sgl_kernel.flash_mla as flash_mla
+    from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
 
-    return flash_mla.get_mla_metadata()[0]
+    return get_mla_metadata()[0]
 
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
+
+
+@dataclass
+class UnifiedKvMetadata:
+    # SWA ring write target (req_slot*ring + pos%ring)
+    swa_loc: Optional[torch.Tensor] = None
+
+    # ragged decode index streams
+    swa_indices: Optional[torch.Tensor] = None
+    swa_indptr: Optional[torch.Tensor] = None
+    hca_indices: Optional[torch.Tensor] = None
+    hca_indptr: Optional[torch.Tensor] = None
+    csa_indices: Optional[torch.Tensor] = None
+    csa_indptr: Optional[torch.Tensor] = None
+
+    # Grouped target-verify streams for the asm decode: one per (request,
+    # draft group), laid out [compressed tail][that group's window slice] so
+    # the kernel's own causal bound and band mask land on each draft's real
+    # cutoff.
+    gasm_indices: Optional[torch.Tensor] = None
+    gasm_kv_indptr: Optional[torch.Tensor] = None
+    gasm_qo_indptr: Optional[torch.Tensor] = None
+
+    # Grouped target-verify streams for the FlyDSL fp8 decode: one per request
+    # on HCA / SWA-only layers, with per-draft key ranges (q_kv_bounds).
+    grp_qo_indptr: Optional[torch.Tensor] = None
+    grp_hca_indices: Optional[torch.Tensor] = None
+    grp_hca_indptr: Optional[torch.Tensor] = None
+    grp_hca_bounds: Optional[torch.Tensor] = None
+    grp_swa_indices: Optional[torch.Tensor] = None
+    grp_swa_indptr: Optional[torch.Tensor] = None
+    grp_swa_bounds: Optional[torch.Tensor] = None
+
+    # prefill/extend per-token mapping
+    pf_state_slot: Optional[torch.Tensor] = None
+    pf_chunk_start: Optional[torch.Tensor] = None
+    pf_cu_q: Optional[torch.Tensor] = None
+    pf_final_pos: Optional[torch.Tensor] = None
+
+    # Per-token req-slot map for the target-verify SWA ring store (num_draft*bs
+    # tokens); unused by plain decode, whose store reads req_pool_indices live.
+    verify_store_state_slot: Optional[torch.Tensor] = None
+
+    # SWA-page-offset compressed-store locations (= c*_out_loc + unified_swa_pages),
+    # precomputed once per step to drop the per-layer int add in the store path.
+    c4_out_loc: Optional[torch.Tensor] = None
+    c128_out_loc: Optional[torch.Tensor] = None
+
+    def copy_(self, other: UnifiedKvMetadata) -> None:
+        copy_metadata(
+            src=other,
+            dst=self,
+            check_eq_fields=[],
+            copy_fields=[
+                "swa_indices",
+                "swa_indptr",
+                "hca_indices",
+                "hca_indptr",
+                "gasm_indices",
+                "gasm_kv_indptr",
+                "gasm_qo_indptr",
+                "grp_qo_indptr",
+                "grp_hca_indices",
+                "grp_hca_indptr",
+                "grp_hca_bounds",
+                "grp_swa_indices",
+                "grp_swa_indptr",
+                "grp_swa_bounds",
+                "csa_indices",
+                "csa_indptr",
+                "pf_state_slot",
+                "pf_chunk_start",
+                "pf_cu_q",
+                "pf_final_pos",
+                "verify_store_state_slot",
+                "c4_out_loc",
+                "c128_out_loc",
+                # Captured store_cache reads swa_loc by address, and the eager
+                # target-verify path builds it outside the graph.
+                "swa_loc",
+            ],
+            assign_fields=[],
+        )
+
+    def refresh_for_breakable_cuda_graph_replay_(
+        self, other: UnifiedKvMetadata
+    ) -> None:
+        copy_metadata(
+            src=other,
+            dst=self,
+            check_eq_fields=[],
+            copy_fields=[
+                "swa_loc",
+                "swa_indices",
+                "swa_indptr",
+                "hca_indices",
+                "hca_indptr",
+                "gasm_indices",
+                "gasm_kv_indptr",
+                "gasm_qo_indptr",
+                "grp_qo_indptr",
+                "grp_hca_indices",
+                "grp_hca_indptr",
+                "grp_hca_bounds",
+                "grp_swa_indices",
+                "grp_swa_indptr",
+                "grp_swa_bounds",
+                "csa_indices",
+                "csa_indptr",
+                "pf_state_slot",
+                "pf_chunk_start",
+                "pf_cu_q",
+                "pf_final_pos",
+                "verify_store_state_slot",
+                "c4_out_loc",
+                "c128_out_loc",
+            ],
+        )
 
 
 @dataclass
@@ -777,12 +895,6 @@ class DeepseekV4HipRadixBackend(
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
     can_run_prefill_cuda_graph = DeepseekV4AttnBackend.can_run_prefill_cuda_graph
-    prefill_cuda_graph_default_max_seq_len = (
-        DeepseekV4AttnBackend.prefill_cuda_graph_default_max_seq_len
-    )
-    _prefill_graph_replays_any_context = (
-        DeepseekV4AttnBackend._prefill_graph_replays_any_context
-    )
     _prefill_graph_seq_limit = DeepseekV4AttnBackend._prefill_graph_seq_limit
     _low_ratio_in_prefill_graph = DeepseekV4AttnBackend._low_ratio_in_prefill_graph
     _low_ratio_compress = DeepseekV4AttnBackend._low_ratio_compress
@@ -1899,7 +2011,7 @@ class DeepseekV4HipRadixBackend(
                 )
         elif bucket == _GraphBucket.TARGET_VERIFY:
             assert out_cache_loc is not None
-            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            ragged_layout = forward_batch.ragged_verify_layout
             if ragged_layout is not None:
                 ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
                 num_tokens_v = ragged_layout.graph_num_tokens
@@ -2026,7 +2138,7 @@ class DeepseekV4HipRadixBackend(
                 block_size=int(forward_batch.spec_info.draft_token_num),
             )
         elif forward_batch.forward_mode.is_target_verify():
-            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            ragged_layout = forward_batch.ragged_verify_layout
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -2248,6 +2360,12 @@ class DeepseekV4HipRadixBackend(
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             seq_lens_cpu=seq_lens_cpu,
         )
+
+    @property
+    def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
+        if self.low_ratios != (1, 2) or get_parallel().attn_cp_size > 1:
+            return None
+        return _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN
 
     def _graph_metadata_max_seq_len(self, forward_batch: ForwardBatch) -> Optional[int]:
         """
@@ -3597,6 +3715,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
         inner_fb = SimpleNamespace(
             batch_size=forward_batch.batch_size,
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             # Propagate the real runtime mode so inner backends can detect IDLE
             # and apply their idle substitution.
             actual_forward_mode=actual_forward_mode,
