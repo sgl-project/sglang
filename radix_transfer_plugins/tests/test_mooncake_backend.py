@@ -4,7 +4,12 @@ import threading
 import pytest
 from conftest import USING_FAKE_MOONCAKE, FakeMooncakeStore
 
-from radix_transfer_plugins import available_backends, create_backend
+from radix_transfer_plugins import (
+    RangeRead,
+    StoreRef,
+    available_backends,
+    create_backend,
+)
 from radix_transfer_plugins.backends.mooncake import (
     MooncakeBackend,
     MooncakeConfig,
@@ -31,6 +36,15 @@ def make_backend(**overrides) -> tuple[MooncakeBackend, FakeMooncakeStore]:
 
 def parts(*sizes):
     return {f"f{i}": memoryview(bytes([i]) * size) for i, size in enumerate(sizes)}
+
+
+def ranges(key, *spans):
+    """Range reads of object ``key``; each span is (part, src_offset, nbytes, dst_offset)."""
+    ref = StoreRef(backend="mooncake", key=key, fields=())
+    return [
+        RangeRead(ref=ref, field=part, src_offset=src, nbytes=size, dst_offset=dst)
+        for part, src, size, dst in spans
+    ]
 
 
 def test_client_holds_no_segment():
@@ -148,7 +162,7 @@ def test_range_reads_take_one_get_into_ranges_call_into_one_registration():
     into = memoryview(bytearray(7))
 
     backend.get_ranges(
-        [(key, "a", 2, 3, 4), (key, "b", 5, 2, 0), (key, "a", 7, 2, 2)], into=into
+        ranges(key, ("a", 2, 3, 4), ("b", 5, 2, 0), ("a", 7, 2, 2)), into=into
     )
 
     assert registers == [7]
@@ -162,11 +176,11 @@ def test_a_failed_range_read_names_the_part_and_unregisters_its_memory():
     (key,) = backend.put_many([parts(3)])
     into = memoryview(bytearray(3))
     with pytest.raises(KeyError, match=f"{key}/f9"):
-        backend.get_ranges([(key, "f0", 0, 3, 0), (key, "f9", 0, 3, 0)], into=into)
+        backend.get_ranges(ranges(key, ("f0", 0, 3, 0), ("f9", 0, 3, 0)), into=into)
     assert store.registered == {}
     # Past the registered memory: Mooncake's -600 is a failed read, not a size mismatch.
     with pytest.raises(RuntimeError, match=f"{key}/f0: -600"):
-        backend.get_ranges([(key, "f0", 0, 3, 1)], into=into)
+        backend.get_ranges(ranges(key, ("f0", 0, 3, 1)), into=into)
     assert store.registered == {}
 
     def broken(*args):
@@ -174,7 +188,7 @@ def test_a_failed_range_read_names_the_part_and_unregisters_its_memory():
 
     store.get_into_ranges = broken
     with pytest.raises(OSError):
-        backend.get_ranges([(key, "f0", 0, 3, 0)], into=into)
+        backend.get_ranges(ranges(key, ("f0", 0, 3, 0)), into=into)
     assert store.registered == {}
 
 

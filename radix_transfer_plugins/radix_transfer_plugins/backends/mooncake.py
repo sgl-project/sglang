@@ -35,6 +35,7 @@ import numpy as np
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 from radix_transfer_plugins.backend import StorageBackend
+from radix_transfer_plugins.schema import RangeRead
 
 logger = logging.getLogger(__name__)
 
@@ -162,16 +163,16 @@ class MooncakeBackend(StorageBackend):
         if failed:
             _raise_failed_reads(failed)
 
-    def get_ranges(
-        self, reads: Sequence[tuple[str, str, int, int, int]], *, into: memoryview
-    ) -> None:
+    def get_ranges(self, reads: Sequence[RangeRead], *, into: memoryview) -> None:
         # Part key -> (dst offsets, src offsets, sizes) of its ranges.
         ranges: dict[str, tuple[list[int], list[int], list[int]]] = {}
-        for key, name, src_offset, nbytes, dst_offset in reads:
-            dsts, srcs, sizes = ranges.setdefault(_part_key(key, name), ([], [], []))
-            dsts.append(dst_offset)
-            srcs.append(src_offset)
-            sizes.append(nbytes)
+        for read in reads:
+            dsts, srcs, sizes = ranges.setdefault(
+                _part_key(read.ref.key, read.field), ([], [], [])
+            )
+            dsts.append(read.dst_offset)
+            srcs.append(read.src_offset)
+            sizes.append(read.nbytes)
         part_keys = list(ranges)
         all_dsts, all_srcs, all_sizes = [list(c) for c in zip(*ranges.values())]
         with self._registered(np.frombuffer(into, dtype=np.uint8)) as base:

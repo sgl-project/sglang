@@ -107,19 +107,7 @@ class OutputStore:
         for read in reads:
             (spec,) = _named_specs(read.ref, [read.field])
             _check_range(read, spec=spec, into=into)
-        self._backend.get_ranges(
-            [
-                (
-                    read.ref.key,
-                    read.field,
-                    read.src_offset,
-                    read.nbytes,
-                    read.dst_offset,
-                )
-                for read in reads
-            ],
-            into=into,
-        )
+        self._backend.get_ranges(reads, into=into)
 
     def delete_many(self, refs: Sequence[StoreRef]) -> None:
         """Delete every field of each ref."""

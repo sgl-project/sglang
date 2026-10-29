@@ -21,7 +21,7 @@ class MemoryBackend(StorageBackend):
     def __init__(self):
         self.objects: dict[str, dict[str, bytes]] = {}
         self.reads: list[list[str]] = []
-        self.range_reads: list[list[tuple[str, str, int, int, int]]] = []
+        self.range_reads: list[list[RangeRead]] = []
         self.next_id = 0
 
     def put_many(self, objects):
@@ -44,9 +44,10 @@ class MemoryBackend(StorageBackend):
 
     def get_ranges(self, reads, *, into):
         self.range_reads.append(list(reads))
-        for key, part, src_offset, nbytes, dst_offset in reads:
-            data = self.objects[key][part][src_offset : src_offset + nbytes]
-            into[dst_offset : dst_offset + nbytes] = data
+        for read in reads:
+            stored = self.objects[read.ref.key][read.field]
+            data = stored[read.src_offset : read.src_offset + read.nbytes]
+            into[read.dst_offset : read.dst_offset + read.nbytes] = data
 
     def delete_many(self, keys, *, parts):
         for key, names in zip(keys, parts):

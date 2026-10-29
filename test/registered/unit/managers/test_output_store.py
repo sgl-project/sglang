@@ -66,9 +66,10 @@ class _MemoryBackend(StorageBackend):
         ]
 
     def get_ranges(self, reads, *, into):
-        for key, part, src_offset, nbytes, dst_offset in reads:
-            data = self.objects[key][part][src_offset : src_offset + nbytes]
-            into[dst_offset : dst_offset + nbytes] = data
+        for read in reads:
+            stored = self.objects[read.ref.key][read.field]
+            data = stored[read.src_offset : read.src_offset + read.nbytes]
+            into[read.dst_offset : read.dst_offset + read.nbytes] = data
 
     def delete_many(self, keys, *, parts):
         if self.delete_error is not None:
