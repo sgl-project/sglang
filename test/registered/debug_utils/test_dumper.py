@@ -2005,6 +2005,54 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
         assert "non_intrusive__model.wrap.output" in captured
         assert "non_intrusive__model.wrap.output.0" not in captured
 
+    def test_unreduced_output_wrapper_dumped_as_payload(self, tmp_path):
+        # Deferred-allreduce layers hand UnreducedOutput across the boundary; the
+        # dumper must serialize the payload under the argument's own name without
+        # unwrapping it for the consumer.
+        from sglang.srt.layers.communicator import UnreducedOutput
+
+        class Layer(torch.nn.Module):
+            def forward(self, positions, hidden_states, residual):
+                payload = (
+                    hidden_states.partial
+                    if isinstance(hidden_states, UnreducedOutput)
+                    else hidden_states
+                )
+                out = payload + residual
+                payload.fill_(-1.0)
+                return UnreducedOutput(partial=out), residual
+
+        class Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([Layer(), Layer()])
+
+            def forward(self, x):
+                hidden = x
+                residual = torch.zeros_like(x)
+                for layer in self.layers:
+                    hidden, residual = layer(x, hidden, residual)
+                return hidden
+
+        d = self._make_dumper(tmp_path)
+        model = self._wrap_as_outer(Inner)
+        d.register_non_intrusive_dumper(model)
+
+        x = torch.randn(2, 4)
+        original_x = x.clone()
+        with d.capture_output() as captured:
+            output = model(x)
+
+        P = self._PREFIX
+        # The pre-hook snapshot survives the consumer's in-place payload mutation.
+        dumped_input = captured[f"{P}model.layers.1.inputs.1"]["value"]
+        assert torch.allclose(dumped_input, original_x)
+        assert f"{P}model.layers.0.output.0" in captured
+        assert f"{P}model.layers.0.output.1" in captured
+        # The wrapper itself still reaches the consumer untouched.
+        assert isinstance(output, UnreducedOutput)
+        assert torch.allclose(output.partial, original_x)
+
     def test_multiple_forward_inputs(self, tmp_path):
         class TwoInputModule(torch.nn.Module):
             def forward(self, x, mask):
