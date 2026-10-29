@@ -15,6 +15,10 @@ import torch
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.environ import envs
 from sglang.srt.speculative import prepared_next_draft
+from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    make_post_verify_io,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -44,17 +48,24 @@ class EaglePostVerifyGraphs:
     """The verify's post-section in SGLang's own CUDA graphs, one set per key: batch
     size, sampling mode, forced acceptance, tracking and the verify logits buffer."""
 
-    def __init__(self, *, target_worker: Any, simulated_acc_len_rng: torch.Generator):
+    def __init__(
+        self,
+        *,
+        target_worker: Any,
+        simulated_acc_len_rng: torch.Generator,
+        speculative_runtime_hooks: Any = STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    ):
         self._target_worker = target_worker
+        self._speculative_runtime_hooks = speculative_runtime_hooks
         self._prepare_next_draft = prepared_next_draft.prepared_next_draft_enabled()
-        # Keep draft-extend metadata in persistent post-verify slot outputs.  The
-        # main stream consumes these tensors after the producer graph, instead of
-        # borrowing temporary plan-stream allocations across streams.
+        # Preparing the next draft also lets this launch produce the draft-extend
+        # layout and the bonus token in the dtype its next consumers read.
         self._extend_layout = self._prepare_next_draft
         self._extend_mrope = (
             self._extend_layout
             and target_worker.model_runner.model_config.model_is_mrope
         )
+        self._bonus_dtype = torch.int64 if self._prepare_next_draft else torch.int32
         self._graphs = _PostVerifyGraphs(
             body=self._body,
             commit=self._commit,
@@ -216,6 +227,9 @@ class EaglePostVerifyGraphs:
             need_top_k=bool(info.need_top_k_sampling),
             need_top_p=bool(info.need_top_p_sampling),
             max_top_k=max_top_k,
+            sampling_info=info,
+            unused_sampling_tensor=torch.empty(0, device=batch.device),
+            return_logprob=bool(batch.return_logprob),
             logits=logits_output.next_token_logits,
             vocab_shard=logits_output.next_token_logits_vocab_shard,
             staged=staged,
@@ -234,7 +248,9 @@ class EaglePostVerifyGraphs:
         post-verify graph."""
         from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 
-        predict, accept_lens, accept_index = _sample(slot)
+        predict, accept_lens, accept_index = _sample(
+            slot, self._speculative_runtime_hooks
+        )
         new_seq_lens, bonus_tokens, commit_steps, draft_extend_inputs = (
             prepare_verify_commit_outputs(
                 predict,
@@ -245,6 +261,7 @@ class EaglePostVerifyGraphs:
                 mamba_track_interval=slot.track_interval,
                 extend_layout=self._extend_layout,
                 extend_mrope=self._extend_mrope,
+                bonus_dtype=self._bonus_dtype,
             )
         )
         if slot.prepared_next_draft is not None:
@@ -285,12 +302,13 @@ class EaglePostVerifyGraphs:
         )
 
 
-def _sample(slot: SimpleNamespace) -> tuple:
-    """SGLang's eagle_sample over the slot's staged copies, with the injected
-    acceptance length read on the device."""
-    from sglang.srt.speculative.eagle_utils import eagle_sample
+def _sample(
+    slot: SimpleNamespace, speculative_runtime_hooks: Any
+) -> tuple:
+    """Run post-verify through the same bound strategy as the eager path."""
 
     staged = slot.staged
+    source_info = slot.sampling_info
     sampling_info = SimpleNamespace(
         acc_additive_penalties=None,
         acc_scaling_penalties=None,
@@ -301,17 +319,16 @@ def _sample(slot: SimpleNamespace) -> tuple:
         need_top_k_sampling=slot.need_top_k,
         need_top_p_sampling=slot.need_top_p,
         need_min_p_sampling=False,
-        temperatures=staged.get("temperatures"),
-        top_ks=staged.get("top_ks"),
-        top_ps=staged.get("top_ps"),
-    )
-    batch_view = SimpleNamespace(
-        device=slot.device,
-        forward_mode=slot.forward_mode,
-        seq_lens=staged["seq_lens"],
-        req_pool_indices=staged["req_pool_indices"],
-        sampling_info=sampling_info,
-        return_logprob=False,
+        temperatures=staged.get("temperatures", source_info.temperatures),
+        top_ks=staged.get("top_ks", source_info.top_ks),
+        top_ps=staged.get("top_ps", source_info.top_ps),
+        min_ps=getattr(source_info, "min_ps", slot.unused_sampling_tensor),
+        max_top_k=getattr(source_info, "max_top_k", None),
+        watermark_keys=getattr(source_info, "watermark_keys", None),
+        watermark_context_windows=getattr(
+            source_info, "watermark_context_windows", None
+        ),
+        watermark_enabled=getattr(source_info, "watermark_enabled", None),
     )
     verify_view = SimpleNamespace(
         draft_token=staged["draft_tokens"],
@@ -322,18 +339,32 @@ def _sample(slot: SimpleNamespace) -> tuple:
         retrieve_next_sibling=staged["retrieve_next_sibling"],
         tree_topk=1,
         draft_probs=None,
+        custom_mask=None,
+        positions=None,
     )
-    return eagle_sample(
-        verify_view,
-        batch_view,
-        SimpleNamespace(
-            next_token_logits=slot.logits,
-            next_token_logits_vocab_shard=slot.vocab_shard,
-        ),
-        uno_target_max_top_k=slot.max_top_k,
-        simulated_acc_len=staged.get("sim_accept_len"),
-        sparse_bonus_argmax=slot.max_top_k is not None,
+    output = speculative_runtime_hooks.post_verify(
+        make_post_verify_io(
+            verify_input=verify_view,
+            sampling_info=sampling_info,
+            sequence_lengths=staged["seq_lens"],
+            request_pool_indices=staged["req_pool_indices"],
+            device=slot.device,
+            logits_output=SimpleNamespace(
+                next_token_logits=slot.logits,
+                next_token_logits_vocab_shard=slot.vocab_shard,
+            ),
+            grammar_mask=None,
+            # Post-verify graph eligibility excludes every watermark round.
+            watermark=None,
+            watermark_full_mask=True,
+            return_logprob=slot.return_logprob,
+            is_idle=False,
+            simulated_accept_length=staged.get("sim_accept_len"),
+            sparse_target_max_top_k=slot.max_top_k,
+            sparse_bonus_argmax=slot.max_top_k is not None,
+        )
     )
+    return output.token_ids, output.accepted_lengths, output.accepted_indices
 
 
 class _PostVerifyGraphs:

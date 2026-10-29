@@ -8,7 +8,11 @@ draws from the global CPU RNG as before. On a GPU, at batch sizes up to 64:
 every round's outputs, eager warm-ups and graph replays alike, must equal bitwise
 what SGLang's eager sampling gives on the same inputs, greedy and with forced
 acceptance, and stay unchanged through the next round; rounds that run eagerly in
-between draw from the same forced-length generator."""
+between draw from the same forced-length generator. With the NVIDIA megakernel's
+fused chain acceptance, eagle_sample's tail (greedy check, injected acceptance,
+accept lengths) must leave every output bitwise as the unfused tail does, greedy,
+compact top-k and dense sampled, at batch sizes up to 64, and the graphs must still
+match eager sampling."""
 
 import unittest
 from contextlib import contextmanager, nullcontext
@@ -44,6 +48,10 @@ register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 TOKENS = 7
 VOCAB = 257
 BATCH_SIZES = (1, 3, 16, 64)
+FUSED_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64)
+# FlashInfer's top-k reads each logits row in 16-byte vectors
+SAMPLED_VOCAB = 512
+TOP_K = 20
 # eager warm-ups, the capture of each slot, then replays of both slots
 ROUNDS = 2 * eagle_post_verify_graphs._NUM_WARMUP + 4
 
@@ -115,12 +123,12 @@ def _graph_capture(stream):
     yield SimpleNamespace(stream=stream)
 
 
-def _round(bs, generator):
+def _round(bs, generator, vocab=VOCAB):
     """A chain verify round whose drafts follow the target's argmax for a random
     prefix of each request."""
-    logits = torch.randn(bs * TOKENS, VOCAB, device="cuda", generator=generator)
+    logits = torch.randn(bs * TOKENS, vocab, device="cuda", generator=generator)
     target = logits.argmax(-1).view(bs, TOKENS)
-    drafts = torch.randint(0, VOCAB, (bs, TOKENS), device="cuda", generator=generator)
+    drafts = torch.randint(0, vocab, (bs, TOKENS), device="cuda", generator=generator)
     keep = torch.randint(0, TOKENS, (bs, 1), device="cuda", generator=generator)
     cols = torch.arange(TOKENS - 1, device="cuda")
     drafts[:, 1:] = torch.where(cols < keep, target[:, :-1], drafts[:, 1:])
@@ -206,6 +214,11 @@ class TestPostVerifyGraphs(CustomTestCase):
         class _EagerSample(Exception):
             pass
 
+        class _EagerHooks:
+            @property
+            def post_verify(self):
+                raise _EagerSample
+
         for clears_c128 in (False, True):
             kvcache = (
                 object.__new__(DeepSeekV4TokenToKVPool)
@@ -241,13 +254,11 @@ class TestPostVerifyGraphs(CustomTestCase):
                     "eagle_prepare_for_verify",
                     return_value=(SimpleNamespace(), True),
                 ),
-                patch.object(
-                    eagle_worker_common, "eagle_sample", side_effect=_EagerSample
-                ),
                 self.assertRaises(_EagerSample),
             ):
                 eagle_worker_common.run_eagle_verify(
                     batch,
+                    speculative_runtime_hooks=_EagerHooks(),
                     target_worker=target_worker,
                     req_to_token_pool=None,
                     token_to_kv_pool_allocator=SimpleNamespace(
@@ -497,13 +508,15 @@ class TestPostVerifyGraphs(CustomTestCase):
 
 
 def _prepared_length_graphs(device):
-    """A graph body that advances lengths while preserving its last slot."""
+    """_PostVerifyGraphs whose body only moves the lengths (+3), and on a CPU host a capture
+    that keeps the first outputs and rewrites them in place on each replay."""
 
     def body(slot):
         new_seq_lens = slot.staged["seq_lens"] + 3
         return (None, None, None, new_seq_lens, None, None, None)
 
     def commit(slot, outputs):
+        # the side-stream graph needs some work of its own to capture
         slot.commit_ct.add_(1)
 
     graphs = eagle_post_verify_graphs._PostVerifyGraphs(
@@ -548,18 +561,21 @@ def _check_prepared_lengths(test, graphs, *, device):
 
     with patch.object(spec_utils, "SIMULATE_ACC_LEN", -1.0):
         lengths = torch.tensor([100, 200], device=device)
+        # eager warm-ups, then each slot's capture: every round takes the last one's lengths
         for _ in range(2 * eagle_post_verify_graphs._NUM_WARMUP + 2):
             lengths = run(lengths)[3]
         round_n = run(lengths)[3]
         want_n = round_n.clone()
         round_n1 = run(round_n)[3]
-        test.assertTrue(torch.equal(round_n, want_n))
+        test.assertTrue(
+            torch.equal(round_n, want_n), "round N's lengths changed in N+1"
+        )
         test.assertNotEqual(round_n1.data_ptr(), round_n.data_ptr())
         round_n2 = run(round_n1)[3]
         test.assertEqual(round_n2.data_ptr(), round_n.data_ptr())
         test.assertTrue(torch.equal(round_n2, want_n + 6))
         with test.assertRaisesRegex(RuntimeError, "holds this batch's lengths"):
-            run(round_n1)
+            run(round_n1)  # round N+1's slot is next: a batch still on its lengths
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
@@ -568,7 +584,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         publish(ServerArgs(model_path="dummy"), role="test")
         self.addCleanup(reset_context)
 
-    def _check(self, *, sim_acc_len):
+    def _check(self, *, sim_acc_len, fused=False):
         # the worker's forced lengths, drawn by its graphs and its eager rounds alike;
         # the all-eager reference draws the same stream from its own generator
         worker_rng = simulated_acc_len_generator(0)
@@ -590,6 +606,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
             patch(
                 "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
             ),
+            patch.object(eagle_utils, "_fused_accept_enabled", return_value=fused),
         ):
             for bs in BATCH_SIZES:
                 # the verify graph's logits buffer: one per batch size, refilled
@@ -599,7 +616,10 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                 for i in range(ROUNDS * 3 // 2):
                     batch, verify_input, logits = _round(bs, generator)
                     logits_buf.copy_(logits)
-                    want = _eager(batch, verify_input, logits, reference_rng)
+                    with patch.object(
+                        eagle_utils, "_fused_accept_enabled", return_value=False
+                    ):
+                        want = _eager(batch, verify_input, logits, reference_rng)
                     graphed = i % 3 != 2
                     got = graphs.run(
                         batch=batch,
@@ -641,6 +661,167 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         # SGLANG_Q35MF_MKH_N3C: inputs and the pinned forced length in one launch
         with patch.object(eagle_post_verify_graphs, "_ONE_LAUNCH_LOAD", True):
             self._check(sim_acc_len=4.8)
+
+    def test_fused_accept_greedy(self):
+        self._check(sim_acc_len=-1.0, fused=True)
+
+    def test_fused_accept_forced_acceptance(self):
+        self._check(sim_acc_len=4.8, fused=True)
+
+    def test_lengths_taken_from_a_slot_outlive_the_next_round(self):
+        """As the CPU test, with captured CUDA graphs replaying into the slots' outputs."""
+        graphs = _prepared_length_graphs("cuda")
+        stream = torch.cuda.Stream()
+        with (
+            torch.cuda.stream(stream),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+        ):
+            _check_prepared_lengths(self, graphs, device="cuda")
+
+    def test_the_bonus_in_int64_is_the_int32_bonus_cast(self):
+        """The prepared path writes the bonus in its consumer's int64 dtype
+        without changing any value from the regular int32 output."""
+        generator = torch.Generator(device="cuda").manual_seed(2)
+        for bs in BATCH_SIZES:
+            batch, verify_input, logits = _round(bs, generator)
+            predict, accept_lens, accept_index, _, _ = _eager(
+                batch, verify_input, logits, simulated_acc_len_generator(0)
+            )
+            outputs = {
+                dtype: prepare_verify_commit_outputs(
+                    predict,
+                    accept_index,
+                    accept_lens,
+                    batch.seq_lens,
+                    num_draft_tokens=TOKENS,
+                    bonus_dtype=dtype,
+                )
+                for dtype in (torch.int32, torch.int64)
+            }
+            with self.subTest(bs=bs):
+                narrow, wide = outputs[torch.int32][1], outputs[torch.int64][1]
+                self.assertEqual(wide.dtype, torch.int64)
+                self.assertTrue(torch.equal(wide, narrow.to(torch.int64)))
+                self.assertIs(wide.to(torch.int64), wide)
+                for a, b in zip(outputs[torch.int32][0:1], outputs[torch.int64][0:1]):
+                    self.assertTrue(torch.equal(a, b))
+
+
+def _sampled(batch, *, generator):
+    """The round's batch with T0.6 / top-k / top-p sampling on every request."""
+    bs = len(batch.seq_lens)
+    info = SimpleNamespace(**vars(batch.sampling_info))
+    info.is_all_greedy = False
+    info.need_top_k_sampling = True
+    info.need_top_p_sampling = True
+    info.temperatures = torch.full((bs, 1), 0.6, device="cuda")
+    info.top_ks = torch.randint(2, TOP_K + 1, (bs,), device="cuda", generator=generator)
+    info.top_ps = torch.full((bs,), 0.95, device="cuda")
+    return SimpleNamespace(**{**vars(batch), "sampling_info": info})
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestFusedAcceptMatchesUnfused(CustomTestCase):
+    """Every output of the NVIDIA megakernel's fused chain acceptance and of the
+    commit outputs built on it (predict at every node, accept lengths and index,
+    sequence lengths, bonus, draft-extend inputs, commit steps) equals the unfused
+    tail's."""
+
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+
+    def _run(self, batch, verify_input, logits, *, fused, max_top_k, sim_len, seed):
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        with patch.object(eagle_utils, "_fused_accept_enabled", return_value=fused):
+            predict, accept_lens, accept_index = eagle_sample(
+                verify_input,
+                batch,
+                SimpleNamespace(
+                    next_token_logits=logits.clone(),
+                    next_token_logits_vocab_shard=None,
+                ),
+                uno_target_max_top_k=max_top_k,
+                simulated_acc_len=sim_len,
+                sparse_bonus_argmax=max_top_k is not None,
+            )
+        commit = prepare_verify_commit_outputs(
+            predict,
+            accept_index,
+            accept_lens,
+            batch.seq_lens,
+            num_draft_tokens=TOKENS,
+            mamba_track_interval=64,
+        )
+        new_seq_lens, bonus, (last_steps, track_steps), extend_inputs = commit
+        return dict(
+            predict=predict,
+            accept_lens=accept_lens,
+            accept_index=accept_index,
+            new_seq_lens=new_seq_lens,
+            bonus=bonus,
+            last_steps=last_steps,
+            track_steps=track_steps,
+            correct=extend_inputs[0],
+            select=extend_inputs[1],
+            ids=extend_inputs[2],
+        )
+
+    def _compare(self, *, sim_acc_len, token_mode, packed):
+        generator = torch.Generator(device="cuda").manual_seed(1)
+        parallel = SimpleNamespace(
+            tp_group=SimpleNamespace(world_size=1),
+            attn_tp_group=SimpleNamespace(world_size=1),
+        )
+        with (
+            patch.object(spec_utils, "SIMULATE_ACC_LEN", sim_acc_len),
+            patch.object(spec_utils, "SIMULATE_ACC_TOKEN_MODE", token_mode),
+            patch.object(eagle_utils, "_PACKED_VERIFY_BCAST", packed),
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+        ):
+            for bs in FUSED_BATCH_SIZES:
+                for sampling in ("greedy", "compact", "dense"):
+                    for length in (1, 3, TOKENS) if sim_acc_len > 0 else (None,):
+                        batch, verify_input, logits = _round(
+                            bs, generator, vocab=SAMPLED_VOCAB
+                        )
+                        if sampling != "greedy":
+                            batch = _sampled(batch, generator=generator)
+                        max_top_k = TOP_K if sampling == "compact" else None
+                        sim_len = (
+                            None
+                            if length is None
+                            else torch.tensor([length], device="cuda")
+                        )
+                        kw = dict(max_top_k=max_top_k, sim_len=sim_len, seed=bs)
+                        want = self._run(batch, verify_input, logits, fused=False, **kw)
+                        got = self._run(batch, verify_input, logits, fused=True, **kw)
+                        with self.subTest(bs=bs, sampling=sampling, length=length):
+                            for name, w in want.items():
+                                g = got[name]
+                                if w is None:
+                                    self.assertIsNone(g, name)
+                                    continue
+                                self.assertEqual(g.dtype, w.dtype, name)
+                                self.assertTrue(torch.equal(g, w), name)
+
+    def test_greedy_check_and_sampled_targets(self):
+        for packed in (False, True):
+            with self.subTest(packed=packed):
+                self._compare(sim_acc_len=-1.0, token_mode="fixed", packed=packed)
+
+    def test_forced_acceptance_of_real_draft_tokens(self):
+        for packed in (False, True):
+            with self.subTest(packed=packed):
+                self._compare(
+                    sim_acc_len=4.8, token_mode="real-draft-token", packed=packed
+                )
+
+    def test_forced_acceptance_of_fixed_tokens(self):
+        self._compare(sim_acc_len=4.8, token_mode="fixed", packed=True)
 
 
 if __name__ == "__main__":

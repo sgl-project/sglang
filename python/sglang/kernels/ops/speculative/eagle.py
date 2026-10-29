@@ -143,10 +143,10 @@ def _verify_commit_outputs_kernel(
         )
         tl.store(ids + row, output_token.to(tl.int64), row < PREDICT_SIZE)
         if TRACK_INTERVAL > 0:
-            post = length + accepted
-            crossing = length // TRACK_INTERVAL != post // TRACK_INTERVAL
+            post_length = length + accepted
+            crossing = length // TRACK_INTERVAL != post_length // TRACK_INTERVAL
             tracking_position = tl.maximum(
-                post // TRACK_INTERVAL * TRACK_INTERVAL - length - 1, 0
+                post_length // TRACK_INTERVAL * TRACK_INTERVAL - length - 1, 0
             )
             track = (
                 tl.load(
@@ -179,7 +179,7 @@ def _verify_commit_outputs_kernel(
     idx = tl.where(idx < 0, idx + PREDICT_SIZE, idx)
     token = tl.load(predict + idx * PREDICT_STRIDE, valid, other=0)
     tl.store(new_seq_lens + row, length + accepted, valid)
-    tl.store(bonus + row, token, valid)
+    tl.store(bonus + row, token.to(bonus.dtype.element_ty), valid)
 
 
 def prepare_verify_commit_outputs(
@@ -191,6 +191,7 @@ def prepare_verify_commit_outputs(
     mamba_track_interval=0,
     extend_layout=False,
     extend_mrope=False,
+    bonus_dtype=torch.int32,
 ):
     """Prepare commit outputs and optionally the subsequent draft layout."""
     bs = accept_lens.numel()
@@ -199,7 +200,7 @@ def prepare_verify_commit_outputs(
         device=seq_lens.device,
         dtype=torch.promote_types(seq_lens.dtype, accept_lens.dtype),
     )
-    bonus = torch.empty((bs,), device=predict.device, dtype=torch.int32)
+    bonus = torch.empty((bs,), device=predict.device, dtype=bonus_dtype)
     last_steps = track_steps = correct = select = ids = None
     if num_draft_tokens:
         last_steps = torch.empty((bs,), device=seq_lens.device, dtype=torch.int64)
@@ -272,6 +273,150 @@ def prepare_verify_commit_outputs(
         draft = (correct, select, ids) + (() if layout is None else (layout,))
         return new_seq_lens, bonus, (last_steps, track_steps), draft
     return new_seq_lens, bonus
+
+
+@triton.jit
+def _chain_accept_kernel(
+    predict,
+    accept_index,
+    num_correct_drafts,
+    accept_lens,
+    sim_accept_index,
+    candidates,
+    retrieve_index,
+    retrieve_next_token,
+    retrieve_next_sibling,
+    target_predict,
+    bonus_target,
+    simulated_acc_len,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+    VERIFY: tl.constexpr,
+    FINISH: tl.constexpr,
+    SIMULATE: tl.constexpr,
+    REAL_DRAFT_TOKENS: tl.constexpr,
+):
+    # One program per request; its WIDTH nodes are rows [b * WIDTH, (b + 1) * WIDTH) of
+    # predict / candidates / retrieve_*, and accept_index is [bs, WIDTH].
+    b = tl.program_id(0).to(tl.int64)
+    base = b * WIDTH
+    cols = tl.arange(0, BLOCK)
+    in_row = cols < WIDTH
+    if VERIFY:
+        # VerifyTreeGreedy over the request's tree, in registers
+        last = tl.load(retrieve_index + base).to(tl.int64)
+        first = last
+        acc = tl.where(cols == 0, last, -1)
+        pred = tl.zeros([BLOCK], dtype=tl.int64)
+        num = last * 0
+        cur = last * 0
+        done = last != last  # noqa: PLR0124 -- Triton scalar false
+        for _ in tl.static_range(1, WIDTH):
+            active = ~done
+            cur = tl.load(retrieve_next_token + base + cur, mask=active, other=-1)
+            cur = cur.to(tl.int64)
+            target = tl.load(target_predict + last).to(tl.int64)
+            matched = last != last  # noqa: PLR0124 -- Triton scalar false
+            for _ in tl.static_range(WIDTH):
+                searching = active & (cur != -1) & ~matched
+                node = tl.load(retrieve_index + base + cur, mask=searching, other=0)
+                draft = tl.load(candidates + base + cur, mask=searching, other=0)
+                hit = searching & (draft.to(tl.int64) == target)
+                pred = tl.where(hit & (cols == last - base), target, pred)
+                num = num + hit.to(tl.int64)
+                acc = tl.where(hit & (cols == num), node.to(tl.int64), acc)
+                last = tl.where(hit, node.to(tl.int64), last)
+                matched = matched | hit
+                sibling = tl.load(
+                    retrieve_next_sibling + base + cur, mask=searching & ~hit, other=-1
+                )
+                cur = tl.where(searching & ~hit, sibling.to(tl.int64), cur)
+            done = done | (active & ~matched)
+        target = tl.load(target_predict + last).to(tl.int64)
+        pred = tl.where(cols == last - base, target, pred)
+        tl.store(accept_index + base + cols, acc.to(tl.int32), mask=in_row)
+        if not (FINISH and SIMULATE):
+            tl.store(predict + base + cols, pred.to(tl.int32), mask=in_row)
+            tl.store(num_correct_drafts + b, num.to(tl.int32))
+    else:
+        pred = tl.load(predict + base + cols, mask=in_row, other=0).to(tl.int64)
+        first = tl.load(accept_index + base).to(tl.int64)
+        num = tl.load(num_correct_drafts + b).to(tl.int64)
+    if FINISH:
+        if SIMULATE:
+            # spec_utils.generate_simulated_accept_index_device for a length on the device
+            length = tl.load(simulated_acc_len).to(tl.int64)
+            sim = tl.where(cols < length, first + cols, -1)
+            tl.store(sim_accept_index + base + cols, sim.to(tl.int32), mask=in_row)
+            num = length - 1
+            if REAL_DRAFT_TOKENS:
+                nxt = tl.minimum(cols + 1, WIDTH - 1)
+                drafted = tl.load(candidates + base + nxt, mask=in_row, other=0)
+                bonus = tl.load(bonus_target + base + cols, mask=in_row, other=0)
+                pred = tl.where(
+                    cols < length - 1,
+                    drafted.to(tl.int32).to(tl.int64),
+                    tl.where(cols == length - 1, bonus.to(tl.int32).to(tl.int64), pred),
+                )
+            else:
+                pred = tl.full([BLOCK], 100, dtype=tl.int64)
+            tl.store(predict + base + cols, pred.to(tl.int32), mask=in_row)
+            tl.store(num_correct_drafts + b, num.to(tl.int32))
+        tl.store(accept_lens + b, (num + 1).to(tl.int32))
+
+
+def chain_accept(
+    *,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor | None,
+    bonus_target: torch.Tensor | None,
+    simulated_acc_len: torch.Tensor | None,
+    real_draft_tokens: bool,
+    verify: bool,
+    finish: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """eagle_sample's tail for a chain draft whose tree width equals the accept width,
+    bitwise: with verify, verify_tree_greedy over target_predict into the (unset)
+    predict / accept_index / num_correct_drafts; with finish, the injected acceptance
+    of simulated_acc_len (device int64 [1], None when off) and the accept lengths,
+    returned with the accept index eagle_sample returns. Contiguous [bs, width] rows."""
+    bs, width = accept_index.shape
+    accept_lens = sim_accept_index = None
+    if finish:
+        accept_lens = torch.empty((bs,), dtype=torch.int32, device=predict.device)
+        if simulated_acc_len is not None:
+            sim_accept_index = torch.empty_like(accept_index)
+    if bs:
+        _chain_accept_kernel[(bs,)](
+            predict,
+            accept_index,
+            num_correct_drafts,
+            accept_lens,
+            sim_accept_index,
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            target_predict,
+            bonus_target,
+            simulated_acc_len,
+            WIDTH=width,
+            BLOCK=next_power_of_2(width),
+            VERIFY=verify,
+            FINISH=finish,
+            SIMULATE=simulated_acc_len is not None,
+            REAL_DRAFT_TOKENS=real_draft_tokens,
+            num_warps=1,
+        )
+    if not finish:
+        return None
+    return accept_lens, (accept_index if sim_accept_index is None else sim_accept_index)
 
 
 @triton.jit(do_not_specialize=["BS", "TOKENS"])
