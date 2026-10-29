@@ -20,10 +20,8 @@ import logging
 import os
 from bisect import bisect_left
 from contextlib import contextmanager
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, fields, replace
 from functools import cached_property
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 
 import torch
@@ -35,18 +33,13 @@ logger = logging.getLogger(__name__)
 class _AutotuneContext:
     decode_num_tokens: int
     prefill_num_tokens: int
-    directory: Path
     records: dict
-    staged_profiles: dict[str, Path] = field(default_factory=dict)
     dirty: bool = False
 
 
 _active_context: _AutotuneContext | None = None
-# Native workspace pooling spans startup contexts. Keep their
-# selected tactics consistent too; a cache-path change must not retune storage
-# already captured by another layer. These payloads own no weights or tensors.
-_session_winners: dict[tuple[Any, int, str], dict] = {}
-_CACHE_NAMESPACE = "sglang_flashinfer_megamoe"
+# Keep direct knob records separate from the legacy native cache-file payloads.
+_CACHE_NAMESPACE = "sglang_flashinfer_megamoe_knobs_v1"
 
 
 @contextmanager
@@ -60,36 +53,18 @@ def megamoe_autotune_context(
     global _active_context
     tuner = AutoTuner.get()
     previous = _active_context
-    with TemporaryDirectory(prefix="sglang-megamoe-") as directory:
-        context = _AutotuneContext(
-            decode_num_tokens,
-            prefill_num_tokens,
-            Path(directory),
-            tuner.get_namespaced_records(_CACHE_NAMESPACE),
-        )
-        _active_context = context
-        try:
-            yield
-        finally:
-            _active_context = previous
-            if context.dirty:
-                tuner.publish_namespaced_records(_CACHE_NAMESPACE, context.records)
-
-
-@contextmanager
-def _native_cache(path: Path):
-    # Native AUTO exposes its winner through this file; generic autotune owns
-    # persistence. Each geometry is staged once per startup context.
-    name = "FLASHINFER_MOE_EP_KNOB_CACHE"
-    previous = os.environ.get(name)
-    os.environ[name] = str(path)
+    context = _AutotuneContext(
+        decode_num_tokens,
+        prefill_num_tokens,
+        tuner.get_namespaced_records(_CACHE_NAMESPACE),
+    )
+    _active_context = context
     try:
         yield
     finally:
-        if previous is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = previous
+        _active_context = previous
+        if context.dirty:
+            tuner.publish_namespaced_records(_CACHE_NAMESPACE, context.records)
 
 
 def _capacities(limit: int) -> list[int]:
@@ -135,17 +110,8 @@ def _profile_inputs(tensors, capacity: int, num_experts: int):
     )
 
 
-def _valid_native_cache(payload) -> bool:
-    if not isinstance(payload, dict) or payload.get("version") != 1:
-        return False
-    entries = payload.get("entries")
-    return (
-        isinstance(entries, list)
-        and len(entries) == 1
-        and isinstance(entries[0], dict)
-        and isinstance(entries[0].get("knobs"), dict)
-        and bool(entries[0]["knobs"])
-    )
+def _valid_knobs(knobs) -> bool:
+    return isinstance(knobs, dict) and bool(knobs)
 
 
 class MegaMoeTunedForward:
@@ -209,18 +175,6 @@ class MegaMoeTunedForward:
             sort_keys=True,
         )
 
-    def _require_all_ranks(self, success: bool, message: str) -> None:
-        if self.bootstrap.world_size > 1:
-            import torch.distributed as dist
-
-            ready = torch.tensor(int(success), dtype=torch.int32, device="cuda")
-            dist.all_reduce(
-                ready, op=dist.ReduceOp.MIN, group=self.bootstrap.process_group
-            )
-            success = bool(ready.item())
-        if not success:
-            raise RuntimeError(message)
-
     def _broadcast(self, value):
         if self.bootstrap.world_size == 1:
             return value
@@ -231,7 +185,7 @@ class MegaMoeTunedForward:
         dist.broadcast_object_list(values, group=group, group_src=0)
         return values[0]
 
-    def _tune(self, tensors, capacity: int, native_path: Path):
+    def _tune(self, tensors, capacity: int):
         from flashinfer.moe_ep import MoEEpMegaLayer
 
         backend = replace(
@@ -243,20 +197,15 @@ class MegaMoeTunedForward:
             weights=None,
             backend=backend,
         )
-        payload = None
         try:
             temporary.warmup(tensors)
-            if self.bootstrap.rank == 0:
-                try:
-                    payload = json.loads(native_path.read_text())
-                except (OSError, ValueError):
-                    pass
+            knobs = temporary.get_tuned_knobs()
         finally:
             temporary.destroy()
-        payload = self._broadcast(payload)
-        if not _valid_native_cache(payload):
-            raise RuntimeError("MegaMoE autotune did not record its selected tactic")
-        return payload
+        knobs = self._broadcast(knobs)
+        if not _valid_knobs(knobs):
+            raise RuntimeError("MegaMoE autotune did not return its selected knobs")
+        return knobs
 
     def _prepare_profile(self, mega, tensors, capacity: int) -> None:
         context = _active_context
@@ -265,53 +214,25 @@ class MegaMoeTunedForward:
         profile_inputs = _profile_inputs(
             tensors, capacity, self.fleet_params.num_experts
         )
-        native_path = context.staged_profiles.get(profile_key)
-        needs_staging = native_path is None
-        if needs_staging:
-            native_path = (
-                context.directory / f"profile{len(context.staged_profiles)}.json"
-            )
-        with _native_cache(native_path):
-            if needs_staging:
-                key = (
-                    self.bootstrap.process_group,
-                    torch.cuda.current_device(),
-                    profile_key,
-                )
-                payload = _session_winners.get(key)
-                if payload is None:
-                    payload = self._broadcast(
-                        context.records.get(profile_key)
-                        if self.bootstrap.rank == 0
-                        else None
-                    )
-                    source = "cache hit"
-                    if not _valid_native_cache(payload):
-                        payload = self._tune(profile_inputs, capacity, native_path)
-                        source = "tuned"
-                    _session_winners[key] = payload
-                    if self.bootstrap.rank == 0:
-                        logger.info(
-                            "MegaMoE %s: capacity=%s, knobs=%s",
-                            source,
-                            capacity,
-                            payload["entries"][0]["knobs"],
-                        )
-                # The backend owns dtype/layout keys and loads its original payload.
-                try:
-                    native_path.write_text(json.dumps(payload))
-                    written = True
-                except OSError:
-                    written = False
-                self._require_all_ranks(
-                    written,
-                    "Cannot stage MegaMoE's selected tactic for workspace creation",
-                )
-                context.staged_profiles[profile_key] = native_path
-                if context.records.get(profile_key) != payload:
-                    context.records[profile_key] = payload
-                    context.dirty = True
-            workspace = mega.create_workspace(capacity)
+        # Rank zero decides whether every EP rank reuses or tunes this profile.
+        # The context records also deduplicate layers with the same geometry.
+        knobs = self._broadcast(
+            context.records.get(profile_key) if self.bootstrap.rank == 0 else None
+        )
+        if not _valid_knobs(knobs):
+            knobs = self._tune(profile_inputs, capacity)
+            if self.bootstrap.rank == 0:
+                logger.info("MegaMoE tuned: capacity=%s, knobs=%s", capacity, knobs)
+        if context.records.get(profile_key) != knobs:
+            context.records[profile_key] = knobs
+            context.dirty = True
+        # Restore tuple-valued knobs after AutoTuner's JSON round trip, as
+        # FlashInfer's native cache loader does.
+        knobs = {
+            key: tuple(value) if isinstance(value, list) else value
+            for key, value in knobs.items()
+        }
+        workspace = mega.create_workspace(capacity, knobs=knobs)
         mega.warmup(profile_inputs, workspace=workspace)
         self.workspaces[capacity] = workspace
 
