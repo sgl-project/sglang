@@ -1,26 +1,31 @@
-"""The gate that picks the fused q-absorb + RoPE + KV-write kernel.
+"""The gates that pick the fused q-absorb + RoPE + KV-write kernels.
 
 Every term names a branch that one of the two kernels it replaces would
 otherwise have taken, so the fused path is only equivalent where all of them
 hold. A term quietly dropped here would route a shape the kernel does not
 implement, and the wrong answer would look like a plausible one.
 
-The caller carries one further term, ``not q_replicate_active``, which needs a
-ForwardBatch to evaluate and so is not part of this predicate.
+The FP8 gate's caller carries one further term, ``not q_replicate_active``,
+which needs a ForwardBatch to evaluate and so is not part of that predicate.
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _CAN_FUSE = forward_mla_rocm._can_fuse_bmm_rope_cat_and_cache
 _ABSORB_CONFIG = forward_mla_rocm._absorb_bmm_config
@@ -113,6 +118,81 @@ class TestAbsorbBmmConfig(CustomTestCase):
     def test_large_row_count_falls_back(self):
         self.assertIsNone(_ABSORB_CONFIG(16, 0, 512))
         self.assertIsNone(_ABSORB_CONFIG(16, 257, 512))
+
+
+class TestMxfp4ProjectionFusionGate(CustomTestCase):
+    """The MXFP4 w_kc gate, ``_can_fuse_rocm_mla_projection_rope_cache``."""
+
+    def _make_attn(self):
+        # Deliberately no q_lora_rank or v_head_dim: the kernel is key-side only,
+        # so a gate that read either would raise AttributeError here.
+        return SimpleNamespace(
+            current_attention_backend="aiter",
+            use_dsa=False,
+            kv_b_proj=SimpleNamespace(set_lora=False),
+            w_kc=torch.empty(1, dtype=torch.uint8),
+            w_scale_k=torch.empty(1),
+            rotary_emb=object(),
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+        )
+
+    def _make_decode_batch(self):
+        return SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+    @contextlib.contextmanager
+    def _aiter_gfx95_env(self):
+        with (
+            mock.patch.object(forward_mla_rocm, "_use_aiter_gfx95", True),
+            mock.patch.object(
+                forward_mla_rocm.envs.SGLANG_ROCM_USE_MULTI_STREAM,
+                "get",
+                side_effect=AssertionError(
+                    "MLA projection fusion must not depend on MoE multi-stream mode"
+                ),
+            ),
+            envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.override(True),
+            get_parallel().override(dcp_enabled=False),
+        ):
+            yield
+
+    def _can_fuse(self, attn, forward_batch):
+        return forward_mla_rocm._can_fuse_rocm_mla_projection_rope_cache(
+            attn, forward_batch=forward_batch, is_capture_mode=True
+        )
+
+    def test_projection_fusion_gate_targets_aiter_graph_decode(self):
+        attn = self._make_attn()
+        forward_batch = self._make_decode_batch()
+
+        with self._aiter_gfx95_env():
+            self.assertTrue(self._can_fuse(attn, forward_batch))
+
+            attn.current_attention_backend = "flashinfer"
+            self.assertFalse(self._can_fuse(attn, forward_batch))
+
+    def test_projection_fusion_gate_requires_power_of_two_shapes(self):
+        """fused_fp4_bmm_rope_cat_and_cache_mla tiles kv_lora_rank and
+        qk_rope_head_dim as unmasked ``tl.arange`` tiles and quantizes the BMM K
+        dim in 32-wide MXFP4 groups.  None of that is asserted kernel-side, so a
+        merely-divisible-looking shape (384 is a multiple of 128, 96 a multiple
+        of 32) must still be rejected here or the kernel reads out of bounds.
+        """
+        forward_batch = self._make_decode_batch()
+
+        with self._aiter_gfx95_env():
+            for field, value in (
+                ("kv_lora_rank", 384),
+                ("qk_nope_head_dim", 96),
+                ("qk_nope_head_dim", 16),
+                ("qk_nope_head_dim", 512),
+                ("qk_rope_head_dim", 48),
+            ):
+                with self.subTest(field=field, value=value):
+                    attn = self._make_attn()
+                    setattr(attn, field, value)
+                    self.assertFalse(self._can_fuse(attn, forward_batch))
 
 
 if __name__ == "__main__":
