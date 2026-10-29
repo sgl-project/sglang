@@ -90,7 +90,8 @@ class TestDsaTrtllmDeviceConstraint(CustomTestCase):
     auto-selects trtllm for FP8 KV on every SM >= 10."""
 
     _ACCEPTED = ((10, 0), (10, 3), (10, 7))
-    # flashinfer/mla/_core.py: the message that dispatch answers with.
+    # What the pinned flashinfer 0.7.2 answers for trtllm-gen off that set;
+    # 0.7.1 says "requires SM100/SM103" instead, so this tracks the pin.
     _REFUSAL = "requires SM100/SM103/SM107"
 
     def _check(self, capability, *, prefill="trtllm", decode="trtllm", kv="fp8_e4m3"):
