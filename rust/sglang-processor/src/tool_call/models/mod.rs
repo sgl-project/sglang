@@ -2,20 +2,36 @@
 //! differently. Every other name goes to Dynamo.
 
 mod deepseek_v4;
+mod kimi_k3;
+mod qwen3_coder;
+
+use serde_json::Value;
 
 use super::ToolDetector;
 
-/// The detector a `--tool-call-parser` name selects, over the request's tool names.
-pub(crate) fn tool_detector(
-    tool_parser: &str,
-    tool_names: Vec<String>,
-) -> Option<Box<dyn ToolDetector>> {
-    let detector = match tool_parser {
-        "deepseekv4" => deepseek_v4::DsmlDetector::new(deepseek_v4::DSML_TAGS, tool_names),
-        "deepseekv41" => deepseek_v4::DsmlDetector::new(deepseek_v4::DSML_TAGS_V41, tool_names),
-        _ => return None,
+/// The detector a `--tool-call-parser` name selects, over the request's tools.
+pub(crate) fn tool_detector(tool_parser: &str, tools: &[Value]) -> Option<Box<dyn ToolDetector>> {
+    let tool_names = || {
+        tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+            .collect()
     };
-    Some(Box::new(detector))
+    Some(match tool_parser {
+        "deepseekv4" => Box::new(deepseek_v4::DsmlDetector::new(
+            deepseek_v4::DSML_TAGS,
+            tool_names(),
+        )),
+        "deepseekv41" => Box::new(deepseek_v4::DsmlDetector::new(
+            deepseek_v4::DSML_TAGS_V41,
+            tool_names(),
+        )),
+        // `KimiK3Detector` keeps calls to tools the request does not list.
+        "kimi_k3" => Box::new(kimi_k3::KimiK3Detector::default()),
+        // Typed argument values follow the tool schemas.
+        "qwen3_coder" => Box::new(qwen3_coder::Qwen3CoderDetector::new(tools.to_vec())),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -34,17 +50,19 @@ mod tests {
                 serde_json::from_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap())
                     .unwrap();
             let parser = fixture["parser"].as_str().unwrap();
-            let names: Vec<String> = fixture["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
-                .collect();
-            let detector = || tool_detector(parser, names.clone()).unwrap();
+            let tools = fixture["tools"].as_array().unwrap();
+            let detector = || tool_detector(parser, tools).unwrap();
+            // An argument delta has no name: `None` in Python, empty here.
             let calls = |calls: Vec<ToolCallItem>| -> Value {
                 calls
                     .into_iter()
-                    .map(|c| json!([c.tool_index, c.name, c.parameters]))
+                    .map(|c| {
+                        json!([
+                            c.tool_index,
+                            (!c.name.is_empty()).then_some(c.name),
+                            c.parameters
+                        ])
+                    })
                     .collect()
             };
             for case in fixture["cases"].as_array().unwrap() {

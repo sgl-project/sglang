@@ -5,6 +5,7 @@
 
 import math
 from enum import IntEnum, auto
+from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -12,7 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
+from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
@@ -52,6 +53,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -282,6 +284,10 @@ class SarvamMoESparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
 
         self.gate = ReplicatedLinear(
@@ -639,7 +645,7 @@ class SarvamMoEMLAAttention(nn.Module):
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
-        get_token_to_kv_pool().set_mla_kv_buffer(
+        get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
             self.attn_mha,
             KVWriteLoc.for_batch(forward_batch),
             k_nope,
@@ -986,20 +992,7 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
-        first_k_dense = getattr(config, "first_k_dense_replace", 1)
-        moe_layer_freq = getattr(config, "moe_layer_freq", 1)
-        has_moe = getattr(config, "num_experts", None) is not None
-        self.is_layer_sparse = (
-            has_moe
-            and layer_id >= first_k_dense
-            and (layer_id - first_k_dense) % moe_layer_freq == 0
-        )
-        is_next_layer_sparse = (
-            has_moe
-            and layer_id < config.num_hidden_layers - 1
-            and (layer_id + 1) >= first_k_dense
-            and (layer_id + 1 - first_k_dense) % moe_layer_freq == 0
-        )
+        self.is_layer_sparse = self._is_layer_sparse(config, layer_id)
 
         if self.is_layer_sparse:
             self.mlp = SarvamMoESparseMoeBlock(
@@ -1026,19 +1019,50 @@ class SarvamMoEMLADecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
-                declare_attn(),
+                attn,
                 self.input_layernorm,
                 {"qkv_latent_func": self.self_attn.prepare_qkv_latent},
             ),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(cls, config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id),
+                next_layer_sparse=cls._is_next_layer_sparse(config, layer_id),
             ),
+        )
+
+    @staticmethod
+    def _is_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        first_k_dense = getattr(config, "first_k_dense_replace", 1)
+        moe_layer_freq = getattr(config, "moe_layer_freq", 1)
+        has_moe = getattr(config, "num_experts", None) is not None
+        return (
+            has_moe
+            and layer_id >= first_k_dense
+            and (layer_id - first_k_dense) % moe_layer_freq == 0
+        )
+
+    @staticmethod
+    def _is_next_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        first_k_dense = getattr(config, "first_k_dense_replace", 1)
+        moe_layer_freq = getattr(config, "moe_layer_freq", 1)
+        has_moe = getattr(config, "num_experts", None) is not None
+        return (
+            has_moe
+            and layer_id < config.num_hidden_layers - 1
+            and (layer_id + 1) >= first_k_dense
+            and (layer_id + 1 - first_k_dense) % moe_layer_freq == 0
         )
 
     def forward(
@@ -1096,6 +1120,7 @@ class SarvamMLAModel(nn.Module):
                 alt_stream=self.alt_stream,
             ),
             prefix="model.layers",
+            stage_facts=partial(SarvamMoEMLADecoderLayer.stage_facts, config),
         )
 
         if self.pp_group.is_last_rank:

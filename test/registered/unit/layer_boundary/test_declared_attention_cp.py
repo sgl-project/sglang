@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 HIDDEN = 4
 CP_SIZE = 2
@@ -125,6 +125,8 @@ class TestAttentionCpBoundary(CustomTestCase):
                 ((comm, "get_moe_cp_size"), lambda: CP_SIZE),
                 ((comm, "get_moe_cp_rank"), lambda: cp),
                 ((comm, "should_use_dp_reduce_scatterv"), lambda: False),
+                ((comm, "post_experts_sum_is_one_all_reduce"), lambda: False),
+                ((comm, "get_lora"), lambda: SimpleNamespace(enable_lora=False)),
                 (
                     (comm, "get_moe_a2a_backend"),
                     lambda: SimpleNamespace(is_none=lambda: True),

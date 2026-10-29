@@ -198,21 +198,25 @@ def model_config_of(server_args: Any):
     from sglang.srt.configs.model_config import ModelConfig
 
     memo = getattr(server_args, "_model_config", None)
-    if memo is not None:
-        # The key is the path this record carried when the cache was
-        # filled. The GGUF and ModelScope handlers declare a different
-        # `model_path`, and a configuration built before them describes
-        # another checkpoint. `ModelConfig` re-points its own `model_path`
-        # at the local pull directory when the weights sit behind an
-        # object-store URI, so its field is not the key. A configuration a
-        # fixture supplied carries no key and is handed back as it is.
-        built_from = getattr(server_args, "_model_config_built_from", None)
-        if built_from is None or built_from == cfg.model_path:
-            return memo
+    built_from = getattr(server_args, "_model_config_built_from", None)
+    if memo is not None and built_from is None:
+        # A configuration a fixture supplied carries no key and is handed
+        # back as it is.
+        return memo
+    # The key is the path this record carried when the cache was filled.
+    # The GGUF and ModelScope handlers declare a different `model_path`, and
+    # a configuration built before them describes another checkpoint.
+    # `ModelConfig` re-points its own `model_path` at the local pull
+    # directory when the weights sit behind an object-store URI, so its
+    # field is not the key. An override that turns the SWA pool off changes
+    # `is_hybrid_swa`, so that flag is part of the key too.
+    key = (cfg.model_path, cfg.disable_hybrid_swa_memory)
+    if memo is not None and built_from == key:
+        return memo
 
     model_config = ModelConfig.from_server_args(server_args)
     server_args._model_config = model_config
-    server_args._model_config_built_from = cfg.model_path
+    server_args._model_config_built_from = key
     if model_config.is_hybrid_swa:
         logger.info(
             "Hybrid SWA model detected. architectures=%s",
@@ -265,6 +269,15 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
     )
 
 
+def _forces_eagle_topk_one(speculative_algorithm: str) -> bool:
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    # DFLASH's topk is declared by _handle_dflash, which runs after this default,
+    # so it still reads None here. Matched by name, not from_string, so an
+    # unregistered algorithm keeps failing in validation rather than here.
+    return str(speculative_algorithm).upper() == SpeculativeAlgorithm.DFLASH.name
+
+
 def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_config):
     """
     Auto select the fastest attention backend.
@@ -306,6 +319,7 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             and (
                 cfg.speculative_algorithm is None
                 or cfg.speculative_eagle_topk is not None
+                or _forces_eagle_topk_one(cfg.speculative_algorithm)
             )
         ):
             # trtllm_mha requires equal K/V row widths; fa4 carries
@@ -341,14 +355,10 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             return "triton"
 
 
-def _dspark_verify_on_decode_backend(
-    backend: Optional[str], q_len: int, kv_cache_dtype: Optional[str]
-) -> bool:
+def _dspark_verify_on_decode_backend(backend: Optional[str], q_len: int) -> bool:
     """Whether the MLA decode backend can serve a q_len-wide target verify."""
     if backend == "trtllm_mla":
         return True
-    if backend == "tokenspeed_mla":
-        return kv_cache_dtype == "fp8_e4m3" and q_len <= 8
     if backend == "cutedsl_mla":
         # cute-dsl monolithic MLA decode folds the verify tokens into the head
         # dim (fold_sq), so it serves any DSPARK verify width. Needs flashinfer
