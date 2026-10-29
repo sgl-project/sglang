@@ -3076,6 +3076,7 @@ class KVCacheConfigurator:
     def _unified_config_from_budget(self, budget_bytes, *, cap_tokens=None):
         from sglang.srt.mem_cache.kv.plan import plan_kv_storage
         from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+        from sglang.srt.mem_cache.kv.state_policy import StateSlotStrategy
         from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
         schedule = get_schedule()
@@ -3115,15 +3116,17 @@ class KVCacheConfigurator:
             if schedule.max_mamba_cache_size is None
             else schedule.max_mamba_cache_size // self.attn_dp_size,
             state_share=ratio / (1 + ratio),
-            slots_per_request=self._calculate_mamba_ratio() if has_state else 1,
+            state_strategy=StateSlotStrategy(
+                radix_cache=not get_memory().disable_radix_cache,
+                decode_only=get_disagg().disaggregation_mode == "decode",
+                extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+                overlap=not schedule.disable_overlap_schedule,
+                lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+                skip_decode_lock=envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get(),
+            ),
             radix_cache=not get_memory().disable_radix_cache,
             window_ratio=schedule.swa_full_tokens_ratio,
             floor_window=self.model_config.sliding_window_size if has_window else None,
-            tracking_slots=get_mamba_tracking_slots(
-                extra_buffer=True, overlap=not schedule.disable_overlap_schedule
-            )
-            if get_exec().mamba.enable_mamba_extra_buffer
-            else 0,
         )
         frozen = self._unified_sized if cap_tokens is not None else None
         if frozen is not None:

@@ -187,10 +187,10 @@ _CONFIGS = {
 }
 
 # One configuration per chain whose bs=1 floor the golden pins. The full + state
-# floor binds only when the state slots alone do not cover it, hence two slots.
+# floor uses the three slots required by the radix state strategy.
 _FLOOR_CONFIGS = {
     "swa_p16": _CONFIGS["swa_p16"],
-    "mamba_p16": _mamba(page_size=16, state_slots=2),
+    "mamba_p16": _mamba(page_size=16, state_slots=3),
     "tri_p16": _CONFIGS["tri_p16"],
 }
 

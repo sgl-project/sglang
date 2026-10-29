@@ -6,10 +6,7 @@ import msgspec
 
 from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.plan import KVStoragePlan
-
-# One running request holds 1 active state slot plus 2 radix checkpoints; a
-# floor, not headroom.
-_BS1_STATE_SLOTS = 3
+from sglang.srt.mem_cache.kv.state_policy import StateSlotStrategy
 
 
 def check_bs1_floor(
@@ -38,7 +35,7 @@ class KVSizingInputs(msgspec.Struct, frozen=True, kw_only=True):
     window_tokens: Optional[int] = None
     state_slots: Optional[int] = None
     state_share: float = 0.1
-    slots_per_request: int = 1
+    state_strategy: Optional[StateSlotStrategy] = None
     radix_cache: bool = True
     context_len: Optional[int] = None
     floor_window: Optional[int] = None
@@ -48,7 +45,6 @@ class KVSizingInputs(msgspec.Struct, frozen=True, kw_only=True):
     max_total_tokens: Optional[int] = None
     pre_alloc_rows: int = 0
     extra_context_len: int = 0
-    tracking_slots: int = 0
     alignment: int = 4096
 
 
@@ -69,6 +65,7 @@ class SizedKVStorage(msgspec.Struct, frozen=True, kw_only=True):
     fixed: Tuple[FixedAllocation, ...]
     full_cap_tokens: Optional[int] = None
     bs1_floor_terms: Tuple[Tuple[str, int], ...] = ()
+    state_strategy: StateSlotStrategy = StateSlotStrategy()
 
     @property
     def fixed_bytes(self):
@@ -94,12 +91,12 @@ def _request_estimate(plan, inp):
     )
 
 
-def _fixed_terms(plan, inp, running):
+def _fixed_terms(plan, inp, running, strategy):
     scratch_rows = running + 1
     request_rows = scratch_rows + inp.pre_alloc_rows
     row_bytes = 4 * ((inp.context_len or 0) + inp.extra_context_len)
     row_bytes += sum(
-        4 + 8 * inp.tracking_slots
+        4 + 8 * strategy.tracking_slots
         for s in plan.sub_pools
         if isinstance(s.lifetime, StateLifetime)
     )
@@ -170,7 +167,7 @@ def _window_units(sub_pool, full, inp, running, page):
     return int(full * inp.window_ratio) // page * page
 
 
-def _bs1_floor_terms(plan, context_len, floor_window):
+def _bs1_floor_terms(plan, context_len, floor_window, strategy):
     terms = []
     for sub_pool in plan.sub_pools:
         if isinstance(sub_pool.lifetime, WindowLifetime):
@@ -190,7 +187,7 @@ def _bs1_floor_terms(plan, context_len, floor_window):
             terms.append(
                 (
                     f"{sub_pool.name}_bs1_state_slots",
-                    _BS1_STATE_SLOTS * sub_pool.spec.entry_bytes(),
+                    strategy.slots_per_request() * sub_pool.spec.entry_bytes(),
                 )
             )
     terms.append(("sink", plan.sink_bytes()))
@@ -199,7 +196,7 @@ def _bs1_floor_terms(plan, context_len, floor_window):
 
 def _state_targets(plan, inp, chain, running, states, frozen):
     units = {}
-    state_budget = int(max(0, chain - plan.sink_bytes()) * inp.state_share)
+    state_budget = int(chain * inp.state_share)
     for sub_pool in states:
         count = inp.state_slots
         if count is None:
@@ -263,7 +260,8 @@ def size_plan(
     if inp.alignment <= 0 or not 0 <= inp.state_share < 1:
         raise ValueError("invalid sizing alignment or state share")
     running = _request_estimate(plan, inp)
-    fixed = _fixed_terms(plan, inp, running)
+    strategy = inp.state_strategy or StateSlotStrategy(radix_cache=inp.radix_cache)
+    fixed = _fixed_terms(plan, inp, running, strategy)
     states = [s for s in plan.sub_pools if isinstance(s.lifetime, StateLifetime)]
     windows = [s for s in plan.sub_pools if isinstance(s.lifetime, WindowLifetime)]
     budget = inp.budget_bytes
@@ -291,12 +289,14 @@ def size_plan(
         plan, inp, chain, running, states, windows, units, frozen
     )
     running = min(
-        running, full // 2, *(units[s.name] // inp.slots_per_request for s in states)
+        running,
+        full // 2,
+        *(units[s.name] // strategy.slots_per_request() for s in states),
     )
     terms = (
         ()
         if inp.context_len is None
-        else _bs1_floor_terms(plan, inp.context_len, inp.floor_window)
+        else _bs1_floor_terms(plan, inp.context_len, inp.floor_window, strategy)
     )
     check_bs1_floor(total_bytes=chain, floor_terms=terms, where="size_plan")
     if full <= 0 or running <= 0:
@@ -313,4 +313,5 @@ def size_plan(
         fixed=fixed,
         full_cap_tokens=inp.max_total_tokens,
         bs1_floor_terms=terms,
+        state_strategy=strategy,
     )

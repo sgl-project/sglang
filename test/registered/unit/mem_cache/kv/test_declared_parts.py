@@ -915,6 +915,63 @@ class TestDeclaredParts(CustomTestCase):
                 plan.sub_pool("mamba").spec.entry_bytes(),
             )
 
+    def test_state_slot_strategy_sizes_floor_and_acquisition_together(self):
+        from sglang.srt.mem_cache.kv.state_policy import StateSlotStrategy
+
+        _, plan, _ = _build(state=True)
+        cases = (
+            (StateSlotStrategy(), 3, 0),
+            (StateSlotStrategy(extra_buffer=True, overlap=True), 5, 2),
+            (
+                StateSlotStrategy(
+                    extra_buffer=True, overlap=True, lazy=True, skip_decode_lock=True
+                ),
+                3,
+                1,
+            ),
+            (StateSlotStrategy(extra_buffer=True, decode_only=True), 2, 1),
+            (StateSlotStrategy(radix_cache=False), 1, 0),
+        )
+        for strategy, slots, initial in cases:
+            with self.subTest(strategy=strategy):
+                sized = size_plan(
+                    plan,
+                    KVSizingInputs(
+                        full_tokens=256,
+                        state_slots=10,
+                        context_len=64,
+                        max_running_requests=8,
+                        alignment=1,
+                        state_strategy=strategy,
+                        radix_cache=strategy.radix_cache,
+                    ),
+                )
+                self.assertEqual(sized.max_running_requests, min(8, 10 // slots))
+                self.assertEqual(
+                    dict(sized.bs1_floor_terms)["mamba_bs1_state_slots"],
+                    slots * plan.sub_pool("mamba").spec.entry_bytes(),
+                )
+                storage = build_kv_storage(
+                    plan,
+                    sized,
+                    UnifiedBuildContext(
+                        device="cpu",
+                        start_layer=0,
+                        end_layer=3,
+                        enable_memory_saver=False,
+                        need_sort=False,
+                        max_num_reqs=8,
+                        model_context_len=64,
+                        state_cache_params=SimpleNamespace(layers=(1, 2)),
+                    ),
+                )
+                self.assertEqual(storage.requests.mamba_initial_tracking_slots, initial)
+                self.assertEqual(
+                    storage.requests.mamba_ping_pong_track_buffer_size,
+                    strategy.tracking_slots,
+                )
+                self.assertEqual(storage.requests.size, sized.max_running_requests)
+
     def test_retraction_carries_whole_entries_derived_pages_and_request_parts(self):
         from unittest.mock import patch
 
