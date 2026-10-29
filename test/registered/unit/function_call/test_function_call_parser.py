@@ -1565,6 +1565,56 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(params1["city"], "Shanghai")
         self.assertEqual(params2["city"], "Beijing")
 
+    def _stream(self, chunks):
+        names, params = {}, {}
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.name:
+                    names[call.tool_index] = call.name
+                params[call.tool_index] = params.get(call.tool_index, "") + (
+                    call.parameters or ""
+                )
+        return names, {i: json.loads(p) for i, p in params.items()}
+
+    def test_parse_streaming_closing_fence_in_last_chunk(self):
+        """With multi-token chunks (MTP) the closing fence and both end tokens can
+        arrive in the final chunk; the arguments must still be streamed."""
+        names, params = self._stream(
+            [
+                "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n",
+                '```json\n{"city": "Shanghai"}',
+                "\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            ]
+        )
+        self.assertEqual(names, {0: "get_weather"})
+        self.assertEqual(params, {0: {"city": "Shanghai"}})
+
+    def test_parse_streaming_multiple_tool_calls_end_tokens_in_last_chunk(self):
+        """Same chunks as the multi-token test above, but the last two arrive together."""
+        names, params = self._stream(
+            [
+                "<｜tool▁calls▁begin｜>",
+                "<｜tool▁call▁begin｜>function",
+                "<｜tool▁sep｜>get",
+                "_weather\n",
+                "```json\n",
+                '{"city":',
+                '"Shanghai',
+                '"}\n```<｜tool▁call▁end｜>',
+                "\n<｜tool▁call▁begin｜>",
+                "function<｜tool▁sep｜>",
+                "get_tour",
+                "ist_att",
+                'ractions\n```json\n{"',
+                'city": "',
+                'Beijing"}\n',
+                "```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            ]
+        )
+        self.assertEqual(names, {0: "get_weather", 1: "get_tourist_attractions"})
+        self.assertEqual(params, {0: {"city": "Shanghai"}, 1: {"city": "Beijing"}})
+
 
 class TestDeepSeekV32Detector(unittest.TestCase):
     def setUp(self):
