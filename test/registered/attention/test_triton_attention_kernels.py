@@ -635,6 +635,83 @@ class TestTritonAttention(CustomTestCase):
             torch.allclose(o_extend_triton, o_extend_torch, rtol=1e-3, atol=1e-3)
         )
 
+    def test_extend_attention_block_bidirectional(self):
+        """block_boundaries widens the causal mask per sequence to
+        causal | (k < P) | (q >= P); P = -1 keeps the sequence causal."""
+        dtype = torch.bfloat16
+        device = get_device()
+        torch.manual_seed(0)
+
+        def indptr(lens):
+            return torch.cat([lens.new_zeros(1), torch.cumsum(lens, 0)]).int()
+
+        def check(H_Q, H_KV, D, prefix_lens, extend_lens, boundaries):
+            prefix = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
+            extend = torch.tensor(extend_lens, dtype=torch.int32, device=device)
+            kv_indptr, qo_indptr = indptr(prefix), indptr(extend)
+            n_kv, n_ext = int(prefix.sum()), int(extend.sum())
+            k_buffer = torch.randn((n_kv, H_KV, D), dtype=dtype, device=device) * 0.2
+            v_buffer = torch.randn_like(k_buffer)
+            q_extend = torch.randn((n_ext, H_Q, D), dtype=dtype, device=device) * 0.2
+            k_extend = torch.randn((n_ext, H_KV, D), dtype=dtype, device=device) * 0.2
+            v_extend = torch.randn_like(k_extend)
+            o = torch.empty_like(q_extend)
+            extend_attention_fwd(
+                q_extend,
+                k_extend,
+                v_extend,
+                o,
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                torch.arange(n_kv, dtype=torch.int32, device=device),
+                None,
+                True,
+                None,
+                int(extend.max()),
+                1.0,
+                1.0,
+                sm_scale=D**-0.5,
+                block_boundaries=torch.tensor(
+                    boundaries, dtype=torch.int32, device=device
+                ),
+            )
+            for i, P in enumerate(boundaries):
+                P0, L = prefix_lens[i], prefix_lens[i] + extend_lens[i]
+                qs, ks = (
+                    slice(qo_indptr[i], qo_indptr[i + 1]),
+                    slice(kv_indptr[i], kv_indptr[i + 1]),
+                )
+                k = torch.cat([k_buffer[ks], k_extend[qs]]).repeat_interleave(
+                    H_Q // H_KV, dim=1
+                )
+                v = torch.cat([v_buffer[ks], v_extend[qs]]).repeat_interleave(
+                    H_Q // H_KV, dim=1
+                )
+                q_abs = torch.arange(P0, L, device=device)[:, None]
+                k_abs = torch.arange(L, device=device)[None, :]
+                mask = (k_abs <= q_abs) | ((P >= 0) & ((k_abs < P) | (q_abs >= P)))
+                s = torch.einsum("qhd,khd->qhk", q_extend[qs].float(), k.float())
+                s = (s * D**-0.5).masked_fill(~mask[:, None, :], float("-inf"))
+                ref = torch.einsum("qhk,khd->qhd", F.softmax(s, dim=-1), v.float())
+                torch.testing.assert_close(o[qs].float(), ref, rtol=1e-2, atol=1e-2)
+
+        # -1 causal, 0 fully bidirectional, boundary at the cached prefix end,
+        # boundary inside the extend part.
+        check(
+            8,
+            2,
+            128,
+            [0, 0, 96, 100, 37],
+            [150, 200, 70, 90, 131],
+            [-1, 0, 96, 130, 90],
+        )
+        # Qwen3.5-shaped heads, tile-aligned (1088 = 17 * 64) and unaligned boundaries.
+        check(
+            16, 4, 256, [0, 0, 0, 0], [1150, 1157, 3128, 1150], [-1, 1088, 3059, 1088]
+        )
+
     def test_extend_attention_sliding_window(self):
         window_sizes = [-1, 127]
         for window_size in window_sizes:
