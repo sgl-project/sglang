@@ -79,7 +79,12 @@ def _reduce_tensor_modified(*args, **kwargs):
 
 def _rebuild_cuda_tensor_modified(*args):
     args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_from_maybe_uuid)
-    return reductions._rebuild_cuda_tensor_original(*args)
+    # The receiving process may not have called monkey_patch_torch_reductions(),
+    # e.g. a worker spawned by a library that knows nothing about this patch.
+    rebuild_cuda_tensor = getattr(
+        reductions, "_rebuild_cuda_tensor_original", reductions.rebuild_cuda_tensor
+    )
+    return rebuild_cuda_tensor(*args)
 
 
 def _device_to_uuid(device: int) -> str:
