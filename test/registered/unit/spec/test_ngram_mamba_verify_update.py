@@ -317,8 +317,6 @@ class TestDelayedMambaCommitBatchPairing(CustomTestCase):
         )
 
     def test_verify_scratch_builds_the_valid_mask_only_for_stable_rows(self):
-        """KDA/GDN verify pass the valid mask as a callable: with stable rows off
-        it must not run, so no per-layer mask kernel launches."""
         from sglang.srt.layers.attention.linear.utils import (
             select_verify_intermediate_state_indices,
         )

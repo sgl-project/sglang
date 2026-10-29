@@ -113,8 +113,7 @@ def select_verify_intermediate_state_indices(
 ):
     if not pp_spec_stable_rows_enabled():
         return default_indices
-    # A callable `valid` is evaluated only here, so per-layer callers launch no
-    # mask kernel when stable rows are off.
+    # Evaluate a callable mask only when it is used.
     if callable(valid):
         valid = valid()
 
