@@ -1857,6 +1857,10 @@ class Envs:
     # whitelist of shapes that win in the microbench, "all" = every shape).
     SGLANG_DSV4_DENSE_MXSCALE = EnvBool(False)
     SGLANG_DSV4_DENSE_MXSCALE_SHAPES = EnvStr("")
+
+    # Opt-in B300 WQKV/shared-FC1 split-K for M <= 8. Changes FP32 reduction
+    # order; deterministic and batch-invariant execution keep the default.
+    SGLANG_OPT_DSV41_SMALL_BATCH_SPLIT_K = EnvBool(False)
     # fp8 unified_kv decode/verify on aiter's FlyDSL v4 nm decode when the
     # installed aiter ships it; 0 keeps the asm kernel.
     SGLANG_DSV4_FLYDSL_DECODE = EnvBool(True)

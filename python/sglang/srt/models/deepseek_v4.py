@@ -4692,6 +4692,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        self._configure_small_batch_split_k()
         self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
@@ -4728,6 +4729,30 @@ class DeepseekV4ForCausalLM(nn.Module):
         # mid-serving (RL refit sends many partial batches); the prewarm and
         # its barrier must only run on the first (startup) load.
         self._mhc_prewarmed_at_load = False
+
+    def _configure_small_batch_split_k(self) -> None:
+        if not (
+            _is_cuda
+            and self.config.model_type == "deepseek_v41"
+            and envs.SGLANG_OPT_DSV41_SMALL_BATCH_SPLIT_K.get()
+        ):
+            return
+        # Only this target-model constructor calls the hook. NextN and DSPARK
+        # draft models keep their own projection policies.
+        for name, layer in self.model.named_modules():
+            if not name.endswith(
+                ("self_attn.wqkv_a", "mlp.shared_experts.gate_up_proj")
+            ):
+                continue
+            method = layer.quant_method
+            if (
+                isinstance(method, Fp8LinearMethod)
+                and method.mxfp8_dense_backend is not None
+                and method.mxfp8_dense_backend.is_flashinfer_cutedsl()
+            ):
+                method.w8a8_mxfp8_linear = functools.partial(
+                    method.w8a8_mxfp8_linear, use_small_batch_split_k=True
+                )
 
     @torch.inference_mode()
     def wants_prefill_autotune(self) -> bool:

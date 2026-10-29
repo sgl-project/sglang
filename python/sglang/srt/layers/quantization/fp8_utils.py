@@ -672,7 +672,7 @@ if get_platform().is_blackwell and is_flashinfer_available():
     @register_custom_op(
         op_name="flashinfer_mm_mxfp8",
         mutates_args=[],
-        fake_impl=lambda q_input, weight_t, x_scale_u8, weight_scale_t, out_dtype, use_8x4_sf_layout=False, backend="auto": (
+        fake_impl=lambda q_input, weight_t, x_scale_u8, weight_scale_t, out_dtype, use_8x4_sf_layout=False, backend="auto", use_split_k=False: (
             q_input.new_empty((q_input.shape[0], weight_t.shape[1]), dtype=out_dtype)
         ),
     )
@@ -684,7 +684,32 @@ if get_platform().is_blackwell and is_flashinfer_available():
         out_dtype: torch.dtype,
         use_8x4_sf_layout: bool = False,
         backend: str = "auto",
+        use_split_k: bool = False,
     ) -> torch.Tensor:
+        if use_split_k:
+            # FlashInfer's public mm_mxfp8 does not accept an explicit tactic.
+            # This stateless runner is also used by its ordinary CuTe dispatch.
+            from flashinfer.gemm.gemm_base import _cute_dsl_gemm_mxfp8_runner
+
+            assert backend == "cute-dsl" and not use_8x4_sf_layout
+            assert out_dtype == torch.bfloat16
+            output = q_input.new_empty(
+                (q_input.shape[0], weight_t.shape[1]), dtype=out_dtype
+            )
+            runner = _cute_dsl_gemm_mxfp8_runner(10, 3, True, out_dtype)
+            runner(
+                inputs=[
+                    q_input,
+                    weight_t,
+                    x_scale_u8,
+                    weight_scale_t,
+                    out_dtype,
+                    output,
+                    None,  # CuTe split-K reduces inside the cluster; no workspace.
+                ],
+                tactic=((128, 8), (1, 1), True, False, 4),
+            )
+            return output
         return _flashinfer_mm_mxfp8_impl(
             q_input,
             weight_t,
@@ -1876,12 +1901,15 @@ def flashinfer_mxfp8_blockscaled_linear(
     output_dtype: Optional[torch.dtype] = None,
     backend: str = "cutlass",
     pin_tactic: bool = False,
+    use_small_batch_split_k: bool = False,
 ) -> torch.Tensor:
     """MXFP8 dense linear via FlashInfer mm_mxfp8. `weight_scale` must be the layout
     the backend expects, prepared at load time.
 
     pin_tactic skips autotuning: tactics tuned per M bucket change the fp32
     reduction order, breaking row-wise batch invariance.
+    use_small_batch_split_k opts selected B300 projections into split-K=4;
+    deterministic and batch-invariant modes retain the original tactic policy.
     """
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -1914,7 +1942,50 @@ def flashinfer_mxfp8_blockscaled_linear(
     else:
         weight_scale_t = weight_scale.t() if weight_scale.ndim == 2 else weight_scale
 
-    if pin_tactic:
+    use_split_k = False
+    if (
+        use_small_batch_split_k
+        and backend == "cute-dsl"
+        and 0 < input_2d.shape[0] <= 8
+        and weight.shape in ((1792, 5120), (1152, 5120))
+        and output_dtype == torch.bfloat16
+        and q_input.is_cuda
+        and q_input.dtype == torch.float8_e4m3fn
+        and q_input.is_contiguous()
+        and weight.is_contiguous()
+        and x_scale_u8.ndim == weight_scale_t.ndim == 1
+        and x_scale_u8.dtype == weight_scale_t.dtype == torch.uint8
+        and x_scale_u8.is_contiguous()
+        and weight_scale_t.is_contiguous()
+        and q_input.device
+        == weight.device
+        == x_scale_u8.device
+        == weight_scale_t.device
+        # The eligible shapes use one 128-row activation scale tile, K/32
+        # scales per row, and N divisible by 128. Keep malformed buffers on
+        # FlashInfer's validating path instead of passing them to the runner.
+        and x_scale_u8.numel() == 128 * (k // 32)
+        and weight_scale_t.numel() == weight.shape[0] * (k // 32)
+        and get_device_sm() == 103
+    ):
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        use_split_k = not (
+            is_batch_invariant_mode_enabled()
+            or get_exec().deterministic.enable_deterministic_inference
+        )
+
+    if use_split_k:
+        output = flashinfer_mm_mxfp8(
+            q_input,
+            weight.t(),
+            x_scale_u8,
+            weight_scale_t,
+            out_dtype=output_dtype,
+            backend=backend,
+            use_split_k=True,
+        )
+    elif pin_tactic:
         from flashinfer.autotuner import autotune
 
         with autotune(False, skip_ops={"mxfp8_gemm"}):
