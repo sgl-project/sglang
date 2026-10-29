@@ -6012,6 +6012,19 @@ class Scheduler(
         ):
             retract_reqs.append(self.chunked_req)
 
+        # dLLM requests wait in the dLLM manager between blocks, many still
+        # holding KV. Take them all out so each one returns exactly once.
+        idle_dllm_reqs = []
+        if self.dllm_config is not None:
+            for req in self.dllm_manager.pop_all_reqs():
+                if req.finished() or any(req is r for r in retract_reqs):
+                    continue
+                if req.kv.holds_kv:
+                    retract_reqs.append(req)
+                else:
+                    req.reset_for_retract()
+                    idle_dllm_reqs.append(req)
+
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
             # retract them too, so their KV is rebuilt under the new weights.
@@ -6043,7 +6056,7 @@ class Scheduler(
                 offload_kv=False,
             )
         self.running_batch.reqs = []
-        for req in retract_reqs:
+        for req in retract_reqs + idle_dllm_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
