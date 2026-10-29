@@ -16,7 +16,6 @@ from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
-from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -130,7 +129,16 @@ def candidate_topk(
             "DFlash candidate top-k requires a dense FP16/BF16/FP32 target lm_head "
             "or a supported lm_head.quant_method."
         )
-    tp = get_parallel().tp_size == 1
+    # Gather over the group the head is vocab-sharded on: with DP attention and
+    # --enable-dp-lm-head that is the attention-TP group, whose ranks hold this DP
+    # rank's tokens; the full TP group would mix other DP ranks' rows.
+    parallel = get_parallel()
+    group = (
+        parallel.attn_tp_group
+        if getattr(lm_head, "use_attn_tp_group", False)
+        else parallel.tp_group
+    )
+    tp = group.world_size == 1
     num_org = (
         int(lm_head.org_vocab_size)
         if tp
@@ -147,13 +155,11 @@ def candidate_topk(
     if tp:
         return ids.long(), vals, lse
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
-    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+    gathered_vals = group.all_gather(vals.float(), dim=-1)
+    gathered_ids = group.all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
-        lse = torch.logsumexp(
-            tensor_model_parallel_all_gather(lse.unsqueeze(-1), dim=-1), dim=-1
-        )
+        lse = torch.logsumexp(group.all_gather(lse.unsqueeze(-1), dim=-1), dim=-1)
     return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
 
 
