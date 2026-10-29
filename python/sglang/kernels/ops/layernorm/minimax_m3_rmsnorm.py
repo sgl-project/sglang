@@ -237,7 +237,7 @@ def _gemma_add_rmsnorm_fp8_4rows_kernel(
                 mask=(zcols < ZERO_COLS) & in_rows,
             )
     if GROUP != 0:
-        # column k: the scales of row base + k
+        # Column k holds the scales of row base + k.
         scales = tl.reshape(
             tl.join(tl.join(scale0, scale2), tl.join(scale1, scale3)),
             [BLOCK_N // GROUP, 4],
@@ -255,7 +255,7 @@ def _gemma_add_rmsnorm_fp8_4rows_kernel(
         )
 
 
-# measured on MI350X at 6144 columns: four rows per program win from 2048 rows
+# Measured on MI350X at 6144 columns: four rows per program win from 2048 rows.
 _FOUR_ROWS_MIN_ROWS = 2048
 
 
@@ -332,15 +332,15 @@ def gemma_add_rmsnorm_fp8(
     keep_bf16: bool = False,
     zeros: Optional[torch.Tensor] = None,
 ):
-    """Gemma RMSNorm of ``x`` (plus ``residual`` when given) quantized to FP8 as aiter
-    does: per token (``group_size`` None, scale ``[m, 1]``) like ``per_token_quant_hip``,
-    or per ``1 x group_size`` (scale ``[m, n / group_size]``, column-major when
-    ``transpose_scale``) like ``get_hip_quant(QuantType.per_1x128)``.
+    """Gemma RMSNorm of ``x`` (plus ``residual`` when given) quantized to FP8 as aiter does.
 
-    Returns ``((fp8 [m, n], fp32 scale), residual_out)``, with the bf16 norm as a third
-    element of the tuple when ``keep_bf16``; ``residual_out`` is the pre-norm sum, or
-    ``x`` itself without a residual. ``zeros``, a contiguous ``[m, *]`` tensor, is
-    zero-filled by the same launch.
+    Per token (``group_size`` None, scale ``[m, 1]``) like ``per_token_quant_hip``, or per
+    ``1 x group_size`` (scale ``[m, n / group_size]``, column-major when
+    ``transpose_scale``) like ``get_hip_quant(QuantType.per_1x128)``. Returns
+    ``((fp8 [m, n], fp32 scale), residual_out)``, with the bf16 norm as a third element of
+    the tuple when ``keep_bf16``; ``residual_out`` is the pre-norm sum, or ``x`` itself
+    without a residual. ``zeros``, a contiguous ``[m, *]`` tensor, is zero-filled by the
+    same launch.
     """
     n = x.shape[-1]
     x2 = x.reshape(-1, n)
@@ -362,7 +362,7 @@ def gemma_add_rmsnorm_fp8(
     zero_cols = 0
     if zeros is not None:
         assert zeros.is_contiguous() and zeros.shape[0] == m
-        # an idle DP-attention rank runs its layers on no tokens
+        # An idle DP-attention rank runs its layers on no tokens.
         zero_cols = zeros.numel() // m if m else 0
     block_n = triton.next_power_of_2(n)
     kernel, grid = _gemma_add_rmsnorm_fp8_kernel, m

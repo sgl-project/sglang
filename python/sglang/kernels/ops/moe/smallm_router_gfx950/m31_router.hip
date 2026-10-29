@@ -22,7 +22,7 @@ static_assert(sizeof(Args) == 108, "kernarg ABI drift: keep in sync with Args in
 
 static constexpr int K = 6144, E = 128, TOPK = 4, BM = 16, NT = 256;
 
-// lane value from the DPP partner: quad_perm xor 1 / xor 2, then half-row and row mirrors (16-lane butterfly)
+// Lane value from the DPP partner: quad_perm xor 1 / xor 2, then half-row and row mirrors (16-lane butterfly).
 template <int CTRL>
 __device__ __forceinline__ int dpp(int v) { return __builtin_amdgcn_mov_dpp(v, CTRL, 0xF, 0xF, false); }
 template <int CTRL>
@@ -32,7 +32,7 @@ __device__ __forceinline__ void topk_step(float& bv, int& bi, float& ba) {
     if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; ba = oa; }
 }
 
-// workgroup barrier ordering LDS only: __syncthreads would also wait for this wave's outstanding global stores
+// Workgroup barrier ordering LDS only: __syncthreads would also wait for this wave's outstanding global stores.
 __device__ __forceinline__ void lds_barrier() {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
     __builtin_amdgcn_s_barrier();
@@ -43,7 +43,7 @@ __device__ __forceinline__ f32x4 mfma(u32x4 a, u32x4 b, f32x4 c) {
     return __builtin_amdgcn_mfma_f32_16x16x32_bf16(__builtin_bit_cast(bf16x8, a), __builtin_bit_cast(bf16x8, b), c, 0, 0, 0);
 }
 
-// bytes per LDS-staged weight / x row, and the staged rows' total
+// Bytes per LDS-staged weight / x row, and the staged rows' total.
 template <int BK, int S>
 constexpr int router_rowb() { return (K + BK * S - 1) / (BK * S) * BK * 2 + 16; }
 template <int BN, int BK, int S>
@@ -72,7 +72,7 @@ __device__ __forceinline__ void router_body(const Args& a, const int item, uint8
         for (int q = 0; q < 4; ++q) bias[4 * v4 + q] = b4[q];
     }
 
-    // all four waves stage the item's weight rows and x rows in LDS; wave j < NSUB then runs subtile j's chain
+    // All four waves stage the item's weight rows and x rows in LDS; wave j < NSUB then runs subtile j's chain.
     constexpr int KL = NIT * BK, ROWB = router_rowb<BK, S>();   // bytes per staged row (+16: bank skew)
     uint8_t* const s_w2 = lds;
     uint8_t* const s_x2 = lds + BN * ROWB;
@@ -171,7 +171,7 @@ __device__ __forceinline__ void router_body(const Args& a, const int item, uint8
         for (int v = 0; v < V; ++v)
             if (cur[v] > bv) { bv = cur[v]; bi = c + v; ba = act[v]; }
         static_assert(G == 16, "the DPP butterfly covers one 16-lane row");
-        // max value, lowest expert id among equals, over the token's 16 lanes
+        // Max value, lowest expert id among equals, over the token's 16 lanes.
         topk_step<0xB1>(bv, bi, ba);    // quad_perm(1, 0, 3, 2)
         topk_step<0x4E>(bv, bi, ba);    // quad_perm(2, 3, 0, 1)
         topk_step<0x141>(bv, bi, ba);   // row_half_mirror
@@ -206,7 +206,7 @@ __device__ __forceinline__ void router_body(const Args& a, const int item, uint8
     if (tid < 64) {
         const bool live = tid < P;
         const int e = live ? s_e[tid] : 0, tok = tid / TOPK;
-        // distinct-expert mask, 4 x 32 bits, OR-reduced over the wave
+        // Distinct-expert mask, 4 x 32 bits, OR-reduced over the wave.
         uint32_t u[4];
 #pragma unroll
         for (int wd = 0; wd < 4; ++wd) {
@@ -270,7 +270,7 @@ template <int BN, int BK, int S, int RG, int STEPS, int WAVES>
 __device__ __forceinline__ void shared_router(const SharedArgs& a) {
     extern __shared__ __attribute__((aligned(16))) uint8_t s_dyn[];
     if (blockIdx.x < RG) {
-        // wave-uniform exit; the router's barriers then wait on its four waves only
+        // Wave-uniform exit; the router's barriers then wait on its four waves only.
         if (__builtin_amdgcn_readfirstlane(threadIdx.x) >= NT) return;
         router_body<BN, BK, S>(a.r, blockIdx.x, s_dyn);
     } else {

@@ -427,7 +427,7 @@ def moe_fused_gate(
 
     from sglang.srt.environ import envs
 
-    # the fast paths below read one 2-D score tensor, not split-K partials
+    # The fast paths below read one 2-D score tensor, not split-K partials.
     if (
         split_k == 1
         and envs.SGLANG_OPT_SM120_MTP_ROUTER_TOP22.get()

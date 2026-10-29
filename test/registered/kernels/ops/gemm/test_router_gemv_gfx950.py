@@ -121,7 +121,8 @@ class TestRouterGemv(CustomTestCase):
             check((fused[0].clone(), fused[1]), x, gu, (None, False))
 
     def test_graph_replay_matches_eager(self):
-        """Back-to-back calls share the split-K scratch."""
+        """Calls captured back to back share the split-K scratch and fixup counter; a replay
+        must still reproduce each call's eager output."""
         from sglang.kernels.ops.gemm.router_gemv import router_gemv
 
         xs = [self._x(m) for m in (8, 256, 40, 512)]

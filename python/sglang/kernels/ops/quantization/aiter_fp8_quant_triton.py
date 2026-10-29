@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Triton epilogues that quantize to FP8 like aiter's HIP quant kernels on gfx95, so a
-fused producer hands the GEMM the bytes and scales the separate quant kernel writes:
+"""Triton epilogues that quantize to FP8 like aiter's HIP quant kernels on gfx95.
+
+A fused producer then hands the GEMM the bytes and scales the separate quant kernel writes:
 per token as ``per_token_quant_hip`` for the ptpc GEMM, per 1 x 128 as
-``get_hip_quant(QuantType.per_1x128)`` for the block-scale GEMMs."""
+``get_hip_quant(QuantType.per_1x128)`` for the block-scale GEMMs.
+"""
 
 from typing import Optional
 
@@ -74,12 +76,12 @@ def swiglu_oai_fp8_rows(
     base = x_ptr + r[:, None].to(tl.int64) * stride_row + c[None, :]
     gate = tl.load(base, mask=mask, other=0.0).to(tl.float32)
     up = tl.load(base + n, mask=mask, other=0.0).to(tl.float32)
-    # the op order Inductor emits for swiglu_no_interleaved_with_alpha_and_limit
+    # This is the op order Inductor emits for swiglu_no_interleaved_with_alpha_and_limit.
     gate = tl.minimum(gate, LIMIT, propagate_nan=tl.PropagateNan.ALL)
     up = tl.maximum(up, -LIMIT, propagate_nan=tl.PropagateNan.ALL)
     up = tl.minimum(up, LIMIT, propagate_nan=tl.PropagateNan.ALL)
     act = gate * tl.sigmoid(gate * ALPHA) * (up + 1.0)
-    # the separate quant reads the bf16 activation; padding stays 0
+    # The separate quant reads the bf16 activation; padding stays 0.
     act = tl.where(mask, act.to(tl.bfloat16).to(tl.float32), 0.0)
     if GROUP == 0:
         q, scale = fp8_per_token_quant(act, 1)
@@ -162,10 +164,12 @@ def swiglu_oai_fp8(
     group_size: Optional[int] = None,
     transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``hidden [rows, 2n]`` bf16 (gate | up) -> quantized SwiGLU-OAI, equal to quantizing
-    ``swiglu_no_interleaved_with_alpha_and_limit(hidden)`` with aiter: per token
-    (``group_size`` None, scale ``[rows, 1]``) or per ``1 x group_size`` (scale
-    ``[rows, n / group_size]``, column-major when ``transpose_scale``)."""
+    """``hidden [rows, 2n]`` bf16 (gate | up) -> quantized SwiGLU-OAI.
+
+    Equal to quantizing ``swiglu_no_interleaved_with_alpha_and_limit(hidden)`` with aiter:
+    per token (``group_size`` None, scale ``[rows, 1]``) or per ``1 x group_size`` (scale
+    ``[rows, n / group_size]``, column-major when ``transpose_scale``).
+    """
     q, scale, block_m, block_n = swiglu_oai_fp8_outputs(
         hidden, group_size, transpose_scale
     )
