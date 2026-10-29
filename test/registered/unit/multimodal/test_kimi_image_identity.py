@@ -4,6 +4,7 @@ import hashlib
 import json
 import unittest
 from array import array
+from dataclasses import replace
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -30,6 +31,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.cache import snapshot_media
+from sglang.srt.multimodal.kimi_k3_image_processing import (
+    DEFERRED_PREPROCESSING_KEY,
+    KimiK3DeferredPreprocessing,
+)
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import (
     KimiGridMMDataMixin,
@@ -168,7 +173,7 @@ class TestKimiImageIdentity(CustomTestCase):
             identities.append(item.identity)
         self.assertEqual(len(set(identities)), 3)
 
-    def test_prepared_inputs_do_not_alias_other_formats_or_metadata(self):
+    def test_prepared_inputs_do_not_alias_other_formats(self):
         """equal tensors need different cache keys when the encoder contract differs"""
         processor = _IdentityOnly({})
         feature = torch.arange(16, dtype=torch.float32).reshape(4, 4)
@@ -185,14 +190,8 @@ class TestKimiImageIdentity(CustomTestCase):
         )
         changed_format.feature = None
         changed_format.precomputed_embeddings = feature
-        changed_metadata = _image_item(
-            [1, 4, 4], feature=feature, fmt=MultimodalInputFormat.PROCESSOR_OUTPUT
-        )
-        changed_metadata.model_specific_data["position_ids"] = torch.arange(4)
-        for item in (changed_format, changed_metadata):
-            with self.subTest(format=item.format, metadata=item.model_specific_data):
-                processor.assign_kimi_image_identities([item], None)
-                self.assertIsNone(cache.get_single(item.cache_key))
+        processor.assign_kimi_image_identities([changed_format], None)
+        self.assertIsNone(cache.get_single(changed_format.cache_key))
 
         repeat = _image_item(
             [1, 4, 4],
@@ -201,6 +200,40 @@ class TestKimiImageIdentity(CustomTestCase):
         )
         processor.assign_kimi_image_identities([repeat], None)
         self.assertIs(cache.get_single(repeat.cache_key), cached)
+
+    def test_prepared_inputs_keep_deferred_preprocessing_config(self):
+        processor = _IdentityOnly({})
+        feature = torch.zeros(3, 28, 28, dtype=torch.uint8)
+        config = KimiK3DeferredPreprocessing(
+            backend="cpu",
+            image_mean=[0.5] * 3,
+            image_std=[0.5] * 3,
+            transparent_bg_config=None,
+            resize_config={
+                "new_height": 28,
+                "new_width": 28,
+                "pad_height": 0,
+                "pad_width": 0,
+            },
+        )
+        cache = MultiModalStaticCache(1024)
+        for index, deferred in enumerate(
+            (
+                config,
+                replace(config, image_mean=[0.0] * 3),
+                replace(config, backend="gpu"),
+            )
+        ):
+            with self.subTest(config=deferred):
+                item = _image_item([1, 2, 2], feature=feature)
+                item.model_specific_data[DEFERRED_PREPROCESSING_KEY] = deferred
+                processor.assign_kimi_image_identities([item], None)
+                if index == 0:
+                    cache.set(
+                        item.cache_key, EmbeddingResult(embedding=torch.ones(1, 4))
+                    )
+                else:
+                    self.assertIsNone(cache.get_single(item.cache_key))
 
     def test_prepared_inputs_use_common_identity_without_snapshot(self):
         """prepared features stay on their device instead of taking the raw-media snapshot path"""
