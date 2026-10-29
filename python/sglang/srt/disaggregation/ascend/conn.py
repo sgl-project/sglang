@@ -149,7 +149,7 @@ class AscendKVManager(MooncakeKVManager):
             if self.dcp_size == 1 and dst_dcp_size > 1:
                 return True
             raise RuntimeError(
-                "NPU MLA PD supports prefill DCP 1 -> decode DCP N only, got "
+                "NPU DSA/MLA PD supports prefill DCP 1 -> decode DCP N only, got "
                 f"prefill={self.dcp_size}, decode={dst_dcp_size}"
             )
         return super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
