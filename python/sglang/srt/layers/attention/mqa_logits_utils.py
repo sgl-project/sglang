@@ -8,9 +8,7 @@ helpers bound that matrix and slice it by query rows.
 
 from __future__ import annotations
 
-import contextlib
-import logging
-from typing import Callable, Iterator, Optional, Set, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -18,8 +16,6 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import get_device_module, is_hip, is_xpu
 from sglang.srt.utils.common import ceil_div
-
-logger = logging.getLogger(__name__)
 
 MQA_LOGITS_BYTES_PER_ELEM = 4
 MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
@@ -103,55 +99,3 @@ def mqa_logits_rows_per_chunk(
         return None
     rows = max(budget_bytes // max(row_bytes, 1), 1)
     return int(rows) if rows < num_rows else None
-
-
-class MqaLogitsPool:
-    """A fixed amount of device memory held for logits tiles and their scratch.
-
-    A budget read from free memory shrinks as the caching allocator holds more of
-    the device, which a long-running server always ends up doing, and then the
-    tiles collapse to a few rows. This pool instead takes ``capacity_bytes`` once,
-    on the first tile of each stream, into a private allocator pool. The caching
-    allocator keeps a live private pool's segments out of every other allocation
-    and out of ``empty_cache``, so later tiles of at most ``capacity_bytes`` reuse
-    them whatever the rest of the server holds. Size tiles by ``capacity_bytes``.
-    """
-
-    def __init__(self, *, capacity_bytes: int, device: torch.device):
-        self.capacity_bytes = max(1, int(capacity_bytes))
-        self.device = device
-        self._pool: Optional[torch.cuda.MemPool] = None
-        # Cached blocks serve only the stream they were freed on.
-        self._reserved_streams: Set[int] = set()
-
-    @contextlib.contextmanager
-    def allocating(self) -> Iterator[None]:
-        """Route this thread's allocations on the device into the pool. Not for
-        graph capture: captured tensors belong to the graph's own pool."""
-        if self._pool is None:
-            self._pool = torch.cuda.MemPool()
-        with torch.cuda.use_mem_pool(self._pool, self.device):
-            stream = torch.cuda.current_stream(self.device).cuda_stream
-            if stream not in self._reserved_streams:
-                self._reserve(stream)
-                self._reserved_streams.add(stream)
-            yield
-
-    def _reserve(self, stream: int) -> None:
-        try:
-            held = torch.empty(
-                self.capacity_bytes, dtype=torch.uint8, device=self.device
-            )
-        except torch.OutOfMemoryError as e:
-            raise RuntimeError(
-                f"Could not reserve {self.capacity_bytes / (1 << 30):.2f} GiB for "
-                "the indexer's logits tiles; lower --mem-fraction-static or "
-                "SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION"
-            ) from e
-        del held
-        logger.info(
-            "Reserved %.2f GiB for indexer logits tiles on %s, stream %#x",
-            self.capacity_bytes / (1 << 30),
-            self.device,
-            stream,
-        )

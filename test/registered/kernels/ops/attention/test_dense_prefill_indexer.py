@@ -534,9 +534,8 @@ class TestPrefillScoreTileBudget(CustomTestCase):
                 self.assertLessEqual(peak_past(baseline, 0), logits + slack)
 
 
-def pooled_logits(inputs):
-    """Tiles scored in the configured pool, copied to the host so that nothing
-    the test keeps is allocated in it."""
+def budget_logits(inputs):
+    """Tiles under the real forward budget (no patched cap), on the host."""
     data = prefill_data(inputs)
     parts = []
     for tile, logits in scoring.score_tiles(data, inputs["kv"]):
@@ -545,62 +544,52 @@ def pooled_logits(inputs):
     return torch.cat(parts), len(parts)
 
 
-def pool_bytes(pool):
-    segments = pool._pool.snapshot()
-    return (
-        sum(s["total_size"] for s in segments),
-        sum(s["allocated_size"] for s in segments),
-    )
-
-
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (10, 12),
     "requires SM100 or SM120",
 )
-class TestPrefillScorePool(CustomTestCase):
+class TestPrefillScoreBudgetOnDevice(CustomTestCase):
     request_lengths = [(3, 4093), (2045, 485_123)]
 
-    def test_tiles_keep_their_size_whatever_else_holds_the_device(self):
-        """Tiles come from memory held once: filling the rest of the device and
-        emptying the allocator's cache change neither the tiles nor the pool."""
+    def park_free_memory(self, keep_bytes):
+        """Leave keep_bytes free to the driver, the rest in the allocator's cache."""
+        torch.cuda.synchronize()
+        free, _ = torch.cuda.mem_get_info()
+        held = torch.empty(max(0, free - keep_bytes), dtype=torch.uint8, device="cuda")
+        del held
+
+    def test_cached_memory_does_not_shrink_the_tiles(self):
         inputs = make_inputs(self.request_lengths)
-        capacity = 256 << 20
-        reference, reference_tiles = tiled_logits(inputs, capacity)
+        torch.cuda.empty_cache()
+        reference, tiles = budget_logits(inputs)
+        self.park_free_memory(64 << 20)
+        parked, parked_tiles = budget_logits(inputs)
+        self.assertEqual(parked_tiles, tiles)
         valid = (
-            torch.arange(reference.shape[1], device="cuda")[None, :]
-            < inputs["lengths"][:, None]
-        ).cpu()
-        reference = reference.cpu()
-        device = torch.device("cuda", torch.cuda.current_device())
-        with patch.dict(scoring._PREFILL_SCORE_POOLS, clear=True):
-            self.assertEqual(
-                scoring.configure_prefill_score_pool(
-                    device=device, need_bytes=capacity
-                ),
-                capacity,
-            )
-            pool = scoring._PREFILL_SCORE_POOLS[device.index]
-            first, tiles = pooled_logits(inputs)
-            held, allocated = pool_bytes(pool)
-            self.assertEqual(allocated, 0)
-            torch.cuda.synchronize()
+            torch.arange(reference.shape[1])[None, :] < inputs["lengths"].cpu()[:, None]
+        )
+        self.assertTrue(torch.equal(parked[valid], reference[valid]))
+
+    def test_memory_in_use_shrinks_the_tiles_with_the_same_scores(self):
+        inputs = make_inputs(self.request_lengths)
+        torch.cuda.empty_cache()
+        reference, tiles = budget_logits(inputs)
+        torch.cuda.synchronize()
+        free, _ = torch.cuda.mem_get_info()
+        # In use, not cached: about 1.2 GiB stays free, a 0.24 GiB budget.
+        held = torch.empty(
+            max(0, free - (1200 << 20)), dtype=torch.uint8, device="cuda"
+        )
+        try:
+            small, small_tiles = budget_logits(inputs)
+        finally:
+            del held
             torch.cuda.empty_cache()
-            free, _ = torch.cuda.mem_get_info()
-            # Leave room only for the small allocations outside the tiles.
-            hog = torch.empty(
-                max(0, free - (256 << 20)), dtype=torch.uint8, device="cuda"
-            )
-            try:
-                second, tiles_held = pooled_logits(inputs)
-            finally:
-                del hog
-            self.assertEqual(pool_bytes(pool), (held, 0))
-        self.assertEqual(tiles, reference_tiles)
-        self.assertEqual(tiles_held, reference_tiles)
-        self.assertGreater(tiles, 8)
-        self.assertLess(held, capacity + (64 << 20))
-        self.assertTrue(torch.equal(first[valid], reference[valid]))
-        self.assertTrue(torch.equal(second[valid], reference[valid]))
+        self.assertGreater(small_tiles, tiles)
+        valid = (
+            torch.arange(reference.shape[1])[None, :] < inputs["lengths"].cpu()[:, None]
+        )
+        self.assertTrue(torch.equal(small[valid], reference[valid]))
 
 
 if __name__ == "__main__":

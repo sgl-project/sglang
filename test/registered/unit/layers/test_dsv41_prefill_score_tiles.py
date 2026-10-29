@@ -387,230 +387,103 @@ CAPTURE_STATES = {
 }
 
 
-class FakePool:
-    """Stands in for ``MqaLogitsPool``: records when tiles are scored inside it."""
-
-    def __init__(self, capacity_bytes):
-        self.capacity_bytes = capacity_bytes
-        self.entries = 0
-        self.inside = False
-
-    @contextlib.contextmanager
-    def allocating(self):
-        self.entries += 1
-        self.inside = True
-        try:
-            yield
-        finally:
-            self.inside = False
-
-
-def with_pool(pool):
-    # CPU tensors have no device index, so the pool is keyed by None here.
-    return patch.dict(scoring._PREFILL_SCORE_POOLS, {None: pool}, clear=True)
-
-
-class TestScoreTilesInThePool(CustomTestCase):
-    def setUp(self):
-        self.data, self.kv, _ = make_case(CASES[0], ratio=1)
-        width = ceil_align(max(self.data.lens_per_request), FLAT_LOGITS_WIDTH_ALIGN)
-        self.group = ROW_ALIGN * mqa_logits_row_bytes(width)
-        stack = contextlib.ExitStack()
-        self.addCleanup(stack.close)
-        stack.enter_context(
-            patch.object(torch.cuda, "is_current_stream_capturing", lambda: False)
-        )
-
-    def score(self, pool, consume=lambda tile, logits: None):
-        fake = FakeDeepGEMM()
-        inside = []
-        allocate = fake.fp8_fp4_mqa_logits
-
-        def recording(*args, **kwargs):
-            inside.append(pool.inside if pool is not None else None)
-            return allocate(*args, **kwargs)
-
-        fake.fp8_fp4_mqa_logits = recording
-        with (
-            patch.dict(sys.modules, {"deep_gemm": fake.module()}),
-            with_pool(pool) if pool is not None else contextlib.nullcontext(),
-        ):
-            for tile, logits in scoring.score_tiles(self.data, self.kv):
-                consume(tile, logits)
-                del logits
-        return fake, inside
-
-    def test_the_pool_capacity_sizes_the_tiles(self):
-        for cap_groups, pool_groups, rows in (
-            (100, 2, 2 * ROW_ALIGN),
-            (2, 100, self.data.num_rows),
-        ):
-            with self.subTest(cap=cap_groups, pool=pool_groups):
-                with patch.object(
-                    scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", cap_groups * self.group
-                ):
-                    fake, _ = self.score(FakePool(pool_groups * self.group))
-                self.assertEqual(fake.allocations[0][0], rows)
-
-    def test_without_a_pool_the_cap_sizes_the_tiles(self):
-        with patch.object(scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", 2 * self.group):
-            fake, inside = self.score(None)
-        self.assertEqual(fake.allocations[0][0], 2 * ROW_ALIGN)
-
-    def test_tiles_and_the_callers_scratch_come_from_the_pool(self):
-        pool = FakePool(2 * self.group)
-        seen = []
-        fake, inside = self.score(pool, lambda tile, logits: seen.append(pool.inside))
-        self.assertGreater(len(fake.allocations), 1)
-        self.assertTrue(all(inside) and all(seen))
-        self.assertEqual(pool.entries, 1)
-        self.assertFalse(pool.inside)
-
-    def test_stopping_early_leaves_the_pool(self):
-        pool = FakePool(2 * self.group)
-        fake = FakeDeepGEMM()
-        with (
-            patch.dict(sys.modules, {"deep_gemm": fake.module()}),
-            with_pool(pool),
-        ):
-            tiles = scoring.score_tiles(self.data, self.kv)
-            next(tiles)
-            self.assertTrue(pool.inside)
-            tiles.close()
-        self.assertFalse(pool.inside)
-
-    def test_capture_scores_outside_the_pool_at_the_same_size(self):
-        for name, state in CAPTURE_STATES.items():
-            with self.subTest(capturing=name), state():
-                pool = FakePool(2 * self.group)
-                fake, inside = self.score(pool)
-                self.assertEqual(pool.entries, 0)
-                self.assertFalse(any(inside))
-                self.assertEqual(fake.allocations[0][0], 2 * ROW_ALIGN)
-
-    def test_breakable_replay_scores_in_the_pool(self):
-        pool = FakePool(2 * self.group)
-        with enable_breakable_cuda_graph():
-            self.score(pool)
-        self.assertEqual(pool.entries, 1)
-
-
-class TestConfigureScorePool(CustomTestCase):
+class TestPrefillScoreBudget(CustomTestCase):
     device = torch.device("cuda", 0)
 
-    def configure(self, need, static=3 << 30):
-        with patch.object(
-            scoring, "mqa_logits_static_budget_bytes", lambda **_: static
-        ):
-            return scoring.configure_prefill_score_pool(
-                device=self.device, need_bytes=need
+    def budget(self, *, reads=(1 << 30,), capturing=None, rows=8192, seq_len=485_000):
+        """The budget with free-memory reads replaced by ``reads`` (one per query)
+        and the allocator's empty_cache recorded."""
+        calls = {"reads": 0, "empty_cache": 0}
+        values = list(reads)
+
+        def read(*, device_index, allow_sync):
+            assert allow_sync and device_index == 0
+            calls["reads"] += 1
+            return values.pop(0)
+
+        def empty_cache():
+            calls["empty_cache"] += 1
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch.object(torch.cuda, "is_current_stream_capturing", lambda: False)
             )
-
-    def test_capacity_is_the_need_within_the_static_budget_and_the_cap(self):
-        with patch.dict(scoring._PREFILL_SCORE_POOLS, clear=True):
-            self.assertEqual(self.configure(100 << 20), 100 << 20)
-        with patch.dict(scoring._PREFILL_SCORE_POOLS, clear=True):
-            self.assertEqual(self.configure(8 << 30), 2 << 30)
-        with patch.dict(scoring._PREFILL_SCORE_POOLS, clear=True):
-            self.assertEqual(self.configure(8 << 30, static=1 << 30), 1 << 30)
-
-    def test_a_second_backend_never_shrinks_the_pool(self):
-        with patch.dict(scoring._PREFILL_SCORE_POOLS, clear=True):
-            self.configure(512 << 20)
-            pool = scoring._PREFILL_SCORE_POOLS[0]
-            self.assertEqual(self.configure(64 << 20), 512 << 20)
-            self.assertIs(scoring._PREFILL_SCORE_POOLS[0], pool)
-            self.assertEqual(self.configure(1 << 30), 1 << 30)
-
-    def test_need_covers_the_widest_scorer(self):
-        from sglang.srt.layers.attention.dsv4 import v41_indexer
-
-        needs = []
-
-        def record(*, device, need_bytes):
-            needs.append(need_bytes)
-            return need_bytes
-
-        rows, context, topk = 509, 4097, 512
-        width = ceil_align(context, FLAT_LOGITS_WIDTH_ALIGN)
-        logits = mqa_logits_row_bytes(width)
-        aligned = ceil_align(rows, ROW_ALIGN)
-        publish_row, publish_tile = dense_blocks._publish_scratch_bytes(
-            width, BLOCK, TOPK_BLOCKS
-        )
-        expected = {
-            0: max(
-                aligned * logits,
-                aligned * (logits + sparse_table._block_keys_row_bytes(width)),
-            ),
-            TOPK_BLOCKS: max(
-                aligned * (logits + sparse_table._block_keys_row_bytes(width)),
-                aligned * (logits + publish_row) + publish_tile,
-                aligned
-                * (
-                    logits
-                    + dense_blocks._consume_scratch_bytes(TOPK_BLOCKS, BLOCK, topk)
-                ),
-            ),
-        }
-        with patch.object(scoring, "configure_prefill_score_pool", record):
-            for topk_blocks, need in expected.items():
-                v41_indexer.configure_prefill_score_pool(
-                    device=self.device,
-                    max_rows=rows,
-                    max_context_len=context,
-                    index_heads=HEADS,
-                    index_topk=topk,
-                    candidate_topk_blocks=topk_blocks,
-                    candidate_block_size=BLOCK,
+            if capturing:
+                stack.enter_context(CAPTURE_STATES[capturing]())
+            stack.enter_context(patch.object(scoring, "mqa_logits_budget_bytes", read))
+            stack.enter_context(
+                patch.object(
+                    scoring, "mqa_logits_static_budget_bytes", lambda **_: 3 << 30
                 )
-                self.assertEqual(needs[-1], need)
+            )
+            stack.enter_context(patch.object(torch.cuda, "empty_cache", empty_cache))
+            value = scoring.prefill_score_budget_bytes(
+                num_rows=rows, max_seq_len=seq_len, device=self.device
+            )
+        return value, calls
+
+    def test_ample_free_memory_takes_the_cap_without_reclaiming(self):
+        value, calls = self.budget(reads=(8 << 30,))
+        self.assertEqual(value, 2 << 30)
+        self.assertEqual(calls, {"reads": 1, "empty_cache": 0})
+
+    def test_low_free_memory_returns_unused_blocks_and_reads_again(self):
+        """A running server's allocator holds nearly all free memory: the second
+        read, after empty_cache, decides."""
+        value, calls = self.budget(reads=(10 << 20, 700 << 20))
+        self.assertEqual(value, 700 << 20)
+        self.assertEqual(calls, {"reads": 2, "empty_cache": 1})
+        value, _ = self.budget(reads=(10 << 20, 8 << 30))
+        self.assertEqual(value, 2 << 30)
+
+    def test_capture_uses_the_static_budget_without_querying(self):
+        for name in CAPTURE_STATES:
+            with self.subTest(capturing=name):
+                value, calls = self.budget(reads=(), capturing=name)
+                self.assertEqual(value, 2 << 30)
+                self.assertEqual(calls, {"reads": 0, "empty_cache": 0})
+
+    def test_breakable_replay_reads_free_memory(self):
+        with enable_breakable_cuda_graph():
+            value, calls = self.budget(reads=(10 << 20, 400 << 20))
+        self.assertEqual(value, 400 << 20)
+        self.assertEqual(calls["empty_cache"], 1)
+
+    def test_small_forward_skips_the_query(self):
+        value, calls = self.budget(reads=(), rows=16, seq_len=4096)
+        self.assertEqual(value, 2 << 30)
+        self.assertEqual(calls["reads"], 0)
 
 
-class TestMqaLogitsPool(CustomTestCase):
-    """The reservation, with the CUDA allocator replaced by fakes."""
+class TestScoreTilesTakeTheForwardBudget(CustomTestCase):
+    def test_tiles_are_sized_by_the_budget_for_their_rows_and_width(self):
+        data, kv, _ = make_case(CASES[0], ratio=1)
+        width = ceil_align(max(data.lens_per_request), FLAT_LOGITS_WIDTH_ALIGN)
+        group = ROW_ALIGN * mqa_logits_row_bytes(width)
+        asked = []
 
-    def run_pool(self, streams, *, fail=False):
-        from sglang.srt.layers.attention import mqa_logits_utils
+        def budget(**kwargs):
+            asked.append(kwargs)
+            return 2 * group
 
-        reserved, routed = [], []
-        current = types.SimpleNamespace(cuda_stream=None)
-
-        def empty(nbytes, **kwargs):
-            if fail:
-                raise torch.OutOfMemoryError("out of memory")
-            reserved.append((current.cuda_stream, nbytes))
-            return object()
-
-        @contextlib.contextmanager
-        def use_mem_pool(pool, device):
-            routed.append(pool)
-            yield
-
-        pool = mqa_logits_utils.MqaLogitsPool(
-            capacity_bytes=64 << 20, device=torch.device("cuda", 0)
-        )
+        fake = FakeDeepGEMM()
         with (
-            patch.object(torch.cuda, "MemPool", object),
-            patch.object(torch.cuda, "use_mem_pool", use_mem_pool),
-            patch.object(torch.cuda, "current_stream", lambda device: current),
-            patch.object(mqa_logits_utils.torch, "empty", empty),
+            patch.dict(sys.modules, {"deep_gemm": fake.module()}),
+            patch.object(scoring, "prefill_score_budget_bytes", budget),
         ):
-            for stream in streams:
-                current.cuda_stream = stream
-                with pool.allocating():
-                    pass
-        return reserved, routed
-
-    def test_reserves_the_capacity_once_per_stream(self):
-        reserved, routed = self.run_pool([7, 7, 9, 7, 9])
-        self.assertEqual(reserved, [(7, 64 << 20), (9, 64 << 20)])
-        self.assertEqual(len(routed), 5)
-        self.assertEqual(len({id(p) for p in routed}), 1)
-
-    def test_a_failed_reservation_names_the_settings(self):
-        with self.assertRaisesRegex(RuntimeError, "--mem-fraction-static"):
-            self.run_pool([7], fail=True)
+            for _ in scoring.score_tiles(data, kv):
+                pass
+        self.assertEqual(
+            asked,
+            [
+                {
+                    "num_rows": data.num_rows,
+                    "max_seq_len": max(data.lens_per_request),
+                    "device": data.q_fp4.device,
+                }
+            ],
+        )
+        self.assertEqual(fake.allocations[0][0], 2 * ROW_ALIGN)
 
 
 if __name__ == "__main__":

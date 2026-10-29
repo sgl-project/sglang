@@ -85,7 +85,6 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
-    configure_prefill_score_pool,
     is_sm100_or_newer,
     make_candidate_indexer,
     make_full_topk_indexer,
@@ -1295,29 +1294,6 @@ class DeepseekV4AttnBackend(
         self.full_topk_indexer = make_full_topk_indexer(
             token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
         )
-        if self.low_ratios and self.full_topk_indexer.use_deep_gemm_prefill:
-            server_args = model_runner.server_args
-            row_limits = [
-                n
-                for n in (
-                    server_args.chunked_prefill_size,
-                    server_args.max_prefill_tokens,
-                )
-                if n is not None and n > 0
-            ]
-            capacity = configure_prefill_score_pool(
-                device=self.device,
-                max_rows=min(row_limits, default=self.max_context_len),
-                max_context_len=self.max_context_len,
-                index_heads=int(cfg.index_n_heads),
-                index_topk=int(getattr(cfg, "index_topk", DEFAULT_INDEX_TOPK)),
-                candidate_topk_blocks=getattr(cfg, "candidate_topk_blocks", 0),
-                candidate_block_size=getattr(cfg, "candidate_block_size", 0),
-            )
-            logger.info(
-                "Low-ratio prefill indexer score tiles: %.2f GiB held per device",
-                capacity / (1 << 30),
-            )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)

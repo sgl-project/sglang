@@ -23,7 +23,8 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
 )
 from sglang.srt.layers.attention.mqa_logits_utils import (
-    MqaLogitsPool,
+    mqa_logits_budget_bytes,
+    mqa_logits_needs_budget_check,
     mqa_logits_static_budget_bytes,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -42,33 +43,6 @@ if TYPE_CHECKING:
 _DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
 
 
-# One pool per device index, shared by every low-ratio layer's prefill scorer.
-_PREFILL_SCORE_POOLS: dict[int, MqaLogitsPool] = {}
-
-
-def _device_index(device: torch.device) -> int:
-    return torch.cuda.current_device() if device.index is None else device.index
-
-
-def configure_prefill_score_pool(*, device: torch.device, need_bytes: int) -> int:
-    """Hold memory for the prefill score tiles on ``device``: what one forward's
-    widest tile needs, ``need_bytes``, within the static budget (the share of the
-    memory --mem-fraction-static leaves free) and the per-tile cap. Returns the
-    capacity the tiles are sized by."""
-    index = _device_index(device)
-    capacity = min(
-        need_bytes,
-        _DEEP_GEMM_SCORE_BUDGET_BYTES,
-        mqa_logits_static_budget_bytes(device_index=index),
-    )
-    pool = _PREFILL_SCORE_POOLS.get(index)
-    if pool is None or pool.capacity_bytes < capacity:
-        _PREFILL_SCORE_POOLS[index] = MqaLogitsPool(
-            capacity_bytes=capacity, device=torch.device(device.type, index)
-        )
-    return _PREFILL_SCORE_POOLS[index].capacity_bytes
-
-
 def _capturing() -> bool:
     # Not get_is_capture_mode(): breakable-graph replay runs the scorers eagerly.
     return (
@@ -76,6 +50,29 @@ def _capturing() -> bool:
         or torch.cuda.is_current_stream_capturing()
         or is_in_tc_piecewise_cuda_graph()
     )
+
+
+def prefill_score_budget_bytes(
+    *, num_rows: int, max_seq_len: int, device: torch.device
+) -> int:
+    """Budget for one score tile and its declared scratch: the static budget
+    under graph capture, else a share of the memory the forward can allocate,
+    at most the fixed cap. Small forwards skip the query."""
+    cap = _DEEP_GEMM_SCORE_BUDGET_BYTES
+    if not mqa_logits_needs_budget_check(num_rows=num_rows, num_cols=max_seq_len):
+        return cap
+    index = torch.cuda.current_device() if device.index is None else device.index
+    if _capturing():
+        return min(cap, mqa_logits_static_budget_bytes(device_index=index))
+    budget = min(cap, mqa_logits_budget_bytes(device_index=index, allow_sync=True))
+    if budget < cap:
+        # Free device memory leaves out the caching allocator's unused blocks, and
+        # a running server's allocator ends up holding nearly all of it, which would
+        # shrink every tile to a few rows. Return those blocks and read again, so
+        # the budget follows the memory that is actually in use.
+        torch.cuda.empty_cache()
+        budget = min(cap, mqa_logits_budget_bytes(device_index=index, allow_sync=True))
+    return budget
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -315,12 +312,14 @@ def score_tiles(
     *,
     scratch_bytes: Callable[[int], Tuple[int, int]] = lambda width: (0, 0),
 ) -> Generator[Tuple[slice, torch.Tensor], None, None]:
-    """``flat_index_logits_tiles`` over the prefill rows. With a configured pool
-    the tiles and everything the caller allocates while holding one come from it,
-    sized by its capacity; the caller must keep nothing allocated in that time."""
-    pool = _PREFILL_SCORE_POOLS.get(data.q_fp4.device.index)
-    budget = _DEEP_GEMM_SCORE_BUDGET_BYTES if pool is None else pool.capacity_bytes
-    tiles = flat_index_logits_tiles(
+    """``flat_index_logits_tiles`` over the prefill rows, each tile with the
+    caller's declared scratch within ``prefill_score_budget_bytes``."""
+    budget = prefill_score_budget_bytes(
+        num_rows=data.num_rows,
+        max_seq_len=max(data.lens_per_request, default=0),
+        device=data.q_fp4.device,
+    )
+    yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,
         weights=data.weights,
@@ -330,11 +329,6 @@ def score_tiles(
         budget_bytes=budget,
         scratch_bytes=scratch_bytes,
     )
-    if pool is None or _capturing():
-        yield from tiles
-        return
-    with pool.allocating():
-        yield from tiles
 
 
 def topk_ragged(
