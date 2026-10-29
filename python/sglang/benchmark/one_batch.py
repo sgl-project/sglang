@@ -500,6 +500,7 @@ def extend(reqs, model_runner):
         page_size=get_schedule().page_size,
         device=model_runner.device,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
+        req_to_token_pool=model_runner.req_to_token_pool,
     )
 
     batch = ScheduleBatch.init_new(
