@@ -4580,6 +4580,9 @@ class Scheduler(
                 else None
             )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
+            # Unclipped max_new_tokens can put the estimate below the floor;
+            # keep the floor that decay_step and reset also keep.
+            new_token_ratio = max(new_token_ratio, self.new_token_ratio_tracker.min)
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
