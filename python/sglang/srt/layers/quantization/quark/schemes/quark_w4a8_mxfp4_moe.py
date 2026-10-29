@@ -62,6 +62,10 @@ OCP_MX_BLOCK_SIZE = 32
 class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
     """Quark MoE scheme for MXFP4 weights with static FP8 activations."""
 
+    # gfx1250 routes inside apply_weights from the raw router logits (aiter
+    # routing for gluon/triton, torch top-k for FlyDSL), so the model may bypass TopK.
+    routes_from_router_logits = _use_gfx1250_w4a8
+
     def __init__(self, weight_config: dict[str, Any], input_config: dict[str, Any]):
         self.weight_quant = weight_config
         self.input_quant = input_config
@@ -481,8 +485,15 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 aiter_w4a8_gfx1250_forward,
             )
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+            from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-            topk_weights, topk_ids, router_logits = dispatch_output.topk_output
+            topk_output = dispatch_output.topk_output
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                router_logits = topk_output.router_logits
+                top_k = topk_output.topk_config.top_k
+            else:
+                _, topk_ids, router_logits = topk_output
+                top_k = topk_ids.shape[-1]
             x = dispatch_output.hidden_states
             if x.shape[-1] != self.hidden_size:
                 x = x[..., : self.hidden_size]
@@ -500,7 +511,7 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 output = aiter_w4a8_gfx1250_flydsl_forward(
                     hidden_states=x,
                     router_logits=router_logits,
-                    topk=topk_ids.shape[-1],
+                    topk=top_k,
                     weights=fw,
                     gemm1_limit=limit,
                     renormalize=True,
@@ -533,7 +544,7 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
             output = aiter_w4a8_gfx1250_forward(
                 hidden_states=x,
                 router_logits=router_logits,
-                topk=topk_ids.shape[-1],
+                topk=top_k,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 gemm1_alpha=alpha,

@@ -1012,6 +1012,9 @@ class Envs:
     # expert-sorted rows, zero-pads them to the gluon K and downcasts them to static fp8,
     # in place of pad + index math + gather + downcast (six kernels per layer at decode).
     SGLANG_GFX1250_W4A8_FUSED_GATHER_QUANT = EnvBool(False)
+    # gfx1250 GPT-OSS W4A8 MoE routes from the raw router logits itself: bypass the
+    # model's TopK (one top-k softmax kernel and its glue per layer that nothing reads).
+    SGLANG_GFX1250_W4A8_BYPASS_TOPK = EnvBool(False)
     # aiter opus moe_sorting dispatch policy (0 auto, 1 oneshot, 2 multi-phase). Auto picks
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
