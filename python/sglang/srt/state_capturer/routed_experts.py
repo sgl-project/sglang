@@ -28,6 +28,34 @@ def _is_scattered_a2a_backend() -> bool:
     return backend.is_deepep() or backend.is_deepep_v2() or backend.is_ascend_ops()
 
 
+def _device_cache_rows(
+    *,
+    chunked_prefill_size: Optional[int],
+    max_prefill_tokens: int,
+    max_running_requests: int,
+    num_dp_ranks: int,
+) -> int:
+    """Rows the device cache must hold for one forward, across all DP ranks.
+
+    ``BaseDeviceCache.capture`` writes ``buffer[:topk_indices.shape[0]]`` with no
+    bounds check, so a forward whose captured row count exceeds the buffer
+    crashes the step instead of dropping data. Chunked prefill is not the only
+    scheduler budget: with chunking disabled (``--chunked-prefill-size -1``,
+    also what several model hooks select) one forward can route up to
+    ``max_prefill_tokens`` rows, and the negative ceiling then silences the
+    prefill term entirely, leaving a decode-sized buffer. The same
+    chunked-else-``max_prefill_tokens`` rule sizes the activation reserve
+    (``runtime_context.pre_capture_activation_reserve_mb``) and the MegaMoE
+    token budget (``arg_groups/layernorm_sp_hook.validate_muse_megamoe_token_budget``).
+    """
+    prefill_rows = (
+        chunked_prefill_size
+        if chunked_prefill_size and chunked_prefill_size > 0
+        else max_prefill_tokens
+    )
+    return max(prefill_rows, max_running_requests) * num_dp_ranks
+
+
 class RoutedExpertsCapturer(BaseTopkCapturer):
     """Capturer for routed experts with host buffer.
 
@@ -77,9 +105,11 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         # and otherwise overflows on dp_rank > 0 when max_running_requests >
         # chunked_prefill_size.
         # FIXME: spec decoding's num_verify_tokens is still not accounted for.
-        max_batch_size = max(
-            get_schedule().chunked_prefill_size * get_parallel().num_dp_ranks,
-            max_running_requests * get_parallel().num_dp_ranks,
+        max_batch_size = _device_cache_rows(
+            chunked_prefill_size=get_schedule().chunked_prefill_size,
+            max_prefill_tokens=get_schedule().max_prefill_tokens,
+            max_running_requests=max_running_requests,
+            num_dp_ranks=get_parallel().num_dp_ranks,
         )
 
         super().__init__(
