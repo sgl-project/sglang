@@ -512,10 +512,15 @@ def test_cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps(
     ):
         for key in ("key", "value"):
             torch.testing.assert_close(actual[key], reference[key], atol=0, rtol=0)
-            assert (
-                actual[key].untyped_storage().nbytes()
-                == actual[key].numel() * actual[key].element_size()
-            )
+            # an image prefix lives in the packed buffer it is attended from;
+            # a text prefix is a compact copy that pins nothing else
+            storage = actual[key].untyped_storage()
+            if edit and qkv_gate.verified:
+                assert storage.data_ptr() == actual["qkv"].untyped_storage().data_ptr()
+            else:
+                assert (
+                    storage.nbytes() == actual[key].numel() * actual[key].element_size()
+                )
 
     runner = DiffusionBreakableCudaGraphRunner(actual_model, torch.device("cuda"))
     try:
@@ -537,6 +542,42 @@ def prompt_inputs_hd128(seed, text_tokens):
         build_layout([False] * text_tokens, [(1, 4, 4)], (16, 56, 56), "cuda")
     ]
     return kwargs
+
+
+@pytest.mark.parametrize("edit", [False, True])
+@torch.no_grad()
+def test_cached_steps_copy_the_prefix_only_for_text(
+    bf16_model_hd128, edit, monkeypatch
+):
+    # Cached steps of an image prefix project into the buffer kept by the prefill and
+    # write only the target rows; a text prefix is still copied into a fresh buffer.
+    for name in ("_QK_ROPE_CUDA_FUSION", "_KV_PACK_CUDA_FUSION", "_QKV_PACK_FUSION"):
+        monkeypatch.setattr(model_module, name, BitExactFusionGate(f"test {name}"))
+    packs = []
+    original = model_module.qknorm_complex_rope_pack_
+
+    def record(q, k_out, v_out, *args):
+        packs.append((args[3].shape[1], k_out.untyped_storage().data_ptr()))
+        return original(q, k_out, v_out, *args)
+
+    monkeypatch.setattr(model_module, "qknorm_complex_rope_pack_", record)
+    kwargs = inputs_hd128(13, edit)
+    with set_forward_context(None, None):
+        for timestep in (700, 300, 10):
+            kwargs["timestep"].fill_(timestep)
+            bf16_model_hd128(**kwargs)
+    if not model_module._QKV_PACK_FUSION.verified:
+        pytest.skip("cuBLAS picked a different kernel for the packed projection")
+    caches = kwargs["prefix_caches"][0]
+    prefill, cached = packs[: len(caches)], packs[len(caches) :]
+    prefix_rows = caches[0]["key"].shape[1]
+    assert [rows for rows, _ in prefill] == [prefix_rows] * len(caches)
+    if edit:
+        kept = [cache["qkv"].untyped_storage().data_ptr() for cache in caches]
+        assert cached == [(0, ptr) for ptr in kept] * 2
+    else:
+        assert all("qkv" not in cache for cache in caches)
+        assert [rows for rows, _ in cached] == [prefix_rows] * 2 * len(caches)
 
 
 @pytest.mark.parametrize("kv_pack", ["cuda", "triton", "eager"])

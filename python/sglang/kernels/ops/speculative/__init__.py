@@ -48,10 +48,26 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="speculative.simulated_accept",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.simulated_accept:simulated_accept",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="speculative.div_argmax",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.row_argmax:div_argmax",
         capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="speculative.pack_verify_mask_into",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.pack_verify_mask:pack_verify_mask_into",
     )
 )
 

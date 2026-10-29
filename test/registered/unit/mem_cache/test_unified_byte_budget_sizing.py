@@ -30,17 +30,16 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
-    UnifiedKVPool,
-    _check_bs1_feasibility_floor,
-    _reserved_floor_bytes,
-    init_unified_swa_pools,
-)
+from sglang.srt.mem_cache.kv.decl import FullLifetime, StateLifetime
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.memory.arena import KVArena, plan_bands
+from sglang.srt.mem_cache.kv.plan import KVStoragePlan, PlannedSubPool, _unit
+from sglang.srt.mem_cache.kv.sizing import check_bs1_floor
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 
@@ -66,7 +65,7 @@ def _swa_factory(**over):
         need_sort=False,
     )
     kw.update(over)
-    return init_unified_swa_pools(**kw)
+    return build_test_unified_pools(**kw)
 
 
 def _entry_bytes():
@@ -92,17 +91,17 @@ class TestBudgetSizing(unittest.TestCase):
         ):
             with self.subTest(budget=budget):
                 bundle = _swa_factory(total_bytes=budget)
-                self.assertEqual(bundle.unified_memory_pool.total_bytes, budget)
+                self.assertEqual(bundle.arena.total_bytes, budget)
 
     def test_fallback_is_the_token_count_resum(self):
         e = _entry_bytes()
         bundle = _swa_factory()
-        self.assertEqual(bundle.unified_memory_pool.total_bytes, (64 + 32) * e)
+        self.assertEqual(bundle.arena.total_bytes, (64 + 32) * e)
 
 
 class TestReservedFloorIsOneSourceOfTruth(unittest.TestCase):
     """The bs=1 floor charges the slot-0 sink, and MUST charge exactly what
-    `UnifiedKVPool` actually reserves.
+    the arena actually reserves.
 
     Regression (Falcon-H1 boot): the floor hand-copied the formula as
     `page_size * max(entry_bytes)`, applying the page multiplier to the MAMBA
@@ -133,9 +132,28 @@ class TestReservedFloorIsOneSourceOfTruth(unittest.TestCase):
         )
         return full, mamba
 
+    @staticmethod
+    def _plan(full, mamba, page_size) -> KVStoragePlan:
+        """The two specs as a plan lays them out; only units and specs matter."""
+        return KVStoragePlan(
+            page_size=page_size,
+            sub_pools=tuple(
+                PlannedSubPool(
+                    name=spec.name,
+                    lifetime=lifetime,
+                    unit=_unit(lifetime, page_size),
+                    layer_ids=(0, 1),
+                    geometry=None,
+                    spec=spec,
+                    external=None,
+                )
+                for spec, lifetime in ((mamba, StateLifetime()), (full, FullLifetime()))
+            ),
+        )
+
     def test_mamba_entry_is_not_multiplied_by_page_size(self):
         full, mamba = self._specs(page_size=256)
-        got = _reserved_floor_bytes([full, mamba], 256)
+        got = self._plan(full, mamba, 256).sink_bytes()
         self.assertEqual(got, max(mamba.entry_bytes(), 256 * full.entry_bytes()))
         self.assertLess(got, 256 * mamba.entry_bytes())  # the bug's value
 
@@ -144,18 +162,18 @@ class TestReservedFloorIsOneSourceOfTruth(unittest.TestCase):
         for page_size in (1, 4, 256):
             with self.subTest(page_size=page_size):
                 full, mamba = self._specs(page_size)
-                floor = _reserved_floor_bytes([full, mamba], page_size)
-                pool = UnifiedKVPool(
+                plan = self._plan(full, mamba, page_size)
+                floor = plan.sink_bytes()
+                pool = KVArena(
+                    bands=plan_bands(plan),
                     total_bytes=floor + 64 * mamba.entry_bytes(),
-                    sub_pool_specs=[full, mamba],
+                    sink_bytes=floor,
                     device=_DEV,
-                    enable_memory_saver=False,
-                    page_size=page_size,
                 )
                 # min_slot_index is ceil(reserved_floor / entry_bytes) per side.
                 for spec in (full, mamba):
                     self.assertEqual(
-                        pool.min_slot_index(spec.name),
+                        pool.first_entry(spec.name),
                         -(-floor // spec.entry_bytes()),
                     )
 
@@ -188,13 +206,11 @@ class TestBs1FeasibilityFloor(unittest.TestCase):
                     model_context_len=model_context_len,
                     sliding_window_size=sliding_window_size,
                 )
-                self.assertEqual(bundle.unified_memory_pool.total_bytes, 200 * e)
+                self.assertEqual(bundle.arena.total_bytes, 200 * e)
 
     def test_exact_floor_passes(self):
         """Boundary: total == floor must NOT raise (>= is the contract)."""
-        _check_bs1_feasibility_floor(
-            total_bytes=16, floor_terms=[("a", 8), ("b", 8)], factory="test"
-        )
+        check_bs1_floor(total_bytes=16, floor_terms=[("a", 8), ("b", 8)], where="test")
 
 
 if __name__ == "__main__":

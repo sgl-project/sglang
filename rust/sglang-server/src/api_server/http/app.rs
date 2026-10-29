@@ -7,10 +7,12 @@ use std::time::Duration;
 
 use axum::Router;
 
-use super::{info, loads, metrics, native_api, openai};
+use super::generate_hook::GenerateHook;
+use super::{hicache, info, loads, metrics, native_api, openai};
 use crate::HttpLayer;
-use crate::api_server::core::CoreHandle;
+use crate::api_server::core::FLUSH_INTERVAL;
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
+use crate::api_server::handlers::{CoreHandle, HiCacheManager};
 use crate::api_server::log;
 use crate::message::config::ServerArgs;
 use crate::message::request::GenerationPolicy;
@@ -28,6 +30,9 @@ pub(super) struct AppState {
     pub(super) server_args: Arc<ServerArgs>,
     pub(super) generation_policy: GenerationPolicy,
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
+    pub(super) generate_hook: Option<Arc<dyn GenerateHook>>,
+    /// The processor's chat layer, tried before the Dynamo-typed chat handler.
+    pub(super) openai_chat: Option<openai::OpenAiChat>,
 }
 
 /// Every listener warms its own rank; health stays 503 until it succeeds,
@@ -64,19 +69,31 @@ pub async fn serve(
     // Whether this listener serves the node's `/metrics`.
     metrics_listener: bool,
     http_layer: Option<HttpLayer>,
+    generate_hook: Option<Arc<dyn GenerateHook>>,
     // The runtime's shutdown signal, shared with every worker stage: it fires
     // (disconnects) when `Runtime::request_shutdown` drops the sender, at
     // which point `serve` stops accepting and its in-flight handlers are
     // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
+    hicache_manager: Arc<HiCacheManager>,
+    tokenizer: Option<Arc<sglang_processor::DynamoTokenizer>>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
+    // Legacy conversation templates add stop strings `lower_chat` never sees;
+    // they stay on the typed handler.
+    let openai_chat = chat_formatter
+        .as_ref()
+        .filter(|formatter| !matches!(formatter, openai::ChatFormatter::Legacy(_)))
+        .zip(tokenizer)
+        .map(|(formatter, tokenizer)| openai::OpenAiChat::new(&server_args, formatter, tokenizer));
     let generation_policy = GenerationPolicy::from(server_args.as_ref());
     let state = Arc::new(AppState {
         core,
         server_args: server_args.clone(),
         generation_policy,
         chat_formatter,
+        generate_hook,
+        openai_chat,
     });
     // Cancelled with the api runtime on shutdown.
     tokio::spawn(startup_warmup(state.core.clone(), server_args.clone()));
@@ -90,6 +107,19 @@ pub async fn serve(
     if server_args.metrics.is_some() && metrics_listener {
         router = router.merge(metrics::routes());
     }
+    // Keep this frontend's metrics files current for the directory's other
+    // readers (the node's metrics listener, when this is a DP rank's offset
+    // listener); stops with the runtime.
+    if let Some(frontend) = state.core.metrics().cloned() {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(FLUSH_INTERVAL);
+            loop {
+                interval.tick().await;
+                let frontend = frontend.clone();
+                let _ = tokio::task::spawn_blocking(move || frontend.flush_or_warn()).await;
+            }
+        });
+    }
 
     // TODO(auth): no API-key boundary yet. Python gates every route (except
     // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
@@ -97,8 +127,9 @@ pub async fn serve(
     //
     // No body limit, matching the Python server.
     let mut app = router
-        .layer(axum::extract::DefaultBodyLimit::disable())
-        .with_state(state);
+        .with_state(state)
+        .merge(hicache::routes(hicache_manager))
+        .layer(axum::extract::DefaultBodyLimit::disable());
     if let Some(http_layer) = http_layer {
         app = http_layer(app);
     }

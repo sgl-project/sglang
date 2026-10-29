@@ -34,7 +34,8 @@ Connect to a standalone SGLang Diffusion server.
 2. **Connect to Server**: Use the `SGLDiffusion Server Model` node to connect (default: `http://localhost:3000/v1`).
 3. **Generate Content**:
    - `SGLDiffusion Generate Image`: For text-to-image and image editing. Set `num_images` (1 to 10) to get several images from one request as one `IMAGE` batch, in order. Image `i` uses `seed + i`, so the same settings and seed reproduce the same batch; a seed of `-1` lets the server pick a random seed.
-   - `SGLDiffusion Generate Video`: For text-to-video and image-to-video.
+   - `SGLDiffusion Generate Video`: For text-to-video, image-to-video, and video-to-video (connect a `VIDEO`).
+   - Both nodes have an `enhance_prompt` toggle (the server needs `--prompt-enhancer-config`); the rewritten prompt comes out as `revised_prompt`.
    - `SGLDiffusion Generate MiniMax-H3`: For joint video-and-audio on a standalone server.
 4. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` and `SGLDiffusion Server Unset LoRA`.
 
@@ -117,6 +118,7 @@ Reference workflow files are provided in the `workflows/` directory:
 
 - **`flux_sgld_sp.json`**: Multi-GPU (Sequence Parallelism) workflow for FLUX models. High-performance inference across multiple cards.
 - **`qwen_image_sgld.json`**: Qwen-Image generation with LoRA support. Optimized for multi-modal image tasks.
+- **`flux_controlnet_sgld.json`**: Flux.1-dev with an InstantX canny ControlNet in integrated mode (`instantx_flux_canny.safetensors` in `models/controlnet`, any image as `example.png` in `input/`).
 - **`z-image_sgld.json`**: High-speed image generation using Z-Image.
 - **`sgld_text2img.json`**: Server-mode text-to-image generation with LoRA support.
 - **`sgld_image2video.json`**: Server-mode image-to-video generation.
@@ -137,6 +139,29 @@ To use these workflows:
 
 SGLang's optimized kernels and parallelism (TP / SP, compile, cache) run on the
 DiT only. Text encoding and VAE stay in ComfyUI.
+
+Start ComfyUI with `--disable-cuda-malloc` for integrated mode. ComfyUI's default `cudaMallocAsync` pool cannot export CUDA IPC handles, so per-step tensors (latents, ControlNet residuals) then go through a host copy; with the flag they are shared on the GPU. Flux + ControlNet at 1024x1024 on an H100 drops from 13.1s to 4.7s for 25 steps.
+
+## Worker Status Node
+
+`SGLDiffusion Worker Status` (category `SGLDiffusion`) takes the SGLD `MODEL`
+and prints the model, worker liveness, and the worker's own `RequestMetrics` for
+the last DiT call: forward time and peak VRAM for one sampler step (with CFG,
+one of the step's two calls), not the whole run. It is never served from
+ComfyUI's cache. Run it on its own to check loader settings and worker
+readiness before generating, or wire the sampler's `LATENT` into the optional
+`after_sampling` input so it runs after that sampler and reports its metrics.
+The node's text box also refreshes after every DiT call while a sampler runs.
+
+Settings use the `SGLDOptions` widget names and values and come in two groups.
+Loader settings (model type, parallel layout, attention, quantization, execution
+and memory mode) are what the worker is running and stay fixed until it
+restarts; fields that do not apply to the chosen mode, such as
+`resident_layers` with `memory_mode=resident`, are left out. Per-run settings
+(`cache_mode`, `cache_dit_params`) apply to the next request.
+
+For per-stage timing set `SGLANG_DIFFUSION_STAGE_LOGGING=1`; for Prometheus
+metrics start the worker with `enable_metrics`.
 
 ## Architecture
 
