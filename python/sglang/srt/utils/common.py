@@ -4455,7 +4455,7 @@ def ceil_div(x: int, y: int) -> int:
 
 def parse_lscpu_topology():
     try:
-        # Get CPU topology: CPU,Core,Socket,Node
+        # Get CPU topology: CPU,Core,Socket,Node,Cache (L3 identifies CBB).
         output = subprocess.check_output(
             ["lscpu", "-p=CPU,Core,Socket,Node,Cache"], text=True
         )
@@ -4479,47 +4479,24 @@ def parse_lscpu_topology():
 
 def get_physical_cpus_by_numa_or_block():
     cpu_info = parse_lscpu_topology()
-
-    # Map NUMA node -> set of (core_id, socket) to avoid duplicates
-    # 0: {(0,0): 0, (1, 0): 1,...}
-    # ...
-    # 5: {(214,1): 214, (215,1): 215}
-    physical_by_node = defaultdict(dict)  # node -> core_id -> cpu_id
-    # L3 cache index represents block
-    physical_by_block = defaultdict(dict)  # block -> core_id -> cpu_id
+    n_nodes = len({node for _, _, _, node, _ in cpu_info})
+    n_blocks = len({block for _, _, _, _, block in cpu_info})
+    use_block = n_blocks > n_nodes
+    physical_by_group = defaultdict(dict)
 
     for cpu, core, socket, node, block in cpu_info:
+        group = block if use_block else node
         key = (core, socket)
-        if key not in physical_by_node[node]:
-            physical_by_node[node][key] = (
-                cpu  # pick first CPU seen for that physical core
-            )
-        if key not in physical_by_block[block]:
-            physical_by_block[block][key] = (
-                cpu  # pick first CPU seen for that physical core
-            )
+        if key not in physical_by_group[group]:
+            # Pick the first CPU seen for that physical core.
+            physical_by_group[group][key] = cpu
 
     # Retrieves CPUs that the current process is allowed to run on
     cpus_allowed_list = psutil.Process().cpu_affinity()
-
-    # Convert to list of physical CPUs per node
-    # 0: [0,1,2,...,42]
-    # ...
-    # 2: [86,87,...,127]
-    # ...
-    # 5: [214,215,...,255]
-    node_to_cpus = {}
-    block_to_cpus = {}
-    for node, core_to_cpu in physical_by_node.items():
-        cpus = sorted(core_to_cpu.values())
-        allowed_cpus = set(cpus).intersection(cpus_allowed_list)
-        node_to_cpus[node] = allowed_cpus
-    for block, core_to_cpu in physical_by_block.items():
-        cpus = sorted(core_to_cpu.values())
-        allowed_cpus = set(cpus).intersection(cpus_allowed_list)
-        block_to_cpus[block] = allowed_cpus
-
-    return block_to_cpus if len(block_to_cpus) > len(node_to_cpus) else node_to_cpus
+    return {
+        group: set(core_to_cpu.values()).intersection(cpus_allowed_list)
+        for group, core_to_cpu in physical_by_group.items()
+    }
 
 
 # Only physical cores are used. Logical cores are excluded.
