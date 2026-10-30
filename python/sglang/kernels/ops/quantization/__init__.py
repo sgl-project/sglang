@@ -111,6 +111,7 @@ _TRITON_KERNELS = [
     ("rocm_upscale", "upscale"),
     ("rocm_upscale", "upscale_mxfp4"),
     ("mxfp8_amd_gfx95", "mxfp8_e4m3_quantize"),
+    ("mxfp8_amd_gfx95", "mxfp8_e4m3_quantize_flydsl"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
