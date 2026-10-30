@@ -59,6 +59,13 @@ def _storage_suffix(
 
 
 def _ordered_layers(entry) -> list[int]:
+    """Logical layers in device-buffer order.
+
+    A logical layer may own SEVERAL buffers of a component -- a target layer
+    plus its packed MTP draft, or K and V of one layer -- so order layers by
+    their first buffer index and require the mapped indices to tile the
+    component exactly, rather than to be a bijection.
+    """
     component_lengths = {len(component) for component in entry.components}
     if len(component_lengths) != 1:
         raise ValueError(
@@ -68,6 +75,10 @@ def _ordered_layers(entry) -> list[int]:
     by_buffer = {}
     for logical_layer, mapped in entry.layer_mapping.items():
         indices = [mapped] if isinstance(mapped, int) else list(mapped)
+        if not indices:
+            raise ValueError(
+                f"UMBP pool {entry.name} maps layer {logical_layer} to no buffer."
+            )
         for index in indices:
             if index in by_buffer:
                 raise ValueError(
@@ -89,6 +100,7 @@ class _PoolRangePlan:
     keys: list[str]
     locations: list[int]
     entries_per_page: int
+    entry: Any
 
 
 # One queued offload: the pools it resolved to, and the events gating the read.
@@ -565,7 +577,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                     f"UMBP pool {name} plan mismatch: keys={len(keys)} "
                     f"rows={len(locations)} per_page={entries_per_page}."
                 )
-            plans.append(_PoolRangePlan(name, keys, locations, entries_per_page))
+            plans.append(_PoolRangePlan(name, keys, locations, entries_per_page, entry))
 
         if not plans or not plans[0].keys:
             raise ValueError("Layer-wise UMBP load has no object keys.")
@@ -691,7 +703,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         the pointer, by ``row * row_stride``. That invariant is what the
         vectorized builder rests on.
         """
-        entry = self.pools[plan.name]
+        entry = plan.entry
         items: list[list[tuple[int, int, int, int]]] = []
         for logical_layer in layers:
             mapped = entry.layer_mapping.get(logical_layer)
@@ -742,7 +754,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 f"{len(rows)} rows at {plan.entries_per_page} per page."
             )
 
-        if self.pools[plan.name].packed:
+        if plan.entry.packed:
             # One object per page, its ranges running (layer, component).
             flat = [item for layer_items in items for item in layer_items]
             base = np.fromiter((item[0] for item in flat), np.int64, len(flat))
@@ -755,6 +767,13 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             return ptrs, [sizes] * len(rows), [offsets] * len(rows)
 
         # One object per (page, component), its ranges running over the layers.
+        widths = {len(layer_items) for layer_items in items}
+        if len(widths) != 1 or widths.pop() != len(plan.entry.components):
+            raise ValueError(
+                f"UMBP pool {plan.name} is unpacked but a layer maps to more "
+                f"than one buffer per component; that shape has no object "
+                f"partition."
+            )
         components = len(items[0])
         base = np.array([[i[0] for i in layer] for layer in items], np.int64).T
         stride = np.array([[i[1] for i in layer] for layer in items], np.int64).T
@@ -912,7 +931,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # Over plans, not transfers: a plan already carries every task's keys
         # for its pool, so walking transfers would put that pool once per task.
         for plan in plans:
-            entry = self.pools[plan.name]
+            entry = plan.entry
             # From the pool layout, never from the ranges below: see
             # _object_sizes_per_page.
             per_page = _object_sizes_per_page(entry)
