@@ -57,6 +57,14 @@ inline constexpr int kEpochs = kMaxRows;
 // kTailSplits chunks of the kTailK latent dim (kimi_k3_latent_tail_hip.k3_latent_tail_partials).
 inline constexpr int kTailK = 3584;
 inline constexpr int kTailSplits = 7;
+// The attention output's one-shot all-reduce fused with the FFN-side read (k3_ar_attn_res_kernel):
+// every rank pushes its whole partial row, two lines per 16-byte vector, into its own slot of
+// each peer's region, which follows the gather read's.
+inline constexpr int kArMaxRows = 16;
+inline constexpr int kArLinesPerRow = 2 * kThreads;
+inline constexpr int64_t kArEpochLines = int64_t{kWorld} * kArMaxRows * kArLinesPerRow;
+inline constexpr int64_t kArRegionLine = 2 * kAgEpochLines;
+inline constexpr int kArPushers = kWorld - 1;  // pusher workgroups per row, one per peer
 static_assert(kThreads % kWave == 0 && kSlice % kVec == 0, "whole waves and vectors");
 
 struct Params {
@@ -83,6 +91,13 @@ struct Params {
   const bf16_t* __restrict__ tail_prefix;  // [T, H] bf16 (row stride tail_stride), or null
   int64_t tail_stride;
   float tail_eps;
+  // All-reduce read: this rank's attention partial and the pending residual, [T, H] bf16 each
+  // (residual null at a block-write layer's FFN read); per-row flags and, for each row, the
+  // count of this rank's pushers that have taken the row's flag.
+  const uint4* __restrict__ partial;
+  const uint4* __restrict__ residual;
+  int32_t* __restrict__ ar_epochs;  // [kArMaxRows], rank-local
+  int32_t* __restrict__ ar_pushed;  // [kArMaxRows], rank-local, left at 0
 };
 
 // The attention-residual read of one row: bank rows + cw are this thread's vectors.
@@ -288,6 +303,99 @@ __global__ __launch_bounds__(kThreads, 1) void k3_ag_attn_res_kernel(const Param
   if (tid == 0) p.epochs[t] = static_cast<int32_t>(flag);
 }
 
+// A peer's scratch base, read with a constant kernarg index (see Params::scratch).
+SGL_DEVICE uint4* peer_scratch(const Params& p, int peer) {
+  uint4* base = p.scratch[0];
+#pragma unroll
+  for (int i = 1; i < kWorld; ++i)
+    if (peer == i) base = p.scratch[i];
+  return base;
+}
+
+// One-shot all-reduce of the attention output's TP partials, its residual add and the FFN-side
+// attention-residual read: out = bf16(rmsnorm(mix(bank[0..nvb), prefix)) * ow) with
+// prefix = bf16(residual + bf16(sum over ranks of partial)).
+// Workgroups [0, T) each read one row; workgroup T + 7 t + j pushes row t to the j-th next peer,
+// so no CU pushes a whole row seven times. The sum runs in rank order, identical on every rank.
+// A row's flag is ar_epochs[t] + 1 for its reader and its pushers alike; the reader publishes
+// it only after its rank's pushers of the row have all taken it (ar_pushed), as a late pusher
+// would otherwise read the next flag.
+template <int kNvb, bool kHasResidual>
+__global__ __launch_bounds__(kThreads, 1) void k3_ar_attn_res_kernel(const Params p) {
+  using Read = AttnResRead<kNvb>;
+  __shared__ typename Read::Shared smem;
+  const int rows = static_cast<int>(gridDim.x) / kWorld;
+  const int tid = threadIdx.x;
+  if (static_cast<int>(blockIdx.x) >= rows) {
+    const int j = static_cast<int>(blockIdx.x) - rows;
+    const int t = j / kArPushers;
+    const int peer = (p.rank + 1 + j % kArPushers) % kWorld;
+    const uint32_t flag = next_flag(p.ar_epochs, t);
+    const int64_t epoch_off = kArRegionLine + static_cast<int64_t>(flag & 1u) * kArEpochLines;
+    const uint4 v = p.partial[static_cast<int64_t>(t) * kThreads + tid];
+    const int64_t row_line = epoch_off + (static_cast<int64_t>(p.rank) * kArMaxRows + t) * kArLinesPerRow;
+    ll_push(peer_scratch(p, peer) + row_line, tid, kThreads, v, flag);
+    // Every lane has issued its stores, so every lane has read the flag.
+    lds_barrier();
+    if (tid == 0) atomicAdd(p.ar_pushed + t, 1);
+    return;
+  }
+
+  const int t = static_cast<int>(blockIdx.x);
+  const int wave = tid / kWave;
+  const int lane = tid % kWave;
+  const uint32_t flag = next_flag(p.ar_epochs, t);
+  const int64_t epoch_off = kArRegionLine + static_cast<int64_t>(flag & 1u) * kArEpochLines;
+  const int64_t row_vec = static_cast<int64_t>(t) * kThreads + tid;
+  const uint4 own = p.partial[row_vec];
+  uint4 res = make_uint4(0, 0, 0, 0);
+  if constexpr (kHasResidual) res = p.residual[row_vec];
+  Read read;
+  read.load(p, t, tid);
+  read.score_bank(smem, tid, wave, lane);
+
+  float sum[kVec] = {};
+#pragma unroll
+  for (int src = 0; src < kWorld; ++src) {
+    uint4 v = own;
+    if (src != p.rank) {
+      const uint4* s = p.self_scratch + epoch_off + (static_cast<int64_t>(src) * kArMaxRows + t) * kArLinesPerRow + tid;
+      uint4 a, b;
+      do {
+        a = ll_load(s);
+        b = ll_load(s + kThreads);
+      } while (!ll_ready(a, b, flag));
+      v = ll_payload(a, b);
+    }
+    float f[kVec];
+    unpack8(v, f);
+#pragma unroll
+    for (int e = 0; e < kVec; ++e)
+      sum[e] += f[e];
+  }
+  // The all-reduce's bf16 output, then the residual add rounded as the unfused read does.
+  float prefix[kVec];
+  uint4 pv = pack8(sum);
+  unpack8(pv, prefix);
+  if constexpr (kHasResidual) {
+    float r[kVec];
+    unpack8(res, r);
+#pragma unroll
+    for (int e = 0; e < kVec; ++e)
+      prefix[e] = r[e] + prefix[e];
+    pv = pack8(prefix);
+    unpack8(pv, prefix);
+  }
+  p.prefix_out[row_vec] = pv;
+  p.out[row_vec] = read.finish(smem, p, prefix, tid, wave, lane);
+  if (tid == 0) {
+    while (__hip_atomic_load(p.ar_pushed + t, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < kArPushers) {
+    }
+    p.ar_pushed[t] = 0;
+    p.ar_epochs[t] = static_cast<int32_t>(flag);
+  }
+}
+
 template <int kNvb, bool kHasPrefix>
 void launch_gather(const Params& params, bool write_bank, int rows, DLDevice device) {
   if (write_bank) {
@@ -403,6 +511,98 @@ struct K3AttnResReadKernel {
         return launch<7>(params, has_residual, write_bank, n, dev);
       default:
         return launch<8>(params, has_residual, write_bank, n, dev);
+    }
+  }
+};
+
+template <int kNvb>
+void launch_ar(const Params& params, bool has_residual, int rows, DLDevice device) {
+  if (has_residual) {
+    host::LaunchKernel(rows * kWorld, kThreads, device)(k3_ar_attn_res_kernel<kNvb, true>, params);
+  } else {
+    host::LaunchKernel(rows * kWorld, kThreads, device)(k3_ar_attn_res_kernel<kNvb, false>, params);
+  }
+}
+
+struct K3AttnResArReadKernel {
+  // The attention output's all-reduce over `comm` (as K3AttnResReadKernel) fused with the FFN-side
+  // read: partial [T, H] is this rank's TP partial, residual [T, H] the pending residual when
+  // has_residual, bank [T, NB, H] read over rows [0, nvb). prefix_out receives the stream.
+  static void
+  run(int64_t comm,
+      const tvm::ffi::TensorView partial,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView bank,
+      const tvm::ffi::TensorView cw,
+      const tvm::ffi::TensorView ow,
+      const tvm::ffi::TensorView prefix_out,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView ar_epochs,
+      const tvm::ffi::TensorView ar_pushed,
+      int64_t nvb,
+      bool has_residual,
+      double score_eps,
+      double out_eps) {
+    using namespace host;
+    auto T = SymbolicSize{"num_tokens"};
+    auto NB = SymbolicSize{"num_blocks"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLROCM>();
+    TensorMatcher({T, kHidden}).with_dtype<bf16_t>().with_device(device).verify(partial).verify(prefix_out).verify(out);
+    if (has_residual) TensorMatcher({T, kHidden}).with_dtype<bf16_t>().with_device(device).verify(residual);
+    TensorMatcher({T, NB, kHidden}).with_dtype<bf16_t>().with_device(device).with_strides({-1, -1, 1}).verify(bank);
+    TensorMatcher({kHidden}).with_dtype<float>().with_device(device).verify(cw).verify(ow);
+    TensorMatcher({kArMaxRows}).with_dtype<int32_t>().with_device(device).verify(ar_epochs).verify(ar_pushed);
+    const int64_t rows = T.unwrap();
+    RuntimeCheck(rows >= 1 && rows <= kArMaxRows, "the all-reduce read takes 1-", kArMaxRows, " rows");
+    RuntimeCheck(1 <= nvb && nvb <= kMaxNvb && nvb <= NB.unwrap(), "k3 attn-res read takes 1-8 bank rows");
+    RuntimeCheck(bank.stride(0) % kVec == 0 && bank.stride(1) % kVec == 0, "bank rows must be 16-byte aligned");
+    auto* communicator = reinterpret_cast<aiter::CustomAllreduce*>(comm);
+    RuntimeCheck(communicator->world_size_ == kWorld, "the all-reduce read requires TP", kWorld);
+    Params params{
+        .bank = static_cast<bf16_t*>(bank.data_ptr()),
+        .cw = static_cast<const float4*>(cw.data_ptr()),
+        .ow = static_cast<const float4*>(ow.data_ptr()),
+        .prefix_out = static_cast<uint4*>(prefix_out.data_ptr()),
+        .out = static_cast<uint4*>(out.data_ptr()),
+        .scratch = {},
+        .self_scratch = nullptr,
+        .epochs = nullptr,
+        .bank_stride_t = bank.stride(0),
+        .bank_stride_b = bank.stride(1),
+        .nvb_write = -1,
+        .rank = communicator->rank_,
+        .score_eps = static_cast<float>(score_eps),
+        .out_eps = static_cast<float>(out_eps),
+        .partial = static_cast<const uint4*>(partial.data_ptr()),
+        .residual = has_residual ? static_cast<const uint4*>(residual.data_ptr()) : nullptr,
+        .ar_epochs = static_cast<int32_t*>(ar_epochs.data_ptr()),
+        .ar_pushed = static_cast<int32_t*>(ar_pushed.data_ptr()),
+    };
+    for (int i = 0; i < kWorld; ++i) {
+      params.scratch[i] =
+          reinterpret_cast<uint4*>(reinterpret_cast<char*>(communicator->sg_.signals[i]) + sizeof(aiter::Signal));
+    }
+    params.self_scratch = params.scratch[communicator->rank_];
+    const DLDevice dev = device.unwrap();
+    const int n = static_cast<int>(rows);
+    switch (nvb) {
+      case 1:
+        return launch_ar<1>(params, has_residual, n, dev);
+      case 2:
+        return launch_ar<2>(params, has_residual, n, dev);
+      case 3:
+        return launch_ar<3>(params, has_residual, n, dev);
+      case 4:
+        return launch_ar<4>(params, has_residual, n, dev);
+      case 5:
+        return launch_ar<5>(params, has_residual, n, dev);
+      case 6:
+        return launch_ar<6>(params, has_residual, n, dev);
+      case 7:
+        return launch_ar<7>(params, has_residual, n, dev);
+      default:
+        return launch_ar<8>(params, has_residual, n, dev);
     }
   }
 };

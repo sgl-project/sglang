@@ -45,6 +45,44 @@ def _read_reference(stream, bank, nvb, cw, ow):
     return out
 
 
+def _check_all_reduce_read(comm, rank, failures):
+    """bf16(residual + bf16(rank-order sum of the partials)), then the FFN read, on
+    the one-shot kernel (4 rows); every rank agrees."""
+    from sglang.kernels.ops.attention import k3_attn_res_read_hip as hip
+
+    g = torch.Generator(device="cuda").manual_seed(1)
+    gr = torch.Generator(device="cuda").manual_seed(100 + rank)
+    cw = torch.randn(H, generator=g, device="cuda") * 0.05
+    ow = (torch.rand(H, generator=g, device="cuda") + 0.5).bfloat16().float()
+    for rows in (4,):
+        residual = (torch.randn(rows, H, generator=g, device="cuda") * 4).bfloat16()
+        bank = (torch.randn(rows, NB, H, generator=g, device="cuda") * 4).bfloat16()
+        partial = torch.randn(rows, H, generator=gr, device="cuda").bfloat16()
+        delta = torch.stack(_gather(partial)).float().sum(0).bfloat16()
+        for with_residual in (True, False):
+            res = residual if with_residual else None
+            want_stream = (
+                (res.float() + delta.float()).bfloat16() if with_residual else delta
+            )
+            for nvb in (1, 3, 8):
+                want = _read_reference(want_stream, bank, nvb, cw, ow)
+                if not hip.all_reduce_covered(partial, res, bank, nvb):
+                    failures.append(f"AR rows={rows}: not covered")
+                    continue
+                for _ in range(3):  # the flags advance across launches
+                    out, stream = hip.all_reduce_attn_res_read(
+                        partial, res, bank, nvb, cw, ow, EPS, EPS, comm
+                    )
+                same = all(torch.equal(x, out) for x in _gather(out))
+                bad = _beyond_ulp(out, want)
+                if not (same and torch.equal(stream, want_stream) and bad <= rows * 4):
+                    failures.append(
+                        f"AR rows={rows} residual={with_residual} nvb={nvb}: "
+                        f"ranks_equal={same} stream_exact="
+                        f"{torch.equal(stream, want_stream)} beyond_ulp={bad}"
+                    )
+
+
 def _check_gather_tail_read(comm, rank, failures):
     """Each rank finishes its column slice from the column tail's partials; the
     gathered stream (and the bank row it may write) and the read match torch."""
@@ -104,6 +142,7 @@ def _worker(rank, port, results):
             failures.append("create_ll_comm returned None")
         else:
             with torch.inference_mode():
+                _check_all_reduce_read(comm, rank, failures)
                 _check_gather_tail_read(comm, rank, failures)
         torch.cuda.synchronize()
     finally:
