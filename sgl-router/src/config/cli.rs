@@ -180,8 +180,9 @@ pub struct ServerArgs {
 
     /// PD: at most N requests per prefill DP rank go to decode before their
     /// first token; the rest wait and get their decode DP rank when sent.
-    /// Needs prefill engines with --optimistic-prefill-attempts above 0 or
-    /// --disaggregation-decode-allocation-policy prefill_complete; others are refused.
+    /// Needs prefill engines with --optimistic-prefill-attempts above 0 or a deferred
+    /// --disaggregation-decode-allocation-policy (prefill_complete or just_in_time);
+    /// others are refused.
     #[arg(long)]
     pub decode_dispatch_limit: Option<NonZeroU32>,
 

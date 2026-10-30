@@ -9,7 +9,7 @@ import test_prefill_complete_allocation as single_gpu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=420, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class _PipelineParallelPrefill:
@@ -54,6 +54,43 @@ class TestPrefillCompletePipelineParallelPrefill(
 
 class TestPrefillCompleteDpAttentionPrefill(
     _AllocationCases, _DpAttentionPrefill, single_gpu._PrefillCompleteServer
+):
+    pass
+
+
+class TestJustInTimePipelineParallelPrefill(
+    _AllocationCases, _PipelineParallelPrefill, single_gpu._PrefillCompleteServer
+):
+    policy = "just_in_time"
+
+
+class TestJustInTimeDpAttentionPrefill(
+    _AllocationCases, _DpAttentionPrefill, single_gpu._PrefillCompleteServer
+):
+    policy = "just_in_time"
+
+
+class _MidPrefillDestination:
+    """Alone on its server: with no handshake measured yet, readiness goes out
+    at the request's first chunk, so decode's destination lands mid-prefill.
+    After earlier requests it goes out about one handshake before the end."""
+
+    policy = "just_in_time"
+
+    _cases = single_gpu.TestJustInTimeAllocation
+    test_destination_lands_mid_prefill_and_output_matches = (
+        _cases.test_destination_lands_mid_prefill_and_output_matches
+    )
+
+
+class TestJustInTimeMidPrefillPipelineParallelPrefill(
+    _MidPrefillDestination, _PipelineParallelPrefill, single_gpu._PrefillCompleteServer
+):
+    pass
+
+
+class TestJustInTimeMidPrefillDpAttentionPrefill(
+    _MidPrefillDestination, _DpAttentionPrefill, single_gpu._PrefillCompleteServer
 ):
     pass
 
