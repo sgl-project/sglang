@@ -13,7 +13,7 @@ use axum::{
         Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -24,7 +24,8 @@ use std::sync::Arc;
 
 use super::app::AppState;
 use super::native_api::native_error;
-use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
+use crate::api_server::core::fanout::RankId;
+use crate::api_server::core::{CoreError, FORWARD_PEER_PATH, FORWARD_PEER_RANK_HEADER};
 use crate::api_server::handlers::ProfileOutcome;
 use crate::message::info::ServerInfo;
 use crate::message::io_struct::ProfileOptions;
@@ -53,7 +54,33 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 /// encoded by another DP rank's listener; the reply body is this scheduler's
 /// encoded output. Errors are plain text so the relaying side can carry the
 /// message into its own merged error.
-async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+async fn forward_control_req(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let own = state.core.dp_rank();
+    let target = headers
+        .get(FORWARD_PEER_RANK_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<RankId>().ok());
+    match target {
+        Some(target) if target == own => {}
+        Some(_) => {
+            return (
+                StatusCode::MISDIRECTED_REQUEST,
+                format!("relayed to dp rank {own}'s listener"),
+            )
+                .into_response();
+        }
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("missing or invalid {FORWARD_PEER_RANK_HEADER} header"),
+            )
+                .into_response();
+        }
+    }
     match state.core.forward_control_req(body).await {
         Ok(reply) => (
             StatusCode::OK,
@@ -1291,6 +1318,7 @@ mod tests {
                 HttpRequest::builder()
                     .method("POST")
                     .uri(FORWARD_PEER_PATH)
+                    .header(FORWARD_PEER_RANK_HEADER, "0")
                     .body(Body::from(header.clone()))
                     .unwrap(),
             ),
@@ -1322,6 +1350,7 @@ mod tests {
                 HttpRequest::builder()
                     .method("POST")
                     .uri(FORWARD_PEER_PATH)
+                    .header(FORWARD_PEER_RANK_HEADER, "0")
                     .body(Body::from(Bytes::from_static(b"\xc0")))
                     .unwrap(),
             )
@@ -1329,6 +1358,54 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(intake_rx.try_recv().is_err());
+    }
+
+    /// A relayed control request for another DP rank, or one that names no
+    /// rank, is refused before it reaches this rank's scheduler, so the
+    /// sender never records this rank's reply under another rank's id.
+    #[tokio::test]
+    async fn forward_control_refuses_a_request_for_another_dp_rank() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let header = crate::message::io_struct::ControlRequest::FlushCacheReqInput(
+            crate::message::io_struct::FlushCacheReqInput::new("sender-rid".into(), Some(2.0)),
+        )
+        .encode()
+        .unwrap();
+        for (rank, status, message) in [
+            (
+                Some("2"),
+                StatusCode::MISDIRECTED_REQUEST,
+                "relayed to dp rank 0's listener",
+            ),
+            (
+                None,
+                StatusCode::BAD_REQUEST,
+                "missing or invalid x-sglang-dp-rank header",
+            ),
+            (
+                Some("two"),
+                StatusCode::BAD_REQUEST,
+                "missing or invalid x-sglang-dp-rank header",
+            ),
+        ] {
+            let mut request = HttpRequest::builder().method("POST").uri(FORWARD_PEER_PATH);
+            if let Some(rank) = rank {
+                request = request.header(FORWARD_PEER_RANK_HEADER, rank);
+            }
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                routes()
+                    .with_state(state.clone())
+                    .oneshot(request.body(Body::from(header.clone())).unwrap()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{rank:?}: served instead of refused"))
+            .unwrap();
+            assert_eq!(response.status(), status, "{rank:?}");
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(body.as_ref(), message.as_bytes(), "{rank:?}");
+            assert!(intake_rx.try_recv().is_err(), "{rank:?}: nothing submitted");
+        }
     }
 
     #[tokio::test]

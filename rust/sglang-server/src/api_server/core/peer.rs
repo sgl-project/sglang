@@ -14,6 +14,11 @@ use crate::message::config::DeploymentInfo;
 /// The route a listener serves forwarded control requests on.
 pub(crate) const FORWARD_PEER_PATH: &str = "/internal/peer";
 
+/// The DP rank a forwarded control request is meant for; a listener serving
+/// another rank refuses it with 421, since its reply would be recorded under
+/// the wrong rank.
+pub(crate) const FORWARD_PEER_RANK_HEADER: &str = "x-sglang-dp-rank";
+
 /// Peers only need a connection to come up; the scheduler-side wait (a
 /// flush's own `timeout_s`, a weight check) has no bound on the local path
 /// either, so a response is waited for as long as it takes.
@@ -43,6 +48,7 @@ impl Peer {
             .client
             .post(&self.url)
             .header(http::header::CONTENT_TYPE, "application/msgpack")
+            .header(FORWARD_PEER_RANK_HEADER, self.ranks[0])
             .body(header)
             .send()
             .await
@@ -57,6 +63,9 @@ impl Peer {
             // The exact variants the handlers match for their own 503/504.
             StatusCode::SERVICE_UNAVAILABLE => CoreError::Unavailable,
             StatusCode::GATEWAY_TIMEOUT => CoreError::DeadlineExceeded(message),
+            // The endpoint table points at another rank's listener: a server
+            // fault, not the client's request.
+            StatusCode::MISDIRECTED_REQUEST => CoreError::Internal(message),
             status => {
                 CoreError::from_runtime_rejection(message, status.as_u16(), Default::default())
             }
@@ -140,18 +149,25 @@ mod tests {
         ))
     }
 
-    /// A listener standing in for a peer: records each forwarded header and
+    /// What a peer listener saw of one forwarded request: the target-rank
+    /// header, if any, and the body.
+    type Seen = Arc<Mutex<Vec<(Option<String>, Bytes)>>>;
+
+    /// A listener standing in for a peer: records each forwarded request and
     /// answers with `reply`.
-    async fn peer_listener(reply: (StatusCode, Bytes)) -> (String, Arc<Mutex<Vec<Bytes>>>) {
-        let seen = Arc::new(Mutex::new(Vec::new()));
+    async fn peer_listener(reply: (StatusCode, Bytes)) -> (String, Seen) {
+        let seen = Seen::default();
         let recorded = seen.clone();
         let app = Router::new().route(
             FORWARD_PEER_PATH,
-            post(move |body: Bytes| {
+            post(move |headers: http::HeaderMap, body: Bytes| {
                 let recorded = recorded.clone();
                 let reply = reply.clone();
                 async move {
-                    recorded.lock().unwrap().push(body);
+                    let rank = headers
+                        .get(FORWARD_PEER_RANK_HEADER)
+                        .map(|value| value.to_str().unwrap().to_owned());
+                    recorded.lock().unwrap().push((rank, body));
                     reply
                 }
             }),
@@ -162,8 +178,9 @@ mod tests {
         (url, seen)
     }
 
-    /// The peer receives the message's own wire bytes, rid included, and its
-    /// reply body comes back as that rank's payload.
+    /// The peer receives the message's own wire bytes, rid included, under
+    /// the rank it is meant for, and its reply body comes back as that rank's
+    /// payload.
     #[tokio::test]
     async fn forwards_the_encoded_message_and_returns_the_reply_body() {
         let (url, seen) = peer_listener((StatusCode::OK, Bytes::from_static(b"reply-bytes"))).await;
@@ -174,11 +191,18 @@ mod tests {
         assert_eq!(replies[0].outcome.as_ref().unwrap(), "reply-bytes");
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        let forwarded = ForwardedControlReq::parse(seen[0].clone()).unwrap();
+        let (rank, body) = &seen[0];
+        assert_eq!(
+            rank.as_deref(),
+            Some("3"),
+            "the target rank travels with it"
+        );
+        let forwarded = ForwardedControlReq::parse(body.clone()).unwrap();
         assert_eq!(forwarded.rid.len(), 32, "a freshly minted uuid rid");
     }
 
-    /// Peer-side statuses keep the categories the handlers match on, and an
+    /// Peer-side statuses keep the categories the handlers match on, a
+    /// listener that is not the target rank's is a server-side fault, and an
     /// unreachable peer is `Unavailable` rather than a transport detail.
     #[tokio::test]
     async fn maps_peer_statuses_and_transport_failures_to_core_errors() {
@@ -187,6 +211,7 @@ mod tests {
             (StatusCode::GATEWAY_TIMEOUT, CoreErrorKind::DeadlineExceeded),
             (StatusCode::BAD_REQUEST, CoreErrorKind::InvalidArgument),
             (StatusCode::INTERNAL_SERVER_ERROR, CoreErrorKind::Internal),
+            (StatusCode::MISDIRECTED_REQUEST, CoreErrorKind::Internal),
         ] {
             let (url, _) = peer_listener((status, Bytes::from_static(b"why"))).await;
             let peer = Peer::new(reqwest::Client::new(), 1, &url);
