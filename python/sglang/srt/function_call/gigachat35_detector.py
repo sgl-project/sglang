@@ -4,6 +4,7 @@ import re
 from typing import Any, Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -115,21 +116,21 @@ class GigaChat35Detector(BaseFormatDetector):
         invokes_body, _, _ = after_open.partition(self.eot_token)
         matches = list(_GCML_INVOKE_RE.finditer(invokes_body))
         calls: List[ToolCallItem] = []
-        for i in range(self._emitted_invokes, len(matches)):
-            m = matches[i]
+        for m in matches[self._emitted_invokes :]:
             name = m.group("name")
             if name not in self._tool_indices:
                 logger.warning(f"[GigaChat35] undefined function call: {name}")
-                continue
+                if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                    continue
             args = _parse_gcml_invoke_body(m.group("body"))
             args_json = json.dumps(args, ensure_ascii=False)
-            calls.append(ToolCallItem(tool_index=i, name=name, parameters=args_json))
-            while len(self.prev_tool_call_arr) <= i:
-                self.prev_tool_call_arr.append({})
-            self.prev_tool_call_arr[i] = {"name": name, "arguments": args}
-            while len(self.streamed_args_for_tool) <= i:
-                self.streamed_args_for_tool.append("")
-            self.streamed_args_for_tool[i] = args_json
+            # Count emitted calls, not invokes, so a skipped unknown tool leaves no gap.
+            tool_index = len(self.prev_tool_call_arr)
+            calls.append(
+                ToolCallItem(tool_index=tool_index, name=name, parameters=args_json)
+            )
+            self.prev_tool_call_arr.append({"name": name, "arguments": args})
+            self.streamed_args_for_tool.append(args_json)
 
         self._emitted_invokes = len(matches)
         return StreamingParseResult(calls=calls)
