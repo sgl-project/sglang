@@ -33,6 +33,7 @@ from types import SimpleNamespace
 import torch
 from test_multi_ended_allocator import _FakeKVCache, _FakeUnifiedSWAKVPool
 
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
@@ -573,6 +574,35 @@ class TestWriteIds(CustomTestCase):
                 self.assertTrue(
                     torch.equal(cap.get_topk(0, len(virt) + 1, req_pool), expected)
                 )
+
+    def test_capture_capacity_covers_dcp_widened_paged_ids(self):
+        """Under DCP a paged allocator numbers slots over every rank's pool, so
+        one rank's pool is too few capture rows."""
+        pool_tokens, ps = 64, 4
+        for dcp_size in (1, 4):
+            with self.subTest(dcp_size=dcp_size):
+                # Widened as kv_cache_configurator builds it under DCP.
+                allocator = PagedTokenToKVPoolAllocator(
+                    size=pool_tokens * dcp_size,
+                    page_size=ps * dcp_size,
+                    dtype=torch.float16,
+                    device=_DEV,
+                    kvcache=None,
+                    need_sort=False,
+                )
+                virt = allocator.alloc(allocator.available_size())
+                src = RunnerIds(
+                    req_to_token=virt[None, :],
+                    token_to_kv_pool_allocator=allocator,
+                    token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
+                    page_size=ps,
+                    device=_DEV,
+                )
+                capacity = src.capture_token_capacity(pool_tokens)
+                self.assertGreater(capacity, int(virt.max()))
+                if dcp_size == 1:
+                    # Without DCP the rows stay one pool.
+                    self.assertEqual(capacity, pool_tokens + ps)
 
     def test_topk_capture_round_trips_request_token_ids(self):
         for ps in (1, 4, 64):
