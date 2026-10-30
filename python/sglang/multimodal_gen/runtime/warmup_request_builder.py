@@ -638,7 +638,7 @@ def build_warmup_reqs(
             data_type=task_type.data_type(),
             width=width,
             height=height,
-            prompt=DEFAULT_PLACEHOLDER_PROMPT,
+            prompt=sampling_defaults.prompt or DEFAULT_PLACEHOLDER_PROMPT,
         )
         req_kwargs["sampling_params"] = copy(sampling_defaults)
         req_kwargs.update(
@@ -661,7 +661,6 @@ def build_warmup_reqs(
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"
                 )
-            req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
             default_image_path = sampling_defaults.image_path
             image_count = (
                 len(default_image_path)
@@ -678,9 +677,9 @@ def build_warmup_reqs(
 
         run_real_path_prewarm = server_based_warmup and server_args.enable_torch_compile
         prompts = (
-            (DEFAULT_PLACEHOLDER_PROMPT,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
+            (req_kwargs["prompt"],) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
             if run_real_path_prewarm
-            else (DEFAULT_PLACEHOLDER_PROMPT,)
+            else (req_kwargs["prompt"],)
         )
         for prompt_idx, prompt in enumerate(prompts):
             prompt_req_kwargs = req_kwargs.copy()

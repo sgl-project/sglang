@@ -1022,14 +1022,18 @@ def _minimax_h3_attention_core_impl(
                 "MiniMax H3 ring parallelism requires the FlashAttention "
                 "backend (matches --ring-degree's general restriction)."
             )
-        # max_seqlen is cu_seqlens[1] (`used`) by construction -- the real,
-        # non-padding row count ring needs, already a host int here.
+        # BCG uses an aligned max_seqlen upper bound. Ring needs the live
+        # first segment length, read here in the eager attention break.
         out = _ring_attention_varlen(
             q,
             k,
             v,
             attn_impl=attention._attention_impl,
-            real_seq_len=max_seqlen,
+            real_seq_len=(
+                cu_seqlens_host[1]
+                if cu_seqlens_host is not None
+                else int(cu_seqlens[1].item())
+            ),
             ring_ws=ring_ws,
         )
     else:
@@ -2988,17 +2992,21 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             torch.int32
         )
         raw_cu_seqlens_host = self._psp_optional_field(psp, "cu_seqlens_q_host")
-        cu_seqlens_host = tuple(
-            int(value)
-            for value in (
-                cu_seqlens.tolist()
-                if raw_cu_seqlens_host is None
-                else raw_cu_seqlens_host
+        # BCG attention consumes the live cu_seqlens tensor at its eager
+        # break; a Python tuple here would retain capture-time boundaries.
+        cu_seqlens_host = (
+            None
+            if is_in_breakable_cuda_graph()
+            else tuple(
+                int(value)
+                for value in (
+                    cu_seqlens.tolist()
+                    if raw_cu_seqlens_host is None
+                    else raw_cu_seqlens_host
+                )
             )
         )
-        # max_seqlen_q is set to cu_seqlens[1] (`used`, the real/non-padding
-        # row count) by construction -- already a plain host int here, so
-        # ring can reuse it as real_seq_len below with no new device sync.
+        # BCG max_seqlen_q is an aligned upper bound, not the live segment length.
         max_seqlen = int(self._psp_field(psp, "packed_seq_params", "max_seqlen_q"))
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(

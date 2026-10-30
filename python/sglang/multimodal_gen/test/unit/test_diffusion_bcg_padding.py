@@ -575,12 +575,14 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             },
             "packed_seq_params": {
                 "cu_seqlens_q": torch.tensor([0, used, packed_seq], dtype=torch.int32),
+                "cu_seqlens_q_host": (0, used, packed_seq),
                 "max_seqlen_q": used,
             },
             "refiner_packed_seq_params": {
                 "cu_seqlens_q": torch.tensor(
                     [0, text_seq, text_seq], dtype=torch.int32
                 ),
+                "cu_seqlens_q_host": (0, text_seq, text_seq),
                 "max_seqlen_q": text_seq,
             },
         }

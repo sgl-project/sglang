@@ -41,6 +41,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     FastH3PipelineConfig,
     MiniMaxH3PipelineConfig,
+    PikaH3FlexPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
@@ -1163,6 +1164,20 @@ class TestWarmupModeNormalization(unittest.TestCase):
                 self.assertTrue(sa.enable_breakable_cuda_graph)
                 self.assertEqual(sa.warmup_resolutions, ["1024x1024"])
                 self.assertEqual(sa.warmup_mode, "server")
+
+    def test_pika_bcg_recognizes_explicit_local_model_ids(self):
+        for model_id in ("Pika-H3-Flex", "Pika-Labs/Pika-H3-Flex"):
+            with self.subTest(model_id=model_id):
+                sa = ServerArgs.__new__(ServerArgs)
+                sa.model_path = "/models/pinned-checkpoint"
+                sa.model_id = model_id
+                sa.pipeline_config = PikaH3FlexPipelineConfig()
+                sa.enable_breakable_cuda_graph = True
+                sa.warmup_resolutions = ["832x480"]
+                with patch.object(server_args_module.logger, "warning") as warning:
+                    sa._adjust_breakable_cuda_graph_support()
+                self.assertTrue(sa.enable_breakable_cuda_graph)
+                warning.assert_not_called()
 
     def test_bcg_warns_but_stays_enabled_off_the_validated_lists(self):
         for model_path, config in (
