@@ -3653,8 +3653,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sgl-kv-indexer",
- "sglang-api-types",
  "sglang-processor",
+ "sglang-runtime-v1-types",
  "sha2",
  "tempfile",
  "thiserror 2.0.20",
@@ -3678,7 +3678,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "prost",
- "prost-types",
  "serde",
  "serde_json",
  "tonic",
@@ -3706,6 +3705,16 @@ dependencies = [
  "tokenizers 0.23.2",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "sglang-runtime-v1-types"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]
