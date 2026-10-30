@@ -195,6 +195,142 @@ class TestSetFinishedTimeSpanAttrs(CustomTestCase):
         self.assertEqual(caller_attrs, {"gen_ai.request.id": "rid-1"})
 
 
+class TestDecodeLoopTraceLimit(CustomTestCase):
+    def setUp(self):
+        limit = mock.patch.object(rts, "SGLANG_TRACE_DECODE_MAX_STEPS", 10)
+        limit.start()
+        self.addCleanup(limit.stop)
+
+    def _stats(self, context_cls=rts.TraceReqContext):
+        ctx = mock.MagicMock(spec=context_cls)
+        ctx.tracing_enable = True
+        ctx.trace_level = 3
+        return rts.SchedulerReqTimeStats(trace_ctx=ctx, last_prefill_finished_time=1.0)
+
+    def _decode_slices(self, stats):
+        return [
+            call.args[0]
+            for call in stats.trace_ctx.trace_slice.call_args_list
+            if call.args[0].slice_name == rts.RequestStage.DECODE_LOOP.stage_name
+        ]
+
+    def test_default_traces_every_step(self):
+        self.assertEqual(rts.envs.SGLANG_TRACE_DECODE_MAX_STEPS.default, -1)
+        self.assertEqual(rts.RequestStage.DECODE_LOOP.level, 3)
+        with mock.patch.object(
+            rts,
+            "SGLANG_TRACE_DECODE_MAX_STEPS",
+            rts.envs.SGLANG_TRACE_DECODE_MAX_STEPS.default,
+        ):
+            stats = self._stats()
+            for i in range(12):
+                stats.set_last_decode_finish_time(ts=2.0 + i)
+            slices = self._decode_slices(stats)
+        self.assertEqual([s.attrs["decode_ct"] for s in slices], list(range(12)))
+
+    def test_limit_sync_and_async(self):
+        for context_cls in (rts.TraceReqContext, rts.TraceReqContextAsync):
+            with self.subTest(context=context_cls.__name__):
+                stats = self._stats(context_cls=context_cls)
+                for i in range(12):
+                    stats.set_last_decode_finish_time(ts=2.0 + i)
+                slices = self._decode_slices(stats)
+                self.assertEqual(
+                    [s.attrs["decode_ct"] for s in slices], list(range(10))
+                )
+                self.assertTrue(all(s.level == 3 for s in slices))
+                for i, span in enumerate(slices):
+                    self.assertEqual(
+                        span.start_time_ns, rts.convert_time_to_realtime_ns(1.0 + i)
+                    )
+                    self.assertEqual(
+                        span.end_time_ns, rts.convert_time_to_realtime_ns(2.0 + i)
+                    )
+                self.assertEqual(stats.decode_ct, 12)
+                self.assertEqual(stats.last_decode_finish_time, 13.0)
+
+    def test_configured_limits(self):
+        # A negative limit traces every decode step (the default behavior).
+        for limit, expected in ((-1, 12), (0, 0), (1, 1), (3, 3), (20, 12)):
+            with (
+                self.subTest(limit=limit),
+                mock.patch.object(rts, "SGLANG_TRACE_DECODE_MAX_STEPS", limit),
+            ):
+                stats = self._stats()
+                for i in range(12):
+                    stats.set_last_decode_finish_time(ts=2.0 + i)
+                self.assertEqual(len(self._decode_slices(stats)), expected)
+                self.assertEqual(stats.decode_ct, 12)
+                self.assertEqual(stats.last_decode_finish_time, 13.0)
+
+    def test_requests_have_independent_limits(self):
+        long_request = self._stats()
+        short_request = self._stats()
+        for i in range(15):
+            long_request.set_last_decode_finish_time(ts=2.0 + i)
+            if i < 4:
+                short_request.set_last_decode_finish_time(ts=2.0 + i)
+        self.assertEqual(len(self._decode_slices(long_request)), 10)
+        self.assertEqual(len(self._decode_slices(short_request)), 4)
+
+    def test_retract_preserves_limit_and_other_slices(self):
+        with mock.patch.object(rts, "SGLANG_TRACE_DECODE_MAX_STEPS", 3):
+            stats = self._stats()
+            stats.set_last_decode_finish_time(ts=2.0)
+            stats.set_last_decode_finish_time(ts=3.0)
+            stats.set_retract_time(ts=4.0)
+            stats.last_prefill_finished_time = 5.0
+            stats.set_last_decode_finish_time(ts=6.0)
+            stats.set_last_decode_finish_time(ts=7.0)
+            slices = self._decode_slices(stats)
+            self.assertEqual([s.attrs["decode_ct"] for s in slices], [0, 1, 2])
+            self.assertEqual(
+                slices[-1].start_time_ns, rts.convert_time_to_realtime_ns(5.0)
+            )
+            self.assertEqual(stats.decode_ct, 4)
+            self.assertEqual(stats.last_decode_finish_time, 7.0)
+            stats.trace_slice(rts.RequestStage.DECODE_FORWARD, 1.0, 7.0)
+            self.assertEqual(
+                stats.trace_ctx.trace_slice.call_args.args[0].slice_name,
+                rts.RequestStage.DECODE_FORWARD.stage_name,
+            )
+
+    def test_prefill_and_prebuilt_do_not_consume_limit(self):
+        for disagg_mode in (rts.DisaggregationMode.NULL, rts.DisaggregationMode.DECODE):
+            with self.subTest(disagg_mode=disagg_mode):
+                stats = self._stats()
+                stats.disagg_mode = disagg_mode
+                stats.last_forward_entry_time = 1.0
+                stats.set_last_chunked_prefill_finish_time(ts=2.0)
+                stats.set_prefill_finished_time(ts=3.0)
+                if disagg_mode == rts.DisaggregationMode.DECODE:
+                    stats.set_decode_prebuilt_finish_time(ts=3.0)
+                self.assertEqual(stats.decode_ct, 0)
+                stats.set_last_decode_finish_time(ts=4.0)
+                slices = self._decode_slices(stats)
+                self.assertEqual(len(slices), 1)
+                self.assertEqual(slices[0].attrs["decode_ct"], 0)
+                self.assertEqual(
+                    slices[0].start_time_ns, rts.convert_time_to_realtime_ns(3.0)
+                )
+
+    def test_metrics_unaffected_by_limit(self):
+        for limit in (0, 3):
+            with (
+                self.subTest(limit=limit),
+                mock.patch.object(rts, "SGLANG_TRACE_DECODE_MAX_STEPS", limit),
+            ):
+                collector = mock.MagicMock()
+                stats = rts.SchedulerReqTimeStats(
+                    enable_metrics=True, metrics_collector=collector
+                )
+                for i in range(12):
+                    stats.set_last_decode_finish_time(ts=2.0 + i)
+                self.assertEqual(stats.last_decode_finish_time, 13.0)
+                self.assertEqual(stats.decode_ct, 12)
+                self.assertFalse(stats.trace_ctx.tracing_enable)
+
+
 class TestQueueTimeAcrossRetraction(CustomTestCase):
     """A retracted request re-enters the waiting queue after its first forward.
 
