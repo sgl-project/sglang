@@ -157,6 +157,11 @@ http2 = [
   "granian>=2.6.0",
 ]
 
+guard = [
+  # Optional fastapi-guard security middleware
+  # (sglang/srt/entrypoints/guard_integration.py; default-off)
+  "fastapi-guard>=8.1.0,<9.0.0",
+]
 fastokens = [
   "fastokens>=0.3.2",
 ]
