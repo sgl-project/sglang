@@ -5,15 +5,18 @@ from typing import NamedTuple, Sequence
 import torch
 
 from sglang.kernels.ops.kv_canary import consts
-from sglang.kernels.ops.kv_canary.consts import splitmix64, splitmix64_mix3
+from sglang.kernels.ops.kv_canary.consts import (
+    U64_MASK,
+    canary_chain_extend_hash,
+    canary_chain_initial_hash,
+    splitmix64,
+    to_signed_int64,
+)
 from sglang.kernels.ops.kv_canary.verify import (
     RealKvSource,
     VerifyOrWriteContext,
     VerifyPlan,
 )
-
-_U64_MASK: int = (1 << 64) - 1
-_I64_SIGN_BIT: int = 1 << 63
 
 
 def launch_canary_verify_kernel_torch_reference(
@@ -119,9 +122,7 @@ def launch_canary_verify_kernel_torch_reference(
 
         prev_reachable = prev_slot != consts.TOKEN_TO_KV_SLOT_PADDING
         if prev_reachable:
-            expected_chain_hash = _to_signed_int64(
-                compute_slot_hash(buf_i64, prev_slot)
-            )
+            expected_chain_hash = to_signed_int64(compute_slot_hash(buf_i64, prev_slot))
         else:
             expected_chain_hash = stored_chain_hash
 
@@ -129,7 +130,7 @@ def launch_canary_verify_kernel_torch_reference(
             slot_idx=slot_idx,
             host_sources=host_real_kv_sources,
         )
-        expected_real_kv_hash = _to_signed_int64(expected_real_kv_hash_u64)
+        expected_real_kv_hash = to_signed_int64(expected_real_kv_hash_u64)
 
         fail_reason = consts.FailReason(0)
         if prev_reachable and stored_chain_hash != expected_chain_hash:
@@ -181,20 +182,13 @@ def launch_canary_verify_kernel_torch_reference(
     violation_write_index[0] = violation_write_index[0] + num_new_violations
 
 
-def _to_signed_int64(value: int) -> int:
-    value &= _U64_MASK
-    if value >= _I64_SIGN_BIT:
-        value -= 1 << 64
-    return value
-
-
 def compute_slot_hash(buf_i64: torch.Tensor, source_slot_idx: int) -> int:
     if source_slot_idx < 0:
-        return splitmix64(consts.CANARY_CHAIN_ANCHOR)
+        return canary_chain_initial_hash()
     token = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_TOKEN].item())
     position = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_POSITION].item())
     prev_hash = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_PREV_HASH].item())
-    return splitmix64_mix3(prev_hash, token, position)
+    return canary_chain_extend_hash(prev_hash, token, position)
 
 
 class _MaterializedRealKvSource(NamedTuple):
@@ -295,7 +289,7 @@ def _splitmix64_fold_bytes_scalar(*, raw_bytes: list[int]) -> int:
         word: int = 0
         for k in range(8):
             word |= padded[w * 8 + k] << (8 * k)
-        word &= _U64_MASK
+        word &= U64_MASK
         acc = splitmix64(acc ^ word)
 
     return acc
