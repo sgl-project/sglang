@@ -68,6 +68,35 @@ class TestCompletionRequest(unittest.TestCase):
 class TestChatCompletionRequest(unittest.TestCase):
     """Test ChatCompletionRequest protocol model"""
 
+    def test_assistant_reasoning_alias(self):
+        def assistant(**fields):
+            request = ChatCompletionRequest(
+                model="test",
+                messages=[
+                    {"role": "user", "content": "Q1"},
+                    {"role": "assistant", "content": "A1", **fields},
+                    {"role": "user", "content": "Q2"},
+                ],
+            )
+            return request.messages[1]
+
+        self.assertEqual(assistant(reasoning="R1").reasoning_content, "R1")
+        self.assertEqual(
+            assistant(reasoning="R1", reasoning_content="R2").reasoning_content, "R2"
+        )
+        self.assertEqual(
+            assistant(reasoning="R1", reasoning_content="").reasoning_content, ""
+        )
+        self.assertIsNone(assistant().reasoning_content)
+        system = ChatCompletionRequest(
+            model="test",
+            messages=[
+                {"role": "system", "content": "S", "reasoning": "R"},
+                {"role": "user", "content": "Q"},
+            ],
+        ).messages[0]
+        self.assertIsNone(system.reasoning_content)
+
     def test_full_assistant_ebnf_preserves_explicit_output_constraints(self):
         constraint = ("full_assistant_ebnf", 'root ::= "generated"')
         for explicit in (

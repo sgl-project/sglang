@@ -759,11 +759,16 @@ class AnthropicServing:
 
         try:
             # Convert to internal request
-            adapted_request, processed_request = (
-                self.openai_serving_chat._convert_to_internal_request(
-                    chat_request, raw_request
+            try:
+                adapted_request, processed_request = (
+                    self.openai_serving_chat._convert_to_internal_request(
+                        chat_request, raw_request
+                    )
                 )
-            )
+            except ValueError as e:
+                return self._error_response(
+                    status_code=400, error_type="invalid_request_error", message=str(e)
+                )
             adapted_request.received_time = received_time
 
             # Get response from OpenAI handler
@@ -772,12 +777,6 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
-        except ValueError as e:
-            return self._error_response(
-                status_code=400,
-                error_type="invalid_request_error",
-                message=str(e),
-            )
         except HTTPException as e:
             logger.warning(
                 "Non-streaming request rejected: %s %s", e.status_code, e.detail

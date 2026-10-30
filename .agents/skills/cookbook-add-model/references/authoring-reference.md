@@ -201,8 +201,12 @@ schemas (full reference in the `_playground.jsx` header):
   `nodes`) plus cross-axis live facts: `dpAttnOn` (effective DP-Attention on),
   `cpOn` (effective prefill-CP on), `cpStrategy` (effective CP layout),
   `cpSizeTarget` (the only enable-able CP size — see below), `effTp`
-  (effective TP degree — override else derived), and `pdMode` (live
-  PD-Disagg role).
+  (effective TP degree — override else derived), `pdMode` (live
+  PD-Disagg role), and `hicacheOn` (HiCache enabled in the command).
+- `flagSelects` options are checked against these facts again when the
+  command is generated (flagSelects composes last): a pick that a later
+  change disables is dropped from the command and the row shows its base
+  value, e.g. a DCP option disabled on `cpOn` or `hicacheOn`.
 - On the `attention` axis, knob-level `hide`/`disable` (on the knob object,
   not a value entry) hides/grays the whole select; apply() skips
   knobs/values that are disabled under the live facts, so stale picks never

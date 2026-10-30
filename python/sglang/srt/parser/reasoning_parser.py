@@ -118,6 +118,13 @@ class BaseReasoningFormatDetector:
     def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
 
+    def get_optional_think_start_token_id(
+        self, tokenizer: PreTrainedTokenizerBase
+    ) -> Optional[int]:
+        """Optional reasoning opener; None means reasoning starts with the first token.
+        A token ID allows the model to begin with either reasoning or an answer."""
+        return None
+
     def get_self_opened_think_start_token_ids(
         self, tokenizer: PreTrainedTokenizerBase
     ) -> Optional[List[int]]:
@@ -1254,6 +1261,18 @@ class MiniMaxM3Detector(BaseReasoningFormatDetector):
         return super().parse_streaming_increment(new_text)
 
 
+def _single_token_id(tokenizer: PreTrainedTokenizerBase, marker: str) -> Optional[int]:
+    # mistral-common encodes marker text as plain pieces ([/THINK] -> "[/", "TH",
+    # "INK", "]"), while the model emits the marker as one control token.
+    token_id = tokenizer.convert_tokens_to_ids(marker)
+    if (
+        isinstance(token_id, int)
+        and tokenizer.convert_ids_to_tokens(token_id) == marker
+    ):
+        return token_id
+    return None
+
+
 class MistralDetector(BaseReasoningFormatDetector):
     """
     Detector for Mistral models with reasoning (e.g., Mistral-Small-4-119B-2603).
@@ -1272,16 +1291,77 @@ class MistralDetector(BaseReasoningFormatDetector):
         previous_content: str = "",
         force_nonempty_content: bool = False,
     ):
+        # The model opens its own [THINK] block; forcing reasoning would route a
+        # think-free reply (e.g. under a JSON response_format) into reasoning.
+        del force_reasoning
         super().__init__(
             "[THINK]",
             "[/THINK]",
-            force_reasoning=force_reasoning,
+            force_reasoning=False,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             reasoning_default="mistral",
             force_nonempty_content=force_nonempty_content,
         )
+        self._pending_reasoning = ""
+
+    def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
+        token_id = _single_token_id(tokenizer, self.think_end_token)
+        if token_id is None:
+            return super().get_think_end_token_ids(tokenizer)
+        return [token_id]
+
+    def get_optional_think_start_token_id(
+        self, tokenizer: PreTrainedTokenizerBase
+    ) -> Optional[int]:
+        return _single_token_id(tokenizer, self.think_start_token)
+
+    def _split(self, text: str, hold_partial: bool) -> StreamingParseResult:
+        markers = (self.think_start_token, self.think_end_token)
+        reasoning, normal = [], []
+        while text:
+            hits = [(text.find(m), m) for m in markers if m in text]
+            if hits:
+                idx, marker = min(hits)
+                (reasoning if self._in_reasoning else normal).append(text[:idx])
+                self._in_reasoning = marker == self.think_start_token
+                text = text[idx + len(marker) :]
+                continue
+            keep = (
+                max(self._ends_with_partial_token(text, m) for m in markers)
+                if hold_partial
+                else 0
+            )
+            (reasoning if self._in_reasoning else normal).append(
+                text[: len(text) - keep]
+            )
+            text = text[len(text) - keep :]
+            break
+        self._buffer = text
+        return StreamingParseResult(
+            normal_text="".join(normal), reasoning_text="".join(reasoning)
+        )
+
+    def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
+        return self._split(text, hold_partial=False)
+
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        ret = self._split(self._buffer + new_text, hold_partial=True)
+        if not self.stream_reasoning:
+            self._pending_reasoning += ret.reasoning_text
+            ret.reasoning_text = ""
+            if not self._in_reasoning:
+                ret.reasoning_text, self._pending_reasoning = (
+                    self._pending_reasoning,
+                    "",
+                )
+        return ret
+
+    def finish(self) -> StreamingParseResult:
+        self._buffer = self._pending_reasoning + self._buffer
+        self._pending_reasoning = ""
+        return super().finish()
 
 
 class HunyuanDetector(BaseReasoningFormatDetector):

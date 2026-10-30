@@ -295,6 +295,65 @@ class TestDSABackendDPPadding(CustomTestCase):
         self.assertTrue(torch.all(output[:2] == 1))
         self.assertTrue(torch.all(output[2:] == 0))
 
+    def test_flashmla_kv_schedules_the_real_rows_of_a_padded_extend(self):
+        # Attention DP pads an extend batch to a multiple of attention TP; attention
+        # then runs on the real rows while the DSA metadata covers the padded rows.
+        for real_rows, padded_rows in ((3, 4), (4, 4)):
+            with self.subTest(real_rows=real_rows, padded_rows=padded_rows):
+                captured, rescheduled = self._run_flashmla_kv(real_rows, padded_rows)
+                self.assertEqual(
+                    captured["cache_seqlens"].tolist(), [5, 6, 7, 8][:real_rows]
+                )
+                self.assertEqual(captured["num_splits"].shape[0], real_rows + 1)
+                self.assertEqual(
+                    rescheduled, [[5, 6, 7]] if real_rows < padded_rows else []
+                )
+
+    def _run_flashmla_kv(self, real_rows, padded_rows):
+        def metadata_for(seqlens):
+            return SimpleNamespace(
+                flashmla_metadata=None,
+                num_splits=torch.zeros(len(seqlens) + 1, dtype=torch.int32),
+            )
+
+        rescheduled = []
+        captured = {}
+
+        def fake_flash_mla_with_kvcache(**kwargs):
+            captured.update(kwargs)
+            return kwargs["q"][..., :2], None
+
+        def compute_flashmla_metadata(cache_seqlens, seq_len_q):
+            rescheduled.append(cache_seqlens.tolist())
+            return metadata_for(cache_seqlens)
+
+        backend = SimpleNamespace(
+            flashmla_kv_num_q_heads=2,
+            physical_page_size=64,
+            kv_cache_dim=4,
+            dsa_kv_cache_store_fp8=True,
+            dsa_index_topk=2,
+            flashmla_kv_format="fp8",
+            _compute_flashmla_metadata=compute_flashmla_metadata,
+            _call_flash_mla_with_kvcache=fake_flash_mla_with_kvcache,
+        )
+        cache_seqlens = torch.tensor([5, 6, 7, 8], dtype=torch.int32)[:padded_rows]
+        metadata = SimpleNamespace(
+            dsa_cache_seqlens_int32=cache_seqlens,
+            flashmla_metadata=metadata_for(cache_seqlens),
+        )
+        DeepseekSparseAttnBackend._forward_flashmla_kv(
+            backend,
+            q_all=torch.zeros(real_rows, 2, 4),
+            kv_cache=torch.zeros(64, 4),
+            v_head_dim=2,
+            sm_scale=1.0,
+            layer=SimpleNamespace(tp_q_head_num=2, head_dim=4),
+            metadata=metadata,
+            page_table_1=torch.zeros(real_rows, 2, dtype=torch.int32),
+        )
+        return captured, rescheduled
+
 
 if __name__ == "__main__":
     unittest.main()

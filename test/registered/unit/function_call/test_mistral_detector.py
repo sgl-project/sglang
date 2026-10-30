@@ -10,6 +10,14 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(1.0, "base-a-test-cpu")
 
 
+class _Vocab:
+    def __init__(self, tokens):
+        self._vocab = {token: i for i, token in enumerate(tokens)}
+
+    def get_vocab(self):
+        return self._vocab
+
+
 class TestMistralDetector(CustomTestCase):
     def setUp(self):
         self.tools = [
@@ -161,11 +169,34 @@ class TestMistralDetector(CustomTestCase):
     # ==================== structure_info Tests ====================
 
     def test_structure_info(self):
-        info_func = self.detector.structure_info()
-        info = info_func("get_weather")
-        self.assertIn("get_weather", info.begin)
-        self.assertIn("[TOOL_CALLS]", info.trigger)
-        self.assertEqual(info.end, "}]")
+        # No tokenizer, or one without [ARGS] (pre-v11): JSON array.
+        for detector in (self.detector, MistralDetector(_Vocab({"[TOOL_CALLS]"}))):
+            info = detector.structure_info()("get_weather")
+            self.assertIn("get_weather", info.begin)
+            self.assertEqual(info.trigger, "[TOOL_CALLS]")
+            self.assertEqual(info.end, "}]")
+
+    def test_structure_info_compact(self):
+        detector = MistralDetector(_Vocab({"[TOOL_CALLS]", "[ARGS]"}))
+        info = detector.structure_info()("get_weather")
+        self.assertEqual(info.begin, "[TOOL_CALLS]get_weather[ARGS]")
+        self.assertEqual(info.trigger, "[TOOL_CALLS]")
+        self.assertEqual(info.end, "")
+
+    def test_constrained_output_parses_every_call(self):
+        info_func = MistralDetector(_Vocab({"[ARGS]"})).structure_info()
+        text = "".join(
+            info_func(name).begin + json.dumps(args) + info_func(name).end
+            for name, args in (
+                ("get_weather", {"city": "Paris"}),
+                ("get_weather", {"city": "Tokyo"}),
+            )
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(
+            [json.loads(c.parameters)["city"] for c in result.calls], ["Paris", "Tokyo"]
+        )
+        self.assertEqual(result.normal_text, "")
 
     # ==================== Streaming Tests ====================
 

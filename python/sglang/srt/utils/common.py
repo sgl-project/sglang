@@ -1913,6 +1913,7 @@ def get_mm_http_session() -> requests.Session:
 # image above twice Image.MAX_IMAGE_PIXELS; it subclasses Exception, not OSError.
 CLIENT_MEDIA_EXCEPTIONS = (
     ValueError,
+    FileNotFoundError,
     UnidentifiedImageError,
     Image.DecompressionBombError,
     requests.exceptions.RequestException,

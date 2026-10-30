@@ -95,6 +95,45 @@ class _FakeNonStreamingErrorOpenAI:
         )
 
 
+class _FakeNonStreamingOpenAI:
+    """Returns a configurable ChatCompletionResponse from the OpenAI handler."""
+
+    def __init__(self, response):
+        self._response = response
+
+    def _validate_request(self, chat_request):
+        return None
+
+    def _convert_to_internal_request(self, chat_request, raw_request):
+        return SimpleNamespace(), chat_request
+
+    async def _handle_non_streaming_request(
+        self, adapted_request, processed_request, raw_request
+    ):
+        return self._response
+
+
+class _FakeRejectingOpenAI(_FakeNonStreamingOpenAI):
+    supports_inline_system = False
+
+    def __init__(self, error):
+        super().__init__(response=None)
+        self._error = error
+
+    def _convert_to_internal_request(self, chat_request, raw_request):
+        raise self._error
+
+
+class _FakeFailingGenerationOpenAI(_FakeRejectingOpenAI):
+    def _convert_to_internal_request(self, chat_request, raw_request):
+        return SimpleNamespace(), chat_request
+
+    async def _handle_non_streaming_request(
+        self, adapted_request, processed_request, raw_request
+    ):
+        raise self._error
+
+
 def _chunk(choices=None, usage=None):
     data = {
         "id": "chatcmpl-test",
@@ -788,6 +827,50 @@ class TestAnthropicServing(unittest.TestCase):
         usage_out = message_start["message"]["usage"]
         self.assertEqual(usage_out["input_tokens"], 5)
         self.assertNotIn("cache_read_input_tokens", usage_out)
+
+    def test_request_conversion_value_error_is_invalid_request(self):
+        """Bug regression: an unsupported output_config.effort raised during request
+        conversion and returned 500 api_error instead of a 400 client error."""
+        message = "reasoning_effort=medium is not supported by Mistral models."
+        serving = AnthropicServing(_FakeRejectingOpenAI(ValueError(message)))
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        for stream, handler in (
+            (False, serving._handle_non_streaming),
+            (True, serving._handle_streaming),
+        ):
+            with self.subTest(stream=stream):
+                anthropic_request = self._anthropic_request(stream=stream)
+                response = asyncio.run(
+                    handler(chat_request, anthropic_request, object())
+                )
+                payload = json.loads(response.body)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(payload["error"]["type"], "invalid_request_error")
+                self.assertEqual(payload["error"]["message"], message)
+
+    def test_generation_value_error_stays_internal_error(self):
+        """Only request conversion maps ValueError to 400; a ValueError from generation
+        is a server failure and must not leak its message to the client."""
+        secret = "internal detail from response construction"
+        serving = AnthropicServing(_FakeFailingGenerationOpenAI(ValueError(secret)))
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        anthropic_request = self._anthropic_request(stream=False)
+        with self.assertLogs("sglang.srt.entrypoints.anthropic.serving", "ERROR"):
+            response = asyncio.run(
+                serving._handle_non_streaming(chat_request, anthropic_request, object())
+            )
+            payload = json.loads(response.body)
+            self.assertEqual(response.status_code, 500)
+            self.assertEqual(payload["error"]["type"], "api_error")
+            self.assertNotIn(secret, response.body.decode())
 
     def test_non_streaming_error_with_non_json_body(self):
         """Non-JSON upstream error body falls back to body[:500] as the message (for 4xx)."""

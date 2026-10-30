@@ -31,7 +31,7 @@ class MistralDetector(BaseFormatDetector):
     Reference: https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3?chat_template=default
     """
 
-    def __init__(self):
+    def __init__(self, tokenizer=None):
         """Initialize tokens and streaming state."""
         super().__init__()
         # Canonical Mistral prefix for JSON-array tool calls.
@@ -40,6 +40,12 @@ class MistralDetector(BaseFormatDetector):
         self._tool_calls_marker = "[TOOL_CALLS"
         self.eot_token = "]"
         self.tool_call_separator = ", "
+        # Models whose tokenizer has [ARGS] (Mistral tokenizer v11+) were trained on
+        # the compact format; older ones on the JSON array. Without a tokenizer, keep
+        # the JSON array.
+        self._compact_format = (
+            tokenizer is not None and "[ARGS]" in tokenizer.get_vocab()
+        )
 
     def has_tool_call(self, text: str) -> bool:
         """Return True if the text contains either supported tool-call marker."""
@@ -336,6 +342,14 @@ class MistralDetector(BaseFormatDetector):
         return None
 
     def structure_info(self) -> _GetInfoFunc:
+        if self._compact_format:
+            # `[TOOL_CALLS]name[ARGS]{...}` has no closing marker; repeated calls
+            # parse as separate calls.
+            return lambda name: StructureInfo(
+                begin="[TOOL_CALLS]" + name + "[ARGS]",
+                end="",
+                trigger="[TOOL_CALLS]",
+            )
         return lambda name: StructureInfo(
             begin='[TOOL_CALLS] [{"name":"' + name + '", "arguments":',
             end="}]",

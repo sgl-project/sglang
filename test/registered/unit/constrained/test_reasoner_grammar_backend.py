@@ -32,8 +32,14 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
-from sglang.srt.parser.reasoning_parser import InklingDetector
+from sglang.srt.parser.reasoning_parser import (
+    BaseReasoningFormatDetector,
+    InklingDetector,
+)
 from sglang.srt.parser.reasoning_parser import KimiK3Detector as KimiK3ReasoningDetector
+from sglang.srt.parser.reasoning_parser import (
+    MistralDetector,
+)
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -173,14 +179,10 @@ class TestReasonerGrammarBackend(CustomTestCase):
             os.environ["SGLANG_MAX_THINK_TOKENS"] = self._prev_budget
 
     def _make_parser(self):
-        detector = SimpleNamespace(
-            think_start_token="<think>",
-            think_end_token="</think>",
+        detector = BaseReasoningFormatDetector(
+            "<think>",
+            "</think>",
             think_excluded_tokens=["<tool_call>", "</tool_call>"],
-            get_think_end_token_ids=lambda tokenizer: tokenizer.encode(
-                "</think>", add_special_tokens=False
-            ),
-            get_answer_frame=lambda: None,
         )
         return SimpleNamespace(detector=detector)
 
@@ -853,6 +855,70 @@ class TestReasonerGrammarBackend(CustomTestCase):
                 self._make_tokenizer(),
                 enable_strict_thinking=True,
             )
+
+
+class TestMistralControlTokenReasoning(CustomTestCase):
+    """Mistral opens and closes reasoning with single control tokens and may
+    answer without a reasoning block, so the grammar must follow those tokens."""
+
+    THINK, END_THINK = 200, 201
+
+    def _make_reasoner(self):
+        vocab = [chr(i) for i in range(128)] + [""] * 75
+        vocab[self.THINK], vocab[self.END_THINK], vocab[202] = (
+            "[THINK]",
+            "[/THINK]",
+            "</s>",
+        )
+        info = TokenizerInfo(vocab, stop_token_ids=[202])
+        control = {"[THINK]": self.THINK, "[/THINK]": self.END_THINK}
+        # Like mistral-common, encode() spells the markers as plain text.
+        tokenizer = SimpleNamespace(
+            encode=lambda text, add_special_tokens=False: list(text.encode()),
+            convert_tokens_to_ids=lambda token: control.get(token, 0),
+            convert_ids_to_tokens=lambda token_id: vocab[token_id],
+            init_xgrammar=lambda: (info, None),
+        )
+        backend = XGrammarGrammarBackend(tokenizer, len(vocab))
+        parser = SimpleNamespace(detector=MistralDetector())
+        return ReasonerGrammarBackend(backend, parser, tokenizer), len(vocab)
+
+    def _allowed(self, grammar, vocab_size, token_ids):
+        mask = torch.full((1, (vocab_size + 31) // 32), -1, dtype=torch.int32)
+        grammar.fill_vocab_mask(mask, 0)
+        return _allowed_token_ids(mask, token_ids)
+
+    def test_grammar_starts_after_the_closing_control_token(self):
+        reasoner, vocab_size = self._make_reasoner()
+        self.assertEqual(reasoner.think_end_ids, [self.END_THINK])
+        grammar = reasoner._init_value_dispatch(("regex", "(ab){2}c"), reasoning=True)
+        probe = [ord("a"), ord("b"), ord("x"), self.THINK]
+
+        grammar.accept_token(self.THINK)
+        for token in map(ord, "xy"):
+            self.assertIn(token, self._allowed(grammar, vocab_size, [token]))
+            grammar.accept_token(token)
+        grammar.accept_token(self.END_THINK)
+
+        self.assertEqual(self._allowed(grammar, vocab_size, probe), [ord("a")])
+
+    def test_reply_without_reasoning_is_constrained_from_the_first_token(self):
+        reasoner, vocab_size = self._make_reasoner()
+        grammar = reasoner._init_value_dispatch(("regex", "(ab){2}c"), reasoning=True)
+        probe = [ord("a"), ord("b"), ord("x"), self.THINK, self.END_THINK]
+
+        self.assertEqual(
+            self._allowed(grammar, vocab_size, probe), [ord("a"), self.THINK]
+        )
+        grammar.accept_token(ord("a"))
+        self.assertEqual(self._allowed(grammar, vocab_size, probe), [ord("b")])
+
+        grammar.rollback(1)
+        self.assertEqual(
+            self._allowed(grammar, vocab_size, probe), [ord("a"), self.THINK]
+        )
+        grammar.accept_token(self.THINK)
+        self.assertIn(ord("x"), self._allowed(grammar, vocab_size, probe))
 
 
 class TestReasonerGrammarObjectRollback(CustomTestCase):

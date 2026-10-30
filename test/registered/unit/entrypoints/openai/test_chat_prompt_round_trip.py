@@ -7,7 +7,7 @@ detects such a tokenizer and the prompt dispatch that reacts to it.
 """
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -91,10 +91,16 @@ class TestRenderAndEncode(unittest.TestCase):
 
 
 class TestEnginePrompt(unittest.TestCase):
-    def _server(self, lossy):
-        return SimpleNamespace(
-            _prompt_text_round_trip_is_lossy=lossy, chat_encoding_spec=None
+    def _server(self, lossy, mistral_common=False):
+        server = SimpleNamespace(
+            _prompt_text_round_trip_is_lossy=lossy,
+            _uses_mistral_common_tokenizer=mistral_common,
+            chat_encoding_spec=None,
         )
+        server._uses_mistral_image_placeholders = MethodType(
+            OpenAIServingChat._uses_mistral_image_placeholders, server
+        )
+        return server
 
     def test_lossy_text_only_sends_ids(self):
         key, value = engine_prompt(
@@ -108,6 +114,20 @@ class TestEnginePrompt(unittest.TestCase):
         key, _ = engine_prompt(
             self._server(True),
             _messages([1, 3, 4], image_data=["img"]),
+            is_multimodal=True,
+        )
+        self.assertEqual(key, "text")
+
+    def test_mistral_common_image_prompt_sends_ids(self):
+        # mistral-common image placeholders survive in IDs; other media needs text.
+        server = self._server(True, mistral_common=True)
+        key, value = engine_prompt(
+            server, _messages([1, 3, 4], image_data=["img"]), is_multimodal=True
+        )
+        self.assertEqual((key, value), ("input_ids", [1, 3, 4]))
+        key, _ = engine_prompt(
+            server,
+            _messages([1, 3, 4], image_data=["img"], video_data=["vid"]),
             is_multimodal=True,
         )
         self.assertEqual(key, "text")
