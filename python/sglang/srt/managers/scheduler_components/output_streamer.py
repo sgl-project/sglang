@@ -440,6 +440,10 @@ class _GenerationStreamAccumulator:
     decode_latencies: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.output_sink is OutputSink.TOKENIZER:
+            # The tokenizer-side router reads this list on every batch, idle
+            # ones included.
+            self.has_http_worker_ipc = True
         if self.output_sink is OutputSink.RUST:
             self.prompt_tokens = []
             self.cached_tokens = []
@@ -548,7 +552,6 @@ class _GenerationStreamAccumulator:
             self.has_http_worker_ipc = self.has_http_worker_ipc or ipc is not None
         elif self.output_sink is OutputSink.TOKENIZER:
             self.http_worker_ipcs.append(req.http_worker_ipc)
-            self.has_http_worker_ipc = True
 
         if self.output_sink is OutputSink.RUST:
             # Per-step header columns of `push_generation`.

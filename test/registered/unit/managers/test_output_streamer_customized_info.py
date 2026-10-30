@@ -1022,6 +1022,15 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         streamer.release_detokenize_state(req)
         self.assertEqual(len(outputs), 2)
 
+    def test_skip_tokenizer_init_idle_batch_carries_an_empty_ipc_list(self):
+        """The tokenizer-side router iterates http_worker_ipcs on every batch;
+        an idle one (a DP rank with no work) must send a list, not None."""
+        payload = _accumulator(output_sink=OutputSink.TOKENIZER).to_payload(
+            dp_rank=0, is_idle_batch=True
+        )
+
+        self.assertEqual(payload.http_worker_ipcs, [])
+
 
 if __name__ == "__main__":
     unittest.main()
