@@ -14,8 +14,9 @@ Mooncake 0.3.13 this relies on (probed against a live master):
   for a read that outlasted its lease. It releases the GIL while it waits.
 - ``get_into_ranges`` reads byte ranges of parts into registered memory in one call and
   returns each range's bytes read; -704 for a missing part; -600 for a range outside its
-  part or outside registered memory; or another negative code. Unlike the rest of this
-  list, this is read from the 0.3.13 source, not probed.
+  part or outside registered memory; or another negative code. Only its successful
+  reads were probed; the error codes are read from the 0.3.13 source.
+- One registration serves any number of reads into any part of the registered memory.
 - A read leaves a lease on the key, and a remove without ``force`` fails (-706) while
   the lease lasts.
 """
@@ -175,10 +176,9 @@ class MooncakeBackend(StorageBackend):
             sizes.append(read.nbytes)
         part_keys = list(ranges)
         all_dsts, all_srcs, all_sizes = [list(c) for c in zip(*ranges.values())]
-        with self._registered(np.frombuffer(into, dtype=np.uint8)) as base:
-            (results,) = self._store.get_into_ranges(
-                [base], [part_keys], [all_dsts], [all_srcs], [all_sizes]
-            )
+        (results,) = self._store.get_into_ranges(
+            [_address(into)], [part_keys], [all_dsts], [all_srcs], [all_sizes]
+        )
         failed = [
             (key, got, nbytes)
             for key, got_ranges, range_sizes in zip(part_keys, results, all_sizes)
@@ -188,20 +188,26 @@ class MooncakeBackend(StorageBackend):
         if failed:
             _raise_failed_ranges(failed)
 
-    @contextlib.contextmanager
-    def _registered(self, memory: np.ndarray) -> Iterator[int]:
-        base = memory.ctypes.data
-        status = self._store.register_buffer(base, memory.nbytes)
+    def register(self, memory: memoryview) -> None:
+        status = self._store.register_buffer(_address(memory), memory.nbytes)
         if status != 0:
             raise RuntimeError(
                 f"Mooncake register_buffer of {memory.nbytes} bytes failed: {status}"
             )
+
+    def unregister(self, memory: memoryview) -> None:
+        status = self._store.unregister_buffer(_address(memory))
+        if status != 0:
+            logger.error("Mooncake unregister_buffer failed: %s", status)
+
+    @contextlib.contextmanager
+    def _registered(self, memory: np.ndarray) -> Iterator[int]:
+        view = memoryview(memory)
+        self.register(view)
         try:
-            yield base
+            yield memory.ctypes.data
         finally:
-            status = self._store.unregister_buffer(base)
-            if status != 0:
-                logger.error("Mooncake unregister_buffer failed: %s", status)
+            self.unregister(view)
 
     def delete_many(
         self, keys: Sequence[str], *, parts: Sequence[Sequence[str]]
@@ -317,3 +323,7 @@ def _raise_failed_ranges(failed: Sequence[tuple[str, int, int]]) -> NoReturn:
 
 def _part_key(object_key: str, name: str) -> str:
     return f"{object_key}/{name}"
+
+
+def _address(memory: memoryview) -> int:
+    return np.frombuffer(memory, dtype=np.uint8).ctypes.data

@@ -25,6 +25,8 @@ Lifecycle:
 
 from __future__ import annotations
 
+import mmap
+import sys
 from typing import Mapping, Optional, Sequence, TypeVar
 
 from radix_transfer_plugins.backend import StorageBackend
@@ -91,23 +93,29 @@ class OutputStore:
             for specs, data in zip(wanted, stored)
         ]
 
-    def read_ranges(self, reads: Sequence[RangeRead], *, into: memoryview) -> None:
-        """Read byte ranges of stored fields into ``into``, memory the caller owns.
+    def read_buffer(self, nbytes: int) -> ReadBuffer:
+        """``nbytes`` of memory to read ranges into, registered until its ``close()``."""
+        return ReadBuffer(backend=self._backend, nbytes=nbytes)
 
-        Only identity-coded fields. Fails before reading when ``into`` is read-only, a
-        field is missing or not identity coded, a range is empty, or a range falls
-        outside its field or ``into``. A read that fails after starting may leave
-        ``into`` partly written.
+    def read_ranges(self, reads: Sequence[RangeRead], *, into: ReadBuffer) -> None:
+        """Read byte ranges of stored fields into ``into``, without registering memory.
+
+        Only identity-coded fields. Fails before reading when ``into`` is closed or
+        from another store, a field is missing or not identity coded, a range is
+        empty, or a range falls outside its field or ``into``. A read that fails after
+        starting may leave ``into`` partly written; ``into`` stays usable.
         """
         if not reads:
             return
-        if into.readonly:
-            raise ValueError("ranges cannot be read into read-only memory")
+        if into.closed:
+            raise ValueError("ranges cannot be read into a closed ReadBuffer")
+        if into.backend is not self._backend:
+            raise ValueError("the ReadBuffer was registered by another store")
         self._check_backend([read.ref for read in reads])
         for read in reads:
             (spec,) = _named_specs(read.ref, [read.field])
-            _check_range(read, spec=spec, into=into)
-        self._backend.get_ranges(reads, into=into)
+            _check_range(read, spec=spec, into=into.view)
+        self._backend.get_ranges(reads, into=into.view)
 
     def delete_many(self, refs: Sequence[StoreRef]) -> None:
         """Delete every field of each ref."""
@@ -149,6 +157,37 @@ class OutputStore:
                 raise ValueError(
                     f"ref of backend {ref.backend!r} given to a {self._backend.name!r} store"
                 )
+
+
+class ReadBuffer:
+    """Host memory registered with a backend from creation until ``close()``, so that
+    repeated ``read_ranges`` into it register nothing.
+
+    It owns its bytes, so a registration never outlives the memory it pins: ``close()``
+    unregisters before the bytes can be freed. Views of ``view`` stay valid after
+    ``close()``. One read at a time may use it.
+    """
+
+    def __init__(self, *, backend: StorageBackend, nbytes: int) -> None:
+        if nbytes <= 0:
+            raise ValueError(f"a ReadBuffer needs a positive size, not {nbytes}")
+        # Anonymous memory is page aligned and untouched; registering it faults it in,
+        # in parallel from 4 GiB up on Mooncake 0.3.13.
+        memory = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE)
+        if sys.platform == "linux":
+            # Hosts often enable THP on madvise only; huge pages fault in 3x faster
+            # (measured on H200 hosts), and numpy asks for them the same way.
+            memory.madvise(mmap.MADV_HUGEPAGE)
+        self.view = memoryview(memory)
+        backend.register(self.view)
+        self.backend = backend
+        self.nbytes = nbytes
+        self.closed = False
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.backend.unregister(self.view)
 
 
 def _as_bytes(data: memoryview) -> memoryview:

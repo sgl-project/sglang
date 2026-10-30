@@ -46,8 +46,20 @@ class StorageBackend(ABC):
         """
 
     @abstractmethod
+    def register(self, memory: memoryview) -> None:
+        """Make ``memory`` a destination of ``get_ranges`` until ``unregister``.
+
+        Raises ``RuntimeError`` when the backend cannot register it.
+        """
+
+    @abstractmethod
+    def unregister(self, memory: memoryview) -> None:
+        """Undo ``register``; the caller is releasing ``memory``, so a failure is only logged."""
+
+    @abstractmethod
     def get_ranges(self, reads: Sequence[RangeRead], *, into: memoryview) -> None:
-        """Read each range of part ``field`` of object ``ref.key`` into ``into``.
+        """Read each range of part ``field`` of object ``ref.key`` into ``into``, which
+        lies in memory given to ``register``.
 
         Raises ``KeyError`` for a part that is not stored and ``RuntimeError`` for a
         range that could not be read.

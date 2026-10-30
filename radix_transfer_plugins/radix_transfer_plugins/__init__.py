@@ -12,13 +12,14 @@ from radix_transfer_plugins.schema import (
     Stash,
     StoreRef,
 )
-from radix_transfer_plugins.store import OutputStore
+from radix_transfer_plugins.store import OutputStore, ReadBuffer
 
 __all__ = [
     "FieldSpec",
     "OutputStore",
     "RangeRead",
     "RawField",
+    "ReadBuffer",
     "Stash",
     "StorageBackend",
     "StoreRef",

@@ -65,6 +65,12 @@ class _MemoryBackend(StorageBackend):
             for key, named in zip(keys, parts)
         ]
 
+    def register(self, memory):
+        pass
+
+    def unregister(self, memory):
+        pass
+
     def get_ranges(self, reads, *, into):
         for read in reads:
             stored = self.objects[read.ref.key][read.field]

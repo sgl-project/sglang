@@ -22,6 +22,9 @@ class MemoryBackend(StorageBackend):
         self.objects: dict[str, dict[str, bytes]] = {}
         self.reads: list[list[str]] = []
         self.range_reads: list[list[RangeRead]] = []
+        # Memory given to register and not yet to unregister, and every register call.
+        self.registered: list[memoryview] = []
+        self.registrations = 0
         self.next_id = 0
 
     def put_many(self, objects):
@@ -42,7 +45,15 @@ class MemoryBackend(StorageBackend):
             out.append({name: memoryview(bytearray(stored[name])) for name, _ in named})
         return out
 
+    def register(self, memory):
+        self.registered.append(memory)
+        self.registrations += 1
+
+    def unregister(self, memory):
+        self.registered = [m for m in self.registered if m is not memory]
+
     def get_ranges(self, reads, *, into):
+        assert any(into is m for m in self.registered)
         self.range_reads.append(list(reads))
         for read in reads:
             stored = self.objects[read.ref.key][read.field]
@@ -316,15 +327,44 @@ def test_read_ranges_match_numpy_slices():
         )
         wants.append(want)
         end += want.nbytes
-    into = np.zeros(end, dtype=np.uint8)
+    into = store.read_buffer(end)
 
     # Passed out of order: each range lands at its own dst_offset.
-    store.read_ranges(
-        [reads[j] for j in rng.permutation(len(reads))], into=memoryview(into)
-    )
+    store.read_ranges([reads[j] for j in rng.permutation(len(reads))], into=into)
 
-    assert into.tobytes() == b"".join(want.tobytes() for want in wants)
+    assert bytes(into.view) == b"".join(want.tobytes() for want in wants)
     assert len(backend.range_reads) == 1
+
+
+def test_a_read_buffer_registers_once_for_every_read_until_closed():
+    backend = MemoryBackend()
+    store = OutputStore(backend=backend)
+    (ref,) = store.put_many([token_stash(30, num_tokens=30)])
+    rows = token_stash(30, num_tokens=30).routed_experts
+    into = store.read_buffer(rows[0].nbytes * 2)
+    for row in (3, 17, 29):
+        read = RangeRead(
+            ref=ref,
+            field="routed_experts",
+            src_offset=row * rows[0].nbytes,
+            nbytes=rows[0].nbytes,
+            dst_offset=rows[0].nbytes,
+        )
+        store.read_ranges([read], into=into)
+        assert bytes(into.view[rows[0].nbytes :]) == rows[row].tobytes()
+    assert backend.registrations == 1
+    # A failed read leaves the buffer registered and usable.
+    missing = msgspec.structs.replace(ref, key="mem/gone")
+    with pytest.raises(KeyError):
+        store.read_ranges([msgspec.structs.replace(read, ref=missing)], into=into)
+    store.read_ranges([read], into=into)
+    into.close()
+    into.close()
+    assert backend.registered == []
+    with pytest.raises(ValueError, match="closed"):
+        store.read_ranges([read], into=into)
+    with pytest.raises(ValueError, match="positive size"):
+        store.read_buffer(0)
 
 
 def test_read_ranges_check_every_range_before_reading():
@@ -338,7 +378,7 @@ def test_read_ranges_check_every_range_before_reading():
     zstd = msgspec.structs.replace(
         ref, fields=tuple(msgspec.structs.replace(s, codec="zstd") for s in ref.fields)
     )
-    into = memoryview(bytearray(size))
+    into = store.read_buffer(size)
     for change, match in [
         ({"field": "hidden_states"}, "no fields"),
         ({"ref": zstd}, "zstd coded"),
@@ -351,7 +391,8 @@ def test_read_ranges_check_every_range_before_reading():
         bad = msgspec.structs.replace(good, **change)
         with pytest.raises(ValueError, match=match):
             store.read_ranges([good, bad], into=into)
-    with pytest.raises(ValueError, match="read-only"):
-        store.read_ranges([good], into=memoryview(bytes(size)))
-    store.read_ranges([], into=memoryview(bytearray()))
+    other = OutputStore(backend=MemoryBackend()).read_buffer(size)
+    with pytest.raises(ValueError, match="another store"):
+        store.read_ranges([good], into=other)
+    store.read_ranges([], into=into)
     assert backend.range_reads == []
