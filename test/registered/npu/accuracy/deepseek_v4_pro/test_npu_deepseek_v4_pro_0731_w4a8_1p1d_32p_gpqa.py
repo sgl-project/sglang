@@ -215,28 +215,53 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(
     #     """Run NPU accuracy test for DSV4-Pro W4A8 PD-Sep GPQA High mode."""
     #     self.run_accuracy()
 
-    def test_npu_deepseek_v4_pro_w4a8_pd_sep_l2_host_hit_rate(self):
-        """run_bench_serving in 128k out 1k asserts the host hit rate"""
-        bench_env = os.environ.copy()
-        bench_env.pop("SGLANG_IS_IN_CI", None)
-        run_bench_serving(
-            host=self.host,
-            port=self.port,
-            model_path=self.model_config.get("model_path"),
-            dataset_name="generated-shared-prefix",
-            input_len=131072,
-            output_len=1024,
-            num_prompts=96,
-            max_concurrency=8,
-            gsp_num_groups=3,
-            gsp_prompts_per_group=8,
-            seed=100,
-            warmup_requests=16,
-            repeat_rate=0.9,
-            cache_report=True,
-            min_host_hit_rate_pct=0,
-            env=bench_env,
-        )
+    # def test_npu_deepseek_v4_pro_w4a8_pd_sep_l2_host_hit_rate(self):
+    #     """run_bench_serving in 128k out 1k asserts the host hit rate"""
+    #     bench_env = os.environ.copy()
+    #     bench_env.pop("SGLANG_IS_IN_CI", None)
+    #     run_bench_serving(
+    #         host=self.host,
+    #         port=self.port,
+    #         model_path=self.model_config.get("model_path"),
+    #         dataset_name="generated-shared-prefix",
+    #         input_len=131072,
+    #         output_len=1024,
+    #         num_prompts=96,
+    #         max_concurrency=8,
+    #         gsp_num_groups=3,
+    #         gsp_prompts_per_group=8,
+    #         seed=100,
+    #         warmup_requests=16,
+    #         repeat_rate=0.9,
+    #         cache_report=True,
+    #         min_host_hit_rate_pct=0,
+    #         env=bench_env,
+    #     )
+
+class TestNPUDeepSeekV4ProW4A8PDSEPIn128kOut1kPrefix90(
+    TestNpuPerfMultiNodePdSepTestCaseBase
+):
+    """Test NPU performance for DeepSeek-V4-Flash W8A8 PD-Sep 1P+1D 16p in128k out1k."""
+
+    benchmark_tool = BENCHMARK_TOOL_DEFAULT
+    model_config = DEEPSEEK_V4_PRO_W4A8_PD_SEP_MODEL_CONFIG
+    dataset_name = "generated-shared-prefix"
+    max_concurrency = 32
+    num_prompts = 32
+    input_len = 131072
+    output_len = 1024
+    random_range_ratio = 1
+    seed = 1
+    repeat_rate = 0.9
+    # request_rate = 3
+    warmup_requests = 16
+    pop_sglang_is_in_ci_for_gsp = True
+    host_hit_rate = 1
+
+    def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_20ms(self):
+        """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k."""
+        self.run_throughput()
+
 
 # class TestNPUDeepSeekV4ProW4A8PDSEPIn128kOut1kPrefix90(
 #     TestNpuPerfMultiNodePdSepTestCaseBase
