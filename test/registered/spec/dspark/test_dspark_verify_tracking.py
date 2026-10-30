@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.arg_groups.model_override_base import mamba_extra_buffer_of
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.speculative import dflash_info, spec_utils
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
@@ -15,11 +16,26 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 class TestDSparkVerifyTracking(unittest.TestCase):
     def test_verify_refreshes_tracking_before_forward_batch(self):
-        for compact, graph, lazy in itertools.product((False, True), repeat=3):
-            with self.subTest(compact=compact, graph=graph, lazy=lazy):
-                self._check_verify(compact, graph, lazy)
+        for compact, graph, lazy, disable_radix_cache in itertools.product(
+            (False, True), repeat=4
+        ):
+            with self.subTest(
+                compact=compact,
+                graph=graph,
+                lazy=lazy,
+                disable_radix_cache=disable_radix_cache,
+            ):
+                self._check_verify(compact, graph, lazy, disable_radix_cache)
 
-    def _check_verify(self, compact, graph, lazy):
+    def _check_verify(self, compact, graph, lazy, disable_radix_cache):
+        tracking = mamba_extra_buffer_of(
+            SimpleNamespace(
+                disable_radix_cache=disable_radix_cache,
+                mamba_radix_cache_strategy="extra_buffer_lazy"
+                if lazy
+                else "extra_buffer",
+            )
+        )
         mapping = torch.arange(8, device="cuda").reshape(4, 2)
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
@@ -30,14 +46,18 @@ class TestDSparkVerifyTracking(unittest.TestCase):
                 SimpleNamespace(kv=SimpleNamespace(mamba_next_track_idx=1)),
                 SimpleNamespace(kv=SimpleNamespace(mamba_next_track_idx=None)),
             ],
-            req_to_token_pool=SimpleNamespace(
-                req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
+            req_to_token_pool=(
+                SimpleNamespace(
+                    req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
+                )
+                if tracking
+                else None
             ),
-            mamba_lazy_spec_track_positions_cpu=[0, 1],
+            mamba_lazy_spec_track_positions_cpu=[0, 1] if tracking else None,
         )
         mode = SimpleNamespace(
             mamba=SimpleNamespace(
-                enable_mamba_extra_buffer=True,
+                enable_mamba_extra_buffer=tracking,
                 enable_mamba_extra_buffer_lazy=lazy,
             )
         )
@@ -72,8 +92,13 @@ class TestDSparkVerifyTracking(unittest.TestCase):
         )
 
         def init_new(prepared, *_args, **_kwargs):
-            expected = torch.tensor([mapping[3, 0 if lazy else 1], -1], device="cuda")
-            torch.testing.assert_close(prepared.mamba_track_indices, expected)
+            if tracking:
+                expected = torch.tensor(
+                    [mapping[3, 0 if lazy else 1], -1], device="cuda"
+                )
+                torch.testing.assert_close(prepared.mamba_track_indices, expected)
+            else:
+                self.assertIsNone(prepared.mamba_track_indices)
             for name in stale_fields:
                 self.assertIsNone(getattr(prepared, name))
             return SimpleNamespace(mamba_track_indices=prepared.mamba_track_indices)
@@ -87,9 +112,11 @@ class TestDSparkVerifyTracking(unittest.TestCase):
             # A later step can reuse request rows with a different slot mapping.
             for offset in (0, 100):
                 mapping.add_(offset)
-                batch.mamba_track_indices = torch.full((2,), -99, device="cuda")
+                batch.mamba_track_indices = (
+                    torch.full((2,), -99, device="cuda") if tracking else None
+                )
                 for name in stale_fields:
-                    setattr(batch, name, object())
+                    setattr(batch, name, object() if tracking else None)
                 if compact:
                     executor._run_ragged(
                         batch=batch,
