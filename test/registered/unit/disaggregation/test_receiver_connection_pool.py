@@ -188,7 +188,7 @@ class TestReceiverControlMessages(CustomTestCase):
         manager.kv_mem_descs = [SimpleNamespace(pack=lambda: b"kv-desc")]
         manager.aux_mem_descs = [SimpleNamespace(pack=lambda: b"aux-desc")]
         manager.state_mem_descs = [[SimpleNamespace(pack=lambda: b"state-desc")]]
-        manager.engine = SimpleNamespace(get_session_id=lambda: "mooncake-peer")
+        manager.transport = SimpleNamespace(session_id="mooncake-peer")
         receiver = CommonKVReceiver(manager, "prefill:8998", 17)
         receiver.required_dst_info_num = 3
         receiver.bootstrap_infos = [
