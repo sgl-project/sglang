@@ -74,9 +74,7 @@ class SenseNovaMHCRouter(nn.Module):
                 mix = mix - torch.logsumexp(mix, dim=-1, keepdim=True)
                 mix = mix - torch.logsumexp(mix, dim=-2, keepdim=True)
             mix = mix.exp()
-        branch = torch.matmul(pre.to(residual.dtype).unsqueeze(-2), residual).squeeze(
-            -2
-        )
+        branch = torch.bmm(pre.to(residual.dtype).unsqueeze(-2), residual).squeeze(-2)
         if self.pre_scale != 1.0:
             branch = branch * self.pre_scale
         # MHCState supplies the norm arguments; False leaves norm to the caller.
@@ -91,7 +89,7 @@ class SenseNovaMHCRouter(nn.Module):
     ) -> torch.Tensor:
         streams = post.shape[-1]
         residual = residual.unflatten(-1, (streams, -1))
-        mixed = torch.matmul(mix.to(residual.dtype), residual)
+        mixed = torch.bmm(mix.to(residual.dtype), residual)
         update = post.to(branch.dtype).unsqueeze(-1) * branch.unsqueeze(-2)
         return (mixed + update).flatten(-2)
 
