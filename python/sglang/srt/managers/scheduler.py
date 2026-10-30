@@ -2095,6 +2095,12 @@ class Scheduler(
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
+            # A host-draft grammar batch waits for the last result anyway; process
+            # it before planning so the plan drops the requests it finishes.
+            processed_before_plan = self._needs_grammar_sync_before_plan()
+            if processed_before_plan:
+                pop_and_process()
+
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -2102,8 +2108,9 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
+            disable_overlap_for_batch = (
+                not processed_before_plan
+                and self.is_disable_overlap_for_batch(batch, last_batch=self.last_batch)
             )
 
             # If we do not need to overlap the current batch with the last batch,
@@ -2131,7 +2138,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not (disable_overlap_for_batch or processed_before_plan):
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -2147,6 +2154,28 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _needs_grammar_sync_before_plan(self) -> bool:
+        """Whether to process the pending result before planning the next batch.
+
+        A host-draft algorithm (NGRAM) processes the previous result before it
+        launches a grammar decode batch (see is_disable_overlap_for_batch). With
+        the plan made first, a request that result finishes (a multi-token run
+        reaching max_new_tokens, an EOS, the grammar end) would be launched after
+        its KV and request row were released. Conservative: true whenever the
+        next batch may hold a grammar request.
+        """
+        if not self.result_queue:
+            return False
+        last_batch = self.last_batch
+        if not self.running_batch.has_grammar and not (
+            last_batch is not None and last_batch.has_grammar
+        ):
+            return False
+        return (
+            not self.spec_algorithm.is_none()
+            and not self.spec_algorithm.supports_grammar_overlap()
+        )
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
