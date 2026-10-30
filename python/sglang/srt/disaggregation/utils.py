@@ -241,6 +241,12 @@ def _is_fake_transfer(req: Req) -> bool:
     )
 
 
+def pre_alloc_fill_len(req: Req) -> int:
+    """The KV length the prefill computes and the decode preallocates. The last
+    output id is the pending decode input; its KV is not written yet."""
+    return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+
+
 def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
     """Downgrade Success → Transferring for requests whose metadata hasn't landed.
 

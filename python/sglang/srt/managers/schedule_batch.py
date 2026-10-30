@@ -1610,6 +1610,22 @@ class Req(ReqDllmMixin):
         return len(self.origin_input_ids) + len(self.output_ids)
 
     @property
+    def kv_rebuildable_from_token_ids(self) -> bool:
+        """A PD rebootstrap recomputes the KV from token ids alone, which do not
+        determine it for multimodal inputs or embeds."""
+        return (
+            self.multimodal_inputs is None
+            and self.input_embeds is None
+            and self.positional_embed_overrides is None
+        )
+
+    @property
+    def kv_rebuildable_by_reprefill(self) -> bool:
+        """A local re-prefill runs the multimodal inputs and embed overrides
+        again, but input_embeds cover only the prompt, not the output."""
+        return self.input_embeds is None or len(self.output_ids) == 0
+
+    @property
     def is_beam_leader(self) -> bool:
         """The user-visible row of a beam group; the group's other rows are
         scheduler-internal and never streamed to the user."""
@@ -2278,10 +2294,9 @@ class Req(ReqDllmMixin):
         not sent: like a handoff token it is the pending decode input, so the
         decode commit keeps it and ignores the token the prefill samples.
         """
-        # TODO: multi-modal requests are not supported here. The payload only
-        # carries token ``input_ids`` and drops any image/audio/video inputs, so
-        # the rebootstrap recompute would not reproduce the original prefix KV
-        # for multi-modal requests. Add multi-modal support before enabling it.
+        # TODO: carry multimodal inputs and embeds. The payload holds token ids
+        # only, so a request without kv_rebuildable_from_token_ids is aborted
+        # instead of rebootstrapped.
         sp = self.sampling_params
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]
@@ -2485,7 +2500,8 @@ def release_req(
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
 ) -> bool:
-    """Returns False when the KV backup failed and the request cannot be resumed."""
+    """Returns False when the request cannot be resumed: its KV is neither
+    backed up nor rebuildable by the recompute that follows."""
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
@@ -2493,16 +2509,19 @@ def release_req(
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
-    backup_saved = True
     # The config bag reflects role flips; server_args keeps the launch role.
-    if get_disagg().disaggregation_mode == "decode" and offload_kv:
-        backup_saved = backup_kv_cache(
+    if get_disagg().disaggregation_mode != "decode":
+        resumable = req.kv_rebuildable_by_reprefill
+    elif offload_kv:
+        resumable = backup_kv_cache(
             req,
             tree_cache,
             req_to_token_pool,
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
+    else:
+        resumable = req.kv_rebuildable_from_token_ids
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, checkpoint=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -2510,7 +2529,7 @@ def release_req(
     evict_from_tree_cache(tree_cache, num_tokens)
 
     req.reset_for_retract()
-    return backup_saved
+    return resumable
 
 
 def retract_all(
@@ -2521,9 +2540,11 @@ def retract_all(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-) -> None:
+) -> List[Req]:
+    """Returns the requests that cannot be resumed; the caller aborts them."""
+    unresumable = []
     for idx in range(len(reqs)):
-        release_req(
+        if not release_req(
             req=reqs[idx],
             remaing_req_count=len(reqs) - idx,
             req_to_token_pool=req_to_token_pool,
@@ -2531,7 +2552,9 @@ def retract_all(
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
             offload_kv=offload_kv,
-        )
+        ):
+            unresumable.append(reqs[idx])
+    return unresumable
 
 
 def compute_extend_logprob_start_len(
@@ -3609,8 +3632,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)
             else:
-                # No backup exists and the device KV is already freed, so the
-                # request cannot resume.
+                # No backup exists, the recompute cannot rebuild the KV, and the
+                # device KV is already freed, so the request cannot resume.
                 if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
                     message = "Retraction host KV pool exhausted. Aborting the request."
                     status_code = HTTPStatus.INTERNAL_SERVER_ERROR
