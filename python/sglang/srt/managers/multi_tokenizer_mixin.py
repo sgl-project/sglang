@@ -266,6 +266,9 @@ def _handle_output_by_index(output, i):
                 output, "indexer_topk", i, check_length=False
             ),
             weight_versions=_extract_field_by_index(output, "weight_versions", i),
+            prefill_weight_versions=_extract_field_by_index(
+                output, "prefill_weight_versions", i
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             beam_search_output=_extract_field_by_index(
@@ -384,6 +387,9 @@ def _handle_output_by_index(output, i):
                 output, "beam_search_output", i, check_length=True
             ),
             weight_versions=_extract_field_by_index(output, "weight_versions", i),
+            prefill_weight_versions=_extract_field_by_index(
+                output, "prefill_weight_versions", i
+            ),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
