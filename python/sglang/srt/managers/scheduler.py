@@ -221,6 +221,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     retract_all,
+    unresumable_abort_message,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -6051,12 +6052,11 @@ class Scheduler(
             # Pending offload copies may still read the device KV that retraction frees,
             # and the paused decode loop never drains them.
             self.decode_offload_manager.drain_before_retraction()
+        unresumable = []
         if retract_reqs:
-            # Decode-side retract always rebootstraps (recomputes the KV from
-            # the prefill), so skip the device->host KV offload that release_req
-            # would otherwise do; the offloaded copy would be immediately
-            # discarded. Non-decode modes ignore offload_kv (they never offload).
-            retract_all(
+            # Decode-side retract rebootstraps or aborts, so a host backup would
+            # be discarded; non-decode modes never offload.
+            unresumable = retract_all(
                 reqs=retract_reqs,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -6066,7 +6066,15 @@ class Scheduler(
             )
         self.running_batch.reqs = []
         for req in retract_reqs:
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            if req in unresumable:
+                abort_reason = FINISH_ABORT(
+                    unresumable_abort_message(),
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                self.send_abort_output(
+                    _make_abort_req(req, finished_reason=abort_reason.to_json()), req
+                )
+            elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 req.time_stats.set_retract_time()
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
