@@ -8,7 +8,10 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
+    can_use_indexed_gate_rmsnorm_scale_shift,
     can_use_rmsnorm_indexed_scale_shift,
+    indexed_gate_bf16_,
+    indexed_gate_rmsnorm_scale_shift_,
     indexed_scale_shift_bf16_,
     rmsnorm_indexed_scale_shift,
 )
@@ -55,6 +58,30 @@ def test_stays_within_rounding_of_the_reference_chain() -> None:
     chain = indexed_scale_shift_bf16_(norm(x), shift, scale, indices)
     got = rmsnorm_indexed_scale_shift(x, weight, shift, scale, indices, EPS)
     torch.testing.assert_close(got.float(), chain.float(), rtol=2**-6, atol=2**-6)
+
+
+@pytest.mark.parametrize("hidden", [1024, 5376])
+@pytest.mark.parametrize("rows", [1, 37, 8256])
+def test_gated_norm_matches_gate_then_norm_bitwise(rows: int, hidden: int) -> None:
+    """The one-pass gated residual + norm writes the same residual and normed
+    rows as indexed_gate_bf16_ followed by rmsnorm_indexed_scale_shift."""
+    x, weight, shift, scale, indices = _inputs(rows, hidden, rows * hidden)
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    other = (4 * torch.randn(rows, hidden, device="cuda", generator=g)).to(
+        torch.bfloat16
+    )
+    gate = (torch.randn(3, 6 * hidden, device="cuda", generator=g)).to(torch.bfloat16)[
+        :, 2 * hidden : 3 * hidden
+    ]
+    assert can_use_indexed_gate_rmsnorm_scale_shift(
+        x, gate, other, weight, shift, scale, indices
+    )
+    x_ref = indexed_gate_bf16_(x.clone(), gate, other, indices)
+    ref = rmsnorm_indexed_scale_shift(x_ref, weight, shift, scale, indices, EPS)
+    got = indexed_gate_rmsnorm_scale_shift_(
+        x, gate, other, weight, shift, scale, indices, EPS
+    )
+    assert torch.equal(x, x_ref) and torch.equal(got, ref)
 
 
 if __name__ == "__main__":
