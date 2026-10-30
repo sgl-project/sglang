@@ -1323,14 +1323,9 @@ class TestKVCRRuntime(CustomTestCase):
                     with self.assertRaisesRegex(RuntimeError, "startup"):
                         runtime.close()
 
-    def test_declines_pins_and_cancels_removals_per_physical_key(self):
+    def test_cancels_removals_per_physical_key(self):
         runtime = self.make_runtime()
         bindings = runtime.client.bindings
-        request = bindings.request_pin([b"small:1234"])
-        cancelled = bindings.request_pin([b"large:1234"])
-        bindings.cancel_pin_request(cancelled)
-        self.assertEqual(list(bindings.poll_pin_results()), [(request, None)])
-        self.assertEqual(list(bindings.poll_pin_results()), [])
         for keys, removed in (
             ((b"small:1234", b"large:1234"), True),
             ((b"small:1234",), False),

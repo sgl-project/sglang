@@ -150,8 +150,6 @@ class KVCRRuntime:
         self.events = deque()
         self.removals = {}
         self._buffers = []
-        self._pin_results = {}
-        self._next_pin = 0
         self.client = None
         self.process_local = False
 
@@ -180,10 +178,6 @@ class KVCRRuntime:
             )
             self.control_endpoint = control.endpoint
             bindings = KVCRBindings(
-                request_pin=self._decline_pin,
-                poll_pin_results=self._poll_pin_results,
-                release_pin=lambda _: True,
-                cancel_pin_request=lambda request: self._pin_results.pop(request, None),
                 framework_control=control,
                 key_adapter=self,
                 inventory_sink=inventory,
@@ -248,16 +242,6 @@ class KVCRRuntime:
             else:
                 self._close_buffers()
             raise
-
-    def _decline_pin(self, keys):
-        self._next_pin += 1
-        self._pin_results[self._next_pin] = None
-        return self._next_pin
-
-    def _poll_pin_results(self):
-        results = list(self._pin_results.items())
-        self._pin_results.clear()
-        return results
 
     def encode(self, key: object) -> bytes:
         if not isinstance(key, bytes):
