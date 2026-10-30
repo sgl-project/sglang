@@ -36,8 +36,9 @@ if is_npu():
 
     causal_conv1d_update = causal_conv1d_update_npu
 elif is_cpu():
-    from sgl_kernel.mamba import causal_conv1d_update_cpu
+    from sgl_kernel.mamba import causal_conv1d_fn_cpu, causal_conv1d_update_cpu
 
+    causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
 
 from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
