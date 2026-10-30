@@ -130,7 +130,6 @@ def _is_target_mimo_megamoe_eligible(config, tp_size: int, ep_size: int) -> bool
     return (
         envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
         and os.getenv("AITER_MEGA_SMALL_M") == "1"
-        and get_moe_a2a_backend().is_megamoe()
         and get_platform().is_hip
         and is_gfx95_supported()
         and not get_flags().moe.in_speculative_scope
@@ -583,10 +582,13 @@ class MiMoV2MoE(nn.Module):
             and forward_batch.forward_mode.is_target_verify()
         ):
             from sglang.srt.layers.moe.mega_moe import (
+                build_mega_moe_experts_weights,
                 forward_mega_moe,
                 should_use_mega_moe,
             )
 
+            if not getattr(self.experts, "_mega_moe_weights_built", False):
+                build_mega_moe_experts_weights(self.experts)
             if should_use_mega_moe(self, hidden_states):
                 return forward_mega_moe(self, hidden_states, forward_batch)
 

@@ -246,7 +246,10 @@ def _rank_consistent_max_tokens(hidden_states: torch.Tensor) -> int:
 
 
 def should_use_mega_moe(moe: Any, hidden_states: torch.Tensor) -> bool:
-    if not get_moe_a2a_backend().is_megamoe():
+    if (
+        not getattr(moe, "_use_target_mega_moe", False)
+        and not get_moe_a2a_backend().is_megamoe()
+    ):
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
