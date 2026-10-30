@@ -60,7 +60,7 @@ def rpd_to_chrome_trace(
                 )
             except ValueError:
                 outfile.write("")
-    except:
+    except Exception:
         pass
 
     rangeStringApi = ""
@@ -144,7 +144,7 @@ def rpd_to_chrome_trace(
                 )
             except ValueError:
                 outfile.write("")
-    except:
+    except Exception:
         pass
 
     # Output apis
@@ -229,7 +229,7 @@ def rpd_to_chrome_trace(
                 )
             except ValueError:
                 outfile.write("")
-    except:
+    except Exception:
         pass
 
     #
@@ -311,7 +311,7 @@ def rpd_to_chrome_trace(
                 ',{"pid":"%s","name":"%s","ph":"C","ts":%s,"args":{"%s":%s}}\n'
                 % (row[0], row[1], row[2], row[1], row[3])
             )
-    except:
+    except Exception:
         print("Did not find SMI data")
 
     # Create the (global) memory counter
