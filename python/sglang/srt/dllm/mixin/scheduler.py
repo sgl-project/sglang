@@ -173,7 +173,7 @@ class SchedulerDllmMixin:
             not req.finished()
             and req.seqlen + self.dllm_config.block_size > self.model_config.context_len
         ):
-            req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+            req.finish_outside_step(FINISH_LENGTH(length=len(req.output_ids)))
 
         if req.finished():
             release_kv_cache(
@@ -198,8 +198,7 @@ class SchedulerDllmMixin:
             ]
             self.token_to_kv_pool_allocator.free_segment(slots, start_pos=free_start)
 
-        req.kv.kv_committed_len = context_len
-        req.kv.kv_allocated_len = context_len
+        req.kv.set_row_len(context_len)
         assert req.kv.max_evicted_seqlen <= context_len
         req.extend_end = context_len
         self.stash_chunked_request(req)

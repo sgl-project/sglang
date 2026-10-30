@@ -325,7 +325,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
             dst_kv_indices=torch.arange(4),
             prefix_len=0,
             total_prefix_len=0,
-            origin_input_len=4,
+            fill_len=4,
         )
 
     def test_deferred_destination_keeps_its_metadata_slot_until_published(self):
