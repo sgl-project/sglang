@@ -1,5 +1,6 @@
 import ctypes
 import dataclasses
+import hashlib
 import struct
 import threading
 from collections import deque
@@ -12,6 +13,46 @@ from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
 )
+
+
+def kv_replicas_per_destination(src_tp: int, dst_tp: int, total_heads: int) -> int:
+    """Number of identical P copies mapped to one D rank."""
+    if (
+        dst_tp <= 0
+        or src_tp <= dst_tp
+        or src_tp % dst_tp
+        or total_heads <= 0
+        or total_heads >= src_tp
+        or src_tp % total_heads
+        or max(total_heads, dst_tp) % min(total_heads, dst_tp)
+    ):
+        return 1
+    return min(src_tp // total_heads, src_tp // dst_tp)
+
+
+def should_send_kv_replica(
+    room: int,
+    src_tp: int,
+    dst_tp: int,
+    src_rank: int,
+    dst_rank: int,
+    total_heads: int,
+) -> bool:
+    """Choose a stable request-scoped writer within each replicated head group."""
+    replicas = kv_replicas_per_destination(src_tp, dst_tp, total_heads)
+    if replicas == 1:
+        return True
+    local_rank = src_rank % src_tp
+    group_size = src_tp // dst_tp
+    group_start = (dst_rank % dst_tp) * group_size
+    if not group_start <= local_rank < group_start + group_size:
+        return False
+    # Low room bits may correlate with DP routing. Hash the shared wire request
+    # ID so all chunks, PP stages and index state agree on the sender.
+    request_hash = int.from_bytes(
+        hashlib.blake2b(str(room).encode("ascii"), digest_size=8).digest(), "little"
+    )
+    return (local_rank - group_start) % replicas == request_hash % replicas
 
 
 @dataclasses.dataclass

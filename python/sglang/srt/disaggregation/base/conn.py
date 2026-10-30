@@ -158,6 +158,9 @@ class BaseKVManager(ABC):
     # Opt-in per backend: set True and implement teardown() to support runtime PD
     # role switch (release transfer resources; the scheduler owns the KV pool).
     supports_role_switch: bool = False
+    # P writer offsets, D staging allocation and D scatter slots must agree, so
+    # all three read this single per-backend switch.
+    deduplicate_kv_staging: bool = False
 
     # Opt-in per backend: set True once the prefill acks a drained abort
     # (ABORT_ACK carrying the sender rank). Without it a hold only ends on timeout.

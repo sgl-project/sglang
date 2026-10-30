@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
+from sglang.srt.disaggregation.common.utils import kv_replicas_per_destination
 from sglang.srt.environ import envs
 from sglang.srt.utils import create_device_stream, device_stream_context
 
@@ -583,6 +584,40 @@ def gather_all_layers_to_staging(
     )
 
 
+def staging_writer_ranks(
+    src_tp: int,
+    dst_tp: int,
+    dst_rank: int,
+    total_heads: int,
+    deduplicate: bool = False,
+) -> range:
+    """Representative source ranks, one per staging slot."""
+    if src_tp <= dst_tp:
+        return range(1)
+    count = src_tp // dst_tp
+    start = (dst_rank % dst_tp) * count
+    stride = (
+        kv_replicas_per_destination(src_tp, dst_tp, total_heads) if deduplicate else 1
+    )
+    return range(start, start + count, stride)
+
+
+def staging_writer_slot(
+    src_tp: int,
+    dst_tp: int,
+    src_rank: int,
+    total_heads: int,
+    deduplicate: bool = False,
+) -> int:
+    """Staging slot of ``src_rank``; ``staging_writer_ranks`` lists slot owners."""
+    if src_tp <= dst_tp:
+        return 0
+    stride = (
+        kv_replicas_per_destination(src_tp, dst_tp, total_heads) if deduplicate else 1
+    )
+    return (src_rank % (src_tp // dst_tp)) // stride
+
+
 def _scatter_staging_to_kv_torch(
     staging_buffer_view: torch.Tensor,
     k_buffers: list,
@@ -593,6 +628,7 @@ def _scatter_staging_to_kv_torch(
     decode_attn_tp_size: int,
     dst_tp_rank: int,
     total_kv_heads: int,
+    deduplicate: bool = False,
 ) -> None:
     """torch path for scatter."""
     num_layers = len(k_buffers)
@@ -600,12 +636,15 @@ def _scatter_staging_to_kv_torch(
     dtype_size = k_buffers[0].element_size()
     num_tokens = page_idx_tensor.shape[0] * page_size
 
-    if prefill_attn_tp_size > decode_attn_tp_size:
-        num_writers = prefill_attn_tp_size // max(1, decode_attn_tp_size)
-    else:
-        num_writers = 1
+    writer_ranks = staging_writer_ranks(
+        prefill_attn_tp_size,
+        decode_attn_tp_size,
+        dst_tp_rank,
+        total_kv_heads,
+        deduplicate,
+    )
 
-    for writer_rank in range(num_writers):
+    for writer_idx, writer_rank in enumerate(writer_ranks):
         _, num_heads, dst_head_start, _ = compute_head_slice_params(
             prefill_attn_tp_size,
             decode_attn_tp_size,
@@ -615,7 +654,7 @@ def _scatter_staging_to_kv_torch(
         )
         per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
         per_rank_bytes = per_layer_bytes * num_layers * 2
-        rank_base = writer_rank * per_rank_bytes
+        rank_base = writer_idx * per_rank_bytes
 
         offset = rank_base
         for layer_id in range(num_layers):
@@ -660,6 +699,7 @@ def _scatter_staging_to_kv_triton(
     decode_attn_tp_size: int,
     dst_tp_rank: int,
     total_kv_heads: int,
+    deduplicate: bool = False,
 ) -> None:
     """Triton fused kernel path for scatter."""
     num_layers = len(k_buffers)
@@ -669,10 +709,14 @@ def _scatter_staging_to_kv_triton(
     num_tokens = page_idx_tensor.shape[0] * page_size
     device = page_idx_tensor.device
 
-    if prefill_attn_tp_size > decode_attn_tp_size:
-        num_writers = prefill_attn_tp_size // max(1, decode_attn_tp_size)
-    else:
-        num_writers = 1
+    writer_ranks = staging_writer_ranks(
+        prefill_attn_tp_size,
+        decode_attn_tp_size,
+        dst_tp_rank,
+        total_kv_heads,
+        deduplicate,
+    )
+    num_writers = len(writer_ranks)
 
     # All writers share the same num_heads; only dst_head_start differs
     _, num_heads, _, _ = compute_head_slice_params(
@@ -700,7 +744,7 @@ def _scatter_staging_to_kv_triton(
                 total_kv_heads,
             )[2]
             * head_dim
-            for wr in range(num_writers)
+            for wr in writer_ranks
         ],
         dtype=torch.int64,
         device=device,
@@ -742,6 +786,7 @@ def scatter_staging_to_kv(
     decode_attn_tp_size: int,
     dst_tp_rank: int,
     total_kv_heads: int,
+    deduplicate: bool = False,
 ) -> None:
     """Scatter data from a contiguous staging region into KV cache buffers."""
     _check_kv_on_staging_device(k_buffers, v_buffers, staging_buffer_view.device)
@@ -756,6 +801,7 @@ def scatter_staging_to_kv(
             decode_attn_tp_size,
             dst_tp_rank,
             total_kv_heads,
+            deduplicate,
         )
     return _scatter_staging_to_kv_torch(
         staging_buffer_view,
@@ -767,6 +813,7 @@ def scatter_staging_to_kv(
         decode_attn_tp_size,
         dst_tp_rank,
         total_kv_heads,
+        deduplicate,
     )
 
 
@@ -814,6 +861,7 @@ def compute_staging_layout(
     num_tokens: int,
     bytes_per_head_token: int,
     num_layers: int,
+    deduplicate: bool = False,
 ) -> Tuple[int, List[int], int]:
     """Compute per-writer byte layout for a staging region.
 
@@ -821,13 +869,13 @@ def compute_staging_layout(
         (num_writers, writer_bytes_list, total_bytes)
         where writer_bytes_list[i] = bytes for writer i covering all layers (K+V).
     """
-    if src_attn_tp_size > dst_attn_tp_size:
-        num_writers = src_attn_tp_size // max(1, dst_attn_tp_size)
-    else:
-        num_writers = 1
+    writer_ranks = staging_writer_ranks(
+        src_attn_tp_size, dst_attn_tp_size, dst_tp_rank, total_kv_heads, deduplicate
+    )
+    num_writers = len(writer_ranks)
 
     writer_bytes = []
-    for wr in range(num_writers):
+    for wr in writer_ranks:
         _, nh, _, _ = compute_head_slice_params(
             src_attn_tp_size,
             dst_attn_tp_size,
