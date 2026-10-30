@@ -1,8 +1,11 @@
-"""Gemma-3 bidirectional image attention on XPU (sgl-kernel-xpu bidirectional_block_ids).
+"""Gemma 3 / Gemma 4 bidirectional image attention on XPU (sgl-kernel-xpu
+bidirectional_block_ids).
 
 Guards the cases the kernel mask cannot express directly: a sliding-window layer
 whose prompt exceeds the window must keep local attention, and image tokens in an
-extend after a cached prefix must still attend bidirectionally.
+extend after a cached prefix must still attend bidirectionally. Gemma 4 must hand
+the backend the same ids, on sliding layers only, and only for checkpoints with
+use_bidirectional_attention == "vision".
 """
 
 import unittest
@@ -216,6 +219,77 @@ class TestXPUGemma3ImageBlockIds(CustomTestCase):
         self.assertIsNone(
             _build_block_ids(_image_batch([256], [50], [[(10, 200)]]), "cpu")
         )
+
+
+@unittest.skipUnless(
+    hasattr(torch, "xpu") and torch.xpu.is_available(), "requires an Intel XPU"
+)
+class TestXPUGemma4ImageBlockIds(CustomTestCase):
+    @staticmethod
+    def _prepare(use_bidirectional_attention, **kwargs):
+        from unittest import mock
+
+        from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.models import gemma4_mm
+
+        backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
+        backend.bidirectional_block_ids = None
+        backend.bidirectional_sliding_layers_only = False
+        forward_batch = _image_batch([0, 0], [300, 120], [[(5, 284)], []])
+        forward_batch.forward_mode = ForwardMode.EXTEND
+        input_ids = torch.zeros(420, dtype=torch.long, device="xpu")
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                text_config=SimpleNamespace(
+                    use_bidirectional_attention=use_bidirectional_attention
+                )
+            )
+        )
+        with mock.patch.object(gemma4_mm, "get_attn_backend", return_value=backend):
+            gemma4_mm.Gemma4ForConditionalGeneration.prepare_attn_masks(
+                model, forward_batch, input_ids, torch.bfloat16, **kwargs
+            )
+        return backend, forward_batch, input_ids
+
+    def test_gemma4_sets_image_block_ids_on_xpu_backend(self):
+        """Gemma 4 must hand the XPU backend the same image-block ids as Gemma 3,
+        not fall back to causal attention (its old Triton-only path), scoped to
+        sliding-window layers as HF does."""
+        backend, forward_batch, input_ids = self._prepare("vision")
+        self.assertIsNotNone(backend.bidirectional_block_ids)
+        torch.testing.assert_close(
+            backend.bidirectional_block_ids,
+            _build_block_ids(forward_batch, input_ids.device),
+        )
+        self.assertTrue(backend.bidirectional_sliding_layers_only)
+
+    def test_diffusion_gemma_keeps_full_layers(self):
+        backend, _, _ = self._prepare("vision", sliding_layers_only=False)
+        self.assertIsNotNone(backend.bidirectional_block_ids)
+        self.assertFalse(backend.bidirectional_sliding_layers_only)
+
+    def test_no_image_mask_without_vision_bidirectional_attention(self):
+        """E2B/E4B ship use_bidirectional_attention=null; HF keeps their images causal."""
+        backend, _, _ = self._prepare(None)
+        self.assertIsNone(backend.bidirectional_block_ids)
+
+    def test_sliding_layers_only_skips_full_layers(self):
+        from sglang.srt.layers.attention.xpu_backend import (
+            _bidirectional_image_attn_args,
+        )
+
+        ids = torch.tensor([-1, 0, 0, -1], dtype=torch.int32)
+        args = dict(block_ids=ids, max_seqlen_k=4, sliding_layers_only=True)
+        self.assertEqual(
+            _bidirectional_image_attn_args(window_size=(-1, -1), **args),
+            (None, (-1, -1)),
+        )
+        block_ids, window_size = _bidirectional_image_attn_args(
+            window_size=(1023, 0), **args
+        )
+        self.assertIs(block_ids, ids)
+        self.assertEqual(window_size, (-1, -1))
 
 
 if __name__ == "__main__":
