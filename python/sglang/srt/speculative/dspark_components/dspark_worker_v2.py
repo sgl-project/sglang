@@ -458,8 +458,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                 ),
             )
-            # optional: a step the epilogue does not accept (sampling, grammar) replays
-            # the verify graph captured without it
             tail_hooks = (
                 self.model_runner.optional_capture_tail_hooks
                 if envs.SGLANG_OPT_DSV41_DSPARK_NOTAIL_VERIFY_GRAPH.get()

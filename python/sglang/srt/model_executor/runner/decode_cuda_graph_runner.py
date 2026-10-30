@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import inspect
+import itertools
 import logging
 import os
 from types import SimpleNamespace
@@ -140,15 +141,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# The graph variant captured without ``ModelRunner.optional_capture_tail_hooks``.
+# suffix of the variant captured without ``ModelRunner.optional_capture_tail_hooks``
 NO_TAIL = "notail"
 
 
-def with_tail_variant(label: Optional[str], tail: Optional[str]) -> Optional[str]:
-    """``label`` (a LoRA variant or None) with the optional-tail variant appended."""
-    if tail is None:
-        return label
-    return tail if label is None else f"{label}-{tail}"
+def _no_tail_label(label: Optional[str]) -> str:
+    return f"{label}-{NO_TAIL}" if label else NO_TAIL
 
 
 @contextlib.contextmanager
@@ -794,19 +792,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             sizes is None or bs in sizes
         )
 
-    def _tail_variants(self) -> tuple:
-        """The optional-tail variants each shape is captured in (see
-        ``ModelRunner.optional_capture_tail_hooks``)."""
-        if getattr(self.model_runner, "optional_capture_tail_hooks", None):
-            return (None, NO_TAIL)
-        return (None,)
-
     def _resolve_variant(self, forward_batch: ForwardBatch):
-        """The captured variant this replay takes: its LoRA variant, then without the
-        optional tail when the step does not want it."""
+        """The LoRA variant, without the optional tail hooks if the step skips them."""
         label = self._resolve_lora_variant(forward_batch)
-        if len(self._tail_variants()) > 1 and not self.model_runner.want_optional_tail:
-            return with_tail_variant(label, NO_TAIL)
+        runner = self.model_runner
+        if runner.optional_capture_tail_hooks and not runner.want_optional_tail:
+            return _no_tail_label(label)
         return label
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
@@ -1403,30 +1394,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
-            for variant_label in lora_variants:
-                with capture_lora_variant(variant_label):
+            # each shape also without the optional tail hooks, if there are any
+            optional_hooks = self.model_runner.optional_capture_tail_hooks
+            skip_tails = (False, True) if optional_hooks else (False,)
+            for lora_label, skip_tail in itertools.product(lora_variants, skip_tails):
+                variant_label = _no_tail_label(lora_label) if skip_tail else lora_label
+                with capture_lora_variant(lora_label):
                     for attention_variant in attention_variants:
-                        for tail_variant in self._tail_variants():
-                            label = with_tail_variant(variant_label, tail_variant)
-                            self._capture_optional_tail = tail_variant is None
-                            _set_capture_attention_variant(attention_variant)
-                            self._set_profile_trace_tag(
-                                bs, stream_idx, label, attention_variant
+                        _set_capture_attention_variant(attention_variant)
+                        self._set_profile_trace_tag(
+                            bs, stream_idx, variant_label, attention_variant
+                        )
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.captured_req_width,
+                            tp_group=get_parallel().tp_group,
+                        ) as forward:
+                            self.capture_one_shape(
+                                bs,
+                                forward,
+                                stream_idx,
+                                variant_label,
+                                attention_variant,
                             )
-                            with torch_compile_decoration.patch_model(
-                                self.model_runner.model,
-                                bs in self.compile_bs,
-                                num_tokens=bs * self.captured_req_width,
-                                tp_group=get_parallel().tp_group,
-                            ) as forward:
-                                self.capture_one_shape(
-                                    bs,
-                                    forward,
-                                    stream_idx,
-                                    label,
-                                    attention_variant,
-                                )
-        self._capture_optional_tail = True
         _set_capture_attention_variant(None)
 
     def capture_one_shape(
@@ -1532,10 +1523,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         )
                     for capture_hook in self.model_runner.capture_tail_hooks:
                         capture_hook(self, out, forward_batch, num_tokens)
-                    if getattr(self, "_capture_optional_tail", True):
-                        for capture_hook in getattr(
-                            self.model_runner, "optional_capture_tail_hooks", ()
-                        ):
+                    if not (variant_label or "").endswith(NO_TAIL):
+                        hooks = self.model_runner.optional_capture_tail_hooks
+                        for capture_hook in hooks:
                             capture_hook(self, out, forward_batch, num_tokens)
                     return out
 

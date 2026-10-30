@@ -26,8 +26,7 @@ def _default_hip() -> bool:
 
 
 def _mega_or_mono_runtime() -> bool:
-    """Default of a runtime optimization both megakernel backends take: on with either
-    vendor's master switch."""
+    """On with either vendor's megakernel runtime switch."""
     return (
         envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
         or envs.SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get()
@@ -586,9 +585,8 @@ class Envs:
     SGLANG_DSPARK_SHARDED_ACCEPT = EnvBool(_default_hip)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
-    # DSpark static verify: every target-verify graph is also captured without the
-    # verify epilogue, and a step the epilogue does not accept (sampling, grammar)
-    # replays that one instead of running the epilogue disarmed.
+    # DSpark static verify: verify graphs also captured without the epilogue, for the
+    # steps that skip it (sampling, grammar)
     SGLANG_OPT_DSV41_DSPARK_NOTAIL_VERIFY_GRAPH = EnvBool(
         SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
     )
