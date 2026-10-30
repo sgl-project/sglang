@@ -30,8 +30,13 @@ from sglang.srt.layers.moe.topk import (
     TopKOutputChecker,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -41,7 +46,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -106,8 +111,20 @@ class DeepEPMoE(FusedMoE):
             self.deprecate_flag = True
         elif _is_npu:
             self.deprecate_flag = True
-        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
-            quant_config, Fp8Config
+        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
+            isinstance(quant_config, Fp8Config)
+            or (
+                is_sail()
+                and backend is not None
+                and backend.is_deep_gemm()
+                and (
+                    isinstance(
+                        quant_config,
+                        (W8A8Int8Config, Mxfp4Config, CompressedTensorsConfig),
+                    )
+                    or quant_config is None
+                )
+            )
         ):
             self.deprecate_flag = True
         elif (

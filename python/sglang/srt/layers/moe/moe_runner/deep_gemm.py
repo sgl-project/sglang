@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
 )
 from sglang.srt.utils.offloader import get_offloader
 
@@ -70,6 +71,7 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_sail = is_sail()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
@@ -292,7 +294,16 @@ class DeepGemmRunnerOutput(RunnerOutput):
 class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
-    use_fp8: bool
+    b13: Optional[torch.Tensor] = None
+    b2: Optional[torch.Tensor] = None
+    use_fp8: bool = False
+    use_int8: bool = False
+    use_mxfp4: bool = False
+    use_int4_w4a16: bool = False
+    # BF16 activations; VALU uses Marlin weights with E8M0 bytes, MMA uses FP4
+    # directly with tiled scales.
+    use_mxfp4_w4a16: bool = False
+    per_channel_quant: bool = False
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
@@ -1027,12 +1038,23 @@ def pre_permute_standard_to_deep_gemm(
     if (
         deep_gemm_sm120.allows_masked_standard_layout()
         and _should_use_masked_standard_layout(runner_config, quant_info, hidden_states)
-    ):
-        output_dtype = (
-            torch.bfloat16
-            if quant_info.w13_weight.dtype == torch.bfloat16
-            else torch.float8_e4m3fn
-        )
+    ) or _is_sail:
+        if not _is_sail:
+            output_dtype = (
+                torch.bfloat16
+                if quant_info.w13_weight.dtype == torch.bfloat16
+                else torch.float8_e4m3fn
+            )
+        elif quant_info.use_fp8:
+            output_dtype = torch.float8_e4m3fn
+        elif quant_info.use_int8:
+            output_dtype = torch.int8
+        elif quant_info.use_mxfp4:
+            output_dtype = torch.uint8
+        elif quant_info.w13_weight.dtype == torch.bfloat16:
+            output_dtype = torch.bfloat16
+        else:
+            raise NotImplementedError
         masked_m, _, src2dst, hidden_states, hidden_states_scale = (
             moe_ep_deepgemm_preprocess(
                 topk_ids,
@@ -1342,13 +1364,24 @@ def pre_permute_deepep_ll_to_deep_gemm(
     running_state["hidden_states_shape"] = hidden_states.shape
     running_state["hidden_states_dtype"] = hidden_states.dtype
     running_state["hidden_states_device"] = hidden_states.device
+    activation_scale_block_size = 128
+    if _is_sail and hidden_states_scale is not None:
+        if hidden_states.dtype == torch.uint8:
+            # MXFP4 data packs two values per byte, so the dispatched quantization
+            # group covers 32 values.
+            activation_scale_block_size = 32
+        else:
+            scale_width = hidden_states_scale.shape[-1]
+            hidden_size = hidden_states.shape[-1]
+            assert scale_width > 0 and hidden_size % scale_width == 0
+            activation_scale_block_size = hidden_size // scale_width
     return DeepGemmRunnerInput(
         hidden_states=hidden_states,
         hidden_states_scale=hidden_states_scale,
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
-        activation_scale_block_size=128,
+        activation_scale_block_size=activation_scale_block_size,
     )
 
 
@@ -1375,7 +1408,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter
+    from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter, ep_scatter_sail
 
     (
         hidden_states,
@@ -1414,19 +1447,32 @@ def pre_permute_deepep_normal_to_deep_gemm(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-        # TODO check whether need `zeros`
+    block_k = 128
+    is_block_wise = quant_info.block_shape is not None
+    if hidden_states_scale is None:
+        input_tensor_scale = None
+    elif deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         input_tensor_scale = torch.zeros(
-            (ceil_div(K // 128, 4), all_tokens),
+            (hidden_states_scale.shape[-1], all_tokens),
             device=hidden_states.device,
-            dtype=torch.int,
+            dtype=hidden_states_scale.dtype,
         ).transpose(0, 1)
     else:
+        # The dispatch quantization group size is independent of the weight
+        # quantization; follow the actual wire scale width.
+        scale_width = hidden_states_scale.shape[-1]
+        assert scale_width > 0 and K % scale_width == 0
+        block_k = K // scale_width
+        if quant_info.use_int8:
+            assert not is_block_wise and scale_width == 1
+        if _is_sail and quant_info.use_mxfp4:
+            assert hidden_states_scale.dtype == torch.uint8 and block_k == 16
         input_tensor_scale = buffer_init(
-            (all_tokens, K // 128),
+            (all_tokens, scale_width),
             device=hidden_states.device,
-            dtype=torch.float32,
+            dtype=hidden_states_scale.dtype,
         )
+
     m_indices = buffer_init(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
 
@@ -1443,31 +1489,54 @@ def pre_permute_deepep_normal_to_deep_gemm(
         ).cuda(non_blocking=True)
     expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
 
-    ep_scatter(
-        hidden_states,
-        hidden_states_scale,
-        topk_ids,
-        num_recv_tokens_per_expert_gpu,
-        num_recv_tokens_per_expert_gpu,
-        expert_start_loc,
-        input_tensor,
-        input_tensor_scale,
-        m_indices,
-        output_index,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
+    if _is_sail:
+        ep_scatter_sail(
+            hidden_states,
+            topk_ids.to(torch.int32),
+            num_recv_tokens_per_expert_gpu,
+            expert_start_loc,
+            input_tensor,
+            m_indices,
+            output_index,
+            hidden_states_scale,
+            input_tensor_scale,
+            BLOCK_E=1,
+            BLOCK_D=block_k,
+            is_block_wise=is_block_wise,
+            num_valid_tokens_per_expert=num_recv_tokens_per_expert_gpu,
+        )
+    else:
+        ep_scatter(
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            num_recv_tokens_per_expert_gpu,
+            num_recv_tokens_per_expert_gpu,
+            expert_start_loc,
+            input_tensor,
+            input_tensor_scale,
+            m_indices,
+            output_index,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            quant_block_size=block_k,
+        )
     dispose_tensor(hidden_states)
     if hidden_states_scale is not None:
         dispose_tensor(hidden_states_scale)
 
     running_state["output_index"] = output_index
+    # Without m_rows the nopad grouped GEMM rescans m_indices to recompute the
+    # per-expert row counts; DeepEP-normal's ep_scatter already consumed exactly
+    # those counts (BLOCK_E=1, no alignment padding), so passing them through
+    # skips the scan without changing numerics.
+    running_state["m_rows"] = num_recv_tokens_per_expert_gpu
 
     return DeepGemmRunnerInput(
         hidden_states=input_tensor,
         hidden_states_scale=input_tensor_scale,
         use_masked_gemm=False,
         m_indices=m_indices,
-        activation_scale_block_size=128,
+        activation_scale_block_size=block_k,
     )
 
 
@@ -1485,6 +1554,10 @@ def post_permute_deep_gemm_to_deepep_normal(
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
     output_index = running_state["output_index"]
+
+    if quant_info.use_mxfp4:
+        M, K = running_state["hidden_states_shape"]
+        running_state["hidden_states_shape"] = (M, K * 2)
 
     gather_out = torch.empty(
         running_state["hidden_states_shape"],
