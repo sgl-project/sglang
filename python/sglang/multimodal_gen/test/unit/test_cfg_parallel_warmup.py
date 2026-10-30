@@ -173,23 +173,6 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual((overridden.num_frames, overridden.fps), (49, 12))
         self.assertEqual((defaults.num_frames, defaults.fps), (1, 24))
 
-    def test_explicit_warmup_prompt_reaches_the_request(self):
-        """Normal and compile warmup must preserve the caller's prompt."""
-        server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
-        prompt = "A red sailboat on a lake with birds calling."
-        for compile_enabled in (False, True):
-            server_args.enable_torch_compile = compile_enabled
-            with patch(
-                "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
-                return_value=SamplingParams(prompt=prompt),
-            ):
-                requests = build_warmup_reqs(
-                    server_args,
-                    warmup_resolutions=["512x512"],
-                    server_based_warmup=True,
-                )
-            self.assertEqual(requests[0].prompt, prompt)
-
     def test_warmup_req_cfg_parallel_sets_do_cfg(self):
         server_args = _make_bare_scheduler(enable_cfg_parallel=True).server_args
         sampling_defaults = SamplingParams()

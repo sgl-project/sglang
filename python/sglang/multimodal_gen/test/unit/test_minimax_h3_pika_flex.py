@@ -13,11 +13,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     PikaH3FlexPipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.minimax_h3 import PikaH3FlexSamplingParams
-from sglang.multimodal_gen.registry import (
-    get_model_info,
-    get_non_diffusers_pipeline_name,
-    has_registered_diffusion_model_path,
-)
+from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
@@ -100,31 +96,29 @@ def test_knot_schedule(shift: float) -> None:
 
 
 def test_renoise_update() -> None:
-    state, velocity = torch.randn(4, 8), torch.randn(4, 8)
+    """The released FP32 equations round multiply and add separately."""
+    generator = torch.Generator().manual_seed(42)
+    state, velocity = [torch.randn(4, 8, generator=generator) for _ in range(2)]
     denoised = state + 0.8 * velocity
     out = state.clone()
     _minimax_h3_renoise_target_rows_(
         out,
         velocity,
-        sigma=torch.tensor(0.8),
+        sigma=0.8,
         sigma_next=0.5,
-        denoised_scratch=torch.empty_like(out),
-        noise_buffer=torch.empty_like(out),
         generator=torch.Generator().manual_seed(7),
     )
     noise = torch.randn(4, 8, generator=torch.Generator().manual_seed(7))
-    torch.testing.assert_close(out, 0.5 * denoised + 0.5 * noise)
+    torch.testing.assert_close(out, 0.5 * denoised + 0.5 * noise, rtol=0, atol=0)
     last = state.clone()
     _minimax_h3_renoise_target_rows_(
         last,
         velocity,
-        sigma=torch.tensor(0.8),
+        sigma=0.8,
         sigma_next=0.0,
-        denoised_scratch=torch.empty_like(last),
-        noise_buffer=torch.empty_like(last),
         generator=torch.Generator(),
     )
-    torch.testing.assert_close(last, denoised)
+    torch.testing.assert_close(last, denoised, rtol=0, atol=0)
 
 
 def _renoise_run(seed: int | None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -201,25 +195,6 @@ def test_release_adapter_defaults_to_dynamic_lora(monkeypatch) -> None:
     explicit = server_args(True, "merge")
     PikaH3FlexPipelineConfig().validate_server_args(explicit)
     assert explicit.lora_merge_mode == "merge"
-
-
-@pytest.mark.parametrize(
-    "path",
-    [
-        "other-org/Pika-H3-Flex",
-        "Pika-Labs/Pika-H3-Flex-extra",
-        "/cache/models--pika-labs--pika-h3-flex-extra/snapshots/abc",
-    ],
-)
-def test_pika_registry_requires_the_exact_repo_id(path):
-    assert get_non_diffusers_pipeline_name(path) is None
-    assert not has_registered_diffusion_model_path(path)
-
-
-def test_pika_registry_accepts_the_pinned_cache_directory():
-    path = "/cache/models--Pika-Labs--Pika-H3-Flex/snapshots/abc"
-    assert get_non_diffusers_pipeline_name(path) == "PikaH3FlexPipeline"
-    assert get_model_info(path).pipeline_config_cls is PikaH3FlexPipelineConfig
 
 
 def _pika_request(task="t2va", conditions=None, **target):

@@ -523,4 +523,9 @@ def register():
         hf_model_paths=[
             "Pika-Labs/Pika-H3-Flex",
         ],
+        model_detectors=[
+            lambda model_id: (
+                "pikah3flex" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
     )

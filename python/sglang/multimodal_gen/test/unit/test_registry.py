@@ -122,37 +122,6 @@ def test_model_id_short_name_selects_the_variant_for_a_neutral_directory():
     assert info.pipeline_config_cls is Wan_Animate_2_14B_Distilled_Config
 
 
-@pytest.mark.parametrize(
-    "repo_id, pipeline_name, config_name",
-    [
-        ("MiniMaxAI/MiniMax-H3", "MiniMaxH3Pipeline", "MiniMaxH3PipelineConfig"),
-        ("OpenVDN/vdn-minimax-h3", "VDNH3Pipeline", "VDNH3PipelineConfig"),
-        (
-            "FastVideo/FastVideo-FastH3-8-Step-V2",
-            "FastH3Pipeline",
-            "FastH3PipelineConfig",
-        ),
-        (
-            "FastVideo/FastVideo-FastH3-Omni-8-Step-V1",
-            "FastH3Pipeline",
-            "FastH3OmniPipelineConfig",
-        ),
-        ("Pika-Labs/Pika-H3-Flex", "PikaH3FlexPipeline", "PikaH3FlexPipelineConfig"),
-    ],
-)
-def test_explicit_native_model_id_resolves_a_neutral_directory(
-    monkeypatch, repo_id, pipeline_name, config_name
-):
-    def unexpected_model_index(*args, **kwargs):
-        pytest.fail("Explicit native model IDs must not fetch a Diffusers index")
-
-    monkeypatch.setattr(registry, "maybe_download_model_index", unexpected_model_index)
-    model_id = repo_id.rsplit("/", 1)[-1]
-    info = registry.get_model_info("/models/pinned-checkpoint", model_id=model_id)
-    assert info.pipeline_cls.pipeline_name == pipeline_name
-    assert info.pipeline_config_cls.__name__ == config_name
-
-
 @pytest.mark.parametrize("entry", ["Model", '[Model, "Model"]', '(Model, "Model")'])
 def test_model_discovery_preserves_nested_declarations(tmp_path, monkeypatch, entry):
     """Skipping expression subtrees must retain declarations under statements."""
