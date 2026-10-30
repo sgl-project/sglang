@@ -445,22 +445,12 @@ python3 -m dynamo.sglang \
 
 ### MI355X deployment measured with SemiAnalysis InferenceX
 
-DFlash V2 on MI355X, measured in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/): TP8·EP8 with the AMD monokernels on 8× MI355X at concurrency 1–13, and TP4·EP4 with HiCache on 4× MI355X at concurrency 10–40.
+DFlash V2 on MI355X, measured in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) at concurrency 1–40: TP8·EP8 with the AMD monokernels at low concurrency, TP4·EP4 with HiCache at high concurrency.
 
 - **Container image.** `lmsysorg/sglang-rocm:muse-spark-open-1027`.
-- **Monokernels.** The TP8 command is the concurrency 4–13 setting; at concurrency 1, use `--max-running-requests 1 --cuda-graph-max-bs-decode 1 --prefill-decode-interval 20`.
-- **HiCache.** `--hicache-size` is the host tier in GB per rank, so 310 GB needs about 1.24 TB of host memory across the four ranks. The TP4 command is the concurrency 40 point; the other points change the flags in the table below, and set `SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1` only at concurrency 28 and above.
+- **HiCache.** At high concurrency, switch to the TP4 HiCache flags below. `--hicache-size` is the host tier in GB per rank, so 310 GB needs about 1.24 TB of host memory across the four ranks.
 
-| Concurrency | `--max-running-requests` | `--cuda-graph-max-bs-decode` | `--chunked-prefill-size` / `--max-prefill-tokens` | `--prefill-decode-interval` | `--hicache-size` | `--mem-fraction-static` | `--schedule-policy` |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 10 | 4 | 4 | 8192 | 64 | 253 | 0.88 | default |
-| 16 | 12 | 12 | 8192 | 96 | 253 | 0.85 | `shortest-prefill-first` |
-| 24 | 48 | default | 8192 | 48 | 253 | 0.96 | `shortest-prefill-first` |
-| 28 | 56 | 56 | 16384 | 80 | 310 | 0.86 | `shortest-prefill-first` |
-| 36 | 72 | 72 | 16384 | 24 | 310 | 0.86 | `shortest-prefill-first` |
-| 40 | 80 | default | 16384 | 80 | 310 | 0.86 | `shortest-prefill-first` |
-
-```bash TP8 + monokernels (concurrency 1–13)
+```bash Command
 SGLANG_USE_AITER=1 \
 SGLANG_USE_AITER_UNIFIED_ATTN=1 \
 MUSE_MOE_BACKEND=flydsl \
@@ -491,44 +481,17 @@ python -m sglang.launch_server \
   --port 30000
 ```
 
-```bash TP4 + HiCache (concurrency 10–40)
-SGLANG_USE_AITER=1 \
-SGLANG_USE_AITER_UNIFIED_ATTN=1 \
-MUSE_MOE_BACKEND=flydsl \
-SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \
-PYTORCH_HIP_ALLOC_CONF=expandable_segments:True \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python -m sglang.launch_server \
-  --model-path amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4 \
+```bash HiCache (high concurrency, replaces the TP and batch flags above)
   --tp-size 4 \
   --ep-size 4 \
-  --attention-backend aiter \
-  --page-size 16 \
-  --kv-cache-dtype fp8_e4m3 \
-  --mem-fraction-static 0.86 \
   --max-running-requests 80 \
   --swa-full-tokens-ratio 0.1 \
   --schedule-policy shortest-prefill-first \
-  --chunked-prefill-size 16384 \
-  --max-prefill-tokens 16384 \
-  --prefill-decode-interval 80 \
-  --scheduler-recv-interval 20 \
-  --tokenizer-worker-num 4 \
   --enable-hierarchical-cache \
   --hicache-size 310 \
   --hicache-write-policy write_through \
   --hicache-io-backend kernel \
-  --hicache-mem-layout page_first \
-  --speculative-algorithm DFLASH \
-  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
-  --speculative-draft-attention-backend triton \
-  --speculative-num-draft-tokens 8 \
-  --speculative-draft-window-size 2048 \
-  --reasoning-parser muse \
-  --tool-call-parser muse \
-  --watchdog-timeout 1800 \
-  --host 0.0.0.0 \
-  --port 30000
+  --hicache-mem-layout page_first
 ```
 
 ## 1. Model introduction
