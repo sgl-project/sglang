@@ -80,6 +80,7 @@
 --speculative-dspark-block-size
 --speculative-dspark-confidence-sts-path
 --speculative-dspark-sps-table-path
+--speculative-sampling-renorm-fallback
 --speculative-use-rejection-sampling
 --startup-weight-load-mode
 --swa-prefix-tails

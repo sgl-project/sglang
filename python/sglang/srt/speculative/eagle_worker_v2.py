@@ -1336,6 +1336,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
+    # eagle_sample's renorm ops run in this worker's verify path; the
+    # scheduler prewarms them at startup (sglang#43412).
+    verify_uses_eagle_sample = True
+
     # Initialized with the post-verify graphs; class defaults let unit-test
     # harnesses construct workers without __init__.
     _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
