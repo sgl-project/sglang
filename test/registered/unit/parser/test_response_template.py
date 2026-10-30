@@ -626,12 +626,43 @@ class TestResponseTemplateAdapters(CustomTestCase):
             response_template=GEMMA4_RESPONSE_TEMPLATE,
         )
         tokenizer = SimpleNamespace(
-            encode=lambda text, add_special_tokens: [len(text), add_special_tokens]
+            unk_token_id=0,
+            convert_tokens_to_ids=lambda token: 0,
+            encode=lambda text, add_special_tokens: [len(text), add_special_tokens],
         )
 
         self.assertIsNone(detector.think_excluded_tokens)
         self.assertIsNone(detector.get_answer_frame())
         self.assertEqual(detector.get_think_end_token_ids(tokenizer), [10, False])
+
+    def test_get_think_end_token_ids_prefers_native_id(self):
+        # split_special_tokens=True makes encode() split a special-added marker
+        # into ordinary ids, so the grammar gate waits for a sequence the model
+        # never emits (#47205). The native vocab id must win, matching
+        # BaseReasoningFormatDetector.get_think_end_token_ids.
+        detector = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        tokenizer = SimpleNamespace(
+            unk_token_id=0,
+            convert_tokens_to_ids=lambda token: 200007,
+            encode=lambda text, add_special_tokens=False: [27, 91, 419, 91, 29],
+        )
+
+        self.assertEqual(detector.get_think_end_token_ids(tokenizer), [200007])
+
+    def test_get_think_end_token_ids_falls_back_to_encode_for_unknown_token(self):
+        # A marker absent from the vocabulary still resolves by encoding.
+        detector = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        tokenizer = SimpleNamespace(
+            unk_token_id=0,
+            convert_tokens_to_ids=lambda token: 0,
+            encode=lambda text, add_special_tokens=False: [10, 20, 30],
+        )
+
+        self.assertEqual(detector.get_think_end_token_ids(tokenizer), [10, 20, 30])
 
     def test_force_nonempty_content_returns_reasoning_only_output_as_content(self):
         request = ChatCompletionRequest(
