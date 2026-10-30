@@ -654,6 +654,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
         return self._draft_worker
 
+    def retraction_draft_pools(self) -> tuple:
+        # A compact draft cache keeps its own request->token table, so its rows
+        # are not the target's slots and do not survive in a target-slot backup.
+        if self.use_compact_draft_cache:
+            return ()
+        return super().retraction_draft_pools()
+
     @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
