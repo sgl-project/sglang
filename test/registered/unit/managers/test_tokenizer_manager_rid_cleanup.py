@@ -35,7 +35,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     BatchStrOutput,
     EmbeddingReqInput,
     GenerateReqInput,
-    wrap_as_pickle,
+    RequestOutputStats,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -47,7 +47,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
 )
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
@@ -63,11 +63,8 @@ _NOT_FINISHED = object()  # Sentinel: request has not finished yet
 
 _PER_REQUEST_INT_FIELDS = frozenset(
     {
-        "prompt_tokens",
         "completion_tokens",
         "reasoning_tokens",
-        "cached_tokens",
-        "retraction_counts",
         # Speculative-decoding int-scalar fields (current and historical names)
         "spec_verify_ct",
         "spec_accepted_drafts",
@@ -178,6 +175,20 @@ def _make_abort_req(rid: str, abort_message: str = "Aborted") -> AbortReq:
     )
 
 
+def _request_stats(**overrides) -> RequestOutputStats:
+    fields = dict(
+        prompt_tokens=0,
+        cached_tokens=0,
+        cached_tokens_details=None,
+        retraction_count=0,
+        image_tokens=0,
+        audio_tokens=0,
+        video_tokens=0,
+        time_stats=None,
+    )
+    return RequestOutputStats(**{**fields, **overrides})
+
+
 def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     """Create a minimal BatchStrOutput for a single request.
 
@@ -202,6 +213,8 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [fr]
         elif f.name == "output_strs":
             kwargs[f.name] = ["hello"]
+        elif f.name == "request_stats":
+            kwargs[f.name] = [_request_stats()]
         elif f.name in _PER_REQUEST_INT_FIELDS:
             kwargs[f.name] = [0]
         elif f.name in _PER_REQUEST_FLOAT_FIELDS:
@@ -334,6 +347,25 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
                 with self.assertRaises(StopAsyncIteration):
                     await anext(stream)
+
+    async def test_non_stream_abort_with_gateway_error_is_raised(self):
+        """A non-stream abort carrying a gateway status such as 502 must become an HTTP error, not an empty 200."""
+        state = _make_req_state("gateway_abort")
+        state.obj.stream = False
+        self.tm.rid_to_state[state.obj.rid] = state
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "status_code": 502,
+                    "message": "encoder dispatch failed",
+                }
+            }
+        }
+        with self.assertRaises(HTTPException) as ctx:
+            await self.tm._handle_abort_finish_reason(out, state, is_stream=False)
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
 
     async def test_http_timeout_still_checks_disconnection(self):
         request = Mock()
@@ -505,6 +537,44 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
 
+class TestStoredRequestStats(CustomTestCase):
+    def test_rows_without_request_stats_read_the_latest_request_stats(self):
+        """A row without request stats reports the latest received, and a row
+        before any is dropped."""
+        tm = _make_tokenizer_manager(self)
+        rid = "request_stats_rid"
+        state = _make_req_state(rid)
+        state.obj.stream = True
+        tm.rid_to_state[rid] = state
+        first = _request_stats(prompt_tokens=5, cached_tokens=2)
+        retracted = _request_stats(prompt_tokens=5, cached_tokens=3, retraction_count=1)
+        for request_stats, finished_reason in (
+            ([first], _NOT_FINISHED),
+            (None, _NOT_FINISHED),
+            ([retracted], _NOT_FINISHED),
+            ([None], None),
+        ):
+            batch_output = _make_batch_str_output(rid, finished_reason)
+            batch_output.request_stats = request_stats
+            asyncio.run(tm._handle_batch_output(batch_output))
+
+        self.assertEqual(
+            [
+                (m["prompt_tokens"], m["cached_tokens"], m["num_retractions"])
+                for m in (out["meta_info"] for out in state.out_list)
+            ],
+            [(5, 2, 0), (5, 2, 0), (5, 3, 1), (5, 3, 1)],
+        )
+
+        # A late row of an aborted request whose rid a new request reused.
+        reused = tm.rid_to_state[rid] = _make_req_state(rid)
+        batch_output = _make_batch_str_output(rid, _NOT_FINISHED)
+        batch_output.request_stats = None
+        asyncio.run(tm._handle_batch_output(batch_output))
+        self.assertEqual(reused.out_list, [])
+        self.assertIs(tm.rid_to_state[rid], reused)
+
+
 class TestRequestTpotGating(CustomTestCase):
     """Request TPOT is observed once, only for requests with a real decode
     interval that ran to completion on a non-prefill worker."""
@@ -536,7 +606,9 @@ class TestRequestTpotGating(CustomTestCase):
         for completion_tokens, finished_reason in batches:
             batch_output = _make_batch_str_output(rid, finished_reason)
             batch_output.completion_tokens = [completion_tokens]
-            batch_output.time_stats = wrap_as_pickle([sched_stats])
+            batch_output.request_stats = [
+                _request_stats(time_stats=sched_stats.to_output_time_stats())
+            ]
             asyncio.run(tm._handle_batch_output(batch_output))
         (call,) = tm.metrics_collector.observe_one_finished_request.call_args_list
         return call.kwargs["time_per_output_token"]
@@ -587,7 +659,9 @@ class TestNonStreamingFirstTokenTime(CustomTestCase):
             enable_metrics=True, prefill_finished_time=prefill_finished_time
         )
         batch_output = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
-        batch_output.time_stats = wrap_as_pickle([sched_stats])
+        batch_output.request_stats = [
+            _request_stats(time_stats=sched_stats.to_output_time_stats())
+        ]
         arrival = time.perf_counter()
         asyncio.run(tm._handle_batch_output(batch_output))
         return state.time_stats, arrival
