@@ -938,8 +938,25 @@ Response:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>67108864</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum nodes in cache tree</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cache-aware-prefill-backlog-rate`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0 (off)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>PD prefill only: estimated prefill throughput per worker in uncached input chars/s; enables backlog-aware prefill selection</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cache-aware-prefill-backlog-hop-factor`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Base weight of a request's uncached chars when comparing prefill backlogs</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cache-aware-prefill-backlog-hop-scale`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>200000</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Backlog (chars) that adds 1.0 to that weight; 0 keeps it constant</td>
+    </tr>
   </tbody>
 </table>
+
+With several prefill workers per PD deployment, `worker.load()` counts requests rather than prefill work and counts a streaming request only after its prefill responds, so bursts and long cold prompts can pile onto one prefill worker. Setting `--cache-aware-prefill-backlog-rate` to roughly one prefill worker's uncached throughput (chars/s, about 3-4 chars per token) makes the prefill policy pick the worker with the smallest estimated queued uncached input plus this request's uncached input, while keeping sessions on the worker that holds their prefix unless the queue gap is large. The estimate is local to each router instance.
 
 ***
 ## Reliability and Flow Control
