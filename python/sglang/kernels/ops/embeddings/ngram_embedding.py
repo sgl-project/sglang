@@ -2,21 +2,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils import is_xpu
 
 if TYPE_CHECKING:
-    import torch
     from tvm_ffi.module import Module
 
 
 @cache_once
 def _jit_ngram_embedding_module() -> Module:
-    if is_xpu():
-        import torch
-
-        return torch.ops.sgl_kernel  # SYCL port in sgl-kernel-xpu, same signatures
     return load_jit(
         "ngram_embedding",
         cuda_files=["speculative/ngram_embedding.cuh"],
@@ -59,7 +56,7 @@ def compute_n_gram_ids(
         n_gram_ids: output tensor for n-gram ids
         eos_token_id: tokens before an eos are excluded from the n-gram context
     """
-    module = _jit_ngram_embedding_module()
+    module = torch.ops.sgl_kernel if is_xpu() else _jit_ngram_embedding_module()
     module.compute_n_gram_ids(
         ne_n,
         ne_k,
@@ -96,7 +93,7 @@ def update_token_table(
         req_lens: request lengths
         ignore_tokens: tokens to be ignored (marked as negative in table)
     """
-    module = _jit_ngram_embedding_module()
+    module = torch.ops.sgl_kernel if is_xpu() else _jit_ngram_embedding_module()
     if ignore_tokens is None:
         # Create an empty tensor for ignore_tokens
         ignore_tokens = tokens.new_empty(0, dtype=tokens.dtype)
