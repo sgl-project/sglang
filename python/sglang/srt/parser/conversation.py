@@ -1118,6 +1118,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "moss_vl": "moss-vl",
     "deepseek-ocr": "deepseek-ocr",
     "unlimited-ocr": "unlimited-ocr",
+    "unlimited_ocr": "unlimited-ocr",
     "paddleocr_vl": "paddle-ocr",
     "whisper": "whisper",
 }
@@ -1230,7 +1231,7 @@ def match_unlimited_ocr(model_path: str):
     if "unlimited" in model_path.lower():
         return "unlimited-ocr"
     model_type = get_model_type(model_path)
-    if model_type == "unlimited-ocr":
+    if model_type in ("unlimited-ocr", "unlimited_ocr"):
         return "unlimited-ocr"
     return None
 
