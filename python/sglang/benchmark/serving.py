@@ -363,6 +363,12 @@ async def async_request_openai_completions(
                             if getattr(args, "cache_report", False):
                                 _extract_cache_from_sglext(data, output)
 
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
+                            if not data["choices"]:
+                                continue
+
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
@@ -382,9 +388,6 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
 
                     output.generated_text = generated_text
                     output.success = True
