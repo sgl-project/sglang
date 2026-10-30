@@ -89,7 +89,6 @@ from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_device_module,
     is_cpu,
     is_npu,
     is_pin_memory_available,
@@ -1462,13 +1461,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         items: List[MultimodalDataItem],
         indices: Iterable[int],
         preserve_for_reprefill: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, Optional[torch.Event]]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, Optional[torch.cuda.Event]]]:
         device = self.visual.device
         device_index = device.index
-        device_module = get_device_module()
         dest_device_type = "npu" if _is_npu else "cuda"
         if device.type == dest_device_type and device_index is None:
-            device_index = device_module.current_device()
+            device_index = torch.cuda.current_device()
         if device.type == dest_device_type:
             parallel = get_parallel()
             consumer_count = max(parallel.tp_size, 1)
@@ -1485,7 +1483,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     CUDA_IPC_FEATURE_COPY_EVENT_KEY, None
                 )
                 if pending_copy is not None:
-                    device_module.current_stream(device_index).wait_event(pending_copy)
+                    torch.cuda.current_stream(device_index).wait_event(pending_copy)
                 borrow_requested = model_specific_data.pop(
                     BORROW_CUDA_IPC_FEATURE_KEY, False
                 )
@@ -1529,8 +1527,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             raise
         packed_ready = None
         if borrowed_items:
-            source_stream = device_module.current_stream(device_index)
-            packed_ready = device_module.Event()
+            source_stream = torch.cuda.current_stream(device_index)
+            packed_ready = torch.cuda.Event()
             packed_ready.record(source_stream)
             for item, proxy, offset, length in borrowed_items:
                 item.feature = materialized.narrow(0, offset, length)
@@ -1556,7 +1554,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         """Preserve inputs for re-prefill without delaying the ViT launch."""
         try:
             device = self.visual.device
-            device_module = get_device_module()
             host_features = torch.empty(
                 materialized.shape,
                 dtype=materialized.dtype,
@@ -1565,14 +1562,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             )
             copy_stream = getattr(self, "_mm_feature_copy_stream", None)
             if copy_stream is None:
-                copy_stream = device_module.Stream(device=device)
+                copy_stream = torch.cuda.Stream(device=device)
                 self._mm_feature_copy_stream = copy_stream
-            with device_module.stream(copy_stream):
+            with torch.cuda.stream(copy_stream):
                 copy_stream.wait_event(packed_ready)
                 host_features.copy_(materialized, non_blocking=True)
-                host_ready = device_module.Event()
+                host_ready = torch.cuda.Event()
                 host_ready.record(copy_stream)
-            if materialized.device.type in ("cuda", "npu"):
+            if materialized.is_cuda:
                 materialized.record_stream(copy_stream)
             for item, _, offset, length in borrowed_items:
                 item.feature = host_features.narrow(0, offset, length)
