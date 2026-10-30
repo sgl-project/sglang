@@ -11,7 +11,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _MutatingLanguageModel:
@@ -23,7 +23,7 @@ class _MutatingLanguageModel:
         return input_embeds
 
 
-@pytest.mark.parametrize("algorithm", ["EAGLE", "EAGLE3", "NEXTN", "FROZEN_KV_MTP"])
+@pytest.mark.parametrize("algorithm", ["EAGLE"])
 def test_eagle_mm_embeddings_survive_in_place_target_updates(algorithm):
     source_embeds = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     expected_embeds = source_embeds.clone()

@@ -155,6 +155,3 @@ class KitchenW4A4Config(QuantizationConfig):
             )
         convrot_group_size, _ = self._parse_marker(prefix, marker)
         return self._supports_input_size(input_size_per_partition, convrot_group_size)
-
-    def get_scaled_act_names(self) -> list[str]:
-        return []

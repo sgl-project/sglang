@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for Cosmos3 config, weight mapping, and sampling params."""
 
+import contextlib
 import dataclasses
 import importlib.util
 import json
@@ -8,6 +9,7 @@ import types
 import unittest
 from unittest import mock
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -41,10 +43,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     VideoGenerationsRequest,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import request_model_kwargs
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _multipart_video_extras,
     _resolve_video_path,
-    _video_request_model_kwargs,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
@@ -76,6 +78,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
     is_cosmos_guardrail_available,
 )
+from sglang.srt.environ import envs
+from sglang.test.test_utils import CustomTestCase
 
 
 def _apply(mapping_fn, key):
@@ -1059,7 +1063,7 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
 
         self.assertEqual(_resolve_video_path(req), "https://example.com/input.mp4")
 
-        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs = request_model_kwargs(req, Cosmos3SamplingParams, "video")
         kwargs.update(num_frames=48, fps=24)
         kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
         self.assertEqual(kwargs["sound_duration"], 2.0)
@@ -1117,7 +1121,7 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
         req = VideoGenerationsRequest(
             prompt="test", generate_sound=False, sound_duration=3.0
         )
-        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs = request_model_kwargs(req, Cosmos3SamplingParams, "video")
         kwargs.update(num_frames=48, fps=24)
         kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
         self.assertEqual(kwargs["sound_duration"], 0.0)
@@ -1141,6 +1145,187 @@ class TestCosmos3Guardrails(unittest.TestCase):
     @mock.patch("importlib.util.find_spec", return_value=None)
     def test_missing_guardrail_package_reports_unavailable(self, _):
         self.assertFalse(is_cosmos_guardrail_available())
+
+
+_COSMOS3_STAGES = (
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3"
+)
+
+
+class _FrameVAE(torch.nn.Module):
+    """Decodes one latent frame at a time and hands each to ``on_frames``."""
+
+    supports_decode_on_frames = True
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.config = types.SimpleNamespace(scaling_factor=1.0)
+
+    def decode(self, z, on_frames=None):
+        out = torch.tanh(3 * z[:, :3])
+        if on_frames is not None:
+            for t in range(out.shape[2]):
+                on_frames(out[:, :, t : t + 1].clone())
+        return out.clone()
+
+
+class _RecordingStream:
+    def __init__(self, save_file_path, batch, finish_frames=None):
+        self.save_file_path = save_file_path
+        self.finish_frames = finish_frames
+        self.frames = []
+
+    def __call__(self, frames):
+        self.frames.append(self.finish_frames(frames))
+
+    def finish(self):
+        return [self.save_file_path]
+
+    def abort(self):
+        raise AssertionError("the decode must not fail")
+
+
+class TestCosmos3EncodeWhileDecoding(unittest.TestCase):
+    """The plain video decode feeds the MP4 encoder the frames it would save."""
+
+    @staticmethod
+    def _stage():
+        stage = Cosmos3DecodingStage.__new__(Cosmos3DecodingStage)
+        stage.vae = _FrameVAE()
+        stage.sound_tokenizer = None
+        stage._guardrails = False
+        stage._latents_mean = stage._latents_std = None
+        stage.log_info = stage.log_debug = lambda *_args, **_kwargs: None
+        stage.use_declared_component = lambda **_kwargs: contextlib.nullcontext()
+        return stage
+
+    @staticmethod
+    def _batch(**overrides):
+        fields = dict(
+            data_type=DataType.VIDEO,
+            latents=torch.randn(
+                1, 4, 5, 6, 8, generator=torch.Generator().manual_seed(0)
+            ),
+            extra={},
+            sampling_params=Cosmos3SamplingParams(prompt="a robot"),
+            action_latents=None,
+            audio_latents=None,
+            use_guardrails=None,
+            metrics=None,
+            rollout_trajectory_data=None,
+        )
+        fields.update(overrides)
+        return types.SimpleNamespace(**fields)
+
+    def test_streamed_frames_equal_the_saved_output(self):
+        stage = self._stage()
+        with mock.patch(
+            f"{_COSMOS3_STAGES}.streamed_video_output_path", return_value=None
+        ):
+            reference = stage.forward(self._batch(), types.SimpleNamespace())
+        streams = []
+
+        def open_stream(*args, **kwargs):
+            streams.append(_RecordingStream(*args, **kwargs))
+            return streams[-1]
+
+        with (
+            mock.patch(
+                f"{_COSMOS3_STAGES}.streamed_video_output_path",
+                return_value="/tmp/cosmos3.mp4",
+            ),
+            mock.patch(
+                f"{_COSMOS3_STAGES}.EncodeWhileDecoding", side_effect=open_stream
+            ),
+        ):
+            streamed = stage.forward(self._batch(), types.SimpleNamespace())
+
+        self.assertIsNone(streamed.output)
+        self.assertEqual(streamed.output_file_paths, ["/tmp/cosmos3.mp4"])
+        self.assertIsNone(reference.output_file_paths)
+        self.assertTrue(
+            torch.equal(torch.cat(streams[0].frames, dim=2), reference.output)
+        )
+
+    def test_outputs_that_need_the_frames_are_not_streamed(self):
+        stage = self._stage()
+        cases = {
+            "guardrails": (dict(_guardrails=True), {}),
+            "audio": (
+                dict(sound_tokenizer=object()),
+                dict(audio_latents=torch.zeros(1)),
+            ),
+            "action": ({}, dict(action_latents=torch.zeros(1, 2, 3))),
+            "transfer": ({}, dict(extra={"transfer_plan": {"total_frames": 5}})),
+        }
+        with mock.patch(
+            f"{_COSMOS3_STAGES}.streamed_video_output_path",
+            return_value="/tmp/cosmos3.mp4",
+        ):
+            self.assertIsNotNone(
+                stage._encode_while_decoding(self._batch(), types.SimpleNamespace())
+            )
+            for name, (stage_fields, batch_fields) in cases.items():
+                with self.subTest(name):
+                    case_stage = self._stage()
+                    vars(case_stage).update(stage_fields)
+                    self.assertIsNone(
+                        case_stage._encode_while_decoding(
+                            self._batch(**batch_fields), types.SimpleNamespace()
+                        )
+                    )
+
+
+class TestCosmos3DecodeFastPath(unittest.TestCase):
+    """The VAE decode runs on the fast path exactly when the quality allows it."""
+
+    def test_fast_path_follows_request_quality(self):
+        class _VAE(torch.nn.Module):
+            supports_decode_on_frames = False
+
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(1))
+                self.config = types.SimpleNamespace(scaling_factor=1.0)
+
+            def decode(self, z):
+                return z[:, :3].clamp(-1, 1)
+
+        stage = Cosmos3DecodingStage.__new__(Cosmos3DecodingStage)
+        stage.vae = _VAE()
+        stage.sound_tokenizer = None
+        stage._guardrails = False
+        stage._latents_mean = stage._latents_std = None
+        stage.log_info = stage.log_debug = lambda *_args, **_kwargs: None
+        stage.use_declared_component = lambda **_kwargs: contextlib.nullcontext()
+        gates = []
+
+        @contextlib.contextmanager
+        def record_gate(vae, enabled):
+            gates.append((vae, enabled))
+            yield
+
+        for quality in ("lossless", "high", "exact"):
+            batch = types.SimpleNamespace(
+                data_type=DataType.VIDEO,
+                latents=torch.zeros(1, 4, 2, 3, 3),
+                extra={},
+                sampling_params=Cosmos3SamplingParams(prompt="a", quality=quality),
+                action_latents=None,
+                audio_latents=None,
+                metrics=None,
+                rollout_trajectory_data=None,
+            )
+            with mock.patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages."
+                "model_specific_stages.cosmos3.use_vae_fast_path",
+                record_gate,
+            ):
+                stage.forward(batch, types.SimpleNamespace())
+        self.assertEqual(
+            gates, [(stage.vae, True), (stage.vae, True), (stage.vae, False)]
+        )
 
 
 class TestCosmos3MRoPE(unittest.TestCase):
@@ -1932,24 +2117,6 @@ class TestCosmos3BatchedActionStages(unittest.TestCase):
         self.assertEqual(tuple(image.shape), (2, 3, 16, 16))
 
 
-class TestCosmos3ModalitySamplingParams(unittest.TestCase):
-    """Sound / V2V / action sampling-param fields and defaults."""
-
-    def test_sound_duration_default_and_set(self):
-        self.assertEqual(Cosmos3SamplingParams(prompt="t").sound_duration, 0.0)
-        self.assertEqual(
-            Cosmos3SamplingParams(prompt="t", sound_duration=3.0).sound_duration, 3.0
-        )
-
-    def test_v2v_fields(self):
-        sp = Cosmos3SamplingParams(
-            prompt="t", video_path="in.mp4", condition_frame_indexes=[0, 1]
-        )
-        self.assertEqual(sp.video_path, "in.mp4")
-        self.assertEqual(sp.condition_frame_indexes, [0, 1])
-        self.assertEqual(sp.condition_video_keep, "first")
-
-
 class TestCosmos3CaptionMetadata(unittest.TestCase):
     """Structured captions get generation metadata; prose prompts opt out."""
 
@@ -2073,6 +2240,49 @@ class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
     def test_prose_prompt_still_gets_the_duration_suffix(self):
         final = self._run_prompt_stage("A curious raccoon.", use_duration_template=True)
         self.assertIn("seconds long", final)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.version.hip is None, "requires CUDA"
+)
+class TestCosmos3VideoPreprocess(CustomTestCase):
+    def test_gpu_preprocess_switch(self):
+        """CPU padding and deferred GPU padding preserve the same source pixels."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+            cosmos3,
+        )
+
+        stage = Cosmos3ImagePreprocessStage.__new__(Cosmos3ImagePreprocessStage)
+        stage.log_info = lambda *_args, **_kwargs: None
+        frames = np.random.default_rng(816).integers(
+            0, 256, (5, 32, 48, 3), dtype=np.uint8
+        )
+        outputs = []
+        for force_cpu in (True, False):
+            with (
+                self.subTest(force_cpu=force_cpu),
+                envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.override(force_cpu),
+                mock.patch.object(
+                    cosmos3,
+                    "_iter_video_frames_pyav",
+                    side_effect=lambda *_: (frame for frame in frames),
+                ),
+            ):
+                batch = types.SimpleNamespace(
+                    image_path=None,
+                    video_path="input.mp4",
+                    data_type=DataType.VIDEO,
+                    height=24,
+                    width=40,
+                    num_frames=45,
+                    sampling_params=types.SimpleNamespace(),
+                )
+                stage.forward(batch, types.SimpleNamespace())
+                actual = batch.preprocessed_video
+                self.assertEqual(actual.device.type, "cpu" if force_cpu else "cuda")
+                self.assertEqual(actual.shape, (1, 3, 45 if force_cpu else 5, 24, 40))
+                outputs.append(actual[:, :, :5].cpu())
+        self.assertTrue(torch.equal(outputs[0], outputs[1]))
 
 
 if __name__ == "__main__":
