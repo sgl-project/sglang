@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
@@ -212,6 +213,11 @@ class UnifiedRadixCache(BasePrefixCache):
     ):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.logical_page_size = params.page_size
+        if self.token_to_kv_pool_allocator is not None:
+            self.logical_page_size = self.token_to_kv_pool_allocator.page_size
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
         self.disable = params.disable
 
         if params.enable_metrics:
@@ -1284,7 +1290,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     req, is_finished=is_finished, insert_params=insert_params
                 )
             return
-        req.kv.cache_inserted_len = max(req.kv.cache_inserted_len, page_aligned_len)
+        req.kv.record_insert(page_aligned_len)
 
         # Split the leaf at the prompt boundary so eviction can drop the output
         # KV without the prompt. prev_prefix_len keeps the overlapping indices
@@ -1347,7 +1353,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Update req fields
-        req.kv.cache_protected_len = len(new_indices)
+        req.kv.protect_prefix(len(new_indices))
         req.last_node = new_last_node
 
         # cleanup
@@ -3751,8 +3757,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
             for req in failed:
                 req.skip_radix_cache_insert = True
-                req.discard_output_reason = FINISH_ABORT(
-                    "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                req.request_discard(
+                    FINISH_ABORT(
+                        "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                    )
                 )
         return failed
 

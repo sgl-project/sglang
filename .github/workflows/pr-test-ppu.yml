@@ -5,7 +5,7 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
       run_all_tests:
@@ -27,16 +27,7 @@ on:
         default: false
 
 concurrency:
-  # Unrelated label events must not cancel or replace the active PPU checks.
-  group: >-
-    pr-test-ppu-${{
-      (github.event_name == 'pull_request' &&
-       github.event.action == 'labeled' &&
-       github.event.label.name != 'run-ci' &&
-       github.event.label.name != 'run-ci-ppu') &&
-      format('ignored-label-{0}', github.run_id) ||
-      inputs.ref || github.ref
-    }}
+  group: pr-test-ppu-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -48,15 +39,7 @@ env:
 
 jobs:
   check-changes:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-check-changes' || 'check-changes' }}
-    if: |
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'run-ci' ||
-      github.event.label.name == 'run-ci-ppu'
+    name: check-changes
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -115,10 +98,7 @@ jobs:
               - "test/registered/ppu/**"
 
   pr-gate:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-pr-gate' || 'pr-gate' }}
+    name: pr-gate
     needs: check-changes
     if: needs.check-changes.outputs.ppu == 'true'
     uses: ./.github/workflows/pr-gate.yml
@@ -128,10 +108,7 @@ jobs:
     secrets: inherit
 
   ppu-build:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-ppu-build' || 'ppu-build' }}
+    name: ppu-build
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.ppu == 'true'
     runs-on: ubuntu-24.04
@@ -189,11 +166,7 @@ jobs:
           if-no-files-found: warn
 
   ppu-sanity:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          format('ignored-label-ppu-sanity ({0})', matrix.runner) ||
-          format('ppu-sanity ({0})', matrix.runner) }}
+    name: ppu-sanity (${{ matrix.runner }})
     needs: [check-changes, pr-gate, ppu-build]
     if: needs.check-changes.outputs.ppu == 'true'
     # Both PPU generations reuse the same wheels; each host supplies its own
@@ -265,10 +238,7 @@ jobs:
           if-no-files-found: warn
 
   pr-test-ppu-finish:
-    name: >-
-      ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
-           github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
-          'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish' }}
+    name: pr-test-ppu-finish
     needs: [pr-gate, check-changes, ppu-build, ppu-sanity]
     if: always() && needs.check-changes.result != 'skipped'
     runs-on: ubuntu-latest
