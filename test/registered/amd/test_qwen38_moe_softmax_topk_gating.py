@@ -50,7 +50,10 @@ class TestQwen38MoeSoftmaxTopKGating(CustomTestCase):
     def test_topk_gating_matches_legacy_launcher(self):
         from aiter.fused_moe import fused_topk as aiter_fused_topk
 
-        for hidden_size, num_tokens in itertools.product(HIDDEN_SIZES, (4, 128, 1024)):
+        # aiter switches from the E=512 prefill kernel to its shared-memory
+        # kernel above 1024 rows.
+        rows = (4, 128, 1024, 1025, 2048, topk_module._AITER_TOPK_GATING_MAX_ROWS)
+        for hidden_size, num_tokens in itertools.product(HIDDEN_SIZES, rows):
             with self.subTest(hidden_size=hidden_size, num_tokens=num_tokens):
                 torch.manual_seed(num_tokens)
                 hidden_states = torch.randn(
