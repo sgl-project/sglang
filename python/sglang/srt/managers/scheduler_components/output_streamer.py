@@ -85,7 +85,6 @@ class SchedulerOutputStreamer:
     is_generation: bool
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
-    # Outputs go straight to the tokenizer side, with no detokenizer between.
     skip_tokenizer_init: InitVar[bool]
     enable_hicache_storage: Callable[[], bool]
     # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
@@ -558,12 +557,9 @@ class _GenerationStreamAccumulator:
             self.audio_tokens.append(audio_t)
             self.video_tokens.append(video_t)
         else:
-            # Everything below feeds the Python DetokenizerManager /
-            # TokenizerManager (incremental detok, meta_info, per-request metrics).
-            # The Rust server replaces those stages and builds its own metadata from the
-            # ChunkEvent, so `push_generation` never reads these — skip the whole
-            # block. The parallel lists stay empty; the payload goes straight to
-            # `push_generation`, which only indexes the fields appended outside it.
+            # Read by the Python DetokenizerManager (continuity check) and
+            # TokenizerManager (meta_info, per-request metrics); `push_generation`
+            # never reads them, so under OutputSink.RUST these lists stay empty.
             self.completion_tokens.append(
                 beam_completion_tokens(beam_output)
                 if beam_output is not None

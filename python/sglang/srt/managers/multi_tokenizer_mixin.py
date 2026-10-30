@@ -697,9 +697,9 @@ class MultiDetokenizerRouter:
     """Route scheduler outputs to one of N DetokenizerManager workers.
 
     Each request is pinned to a worker by hashing its ``rid`` with ``zlib.crc32``
-    (deterministic across runs), so all outputs of the same rid always land on
-    the same detokenizer and ``detokenize_state_table`` stays consistent. Only the first
-    and the finished output of a request carry its ``http_worker_ipc``.
+    (deterministic across runs), so all outputs of a rid land on the same
+    detokenizer and ``detokenize_state_table`` stays consistent. The route cannot
+    be the key: only some outputs of a request carry its ``http_worker_ipc``.
     """
 
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):

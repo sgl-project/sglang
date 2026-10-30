@@ -1,6 +1,6 @@
 """The detokenizer's incremental decoding: the DetokenizeHeader the scheduler
-sends on a request's first output, and the per-request state and step that
-turn each later row's output ids into text."""
+builds and sends on a request's first output, and the per-request state, kept
+by rid, that turns each row's output ids into text."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ class DetokenizeHeader(
 ):
     """A request's detokenization inputs. The scheduler sends it on the request's
     first output only; the detokenizer keeps it for the request's lifetime and
-    decodes every later row from that row's output_ids."""
+    decodes each row, the first included, from that row's output_ids."""
 
     # The prompt tail decoded ahead of the output as context; the output text
     # starts after it.
@@ -83,7 +83,7 @@ class DetokenizeState(msgspec.Struct):
     surr_offset: int
     read_offset: int
     header: DetokenizeHeader
-    # Output tokens received so far; each row's completion_tokens is this
+    # Output ids received so far; a non-beam row's completion_tokens is this
     # plus the row's output ids.
     num_received_ids: int = 0
     # Offset that's sent to tokenizer for incremental update.
@@ -133,7 +133,7 @@ class DetokenizeState(msgspec.Struct):
         *, rid: str, num_received: int, num_new: int, completion_tokens: int
     ) -> None:
         if num_received + num_new != completion_tokens:
-            # An alarm only: the row is still decoded and routed.
+            # Outside CI an alarm only: the row is still decoded and routed.
             msg = (
                 f"Output ids of {rid=} do not continue the "
                 f"{num_received} received: {num_new} new for "

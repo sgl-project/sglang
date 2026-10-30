@@ -242,8 +242,8 @@ class TestDetokenizeState(CustomTestCase):
         )
 
     def test_one_rid_on_two_tokenizer_workers_finishes_on_both(self):
-        """With one rid in flight on two tokenizer workers, each finished row reaches
-        its own worker, not the stored header's."""
+        """With one rid in flight on two tokenizer workers, the finished row reaches
+        the worker it carries, not the stored header's."""
         detok = _detokenizer()
         sent = {}
         outputs = [
