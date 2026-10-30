@@ -1,48 +1,35 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Iterator, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, Iterator, Optional, Set
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
 
 class RunningReqs:
-    """The requests in the running state.
+    """The requests in the running state, in join order (the same on every rank).
 
     A request joins once a launched step runs its last prefill chunk, and leaves
-    when it finishes, is retracted or preempted, or a pause retracts it. Kept in
-    join order, which every rank sees alike. Each change binds a new tuple, so a
-    caller holding an earlier ``reqs()`` never sees it change.
+    when it finishes, is retracted or preempted, or a pause retracts it. Each
+    change rebinds a new dict, so iterating over the requests while some leave
+    stays safe.
     """
 
     def __init__(self) -> None:
-        self._reqs: Tuple[Req, ...] = ()
-        self._members: Set[Req] = set()
+        self._reqs: Dict[Req, None] = {}
 
     def join(self, reqs: Iterable[Req]) -> None:
         """Add the given requests; ones already running keep their place."""
-        joining = []
-        for req in reqs:
-            if req not in self._members:
-                self._members.add(req)
-                joining.append(req)
+        joining = [req for req in reqs if req not in self._reqs]
         if joining:
-            self._reqs = (*self._reqs, *joining)
+            self._reqs = {**self._reqs, **dict.fromkeys(joining)}
+
+    def leave(self, reqs: Iterable[Req]) -> None:
+        """Drop the given requests; ones not running are ignored."""
+        self._drop({req for req in reqs if req in self._reqs})
 
     def leave_finished(self) -> None:
-        self._leave([req for req in self._reqs if req.finished()])
-
-    def remove(self, reqs: Iterable[Req]) -> None:
-        """Drop the given requests; ones not running are ignored."""
-        if self._members:
-            self._leave([req for req in reqs if req in self._members])
-
-    def clear(self) -> None:
-        self._reqs = ()
-        self._members = set()
-
-    def reqs(self) -> Tuple[Req, ...]:
-        return self._reqs
+        self._drop({req for req in self._reqs if req.finished()})
 
     def __iter__(self) -> Iterator[Req]:
         return iter(self._reqs)
@@ -51,14 +38,11 @@ class RunningReqs:
         return len(self._reqs)
 
     def __contains__(self, req: Req) -> bool:
-        return req in self._members
+        return req in self._reqs
 
-    def _leave(self, leaving: Iterable[Req]) -> None:
-        leaving = set(leaving)
-        if not leaving:
-            return
-        self._members -= leaving
-        self._reqs = tuple(req for req in self._reqs if req not in leaving)
+    def _drop(self, leaving: Set[Req]) -> None:
+        if leaving:
+            self._reqs = {req: None for req in self._reqs if req not in leaving}
 
     def check(
         self,
@@ -74,10 +58,11 @@ class RunningReqs:
             for req in batch.reqs
             if not req.finished() and req is not chunked_req
         }
-        if expected == self._members:
+        running = self._reqs.keys()
+        if expected == running:
             return
-        not_running = sorted(req.rid for req in expected - self._members)
-        not_held = sorted(req.rid for req in self._members - expected)
+        not_running = sorted(req.rid for req in expected - running)
+        not_held = sorted(req.rid for req in running - expected)
         raise RuntimeError(
             "Running requests disagree with the batches: "
             f"held by a batch but not running: {not_running}; "

@@ -27,6 +27,9 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.invariant_checker import (
+    SchedulerInvariantChecker,
+)
 from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -68,6 +71,22 @@ class _Scheduler(Scheduler):
         raise _ForwardLaunched
 
 
+def _running_reqs_checker(s):
+    return SchedulerInvariantChecker(
+        disaggregation_mode=s.disaggregation_mode,
+        page_size=1,
+        tree_cache=Mock(),
+        token_to_kv_pool_allocator=Mock(),
+        req_to_token_pool=Mock(),
+        pool_stats_observer=Mock(),
+        get_last_batch=Mock(),
+        get_running_batch=Mock(),
+        scheduler_stage_metrics=Mock(),
+        get_chunked_req=lambda: s.chunked_req,
+        get_running_reqs=lambda: s.running_reqs,
+    )
+
+
 def _scheduler():
     s = _Scheduler.__new__(_Scheduler)
     s.running_reqs = RunningReqs()
@@ -75,6 +94,7 @@ def _scheduler():
     s.dllm_config = None
     s.enable_hisparse = False
     s.chunked_req = None
+    s.invariant_checker = _running_reqs_checker(s)
     # run_batch up to the forward
     s.metrics_reporter = MagicMock()
     s.forward_ct = 0
@@ -108,19 +128,21 @@ def _launch(s, batch):
 
 
 class TestRunningReqs(CustomTestCase):
-    def test_join_keeps_order_and_leaving_rebinds(self):
+    def test_join_keeps_order_and_leaving_mid_iteration_is_safe(self):
         a, b, c, outsider = (_req(rid) for rid in "abcx")
         running = RunningReqs()
         running.join([a, b])
         running.join([c, b])
-        snapshot = running.reqs()
-
         _finish(b)
-        running.leave_finished()
-        running.remove([a, outsider])
 
-        self.assertEqual(running.reqs(), (c,))
-        self.assertEqual(snapshot, (a, b, c))
+        seen = []
+        for req in running:
+            seen.append(req)
+            running.leave_finished()
+            running.leave([a, outsider])
+
+        self.assertEqual(seen, [a, b, c])
+        self.assertEqual(list(running), [c])
         self.assertNotIn(a, running)
 
     def test_check_names_both_differences(self):
@@ -135,7 +157,7 @@ class TestRunningReqs(CustomTestCase):
         ):
             running.check([batch, None], chunked_req=chunk)
 
-        running.remove([stray])
+        running.leave([stray])
         running.join([b])
         running.check([batch, None], chunked_req=chunk)
 
@@ -191,7 +213,7 @@ class TestRunningReqsHooks(CustomTestCase):
                 _launch(s, plan.batch_to_run)
             return plan
 
-        with envs.SGLANG_DEBUG_CHECK_RUNNING_REQS.override(True):
+        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
             # Launch a prefill whose chunked request continues.
             admit.next, s.chunked_req = prefill, chunk
             plan = step(ScheduleBatch(reqs=[]), None)

@@ -2570,6 +2570,14 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_chunked_req=lambda: self.chunked_req,
+            get_running_reqs=lambda: self.running_reqs,
+            get_pp_running_mbs=lambda: (
+                self.running_mbs if get_parallel().pp_size > 1 else ()
+            ),
+            get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
+            prefill_joins_at_merge=lambda: (
+                self.dllm_config is not None or self.enable_hisparse
+            ),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -4088,7 +4096,8 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
-        self._maybe_check_running_reqs(running_batch, last_batch)
+        if envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            self.invariant_checker.check_running_reqs(running_batch, last_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -4440,7 +4449,7 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
-        self.running_reqs.remove(adder.preempt_list)
+        self.running_reqs.leave(adder.preempt_list)
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -4591,8 +4600,8 @@ class Scheduler(
         ]
 
     def _join_launched_reqs(self, batch: ScheduleBatch) -> None:
-        """A launched extend step makes running each request whose last prefill
-        chunk it runs; requests already running (mixed rows) keep their place."""
+        """A launched extend step starts running each request whose last prefill
+        chunk it runs; its mixed decode rows are running already."""
         if (
             # PD prefill hands prefilled requests to the KV transfer; PD decode
             # requests join where the prebuilt batch is merged.
@@ -4605,28 +4614,6 @@ class Scheduler(
         ):
             return
         self.running_reqs.join(r for r in batch.reqs if r is not batch.chunked_req)
-
-    def _maybe_check_running_reqs(
-        self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
-    ) -> None:
-        if not envs.SGLANG_DEBUG_CHECK_RUNNING_REQS.get():
-            return
-        step_batches = [last_batch]
-        if get_parallel().pp_size > 1:
-            step_batches.extend(self.mbs)
-        if self.dllm_config is not None or self.enable_hisparse:
-            # Their prefilled requests are not running until merged.
-            step_batches = [
-                b
-                for b in step_batches
-                if b is not None and not b.forward_mode.is_extend()
-            ]
-        running_batches = [running_batch]
-        if get_parallel().pp_size > 1:
-            running_batches.extend(self.running_mbs)
-        self.running_reqs.check(
-            [*running_batches, *step_batches], chunked_req=self.chunked_req
-        )
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose queued result commits their last output by length."""
@@ -4676,7 +4663,7 @@ class Scheduler(
                 else None
             )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
-            self.running_reqs.remove([*retracted_reqs, *reqs_to_abort])
+            self.running_reqs.leave([*retracted_reqs, *reqs_to_abort])
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -6107,7 +6094,7 @@ class Scheduler(
             )
         self.running_batch.reqs = []
         # Under PP only this micro-batch's requests are retracted; the others stay.
-        self.running_reqs.remove(retract_reqs)
+        self.running_reqs.leave(retract_reqs)
         for req in retract_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 req.time_stats.set_retract_time()

@@ -35,6 +35,13 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
+class _FakeReq(SimpleNamespace):
+    """A request stand-in compared and hashed by identity, like Req."""
+
+    __eq__ = object.__eq__
+    __hash__ = object.__hash__
+
+
 class _PendingCopy:
     def __init__(self):
         self.done = False
@@ -648,7 +655,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler._add_request_to_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
 
-        req = SimpleNamespace(
+        req = _FakeReq(
             finished=lambda: False,
             output_ids=[10, 11, 12],
             time_stats=MagicMock(),
@@ -677,7 +684,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = MagicMock()
 
         def _req(rid, req_pool_idx):
-            return SimpleNamespace(
+            return _FakeReq(
                 rid=rid,
                 finished=lambda: False,
                 output_ids=[7],

@@ -3538,7 +3538,8 @@ class SchedulerDisaggregationDecodeMixin:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
-        self._maybe_check_running_reqs(running_batch, last_batch=None)
+        if envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            self.invariant_checker.check_running_reqs(running_batch, last_batch=None)
 
         # Schedule decode batch
         if running_batch.is_empty():

@@ -17,6 +17,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.invariant_checker import (
+    SchedulerInvariantChecker,
+)
 from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -65,6 +68,19 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         s.chunked_req = None
         s.enable_hisparse = False
         s.running_reqs = RunningReqs()
+        s.invariant_checker = SchedulerInvariantChecker(
+            disaggregation_mode=s.disaggregation_mode,
+            page_size=1,
+            tree_cache=Mock(),
+            token_to_kv_pool_allocator=Mock(),
+            req_to_token_pool=Mock(),
+            pool_stats_observer=Mock(),
+            get_last_batch=Mock(),
+            get_running_batch=Mock(),
+            scheduler_stage_metrics=Mock(),
+            get_chunked_req=lambda: s.chunked_req,
+            get_running_reqs=lambda: s.running_reqs,
+        )
         s.require_mlp_sync = False
         s._should_defer_prefill = Mock(return_value=False)
         s.dp_attn_adapter = Mock()
@@ -86,7 +102,7 @@ class TestDpConvertedBatchFull(unittest.TestCase):
 
     def setUp(self):
         enter_scope(self, published_topology())
-        enter_scope(self, envs.SGLANG_DEBUG_CHECK_RUNNING_REQS.override(True))
+        enter_scope(self, envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True))
 
     def test_converted_batch_stays_running_and_reopens_admission(self):
         seen = []
