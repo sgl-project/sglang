@@ -217,5 +217,213 @@ def test_target_only_sampling_cdf_boundaries(
     assert accept_token_num.item() == expected_accept_token_num
 
 
+# ---------------------------------------------------------------------------
+# chain_speculative_sampling_target_only_triton (topk=1, no draft_probs)
+# ---------------------------------------------------------------------------
+
+from sglang.kernels.ops.speculative.reject_sampling import (
+    chain_speculative_sampling_target_only_triton,
+)
+
+
+@pytest.mark.parametrize(
+    "candidate_tokens,target_probabilities,coin,threshold_single,"
+    "expected_token,expected_accept_token_num",
+    [
+        # Review Focus 1: zero-mass draft (p==0) with coin==0 and threshold==0 -> reject
+        ([2], [0.0, 1.0, 0.0], 0.0, 0.0, 1, 0),
+        # zero-mass with default threshold -> reject
+        ([2], [0.0, 1.0, 0.0], 0.0, 1.0, 1, 0),
+        # interior boundary: coin == p / threshold_acc -> rejected (strict <),
+        # token 1 is masked out of residual so final sample (coin_final=0) picks token 3
+        ([1], [0.0, 0.25, 0.0, 0.75], 0.25, 1.0, 3, 0),
+        # lower-endpoint: coin == 0 -> accept
+        ([1], [0.0, 0.25, 0.75], 0.0, 1.0, 1, 1),
+        # upper-endpoint: coin near 1.0 -> accept, then sample from next row
+        ([1], [0.0, 1.0], 1.0 - 2**-24, 1.0, 1, 1),
+    ],
+    ids=[
+        "zero-mass-zero-threshold",
+        "zero-mass-default-threshold",
+        "interior-boundary",
+        "lower-endpoint",
+        "upper-endpoint",
+    ],
+)
+def test_chain_target_only_triton_cdf_boundaries(
+    candidate_tokens,
+    target_probabilities,
+    coin,
+    threshold_single,
+    expected_token,
+    expected_accept_token_num,
+):
+    """CDF boundary tests for the topk=1 chain target-only Triton sampler.
+
+    Mirrors ``test_target_only_sampling_cdf_boundaries`` but exercises the
+    chain kernel directly (no tree sibling traversal, no draft_probs alloc).
+    """
+    device = "cuda"
+    num_candidates = len(candidate_tokens)
+    candidates = torch.tensor(
+        [[0, *candidate_tokens]], dtype=torch.int64, device=device
+    )
+    num_draft_tokens = candidates.shape[1]
+
+    # Linear chain: retrive_index = [[0, 1, 2, ...]], next_token linear, no siblings
+    retrive_index = torch.arange(
+        num_draft_tokens, dtype=torch.int64, device=device
+    ).unsqueeze(0)
+    retrive_next_token = torch.full_like(retrive_index, -1)
+    retrive_next_token[0, 0] = 1
+    retrive_next_sibling = torch.full_like(retrive_index, -1)
+
+    target_probs = torch.zeros(
+        (1, num_draft_tokens, len(target_probabilities)),
+        dtype=torch.float32,
+        device=device,
+    )
+    target_probs[0, 0] = torch.tensor(
+        target_probabilities, dtype=torch.float32, device=device
+    )
+    target_probs[0, 1:, 0] = 1.0
+    predicts = torch.full((num_draft_tokens,), -1, dtype=torch.int32, device=device)
+    accept_index = torch.full(
+        (1, num_draft_tokens), -1, dtype=torch.int32, device=device
+    )
+    accept_token_num = torch.zeros((1,), dtype=torch.int32, device=device)
+    coins = torch.zeros((1, num_draft_tokens), dtype=torch.float32, device=device)
+    coins[0, 0] = coin
+
+    chain_speculative_sampling_target_only_triton(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        uniform_samples=coins,
+        uniform_samples_for_final_sampling=torch.zeros(
+            (1,), dtype=torch.float32, device=device
+        ),
+        target_probs=target_probs,
+        draft_probs=None,
+        threshold_single=threshold_single,
+        threshold_acc=1.0,
+        deterministic=True,
+    )
+
+    assert predicts[0].item() == expected_token
+    assert accept_token_num.item() == expected_accept_token_num
+
+
+@pytest.mark.parametrize(
+    "threshold_single, threshold_acc",
+    [(1, 1), (0, 0)],
+)
+def test_chain_target_only_triton_matches_tree_kernel(
+    threshold_single,
+    threshold_acc,
+):
+    """The chain kernel must produce identical results to the tree kernel for
+    linear-chain (topk=1) inputs when draft_probs is all-zeros.
+    """
+    device = "cuda"
+    torch.manual_seed(42)
+
+    bs, num_draft_tokens, vocab_size = 3, 5, 32
+    candidates = torch.randint(
+        0, vocab_size, (bs, num_draft_tokens), dtype=torch.int64, device=device
+    )
+    retrive_index = torch.arange(
+        bs * num_draft_tokens, dtype=torch.int64, device=device
+    ).reshape(bs, num_draft_tokens)
+    # retrive_next_token stores per-request *local* indices [0, num_draft_tokens-1],
+    # not global flat indices — the kernel addresses via bx * num_draft_tokens + cur_index.
+    retrive_next_token = torch.full_like(retrive_index, -1)
+    retrive_next_token[:, :-1] = torch.arange(
+        1, num_draft_tokens, dtype=torch.int64, device=device
+    ).unsqueeze(0)
+    retrive_next_sibling = torch.full_like(retrive_index, -1)
+
+    target_logits = torch.randn(
+        bs, num_draft_tokens, vocab_size, dtype=torch.float32, device=device
+    )
+    temperatures = torch.full((bs, 1), 0.5, dtype=torch.float32, device=device)
+    expanded_temp = temperatures.unsqueeze(1)
+    target_probs = F.softmax(target_logits / expanded_temp, dim=-1)
+
+    coins = torch.rand(bs, num_draft_tokens, device=device, dtype=torch.float32)
+    coins_final = torch.rand(bs, device=device).to(torch.float32)
+    threshold_acc_clamped = max(float(threshold_acc), 1e-9)
+
+    # --- Tree kernel (draft_probs = zeros) ---
+    predicts_tree = torch.full(
+        (bs * num_draft_tokens,), -1, dtype=torch.int32, device=device
+    )
+    accept_index_tree = torch.full(
+        (bs, num_draft_tokens), -1, dtype=torch.int32, device=device
+    )
+    accept_token_num_tree = torch.zeros((bs,), dtype=torch.int32, device=device)
+    draft_probs_zeros = torch.zeros_like(target_probs)
+
+    tree_speculative_sampling_target_only(
+        predicts=predicts_tree,
+        accept_index=accept_index_tree,
+        accept_token_num=accept_token_num_tree,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        uniform_samples=coins,
+        uniform_samples_for_final_sampling=coins_final,
+        target_probs=target_probs,
+        draft_probs=draft_probs_zeros,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc_clamped,
+        deterministic=True,
+    )
+
+    # --- Chain kernel (draft_probs = None) ---
+    predicts_chain = torch.full(
+        (bs * num_draft_tokens,), -1, dtype=torch.int32, device=device
+    )
+    accept_index_chain = torch.full(
+        (bs, num_draft_tokens), -1, dtype=torch.int32, device=device
+    )
+    accept_token_num_chain = torch.zeros((bs,), dtype=torch.int32, device=device)
+
+    chain_speculative_sampling_target_only_triton(
+        predicts=predicts_chain,
+        accept_index=accept_index_chain,
+        accept_token_num=accept_token_num_chain,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        uniform_samples=coins,
+        uniform_samples_for_final_sampling=coins_final,
+        target_probs=target_probs,
+        draft_probs=None,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc_clamped,
+        deterministic=True,
+    )
+
+    assert torch.equal(accept_token_num_tree, accept_token_num_chain), (
+        f"accept_token_num mismatch: tree={accept_token_num_tree.tolist()} "
+        f"chain={accept_token_num_chain.tolist()}"
+    )
+    assert torch.equal(predicts_tree, predicts_chain), (
+        f"predicts mismatch: tree={predicts_tree.tolist()} "
+        f"chain={predicts_chain.tolist()}"
+    )
+    assert torch.equal(accept_index_tree, accept_index_chain), (
+        f"accept_index mismatch: tree={accept_index_tree.tolist()} "
+        f"chain={accept_index_chain.tolist()}"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

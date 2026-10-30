@@ -177,7 +177,10 @@ class TestGraphPoolBorrow(CustomTestCase):
         self.assertEqual(self.state.static_runs, [(0x2000, 8192), (0x1000, 4096)])
 
     def test_eagle_non_greedy_probabilities_do_not_borrow_graph_pool(self):
+        captured_kwargs = {}
+
         def fake_sampling(**kwargs):
+            captured_kwargs.update(kwargs)
             kwargs["predicts"].fill_(3)
             kwargs["accept_index"].fill_(0)
             kwargs["accept_token_num"].fill_(1)
@@ -226,7 +229,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             get_parallel().override(tp_group=tp_group),
             patch.object(
                 eagle_utils,
-                "tree_speculative_sampling_target_only",
+                "chain_speculative_sampling_target_only_triton",
                 side_effect=fake_sampling,
             ),
         ):
@@ -235,6 +238,9 @@ class TestGraphPoolBorrow(CustomTestCase):
             )
 
         borrow_graph_pool.assert_not_called()
+        # The chain target-only kernel must receive draft_probs=None (no
+        # torch.zeros_like allocation).
+        self.assertIsNone(captured_kwargs.get("draft_probs"))
         self.assertTrue(torch.equal(predict, torch.full_like(predict, 3)))
         self.assertTrue(torch.equal(accept_lens, torch.full_like(accept_lens, 2)))
         self.assertTrue(torch.equal(accept_index, torch.zeros_like(accept_index)))
@@ -816,7 +822,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             patch.object(dflash_utils, "_DFLASH_SAMPLING_VERIFY_AVAILABLE", True),
             patch.object(
                 dflash_utils,
-                "tree_speculative_sampling_target_only",
+                "chain_speculative_sampling_target_only_triton",
                 fake_sampling,
             ),
         ):
