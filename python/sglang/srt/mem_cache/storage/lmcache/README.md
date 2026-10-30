@@ -69,3 +69,8 @@ loads on the forward stream, including with `--disable-overlap-schedule`.
 
 PD decode, DP attention, DCP, and speculative decoding remain unsupported
 with `--enable-lmcache`.
+
+For strict output comparisons, enable `--enable-deterministic-inference` with
+a supported attention backend on both PD servers. Prefix reuse changes the
+prefill computation shape; non-deterministic kernels can produce different
+tokens even when the restored prefix KV is byte-identical.
