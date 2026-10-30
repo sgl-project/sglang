@@ -8,6 +8,7 @@ whatever the slot held before.
 """
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -297,6 +298,9 @@ class TestLazyFinishBeforeMixedBoundary(unittest.TestCase):
             _maybe_collect_routed_experts=lambda req: None,
             _maybe_collect_indexer_topk=lambda req: None,
             _maybe_collect_customized_info=lambda i, req, out, n: None,
+        )
+        processor.retire_finished_req = partial(
+            brp.SchedulerBatchResultProcessor.retire_finished_req, processor
         )
         released = []
         with (
