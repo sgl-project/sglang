@@ -2,6 +2,7 @@
 registration and the cpu_tensor retraction backup."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -9,6 +10,7 @@ from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.utils import setup_state_kv_args
 from sglang.srt.mem_cache.kv_cache_builder import _has_per_token_kv_scales
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -38,6 +40,11 @@ def _pool(scales: bool = True, chunk_size: int = 3) -> MHATokenToKVPool:
     return pool
 
 
+def _static_storage(pool) -> StaticKVStorage:
+    allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+    return StaticKVStorage(None, allocator)
+
+
 def _fill(pool, slots):
     """A different value for every (buffer kind, layer, token)."""
     tok = torch.arange(len(slots), dtype=torch.uint8)
@@ -53,7 +60,7 @@ class TestFP4KVScales(CustomTestCase):
     def test_pd_registers_block_scales_in_k_then_v_layer_order(self):
         pool = _pool()
         kv_args = KVArgs()
-        setup_state_kv_args(kv_args, pool)
+        setup_state_kv_args(kv_args, _static_storage(pool))
 
         self.assertEqual(kv_args.state_types.count(StateType.BLOCK_SCALE), 1)
         i = kv_args.state_types.index(StateType.BLOCK_SCALE)
@@ -64,7 +71,7 @@ class TestFP4KVScales(CustomTestCase):
 
     def test_unquantized_pool_registers_no_block_scales(self):
         kv_args = KVArgs()
-        setup_state_kv_args(kv_args, _pool(scales=False))
+        setup_state_kv_args(kv_args, _static_storage(_pool(scales=False)))
         self.assertNotIn(StateType.BLOCK_SCALE, kv_args.state_types)
 
     def test_retraction_restores_scales_across_chunks(self):
