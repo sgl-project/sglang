@@ -877,6 +877,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         layer: "RadixAttention",
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
         """Gather ``(nope, rope)`` at physical rows ``loc``.
 
@@ -884,8 +885,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         and this pool keeps the halves apart. ``loc`` is already rank-local and
         physical (the read door's contract), so no owner filter here.
         """
-        k = self.get_key_buffer(layer.layer_id).view(-1, self.kv_lora_rank)
-        v = self.get_value_buffer(layer.layer_id).view(-1, self.qk_rope_head_dim)
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+        k = self.get_key_buffer(layer_id).view(-1, self.kv_lora_rank)
+        v = self.get_value_buffer(layer_id).view(-1, self.qk_rope_head_dim)
         idx = loc.to(torch.int64)
         cache_k_nope = k.index_select(0, idx).unsqueeze(1)
         cache_k_rope = v.index_select(0, idx).unsqueeze(1)

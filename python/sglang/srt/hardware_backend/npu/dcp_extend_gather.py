@@ -19,14 +19,18 @@ Pure index math and buffers, no torch_npu, so CPU tests can import it.
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.dcp.layout import dcp_local_row, get_dcp_lens
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.runtime_context import get_parallel
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +65,8 @@ class DcpExtendGatherPlan(NamedTuple):
 # A dataclass, not a msgspec.Struct, because its base is one.
 @dataclass
 class NPUDecodeContextParallelMetadata(DecodeContextParallelMetadata):
-    # Built by the attention backend's init_forward_metadata, reused by all layers.
+    # Set once per forward by build_dcp_extend_gather_plan and only read by the
+    # layers. None means this forward takes the query gather instead.
     extend_gather_plan: Optional[DcpExtendGatherPlan] = None
     # The current layer's gathered (latent, rope) KV. NPU keeps the two apart
     # in the pool and in npu_sparse_flash_attention, so not dcp_kv_buffer.
@@ -140,16 +145,27 @@ DCP_EXTEND_GATHER_PIECE_ROWS = _piece_rows if _piece_rows > 0 else 1 << 62
 
 
 def build_dcp_extend_gather_plan(
-    prefix_lens: Sequence[int],
-    extend_lens: Sequence[int],
+    forward_batch: "ForwardBatch",
     interleave_size: int,
     device: torch.device,
-) -> DcpExtendGatherPlan:
-    """This rank's plan, with its indices already on ``device``."""
+) -> Optional[DcpExtendGatherPlan]:
+    """This rank's plan if this forward gathers the prefix KV, else None.
+
+    The one place that decides per forward; the layers only test the result,
+    so these checks do not repeat on every layer. Indices land on ``device``.
+    """
+    mode = forward_batch.forward_mode
+    # Target verify and DSA prefill CP keep their own attention paths.
+    if (
+        not mode.is_extend()
+        or mode.is_target_verify()
+        or dsa_use_prefill_cp(forward_batch)
+    ):
+        return None
     parallel = get_parallel()
     plan = plan_dcp_extend_gather(
-        prefix_lens,
-        extend_lens,
+        forward_batch.extend_prefix_lens_cpu,
+        forward_batch.extend_seq_lens_cpu,
         parallel.dcp_size,
         parallel.dcp_rank,
         DCP_EXTEND_GATHER_PIECE_ROWS,

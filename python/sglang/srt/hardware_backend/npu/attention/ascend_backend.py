@@ -705,11 +705,11 @@ class AscendAttnBackend(AttentionBackend):
                     )
                 )
             dcp_metadata = forward_batch.attn_dcp_metadata
-            # Here, not in the model's prepare: the plan needs extend_seq_lens_cpu.
+            # Here, not in the model's prepare: deciding needs the forward mode
+            # and extend_seq_lens_cpu, which prepare is not given.
             if isinstance(dcp_metadata, NPUDecodeContextParallelMetadata):
                 dcp_metadata.extend_gather_plan = build_dcp_extend_gather_plan(
-                    prefix_lens=forward_batch.extend_prefix_lens_cpu,
-                    extend_lens=forward_batch.extend_seq_lens_cpu,
+                    forward_batch,
                     interleave_size=self.page_size,
                     device=self.device,
                 )

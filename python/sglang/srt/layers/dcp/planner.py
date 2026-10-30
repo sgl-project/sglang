@@ -125,7 +125,10 @@ def prepare_decode_context_parallel_metadata(
         )
     else:
         # Interleaved pools are written rank-local, never through translated ids.
-        assert runner_ids is None or not runner_ids.is_translating
+        assert runner_ids is None or not runner_ids.is_translating, (
+            f"interleave_size={interleave_size} expects a rank-local pool, "
+            "but the KV ids are being translated"
+        )
         owned_kv_indices = filter_dcp_local_chunk_kv_indices(
             dcp_prefix_kv_indices,
             torch.zeros(len(extend_prefix_lens_cpu), dtype=torch.int64),

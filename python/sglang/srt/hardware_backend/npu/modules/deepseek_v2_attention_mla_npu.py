@@ -50,18 +50,17 @@ def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
 
 
 def _dsa_dcp_extend_gathers_kv(forward_batch: "ForwardBatch") -> bool:
-    """This DCP extend gathers the prefix KV rather than the query.
+    """This forward gathers the prefix KV rather than the query.
 
-    ``prepare_dcp_extend_metadata_npu`` builds ``attn_dcp_metadata`` only for
-    such an extend, so its presence decides.
+    ``build_dcp_extend_gather_plan`` decides once per forward; this only reads
+    its answer.
     """
+    dcp_metadata = forward_batch.attn_dcp_metadata
     return (
-        isinstance(forward_batch.attn_dcp_metadata, NPUDecodeContextParallelMetadata)
-        and runtime_context.get_parallel().dcp_enabled
+        isinstance(dcp_metadata, NPUDecodeContextParallelMetadata)
+        and dcp_metadata.extend_gather_plan is not None
+        # Per model, not per batch: never the draft model's layers.
         and not forward_context.get_attn_backend().is_draft_worker
-        and not dsa_use_prefill_cp(forward_batch)
-        and forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_target_verify()
     )
 
 

@@ -21,6 +21,8 @@ Usage:
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -28,6 +30,7 @@ from sglang.srt import runtime_context as rc
 from sglang.srt.hardware_backend.npu import dcp_extend_gather
 from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     DCP_EXTEND_QUERY_GATHER_MAX_TOKENS,
+    build_dcp_extend_gather_plan,
     dcp_extend_gather_buffer,
     dcp_extend_gathers_kv,
     plan_dcp_extend_gather,
@@ -280,6 +283,51 @@ class TestDcpExtendGathersKv(CustomTestCase):
         self.assertFalse(dcp_extend_gathers_kv(prefix, tail, **self.GLM52))
         tail = [DCP_EXTEND_QUERY_GATHER_MAX_TOKENS + 1]
         self.assertTrue(dcp_extend_gathers_kv(prefix, tail, **self.GLM52))
+
+
+class TestBuildDcpExtendGatherPlanDecides(CustomTestCase):
+    """``build_dcp_extend_gather_plan`` is the one place a forward picks the KV
+    gather; every layer only tests its result for None. Target verify and DSA
+    prefill CP must get None, and a target-verify batch may carry no
+    ``extend_seq_lens_cpu``, so planning one anyway crashes metadata init."""
+
+    def _batch(self, *, extend=True, target_verify=False, extend_lens=(3,)):
+        mode = SimpleNamespace(
+            is_extend=lambda: extend,
+            is_target_verify=lambda: target_verify,
+            is_context_parallel_extend=lambda: False,
+        )
+        return SimpleNamespace(
+            forward_mode=mode,
+            attn_cp_metadata=None,
+            extend_prefix_lens_cpu=[16],
+            extend_seq_lens_cpu=None if extend_lens is None else list(extend_lens),
+        )
+
+    def _build(self, batch, prefill_cp=False):
+        # dsa_use_prefill_cp reads server-wide CP state no CPU test sets up.
+        with (
+            rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=0),
+            patch.object(
+                dcp_extend_gather, "dsa_use_prefill_cp", return_value=prefill_cp
+            ),
+        ):
+            return build_dcp_extend_gather_plan(
+                batch, interleave_size=4, device=torch.device("cpu")
+            )
+
+    def test_a_plain_extend_gets_a_plan(self):
+        self.assertIsNotNone(self._build(self._batch()))
+
+    def test_target_verify_gets_none_without_reading_extend_lens(self):
+        batch = self._batch(target_verify=True, extend_lens=None)
+        self.assertIsNone(self._build(batch))
+
+    def test_a_forward_that_is_not_an_extend_gets_none(self):
+        self.assertIsNone(self._build(self._batch(extend=False, extend_lens=None)))
+
+    def test_dsa_prefill_cp_gets_none(self):
+        self.assertIsNone(self._build(self._batch(), prefill_cp=True))
 
 
 class TestDcpExtendGatherBuffer(CustomTestCase):
