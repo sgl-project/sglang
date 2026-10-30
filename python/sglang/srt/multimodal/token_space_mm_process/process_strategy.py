@@ -60,6 +60,9 @@ class TokenSpaceProcessStrategy:
     video_preprocessing_device: str | None = None
     # False decodes JPEGs with PIL even on CUDA; nvJPEG pixels differ from PIL's.
     gpu_image_decode: bool = True
+    # True loads PIL images with smart_to_rgb: EXIF rotation, and transparent
+    # pixels laid on a background chosen from the image edges.
+    smart_rgb_conversion: bool = False
 
     def __init__(self, hf_config, processor, *, mm_process_config=None):
         # `processor` is the shared original; read config from it here, never keep it.

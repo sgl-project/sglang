@@ -38,6 +38,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             {
                 "strategy_class": strategy_class,
                 "gpu_image_decode": strategy_class.gpu_image_decode,
+                "smart_rgb_conversion": strategy_class.smart_rgb_conversion,
             },
         )
 
