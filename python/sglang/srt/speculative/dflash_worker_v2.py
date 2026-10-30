@@ -597,6 +597,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_index_cap: int = 0
         self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
         self._fused_kv_helper: Optional[object] = None
+        # Side stream for the verify step's context projection; see
+        # _start_ctx_projection. Created on first use so a server that never
+        # verifies, or runs with the flag off, does not pay for a stream.
+        self._overlap_ctx_projection = (
+            bool(getattr(server_args, "speculative_overlap_ctx_projection", False))
+            and is_cuda()
+        )
+        self._ctx_proj_stream: Optional[torch.cuda.Stream] = None
+        self._ctx_proj_pending: Optional[
+            Tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
+        ] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
@@ -1819,6 +1830,73 @@ class DFlashWorkerV2(BaseSpecWorker):
         physical ids for a fused draft, the virtual ids for a private one."""
         return plan.write_ids(self.draft_model_runner.runner_ids)
 
+    def _start_ctx_projection(self, target_hidden: torch.Tensor) -> None:
+        """Issue the verify step's context projection on a side stream.
+
+        ``project_target_hidden`` reads only the verify hidden states, but the worker
+        calls it after accept and sampling, which read only the logits. Issuing it here,
+        as soon as the verify forward returns, lets the two run concurrently;
+        ``_take_ctx_projection`` joins the side stream where the result is first needed.
+
+        Same call on the same tensor, so the result is unchanged. A capture, a missing
+        stream or any failure leaves nothing pending and the stock call runs.
+        """
+        if not self._overlap_ctx_projection:
+            return
+        if target_hidden is None or target_hidden.numel() == 0:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if self._ctx_proj_stream is None:
+            self._ctx_proj_stream = torch.cuda.Stream(device=self.device)
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self.device))
+        try:
+            with (
+                torch.cuda.stream(self._ctx_proj_stream),
+                torch.inference_mode(),
+                draft_tp_context(self.draft_parallel_layout),
+            ):
+                self._ctx_proj_stream.wait_event(ready)
+                # The side stream reads a buffer the worker's stream produced and
+                # allocated; it must be held until the side work is done.
+                target_hidden.record_stream(self._ctx_proj_stream)
+                projected = self.draft_model.project_target_hidden(target_hidden)
+                done = torch.cuda.Event()
+                done.record(self._ctx_proj_stream)
+        except Exception as e:
+            logger.warning(
+                "DFLASH side-stream context projection failed; "
+                "falling back to the inline projection: %s",
+                e,
+            )
+            self._overlap_ctx_projection = False
+            self._ctx_proj_pending = None
+            return
+        self._ctx_proj_pending = (target_hidden, projected, done)
+
+    def _take_ctx_projection(
+        self, target_hidden: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """The pending projection of ``target_hidden``, after joining the side stream.
+
+        The match is by identity: the pending result belongs to the exact tensor
+        ``_start_ctx_projection`` was given. Any other tensor gets None and is projected
+        inline, but the join still happens, so the side stream is never left reading a
+        buffer the next verify replay is free to overwrite.
+        """
+        pending = self._ctx_proj_pending
+        if pending is None:
+            return None
+        self._ctx_proj_pending = None
+        started, projected, done = pending
+        current = torch.cuda.current_stream(self.device)
+        current.wait_event(done)
+        projected.record_stream(current)
+        if started is not target_hidden:
+            return None
+        return projected
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1927,7 +2005,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             torch.inference_mode(),
             draft_tp_context(self.draft_parallel_layout),
         ):
-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            ctx_hidden = self._take_ctx_projection(target_hidden)
+            if ctx_hidden is None:
+                ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
             if self.lilicorr is not None:
                 self._lilicorr_anchor = publish_anchor(
                     draft_sampler=self._draft_sampler,
@@ -2903,6 +2983,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+        # The draft KV write below needs these hidden states projected, and nothing
+        # between here and there reads them. Start that work now so it overlaps the
+        # logits path; _take_ctx_projection joins it at the write.
+        self._start_ctx_projection(logits_output.hidden_states)
         target_predict = None
         target_lp = self._target_logits_processor
         if target_lp is not None and target_lp.is_deferred_shard(
