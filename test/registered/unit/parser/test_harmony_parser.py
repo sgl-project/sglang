@@ -110,6 +110,15 @@ class TestCanonicalStrategy(CustomTestCase):
     def setUp(self):
         self.strategy = CanonicalStrategy()
 
+    def test_empty_post_call_text_does_not_start_prefix_match(self):
+        """An empty normal event must not become a commentary prefix."""
+        self.strategy._filter_commentary_after_call = True
+
+        self.assertEqual(self.strategy._filter_post_call_text(""), [])
+        self.assertEqual(self.strategy._partial_commentary, "")
+        events = self.strategy._filter_post_call_text("Compare")
+        self.assertEqual([event.content for event in events], ["Compare"])
+
     def test_extract_channel_type(self):
         """Test _extract_channel_type method."""
         self.assertEqual(self.strategy._extract_channel_type("analysis"), "analysis")
@@ -356,6 +365,77 @@ class TestHarmonyParser(CustomTestCase):
         self.assertEqual(tool_events[0].content, '{"location":"SF"}')
         self.assertEqual(tool_events[1].content, '{"location":"NYC"}')
         self.assertEqual(normal_events[0].content, "Done")
+
+    def test_streamed_answer_prefix_after_final_header_is_preserved(self):
+        """A post-tool answer is not commentary filler once its block starts."""
+        parser = HarmonyParser()
+        head = (
+            "<|channel|>commentary to=functions.get_weather<|message|>"
+            '{"city":"SF"}<|call|>'
+            "<|start|>assistant<|channel|>final<|message|>"
+        )
+        events = []
+        for chunk in [head, "Co", "mpare prices.", "<|return|>"]:
+            events.extend(parser.parse(chunk))
+        events.extend(parser.finish())
+
+        normal_text = "".join(
+            event.content for event in events if event.event_type == "normal"
+        )
+        self.assertEqual(normal_text, "Compare prices.")
+
+    def test_partial_filler_prefix_is_flushed_at_structure_boundary(self):
+        """A prefix that cannot finish before the next block stays visible."""
+        parser = HarmonyParser()
+        tool_call = (
+            "<|channel|>commentary to=functions.get_weather<|message|>"
+            '{"city":"SF"}<|call|>'
+        )
+        events = []
+        for chunk in [
+            tool_call,
+            "comment",
+            "<|start|>assistant<|channel|>final<|message|>Done<|return|>",
+        ]:
+            events.extend(parser.parse(chunk))
+
+        normal_text = "".join(
+            event.content for event in events if event.event_type == "normal"
+        )
+        self.assertEqual(normal_text, "commentDone")
+
+    def test_partial_filler_prefix_is_flushed_at_stream_end(self):
+        """A stream ending on a strict filler prefix must not lose its text."""
+        parser = HarmonyParser()
+        tool_call = (
+            "<|channel|>commentary to=functions.get_weather<|message|>"
+            '{"city":"SF"}<|call|>'
+        )
+        events = parser.parse(tool_call)
+        events.extend(parser.parse("Co"))
+        events.extend(parser.finish())
+
+        normal_text = "".join(
+            event.content for event in events if event.event_type == "normal"
+        )
+        self.assertEqual(normal_text, "Co")
+
+    def test_commentary_word_after_final_header_is_content(self):
+        """The filler filter must stop at the next Harmony structural token."""
+        parser = HarmonyParser()
+        head = (
+            "<|channel|>commentary to=functions.get_weather<|message|>"
+            '{"city":"SF"}<|call|>'
+            "<|start|>assistant<|channel|>final<|message|>"
+        )
+        events = []
+        for chunk in [head, "commentary", "<|return|>"]:
+            events.extend(parser.parse(chunk))
+
+        normal_text = "".join(
+            event.content for event in events if event.event_type == "normal"
+        )
+        self.assertEqual(normal_text, "commentary")
 
     def test_repetitive_tool_calls_with_commentary_filler(self):
         """Test handling of repetitive tool calls with 'commentary' filler text."""
