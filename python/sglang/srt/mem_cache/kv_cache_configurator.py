@@ -125,20 +125,31 @@ logger = logging.getLogger(__name__)
 
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
-    """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries."""
+    """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries.
+
+    Skip-topk layers build no Indexer, so the forward never writes their index-K.
+    """
+    if is_draft_worker or envs.SGLANG_DISABLE_DSA_INDEXK_ELISION.get():
+        return False
+
     memory_config = get_memory()
+    disaggregation_mode = get_disagg().disaggregation_mode
+
     # Ascend PD slices the KV list positionally (index-K rides in it, not in
     # StateType.DSA), so a compact layout would mis-slice PP>1 against PP=1.
-    if _is_npu and get_disagg().disaggregation_mode != "null":
+    if _is_npu and disaggregation_mode != "null":
         return False
     # The NPU HiCache host pool has no compact index-K layout.
     if _is_npu and memory_config.enable_hierarchical_cache:
         return False
-    return (
-        not memory_config.enable_hisparse
-        and not is_draft_worker
-        and not memory_config.enable_unified_cache_external_linker
-    )
+    # The external linker hands rows to an out-of-tree owner assuming dense layout.
+    if memory_config.enable_unified_cache_external_linker:
+        return False
+
+    if not memory_config.enable_hisparse:
+        return True
+    # HiSparse only elides on a PD decode engine: A single-engine or prefill worker keeps the full index-K.
+    return disaggregation_mode == "decode"
 
 
 _is_hip = is_hip()

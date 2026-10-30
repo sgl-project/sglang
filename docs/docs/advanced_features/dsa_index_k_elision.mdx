@@ -1,0 +1,64 @@
+---
+title: "DSA Index-K Elision for Shared-Index Layers"
+metatags:
+    description: "Reclaim the index-K cache of DSA layers that reuse another layer's top-k selection, raising decode capacity for HiSparse, HiCache, and single-engine serving."
+---
+
+Some DeepSeek Sparse Attention (DSA) models share one top-k selection across several layers. GLM-5.2 is an example: its IndexShare pattern runs the indexer on an anchor layer and lets the following "skip" layers reuse the anchor's top-k (`index_topk_freq` / `index_topk_pattern`). A skip layer builds no indexer, so its index-K cache is never written or read. SGLang gives those layers a zero-row index-K buffer and spends the reclaimed memory on more KV tokens, which raises the maximum decode batch size.
+
+The optimization is on by default. It does not change model outputs.
+
+## When elision applies
+
+Elision applies to the target model's KV pool only. The MTP / NextN draft pool always keeps a full indexer.
+
+| Deployment | Elided? |
+|---|---|
+| Single engine, no HiSparse | Yes |
+| PD prefill or decode, no HiSparse | Yes |
+| Hierarchical cache (`--enable-hierarchical-cache`), no HiSparse | Yes |
+| PD decode with HiSparse (`--enable-hisparse`) | Yes |
+| Single engine or PD prefill with HiSparse | No |
+| MTP / NextN draft pool | No |
+| `--enable-unified-cache-external-linker` | No |
+| Ascend NPU with PD, or Ascend NPU with hierarchical cache | No |
+
+HiSparse is the one case that depends on the PD role. A HiSparse prefill peer still runs the indexer on every layer and writes its own index-K, so only the decode engine can drop the rows.
+
+Elision needs no change to the PD transfer protocol. A skip layer's buffer is zero bytes, so the RDMA path never registers a memory region for it and the sender drops the matching transfer entry. The hierarchical-cache host (L2) index-K pool is likewise packed: it allocates one host layer per indexer-owning device layer and maps device layer ids onto those compact slots.
+
+## Memory impact
+
+The saving is proportional to the fraction of skip layers. For GLM-5.2 (78 layers, 21 with an indexer, FP8 KV cache) the per-token cost of the device KV pool is `78 × 656 B` of latent KV plus `132 B` per indexer-owning layer:
+
+| Pool | Elision off | Elision on | Change |
+|---|---|---|---|
+| Plain DSA or HiCache decode | 51,168 + 78 × 132 = 61,464 B | 51,168 + 21 × 132 = 53,940 B | +14% tokens |
+| HiSparse decode, `host_to_device_ratio=10` | 51,168 + 78 × 132 × 10 = 154,128 B | 51,168 + 21 × 132 × 10 = 78,888 B | +95% tokens |
+
+HiSparse stores index-K at logical (host) capacity on the device, so its saving is multiplied by `host_to_device_ratio`. The host pool holds `max_total_num_tokens × host_to_device_ratio` tokens, so decode concurrency is bounded by that capacity divided by each request's `input_len + output_len`, and it grows by the same factor as the pool.
+
+<Note>
+HiSparse keeps the full KV of every request in host memory, so doubling the device pool also doubles the host memory requirement. Size `host_to_device_ratio` against your host RAM; see the [HiSparse guide](./hisparse_guide).
+</Note>
+
+## Disabling elision
+
+Set the kill-switch on the engine whose pool you want to keep full, typically the decode instance:
+
+```bash
+SGLANG_DISABLE_DSA_INDEXK_ELISION=1 python3 -m sglang.launch_server ...
+```
+
+Use it for A/B comparisons or to roll back. The prefill instance needs no change in either case.
+
+## Measured results
+
+GLM-5.2 NVFP4 on 8× RTX PRO 6000 (SM120), TP8 / PP1, PD disaggregation with HiSparse on the decode engine, `host_to_device_ratio=10`, `device_buffer_size=4096`, shared-index prefetch off, decode `--mem-fraction-static 0.90`, prefill `0.80`, 128K input, 2,000 output tokens, full prefix hit on the prefill engine. Batch size is the largest offered concurrency the decode pool admits without retraction. Latencies are sampled after the client's initial burst has drained, so they reflect steady state. These numbers come from a `--pp-size 1` deployment; elision itself does not depend on the pipeline-parallel degree.
+
+| Arm | Device pool tokens | Batch size | Output throughput | Per-GPU throughput | TPOT |
+|---|---|---|---|---|---|
+| Elision off | 206,144 | 15 | 325.7 tok/s | 40.7 tok/s | 45.5 ms |
+| Elision on | 402,752 | 30 | 436.5 tok/s | 54.6 tok/s | 67.1 ms |
+
+The pool grows by 1.954×, which matches the per-token cost ratio 154,128 / 78,888 above. Serving twice the concurrent requests on the same GPUs trades per-request latency for aggregate throughput: output throughput rises 34% while TPOT rises 48% (45.5 → 67.1 ms). Pick the arm that matches your latency budget; the kill-switch above restores the smaller pool.
