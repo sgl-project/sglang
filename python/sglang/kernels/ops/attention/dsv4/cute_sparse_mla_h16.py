@@ -126,7 +126,7 @@ def _resolve_rows(
             cutlass.min(s_kv - row_raw, cutlass.Int32(1)), cutlass.Int32(0)
         )
         ok = prefix_ok * lower_ok * upper_ok
-        row = row_raw * ok
+        row = cutlass.Int64(row_raw * ok)
         smask_ptr[n] = ok.to(cutlass.Float32)
 
         # cp.async predication zero-fills the shared-memory destination for an
@@ -343,7 +343,8 @@ def _kernel(
     bidx, _, _ = cute.arch.block_idx()
     # Reverse query order to retain the benchmark kernel's launch behaviour;
     # unlike the old kernel, this value is not used as a causal KV position.
-    qpos = cutlass.Int32(tq - 1) - cutlass.Int32(bidx)
+    # Widen before multiplying Q, index, and output row strides.
+    qpos = cutlass.Int64(tq - 1) - cutlass.Int64(bidx)
     g8 = tidx // 8
     k8 = tidx % 8
 

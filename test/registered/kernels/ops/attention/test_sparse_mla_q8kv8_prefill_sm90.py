@@ -816,5 +816,42 @@ def test_native_h16_matches_torch_reference(monkeypatch):
     torch.testing.assert_close(actual.float(), expected, atol=1e-3, rtol=1e-2)
 
 
+@pytest.mark.skipif(not _sm90_available(), reason="native H16 prefill requires SM90")
+@pytest.mark.parametrize("heads,topk", [(64, 128), (16, 8192)])
+@torch.inference_mode()
+def test_native_h16_int64_offsets(heads, topk, monkeypatch):
+    from sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16 import (
+        cute_sparse_mla_h16_fwd,
+    )
+
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    q, kv, indices, scale, qs, ks, sink, lengths = _make_case(
+        512, True, s_q=2, topk=topk, s_kv=2
+    )
+    q, kv = q[:, :heads].bfloat16().contiguous(), kv[:2].bfloat16()
+    indices[:, :, :2] = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    lengths.fill_(2)
+    expected = _torch_sparse_attention_ref(
+        q[:, :16], kv, indices, scale, qs, ks, sink[:16], lengths
+    )[0]
+
+    # Cross signed-int32 element offsets for Q (both cases), indices/output
+    # (H16/TOPK8192), and KV. Only the two boundary queries attend to KV.
+    s_q, s_kv = (1 << 31) // (heads * 512) + 1, (1 << 31) // 512 + 1
+    large_q = torch.zeros((s_q, heads, 512), dtype=q.dtype, device="cuda")
+    large_kv = torch.empty((s_kv, 512), dtype=kv.dtype, device="cuda")
+    large_indices = torch.full((s_q, topk), -1, dtype=torch.int32, device="cuda")
+    large_lengths = torch.zeros(s_q, dtype=torch.int32, device="cuda")
+    large_q[-2:] = q
+    large_kv[-2:] = kv.squeeze(1)
+    large_indices[-2:, :2] = indices[:, 0, :2] + s_kv - 2
+    large_lengths[-2:] = lengths
+    actual = cute_sparse_mla_h16_fwd(
+        large_q, large_kv, large_indices, large_lengths, sink, scale
+    )
+    torch.testing.assert_close(actual[-2:].float(), expected, atol=1e-3, rtol=1e-2)
+    assert torch.count_nonzero(actual[:-2]).item() == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
