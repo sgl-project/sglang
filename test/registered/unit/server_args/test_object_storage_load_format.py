@@ -1,4 +1,4 @@
-"""Object-store metadata preparation must preserve an explicit MX loader."""
+"""Object-store metadata preparation is independent of the weight loader."""
 
 import unittest
 from unittest import mock
@@ -37,14 +37,11 @@ class TestObjectStorageLoadFormat(unittest.TestCase):
                 self.assertEqual(cfg.modelexpress_config, '{"transport":"nixl"}')
                 self.assertEqual(cfg.model_path, uri)
 
-    def test_other_object_storage_loaders_keep_streamer_default(self):
+    def test_object_storage_uses_streamer_only_for_auto(self):
         for load_format, backend in (
             ("auto", "nccl"),
             ("auto", "modelexpress"),
-            ("runai_streamer", "modelexpress"),
-            ("safetensors", "nccl"),
-            ("remote_instance", "nccl"),
-            ("remote_instance", "transfer_engine"),
+            ("auto", "transfer_engine"),
         ):
             with self.subTest(load_format=load_format, backend=backend):
                 args = ServerArgs(
@@ -58,8 +55,95 @@ class TestObjectStorageLoadFormat(unittest.TestCase):
                     return_value=False,
                 ):
                     handle_load_format(args)
-
                 self.assertEqual(resolving_view(args).load_format, "runai_streamer")
+
+    def test_object_storage_preserves_explicit_weight_formats(self):
+        for load_format, backend in (
+            ("runai_streamer", "modelexpress"),
+            ("safetensors", "nccl"),
+            ("dummy", "nccl"),
+            ("remote", "nccl"),
+        ):
+            with self.subTest(load_format=load_format, backend=backend):
+                args = ServerArgs(
+                    model_path="s3://bucket/model",
+                    load_format=load_format,
+                    remote_instance_weight_loader_backend=backend,
+                    device="cuda",
+                )
+                handle_load_format(args)
+
+                self.assertEqual(resolving_view(args).load_format, load_format)
+
+    def test_object_storage_preserves_configured_remote_backends(self):
+        for backend in ("nccl", "transfer_engine", "modelexpress"):
+            with self.subTest(backend=backend):
+                args = ServerArgs(
+                    model_path="s3://bucket/model",
+                    load_format="remote_instance",
+                    remote_instance_weight_loader_backend=backend,
+                    remote_instance_weight_loader_seed_instance_ip="127.0.0.1",
+                    remote_instance_weight_loader_seed_instance_service_port=30000,
+                    remote_instance_weight_loader_send_weights_group_ports=[5000],
+                    speculative_draft_model_path="s3://bucket/draft",
+                    device="cuda",
+                )
+                # Only hardware/package availability is replaced; the real
+                # backend validation and loader resolution both execute.
+                with mock.patch(
+                    "sglang.srt.arg_groups.model_path_hook.importlib.util.find_spec",
+                    return_value=object(),
+                ):
+                    handle_load_format(args)
+                cfg = resolving_view(args)
+                self.assertEqual(cfg.load_format, "remote_instance")
+                self.assertEqual(cfg.remote_instance_weight_loader_backend, backend)
+                self.assertIsNone(cfg.speculative_draft_load_format)
+
+    def test_invalid_remote_configuration_resolves_object_storage_default(self):
+        for backend, missing in (
+            ("nccl", "remote_instance_weight_loader_seed_instance_ip"),
+            ("nccl", "remote_instance_weight_loader_seed_instance_service_port"),
+            ("nccl", "remote_instance_weight_loader_send_weights_group_ports"),
+            ("transfer_engine", "remote_instance_weight_loader_seed_instance_ip"),
+            (
+                "transfer_engine",
+                "remote_instance_weight_loader_seed_instance_service_port",
+            ),
+        ):
+            with self.subTest(backend=backend, missing=missing):
+                settings = dict(
+                    model_path="s3://bucket/model",
+                    load_format="remote_instance",
+                    remote_instance_weight_loader_backend=backend,
+                    remote_instance_weight_loader_seed_instance_ip="127.0.0.1",
+                    remote_instance_weight_loader_seed_instance_service_port=30000,
+                    remote_instance_weight_loader_send_weights_group_ports=[5000],
+                    speculative_draft_model_path="s3://bucket/draft",
+                    device="cuda",
+                )
+                settings[missing] = None
+                args = ServerArgs(**settings)
+                handle_load_format(args)
+                cfg = resolving_view(args)
+                self.assertEqual(cfg.load_format, "runai_streamer")
+                self.assertIsNone(cfg.speculative_draft_load_format)
+
+    def test_unavailable_transfer_engine_resolves_object_storage_default(self):
+        args = ServerArgs(
+            model_path="s3://bucket/model",
+            load_format="remote_instance",
+            remote_instance_weight_loader_backend="transfer_engine",
+            remote_instance_weight_loader_seed_instance_ip="127.0.0.1",
+            remote_instance_weight_loader_seed_instance_service_port=30000,
+            device="cuda",
+        )
+        with mock.patch(
+            "sglang.srt.arg_groups.model_path_hook.importlib.util.find_spec",
+            return_value=None,
+        ):
+            handle_load_format(args)
+        self.assertEqual(resolving_view(args).load_format, "runai_streamer")
 
     def test_local_modelexpress_selection_is_unchanged(self):
         args = ServerArgs(
@@ -81,7 +165,7 @@ class TestObjectStorageLoadFormat(unittest.TestCase):
         handle_load_format(args)
         self.assertEqual(resolving_view(args).load_format, "remote")
 
-    def test_remote_connector_target_keeps_streamer_for_object_storage_draft(self):
+    def test_object_storage_draft_inherits_remote_connector_target(self):
         args = ServerArgs(
             model_path="redis://host:6379/model",
             load_format="remote_instance",
@@ -92,11 +176,12 @@ class TestObjectStorageLoadFormat(unittest.TestCase):
         handle_load_format(args)
         cfg = resolving_view(args)
         self.assertEqual(cfg.load_format, "remote")
-        self.assertEqual(cfg.speculative_draft_load_format, "runai_streamer")
+        self.assertIsNone(cfg.speculative_draft_load_format)
 
     def test_object_storage_draft_inherits_modelexpress_unless_explicit(self):
         for draft_format, expected in (
             (None, None),
+            ("auto", "runai_streamer"),
             ("remote_instance", "remote_instance"),
             ("runai_streamer", "runai_streamer"),
             ("dummy", "dummy"),
@@ -126,7 +211,7 @@ class TestObjectStorageLoadFormat(unittest.TestCase):
         handle_load_format(args)
         self.assertIsNone(resolving_view(args).speculative_draft_load_format)
 
-    def test_object_storage_draft_keeps_streamer_without_modelexpress_target(self):
+    def test_object_storage_draft_inherits_explicit_weight_format(self):
         args = ServerArgs(
             model_path="/local/model",
             load_format="safetensors",
@@ -134,9 +219,23 @@ class TestObjectStorageLoadFormat(unittest.TestCase):
             device="cuda",
         )
         handle_load_format(args)
-        self.assertEqual(
-            resolving_view(args).speculative_draft_load_format, "runai_streamer"
+        self.assertIsNone(resolving_view(args).speculative_draft_load_format)
+
+    def test_object_storage_draft_auto_uses_streamer_for_local_auto_target(self):
+        args = ServerArgs(
+            model_path="/local/model",
+            load_format="auto",
+            speculative_draft_model_path="s3://bucket/draft",
+            device="cuda",
         )
+        with mock.patch(
+            "sglang.srt.arg_groups.model_path_hook.is_mistral_native_format",
+            return_value=False,
+        ):
+            handle_load_format(args)
+        cfg = resolving_view(args)
+        self.assertEqual(cfg.load_format, "auto")
+        self.assertEqual(cfg.speculative_draft_load_format, "runai_streamer")
 
     def test_modelexpress_still_prepares_metadata_once_per_uri(self):
         uri = "s3://bucket/model"
