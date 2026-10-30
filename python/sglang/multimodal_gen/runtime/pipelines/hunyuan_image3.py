@@ -8,6 +8,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from transformers import AutoTokenizer
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
+from sglang.multimodal_gen.configs.attention_roles import AttentionRole
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
@@ -48,7 +49,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
     HunyuanImage3AR,
     HunyuanImage3DecodingStage,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_hf_config,
@@ -340,13 +344,25 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             load_dict(os.path.join(model_path, "generation_config.json"))["flow_shift"]
         )
 
-    def create_pipeline_stages(self, server_args: ServerArgs):
-        transformer_attn_backend, _ = server_args.resolve_component_attention_backend(
-            "transformer"
+    @staticmethod
+    def _resolve_transformer_self_attn_backend(server_args: ServerArgs) -> str:
+        # The self-attention role override outranks the component-wide and global
+        # backends; FA3 segments only replace self-attention.
+        backend = server_args.resolve_component_backend_by_role("transformer").get(
+            AttentionRole.SELF
         )
-        if transformer_attn_backend is None:
-            transformer_attn_backend = server_args.attention_backend
-        transformer_attn_backend = str(transformer_attn_backend).lower()
+        if backend is None:
+            backend, _ = server_args.resolve_component_attention_backend("transformer")
+        if backend is None:
+            backend = server_args.attention_backend
+        if isinstance(backend, AttentionBackendEnum):
+            backend = backend.name
+        return str(backend).lower()
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        transformer_attn_backend = self._resolve_transformer_self_attn_backend(
+            server_args
+        )
 
         self.add_stage(
             HunyuanImage3AR(
