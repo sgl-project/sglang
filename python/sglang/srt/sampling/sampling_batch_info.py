@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import operator
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -17,6 +18,7 @@ from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.core import build_watermark_batch_config
+from sglang.srt.utils import speculative_decode_resources as spec_decode_resources
 from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -679,7 +681,16 @@ class SamplingBatchInfo:
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
+        if spec_decode_resources.enabled() and type(self) is SamplingBatchInfo:
+            new = object.__new__(SamplingBatchInfo)
+            new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
+            new.penalizer_orchestrator = None
+            return new
         return dataclasses.replace(self, penalizer_orchestrator=None)
+
+
+_FIELD_NAMES = tuple(f.name for f in dataclasses.fields(SamplingBatchInfo))
+_FIELD_GETTER = operator.itemgetter(*_FIELD_NAMES)
 
 
 def merge_bias_tensor(

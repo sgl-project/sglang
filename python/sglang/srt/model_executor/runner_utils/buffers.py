@@ -33,6 +33,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.utils import speculative_decode_resources as spec_decode_resources
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
@@ -48,6 +49,13 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
                 dst.copy_(src)
 
     if dsts and dsts[0].is_cuda:
+        if spec_decode_resources.enabled():
+            from sglang.kernels.ops.memory.small_field_copy import (
+                cached_small_field_copy,
+            )
+
+            if cached_small_field_copy(dsts, srcs):
+                return
         from sglang.kernels.ops.memory.small_copy import try_small_copy
 
         if try_small_copy(dsts, srcs):

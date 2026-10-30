@@ -65,9 +65,16 @@ def get_alloc_reserve_per_decode() -> int:
     """KV length reserved per request at each decode step.
 
     The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
-    mode; see eagle_utils.eagle_prepare_for_decode.
+    mode; see eagle_utils.eagle_prepare_for_decode. Preparing the subsequent
+    NVIDIA EAGLE round reserves a third window.
     """
-    return 2 * get_alloc_len_per_decode()
+    from sglang.srt.speculative.prepared_next_draft import (
+        prepared_next_draft_reserve_enabled,
+    )
+
+    prepares_next_round = prepared_next_draft_reserve_enabled()
+    windows = 3 if prepares_next_round else 2
+    return windows * get_alloc_len_per_decode()
 
 
 def page_aligned_decode_alloc_lens(
@@ -106,10 +113,19 @@ def get_req_to_token_extra_context_len() -> int:
     page_size = get_alloc_page_size()
     spec_algorithm = get_spec().speculative_algorithm
     if spec_algorithm is not None:
+        from sglang.srt.speculative.prepared_next_draft import (
+            prepared_next_draft_reserve_enabled,
+        )
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         spec_algo = SpeculativeAlgorithm.from_string(spec_algorithm)
-        if page_size > 1 or spec_algo.is_uno():
+        if prepared_next_draft_reserve_enabled():
+            # Pools are sized before the stager is constructed. Price the
+            # maximum eligible three-window layout here; the live allocator
+            # switches to it only after the stager is published.
+            reserve = 3 * get_alloc_len_per_decode()
+            extra = max(extra, reserve + page_size - 1)
+        elif page_size > 1 or spec_algo.is_uno():
             # UNO's double-buffer reserve applies at every page size. Larger
             # pages may additionally round the allocation up by page_size - 1.
             extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)

@@ -208,7 +208,11 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
-                exchange = get_shm_exchange(tp_group.cpu_group, "recv")
+                exchange = get_shm_exchange(
+                    group=tp_group.cpu_group,
+                    kind="recv",
+                    multihost=envs.SGLANG_Q35MF_EDGE_SHM_SYNC_MULTIHOST.get(),
+                )
                 if exchange is not None:
                     recv_reqs = _broadcast_via_exchange(
                         recv_reqs, exchange=exchange, tp_group=tp_group

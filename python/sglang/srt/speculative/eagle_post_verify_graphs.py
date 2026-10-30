@@ -14,6 +14,11 @@ import torch
 
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.environ import envs
+from sglang.srt.speculative import prepared_next_draft
+from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    make_post_verify_io,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -43,13 +48,73 @@ class EaglePostVerifyGraphs:
     """The verify's post-section in SGLang's own CUDA graphs, one set per key: batch
     size, sampling mode, forced acceptance, tracking and the verify logits buffer."""
 
-    def __init__(self, *, target_worker: Any, simulated_acc_len_rng: torch.Generator):
+    def __init__(
+        self,
+        *,
+        target_worker: Any,
+        simulated_acc_len_rng: torch.Generator,
+        speculative_runtime_hooks: Any = STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    ):
         self._target_worker = target_worker
+        self._speculative_runtime_hooks = speculative_runtime_hooks
+        self._prepare_next_draft = prepared_next_draft.prepared_next_draft_enabled()
+        # Preparing the next draft also lets this launch produce the draft-extend
+        # layout and the bonus token in the dtype its next consumers read.
+        self._extend_layout = self._prepare_next_draft
+        self._extend_mrope = (
+            self._extend_layout
+            and target_worker.model_runner.model_config.model_is_mrope
+        )
+        self._bonus_dtype = torch.int64 if self._prepare_next_draft else torch.int32
         self._graphs = _PostVerifyGraphs(
             body=self._body,
             commit=self._commit,
             sim_rng=simulated_acc_len_rng,
+            protect_prepared_seq_lens=self._prepare_next_draft,
         )
+        self._next_draft_producer: Optional[
+            prepared_next_draft.PreparedNextDraftProducer
+        ] = None
+        self.prepared_next_draft = None
+
+    def enable_prepared_next_draft(
+        self,
+        *,
+        num_steps: int,
+        window: int,
+        seq_len_fill_value: int,
+        mrope: bool,
+        req_to_token: torch.Tensor,
+        runner_buffers: Any,
+        capture_sizes,
+    ) -> None:
+        """Bind one producer shared by graph replays and eager verify rounds."""
+        if not self._prepare_next_draft:
+            return
+        self._next_draft_producer = prepared_next_draft.PreparedNextDraftProducer(
+            num_steps=num_steps,
+            window_size=window,
+            seq_len_fill_value=seq_len_fill_value,
+            with_mrope=mrope,
+            req_to_token=req_to_token,
+            runner_buffers=runner_buffers,
+            capture_sizes=capture_sizes,
+        )
+
+    def prepare_next_eager(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        scheduler_sequence_lengths: torch.Tensor,
+    ) -> None:
+        """Publish the eager equivalent of the captured next-round producer."""
+        self.prepared_next_draft = None
+        producer = self._next_draft_producer
+        if producer is not None:
+            self.prepared_next_draft = producer.prepare_eager(
+                req_pool_indices=req_pool_indices,
+                scheduler_sequence_lengths=scheduler_sequence_lengths,
+            )
 
     def run(
         self,
@@ -65,12 +130,13 @@ class EaglePostVerifyGraphs:
         sampling and commit run eagerly. max_top_k: the compact top-k branch's
         support (compact_verify_max_top_k), None for the dense branch."""
         self.join()
+        self.prepared_next_draft = None
         key = self._key(
             batch, verify_input, logits_output, can_run_cuda_graph, max_top_k
         )
         if key is None:
             return None
-        return self._graphs.run(
+        outputs = self._graphs.run(
             key=key,
             inputs=_post_verify_inputs(batch, verify_input),
             make_slot=lambda staged: self._make_slot(
@@ -78,6 +144,9 @@ class EaglePostVerifyGraphs:
             ),
             sim_max_len=verify_input.max_tree_depth,
         )
+        if outputs is not None:
+            self.prepared_next_draft = self._graphs.last_slot.prepared_next_draft
+        return outputs
 
     def join(self) -> None:
         """Order the current stream after the last side-stream mamba state commit; the
@@ -109,6 +178,11 @@ class EaglePostVerifyGraphs:
             or info.sampling_seed is not None
             or info.need_min_p_sampling
             or (watermark is not None and info.has_watermark_candidates)
+            # compute_spec_logprobs reads the gathered logits off logits_output
+            or (
+                batch.return_logprob
+                and logits_output.next_token_logits_vocab_shard is not None
+            )
         ):
             return None
         return (
@@ -136,7 +210,16 @@ class EaglePostVerifyGraphs:
         from sglang.srt.runtime_context import mamba_track_grid
 
         info = batch.sampling_info
+        producer = self._next_draft_producer
         return SimpleNamespace(
+            prepared_next_draft=(
+                None
+                if producer is None
+                else producer.allocate(
+                    num_requests=len(batch.seq_lens),
+                    device=batch.device,
+                )
+            ),
             num_requests=len(batch.seq_lens),
             tokens_per_request=verify_input.draft_token_num,
             max_tree_depth=verify_input.max_tree_depth,
@@ -144,7 +227,11 @@ class EaglePostVerifyGraphs:
             need_top_k=bool(info.need_top_k_sampling),
             need_top_p=bool(info.need_top_p_sampling),
             max_top_k=max_top_k,
+            sampling_info=info,
+            unused_sampling_tensor=torch.empty(0, device=batch.device),
+            return_logprob=bool(batch.return_logprob),
             logits=logits_output.next_token_logits,
+            vocab_shard=logits_output.next_token_logits_vocab_shard,
             staged=staged,
             device=batch.device,
             forward_mode=batch.forward_mode,
@@ -161,7 +248,9 @@ class EaglePostVerifyGraphs:
         post-verify graph."""
         from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 
-        predict, accept_lens, accept_index = _sample(slot)
+        predict, accept_lens, accept_index = _sample(
+            slot, self._speculative_runtime_hooks
+        )
         new_seq_lens, bonus_tokens, commit_steps, draft_extend_inputs = (
             prepare_verify_commit_outputs(
                 predict,
@@ -170,8 +259,18 @@ class EaglePostVerifyGraphs:
                 slot.staged["seq_lens"],
                 num_draft_tokens=slot.tokens_per_request,
                 mamba_track_interval=slot.track_interval,
+                extend_layout=self._extend_layout,
+                extend_mrope=self._extend_mrope,
+                bonus_dtype=self._bonus_dtype,
             )
         )
+        if slot.prepared_next_draft is not None:
+            producer = self._next_draft_producer
+            slot.prepared_next_draft = producer.prepare(
+                slot.prepared_next_draft,
+                req_pool_indices=slot.staged["req_pool_indices"],
+                scheduler_sequence_lengths=new_seq_lens,
+            )
         return (
             predict,
             accept_lens,
@@ -203,12 +302,13 @@ class EaglePostVerifyGraphs:
         )
 
 
-def _sample(slot: SimpleNamespace) -> tuple:
-    """SGLang's eagle_sample over the slot's staged copies, with the injected
-    acceptance length read on the device."""
-    from sglang.srt.speculative.eagle_utils import eagle_sample
+def _sample(
+    slot: SimpleNamespace, speculative_runtime_hooks: Any
+) -> tuple:
+    """Run post-verify through the same bound strategy as the eager path."""
 
     staged = slot.staged
+    source_info = slot.sampling_info
     sampling_info = SimpleNamespace(
         acc_additive_penalties=None,
         acc_scaling_penalties=None,
@@ -219,17 +319,16 @@ def _sample(slot: SimpleNamespace) -> tuple:
         need_top_k_sampling=slot.need_top_k,
         need_top_p_sampling=slot.need_top_p,
         need_min_p_sampling=False,
-        temperatures=staged.get("temperatures"),
-        top_ks=staged.get("top_ks"),
-        top_ps=staged.get("top_ps"),
-    )
-    batch_view = SimpleNamespace(
-        device=slot.device,
-        forward_mode=slot.forward_mode,
-        seq_lens=staged["seq_lens"],
-        req_pool_indices=staged["req_pool_indices"],
-        sampling_info=sampling_info,
-        return_logprob=False,
+        temperatures=staged.get("temperatures", source_info.temperatures),
+        top_ks=staged.get("top_ks", source_info.top_ks),
+        top_ps=staged.get("top_ps", source_info.top_ps),
+        min_ps=getattr(source_info, "min_ps", slot.unused_sampling_tensor),
+        max_top_k=getattr(source_info, "max_top_k", None),
+        watermark_keys=getattr(source_info, "watermark_keys", None),
+        watermark_context_windows=getattr(
+            source_info, "watermark_context_windows", None
+        ),
+        watermark_enabled=getattr(source_info, "watermark_enabled", None),
     )
     verify_view = SimpleNamespace(
         draft_token=staged["draft_tokens"],
@@ -240,15 +339,32 @@ def _sample(slot: SimpleNamespace) -> tuple:
         retrieve_next_sibling=staged["retrieve_next_sibling"],
         tree_topk=1,
         draft_probs=None,
+        custom_mask=None,
+        positions=None,
     )
-    return eagle_sample(
-        verify_view,
-        batch_view,
-        SimpleNamespace(next_token_logits=slot.logits),
-        uno_target_max_top_k=slot.max_top_k,
-        simulated_acc_len=staged.get("sim_accept_len"),
-        sparse_bonus_argmax=slot.max_top_k is not None,
+    output = speculative_runtime_hooks.post_verify(
+        make_post_verify_io(
+            verify_input=verify_view,
+            sampling_info=sampling_info,
+            sequence_lengths=staged["seq_lens"],
+            request_pool_indices=staged["req_pool_indices"],
+            device=slot.device,
+            logits_output=SimpleNamespace(
+                next_token_logits=slot.logits,
+                next_token_logits_vocab_shard=slot.vocab_shard,
+            ),
+            grammar_mask=None,
+            # Post-verify graph eligibility excludes every watermark round.
+            watermark=None,
+            watermark_full_mask=True,
+            return_logprob=slot.return_logprob,
+            is_idle=False,
+            simulated_accept_length=staged.get("sim_accept_len"),
+            sparse_target_max_top_k=slot.max_top_k,
+            sparse_bonus_argmax=slot.max_top_k is not None,
+        )
     )
+    return output.token_ids, output.accepted_lengths, output.accepted_indices
 
 
 class _PostVerifyGraphs:
@@ -256,8 +372,16 @@ class _PostVerifyGraphs:
     and outputs alternate, so one round's outputs stay valid while the host consumes
     them; the mamba state commit replays on a side stream until join()."""
 
-    def __init__(self, *, body: Callable, commit: Callable, sim_rng: torch.Generator):
+    def __init__(
+        self,
+        *,
+        body: Callable,
+        commit: Callable,
+        sim_rng: torch.Generator,
+        protect_prepared_seq_lens: bool,
+    ):
         self._body, self._commit = body, commit
+        self._protect_prepared_seq_lens = protect_prepared_seq_lens
         # forced acceptance lengths: the worker's one stream, from which SGLang's eager
         # verify draws too; once per round, whatever else uses the global RNG
         self._sim_rng = sim_rng
@@ -270,6 +394,8 @@ class _PostVerifyGraphs:
         self._sim_host: list[torch.Tensor] = []
         self._sim_done: list[Optional[torch.cuda.Event]] = []
         self._sim_turn = 0
+        # the slot of the last run that returned outputs
+        self.last_slot: Optional[SimpleNamespace] = None
 
     def run(
         self, *, key: tuple, inputs: dict, make_slot: Callable, sim_max_len: int
@@ -284,6 +410,12 @@ class _PostVerifyGraphs:
         turn, state.turn = state.turn, state.turn ^ 1
         sim_len, sim_turn = self._draw_sim_len(sim_max_len)
         slot = state.slots[turn]
+        if (
+            self._protect_prepared_seq_lens
+            and slot is not None
+            and slot.graph is not None
+        ):
+            _check_lengths_outlive(slot, inputs["seq_lens"])
         if slot is None:
             staged = {name: src.clone() for name, src in inputs.items()}
             if sim_len is not None:
@@ -298,6 +430,7 @@ class _PostVerifyGraphs:
         self._load(slot, inputs, sim_len)
         if sim_len is not None:
             self._record_sim_done(sim_turn)
+        self.last_slot = slot
         if slot.graph is None:
             if state.warmups < _NUM_WARMUP * 2:
                 state.warmups += 1
@@ -404,6 +537,15 @@ class _PostVerifyGraphs:
         logger.info(
             "Captured the EAGLE post-verify graphs for batch size %d",
             slot.num_requests,
+        )
+
+
+def _check_lengths_outlive(slot: SimpleNamespace, seq_lens: torch.Tensor) -> None:
+    """Reject replaying the slot whose lengths the current round still reads."""
+    if seq_lens.data_ptr() == slot.outputs[3].data_ptr():
+        raise RuntimeError(
+            "The post-verify slot about to replay holds this batch's lengths; "
+            "its readers in this round would see the overwrite"
         )
 
 

@@ -25,6 +25,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
+        GDNFlashInferGraphTables,
+    )
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -168,6 +171,18 @@ def is_flashinfer_gdn_prefill_available() -> bool:
     """Return whether the kernel loader can construct the prefill path."""
     available, prefill_fn, *_ = _get_flashinfer_gdn_kernels()
     return bool(available and prefill_fn is not None)
+
+
+def is_flashinfer_gdn_cp_prefill_available() -> bool:
+    """Return whether FlashInfer can run its SM100 CP prefill path."""
+    cuda_version = torch.version.cuda
+    if cuda_version is None or int(cuda_version.split(".", 1)[0]) < 13:
+        return False
+    try:
+        from flashinfer.gdn_kernels import cp_delta_rule_dsl_sm100
+    except (ImportError, RuntimeError):
+        return False
+    return cp_delta_rule_dsl_sm100 is not None
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +609,85 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # Match Triton's [1, checkpoints, H, V, K] intermediate-state layout.
         h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
         return core_attn_out, None, h
+
+    def extend_in_graph(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        tables: GDNFlashInferGraphTables,
+        output: torch.Tensor,
+        checkpoint_rows: int,
+        checkpoint_every_n_tokens: int,
+    ) -> Optional[torch.Tensor]:
+        """Run both static FlashInfer graph variants and update state by slot."""
+        from sglang.kernels.ops.attention.fla.l2norm import (
+            gdn_prefill_qkv_prepare_fwd,
+        )
+        from sglang.kernels.ops.mamba.gdn_prefill_track import (
+            gdn_cp_tail_neutralize,
+        )
+
+        q_fi, k_fi, v_fi = gdn_prefill_qkv_prepare_fwd(q[0], k[0], v[0])
+        alpha = torch.exp(g[0].to(torch.float32))
+        beta_fi = beta[0].to(torch.float32)
+        common = dict(
+            q=q_fi,
+            k=k_fi,
+            v=v_fi,
+            g=alpha,
+            beta=beta_fi,
+            scale=None,
+            initial_state=ssm_states,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=False,
+            output=output,
+            output_state=ssm_states,
+        )
+        checkpoints = (
+            ssm_states.new_empty((checkpoint_rows, *ssm_states.shape[1:]))
+            if checkpoint_rows > 0
+            else None
+        )
+
+        def checkpoint_args(cumulative_starts: torch.Tensor) -> dict:
+            if checkpoints is None:
+                return {}
+            return dict(
+                state_checkpoints=checkpoints,
+                checkpoint_cu_starts=cumulative_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            )
+
+        if tables.cp_single:
+            gdn_cp_tail_neutralize(
+                q_fi,
+                k_fi,
+                v_fi,
+                alpha,
+                beta_fi,
+                tables.cp_cu_seqlens,
+            )
+            self._prefill_fn(
+                **common,
+                cu_seqlens=tables.cp_cu_seqlens,
+                state_indices=tables.cp_state_indices,
+                use_cp=True,
+                max_seqlen=q_fi.shape[0],
+                **checkpoint_args(tables.cp_checkpoint_cu),
+            )
+        self._prefill_fn(
+            **common,
+            cu_seqlens=tables.non_cp_cu_seqlens,
+            state_indices=tables.non_cp_state_indices,
+            use_cp=False,
+            **checkpoint_args(tables.non_cp_checkpoint_cu),
+        )
+        return checkpoints.unsqueeze(0) if checkpoints is not None else None
 
     # ---- target_verify (MTP) ----
 

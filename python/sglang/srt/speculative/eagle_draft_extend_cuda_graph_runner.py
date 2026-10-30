@@ -16,6 +16,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.overlap_utils import spec_relay_bypass_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -47,6 +48,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track_indices
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
+from sglang.srt.speculative.prepared_next_draft import (
+    prepared_next_draft_enabled,
+)
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -111,6 +115,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Parse args
         self.eagle_worker = eagle_worker
         self.model_runner = model_runner = eagle_worker.draft_runner
+        self._prepared_next_draft = prepared_next_draft_enabled()
+        # An unchanged top-k-1 batch reads these rows before this runner's next
+        # replay, so the generic relay lease need not copy them out.
+        self.keep_hidden_in_place = spec_relay_bypass_enabled()
         self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
 
         # Fields the parent's capture() reads:
@@ -295,6 +303,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # shape [max_bs]. Sharing by field name and shape would alias those
         # width-specific indices and can make a narrower graph gather OOB.
         self.buffers.share_buffers(exclude={"select_index"})
+        # (raw_bs, field mask) -> (destination views, copy plan); None once refused.
+        self._planned_inputs = {}
         # the batch sizes whose graphs run the draft megakernel's draft_extend,
         # captured once per label of the graph variants it offers this runner
         self.megakernel = self.eagle_worker.megakernel
@@ -543,6 +553,87 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
+    def _copy_planned_inputs(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        select_index: torch.Tensor,
+        raw_bs: int,
+    ) -> bool:
+        """Copy an unpadded round's inputs with one cached field-copy plan."""
+        buffers = self.buffers
+        spec_info = forward_batch.spec_info
+        if forward_batch.extend_seq_lens is None:
+            return False
+        srcs = [
+            forward_batch.input_ids,
+            forward_batch.seq_lens,
+            forward_batch.out_cache_loc,
+            forward_batch.positions,
+            forward_batch.req_pool_indices,
+        ]
+        mask = 0
+        if self.model_runner.model_config.model_is_mrope:
+            if forward_batch.mrope_positions is None:
+                return False
+            srcs.append(forward_batch.mrope_positions)
+            mask |= 1
+        srcs.append(forward_batch.extend_seq_lens)
+        if spec_info.num_correct_drafts is not None:
+            srcs.append(spec_info.num_correct_drafts)
+            srcs.append(spec_info.num_accept_tokens)
+            mask |= 2
+        srcs.append(select_index)
+        if buffers.mamba_track_indices is not None:
+            if forward_batch.mamba_track_indices is None:
+                return False
+            srcs.append(forward_batch.mamba_track_indices)
+            mask |= 4
+        hidden_states = spec_info.hidden_states
+        if (
+            buffers.hidden_states is not None
+            and hidden_states is not None
+            and hidden_states.shape[1] == buffers.hidden_states.shape[1]
+        ):
+            srcs.append(hidden_states)
+            mask |= 8
+        key = (raw_bs, mask)
+        entry = self._planned_inputs.get(key, False)
+        if entry is False:
+            entry = self._planned_inputs[key] = self._plan_inputs(
+                raw_bs=raw_bs, mask=mask
+            )
+        if entry is not None and entry[1](entry[0], srcs):
+            return True
+        # A refused layout keeps the default path from then on.
+        self._planned_inputs[key] = None
+        return False
+
+    def _plan_inputs(self, *, raw_bs: int, mask: int):
+        from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
+
+        buffers = self.buffers
+        num_tokens = raw_bs * self.captured_req_width
+        dsts = [
+            buffers.input_ids[:num_tokens],
+            buffers.seq_lens[:raw_bs],
+            buffers.out_cache_loc[:num_tokens],
+            buffers.positions[:num_tokens],
+            buffers.req_pool_indices[:raw_bs],
+        ]
+        if mask & 1:
+            dsts.append(buffers.mrope_positions[:, :num_tokens])
+        dsts.append(buffers.extend_seq_lens[:raw_bs])
+        if mask & 2:
+            dsts.append(buffers.num_correct_drafts[:raw_bs])
+            dsts.append(buffers.num_accept_tokens[:raw_bs])
+        dsts.append(buffers.select_index[:raw_bs])
+        if mask & 4:
+            dsts.append(buffers.mamba_track_indices[:raw_bs])
+        if mask & 8:
+            dsts.append(buffers.hidden_states[:num_tokens])
+        return dsts, SmallFieldCopyPlan()
+
     def execute(self, forward_batch: ForwardBatch, select_index: torch.Tensor):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
@@ -572,59 +663,69 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.num_accept_tokens.fill_(self.captured_req_width)
             buffers.extend_seq_lens.fill_(self.captured_req_width)
 
-        # Batch the small per-field device copies into a grouped foreach copy
-        # (one foreach call per dtype pair) to cut launch overhead. hidden_states
-        # is handled separately below (see note), and seq_lens_cpu is handled
-        # further down since it lives on host.
-        copy_dsts = [
-            buffers.input_ids[:num_tokens],
-            buffers.seq_lens[:raw_bs],
-            buffers.out_cache_loc[:num_tokens],
-            buffers.positions[:num_tokens],
-            buffers.req_pool_indices[:raw_bs],
-        ]
-        copy_srcs = [
-            forward_batch.input_ids,
-            forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
-            forward_batch.positions,
-            forward_batch.req_pool_indices,
-        ]
-        if self.model_runner.model_config.model_is_mrope:
-            if (
-                bs * self.captured_req_width != num_tokens
-                or forward_batch.mrope_positions is None
-            ):
-                buffers.mrope_positions.zero_()
-            if forward_batch.mrope_positions is not None:
-                copy_dsts.append(buffers.mrope_positions[:, :num_tokens])
-                copy_srcs.append(forward_batch.mrope_positions)
-        if forward_batch.extend_seq_lens is not None:
-            copy_dsts.append(buffers.extend_seq_lens[:raw_bs])
-            copy_srcs.append(forward_batch.extend_seq_lens)
-        else:
-            buffers.extend_seq_lens[:raw_bs].fill_(self.captured_req_width)
-        if forward_batch.spec_info.num_correct_drafts is not None:
-            copy_dsts.append(buffers.num_correct_drafts[:raw_bs])
-            copy_srcs.append(forward_batch.spec_info.num_correct_drafts)
-            copy_dsts.append(buffers.num_accept_tokens[:raw_bs])
-            copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
-        copy_dsts.append(buffers.select_index[:raw_bs])
-        copy_srcs.append(select_index)
-        refresh_track_indices(
-            buffers.mamba_track_indices,
-            forward_batch.mamba_track_indices,
-            raw_bs=raw_bs,
-            bs=bs,
-            copy_dsts=copy_dsts,
-            copy_srcs=copy_srcs,
+        copied_with_plan = (
+            self._prepared_next_draft
+            and bs == raw_bs
+            and bs * self.captured_req_width == num_tokens
+            and self._copy_planned_inputs(
+                forward_batch, select_index=select_index, raw_bs=raw_bs
+            )
         )
-        _grouped_foreach_copy_(copy_dsts, copy_srcs)
+        if not copied_with_plan:
+            # Batch the small per-field device copies into a grouped foreach copy
+            # (one foreach call per dtype pair) to cut launch overhead. hidden_states
+            # is handled separately below (see note), and seq_lens_cpu is handled
+            # further down since it lives on host.
+            copy_dsts = [
+                buffers.input_ids[:num_tokens],
+                buffers.seq_lens[:raw_bs],
+                buffers.out_cache_loc[:num_tokens],
+                buffers.positions[:num_tokens],
+                buffers.req_pool_indices[:raw_bs],
+            ]
+            copy_srcs = [
+                forward_batch.input_ids,
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
+                forward_batch.positions,
+                forward_batch.req_pool_indices,
+            ]
+            if self.model_runner.model_config.model_is_mrope:
+                if (
+                    bs * self.captured_req_width != num_tokens
+                    or forward_batch.mrope_positions is None
+                ):
+                    buffers.mrope_positions.zero_()
+                if forward_batch.mrope_positions is not None:
+                    copy_dsts.append(buffers.mrope_positions[:, :num_tokens])
+                    copy_srcs.append(forward_batch.mrope_positions)
+            if forward_batch.extend_seq_lens is not None:
+                copy_dsts.append(buffers.extend_seq_lens[:raw_bs])
+                copy_srcs.append(forward_batch.extend_seq_lens)
+            else:
+                buffers.extend_seq_lens[:raw_bs].fill_(self.captured_req_width)
+            if forward_batch.spec_info.num_correct_drafts is not None:
+                copy_dsts.append(buffers.num_correct_drafts[:raw_bs])
+                copy_srcs.append(forward_batch.spec_info.num_correct_drafts)
+                copy_dsts.append(buffers.num_accept_tokens[:raw_bs])
+                copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
+            copy_dsts.append(buffers.select_index[:raw_bs])
+            copy_srcs.append(select_index)
+            refresh_track_indices(
+                buffers.mamba_track_indices,
+                forward_batch.mamba_track_indices,
+                raw_bs=raw_bs,
+                bs=bs,
+                copy_dsts=copy_dsts,
+                copy_srcs=copy_srcs,
+            )
+            _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.
         if (
-            buffers.hidden_states is not None
+            not copied_with_plan
+            and buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
             and forward_batch.spec_info.hidden_states.shape[1]
             == buffers.hidden_states.shape[1]
@@ -720,8 +821,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 if out.next_token_logits is None
                 else out.next_token_logits[:raw_bs]
             ),
-            # CUDA graph replay reuses its captured output storage. These states
-            # survive into the next draft step, so detach them from that buffer.
-            hidden_states=out.hidden_states[:raw_bs].clone(),
+            # The unchanged megakernel batch consumes the graph-owned rows before
+            # replay; every other path detaches the recurrent state from that buffer.
+            hidden_states=(
+                out.hidden_states[:raw_bs]
+                if self.keep_hidden_in_place
+                else out.hidden_states[:raw_bs].clone()
+            ),
         )
         return out

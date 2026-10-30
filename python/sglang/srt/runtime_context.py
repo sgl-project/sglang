@@ -658,6 +658,9 @@ class Resources(_FlagGroupBase):
     experts_capturer: Any = None
     # The shared TCPStore created during distributed initialization.
     tcp_store: Any = None
+    # None before pool sizing means "derive the safe static upper bound";
+    # CUDA-graph initialization resolves it to the actual stager outcome.
+    prepared_next_draft_reserve_enabled: Optional[bool] = None
     # Trace verbosity; the accessor seeds it lazily from SGLANG_TRACE_LEVEL.
     trace_level: Any = None
 

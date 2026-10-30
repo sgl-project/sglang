@@ -223,6 +223,21 @@ class TestOOTSpecGraphRunnerSelection(CustomTestCase):
             runners["draft_extend"].return_value,
         )
 
+    def test_flashmla_graph_backend_import_is_configuration_gated(self):
+        module_name = "sglang.srt.layers.attention.flashmla_backend"
+        backend = SimpleNamespace(prefill_attention_backend_str="triton")
+        with patch.dict(sys.modules, {module_name: None}):
+            self.assertIsNone(eagle_worker_v2._flashmla_graph_backend_type(backend))
+
+        flashmla_module = types.ModuleType(module_name)
+        flashmla_module.FlashMLABackend = sentinel.flashmla_backend
+        backend.prefill_attention_backend_str = "flashmla"
+        with patch.dict(sys.modules, {module_name: flashmla_module}):
+            self.assertIs(
+                eagle_worker_v2._flashmla_graph_backend_type(backend),
+                sentinel.flashmla_backend,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

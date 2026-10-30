@@ -37,6 +37,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.kernels.ops.mamba.gdn_prefill_track import (
     TRACK_CHUNK_STATE,
     TRACK_FINAL_STATE,
+    TRACK_NONE,
 )
 from sglang.srt.layers.attention.linear.kda_prefill_graph import KDAPrefillTrackRows
 
@@ -58,6 +59,123 @@ def buckets_keep_chunk_o_block_size(capture_num_tokens: list[int]) -> bool:
         if bucket is not None and chunk_o_block_size(bucket) != chunk_o_block_size(n):
             return False
     return True
+
+
+class GDNFlashInferGraphTables(msgspec.Struct, frozen=True):
+    """Static batch tables for the captured FlashInfer GDN prefill core."""
+
+    max_seqs: int
+    cp_single: bool
+
+    packed64: torch.Tensor
+    cp_cu_seqlens: torch.Tensor  # [2]
+    non_cp_cu_seqlens: torch.Tensor  # [max_seqs + 1]
+    host64: np.ndarray
+
+    packed32: torch.Tensor
+    cp_checkpoint_cu: torch.Tensor  # [2]
+    non_cp_checkpoint_cu: torch.Tensor  # [max_seqs + 1]
+    track_mode: torch.Tensor  # [max_seqs]
+    pre_track_mode: torch.Tensor  # [max_seqs]
+    track_h_row: torch.Tensor  # [max_seqs]
+    host32: np.ndarray
+
+    cp_state_indices: torch.Tensor  # [1]
+    non_cp_state_indices: torch.Tensor  # [max_seqs]
+
+    @classmethod
+    def allocate(
+        cls, *, max_seqs: int, cp_single: bool, device: torch.device
+    ) -> GDNFlashInferGraphTables:
+        sizes64 = [2, max_seqs + 1]
+        sizes32 = [2, max_seqs + 1, max_seqs, max_seqs, max_seqs]
+        packed64 = torch.zeros(sum(sizes64), dtype=torch.int64, device=device)
+        packed32 = torch.zeros(sum(sizes32), dtype=torch.int32, device=device)
+        views64 = torch.split(packed64, sizes64)
+        views32 = torch.split(packed32, sizes32)
+        return cls(
+            max_seqs=max_seqs,
+            cp_single=cp_single,
+            packed64=packed64,
+            cp_cu_seqlens=views64[0],
+            non_cp_cu_seqlens=views64[1],
+            host64=np.zeros(sum(sizes64), dtype=np.int64),
+            packed32=packed32,
+            cp_checkpoint_cu=views32[0],
+            non_cp_checkpoint_cu=views32[1],
+            track_mode=views32[2],
+            pre_track_mode=views32[3],
+            track_h_row=views32[4],
+            host32=np.zeros(sum(sizes32), dtype=np.int32),
+            cp_state_indices=torch.zeros(1, dtype=torch.int32, device=device),
+            non_cp_state_indices=torch.zeros(
+                max_seqs, dtype=torch.int32, device=device
+            ),
+        )
+
+    def fill(
+        self,
+        *,
+        lens: np.ndarray,
+        cache_indices: torch.Tensor,
+        track_rows: Optional[KDAPrefillTrackRows],
+    ) -> None:
+        batch_size = lens.shape[0]
+        use_cp = batch_size == 1 and self.cp_single
+        checkpoint_counts = lens // GDN_CHUNK_SIZE
+
+        cp_cu = self.host64[:2]
+        non_cp_cu = self.host64[2:]
+        non_cp_cu[:] = 0
+        cp_cu[:] = (0, int(lens[0]) if use_cp else 0)
+
+        cp_checkpoint_cu = self.host32[:2]
+        non_cp_checkpoint_cu = self.host32[2 : self.max_seqs + 3]
+        non_cp_checkpoint_cu[:] = 0
+        cp_checkpoint_cu[:] = (
+            0,
+            int(checkpoint_counts[0]) if use_cp else 0,
+        )
+        if not use_cp:
+            non_cp_cu[1 : batch_size + 1] = np.cumsum(lens)
+            non_cp_cu[batch_size + 1 :] = non_cp_cu[batch_size]
+            non_cp_checkpoint_cu[1 : batch_size + 1] = np.cumsum(checkpoint_counts)
+            non_cp_checkpoint_cu[batch_size + 1 :] = non_cp_checkpoint_cu[batch_size]
+
+        offset = self.max_seqs + 3
+        track_mode = self.host32[offset : offset + self.max_seqs]
+        pre_track_mode = self.host32[
+            offset + self.max_seqs : offset + 2 * self.max_seqs
+        ]
+        track_h_row = self.host32[offset + 2 * self.max_seqs :]
+        track_mode[:] = TRACK_NONE
+        pre_track_mode[:] = TRACK_NONE
+        track_h_row[:] = 0
+        if track_rows is not None:
+            checkpoint_starts = cp_checkpoint_cu if use_cp else non_cp_checkpoint_cu
+            for row, chunk in track_rows.chunk_rows:
+                if chunk == 0:
+                    pre_track_mode[row] = TRACK_FINAL_STATE
+                else:
+                    track_mode[row] = TRACK_CHUNK_STATE
+                    track_h_row[row] = checkpoint_starts[row] + chunk - 1
+            for row in track_rows.final_rows:
+                track_mode[row] = TRACK_FINAL_STATE
+
+        self.packed64.copy_(
+            torch.from_numpy(self.host64).pin_memory(), non_blocking=True
+        )
+        self.packed32.copy_(
+            torch.from_numpy(self.host32).pin_memory(), non_blocking=True
+        )
+        state_indices = cache_indices[:batch_size].clamp(min=0)
+        if use_cp:
+            self.cp_state_indices.copy_(state_indices)
+            self.non_cp_state_indices.zero_()
+        else:
+            self.cp_state_indices.zero_()
+            self.non_cp_state_indices[:batch_size].copy_(state_indices)
+            self.non_cp_state_indices[batch_size:].zero_()
 
 
 class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
@@ -87,6 +205,8 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
     has_initial_state: torch.Tensor  # [max_seqs] bool
     track_dst: torch.Tensor  # [max_seqs] int64
 
+    flashinfer: Optional[GDNFlashInferGraphTables] = None
+
     @classmethod
     def allocate(
         cls,
@@ -96,6 +216,8 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
         track: bool,
         cache_index_dtype: torch.dtype,
         device: torch.device,
+        flashinfer: bool = False,
+        flashinfer_cp_single: bool = True,
     ) -> GDNPrefillGraphMetadata:
         max_seqs = max(1, min(num_tokens, max_seqs_cap))
         max_chunks = triton.cdiv(num_tokens, GDN_CHUNK_SIZE) + max_seqs
@@ -133,6 +255,15 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
             ),
             has_initial_state=torch.zeros(max_seqs, dtype=torch.bool, device=device),
             track_dst=torch.zeros(max_seqs, dtype=torch.int64, device=device),
+            flashinfer=(
+                GDNFlashInferGraphTables.allocate(
+                    max_seqs=max_seqs,
+                    cp_single=flashinfer_cp_single,
+                    device=device,
+                )
+                if flashinfer
+                else None
+            ),
         )
 
     def can_fit(self, extend_seq_lens: list[int]) -> bool:
@@ -156,9 +287,14 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
             f"batch of {bs} sequences / {sum(extend_seq_lens)} tokens exceeds the "
             f"captured bounds ({self.max_seqs} / {self.num_tokens})"
         )
-        self._write_host_tables(
-            lens=np.asarray(extend_seq_lens, dtype=np.int64), track_rows=track_rows
-        )
+        lens = np.asarray(extend_seq_lens, dtype=np.int64)
+        self._write_host_tables(lens=lens, track_rows=track_rows)
+        if self.flashinfer is not None:
+            self.flashinfer.fill(
+                lens=lens,
+                cache_indices=cache_indices,
+                track_rows=track_rows,
+            )
         # A pinned block from the caching host allocator keeps the copy
         # asynchronous and is not reused before the copy completes.
         self.packed.copy_(torch.from_numpy(self.host).pin_memory(), non_blocking=True)

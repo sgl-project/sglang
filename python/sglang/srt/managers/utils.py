@@ -24,6 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
+from sglang.srt.utils import speculative_decode_resources as spec_decode_resources
 from sglang.srt.utils.common import async_d2h as _async_d2h
 from sglang.srt.utils.common import is_cuda
 
@@ -144,9 +145,8 @@ class GenerationBatchResult:
     # Every stage holds the KV for its own layers, so every stage has to compact
     # that path into its committed prefix; only the last stage can compute it.
     accept_index: Optional[torch.Tensor] = None
-    prepared_draft_extend_inputs: Optional[
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ] = None
+    # The optional fourth item is the prepared draft-extend layout.
+    prepared_draft_extend_inputs: Optional[tuple] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -178,12 +178,21 @@ class GenerationBatchResult:
     def get_num_generated_tokens(self, batch_size: int) -> int:
         return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
-    @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        if (
+            spec_decode_resources.enabled()
+            and self.accept_lens is not None
+            and not torch.autograd._profiler_enabled()
+        ):
+            return self._copy_to_cpu(return_logprob, return_hidden_states)
+        with torch.profiler.record_function("copy_result_to_cpu"):
+            return self._copy_to_cpu(return_logprob, return_hidden_states)
+
+    def _copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool):
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
@@ -212,10 +221,15 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        self.next_token_ids = _async_d2h(self.next_token_ids)
-
         if self.accept_lens is not None:
-            self.accept_lens = _async_d2h(self.accept_lens)
+            self.next_token_ids = spec_decode_resources.copy_to_host(
+                self.next_token_ids, tag="next_token_ids"
+            )
+            self.accept_lens = spec_decode_resources.copy_to_host(
+                self.accept_lens, tag="accept_lens"
+            )
+        else:
+            self.next_token_ids = _async_d2h(self.next_token_ids)
 
         if self.block_accept_lens is not None:
             self.block_accept_lens = _async_d2h(self.block_accept_lens)

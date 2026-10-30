@@ -135,6 +135,8 @@ class IterationIds:
                 assert space is not None and space.write is not None
                 assert ids.shape == write_virtual.shape
                 self._write_ids[space.key] = ids
+        # (cols, ids): write_virtual's cols already laid out in a buffer of their own
+        self._prepared_cols: Optional[tuple] = None
         self.write_physical = self.write_ids(source)
         self._read_tables: Dict[Hashable, ReadTable] = {}
 
@@ -201,6 +203,10 @@ class IterationIds:
         names."""
         return self._cols(self.write_virtual, cols)
 
+    def use_prepared_cols(self, cols: slice, ids: torch.Tensor) -> None:
+        """Use already prepared virtual ids for one contiguous column span."""
+        self._prepared_cols = (cols, ids)
+
     def _cols(self, ids: Optional[torch.Tensor], cols: Optional[Cols]):
         if ids is None or cols is None:
             return ids
@@ -208,6 +214,9 @@ class IterationIds:
             return ids[cols.start : cols.stop]
         if isinstance(cols, torch.Tensor):
             return torch.where(cols >= 0, ids[cols.clamp(min=0)], 0)
+        prepared = self._prepared_cols
+        if prepared is not None and ids is self.write_virtual and cols == prepared[0]:
+            return prepared[1]
         bs = int(self.req_pool_indices.numel())
         if bs == 1:
             return ids[cols]
@@ -258,6 +267,7 @@ class IterationIds:
         plan.write_virtual = self.write_virtual
         plan.write_physical = self.write_physical
         plan._write_ids = self._write_ids
+        plan._prepared_cols = self._prepared_cols
         return plan
 
     # -- reads -----------------------------------------------------------------

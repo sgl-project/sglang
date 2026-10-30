@@ -741,6 +741,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                     capture=SimpleNamespace(enable_torch_compile=False)
                 ),
                 "get_spec": SimpleNamespace(speculative_num_steps=1),
+                "spec_relay_bypass_enabled": False,
                 "get_batch_sizes_to_capture": ([4], []),
                 "resolve_num_tokens_per_req": 4,
                 "get_draft_input_from_target_hidden_dim": 64,
@@ -799,6 +800,11 @@ class TestInklingCheckpointIndices(CustomTestCase):
             else eagle.EAGLEDraftExtendCudaGraphRunner
         )
         runner = cls.__new__(cls)
+        # This fixture intentionally bypasses the production constructor.  The
+        # checkpoint replay under test uses the stock copy path, so initialize
+        # the optional prepared-next planned-copy gate explicitly.
+        runner._prepared_next_draft = False
+        runner.keep_hidden_in_place = False
         runner.megakernel = None
         runner.megakernel_served = frozenset()
         runner.buffers = buffers

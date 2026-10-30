@@ -2732,6 +2732,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
+    # Whether this speculative decode preparation launched schedule-stream work.
+    spec_decode_schedule_stream_idle: bool = False
 
     # Whether to return hidden states
     return_hidden_states: bool = False

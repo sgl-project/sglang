@@ -24,7 +24,11 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    bind_eagle_runtime_hooks,
+    make_post_verify_io,
+)
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
@@ -74,6 +78,8 @@ def _derive_tree_links(
 
 
 class NGRAMWorker(BaseSpecWorker):
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
+
     def alloc_memory_pool(self, **kwargs):
         # The target memory pool does not exist yet when __init__ runs.
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -150,6 +156,12 @@ class NGRAMWorker(BaseSpecWorker):
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
+
+    def init_attention_backends(self):
+        super().init_attention_backends()
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
+            self.target_worker, supports_sharded_verify=False
+        )
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
@@ -472,17 +484,25 @@ class NGRAMWorker(BaseSpecWorker):
             maybe_detect_inf(
                 logits_output.next_token_logits, "verify: target model logits"
             )
-            (
-                predict,
-                accept_lens,
-                accept_index,
-            ) = eagle_sample(
-                verify_input,
-                batch,
-                logits_output,
-                grammar_mask,
-                watermark_state=self.model_runner.watermark_state,
+            post_verify_output = self._speculative_runtime_hooks.post_verify(
+                make_post_verify_io(
+                    verify_input=verify_input,
+                    sampling_info=batch.sampling_info,
+                    sequence_lengths=batch.seq_lens,
+                    request_pool_indices=batch.req_pool_indices,
+                    device=batch.device,
+                    logits_output=logits_output,
+                    grammar_mask=grammar_mask,
+                    watermark=self.model_runner.watermark_state,
+                    # Preserve NGRAM's former eagle_sample default exactly.
+                    watermark_full_mask=True,
+                    return_logprob=batch.return_logprob,
+                    is_idle=batch.forward_mode.is_idle(),
+                )
             )
+            predict = post_verify_output.token_ids
+            accept_lens = post_verify_output.accepted_lengths
+            accept_index = post_verify_output.accepted_indices
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,
