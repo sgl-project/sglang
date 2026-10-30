@@ -323,6 +323,11 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             "mamba state lives in UnifiedRadixCache. Please open an issue or a PR "
             "at https://github.com/sgl-project/sglang if you need this."
         )
+    if ctx.params.swa_checkpoint_windows and type(cache) is not UnifiedRadixCache:
+        raise ValueError(
+            "SWA checkpoint windows require the built-in UnifiedRadixCache; "
+            f"this config selected {type(cache).__name__}."
+        )
 
     hicache_attached = cache.cache_controller is not None
     logger.info(

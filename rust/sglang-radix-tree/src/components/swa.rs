@@ -12,7 +12,8 @@ use crate::cache_action::{
     SwaRebuild,
 };
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, FULL, Family, SWA};
+use crate::components::checkpoint_window;
+use crate::components::{ComponentType, FULL, Family, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -143,6 +144,13 @@ impl SwaComponent {
         node_id: NodeIdx_,
     ) -> Vec<NodeIdx_> {
         if !tree_core.has_swa_host_pool {
+            return Vec::new();
+        }
+        let node = tree_core.arena.node(node_id);
+        if tree_core.checkpoint_windows()
+            && !node.has_device_value(MAMBA)
+            && !node.has_host_value(MAMBA)
+        {
             return Vec::new();
         }
         if tree_core.is_host_memory_buffer_only {
@@ -669,6 +677,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         tree_core.arena.node_mut(new_parent_id).swa_uuid = swa_uuid;
         let swa_host_uuid = tree_core.arena.node_mut(child_id).swa_host_uuid.take();
         tree_core.arena.node_mut(new_parent_id).swa_host_uuid = swa_host_uuid;
+        if tree_core.checkpoint_windows() {
+            checkpoint_window::redistribute_on_node_split(tree_core, new_parent_id, child_id);
+        }
     }
 
     fn evict_component(
@@ -681,6 +692,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         target: EvictLayer,
     ) -> (usize, usize) {
         let ct = SWA;
+        if tree_core.checkpoint_windows() {
+            checkpoint_window::dequeue(tree_core, node_id, target);
+        }
         let node = tree_core.arena.node(node_id);
         let mut freed = 0;
         let mut host_freed = 0;
@@ -731,6 +745,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
 
     fn evict_device_start(&self, tree_core: &mut UnifiedTreeCore<K>, request_cnt: usize) {
         tree_core.set_evict_device_start(SWA, request_cnt);
+        if tree_core.checkpoint_windows() {
+            return;
+        }
         let cursor = tree_core
             .device_lru_list(SWA)
             .get_lru_no_lock(&tree_core.arena);
@@ -761,6 +778,15 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 .is_none(),
             "finish the pending internal SWA eviction before advancing"
         );
+        if tree_core.checkpoint_windows() {
+            return checkpoint_window::evict_device_next_node(
+                tree_core,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions,
+            );
+        }
         let mut cursor = tree_core.component_state(SWA).evict_device_cursor;
         // The cursor is re-validated (reset to LRU head) if the previous
         // node's eviction removed it.
@@ -856,6 +882,17 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         cache_actions: &mut CacheActions,
     ) {
+        if tree_core.checkpoint_windows() {
+            checkpoint_window::drive_host_eviction(
+                tree_core,
+                num_tokens,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions,
+            );
+            return;
+        }
         let ct = SWA;
         let mut x = tree_core
             .host_lru_list(SWA)
@@ -1085,6 +1122,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                     if !node.has_host_value(SWA) {
                         node.set_host_value(SWA, host_indices.copy());
                     }
+                    if tree_core.checkpoint_windows() {
+                        checkpoint_window::queue_if_uncovered(tree_core, node_id, true);
+                    }
                     return;
                 };
                 let mut offset = 0i64;
@@ -1105,6 +1145,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                         SWA,
                         host_indices.narrow(0, offset, size).copy(),
                     );
+                    if tree_core.checkpoint_windows() {
+                        checkpoint_window::queue_if_uncovered(tree_core, target_idx, true);
+                    }
                     offset += size;
                 }
                 assert_eq!(offset, host_indices.size()[0]);
@@ -1270,6 +1313,9 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 // the evictable-leaf sets; refresh it here rather than rely
                 // on the Full walk running after this one.
                 tree_core.update_evictable_leaf_sets_(cur);
+                if tree_core.checkpoint_windows() {
+                    checkpoint_window::queue_if_uncovered(tree_core, cur, lock_host);
+                }
             }
             if swa_uuid_for_lock.is_some()
                 && Self::swa_uuid(tree_core.arena.node(cur), lock_host) == swa_uuid_for_lock
@@ -1323,7 +1369,18 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             if now_unlocked && has_value {
                 tree_core.dec_protected_size(SWA, value_len);
                 tree_core.inc_evictable_size(SWA, value_len);
-                if tree_core.is_evictable_device_leaf_(tree_core.arena.node(cur)) {
+                if tree_core.checkpoint_windows() {
+                    if tree_core.arena.node(cur).state_(Self::DEVICE).cover_ref == 0 {
+                        checkpoint_window::release_device_kv(
+                            tree_core,
+                            cur,
+                            device_frees,
+                            host_frees,
+                            cache_actions,
+                            None,
+                        );
+                    }
+                } else if tree_core.is_evictable_device_leaf_(tree_core.arena.node(cur)) {
                     tree_core.evict_component_and_detach_lru_(
                         cur,
                         ct,
@@ -1342,6 +1399,47 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 break;
             }
             cur = parent;
+        }
+    }
+
+    fn on_device_value_set(&self, tree_core: &mut UnifiedTreeCore<K>, node_id: NodeIdx_) {
+        if tree_core.checkpoint_windows() {
+            checkpoint_window::queue_if_uncovered(tree_core, node_id, false);
+        }
+    }
+
+    fn validate_component_state(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        nodes: &[NodeIdx_],
+        errors: &mut Vec<String>,
+    ) {
+        if tree_core.checkpoint_windows() {
+            checkpoint_window::validate(tree_core, nodes, errors);
+        }
+    }
+
+    fn on_peer_value_freed(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+        component_type: ComponentType,
+        host: bool,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
+        tracker: Option<&mut HashMap<ComponentType, usize>>,
+    ) {
+        if component_type == MAMBA && tree_core.checkpoint_windows() {
+            checkpoint_window::release_window(
+                tree_core,
+                node_id,
+                host,
+                device_frees,
+                host_frees,
+                cache_actions,
+                tracker,
+            );
         }
     }
 }

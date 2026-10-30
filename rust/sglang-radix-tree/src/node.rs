@@ -726,6 +726,8 @@ pub struct ValueState {
     pub value: Option<Tensor>,
     /// In-flight request refcount; a host slot's own `lock_ref` IS the host lock.
     pub lock_ref: u32,
+    /// Number of cached checkpoints on this tier whose window includes this node.
+    pub cover_ref: u32,
 }
 
 // Tree-core runtime errors.

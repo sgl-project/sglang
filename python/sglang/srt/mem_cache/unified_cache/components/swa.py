@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverSWAWithLockedFull,
     SWARebuild,
 )
+from sglang.srt.mem_cache.unified_cache.components import checkpoint_window
 from sglang.srt.mem_cache.unified_cache.components.base import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -111,6 +112,11 @@ class SWAComponent(TreeComponent):
         """
         if not self.tree_core.has_swa_host_pool:
             return []
+        if self.tree_core.checkpoint_windows:
+            # Only a checkpoint node's window is kept, so only it gets a host copy.
+            mamba = node.component_data[ComponentType.MAMBA]
+            if mamba.value is None and mamba.host_value is None:
+                return []
         if self.tree_core.is_host_memory_buffer_only:
             cd = node.component_data[self.component_type]
             return [node] if cd.value is not None else []
@@ -229,6 +235,14 @@ class SWAComponent(TreeComponent):
                     report_error(
                         f"{ct} session {session_id!r} leaf {leaf.id} has no coverage record"
                     )
+
+    def validate_component_state(
+        self,
+        reachable_nodes: set[UnifiedTreeNode],
+        report_error: Callable[[str], None],
+    ) -> None:
+        if self.tree_core.checkpoint_windows:
+            checkpoint_window.validate(self.tree_core, reachable_nodes, report_error)
 
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
         # Tree component values use int64 indices; the storage hands them so.
@@ -613,6 +627,10 @@ class SWAComponent(TreeComponent):
             child.component_data[self.component_type].metadata.get("host_uuid")
         )
         child.component_data[self.component_type].metadata.pop("host_uuid", None)
+        if self.tree_core.checkpoint_windows:
+            checkpoint_window.redistribute_on_node_split(
+                self.tree_core, new_parent, child
+            )
 
     def evict_component(
         self,
@@ -623,6 +641,8 @@ class SWAComponent(TreeComponent):
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         ct = self.component_type
+        if self.tree_core.checkpoint_windows:
+            checkpoint_window.dequeue(self.tree_core, node, target)
         cd = node.component_data[ct]
         freed = 0
         host_freed = 0
@@ -659,12 +679,40 @@ class SWAComponent(TreeComponent):
 
         return freed, host_freed
 
+    def on_device_value_set(self, node: UnifiedTreeNode) -> None:
+        if self.tree_core.checkpoint_windows:
+            checkpoint_window.queue_if_uncovered(self.tree_core, node, False)
+
+    def on_peer_value_freed(
+        self,
+        node: UnifiedTreeNode,
+        component_type: ComponentType,
+        layer: EvictLayer,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
+        tracker: Optional[dict[ComponentType, int]],
+    ) -> None:
+        if component_type == ComponentType.MAMBA and self.tree_core.checkpoint_windows:
+            checkpoint_window.release_window(
+                self.tree_core,
+                node,
+                layer == EvictLayer.HOST,
+                device_frees,
+                host_frees,
+                cache_actions,
+                tracker,
+            )
+
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
 
     def _evict_device_start(self, request_cnt: int) -> None:
         """Begin the device-eviction walk from this component's LRU cursor."""
         self._evict_device_request_cnt = request_cnt
+        if self.tree_core.checkpoint_windows:
+            self._evict_device_cursor = None
+            return
         if self.tree_core.enable_session_radix_cache:
             lru = self.tree_core.lru_lists[self.component_type]
             lru.cursor_begin()
@@ -689,6 +737,16 @@ class SWAComponent(TreeComponent):
         from the partition sentinel with session refs on, else it restarts at
         the LRU tail.
         """
+        if self.tree_core.checkpoint_windows:
+            checkpoint_window.evict_device_next_node(
+                self.tree_core,
+                self._evict_device_request_cnt,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions,
+            )
+            return None
         ct = self.component_type
         lru = self.tree_core.lru_lists[ct]
         enabled = self.tree_core.enable_session_radix_cache
@@ -868,6 +926,8 @@ class SWAComponent(TreeComponent):
                 # the evictable-leaf sets; refresh it here rather than rely
                 # on the Full walk running after this one.
                 self.tree_core._update_evictable_leaf_sets(cur)
+                if self.tree_core.checkpoint_windows:
+                    checkpoint_window.queue_if_uncovered(self.tree_core, cur, lock_host)
             if swa_uuid_for_lock and comp.metadata.get(uuid_key) == swa_uuid_for_lock:
                 dec_swa = False
             cur = cur.parent
@@ -905,7 +965,17 @@ class SWAComponent(TreeComponent):
                 value_len = self.reclaimable_value_len(cur)
                 self.tree_core.component_protected_size_[ct] -= value_len
                 self.tree_core.component_evictable_size_[ct] += value_len
-                if self.tree_core._is_device_leaf(cur):
+                if self.tree_core.checkpoint_windows:
+                    if cd.cover_ref == 0:
+                        checkpoint_window.release_device_kv(
+                            self.tree_core,
+                            cur,
+                            device_frees,
+                            host_frees,
+                            cache_actions,
+                            None,
+                        )
+                elif self.tree_core._is_device_leaf(cur):
                     self.tree_core._evict_component_and_detach_lru(
                         cur,
                         self,
@@ -1259,6 +1329,8 @@ class SWAComponent(TreeComponent):
                 assert cd.value is not None and cd.host_value is None
                 size = len(cd.value)
                 cd.host_value = xfer.host_indices[offset : offset + size].clone()
+                if self.tree_core.checkpoint_windows:
+                    checkpoint_window.queue_if_uncovered(self.tree_core, target, True)
                 offset += size
             assert offset == len(xfer.host_indices)
             return
@@ -1420,6 +1492,16 @@ class SWAComponent(TreeComponent):
         """Evict SWA host resources.
         Internal nodes: private tombstone (free SWA host only).
         Host leaves: atomic eviction via _evict_host_leaf."""
+        if self.tree_core.checkpoint_windows:
+            checkpoint_window.drive_host_eviction(
+                self.tree_core,
+                num_tokens,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions,
+            )
+            return
         ct = self.component_type
         host_lru = self.tree_core.host_lru_lists[ct]
         enabled = self.tree_core.enable_session_radix_cache

@@ -324,7 +324,7 @@ class MambaFinishedOvershootCheckpointFixtures:
         req.kv.mamba_prev_track_seqlen = previous_track_seqlen
         req.kv.mamba_last_track_idx = 0
         req.kv.mamba_next_track_idx = pool.get_mamba_ping_pong_other_idx(0)
-        indices = allocator.alloc(len(tokens))
+        indices = UnifiedRadixCacheFixtures._alloc(self, allocator, len(tokens))
         self.assertIsNotNone(indices)
         pool.write((req.kv.req_pool_idx, slice(0, len(tokens))), indices)
         return req, tokens
