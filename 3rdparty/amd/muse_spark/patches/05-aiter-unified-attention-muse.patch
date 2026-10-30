@@ -252,11 +252,10 @@ index 8218bf7..49e29c0 100644
              ](
                  segm_output_ptr=segm_output,
                  segm_max_ptr=segm_max,
-@@ -720,6 +766,7 @@ def unified_attention(
+@@ -720,5 +766,6 @@ def unified_attention(
                  K_WIDTH=K_WIDTH,
                  IS_Q_FP8=(q_dtype == e4m3_dtype),
                  IS_KV_FP8=(kv_cache_dtype == e4m3_dtype),
 +                **({"EXACT_Q_BLOCKS": True} if exact_q_blocks else {}),
                  **attn_config,
              )
-
