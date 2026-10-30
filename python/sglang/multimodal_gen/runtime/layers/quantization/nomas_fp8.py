@@ -48,10 +48,9 @@ class NomasFP8Linear(nn.Module):
         )
 
     def _apply(self, fn, recurse=True):
-        # Probe the destination without rounding either serialized buffer.
+        # Move raw bytes through fn to preserve non_blocking and original dtypes.
         for name, tensor in self._buffers.items():
-            destination = fn(torch.empty(0, device=tensor.device, dtype=tensor.dtype))
-            self._buffers[name] = tensor.to(device=destination.device)
+            self._buffers[name] = fn(tensor.view(torch.uint8)).view(tensor.dtype)
         return self
 
     def forward(self, x):

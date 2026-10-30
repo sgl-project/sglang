@@ -937,6 +937,35 @@ def test_pixelumm_fp8_linear_quantized_reference(tokens):
     torch.testing.assert_close(output, reference, rtol=0.008, atol=0.008)
 
 
+@pytest.mark.skipif(not is_nvidia_cuda, reason="requires CUDA transfers")
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_fp8_transfer_preserves_bytes_and_blocking_semantics(non_blocking):
+    model = torch.nn.Sequential(NomasFP8Linear(256, 256)).eval()
+    layer = model[0]
+    layer.fp8_weight = torch.randn(256, 256).to(torch.float8_e4m3fn).pin_memory()
+    layer.fp8_scale = torch.full((2, 2), 0.01003).pin_memory()
+    expected = {name: value.clone() for name, value in model.named_buffers()}
+    stream = torch.cuda.Stream()
+    ready = torch.cuda.Event()
+    with torch.cuda.stream(stream):
+        # A blocking copy would also wait for this preceding stream work.
+        torch.cuda._sleep(100_000_000)
+        ready.record()
+        model.to("cuda", dtype=torch.bfloat16, non_blocking=non_blocking)
+    assert ready.query() is (not non_blocking)
+    stream.synchronize()
+    for name, value in model.named_buffers():
+        assert value.is_cuda
+        assert value.dtype == expected[name].dtype
+        assert torch.equal(
+            value.cpu().view(torch.uint8), expected[name].view(torch.uint8)
+        )
+    model.cpu().bfloat16().half().float()
+    for name, value in model.named_buffers():
+        assert value.dtype == expected[name].dtype
+        assert torch.equal(value.view(torch.uint8), expected[name].view(torch.uint8))
+
+
 @pytest.fixture
 def fp8_checkpoint(tmp_path):
     checkpoint = SimpleNamespace(path=tmp_path / "model.safetensors")
