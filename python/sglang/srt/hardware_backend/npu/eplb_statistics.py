@@ -48,28 +48,17 @@ def isolate_draft_expert_recording(forward):
     return wrapped
 
 
-class _NpuEplbAccumulatorMixin:
-    """Share TP communication and initialize migration channels before recording."""
-
-    def __init__(self, *args, **kwargs):
-        moe = get_exec().moe
-        if moe.enable_eplb and not moe.elastic_ep_backend:
-            # Join/scale paths need their own collective initialization order.
-            warmup_eplb_communication()
-        super().__init__(*args, **kwargs)
-
+class _NpuDetailAccumulator(_DetailAccumulator):
     @property
     def _communication_group(self) -> ProcessGroup:
         # Resolve lazily so a replaced TP group is used by subsequent dumps.
         return get_eplb_device_group()
 
 
-class _NpuDetailAccumulator(_NpuEplbAccumulatorMixin, _DetailAccumulator):
-    pass
-
-
-class _NpuStatAccumulator(_NpuEplbAccumulatorMixin, _StatAccumulator):
-    pass
+class _NpuStatAccumulator(_StatAccumulator):
+    @property
+    def _communication_group(self) -> ProcessGroup:
+        return get_eplb_device_group()
 
 
 class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
@@ -80,6 +69,10 @@ class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
             _StatAccumulator: _NpuStatAccumulator,
             _DetailAccumulator: _NpuDetailAccumulator,
         }[_Accumulator.get_class()]
+        moe = get_exec().moe
+        if moe.enable_eplb and not moe.elastic_ep_backend:
+            # Join/scale paths need their own collective initialization order.
+            warmup_eplb_communication()
         return accumulator_class(expert_location_metadata, rank)
 
     def _create_gatherer(self, expert_location_metadata, rank):

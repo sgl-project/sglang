@@ -31,7 +31,7 @@ from sglang.srt.utils import get_bool_env_var, is_npu
 
 _is_npu = is_npu()
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.eplb import prepare_expert_weight_update
+    from sglang.srt.hardware_backend.npu.eplb import update_expert_weights_npu
 
 
 logger = logging.getLogger(__name__)
@@ -151,18 +151,21 @@ def _update_expert_weights_raw(
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
     if _is_npu:
-        update_layer_ids, temp_buffers, update_layer = prepare_expert_weight_update(
+        return update_expert_weights_npu(
             weights_by_layer=routed_experts_weights_of_layer,
             layer_ids=update_layer_ids,
             old_placement_by_layer=old_expert_location_metadata.physical_to_logical_map_cpu,
             new_placement_by_layer=new_expert_location_metadata.physical_to_logical_map_cpu,
+            num_local_physical_experts=old_expert_location_metadata.num_local_physical_experts,
+            nnodes=nnodes,
+            rank=rank,
             update_layer_fn=update_expert_weights_single_layer,
+            log_metrics=log_metrics,
         )
-    else:
-        temp_buffers = create_temp_buffers(
-            routed_experts_weights_of_layer[update_layer_ids[0]]
-        )
-        update_layer = update_expert_weights_single_layer
+
+    temp_buffers = create_temp_buffers(
+        routed_experts_weights_of_layer[update_layer_ids[0]]
+    )
 
     world_size = torch.distributed.get_world_size()
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
@@ -172,7 +175,7 @@ def _update_expert_weights_raw(
 
     for layer_id in update_layer_ids:
         missing_logical_experts_info: List[int] = []
-        update_layer(
+        update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
             temp_buffers=temp_buffers,
             old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map_cpu[

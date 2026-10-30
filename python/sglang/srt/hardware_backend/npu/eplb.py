@@ -85,23 +85,24 @@ def warmup_eplb_communication() -> None:
     )
 
 
-def prepare_expert_weight_update(
+def update_expert_weights_npu(
     *,
     weights_by_layer: dict[int, list[torch.Tensor]],
     layer_ids: list[int],
     old_placement_by_layer: torch.Tensor,
     new_placement_by_layer: torch.Tensor,
+    num_local_physical_experts: int,
+    nnodes: int,
+    rank: int,
     update_layer_fn: Callable[..., None],
-) -> tuple[list[int], list[torch.Tensor] | None, Callable[..., None] | None]:
-    """Return selected layers, receive buffers, and a single-layer update callable.
+    log_metrics: bool = False,
+) -> dict[int, list[int]]:
+    """Migrate a chunk of Ascend expert weights with the shared single-layer updater.
 
     Validate the entire chunk before allocating workspaces or moving weights.
-    The callable loads internal-format weights into ND storage, invokes the
-    shared migration algorithm, and writes changed local slots back in place.
-    The caller owns the receive buffers and passes them to each layer update.
-    They are allocated lazily and reused across compatible layers in this chunk.
-    Weights are converted one layer at a time; completion events bound queued
-    device work before allocating the next layer's ND tensors.
+    Reuse receive buffers across participating layers, convert each layer to ND,
+    and write changed local slots back into the original model storage.
+    Return missing logical experts by layer for elastic EP recovery.
     """
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
@@ -116,27 +117,21 @@ def prepare_expert_weight_update(
             )
         ]
     if not layer_ids:
-        return layer_ids, None, None
+        return {}
 
-    rank = dist.get_rank()
     needs_staging = _validate_migration_weights(weights_by_layer, layer_ids, rank)
     staging = _ExpertWeightStaging(needs_staging)
     group = _get_migration_group()
+    world_size = dist.get_world_size()
+    num_gpu_per_node = world_size // nnodes
+    start = rank * num_local_physical_experts
+    end = start + num_local_physical_experts
+    temp_buffers = []
+    missing_experts_by_layer = {}
 
-    def update_layer(
-        *,
-        routed_experts_weights: list[torch.Tensor],
-        temp_buffers: list[torch.Tensor],
-        old_physical_to_logical_map: list[int],
-        new_physical_to_logical_map: list[int],
-        num_local_physical_experts: int,
-        rank: int,
-        **kwargs,
-    ) -> None:
-        start = rank * num_local_physical_experts
-        end = start + num_local_physical_experts
-        old_placement = old_physical_to_logical_map
-        new_placement = new_physical_to_logical_map
+    for layer in layer_ids:
+        old_placement = old_placement_by_layer[layer].tolist()
+        new_placement = new_placement_by_layer[layer].tolist()
         local_changed = old_placement[start:end] != new_placement[start:end]
         if not local_changed and not elastic_ep_enabled:
             # Any outgoing expert must appear in a changed destination slot.
@@ -146,26 +141,35 @@ def prepare_expert_weight_update(
                 old != new and new in local_experts
                 for old, new in zip(old_placement, new_placement, strict=True)
             ):
-                return
-        # Populate the shared receive list only when this rank participates.
+                continue
+        weights = weights_by_layer[layer]
+        # Allocate only when this rank participates, then reuse across layers.
         if not temp_buffers:
-            temp_buffers.extend(staging.create_temp_buffers(routed_experts_weights))
-        migration_weights = staging.load(routed_experts_weights)
+            temp_buffers = staging.create_temp_buffers(weights)
+        migration_weights = staging.load(weights)
+        missing_experts = []
         update_layer_fn(
             routed_experts_weights=migration_weights,
             temp_buffers=temp_buffers,
             old_physical_to_logical_map=old_placement,
             new_physical_to_logical_map=new_placement,
             num_local_physical_experts=num_local_physical_experts,
+            num_gpu_per_node=num_gpu_per_node,
             rank=rank,
+            world_size=world_size,
+            missing_logical_experts_info=missing_experts,
+            log_metrics=log_metrics,
             group=group,
-            **kwargs,
         )
         # Unchanged local slots may still send; only their writeback is redundant.
         if local_changed:
-            staging.store(routed_experts_weights, migration_weights)
+            staging.store(weights, migration_weights)
+        # Release this layer's ND references before preparing the next layer.
+        del migration_weights
+        if missing_experts:
+            missing_experts_by_layer[layer] = missing_experts
 
-    return layer_ids, [], update_layer
+    return missing_experts_by_layer
 
 
 def _validate_migration_weights(
