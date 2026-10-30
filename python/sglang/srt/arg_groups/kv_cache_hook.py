@@ -318,6 +318,32 @@ def handle_kv4_compatibility(server_args: Any) -> None:
         raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
 
 
+def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
+    """Check the DSA lightning-indexer quant recipe.
+
+    quant_lightning_indexer (v2) is a CANN op, so an explicitly requested
+    indexer recipe only makes sense on Ascend NPU and on a model that
+    actually has a DSA lightning indexer.  The recipe itself is resolved
+    against the resolved KV cache dtype later, at pool-build time.
+    """
+    cfg = resolving_view(server_args)
+
+    if cfg.indexer_kv_cache_dtype is None:
+        return
+
+    if not get_platform().is_npu:
+        raise RuntimeError(
+            "--indexer-kv-cache-dtype is only supported on Ascend NPU "
+            "(quant_lightning_indexer is a CANN op)."
+        )
+
+    if getattr(model_config_of(server_args), "index_head_dim", None) is None:
+        raise ValueError(
+            "--indexer-kv-cache-dtype requires a DSA model with a lightning "
+            "indexer; this model has none."
+        )
+
+
 def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
     """Validate --prefill-only-disable-kv-cache backend constraint.
 

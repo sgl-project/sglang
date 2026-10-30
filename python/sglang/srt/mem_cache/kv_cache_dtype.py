@@ -19,6 +19,17 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
     torch.bfloat16: "bf16",
 }
 
+# quant_lightning_indexer (v2) quant modes for the NPU DSA indexer cache.
+QUANT_MODE_TOKEN_FP8 = 1
+QUANT_MODE_MXFP8 = 3
+QUANT_MODE_MXFP4 = 5
+
+_INDEXER_KV_CACHE_DTYPE_TO_QUANT_MODE = {
+    "fp8_e4m3": QUANT_MODE_TOKEN_FP8,
+    "mxfp8": QUANT_MODE_MXFP8,
+    "fp4_e2m1": QUANT_MODE_MXFP4,
+}
+
 
 def configure_kv_cache_dtype(
     *,
@@ -97,3 +108,42 @@ def configure_kv_cache_dtype(
         resolved_kv_cache_dtype = "auto"
 
     return resolved_kv_cache_dtype, kv_cache_dtype
+
+
+def resolve_indexer_quant_mode(
+    indexer_kv_cache_dtype: Optional[str],
+    main_kv_cache_dtype: torch.dtype,
+) -> Optional[int]:
+    """Map --indexer-kv-cache-dtype to a quant_lightning_indexer (v2)
+    quant_mode for the NPU DSA indexer cache.
+
+    None inherits the configuration's behavior: an FP8 main KV cache keeps
+    the existing block-32 MXFP8 indexer (quant_mode 3); any other main dtype
+    leaves the quantized indexer disabled (the DSA indexer then runs the
+    legacy bf16 npu_lightning_indexer path).  Explicit recipes require the
+    FP8 main KV cache, which is where the quantized-indexer storage lives.
+    """
+    if indexer_kv_cache_dtype is None:
+        if main_kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            return QUANT_MODE_MXFP8
+        return None
+    quant_mode = _INDEXER_KV_CACHE_DTYPE_TO_QUANT_MODE.get(indexer_kv_cache_dtype)
+    if quant_mode is None:
+        raise ValueError(
+            f"Unsupported indexer_kv_cache_dtype: {indexer_kv_cache_dtype}."
+        )
+    if main_kv_cache_dtype not in (
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ):
+        raise ValueError(
+            f"--indexer-kv-cache-dtype={indexer_kv_cache_dtype} requires the "
+            "FP8 DSA packed main cache (--kv-cache-dtype=fp8_e4m3); got main "
+            f"KV cache dtype {main_kv_cache_dtype}."
+        )
+    if quant_mode == QUANT_MODE_MXFP4 and not hasattr(torch, "float4_e2m1fn_x2"):
+        raise ValueError(
+            "--indexer-kv-cache-dtype=fp4_e2m1 requires "
+            "torch.float4_e2m1fn_x2 support. Please use PyTorch 2.8.0+."
+        )
+    return quant_mode
