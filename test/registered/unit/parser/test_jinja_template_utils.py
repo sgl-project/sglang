@@ -199,6 +199,49 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         self.assertEqual(result["content"], [{"type": "image"}])
         self.assertEqual(image_data[0].content_hash, content_hash)
 
+    def test_process_content_folds_assistant_thinking_parts(self):
+        content = [
+            {"type": "thinking", "thinking": "R1", "text": None},
+            {"type": "reasoning", "thinking": None, "text": "R2"},
+            {"type": "text", "text": "A1"},
+        ]
+        for content_format in ("openai", "string"):
+            msg_dict = {"role": "assistant", "content": list(content)}
+            result = process_content_for_template_format(
+                msg_dict, content_format, [], [], [], []
+            )
+            self.assertEqual(result["reasoning_content"], "R1R2")
+            self.assertNotIn("reasoning_content", msg_dict)
+        result = process_content_for_template_format(
+            {"role": "assistant", "content": [{"type": "text", "text": "A1"}]},
+            "openai",
+            [],
+            [],
+            [],
+            [],
+        )
+        self.assertNotIn("reasoning_content", result)
+
+    def test_process_content_keeps_explicit_reasoning_content(self):
+        for explicit in ("explicit", ""):
+            with self.subTest(reasoning_content=explicit):
+                result = process_content_for_template_format(
+                    {
+                        "role": "assistant",
+                        "reasoning_content": explicit,
+                        "content": [
+                            {"type": "thinking", "thinking": "R1"},
+                            {"type": "text", "text": "A1"},
+                        ],
+                    },
+                    "openai",
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                self.assertEqual(result["reasoning_content"], explicit)
+
     def test_process_content_string_format(self):
         """Test content processing for string format."""
         msg_dict = {

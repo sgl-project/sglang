@@ -298,6 +298,26 @@ class DeepseekMLAForwardMixin:
             return None
         return backend
 
+    def prepare_q_latent_without_q_lora(
+        self: DeepseekV2AttentionMLA,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        q_replicate_active: bool,
+        prev_topk_indices: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        if q_replicate_active:
+            q = self.q_b_proj_replicated_forward(hidden_states)
+        else:
+            q = self.q_proj(hidden_states)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        k_nope = latent_cache[..., : self.kv_lora_rank]
+        k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+        return q, latent_cache, k_nope, None
+
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -482,15 +502,15 @@ class DeepseekMLAForwardMixin:
                             self.layer_id, prev_topk_indices
                         )
         else:
-            if q_replicate_active:
-                q = self.q_b_proj_replicated_forward(hidden_states)
-            else:
-                q = self.q_proj(hidden_states)[0].view(
-                    -1, self.num_local_heads, self.qk_head_dim
+            q, latent_cache, k_nope, topk_indices = (
+                self.prepare_q_latent_without_q_lora(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    q_replicate_active=q_replicate_active,
+                    prev_topk_indices=prev_topk_indices,
                 )
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-            k_nope = latent_cache[..., : self.kv_lora_rank]
-            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
+            )
 
         if q_nope is None:
             q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
@@ -727,7 +747,7 @@ class DeepseekMLAForwardMixin:
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
         attention_output_gate: Optional[torch.Tensor] = None,
     ):
-        save_kv_cache = True
+        save_kv_cache = self.save_kv_cache
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -773,6 +793,7 @@ class DeepseekMLAForwardMixin:
                     k_nope,
                     k_nope,
                     forward_batch,
+                    save_kv_cache=save_kv_cache,
                     q_rope=q_pe,
                     k_rope=k_pe,
                     **extra_args,
@@ -788,6 +809,7 @@ class DeepseekMLAForwardMixin:
                     k_nope,
                     k_nope,
                     forward_batch,
+                    save_kv_cache=save_kv_cache,
                     q_rope=q_pe,
                     k_rope=k_pe,
                     **extra_args,

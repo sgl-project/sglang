@@ -164,6 +164,108 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 ].cpu()
                 self.assertTrue(torch.equal(got_kv, expected_kv))
 
+    def _round_trip_with_shared_topk_layers(self, layout: str, io_backend: str):
+        page_size = 64
+        skip = [False, True, False, True]
+        device_pool = DSATokenToKVPool(
+            size=page_size * 4,
+            page_size=page_size,
+            kv_lora_rank=128,
+            dtype=torch.bfloat16,
+            qk_rope_head_dim=32,
+            layer_num=len(skip),
+            device="cuda",
+            enable_memory_saver=False,
+            kv_cache_dim=576,
+            index_head_dim=128,
+            skip_topk_layers=skip,
+        )
+        pin_memory = io_backend == "kernel"
+        original_alloc = ALLOC_MEMORY_FUNCS["cuda"]
+        if pin_memory:
+            ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
+        try:
+            mla_host = MLATokenToKVPoolHost(
+                device_pool=device_pool,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=page_size,
+                layout=layout,
+                pin_memory=pin_memory,
+                device="cpu",
+                allocator_type="default",
+                override_kv_cache_dim=device_pool.kv_cache_dim,
+            )
+            indexer_host = DSAIndexerPoolHost(
+                decl=make_dsa_indexer_pool_decl(device_pool),
+                anchor_host=mla_host,
+                pin_memory=pin_memory,
+                device="cpu",
+                allocator_type="default",
+            )
+        finally:
+            ALLOC_MEMORY_FUNCS["cuda"] = original_alloc
+
+        owned = [layer for layer, shared in enumerate(skip) if not shared]
+        self.assertEqual(indexer_host.layer_num, len(owned))
+        buffers = device_pool.index_k_with_scale_buffer
+        for layer_id in owned:
+            data = torch.arange(buffers[layer_id].numel(), device="cuda")
+            buffers[layer_id].copy_(
+                ((data + 7 * layer_id) % 256).view_as(buffers[layer_id])
+            )
+
+        # Index placement follows HiCacheController.move_indices / _move_write_operation.
+        index_device = "cuda" if io_backend == "kernel" else "cpu"
+        backup_host_device = (
+            "cpu"
+            if layout == "page_first" and indexer_host.can_use_write_back_jit
+            else index_device
+        )
+        device_pages = torch.tensor([1, 2, 3], dtype=torch.int64)
+        host_pages = torch.tensor([0, 1, 2], dtype=torch.int64)
+        device_indices = self._token_indices_for_pages(
+            device_pages, page_size, index_device
+        )
+        host_indices = self._token_indices_for_pages(
+            host_pages, page_size, index_device
+        )
+
+        expected = {layer: buffers[layer][device_pages].clone() for layer in owned}
+        indexer_host.backup_from_device_all_layer(
+            device_pool,
+            host_indices.to(backup_host_device),
+            device_indices,
+            io_backend,
+        )
+        for layer_id in owned:
+            buffers[layer_id].zero_()
+        for layer_id in range(len(skip)):
+            indexer_host.load_to_device_per_layer(
+                device_pool, host_indices, device_indices, layer_id, io_backend
+            )
+        torch.cuda.synchronize()
+
+        for layer_id in owned:
+            self.assertTrue(
+                torch.equal(buffers[layer_id][device_pages], expected[layer_id])
+            )
+        for layer_id, shared in enumerate(skip):
+            if shared:
+                self.assertEqual(buffers[layer_id].shape[0], 0)
+
+    @unittest.skipIf(is_hip(), "The HIP pool tests above run with page_size=1.")
+    def test_shared_topk_layers_round_trip_through_host(self):
+        """Bug regression (upstream #30531 review): shared-topk layers' zero-row
+        index-K buffers must never enter the HiCache transfer kernels."""
+        for layout, io_backend in (
+            ("layer_first", "kernel"),
+            ("page_first", "kernel"),
+            ("layer_first", "direct"),
+        ):
+            with self.subTest(layout=layout, io_backend=io_backend):
+                self._round_trip_with_shared_topk_layers(layout, io_backend)
+
     @unittest.skipIf(
         is_hip(),
         '`io_backend="kernel"` path in MLATokenToKVPoolHost.backup_from_device_all_layer '

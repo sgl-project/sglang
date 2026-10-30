@@ -352,6 +352,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self._qwen_bcg_hc_sidechannel = qwen_bcg and not model_runner.is_draft_worker
         self._qwen_bcg_mtp_draft = qwen_bcg and model_runner.is_draft_worker
+        self._mm_batches_eager = not getattr(
+            model_runner.model, "prefill_graph_replays_mm_batches", True
+        )
         self.prefer_eager_mixed_prefill = (
             self.prefill_backend_name == Backend.BREAKABLE
             and get_parallel().attn_dp_enabled
@@ -1353,7 +1356,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
         if contains_mm_inputs and (
-            self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
+            self._qwen_bcg_hc_sidechannel
+            or self._qwen_bcg_mtp_draft
+            or getattr(self, "_mm_batches_eager", False)
         ):
             return False
         # Full replay bypasses forward_extend's Python image-mask guard.

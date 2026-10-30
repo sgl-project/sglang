@@ -2615,7 +2615,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             # user-set prefill survives; only decode defaulted
             self.assertEqual(
-                _dsa_split_backend_resolution(_view(dsa_prefill_backend="trtllm")),
+                _dsa_split_backend_resolution(
+                    _view(dsa_prefill_backend="flashmla_sparse")
+                ),
                 {"dsa_decode_backend": "flashmla_kv"},
             )
             # hisparse arm takes precedence (CUDA fp8 -> flashmla_kv)
@@ -2681,6 +2683,65 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "triton",
                 },
             )
+
+    def test_dsa_fp8_trtllm_raw_layout_rejects_a_mixed_consumer(self):
+        """FP8 KV with flashmla_sparse prefill and trtllm decode passed
+        resolution; the first ML4 prefill then fed raw FP8 rows to the BF16
+        sparse kernel ("kv must have dtype BFloat16")."""
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _check_dsa_backend_constraints,
+            _dsa_split_backend_resolution,
+        )
+
+        def _view(**kw):
+            hf = SimpleNamespace(
+                architectures=["MistralLarge4ForCausalLM"], learnable_sink=False
+            )
+            defaults = dict(
+                kv_cache_dtype="fp8_e4m3",
+                dsa_prefill_backend="flashmla_sparse",
+                dsa_decode_backend=None,
+                enable_hisparse=False,
+                disaggregation_mode="null",
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
+            )
+
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 3)),
+        ):
+            with self.assertRaisesRegex(ValueError, "raw FP8"):
+                _dsa_split_backend_resolution(_view())
+            with self.assertRaisesRegex(ValueError, "raw FP8"):
+                _dsa_split_backend_resolution(
+                    _view(
+                        dsa_prefill_backend="trtllm", dsa_decode_backend="flashmla_kv"
+                    )
+                )
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(kv_cache_dtype="bfloat16")),
+                {"dsa_decode_backend": "trtllm"},
+            )
+            self.assertEqual(
+                _dsa_split_backend_resolution(_view(dsa_prefill_backend=None)),
+                {"dsa_prefill_backend": "trtllm", "dsa_decode_backend": "trtllm"},
+            )
+            # Under PD only the local role's backend shapes the local pool.
+            for mode in ("prefill", "decode"):
+                _check_dsa_backend_constraints(
+                    "fp8_e4m3",
+                    "flashmla_sparse",
+                    "trtllm",
+                    hip=False,
+                    disaggregation_mode=mode,
+                )
 
     def test_flashinfer_allreduce_fusion_passes(self):
         from sglang.srt.arg_groups.overrides import (

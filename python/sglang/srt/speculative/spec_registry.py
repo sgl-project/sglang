@@ -115,6 +115,9 @@ class CustomSpecAlgo:
         # Conservative default: the larger KV reserve.
         return True
 
+    def injects_prefill_draft_kv(self) -> bool:
+        return False
+
     def handle_server_args(self, server_args: ServerArgs) -> None:
         pass
 

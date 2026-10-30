@@ -17,6 +17,7 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai_harmony import Conversation, Message, Role, ToolNamespaceConfig
+from transformers.utils.chat_template_utils import _compile_jinja_template
 from utils import (
     MockTemplateManager,
     MockTokenizerManager,
@@ -46,7 +47,10 @@ from sglang.srt.entrypoints.openai.serving_responses import (
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
-from sglang.srt.parser.template_detection import ReasoningToggleConfig
+from sglang.srt.parser.template_detection import (
+    ReasoningToggleConfig,
+    detect_reasoning_pattern,
+)
 from sglang.srt.runtime_context import (
     get_context,
     get_serving,
@@ -618,6 +622,62 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
             [41, 42],
         )
         self.assertFalse(parser_cls.call_args.kwargs["force_reasoning"])
+
+
+class MistralDefaultReasoningEffortTestCase(unittest.TestCase):
+    def test_reasoning_state_matches_rendered_effort(self):
+        """Bug regression: Responses renders its chat_template_kwargs effort, so
+        parsing must follow the template, which maps a null to the default only
+        when its guard tests ``is none``."""
+        think = (
+            "{% if reasoning_effort and reasoning_effort != 'none' %}[THINK]{% endif %}"
+        )
+        undefined_only = (
+            "{% if reasoning_effort is not defined %}"
+            "{% set reasoning_effort = 'high' %}{% endif %}" + think
+        )
+        undefined_or_none = (
+            "{% if reasoning_effort is not defined or reasoning_effort is none %}"
+            "{% set reasoning_effort = 'high' %}{% endif %}" + think
+        )
+        null = {"chat_template_kwargs": {"reasoning_effort": None}}
+        cases = (
+            (undefined_only, {}, True),
+            (undefined_only, null, False),
+            (
+                undefined_only,
+                {"chat_template_kwargs": {"reasoning_effort": "none"}},
+                False,
+            ),
+            (undefined_only, {"reasoning": {"effort": "low"}}, True),
+            (undefined_only, {**null, "reasoning": {"effort": "low"}}, True),
+            (undefined_only, {**null, "reasoning": {"effort": "high"}}, True),
+            (undefined_or_none, {}, True),
+            (undefined_or_none, null, True),
+        )
+        serving = make_serving()
+        serving.reasoning_parser = "mistral"
+        serving._uses_mistral_common_tokenizer = False
+        serving.template_manager.chat_template_name = None
+        serving.template_manager.jinja_template_content_format = "string"
+        tokenizer = serving.tokenizer_manager.tokenizer
+        tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        for template, request_kwargs, thinks in cases:
+            with self.subTest(template=template, request_kwargs=request_kwargs):
+                _, serving.template_manager.reasoning_config = detect_reasoning_pattern(
+                    template
+                )
+                request = ResponsesRequest(model="x", input="hi", **request_kwargs)
+                *_, processed = asyncio.run(
+                    serving._make_request(request, None, tokenizer)
+                )
+                kwargs = tokenizer.apply_chat_template.call_args.kwargs
+                rendered = _compile_jinja_template(template).render(
+                    **{k: v for k, v in kwargs.items() if k == "reasoning_effort"}
+                )
+                self.assertIs("[THINK]" in rendered, thinks)
+                self.assertIs(processed.require_reasoning, thinks)
+                self.assertIs(processed.skip_special_tokens, not thinks)
 
 
 class SkipSpecialTokensForwardingTestCase(CustomTestCase):

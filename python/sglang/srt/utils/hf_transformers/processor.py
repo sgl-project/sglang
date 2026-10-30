@@ -267,7 +267,7 @@ def get_processor(
     if model_name is not None:
         model_name = resolve_runai_obj_uri(model_name)
 
-    if is_mistral_model(tokenizer_name):
+    if is_mistral_model(tokenizer_name, revision=revision):
         config = load_mistral_config(
             tokenizer_name,
             trust_remote_code=trust_remote_code,
@@ -397,11 +397,14 @@ def get_processor(
 
     # AutoProcessor may internally create a TokenizersBackend tokenizer
     # (same issue as get_tokenizer). Replace it with a properly loaded one.
-    if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
+    tokenizer_cls_name = type(tokenizer).__name__
+    if tokenizer_cls_name == _TOKENIZERS_BACKEND or (
+        tokenizer_mode == "mistral" and "MistralCommon" not in tokenizer_cls_name
+    ):
         logger.warning(
-            "Processor tokenizer for %s is TokenizersBackend, "
-            "reloading via get_tokenizer",
+            "Processor tokenizer for %s is %s, reloading via get_tokenizer",
             tokenizer_name,
+            tokenizer_cls_name,
         )
         tokenizer = get_tokenizer(
             tokenizer_name,
@@ -419,7 +422,9 @@ def get_processor(
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(
-            tokenizer_name, allow_patterns=["*.json", "*.jinja", "*.model"]
+            tokenizer_name,
+            allow_patterns=["*.json", "*.jinja", "*.model"],
+            revision=revision,
         )
         jinja_path = Path(local_path) / "chat_template.jinja"
         if jinja_path.is_file():

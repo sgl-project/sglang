@@ -36,7 +36,11 @@ else:
         load_cache_to_device_buffer_spec_mla,
     )
 
-from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
+    dsa_shared_kv_providers,
+    is_deepseek_dsa,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
@@ -96,6 +100,18 @@ def resolve_shared_index_layers(
     else:
         pattern = [dsa_layer_skips_topk(hf_text_config, i) for i in range(num_layers)]
     if not any(pattern):
+        return None
+    # Shared-KV readers swap in under their provider's layer id, which must then
+    # neither consume nor anchor a prefetch plan built from another layer's top-k.
+    if any(
+        pattern[provider] or (provider + 1 < num_layers and pattern[provider + 1])
+        for provider in dsa_shared_kv_providers(hf_text_config)
+    ):
+        logger.warning(
+            "HiSparse shared-index prefetch is unsupported when a shared-KV "
+            "provider layer belongs to a shared-index group; falling back to "
+            "synchronous swap-in."
+        )
         return None
     # Speculative decoding is supported by the HiSparse multi-step swap path;
     # only pipeline parallelism still prevents the shared-index prefetch plan.
@@ -1095,6 +1111,22 @@ class HiSparseCoordinator:
     def commit_spec_accept_tokens(
         self, batch: ScheduleBatch, accept_indices: torch.Tensor
     ) -> None:
+        self.spec_swap.commit_accept_tokens(batch, accept_indices)
+
+    def commit_spec_accept_lens(
+        self, batch: ScheduleBatch, commit_lens: torch.Tensor
+    ) -> None:
+        """Commit a chain verify that accepted the first ``commit_lens`` slots of
+        each request's uniform verify window."""
+        num_slots = self.spec_swap.num_draft_tokens
+        steps = torch.arange(num_slots, device=commit_lens.device)
+        window_starts = (
+            torch.arange(commit_lens.numel(), device=commit_lens.device)[:, None]
+            * num_slots
+        )
+        accept_indices = torch.where(
+            steps < commit_lens[:, None], window_starts + steps, -1
+        )
         self.spec_swap.commit_accept_tokens(batch, accept_indices)
 
     def map_last_loc_to_buffer(

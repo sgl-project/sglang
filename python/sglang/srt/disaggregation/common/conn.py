@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
     BootstrapNotification,
     DeferredBootstrap,
 )
+from sglang.srt.disaggregation.peer_fingerprint import peer_fingerprint_mismatches
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -129,6 +130,7 @@ class PrefillServerInfo:
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
+    peer_fingerprint: Optional[dict] = None
     decode_allocation_policy: str = "early"
     # Each prefill shard-group rank owns a subset of logical KV pages.
     enable_kv_cache_sharding: bool = False
@@ -302,6 +304,7 @@ class CommonKVManager(BaseKVManager):
 
     kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
+    peer_fingerprint: Optional[dict] = None
 
     # Logical-page KV sharding (PD prefill only): this rank's slot in the
     # shard group. Each rank owns a subset of logical KV pages.
@@ -324,6 +327,7 @@ class CommonKVManager(BaseKVManager):
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
+        self.peer_fingerprint = getattr(args, "peer_fingerprint", None)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
@@ -1356,6 +1360,23 @@ class CommonKVManager(BaseKVManager):
                 f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
             )
 
+        if self.peer_fingerprint is not None:
+            problems = peer_fingerprint_mismatches(
+                self.peer_fingerprint, info.peer_fingerprint
+            )
+            if problems:
+                raise RuntimeError(
+                    f"PD peer mismatch with prefill {bootstrap_addr}: "
+                    + "; ".join(problems)
+                    + ". Launch both roles with the same model, speculation "
+                    "and KV layout."
+                )
+            if info.peer_fingerprint is None:
+                logger.warning(
+                    f"Prefill {bootstrap_addr} publishes no peer fingerprint; "
+                    "its model and KV layout are not verified."
+                )
+
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:
             if local_layout != info.dsv41_spec_layout:
@@ -1598,6 +1619,7 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
+            "peer_fingerprint": self.peer_fingerprint,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
@@ -3012,6 +3034,14 @@ class CommonKVReceiver(BaseKVReceiver):
                 )
 
 
+def _same_peer_identity(first: Optional[dict], other: Optional[dict]) -> bool:
+    # Prefill ranks differ in per-rank layout (PP stages); model and speculation must not.
+    keys = ("target", "draft", "speculation")
+    return {k: (first or {}).get(k) for k in keys} == {
+        k: (other or {}).get(k) for k in keys
+    }
+
+
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def __init__(self, host: str, port: int):
         self.host = host
@@ -3031,6 +3061,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.kv_layout: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
+        self.peer_fingerprint: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
@@ -3105,6 +3136,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         kv_layout = data.get("kv_layout")
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
+        peer_fingerprint = data.get("peer_fingerprint")
+        if self._registered_count and not _same_peer_identity(
+            self.peer_fingerprint, peer_fingerprint
+        ):
+            return web.Response(
+                text="Model or speculation differs across prefill ranks", status=400
+            )
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
             return web.Response(
@@ -3117,6 +3155,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 text="Inconsistent prefill allocation policies", status=400
             )
         self.dsv41_spec_layout = dsv41_spec_layout
+        if self.peer_fingerprint is None:
+            self.peer_fingerprint = peer_fingerprint
         self.decode_allocation_policy = policy
 
         if self.attn_tp_size is None:
@@ -3219,6 +3259,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 kv_cache_dtype=self.kv_cache_dtype,
                 kv_layout=self.kv_layout,
                 dsv41_spec_layout=self.dsv41_spec_layout,
+                peer_fingerprint=self.peer_fingerprint,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -3234,6 +3275,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 payload.pop("dsv41_spec_layout")
             if info.kv_layout is None:
                 payload.pop("kv_layout")
+            if info.peer_fingerprint is None:
+                payload.pop("peer_fingerprint")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():

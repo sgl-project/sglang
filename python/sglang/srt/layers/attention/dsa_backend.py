@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.configs.model_config import (
     dsa_draft_shards_under_dcp,
+    dsa_supports_dense_attention,
     get_dsa_index_topk,
     is_deepseek_dsa,
 )
@@ -130,6 +131,8 @@ def prepare_kv_for_attention(
     """Materialize KV needed before attention for the active layout."""
     if (
         defer_materialization
+        # A layer that reads another layer's cache has no KV of its own to gather.
+        or not attn_mla.save_kv_cache
         or not dsa_use_prefill_cp(forward_batch)
         or not is_cp_active(forward_batch)
     ):
@@ -591,7 +594,9 @@ class DeepseekSparseAttnBackend(
         # Dense MHA expands prefix KV outside the DSA metadata path. Keep
         # sharded prefill on the sparse kernels with explicit scratch addresses.
         self.supports_mha_one_shot: bool = (
-            self.dcp_size == 1 and self._kv_shard_pool is None
+            dsa_supports_dense_attention(hf_config)
+            and self.dcp_size == 1
+            and self._kv_shard_pool is None
         )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
@@ -3377,10 +3382,19 @@ class DeepseekSparseAttnBackend(
         page_table_1,
     ) -> torch.Tensor:
         cache_seqlens = metadata.dsa_cache_seqlens_int32
-        assert metadata.flashmla_metadata is not None
+        flashmla_metadata = metadata.flashmla_metadata
+        assert flashmla_metadata is not None
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        if cache_seqlens.shape[0] != q_all.shape[0]:
+            # An extend batch padded to a multiple of attention TP runs on its real
+            # rows only, while the DP-padded metadata covers the padded rows.
+            assert cache_seqlens.shape[0] > q_all.shape[0]
+            cache_seqlens = cache_seqlens[: q_all.shape[0]]
+            flashmla_metadata = self._compute_flashmla_metadata(
+                cache_seqlens=cache_seqlens, seq_len_q=1
+            )
         num_q_heads = q_all.shape[2]
         target_q_heads = self.flashmla_kv_num_q_heads
         if target_q_heads != num_q_heads:
@@ -3409,8 +3423,8 @@ class DeepseekSparseAttnBackend(
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
             head_dim_v=v_head_dim,
-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
+            tile_scheduler_metadata=flashmla_metadata.flashmla_metadata,
+            num_splits=flashmla_metadata.num_splits,
             softmax_scale=sm_scale,
             indices=indices,
             # doc says it is not used, but if pass in None then error

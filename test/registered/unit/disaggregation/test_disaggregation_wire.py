@@ -1593,6 +1593,22 @@ class TestHiSparseStagedSpecRelay(CustomTestCase):
         self.assertIs(spec_input.future_indices, future_indices)
         self.assertFalse(spec_input.future_dsa_topk_indices_available)
 
+    def test_staged_dspark_relay_resolves_the_bonus_token(self):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SpeculativeAlgorithm.DSPARK
+        future_map.device = torch.device("cpu")
+        future_map.need_topk = False
+        future_map.need_hidden_states = False
+        future_map.output_tokens_buf = torch.arange(10, 14, dtype=torch.int64)
+        future_map.dsa_topk_indices_buf = None
+        future_indices = torch.tensor([1, 3], dtype=torch.int64)
+
+        spec_input = future_map.make_staged_spec_input(future_indices)
+        future_map._resolve_spec_extras(SimpleNamespace(spec_info=spec_input))
+
+        self.assertIs(spec_input.future_indices, future_indices)
+        torch.testing.assert_close(spec_input.bonus_tokens, torch.tensor([11, 13]))
+
     @patch("sglang.srt.managers.overlap_utils.gather_spec_extras")
     def test_staged_relay_restores_rejection_sampling_probs(self, gather_spec_extras):
         future_map = object.__new__(FutureMap)

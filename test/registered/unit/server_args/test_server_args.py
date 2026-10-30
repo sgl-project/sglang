@@ -39,6 +39,7 @@ from sglang.srt.arg_groups.hisparse_hook import (
     _hisparse_default_backend,
     validate_hisparse,
     validate_hisparse_dsa_backend,
+    validate_hisparse_feature_combos,
     validate_hisparse_kv_cache_dtype,
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
@@ -288,6 +289,73 @@ class TestPrepareServerArgs(CustomTestCase):
         # This validation runs before model construction and should allow the
         # daemon to build the same static EPLB layout as the engine.
         handle_load_format(args)
+
+    def test_hf_draft_for_mistral_native_target_loads_its_own_format(self):
+        def checkpoint(root, *names):
+            os.makedirs(root)
+            for name in names:
+                open(os.path.join(root, name), "w").close()
+            return root
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = checkpoint(
+                os.path.join(tmp, "target"), "params.json", "consolidated.safetensors"
+            )
+            cases = (
+                (("config.json", "model.safetensors"), "auto"),
+                (("params.json", "consolidated.safetensors"), None),
+            )
+            for i, (draft_files, draft_load_format) in enumerate(cases):
+                with self.subTest(draft_files=draft_files):
+                    args = ServerArgs(model_path="dummy")
+                    msgspec.structs.force_setattr(args, "model_path", target)
+                    msgspec.structs.force_setattr(
+                        args,
+                        "speculative_draft_model_path",
+                        checkpoint(os.path.join(tmp, f"draft{i}"), *draft_files),
+                    )
+                    handle_load_format(args)
+                    self.assertEqual(resolution_result(args, "load_format"), "mistral")
+                    self.assertEqual(
+                        resolution_result(args, "speculative_draft_load_format"),
+                        draft_load_format,
+                    )
+
+    def test_hub_draft_format_follows_the_pinned_revision(self):
+        native = ["params.json", "consolidated.safetensors"]
+        hf = ["config.json", "model.safetensors"]
+        cases = (
+            ({None: hf, "native-pin": native}, "native-pin", None),
+            ({None: native, "hf-pin": hf}, "hf-pin", "auto"),
+        )
+        with tempfile.TemporaryDirectory() as target:
+            for name in ("params.json", "consolidated.safetensors"):
+                open(os.path.join(target, name), "w").close()
+            for layouts, revision, draft_load_format in cases:
+                with self.subTest(revision=revision):
+
+                    def model_info(repo_id, revision=None, **kwargs):
+                        return SimpleNamespace(
+                            siblings=[
+                                SimpleNamespace(rfilename=f) for f in layouts[revision]
+                            ]
+                        )
+
+                    args = ServerArgs(model_path="dummy")
+                    msgspec.structs.force_setattr(args, "model_path", target)
+                    msgspec.structs.force_setattr(
+                        args, "speculative_draft_model_path", "org/draft"
+                    )
+                    msgspec.structs.force_setattr(
+                        args, "speculative_draft_model_revision", revision
+                    )
+                    with patch("huggingface_hub.HfApi") as hf_api:
+                        hf_api.return_value.model_info.side_effect = model_info
+                        handle_load_format(args)
+                    self.assertEqual(
+                        resolution_result(args, "speculative_draft_load_format"),
+                        draft_load_format,
+                    )
 
     def test_instanttensor_requires_cuda_device(self):
         for device in ("cpu", "xpu", "npu", "musa", "hpu", "mps"):
@@ -1782,6 +1850,51 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "speculative-adaptive"):
                 validate_hisparse(server_args)
+
+    def test_hisparse_rejects_compositions_without_hisparse_translation(self):
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["MistralLarge4ForCausalLM"])
+        )
+        cases = [
+            ({"speculative_algorithm": "DFLASH"}, "DFLASH", "static"),
+            (
+                {"speculative_algorithm": "DSPARK"},
+                "SGLANG_RAGGED_VERIFY_MODE",
+                "compact",
+            ),
+            ({"enable_prefill_cp": True}, "enable-prefill-cp", "static"),
+        ]
+        for extra, message, ragged_mode in cases:
+            server_args = ServerArgs(
+                model_path="dummy",
+                enable_hisparse=True,
+                disable_radix_cache=True,
+                **extra,
+            )
+            with (
+                self.subTest(message=message),
+                patch(
+                    "sglang.srt.arg_groups.hisparse_hook.model_config_of",
+                    return_value=model_config,
+                ),
+                patch(
+                    "sglang.srt.configs.model_config.is_deepseek_dsa",
+                    return_value=True,
+                ),
+                envs.SGLANG_RAGGED_VERIFY_MODE.override(ragged_mode),
+            ):
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_hisparse(server_args)
+
+    def test_hisparse_accepts_dspark_with_static_verify(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            speculative_algorithm="DSPARK",
+        )
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            validate_hisparse_feature_combos(server_args)
 
 
 class TestFa4PageSizeAutoForce(CustomTestCase):
@@ -4339,6 +4452,66 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
             )
         ]
         return args
+
+    def _dsa_args(self, hf_config, **overrides):
+        args = self._args(
+            device="cuda",
+            tp_size=8,
+            enable_prefill_cp=True,
+            attn_cp_size=2,
+            cp_strategy="interleave",
+            pp_size=1,
+            attention_backend="dsa",
+            dsa_prefill_backend="trtllm",
+            dsa_decode_backend="trtllm",
+            kv_cache_dtype="fp8_e4m3",
+            page_size=64,
+            disaggregation_transfer_backend="mooncake",
+            chunked_prefill_size=4096,
+            disable_hybrid_swa_memory=True,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+            model_config=SimpleNamespace(
+                is_encoder_decoder=False,
+                attention_chunk_size=None,
+                attention_arch=AttentionArch.MLA,
+                hf_config=hf_config,
+            ),
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_dsa_sharding_rejects_cross_layer_kv_sharing(self):
+        # The two-slot prefix scratch evicts a provider before its reader runs.
+        def text(sources):
+            return SimpleNamespace(
+                architectures=["MistralLarge4ForCausalLM"],
+                index_topk=2048,
+                kv_sharing_config={"source_layers_str": ",".join(map(str, sources))},
+            )
+
+        shared = text([35 if i > 35 and i % 4 == 3 else i for i in range(72)])
+        identity = text(list(range(72)))
+        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            for name, hf_config in (
+                ("text", shared),
+                (
+                    "pixtral",
+                    SimpleNamespace(
+                        architectures=["PixtralForConditionalGeneration"],
+                        text_config=shared,
+                    ),
+                ),
+            ):
+                with self.subTest(name):
+                    with self.assertRaisesRegex(ValueError, "cross-layer KV sharing"):
+                        handle_kv_cache_sharding(self._dsa_args(hf_config), 80 * 1024)
+            handle_kv_cache_sharding(self._dsa_args(identity), 80 * 1024)
+            handle_kv_cache_sharding(
+                self._dsa_args(shared, enable_kv_cache_sharding=False), 80 * 1024
+            )
 
     def test_sharding_defaults_to_python_when_backend_is_unset(self):
         args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)

@@ -24,6 +24,19 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
         raise ValueError("DSA DCP does not support PD disaggregation.")
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
+    if (cfg.speculative_algorithm or "").upper() == "DSPARK":
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        ragged_mode = read_ragged_verify_mode()
+        if ragged_mode is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "DSA DCP with DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static: the "
+                "DSA verify expands a uniform window per request (got "
+                f"{ragged_mode.value!r})."
+            )
     # The DCP paths: trtllm on CUDA, triton on ROCm.
     backend = "triton" if get_platform().is_hip else "trtllm"
     overrides = {
@@ -36,11 +49,31 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     return overrides
 
 
+def _dsa_only_attention_overrides(cfg: Any) -> dict:
+    unsupported = {
+        name: backend
+        for name in (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        )
+        if (backend := getattr(cfg, name)) not in (None, "dsa", "nsa")
+    }
+    if unsupported:
+        raise ValueError(
+            "This model's NoPE, SSMax or KV-sharing attention is implemented only "
+            f"by the dsa attention backend; got {unsupported}."
+        )
+    # A split field alone leaves the other phase to the generic dense default.
+    return {"attention_backend": "dsa"} if cfg.attention_backend is None else {}
+
+
 @_register_for(
     "DeepseekV3ForCausalLM",
     "DeepseekV32ForCausalLM",
     "KimiK25ForConditionalGeneration",
     "MistralLarge3ForCausalLM",
+    "MistralLarge4ForCausalLM",
     "PixtralForConditionalGeneration",
     "GlmMoeDsaForCausalLM",
     "Glm5NextForConditionalGeneration",
@@ -54,6 +87,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Declare DeepSeek/DSA defaults; ordered CP, KV-cache, and MoE passes run in model_hook."""
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
+        dsa_supports_dense_attention,
         get_dsa_index_kpool,
         is_deepseek_dsa,
         unwrap_modelopt_quantization_config,
@@ -99,6 +133,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
+        if not dsa_supports_dense_attention(hf_config):
+            overrides.update(_dsa_only_attention_overrides(cfg))
         overrides.update(_dsa_dcp_overrides(cfg))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):

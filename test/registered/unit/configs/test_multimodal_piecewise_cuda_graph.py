@@ -95,6 +95,19 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
         self.assertTrue(runner.can_run_graph(self._make_multimodal_forward_batch()))
 
+    def test_pixtral_replays_image_batches(self):
+        from sglang.srt.models.pixtral import PixtralForConditionalGeneration
+
+        runner = self._make_prefill_runner(Backend.BREAKABLE)
+        runner._mm_batches_eager = (
+            not PixtralForConditionalGeneration.prefill_graph_replays_mm_batches
+        )
+        forward_batch = self._make_multimodal_forward_batch()
+        self.assertTrue(runner.can_run_graph(forward_batch))
+        forward_batch.mm_inputs = None
+        forward_batch.contains_mm_inputs = lambda: False
+        self.assertTrue(runner.can_run_graph(forward_batch))
+
     def test_breakable_prefill_takes_nonzero_prefix_on_cuda_only(self):
         runner = self._make_prefill_runner(Backend.BREAKABLE)
         forward_batch = self._make_multimodal_forward_batch()

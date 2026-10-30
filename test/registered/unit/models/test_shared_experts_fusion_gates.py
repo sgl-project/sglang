@@ -866,6 +866,25 @@ class TestWrapperEntryClassGates(_FusionGateCase):
         self.assertEqual(count(SimpleNamespace(text_config=mla_text)), 1)
         self.assertEqual(count(gqa), 0)
 
+    def test_pixtral_hands_mistral_large_4_to_its_own_family(self):
+        from sglang.srt.models.mistral_large_4 import MistralLarge4ForCausalLM
+        from sglang.srt.models.pixtral import PixtralForConditionalGeneration
+
+        self._seed()
+        ml4_text = SimpleNamespace(
+            model_type="mistral_large_4",
+            architectures=["MistralLarge4ForCausalLM"],
+            n_routed_experts=128,
+            n_shared_experts=1,
+        )
+        config = SimpleNamespace(text_config=ml4_text)
+        seen, patcher = self._recording_gate(MistralLarge4ForCausalLM)
+        with patcher:
+            self._reason(PixtralForConditionalGeneration, config)
+        self.assertIs(seen["config"], ml4_text)
+        count = PixtralForConditionalGeneration.num_fusable_shared_experts
+        self.assertEqual(count(config), 1)
+
     def test_dots_vlm_hands_over_the_language_config(self):
         from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
         from sglang.srt.models.dots_vlm import DotsVLMForCausalLM

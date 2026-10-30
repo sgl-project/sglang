@@ -382,6 +382,77 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
 
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_mistral_large_4_latent_and_index_layers_follow_their_own_gates(self, _):
+        """Latent sharing and top-k sharing elide different layers. HiCache retains
+        every latent buffer, so pricing and allocation must apply separate gates."""
+        from sglang.srt.mem_cache import kv_cache_configurator
+        from sglang.srt.utils.hf_transformers.mistral_utils import (
+            _remap_mistral_dsa_args,
+        )
+
+        sharing = (
+            ["full"] * 17
+            + ["shared", "shared", "full", "full"] * 13
+            + ["shared", "shared", "full"]
+        )
+        sources = [
+            35 if layer > 35 and layer % 4 == 3 else layer for layer in range(72)
+        ]
+        pattern = _remap_mistral_dsa_args(
+            {
+                "num_hidden_layers": 72,
+                "qk_rope_head_dim": 64,
+                "dsa": {"index_topk": 2048, "index_sharing": ",".join(sharing)},
+            }
+        )["index_topk_pattern"]
+
+        def layout(**published):
+            mr = _make_model_runner(self, num_layers=72, use_mla_backend=True)
+            _configure_dsa_model(mr)
+            hf_config = mr.model_config.hf_config
+            mr.loc_space_scale = 1
+            mr.kv_shard_rank = None
+            hf_config.architectures = ["MistralLarge4ForCausalLM"]
+            hf_config.index_topk_pattern = pattern
+            hf_config.kv_sharing_config = {
+                "source_layers_str": ",".join(map(str, sources))
+            }
+            if published:
+                _publish_config(self, **published)
+            with mock_cpu_env(kv_size=1):
+                from sglang.srt.model_executor.pool_configurator import (
+                    DefaultPoolConfigurator,
+                )
+
+                cell_size = DefaultPoolConfigurator(mr)._cell_size
+                pool_cls = MagicMock()
+                kv_cache_configurator.KVCacheConfigurator._build_dsa_kv_pool(
+                    mr,
+                    max_total_num_tokens=64,
+                    max_running_requests=1,
+                    dsa_pool_class=pool_cls,
+                )
+            kwargs = pool_cls.call_args.kwargs
+            latent_layers = 72 - sum(kwargs.get("skip_kv_layers") or ())
+            index_layers = 72 - sum(kwargs.get("skip_topk_layers") or ())
+            return cell_size, latent_layers, index_layers
+
+        # The DSA indexer adds 128 FP8 values and one FP32 scale (4 bytes).
+        self.assertEqual(layout(), (576 * 63 + 132 * 44, 63, 44))
+        self.assertEqual(
+            layout(enable_hierarchical_cache=True), (576 * 72 + 132 * 44, 72, 44)
+        )
+        with patch.object(kv_cache_configurator, "_is_npu", True):
+            self.assertEqual(
+                layout(enable_hierarchical_cache=True), (576 * 72 + 132 * 72, 72, 72)
+            )
+        # The Ascend MLA pool allocates every latent layer, so it must be priced in full.
+        self.assertEqual(layout(attention_backend="ascend")[0], 576 * 72 + 132 * 44)
+
     def test_fused_draft_entry_overrides_the_layer_ratio(self):
         """A fused draft prices the exact fused entry (host + draft + pad);
         the per-draft-layer ratio under-reserves the pad."""

@@ -11,7 +11,9 @@ import torch
 
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.kv_cache_configurator import _should_elide_dsa_index_k
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     MambaPool,
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -36,6 +38,8 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.srt.runtime_context import get_context
+from sglang.srt.utils.hf_transformers.mistral_utils import _remap_mistral_dsa_args
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -938,6 +942,93 @@ class TestDSAIndexerPoolDecl(CustomTestCase):
         self.assertFalse(mirror._is_device_layer_owned(stub, 1))
         # packed draft depth 0 arrives as device layer_num + 0 and lands after the live layers
         self.assertEqual(mirror._draft_host_layer(stub.layer_num), 2)
+
+    def test_kv_sharing_consumers_keep_their_index_keys_on_host(self):
+        """Latent-cache sharing does not imply index-key sharing; dropping a
+        consumer's keys on host silently corrupts top-k after a host hit."""
+        sharing = (
+            ["full"] * 17
+            + ["shared", "shared", "full", "full"] * 13
+            + ["shared", "shared", "full"]
+        )
+        kv_sources = [
+            35 if layer > 35 and layer % 4 == 3 else layer for layer in range(72)
+        ]
+        config = _remap_mistral_dsa_args(
+            {
+                "num_hidden_layers": 72,
+                "qk_rope_head_dim": 64,
+                "dsa": {"index_topk": 2048, "index_sharing": ",".join(sharing)},
+            }
+        )
+        consumers = [layer for layer, src in enumerate(kv_sources) if src != layer]
+
+        # HiCache keeps the elided device layout that the host pool mirrors.
+        override = get_context().override_server_args(enable_hierarchical_cache=True)
+        override.install()
+        self.addCleanup(override.restore)
+        self.assertTrue(_should_elide_dsa_index_k(is_draft_worker=False))
+
+        stub = self._stub()
+        stub.layer_num = stub.end_layer = 72
+        stub.skip_topk_layers = [p == "S" for p in config["index_topk_pattern"]]
+        decl = make_dsa_indexer_pool_decl(stub)
+        anchor = MLATokenToKVPoolHost(
+            MLAHostAllocation(
+                dtype=stub.store_dtype,
+                kv_lora_rank=stub.kv_lora_rank,
+                qk_rope_head_dim=stub.qk_rope_head_dim,
+                kv_cache_dim=stub.kv_lora_rank + stub.qk_rope_head_dim,
+                size_per_token=(stub.kv_lora_rank + stub.qk_rope_head_dim)
+                * stub.store_dtype.itemsize
+                * stub.layer_num,
+            ),
+            device_capacity_tokens=stub.size,
+            start_layer=stub.start_layer,
+            end_layer=stub.end_layer,
+            target_layer_num=stub.layer_num,
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=64,
+            layout="page_first",
+            pin_memory=False,
+        )
+        mirror = DSAIndexerPoolHost(
+            decl=decl, anchor_host=anchor, pin_memory=False, is_dummy=True
+        )
+
+        owned = set(decl.owned_device_layers)
+        self.assertEqual(len(owned), 44)
+        self.assertLessEqual(set(consumers), owned)
+        self.assertEqual(mirror.layer_num, 44)
+        self.assertEqual(anchor.layer_num, 72)
+
+    def test_kv_sharing_consumers_relocate_without_latent_rows(self):
+        """Consumer layers hold 0-row latent placeholders: relocation must move the
+        providers' rows around them and still move the index keys."""
+        pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        pool.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+        pool.custom_mem_pool = None
+        pool.size, pool.page_size, pool.kv_cache_dim = 6, 2, 3
+        pool.store_dtype, pool.device = torch.float32, "cpu"
+        pool.skip_kv_layers = [False, True, False]
+        pool.index_key_cache = unittest.mock.Mock()
+
+        pool._create_buffers()
+        self.assertEqual([buf.shape[0] for buf in pool.kv_buffer], [8, 0, 8])
+        for layer, buf in enumerate(pool.kv_buffer):
+            buf.copy_(torch.arange(buf.numel()).view_as(buf) + 100 * layer)
+        before = [buf.clone() for buf in pool.kv_buffer]
+
+        tgt, src = torch.tensor([5, 6]), torch.tensor([1, 2])
+        pool.move_kv_cache(tgt, src)
+
+        for layer in (0, 2):
+            expected = before[layer].clone()
+            expected[tgt] = before[layer][src]
+            torch.testing.assert_close(pool.kv_buffer[layer], expected)
+        self.assertEqual(pool.kv_buffer[1].shape[0], 0)
+        pool.index_key_cache.move.assert_called_once_with(tgt, src)
 
 
 class TestMambaHostPoolOnXpu(CustomTestCase):

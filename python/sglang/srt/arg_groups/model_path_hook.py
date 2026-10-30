@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import glob
 import importlib
 import logging
 import os
@@ -15,7 +14,8 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
-from sglang.srt.utils.common import find_local_repo_dir, is_remote_url
+from sglang.srt.utils.common import is_remote_url
+from sglang.srt.utils.hf_transformers.mistral_utils import is_mistral_native_checkpoint
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
@@ -199,6 +199,23 @@ def handle_load_format(server_args: Any):
             load_format="remote",
         )
 
+    # The draft inherits the target's load format unless it has its own; an
+    # HF-layout draft for a Mistral-native target must not look for consolidated files.
+    if (
+        cfg.speculative_draft_model_path is not None
+        and cfg.speculative_draft_load_format is None
+        and cfg.load_format == "mistral"
+        and not is_runai_obj_uri(cfg.speculative_draft_model_path)
+        and not is_mistral_native_checkpoint(
+            cfg.speculative_draft_model_path, cfg.speculative_draft_model_revision
+        )
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_load_format",
+            speculative_draft_load_format="auto",
+        )
+
     if (
         cfg.speculative_draft_model_path is not None
         and is_runai_obj_uri(cfg.speculative_draft_model_path)
@@ -308,62 +325,5 @@ def validate_transfer_engine(server_args: Any):
 
 
 def is_mistral_native_format(server_args: Any) -> bool:
-    """True iff the checkpoint requires load_format=mistral.
-
-    Looks for consolidated*.safetensors with no competing
-    model*.safetensors; when both weight formats ship in the
-    same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
-    preferred to avoid loading Mistral-named weights into an
-    HF-named architecture.
-
-    Name override: mistral-large-3 / mistral-small-4 /
-    leanstral always treat as Mistral-native when params.json
-    is present -- those families need Mistral weight loading
-    regardless of which weight files happen to be present.
-    """
     cfg = resolving_view(server_args)
-    _MISTRAL_NATIVE_PATTERNS = (
-        "mistral-large-3",
-        "mistral-small-4",
-        "leanstral",
-    )
-    name_matches = any(
-        p in str(cfg.model_path).lower() for p in _MISTRAL_NATIVE_PATTERNS
-    )
-
-    def _check_format(has_params, has_consolidated, has_hf_weights) -> bool:
-        if has_params and name_matches:
-            return True
-        return has_consolidated and not has_hf_weights
-
-    if os.path.isdir(cfg.model_path):
-        return _check_format(
-            has_params=os.path.exists(os.path.join(cfg.model_path, "params.json")),
-            has_consolidated=bool(
-                glob.glob(os.path.join(cfg.model_path, "consolidated*.safetensors"))
-            ),
-            has_hf_weights=bool(
-                glob.glob(os.path.join(cfg.model_path, "model*.safetensors"))
-            ),
-        )
-
-    try:
-        from huggingface_hub import HfApi
-
-        files = {s.rfilename for s in HfApi().model_info(cfg.model_path).siblings}
-    except Exception:
-        # Hub unreachable (offline, rate-limited): judge from the local snapshot.
-        snapshot_dir = find_local_repo_dir(cfg.model_path, cfg.revision)
-        if snapshot_dir is None:
-            return False
-        files = set(os.listdir(snapshot_dir))
-    return _check_format(
-        has_params="params.json" in files,
-        has_consolidated=any(
-            f.startswith("consolidated") and f.endswith(".safetensors") for f in files
-        ),
-        has_hf_weights=any(
-            f.startswith("model") and f.endswith(".safetensors") and "/" not in f
-            for f in files
-        ),
-    )
+    return is_mistral_native_checkpoint(cfg.model_path, cfg.revision)

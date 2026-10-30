@@ -40,11 +40,14 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
+    prepare_mm_inputs,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mistral import MistralForCausalLMMistralFormat
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
+from sglang.srt.models.mistral_large_4 import MistralLarge4ForCausalLM
 
 USE_XFORMERS_OPS = False
 PATCH_MERGE = "patch_merge"
@@ -78,9 +81,14 @@ def _fused_moe_text_config(hf_config):
 
 class PixtralForConditionalGeneration(nn.Module):
     merge_by_field_config = True
+    prefill_graph_replays_mm_batches = True
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        if getattr(hf_config.text_config, "model_type", "") == "mistral_large_4":
+            return MistralLarge4ForCausalLM.shared_experts_fusion_disable_reason(
+                hf_config.text_config, quant_config
+            )
         text_config = _fused_moe_text_config(hf_config)
         if text_config is None:
             return None
@@ -90,6 +98,10 @@ class PixtralForConditionalGeneration(nn.Module):
 
     @staticmethod
     def num_fusable_shared_experts(hf_config) -> int:
+        if getattr(hf_config.text_config, "model_type", "") == "mistral_large_4":
+            return MistralLarge4ForCausalLM.num_fusable_shared_experts(
+                hf_config.text_config
+            )
         text_config = _fused_moe_text_config(hf_config)
         if text_config is None:
             return 0
@@ -122,7 +134,12 @@ class PixtralForConditionalGeneration(nn.Module):
         # GQA text configs use the standard Llama-style Mistral backbone.
         text_config = self.config.text_config
         is_mla = getattr(text_config, "model_type", "") == "deepseek_v3"
-        if is_mla:
+        if text_config.model_type == "mistral_large_4":
+            self.language_model = MistralLarge4ForCausalLM(
+                config=text_config,
+                quant_config=kwargs.get("quant_config"),
+            )
+        elif is_mla:
             self.language_model = MistralLarge3ForCausalLM(
                 config=text_config,
                 quant_config=kwargs.get("quant_config"),
@@ -242,13 +259,28 @@ class PixtralForConditionalGeneration(nn.Module):
         image_embeds = self.vision_language_adapter(image_features)
         return image_embeds
 
-    def forward(self, input_ids, positions, forward_batch):
+    @property
+    def start_layer(self) -> int:
+        return self.language_model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.language_model.end_layer
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        forward_batch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
         return general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
             multimodal_model=self,
             positions=positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
     def compute_logits(
@@ -259,6 +291,44 @@ class PixtralForConditionalGeneration(nn.Module):
 
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.language_model.get_input_embeddings()
+
+    @property
+    def lm_head(self) -> nn.Module:
+        return self.language_model.lm_head
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
+
+    @property
+    def capture_aux_hidden_states(self) -> bool:
+        return self.language_model.capture_aux_hidden_states
+
+    @property
+    def pp_group(self):
+        return self.language_model.pp_group
+
+    @property
+    def logits_processor(self) -> nn.Module:
+        return self.language_model.logits_processor
+
+    def get_cp_language_model(self) -> nn.Module:
+        return self.language_model.model
+
+    def prepare_cp_inputs(self, forward_batch, **kwargs):
+        """Embed images over the full sequence before the CP runner shards tokens."""
+        input_embeds = kwargs.pop("input_embeds", None)
+        if input_embeds is None or forward_batch.contains_mm_inputs():
+            input_embeds = prepare_mm_inputs(
+                forward_batch.input_ids,
+                forward_batch,
+                self.language_model,
+                kwargs,
+                multimodal_model=self,
+            )
+        return input_embeds, forward_batch.positions, kwargs
 
 
 class PatchMerger(nn.Module):

@@ -23,6 +23,7 @@ from sglang.srt.configs.model_config import (
     is_hybrid_swa_model,
     is_layer_types_hybrid_swa_model,
     is_multimodal_model,
+    is_pixtral_mistral_large_4,
     load_decision_config,
     register_model_config_factory,
     resolve_spec_hidden_size,
@@ -358,6 +359,56 @@ class TestDecisionCheckpointConfig(CustomTestCase):
                 self._checkpoint(checkpoint, **decision)
                 with self.assertRaisesRegex(ValueError, "is not supported"):
                     load_decision_config(checkpoint, None)
+
+
+class TestPixtralBreakableCudaGraphSupport(CustomTestCase):
+    """Pixtral opts into multimodal BCG only when it hosts Mistral Large 4."""
+
+    def _derived(self, text_arch, *, enable_multimodal=True):
+        config = ModelConfig.__new__(ModelConfig)
+        config.is_multimodal = True
+        config.hf_config = SimpleNamespace(
+            architectures=["PixtralForConditionalGeneration"],
+            text_config=SimpleNamespace(architectures=[text_arch]),
+        )
+        config._derive_multimodal_cuda_graph_support(enable_multimodal)
+        return config
+
+    def test_mistral_large_4_host_is_supported(self):
+        self.assertTrue(
+            self._derived(
+                "MistralLarge4ForCausalLM"
+            ).is_multimodal_breakable_cuda_graph_supported
+        )
+
+    def test_other_pixtral_language_models_are_not_supported(self):
+        for text_arch in ("MistralLarge3ForCausalLM", "MistralForCausalLM"):
+            with self.subTest(text_arch=text_arch):
+                self.assertFalse(
+                    self._derived(
+                        text_arch
+                    ).is_multimodal_breakable_cuda_graph_supported
+                )
+
+    def test_requires_multimodal_enabled(self):
+        self.assertFalse(
+            self._derived(
+                "MistralLarge4ForCausalLM", enable_multimodal=False
+            ).is_multimodal_breakable_cuda_graph_supported
+        )
+
+    def test_dict_configs(self):
+        self.assertTrue(
+            is_pixtral_mistral_large_4(
+                {
+                    "architectures": ["PixtralForConditionalGeneration"],
+                    "text_config": {"architectures": ["MistralLarge4ForCausalLM"]},
+                }
+            )
+        )
+        self.assertFalse(
+            is_pixtral_mistral_large_4({"architectures": ["MistralLarge4ForCausalLM"]})
+        )
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import msgspec
+from transformers.utils.chat_template_utils import _compile_jinja_template
 
 from sglang.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
@@ -29,6 +30,13 @@ class _DummyTokenizer:
 
     def get_vocab(self):
         return {token: i for i, token in enumerate(self._vocab)}
+
+
+class MistralCommonBackend(_DummyTokenizer):
+    pass
+
+
+_MISTRAL_COMMON_PLACEHOLDER = "<!-- audio/image multimodal -->"
 
 
 def _patch_hf_transformers_utils(get_tokenizer, get_config=None):
@@ -274,6 +282,62 @@ class TestTemplateManagerReasoningDetection(CustomTestCase):
                         toggle_param="enable_thinking", default_enabled=expected
                     ),
                 )
+
+    def test_mistral_effort_default_renders_like_omission(self):
+        """Bug regression: serving passes the detected default in place of an
+        omitted effort, so it is reported only where that renders identically."""
+        think = "{% if reasoning_effort %}[THINK]{% endif %}"
+        cases = {
+            "release guard": (
+                "{%- if reasoning_effort is not defined or reasoning_effort is none %}"
+                "{%- set reasoning_effort = 'high' %}{%- endif %}"
+                "{{ reasoning_effort }}" + think,
+                "high",
+            ),
+            "swapped guard": (
+                "{% if reasoning_effort is none or reasoning_effort is not defined %}"
+                "{% set reasoning_effort = 'none' %}{% endif %}{{ reasoning_effort }}"
+                + think,
+                "none",
+            ),
+            "conditional": (
+                "{% if enable_thinking %}{% set reasoning_effort = 'high' %}"
+                "{% endif %}" + think,
+                None,
+            ),
+            "unused macro": (
+                "{% macro unused() %}{% set reasoning_effort = 'high' %}"
+                "{% endmacro %}" + think,
+                None,
+            ),
+            "later rebinding": (
+                "{% if reasoning_effort is not defined %}"
+                "{% set reasoning_effort = 'high' %}{% endif %}"
+                "{% set reasoning_effort = fallback %}" + think,
+                None,
+            ),
+            "filter only": (
+                "{{ reasoning_effort | default('high') }}" + think,
+                None,
+            ),
+            "read before guard": (
+                "{{ reasoning_effort is defined }}"
+                "{% if reasoning_effort is not defined %}"
+                "{% set reasoning_effort = 'high' %}{% endif %}" + think,
+                None,
+            ),
+        }
+        for name, (template, default) in cases.items():
+            with self.subTest(name):
+                _, config = detect_reasoning_pattern(template)
+                self.assertEqual(config.special_case, "mistral")
+                self.assertEqual(config.default_effort, default)
+                if default is not None:
+                    render = _compile_jinja_template(template).render
+                    kwargs = {"enable_thinking": False, "fallback": None}
+                    self.assertEqual(
+                        render(**kwargs, reasoning_effort=default), render(**kwargs)
+                    )
 
     def test_pathological_template_does_not_raise(self):
         # A template jinja cannot parse (RecursionError from deep nesting) must
@@ -1212,6 +1276,90 @@ class TestResolveAutoParsers(CustomTestCase):
 
         self.assertIsNone(_declared(args, "reasoning_parser"))
         self.assertIsNone(_declared(args, "tool_call_parser"))
+
+    def test_mistral_common_tokenizer_resolves_parsers_from_control_tokens(self):
+        cases = (
+            (["[THINK]", "[/THINK]", "[TOOL_CALLS]"], "mistral", "mistral"),
+            (["[TOOL_CALLS]"], None, "mistral"),
+            (["[THINK]", "[/THINK]"], "mistral", None),
+        )
+        for vocab, reasoning, tool_call in cases:
+            with self.subTest(vocab=vocab):
+                args = self._make_server_args(
+                    reasoning_parser="auto", tool_call_parser="auto"
+                )
+                tokenizer = MistralCommonBackend(
+                    vocab, chat_template=_MISTRAL_COMMON_PLACEHOLDER
+                )
+                with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+                    resolve_auto_parsers(args)
+                self.assertEqual(_declared(args, "reasoning_parser"), reasoning)
+                self.assertEqual(_declared(args, "tool_call_parser"), tool_call)
+
+    def test_control_tokens_do_not_resolve_parsers_for_other_tokenizers(self):
+        cases = (
+            (_MISTRAL_COMMON_PLACEHOLDER, None, None),
+            ("{% if reasoning_effort %}[THINK]{% endif %}", "mistral", "mistral"),
+        )
+        for template, reasoning, tool_call in cases:
+            with self.subTest(template=template):
+                args = self._make_server_args(
+                    reasoning_parser="auto", tool_call_parser="auto"
+                )
+                tokenizer = _DummyTokenizer(
+                    ["[THINK]", "[/THINK]", "[TOOL_CALLS]"], chat_template=template
+                )
+                with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+                    resolve_auto_parsers(args)
+                self.assertEqual(_declared(args, "reasoning_parser"), reasoning)
+                self.assertEqual(_declared(args, "tool_call_parser"), tool_call)
+
+    def test_explicit_non_jinja_template_disables_mistral_common_parsers(self):
+        # The explicit template, not the tokenizer vocabulary, sets the output format.
+        tokenizer = MistralCommonBackend(
+            ["[THINK]", "[/THINK]", "[TOOL_CALLS]"],
+            chat_template=_MISTRAL_COMMON_PLACEHOLDER,
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            f.write('{"name": "custom"}')
+            f.flush()
+            for chat_template in ("llama-3", f.name):
+                with self.subTest(chat_template=chat_template):
+                    args = self._make_server_args(
+                        reasoning_parser="auto",
+                        tool_call_parser="auto",
+                        chat_template=chat_template,
+                    )
+                    with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+                        resolve_auto_parsers(args)
+                    self.assertIsNone(_declared(args, "reasoning_parser"))
+                    self.assertIsNone(_declared(args, "tool_call_parser"))
+
+    def test_detection_loads_the_serving_tokenizer(self):
+        # A dual-format checkpoint loads HF or mistral-common by tokenizer mode/path.
+        def get_tokenizer(name, tokenizer_mode="auto", **kwargs):
+            vocab = ["[THINK]", "[/THINK]", "[TOOL_CALLS]"]
+            if tokenizer_mode == "mistral" or name == "org/tekken-only":
+                return MistralCommonBackend(
+                    vocab, chat_template=_MISTRAL_COMMON_PLACEHOLDER
+                )
+            return _DummyTokenizer(vocab)
+
+        for serving in (
+            {"tokenizer_path": "org/dual-format", "tokenizer_mode": "mistral"},
+            {"tokenizer_path": "org/tekken-only", "tokenizer_mode": "auto"},
+        ):
+            with self.subTest(**serving):
+                args = self._make_server_args(
+                    reasoning_parser="auto", tool_call_parser="auto"
+                )
+                for field, value in serving.items():
+                    msgspec.Struct.__setattr__(args, field, value)
+                msgspec.Struct.__setattr__(args, "model_path", "org/dual-format")
+                with _patch_hf_transformers_utils(get_tokenizer):
+                    resolve_auto_parsers(args)
+                self.assertEqual(_declared(args, "reasoning_parser"), "mistral")
+                self.assertEqual(_declared(args, "tool_call_parser"), "mistral")
 
     def test_deepseek_v32_arch_without_chat_template_uses_custom_encoder(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser="auto")

@@ -14,9 +14,11 @@ import asyncio
 import copy
 import gc
 import json
+import re
 import unittest
 import uuid
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
@@ -59,7 +61,10 @@ from sglang.srt.parser.response_template import (
     ResponseTemplateReasoningDetector,
     ResponseTemplateToolDetector,
 )
-from sglang.srt.parser.template_detection import ReasoningToggleConfig
+from sglang.srt.parser.template_detection import (
+    ReasoningToggleConfig,
+    detect_reasoning_pattern,
+)
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
@@ -387,6 +392,19 @@ class TestPythonChatTemplateSegments(CustomTestCase):
         )
         self.assertEqual(ids, self.tokenizer.encode(rendered))
         self.assertEqual(documents_ids, ids)
+
+
+# Mistral templates keyed by the effort they render when the request omits it.
+_MISTRAL_UNSET_EFFORT = (
+    "{%- if reasoning_effort is not defined or reasoning_effort is none %}"
+)
+MISTRAL_EFFORT_TEMPLATES = {
+    "high": _MISTRAL_UNSET_EFFORT
+    + "{%- set reasoning_effort = 'high' %}{%- endif %}[THINK]",
+    "none": _MISTRAL_UNSET_EFFORT
+    + "{%- set reasoning_effort = 'none' %}{%- endif %}[THINK]",
+    None: "{% if reasoning_effort %}[THINK]{% endif %}",
+}
 
 
 class ServingChatTestCase(CustomTestCase):
@@ -2192,6 +2210,175 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(req.reasoning_effort, "medium")
         self.assertEqual(kwargs["reasoning_effort"], "medium")
         self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "medium")
+
+    def test_mistral_common_reasoning_effort_contract(self):
+        """mistral-common accepts only its ReasoningEffort values; unsupported values
+        from either request field must become client errors."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat._uses_mistral_common_tokenizer = True
+
+        for field, value in (
+            ("reasoning_effort", "ultra"),
+            ("chat_template_kwargs", {"reasoning_effort": "ultra"}),
+        ):
+            with self.subTest(field=field):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    **{field: value},
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    re.escape(
+                        "reasoning_effort=ultra is not supported by Mistral models."
+                    ),
+                ):
+                    self.chat._process_messages(req, is_multimodal=False)
+
+    def test_mistral_common_reasoning_effort_resolves_to_one_value(self):
+        """Bug regression: conversion must reject conflicting field/kwargs efforts
+        before either overwrites the other; explicit values beat server defaults."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat._uses_mistral_common_tokenizer = True
+
+        for field_effort, template_effort in (("none", "high"), ("high", "none")):
+            with self.subTest(field=field_effort, template=template_effort):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    reasoning_effort=field_effort,
+                    chat_template_kwargs={"reasoning_effort": template_effort},
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    re.escape(
+                        f"reasoning_effort={field_effort} conflicts with "
+                        f"chat_template_kwargs.reasoning_effort={template_effort}."
+                    ),
+                ):
+                    self.chat._convert_to_internal_request(req)
+
+        self.chat.default_chat_template_kwargs = {"reasoning_effort": "high"}
+        for request_kwargs, effort in (
+            ({}, "high"),
+            ({"reasoning_effort": "none"}, "none"),
+            ({"chat_template_kwargs": {"reasoning_effort": "none"}}, "none"),
+        ):
+            with self.subTest(request_kwargs=request_kwargs):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    **request_kwargs,
+                )
+                self.chat._convert_to_internal_request(req)
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                self.assertEqual(kwargs["reasoning_effort"], effort)
+                self.assertEqual(req.reasoning_effort, effort)
+                # [THINK]/[/THINK] are control tokens: skipping specials
+                # would strip them from inline output with no parser set.
+                self.assertIs(req.skip_special_tokens, effort == "none")
+
+    def test_mistral_omitted_reasoning_effort_uses_checkpoint_default(self):
+        """Bug regression: an omitted effort renders the checkpoint's default, so a
+        default-high checkpoint must keep and split [THINK] like an explicit high."""
+        self._setup_fallback("mistral")
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+
+        def use_renderer(mistral_common, default):
+            self.chat._uses_mistral_common_tokenizer = mistral_common
+            if mistral_common:
+                builder = SimpleNamespace(
+                    reasoning_effort=SimpleNamespace(default=default)
+                )
+                self.tm.tokenizer.tokenizer = SimpleNamespace(
+                    instruct_tokenizer=SimpleNamespace(
+                        tokenizer=SimpleNamespace(model_settings_builder=builder)
+                    )
+                )
+                self.template_manager.reasoning_config = None
+            else:
+                _, self.template_manager.reasoning_config = detect_reasoning_pattern(
+                    MISTRAL_EFFORT_TEMPLATES[default]
+                )
+
+        for mistral_common in (True, False):
+            for default, requested, effort, reasons in (
+                ("high", None, "high", True),
+                ("high", "low", "low", True),
+                ("high", "none", "none", False),
+                ("none", None, "none", False),
+                (None, None, None, False),
+            ):
+                with self.subTest(
+                    mistral_common=mistral_common,
+                    default=default,
+                    requested=requested,
+                ):
+                    use_renderer(mistral_common, default)
+                    req = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        reasoning_effort=requested,
+                    )
+                    self.chat._process_messages(req, is_multimodal=False)
+
+                    kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                    self.assertEqual(kwargs.get("reasoning_effort"), effort)
+                    self.assertEqual(req.reasoning_effort, effort)
+                    self.assertIs(req.skip_special_tokens, not reasons)
+                    self.assertIs(self.chat._get_reasoning_from_request(req), reasons)
+
+    def test_mistral_null_kwargs_effort_follows_template_guard(self):
+        """A null chat_template_kwargs effort renders as the default only when the
+        omission guard also tests ``is none``, and an explicit field overrides
+        it; parsing must agree with the render either way."""
+        self._setup_fallback("mistral")
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        think = (
+            "{% if reasoning_effort and reasoning_effort != 'none' %}[THINK]{% endif %}"
+        )
+        undefined_only = "reasoning_effort is not defined"
+        undefined_or_none = (
+            "reasoning_effort is not defined or reasoning_effort is none"
+        )
+        for guard, field, thinks in (
+            (undefined_only, None, False),
+            (undefined_only, "low", True),
+            (undefined_only, "high", True),
+            (undefined_only, "none", False),
+            (undefined_or_none, None, True),
+        ):
+            with self.subTest(guard=guard, field=field):
+                template = (
+                    f"{{% if {guard} %}}{{% set reasoning_effort = 'high' %}}"
+                    "{% endif %}" + think
+                )
+                _, self.template_manager.reasoning_config = detect_reasoning_pattern(
+                    template
+                )
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    reasoning_effort=field,
+                    chat_template_kwargs={"reasoning_effort": None},
+                )
+                adapted, _ = self.chat._convert_to_internal_request(req)
+
+                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                rendered = _compile_jinja_template(template).render(
+                    **{k: v for k, v in kwargs.items() if k == "reasoning_effort"}
+                )
+                self.assertIs("[THINK]" in rendered, thinks)
+                self.assertIs(adapted.require_reasoning, thinks)
+                self.assertIs(req.skip_special_tokens, not thinks)
 
     def test_k2_selected_terminator_reaches_sampling_params(self):
         self.tm._config_overrides["reasoning_parser"] = "k2_horizon"
@@ -5845,6 +6032,22 @@ class ServingChatTestCase(CustomTestCase):
             reasoning_effort="high",
         )
         self.assertTrue(self.chat._get_reasoning_from_request(req_with_effort))
+
+    def test_mistral_thinking_toggle_uses_supported_effort(self):
+        """Bug regression: enabling thinking must use high for mistral-common, whose
+        enum rejects medium; other Mistral templates retain medium."""
+        self._setup_fallback("mistral")
+        for mistral_common, enabled_effort in ((True, "high"), (False, "medium")):
+            with self.subTest(mistral_common=mistral_common):
+                self.chat._uses_mistral_common_tokenizer = mistral_common
+                req = ChatCompletionRequest(
+                    model="x", messages=[{"role": "user", "content": "Hi?"}]
+                )
+
+                self.chat.apply_reasoning_enabled(req, True)
+                self.assertEqual(req.reasoning_effort, enabled_effort)
+                self.chat.apply_reasoning_enabled(req, False)
+                self.assertEqual(req.reasoning_effort, "none")
 
     def test_fallback_enable_thinking_mode_default_on(self):
         self._setup_fallback("qwen3")

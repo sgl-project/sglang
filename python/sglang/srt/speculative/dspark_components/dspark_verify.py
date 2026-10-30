@@ -322,6 +322,8 @@ class TargetVerifyExecutor:
             iteration_ids=verify_window.iteration_ids,
         )
         batch.out_cache_loc = verify_cache_loc
+        if batch.hisparse_coordinator is not None and not batch.forward_mode.is_idle():
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if not self._verify_backend_self_adds_seq_lens():

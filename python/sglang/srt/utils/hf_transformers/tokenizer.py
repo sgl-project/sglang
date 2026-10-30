@@ -41,6 +41,7 @@ from .gguf_native import build_gguf_tokenizer, has_native_gguf_support
 from .mistral_utils import (
     _MISTRAL_TOKENIZER_REDIRECTS,
     is_bare_tekken_checkpoint,
+    load_mistral_common_tokenizer,
     patch_mistral_common_tokenizer,
     retry_without_mistral_common_kwargs,
 )
@@ -518,20 +519,17 @@ def get_tokenizer(
     )
 
     try:
-        if is_bare_tekken_checkpoint(tokenizer_name, tokenizer_revision):
-            from transformers.tokenization_mistral_common import (
-                MistralCommonTokenizer,
-            )
-
+        if tokenizer_mode == "mistral" or is_bare_tekken_checkpoint(
+            tokenizer_name, tokenizer_revision
+        ):
             logger.info(
-                "Detected bare-tekken checkpoint %s (tekken.json, no "
-                "tokenizer.json); loading via mistral-common MistralCommonTokenizer, "
-                "ignoring tokenizer_backend=%r.",
+                "Loading %s via mistral-common MistralCommonTokenizer "
+                "(tokenizer_mode=%r), ignoring tokenizer_backend=%r.",
                 tokenizer_name,
+                tokenizer_mode,
                 tokenizer_backend,
             )
-
-            tokenizer = MistralCommonTokenizer.from_pretrained(
+            tokenizer = load_mistral_common_tokenizer(
                 tokenizer_name, revision=tokenizer_revision
             )
         else:

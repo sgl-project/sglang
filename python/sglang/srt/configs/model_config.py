@@ -188,27 +188,63 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
-def is_deepseek_dsa(config) -> bool:
+def is_pixtral_mistral_large_4(config) -> bool:
+    """A Pixtral host whose language model is Mistral Large 4."""
+    if _hf_arch(config) != "PixtralForConditionalGeneration":
+        return False
+    text_config = _hf_attr(config, "text_config")
     return (
-        _hf_arch(config)
-        in (
-            "DeepseekV3ForCausalLM",
-            "DeepseekV32ForCausalLM",
-            "DeepseekV3ForCausalLMNextN",
-            "MistralLarge3ForCausalLM",
-            "PixtralForConditionalGeneration",
-            "GlmMoeDsaForCausalLM",
-            "GlmMoeDsaForCausalLMNextN",
-            "Glm5NextForConditionalGenerationNextN",
-            "Glm5NextForConditionalGeneration",
-            "LongcatFlashForCausalLM",
-            "LongcatFlashForCausalLMNextN",
-            "Dots3NoteForCausalLM",
-            "Dots3NoteForCausalLMNextN",
-            "HYV4ForCausalLM",
-            "HYV4ForCausalLMNextN",
-        )
-        and _hf_attr(config, "index_topk") is not None
+        text_config is not None and _hf_arch(text_config) == "MistralLarge4ForCausalLM"
+    )
+
+
+def get_dsa_config(config):
+    # Multimodal wrappers (Pixtral) keep the DSA fields on their text config.
+    if _hf_attr(config, "index_topk") is None:
+        text_config = _hf_attr(config, "text_config")
+        if text_config is not None and _hf_attr(text_config, "index_topk") is not None:
+            return text_config
+    return config
+
+
+# Text-model implementations of DeepSeek sparse attention. Multimodal wrappers
+# are not listed: they qualify through the text model that carries the DSA fields.
+_DSA_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "DeepseekV3ForCausalLMNextN",
+        "MistralLarge3ForCausalLM",
+        "MistralLarge4ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaForCausalLMNextN",
+        "Glm5NextForConditionalGenerationNextN",
+        "Glm5NextForConditionalGeneration",
+        "LongcatFlashForCausalLM",
+        "LongcatFlashForCausalLMNextN",
+        "Dots3NoteForCausalLM",
+        "Dots3NoteForCausalLMNextN",
+        "HYV4ForCausalLM",
+        "HYV4ForCausalLMNextN",
+    }
+)
+
+
+def is_deepseek_dsa(config) -> bool:
+    dsa_config = get_dsa_config(config)
+    return _hf_attr(dsa_config, "index_topk") is not None and (
+        _hf_arch(config) in _DSA_ARCHITECTURES
+        or _hf_arch(dsa_config) in _DSA_ARCHITECTURES
+    )
+
+
+def dsa_supports_dense_attention(config) -> bool:
+    # NoPE layers, SSMax and cross-layer KV sharing are implemented only on sparse MLA.
+    dsa_config = get_dsa_config(config)
+    return not (
+        any(_hf_attr(dsa_config, "nope_layer_flags") or ())
+        or _hf_attr(dsa_config, "ssmax_scaling")
+        or _hf_attr(dsa_config, "kv_sharing_config") is not None
     )
 
 
@@ -429,7 +465,7 @@ def resolve_spec_hidden_size(
 
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config) or is_deepseek_v4(config)
-    return config.index_head_dim
+    return get_dsa_config(config).index_head_dim
 
 
 def is_minimax_sparse(config: PretrainedConfig) -> bool:
@@ -491,12 +527,13 @@ def get_minimax_sparse_score_type(sparse_cfg: dict) -> str:
 
 def get_dsa_index_topk(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
-    return config.index_topk
+    return get_dsa_config(config).index_topk
 
 
 def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     """Return whether a DSA layer reuses the previous layer's top-k indices."""
     assert is_deepseek_dsa(config)
+    config = get_dsa_config(config)
 
     indexer_types = getattr(config, "indexer_types", None)
     if indexer_types is not None:
@@ -531,24 +568,40 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     return max(layer_id - 1, 0) % freq != 0
 
 
+def dsa_layer_reads_shared_kv(config: PretrainedConfig, layer_id: int) -> bool:
+    kv_sharing_config = _hf_attr(get_dsa_config(config), "kv_sharing_config")
+    if kv_sharing_config is None:
+        return False
+    sources = kv_sharing_config["source_layers_str"].split(",")
+    return 0 <= layer_id < len(sources) and int(sources[layer_id]) != layer_id
+
+
+def dsa_shared_kv_providers(config: PretrainedConfig) -> set[int]:
+    kv_sharing_config = _hf_attr(get_dsa_config(config), "kv_sharing_config")
+    if kv_sharing_config is None:
+        return set()
+    sources = [int(s) for s in kv_sharing_config["source_layers_str"].split(",")]
+    return {source for layer_id, source in enumerate(sources) if source != layer_id}
+
+
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
-    return config.index_n_heads
+    return get_dsa_config(config).index_n_heads
 
 
 def get_dsa_index_kpool(config: PretrainedConfig) -> int:
-    return getattr(config, "index_kpool", 1)
+    return getattr(get_dsa_config(config), "index_kpool", 1)
 
 
 def get_dsa_mtp_topk_width(config: PretrainedConfig) -> int:
     """MTP seeds include index_topk pooled tokens plus up to index_kpool - 1 tail tokens."""
     index_kpool = get_dsa_index_kpool(config)
     assert index_kpool >= 1, f"index_kpool must be positive, got {index_kpool}"
-    return config.index_topk + index_kpool - 1
+    return get_dsa_config(config).index_topk + index_kpool - 1
 
 
 def get_dsa_index_kpool_compress(config: PretrainedConfig) -> bool:
-    return getattr(config, "index_kpool_compress", False)
+    return getattr(get_dsa_config(config), "index_kpool_compress", False)
 
 
 REQUANTIZATION_METHODS = ["quark_mxfp4"]
@@ -565,7 +618,7 @@ def get_num_indexer_layers(config) -> int:
     capturer.
     """
     if is_deepseek_dsa(config):
-        return config.num_hidden_layers
+        return get_dsa_config(config).num_hidden_layers
     if is_deepseek_v4(config):
         compress_ratios = getattr(config, "compress_ratios", None) or []
         return sum(1 for r in compress_ratios if r == 4)
@@ -1014,6 +1067,7 @@ class ModelConfig:
         )
         self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
             is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
+            or is_pixtral_mistral_large_4(self.hf_config)
         )
 
     def _config_draft_model(self):
@@ -1068,6 +1122,26 @@ class ModelConfig:
             else:
                 self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
                 self.hf_config.num_nextn_predict_layers = 1
+
+        if (
+            is_draft_model
+            and getattr(self.hf_text_config, "model_type", None) == "mistral_large_4"
+            and self.speculative_algorithm in (None, "DSPARK")
+        ):
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                checkpoint_bundles_dspark_draft,
+            )
+            from sglang.srt.utils.hf_transformers.mistral_utils import (
+                mistral_large_4_dspark_draft_config,
+            )
+
+            if checkpoint_bundles_dspark_draft(self.hf_text_config):
+                self.hf_config = self.hf_text_config = (
+                    mistral_large_4_dspark_draft_config(self.hf_text_config)
+                )
+                # The draft ships in BF16 whatever the target's quantization.
+                if not self.is_draft_quantization_explicit:
+                    self.quantization = None
 
         if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
@@ -1414,6 +1488,7 @@ class ModelConfig:
             or "Dots3NoteForCausalLM" in self.hf_config.architectures
             or "Dots3NoteForCausalLMNextN" in self.hf_config.architectures
             or "MistralLarge3ForCausalLM" in self.hf_config.architectures
+            or "MistralLarge4ForCausalLM" in self.hf_config.architectures
             or (
                 "PixtralForConditionalGeneration" in self.hf_config.architectures
                 and getattr(self.hf_text_config, "kv_lora_rank", None) is not None
@@ -1463,6 +1538,21 @@ class ModelConfig:
             self.compress_ratios = self.hf_config.compress_ratios
             self.attention_arch = AttentionArch.MHA
             self._init_mla_scaling(self.hf_config.rope_scaling)
+        elif self.hf_config.architectures[0] in (
+            "MLADSparkModel",
+            "MistralLarge4DSparkModel",
+        ):
+            # The draft caches MLA as per-head K/V, with V padded to the K head dim.
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+            self.v_head_dim = self.head_dim
+            self.swa_head_dim = self.head_dim
+            self.swa_v_head_dim = self.head_dim
+            self.hf_text_config.num_key_value_heads = (
+                self.hf_text_config.num_attention_heads
+            )
+            self.attention_arch = AttentionArch.MHA
         elif "Glm4MoeForCausalLMNextN" in self.hf_config.architectures:
             if self.head_dim is None:
                 self.head_dim = (

@@ -394,7 +394,14 @@ class EagerRunner(BaseRunner):
             forward_batch.input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs["input_embeds"] = sharded_input_embeds
-            hidden_states = model.model(
+            # Wrappers whose decoder is not ``model.model`` name it explicitly;
+            # exposing ``model`` would change how other runners resolve them.
+            language_model = (
+                model.get_cp_language_model()
+                if hasattr(model, "get_cp_language_model")
+                else model.model
+            )
+            hidden_states = language_model(
                 model_input_ids,
                 sharded_positions,
                 forward_batch,
