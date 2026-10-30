@@ -98,9 +98,8 @@ def should_use_mega_gate(moe, hidden_states: torch.Tensor, forward_batch) -> boo
 
 def _captures_routed_experts(moe) -> bool:
     return (
-        not moe.is_hash
+        get_global_experts_capturer() is not None
         and moe.topk.topk_config.allow_routed_experts_capture
-        and get_global_experts_capturer() is not None
     )
 
 
@@ -258,7 +257,8 @@ def run_mega_gate(
             top_k=moe.topk.topk,
             routed_scaling_factor=moe.topk.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=moe.topk.apply_routed_scaling_factor_on_output,
-            allow_routed_experts_capture=False,
+            # the gate stands in for HashTopK.forward, which records hash routing for R3
+            allow_routed_experts_capture=_captures_routed_experts(moe),
         )
     else:
         config = moe.topk.topk_config
