@@ -7,7 +7,6 @@ from functools import lru_cache
 from math import isqrt, prod
 from typing import Optional, cast
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -200,35 +199,56 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
 
         return self._decode(z)[:, :, :num_sample_frames]
 
+    @staticmethod
+    def _blend(
+        a: torch.Tensor, b: torch.Tensor, blend_extent: int, dim: int
+    ) -> torch.Tensor:
+        """Cross-fade `a`'s last `blend_extent` slices into `b`'s first along `dim`, in place.
+
+        Bitwise equal to scaling one slice at a time by the Python floats
+        `1 - i / extent` and `i / extent`: those scalars run in the op-math dtype,
+        so the weights are the same doubles rounded to it, and each product is
+        rounded to `b`'s dtype before the add.
+        """
+        blend_extent = min(a.shape[dim], b.shape[dim], blend_extent)
+        if blend_extent <= 0:
+            return b
+        opmath = torch.float64 if b.dtype == torch.float64 else torch.float32
+        shape = [1] * b.dim()
+        shape[dim] = blend_extent
+        take = (
+            torch.arange(blend_extent, device=b.device, dtype=torch.float64)
+            / blend_extent
+        )
+        keep = (1 - take).to(opmath).view(shape)
+        take = take.to(opmath).view(shape)
+        head = b.narrow(dim, 0, blend_extent)
+        tail = a.narrow(dim, a.shape[dim] - blend_extent, blend_extent)
+        head.copy_((tail * keep).to(b.dtype) + (head * take).to(b.dtype))
+        return b
+
     def blend_v(
         self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
     ) -> torch.Tensor:
-        blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
-        for y in range(blend_extent):
-            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (
-                1 - y / blend_extent
-            ) + b[:, :, :, y, :] * (y / blend_extent)
-        return b
+        return self._blend(a, b, blend_extent, dim=-2)
 
     def blend_h(
         self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
     ) -> torch.Tensor:
-        blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (
-                1 - x / blend_extent
-            ) + b[:, :, :, :, x] * (x / blend_extent)
-        return b
+        return self._blend(a, b, blend_extent, dim=-1)
 
     def blend_t(
         self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
     ) -> torch.Tensor:
-        blend_extent = min(a.shape[-3], b.shape[-3], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, x, :, :] = a[:, :, -blend_extent + x, :, :] * (
-                1 - x / blend_extent
-            ) + b[:, :, x, :, :] * (x / blend_extent)
-        return b
+        return self._blend(a, b, blend_extent, dim=-3)
+
+    def _spatial_tile_geometry(self) -> tuple[int, int, int, int]:
+        return (
+            self.tile_sample_min_height // self.spatial_compression_ratio,
+            self.tile_sample_min_width // self.spatial_compression_ratio,
+            self.tile_sample_stride_height // self.spatial_compression_ratio,
+            self.tile_sample_stride_width // self.spatial_compression_ratio,
+        )
 
     def spatial_tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
         r"""Encode a batch of images using a tiled encoder.
@@ -244,18 +264,12 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         # latent_height = height // self.spatial_compression_ratio
         # latent_width = width // self.spatial_compression_ratio
 
-        tile_latent_min_height = (
-            self.tile_sample_min_height // self.spatial_compression_ratio
-        )
-        tile_latent_min_width = (
-            self.tile_sample_min_width // self.spatial_compression_ratio
-        )
-        tile_latent_stride_height = (
-            self.tile_sample_stride_height // self.spatial_compression_ratio
-        )
-        tile_latent_stride_width = (
-            self.tile_sample_stride_width // self.spatial_compression_ratio
-        )
+        (
+            tile_latent_min_height,
+            tile_latent_min_width,
+            tile_latent_stride_height,
+            tile_latent_stride_width,
+        ) = self._spatial_tile_geometry()
 
         blend_height = tile_latent_min_height - tile_latent_stride_height
         blend_width = tile_latent_min_width - tile_latent_stride_width
@@ -293,20 +307,14 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         world_size, rank = sp_group.world_size, sp_group.rank_in_group
         _, _, T, H, W = z.shape
 
-        tile_latent_min_height = (
-            self.tile_sample_min_height // self.spatial_compression_ratio
-        )
-        tile_latent_min_width = (
-            self.tile_sample_min_width // self.spatial_compression_ratio
-        )
+        (
+            tile_latent_min_height,
+            tile_latent_min_width,
+            tile_latent_stride_height,
+            tile_latent_stride_width,
+        ) = self._spatial_tile_geometry()
         tile_latent_min_num_frames = (
             self.tile_sample_min_num_frames // self.temporal_compression_ratio
-        )
-        tile_latent_stride_height = (
-            self.tile_sample_stride_height // self.spatial_compression_ratio
-        )
-        tile_latent_stride_width = (
-            self.tile_sample_stride_width // self.spatial_compression_ratio
         )
         tile_latent_stride_num_frames = (
             self.tile_sample_stride_num_frames // self.temporal_compression_ratio
@@ -436,18 +444,12 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         if world_size <= 1:
             return self._decode(z)
 
-        tile_latent_min_height = (
-            self.tile_sample_min_height // self.spatial_compression_ratio
-        )
-        tile_latent_min_width = (
-            self.tile_sample_min_width // self.spatial_compression_ratio
-        )
-        tile_latent_stride_height = (
-            self.tile_sample_stride_height // self.spatial_compression_ratio
-        )
-        tile_latent_stride_width = (
-            self.tile_sample_stride_width // self.spatial_compression_ratio
-        )
+        (
+            tile_latent_min_height,
+            tile_latent_min_width,
+            tile_latent_stride_height,
+            tile_latent_stride_width,
+        ) = self._spatial_tile_geometry()
         overlap_h = max(0, tile_latent_min_height - tile_latent_stride_height)
         overlap_w = max(0, tile_latent_min_width - tile_latent_stride_width)
         halo_h = overlap_h // 2
@@ -574,18 +576,12 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         # sample_height = height * self.spatial_compression_ratio
         # sample_width = width * self.spatial_compression_ratio
 
-        tile_latent_min_height = (
-            self.tile_sample_min_height // self.spatial_compression_ratio
-        )
-        tile_latent_min_width = (
-            self.tile_sample_min_width // self.spatial_compression_ratio
-        )
-        tile_latent_stride_height = (
-            self.tile_sample_stride_height // self.spatial_compression_ratio
-        )
-        tile_latent_stride_width = (
-            self.tile_sample_stride_width // self.spatial_compression_ratio
-        )
+        (
+            tile_latent_min_height,
+            tile_latent_min_width,
+            tile_latent_stride_height,
+            tile_latent_stride_width,
+        ) = self._spatial_tile_geometry()
 
         blend_height = self.tile_sample_min_height - self.tile_sample_stride_height
         blend_width = self.tile_sample_min_width - self.tile_sample_stride_width
@@ -808,17 +804,6 @@ class DiagonalGaussianDistribution:
                     + other.logvar,
                     dim=dims,
                 )
-
-    def nll(
-        self, sample: torch.Tensor, dims: tuple[int, ...] = (1, 2, 3)
-    ) -> torch.Tensor:
-        if self.deterministic:
-            return torch.Tensor([0.0])
-        logtwopi = np.log(2.0 * np.pi)
-        return 0.5 * torch.sum(
-            logtwopi + self.logvar + torch.pow(sample - self.mean, 2) / self.var,
-            dim=dims,
-        )
 
     def mode(self) -> torch.Tensor:
         return self.mean

@@ -33,6 +33,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -137,6 +138,28 @@ class DeepseekModelNextN(nn.Module):
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def embed_input_ids(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels
+        # (far above vocab_size). Use target-produced mm_input_embeds for
+        # these positions and only call embed_tokens on the appended
+        # next-token to avoid embed OOB.
+        input_embeds = forward_batch.mm_input_embeds
+        if (
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.contains_mm_inputs()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            assert input_embeds is not None
+            last_indices = (
+                forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+            ).long()
+            input_embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
+        if input_embeds is None:
+            input_embeds = self.embed_tokens(input_ids)
+        return input_embeds
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -168,27 +191,7 @@ class DeepseekModelNextN(nn.Module):
             )
 
             if input_embeds is None:
-                # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels
-                # (far above vocab_size). Use target-produced mm_input_embeds for
-                # these positions and only call embed_tokens on the appended
-                # next-token to avoid embed OOB.
-                input_embeds = forward_batch.mm_input_embeds
-                if (
-                    forward_batch.forward_mode.is_extend()
-                    and forward_batch.contains_mm_inputs()
-                    and not forward_batch.forward_mode.is_draft_extend_v2()
-                ):
-                    assert input_embeds is not None
-                    last_indices = (
-                        forward_batch.extend_start_loc
-                        + forward_batch.extend_seq_lens
-                        - 1
-                    ).long()
-                    input_embeds[last_indices] = self.embed_tokens(
-                        input_ids[last_indices]
-                    )
-                if input_embeds is None:
-                    input_embeds = self.embed_tokens(input_ids)
+                input_embeds = self.embed_input_ids(input_ids, forward_batch)
             hidden_states = input_embeds
 
             if hidden_states.shape[0] > 0:
@@ -282,7 +285,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_parallel().pp_group
-        self.determine_num_fused_shared_experts()
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
         self.model = DeepseekModelNextN(

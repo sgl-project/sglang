@@ -87,7 +87,7 @@ export const AgentX = ({ data }) => {
   // KV-offload tiers: "none" | "hicache" | "mooncake" (external linker). A derived tier strips
   // the measured tier from the cache-owning workers and adds the target tier's settings
   // (cell.kv.hicache / data.kvMooncake), mirroring the generator's kv.py.
-  const LINKER_FLAGS = ["--enable-unified-cache-external-linker", "--unified-cache-external-linker-backend", "--hicache-storage-backend-extra-config"];
+  const LINKER_FLAGS = ["--enable-unified-cache-external-linker", "--unified-cache-external-linker-backend", "--unified-cache-external-linker-config", "--hicache-storage-backend-extra-config"];
   const STORE_ONLY_ENV = ["MOONCAKE_MASTER", "MOONCAKE_TE_META_DATA_SERVER", "MOONCAKE_GLOBAL_SEGMENT_SIZE", "MOONCAKE_STANDALONE_STORAGE"];
   const CACHE_ROLES = ["agg", "prefill"];
   const isKvFlag = (n) => n === "--enable-hierarchical-cache" || n.startsWith("--hicache-") || LINKER_FLAGS.includes(n);
@@ -168,9 +168,10 @@ export const AgentX = ({ data }) => {
     if (b.kind === "worker") {
       const n = b.nodes_per_worker || 1;
       const parts = [];
-      if (b.workers > 1) parts.push(`Start ${b.workers} ${b.role} workers${n > 1 ? `, each spanning ${n} nodes` : ", one per node"}.`);
+      if (b.workers > 1) parts.push(`Start ${b.workers} ${b.role} workers${n > 1 ? `, each spanning ${n} nodes` : b.gpu_pinning ? " across the shared nodes" : ", one per node"}.`);
       if (n > 1) parts.push(`Run on every node of a worker with NODE_RANK=0..${n - 1}; ${ROLE_HEAD[b.role]} is that worker's first node.`);
-      if (b.gpu_pinning) parts.push(`Workers share nodes: pin GPUs per worker with CUDA_VISIBLE_DEVICES = ${b.gpu_pinning.map((w, i) => `worker ${i}: ${w.filter(Boolean).join(" / ") || "all"}`).join(" · ")}.`);
+      if (b.local_ranks) parts.push(`Workers share nodes: set LOCAL_WORKER_RANK per worker (${b.local_ranks.map((r, i) => `worker ${i}: ${r}`).join(" · ")}); the first lines pick its GPUs and ports.`);
+      else if (b.gpu_pinning) parts.push(`Workers share nodes: pin GPUs per worker with CUDA_VISIBLE_DEVICES = ${b.gpu_pinning.map((w, i) => `worker ${i}: ${w.filter(Boolean).join(" / ") || "all"}`).join(" · ")}.`);
       if (router === "sglang" && workerCount === 1 && b.role === "agg" && n === 1) parts.push("Serves the OpenAI API on port 30000.");
       if (router === "dynamo") parts.push("Workers register with Dynamo through etcd; start them after etcd/NATS.");
       return parts.join(" ") || `Run on the ${b.role} node.`;
@@ -191,8 +192,10 @@ export const AgentX = ({ data }) => {
   };
   const noteText = (S) => ({
     "rename-dp-attention": <>Flags are mirrored from the submission image: <code style={S.code}>--enable-dp-attention</code> with <code style={S.code}>--dp-size</code> / <code style={S.code}>--data-parallel-size</code>. Newer SGLang deprecates them in favor of <code style={S.code}>--attn-dp-size</code> (<a style={S.a} href="https://github.com/sgl-project/sglang/pull/41818">#41818</a>).</>,
+    "rename-mamba-strategy": <>Flags are mirrored from the submission image: <code style={S.code}>--mamba-scheduler-strategy</code> is the older spelling of <code style={S.code}>--mamba-radix-cache-strategy</code> (<a style={S.a} href="https://github.com/sgl-project/sglang/pull/28151">#28151</a>). Current SGLang accepts only the new name.</>,
     "hicache-size": <><code style={S.code}>--hicache-size</code> is host DRAM per rank in GB, sized to SemiAnalysis's nodes. Scale it to your host memory.</>,
     efa: <><code style={S.code}>MOONCAKE_PROTOCOL=efa</code> reflects SemiAnalysis's AWS-EFA B300 cluster. Use <code style={S.code}>rdma</code> on InfiniBand.</>,
+    "nixl-libfabric": <><code style={S.code}>SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC</code> reflects SemiAnalysis's AWS-EFA B300 cluster. On InfiniBand, leave it unset to use NIXL's default UCX backend.</>,
     "ib-devices": <>Set <code style={S.code}>IB_DEVICES</code> to your node's RDMA NICs (comma-separated, e.g. <code style={S.code}>mlx5_0,mlx5_1</code>).</>,
     "mooncake-segment": <><code style={S.code}>MOONCAKE_GLOBAL_SEGMENT_SIZE</code> is the host DRAM each worker process contributes to the Mooncake store. Size it to your host memory.</>,
   });
@@ -202,14 +205,17 @@ export const AgentX = ({ data }) => {
     const text = JSON.stringify(blocks);
     return [
       names.has("--enable-dp-attention") && "rename-dp-attention",
+      names.has("--mamba-scheduler-strategy") && "rename-mamba-strategy",
       names.has("--hicache-size") && "hicache-size",
       env.MOONCAKE_PROTOCOL === "efa" && "efa",
+      env.SGLANG_DISAGGREGATION_NIXL_BACKEND === "LIBFABRIC" && "nixl-libfabric",
       env.MOONCAKE_GLOBAL_SEGMENT_SIZE !== undefined && "mooncake-segment",
       text.includes("$IB_DEVICES") && "ib-devices",
     ].filter(Boolean);
   };
   const PLACEHOLDERS = {
     NODE_RANK: "rank of this node within its worker (0 on the worker's first node)",
+    LOCAL_WORKER_RANK: "this worker's index on its node (selects its GPUs and ports)",
     NODE_IP: "IP of the node the command runs on",
     ETCD_IP: "node running etcd",
     NATS_IP: "node running NATS",
@@ -299,6 +305,8 @@ export const AgentX = ({ data }) => {
   const [pointIdx, setPointIdx] = useState(0);
   const [router, setRouter] = useState(data.cells[cellIdx].submitted);
   const [kvChoice, setKvChoice] = useState(null); // null = the tier the point was measured with
+  // A point's measured tier is always selectable; other tiers only when the deployment can derive them.
+  const kvSelectable = (c, p, t) => c.kv.available.includes(t) || t === p.kv;
   const [tab, setTab] = useState(null);
   const [copied, setCopied] = useState(null);
   const [urlRead, setUrlRead] = useState(false);
@@ -331,7 +339,7 @@ export const AgentX = ({ data }) => {
       }
       setHw(h); setCkpt(k); setCellIdx(ci); setPointIdx(p);
       setRouter(Object.keys(c.routers).includes(q.get("ax_router")) ? q.get("ax_router") : c.submitted);
-      setKvChoice(c.kv.available.includes(q.get("ax_kv")) ? q.get("ax_kv") : null);
+      setKvChoice(kvSelectable(c, c.points[p], q.get("ax_kv")) ? q.get("ax_kv") : null);
       setTab(q.get("ax_tab"));
       setLinked(true);
       // After the Deployment panel's own hash scroll, if any.
@@ -346,7 +354,7 @@ export const AgentX = ({ data }) => {
   const cell = data.cells[cellIdx];
   const pi = Math.min(pointIdx, cell.points.length - 1);
   const point = pointInfo(cell, cell.points[pi]);
-  const kv = kvChoice && cell.kv.available.includes(kvChoice) ? kvChoice : point.kv;
+  const kv = kvChoice && kvSelectable(cell, point, kvChoice) ? kvChoice : point.kv;
   const routerData = cell.routers[router];
   const blocks = blocksFor(cellIdx, pi, router, kv);
   const status = router === cell.submitted && kv === point.kv ? point.status : "derived";
@@ -497,7 +505,7 @@ export const AgentX = ({ data }) => {
           {cellsFor(hw, ckpt).map(([c, i]) => (
             <button key={c.id} value={c.id} style={S.chip(cellIdx === i)} onClick={() => pickCell(i)}>
               {c.label}
-              <span style={S.sub}>{c.detail} · {c.gpus} GPUs · c{c.points.flatMap((p) => p.concs).join(", ")}</span>
+              <span style={S.sub}>{c.detail} · {c.gpus} GPU{c.gpus === 1 ? "" : "s"} · c{c.points.flatMap((p) => p.concs).join(", ")}</span>
             </button>
           ))}
           <span style={{ ...S.sub, paddingTop: "2px" }}>Ordered from low latency (top) to high throughput (bottom).</span>
@@ -515,13 +523,13 @@ export const AgentX = ({ data }) => {
         <span style={S.title} className="sg-agentx-row sg-agentx-row-kv">KV offload</span>
         <div style={S.chips}>
           {["none", "hicache", "mooncake"].map((t) => {
-            const ok = cell.kv.available.includes(t);
+            const ok = kvSelectable(cell, point, t);
             return (
               <button key={t} value={t} disabled={!ok} title={ok ? "" : cell.kv.unavailable[t]}
                 style={{ ...S.chip(kv === t), ...(ok ? {} : { opacity: 0.4, cursor: "not-allowed" }) }}
                 onClick={() => ok && pick(setKvChoice)(t)}>
                 {KV_LABEL[t]}{t === point.kv ? " ✓" : ""}
-                <span style={S.sub}>{t === point.kv ? "as measured" : ok ? "derived" : "not available for this image"}</span>
+                <span style={S.sub}>{t === point.kv ? "as measured" : ok ? "derived" : "not available"}</span>
               </button>
             );
           })}
@@ -566,7 +574,7 @@ export const AgentX = ({ data }) => {
             )}
             {kv !== point.kv && kv === "none" && <li>KV offload: removed; only the GPU KV cache is used.</li>}
             {kv !== point.kv && kv === "hicache" && (
-              <li>KV offload: HiCache settings from the verified <code style={S.code}>{cell.kv.hicache.donor}</code> launch ({cell.kv.hicache.donorHardware.toUpperCase()}), applied to the workers that hold the prefix cache ({blocks.some((b) => b.role === "prefill") ? "prefill" : "aggregated"}).</li>
+              <li>KV offload: HiCache settings from the verified <code style={S.code}>{cell.kv.hicache.donor}</code> launch{cell.kv.hicache.donorRef === "main" ? " on InferenceX main" : ""} ({cell.kv.hicache.donorHardware.toUpperCase()}), applied to the workers that hold the prefix cache ({blocks.some((b) => b.role === "prefill") ? "prefill" : "aggregated"}).</li>
             )}
             {kv !== point.kv && kv === "mooncake" && (
               <li>KV offload: Mooncake external-linker flags, store-client environment and <code style={S.code}>mooncake_master</code> from the verified <code style={S.code}>{data.kvMooncake.donor}</code> launch ({data.kvMooncake.donorHardware.toUpperCase()}). Its optional standalone Mooncake stores are not included.</li>
@@ -575,14 +583,14 @@ export const AgentX = ({ data }) => {
         )}
         <ul style={S.list}>
           {cell.disclosures.includes("synthetic-acceptance") && point.goldenAL && (
-            <li>SemiAnalysis measured this point with a synthetic speculative-decoding acceptance length of {point.goldenAL} (InferenceX golden AL via <code style={S.code}>SGLANG_SIMULATE_ACC_LEN</code>), which is not part of these commands. Real speed depends on your workload's acceptance.</li>
+            <li>{point.status === "in-progress" ? "The pending submission specifies" : "SemiAnalysis measured this point with"} a synthetic speculative-decoding acceptance length of {point.goldenAL} (InferenceX golden AL via <code style={S.code}>SGLANG_SIMULATE_ACC_LEN</code>), which is not part of these commands. Real speed depends on your workload's acceptance.</li>
           )}
           {cell.disclosures.includes("chat-template") && (
             <li>The SA run passed InferenceX's thinking-only chat template (<code style={S.code}>deepseek_v4_thinking.jinja</code>, which drops tool definitions). These commands keep SGLang's built-in DeepSeek-V4 encoding, which supports tool calling.</li>
           )}
           {notesFor(blocks).map((n) => noteText(S)[n] && <li key={n}>{noteText(S)[n]}</li>)}
           {routerData.install.map((cmd) => (
-            <li key={cmd}>{cmd.startsWith("#") ? <>Dynamo: {cmd.replace(/^# /, "")}</> : <>Dynamo install used by SA: <code style={S.code}>{cmd}</code></>}</li>
+            <li key={cmd}>{cmd.startsWith("#") ? <>Dynamo: {cmd.replace(/^# /, "")}</> : router === cell.submitted ? <>Dynamo install used by SA: <code style={S.code}>{cmd}</code></> : <>This image does not bundle <code style={S.code}>ai-dynamo</code>. Install the release built for its SGLang version first: <code style={S.code}>{cmd}</code></>}</li>
           ))}
           {router === "dynamo" && !routerData.install.length && <li>Dynamo: the <code style={S.code}>ai-dynamo</code> release bundled in the image.</li>}
           {cell.setup.map((s, i) => (

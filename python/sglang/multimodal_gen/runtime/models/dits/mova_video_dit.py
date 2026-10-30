@@ -272,9 +272,6 @@ class CrossAttention(_MOVAAttention):
 
 
 class MulAdd(nn.Module):
-    def __init__(self):
-        super().__init__()
-
     def forward(self, x, gate, residual):
         return residual + gate * x
 
@@ -408,6 +405,41 @@ class Conv3dLocalIsland(nn.Conv3d):
             return super().forward(input)
 
 
+def initialize_mova_transformer_layers(model, config, quant_config):
+    """Create shared audio/video layers in checkpoint registration order."""
+    model.text_embedding = MLP(
+        config.text_dim,
+        config.dim,
+        output_dim=config.dim,
+        act_type="gelu_pytorch_tanh",
+        quant_config=quant_config,
+    )
+    model.time_embedding = MLP(
+        config.freq_dim,
+        config.dim,
+        output_dim=config.dim,
+        act_type="silu",
+        quant_config=quant_config,
+    )
+    # Preserve state_dict keys (time_projection.1.weight/bias).
+    model.time_projection = nn.Sequential(
+        nn.SiLU(),
+        ReplicatedLinear(config.dim, config.dim * 6, quant_config=quant_config),
+    )
+    model.blocks = nn.ModuleList(
+        [
+            DiTBlock(
+                config.dim,
+                config.num_heads,
+                config.ffn_dim,
+                config.eps,
+                quant_config=quant_config,
+            )
+            for _ in range(config.num_layers)
+        ]
+    )
+
+
 class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
@@ -426,15 +458,11 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # Extract parameters from config
         dim = config.dim
         in_dim = config.in_dim
-        ffn_dim = config.ffn_dim
         out_dim = config.out_dim
-        text_dim = config.text_dim
         freq_dim = config.freq_dim
         eps = config.eps
         patch_size = config.patch_size
         num_heads = config.num_heads
-        num_layers = config.num_layers
-        has_image_pos_emb = config.has_image_pos_emb
         has_ref_conv = config.has_ref_conv
         separated_timestep = config.separated_timestep
         require_vae_embedding = config.require_vae_embedding
@@ -452,33 +480,13 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.patch_embedding = Conv3dLocalIsland(
             in_dim, dim, kernel_size=patch_size, stride=patch_size
         )
-        self.text_embedding = MLP(
-            text_dim,
-            dim,
-            output_dim=dim,
-            act_type="gelu_pytorch_tanh",
-            quant_config=quant_config,
-        )
-        self.time_embedding = MLP(
-            freq_dim, dim, output_dim=dim, act_type="silu", quant_config=quant_config
-        )
-        # Preserve state_dict keys (time_projection.1.weight/bias).
-        self.time_projection = nn.Sequential(
-            nn.SiLU(), ReplicatedLinear(dim, dim * 6, quant_config=quant_config)
-        )
-        self.blocks = nn.ModuleList(
-            [
-                DiTBlock(dim, num_heads, ffn_dim, eps, quant_config=quant_config)
-                for _ in range(num_layers)
-            ]
-        )
+        initialize_mova_transformer_layers(self, config, quant_config)
         self.head = Head(dim, out_dim, patch_size, eps)
         self.num_heads = num_heads
         self.freqs = None
 
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
-        self.has_image_pos_emb = has_image_pos_emb
         self.has_ref_conv = has_ref_conv
         self.hidden_size = dim
         self.num_attention_heads = num_heads

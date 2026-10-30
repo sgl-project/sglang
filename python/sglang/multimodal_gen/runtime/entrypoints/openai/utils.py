@@ -8,12 +8,13 @@ import re
 import shutil
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from functools import cache
 from typing import Any, Generator, List, Literal, Optional, Union
 
 import httpx
 from fastapi import HTTPException, UploadFile
+from pydantic import BaseModel
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -30,6 +31,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     format_lora_message,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -37,6 +41,7 @@ from sglang.multimodal_gen.runtime.utils.common import parse_size
 from sglang.multimodal_gen.runtime.utils.image_io import (
     ensure_path_within_root,
     save_base64_image_to_path,
+    save_image_bytes_to_path,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -147,6 +152,14 @@ def request_extra_value(request: Any, field_name: str) -> Any:
     return None
 
 
+def request_field_value(request: BaseModel, field_name: str) -> Any:
+    """Prefer a non-None protocol field over transport extras."""
+    value = vars(request).get(field_name)
+    if value is not None:
+        return value
+    return request_extra_value(request, field_name)
+
+
 @cache
 def get_declared_request_extra_fields(
     sampling_params_cls: type[SamplingParams],
@@ -178,6 +191,20 @@ def get_sampling_request_extra_fields(
     return declared & init_fields
 
 
+def request_model_kwargs(
+    request: BaseModel,
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> dict[str, Any]:
+    """Extract only constructor fields declared by the active model contract."""
+    kwargs = {}
+    for field_name in get_sampling_request_extra_fields(sampling_params_cls, api):
+        value = request_extra_value(request, field_name)
+        if value is not None:
+            kwargs[field_name] = value
+    return kwargs
+
+
 @contextmanager
 def temp_dir_if_disabled(
     configured_path: str | None,
@@ -206,6 +233,23 @@ def choose_output_image_ext(
     return "jpg"
 
 
+_MODEL_PATH_FIELDS = ("upscaling_model_path", "frame_interpolation_model_path")
+
+
+def _reject_remote_model_paths(kwargs: dict[str, Any]) -> None:
+    """Reject URL model paths so a client cannot make the server fetch them (SSRF).
+
+    Only network entry points call this; the CLI and Python API still accept URLs.
+    """
+    for name in _MODEL_PATH_FIELDS:
+        value = kwargs.get(name)
+        if isinstance(value, str) and "://" in value:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be a local path or a HuggingFace repo id, not a URL",
+            )
+
+
 def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     """Build SamplingParams from request parameters.
 
@@ -230,6 +274,7 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    _reject_remote_model_paths(kwargs)
     has_explicit_compression = kwargs.get("output_compression") is not None
 
     # parse "WxH" size string if provided
@@ -269,9 +314,12 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     # SamplingParams.__post_init__ may have resolved with the wrong data_type
     # (default VIDEO) before _adjust() set the correct one.
     if not has_explicit_compression and output_quality is not None:
-        sampling_params.output_compression = adjust_output_quality(
-            output_quality, sampling_params.data_type
-        )
+        try:
+            sampling_params.output_compression = adjust_output_quality(
+                output_quality, sampling_params.data_type
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return sampling_params
 
@@ -340,7 +388,6 @@ async def save_image_to_path(
 async def _save_upload_to_path(
     upload: Union[UploadFile, bytes], target_path: str
 ) -> str:
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
     if isinstance(upload, bytes):
         content = upload
     elif isinstance(upload, (bytearray, memoryview)):
@@ -358,9 +405,7 @@ async def _save_upload_to_path(
             raise TypeError(
                 f"Image upload read() returned {type(content).__name__}, expected bytes"
             )
-    with open(target_path, "wb") as f:
-        f.write(content)
-    return target_path
+    return save_image_bytes_to_path(content, target_path)
 
 
 async def _maybe_url_image(
@@ -395,6 +440,32 @@ async def _maybe_url_image(
         raise ValueError("Unsupported image url format")
 
 
+# Arbitrary cap; keeps a hostile or mistaken URL from filling server memory.
+_MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+
+async def _download_capped_to_temp_file(
+    response: httpx.Response, directory: str
+) -> str:
+    too_large = f"Image exceeds the {_MAX_IMAGE_DOWNLOAD_BYTES} byte download limit"
+    declared = response.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > _MAX_IMAGE_DOWNLOAD_BYTES:
+        raise ValueError(too_large)
+    fd, part_path = tempfile.mkstemp(dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > _MAX_IMAGE_DOWNLOAD_BYTES:
+                    raise ValueError(too_large)
+                await asyncio.to_thread(f.write, chunk)
+    except BaseException:
+        os.remove(part_path)
+        raise
+    return part_path
+
+
 async def _save_url_image_to_path(
     image_url: str, target_path: str, *, uploads_root: str | None = None
 ) -> str:
@@ -419,14 +490,19 @@ async def _save_url_image_to_path(
 
     max_attempts = 3
     backoff_seconds = 0.2
-    last_error: Exception | None = None
 
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
             for attempt in range(1, max_attempts + 1):
+                part_path = None
                 try:
-                    response = await client.get(image_url, timeout=10.0)
-                    response.raise_for_status()
+                    async with client.stream(
+                        "GET", image_url, timeout=10.0
+                    ) as response:
+                        response.raise_for_status()
+                        part_path = await _download_capped_to_temp_file(
+                            response, os.path.dirname(target_path)
+                        )
 
                     # Determine file extension from content type or URL after downloading
                     if not os.path.splitext(target_path)[1]:
@@ -465,12 +541,11 @@ async def _save_url_image_to_path(
 
                     if uploads_root is not None:
                         target_path = ensure_path_within_root(target_path, uploads_root)
-                    with open(target_path, "wb") as f:
-                        f.write(response.content)
+                    # same-filesystem rename publishes only a complete download
+                    os.replace(part_path, target_path)
 
                     return target_path
                 except Exception as e:
-                    last_error = e
                     if attempt == max_attempts or not _is_retryable_download_error(e):
                         raise
                     wait_s = backoff_seconds * (2 ** (attempt - 1))
@@ -483,11 +558,12 @@ async def _save_url_image_to_path(
                         e,
                     )
                     await asyncio.sleep(wait_s)
+                finally:
+                    if part_path is not None:
+                        with suppress(FileNotFoundError):
+                            os.remove(part_path)
     except Exception as e:
-        final_error = last_error or e
-        raise Exception(
-            f"Failed to download image from URL {image_url}: {str(final_error)}"
-        )
+        raise Exception(f"Failed to download image from URL {image_url}: {e}")
 
 
 async def process_generation_batch(
@@ -502,21 +578,27 @@ async def process_generation_batch(
             scheduler_batches if scheduler_batches is not None else [batch]
         )
 
+        if result.cancelled:
+            raise RequestCancelledError(batch.client_request_ids())
+        # failed finalization can leave tensors or encoded files attached
+        if result.error:
+            raise RuntimeError(
+                f"Model generation failed. Error from scheduler: {result.error}"
+            )
+
         if (
             result.output is None
             and result.output_file_paths is None
             and result.raw_frame_batches is None
         ):
-            error_msg = result.error or "Unknown error"
-            raise RuntimeError(
-                f"Model generation returned no output. Error from scheduler: {error_msg}"
-            )
+            raise RuntimeError("Model generation returned no output.")
 
         save_file_path_list = []
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
         elif result.output is not None:
             num_outputs = len(result.output)
+            image_bytes = [] if batch.return_image_bytes else None
             save_file_path_list = save_outputs(
                 result.output,
                 batch.data_type,
@@ -525,6 +607,7 @@ async def process_generation_batch(
                 lambda idx: str(batch.output_file_path(num_outputs, idx)),
                 audio=result.audio,
                 audio_sample_rate=result.audio_sample_rate,
+                image_bytes_out=image_bytes,
                 output_compression=batch.output_compression,
                 x264_preset=batch.x264_preset,
                 enable_frame_interpolation=batch.enable_frame_interpolation,
@@ -535,6 +618,7 @@ async def process_generation_batch(
                 upscaling_model_path=batch.upscaling_model_path,
                 upscaling_scale=batch.upscaling_scale,
             )
+            result.output_image_bytes = image_bytes
 
     total_time = time.perf_counter() - total_start_time
     if get_global_server_args().batching_max_size > 1:
@@ -614,6 +698,12 @@ def add_common_data_to_response(
             "action_mode": result.action_mode,
             "domain_id": result.action_domain_id,
         }
+    if result.lidar is not None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.lidar_outputs import (
+            lidar_payload_for_response,
+        )
+
+        response["lidar"] = lidar_payload_for_response(result.lidar)
 
     return response
 

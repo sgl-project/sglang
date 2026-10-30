@@ -17,6 +17,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
     get_parallel,
+    get_schedule,
     pre_capture_activation_reserve_mb,
 )
 from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity
@@ -90,13 +91,26 @@ def compute_post_capture_kv_resize(
             running_requests,
         )
     if eager_decode_gap or mambaish_config(model_runner.model_config) is not None:
-        headroom_gb = max(
-            headroom_gb,
-            pre_capture_activation_reserve_mb(
-                get_device_memory_capacity(model_runner.device)
-            )
-            / 1024,
+        prefill_max_requests = get_schedule().prefill_max_requests
+        request_slots = get_exec().graph.cuda_graph_config.prefill.full_prefill_max_req
+        # Every prefill batch fits a captured bucket when batches are capped at the
+        # request slots; the configured headroom then covers the eager tail.
+        capped_full_prefill_role = (
+            get_disagg().disaggregation_mode == "prefill"
+            and get_exec().graph.cuda_graph_config.prefill.backend == Backend.FULL
+            and get_schedule().max_mamba_cache_size is not None
+            and prefill_max_requests is not None
+            and request_slots is not None
+            and prefill_max_requests <= request_slots
         )
+        if not capped_full_prefill_role:
+            headroom_gb = max(
+                headroom_gb,
+                pre_capture_activation_reserve_mb(
+                    get_device_memory_capacity(model_runner.device)
+                )
+                / 1024,
+            )
     if not graph_pool_borrow_enabled():
         # Borrowing serves the sampling temporaries out of idle graph storage;
         # without it they need real headroom the KV pool must not claim.

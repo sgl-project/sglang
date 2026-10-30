@@ -169,6 +169,14 @@ pub struct GenerateRequest {
     pub max_thinking_tokens: ::core::option::Option<u32>,
     #[prost(message, optional, tag = "17")]
     pub kv_hints: ::core::option::Option<KvHintsEnvelope>,
+    #[prost(bool, optional, tag = "18")]
+    pub return_text: ::core::option::Option<bool>,
+    #[prost(string, repeated, tag = "19")]
+    pub image_data: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "20")]
+    pub video_data: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "21")]
+    pub audio_data: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Versioned KV-hint envelope forwarded from a trusted orchestrator.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -201,6 +209,9 @@ pub struct GenerateResponse {
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(bool, tag = "3")]
     pub finished: bool,
+    /// Set only when the request asked for return_text.
+    #[prost(string, optional, tag = "4")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TextEmbedRequest {
@@ -416,6 +427,9 @@ pub struct OpenAiStreamChunk {
     pub json_chunk: ::prost::alloc::vec::Vec<u8>,
     #[prost(bool, tag = "2")]
     pub finished: bool,
+    /// HTTP status of a non-streaming response, set on its single finished chunk.
+    #[prost(int32, optional, tag = "3")]
+    pub status_code: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OpenAiResponse {
