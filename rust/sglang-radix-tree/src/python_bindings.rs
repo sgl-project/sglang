@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
 
-use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
+use crate::components::{ComponentSet, ComponentType, FULL, Family, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
 use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
@@ -75,6 +75,12 @@ fn parse_component_type(component_type: u8) -> PyResult<ComponentType> {
             "unknown component type: {other}"
         ))),
     }
+}
+
+/// Map a tree slot's family name onto the Rust enum.
+fn parse_family(family: &str) -> PyResult<Family> {
+    Family::parse(family)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown tree slot family: {family}")))
 }
 
 /// Map the Python EvictLayer IntFlag value onto the Rust enum.
@@ -973,20 +979,20 @@ struct TreeCoreBinding<Core> {
 macro_rules! tree_core_methods {
     ($core:ident) => {
         impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<$core<K>> {
-            /// Build a tree core for the given component types from the cache's
-            /// init params.
-            fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
-                let component_types = component_types
+            /// Build a tree core for the tree's slots (each slot's id and family)
+            /// from the cache's init params.
+            fn new(init_params: &TreeCoreInitParamsBinding, slots: Vec<(u8, String)>) -> PyResult<Self> {
+                let slots = slots
                     .into_iter()
-                    .map(parse_component_type)
+                    .map(|(slot, family)| Ok((parse_component_type(slot)?, parse_family(&family)?)))
                     .collect::<PyResult<Vec<_>>>()?;
                 let params = init_params.to_cache_init_params()?;
-                $core::<K>::validate_init_params(&params, &component_types)
+                $core::<K>::validate_init_params(&params, &slots)
                     .map_err(PyValueError::new_err)?;
                 let device = params.device;
                 let page_size = params.page_size;
                 Ok(TreeCoreBinding {
-                    core: Mutex::new($core::new(params, component_types)),
+                    core: Mutex::new($core::new_with_slots(params, slots)),
                     device,
                     page_size,
                 })
@@ -2739,13 +2745,13 @@ macro_rules! tree_core_binding {
 
         #[pymethods]
         impl $name {
-            /// Build a tree core for the given component types from the cache's
-            /// init params.
+            /// Build a tree core for the tree's slots (each slot's id and family)
+            /// from the cache's init params.
             #[new]
-            fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
+            fn new(init_params: &TreeCoreInitParamsBinding, slots: Vec<(u8, String)>) -> PyResult<Self> {
                 catch_native_panic(|| {
                     Ok($name {
-                        inner: TreeCoreBinding::<$core<$key>>::new(init_params, component_types)?,
+                        inner: TreeCoreBinding::<$core<$key>>::new(init_params, slots)?,
                     })
                 })
             }

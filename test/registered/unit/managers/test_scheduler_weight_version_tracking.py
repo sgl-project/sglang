@@ -48,6 +48,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     ) -> SimpleNamespace:
         return SimpleNamespace(
             collect_inflight_reqs=lambda: set(inflight),
+            _deferred_responses=None,
             waiting_queue=list(waiting),
             chunked_req=chunked,
             hisparse_coordinator=(
