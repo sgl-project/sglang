@@ -167,7 +167,29 @@ def handle_sail_backends(server_args: Any):
         return
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
+    if not envs.SGLANG_SAIL_DEEPGEMM_DENSE.is_set():
+        envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
+    if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
+        envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
+
     cfg = resolving_view(server_args)
+    if cfg.moe_a2a_backend == "megamoe":
+        raise ValueError(
+            "SAIL does not support MegaMoE; please use --moe-a2a-backend none."
+        )
+    valu_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
+    mma_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.get()
+    if valu_enabled and mma_enabled:
+        raise ValueError("SAIL MXFP4 W4A16 VALU and MMA modes are mutually exclusive.")
+    if valu_enabled or mma_enabled:
+        if cfg.moe_runner_backend != "deep_gemm":
+            raise ValueError(
+                "SAIL MXFP4 W4A16 requires --moe-runner-backend deep_gemm."
+            )
+        if cfg.moe_a2a_backend not in ("none", "deepep"):
+            raise ValueError(
+                "SAIL MXFP4 W4A16 only supports --moe-a2a-backend none or deepep."
+            )
     # A captured prefill graph pins MLA to the absorbed path, which hands the
     # backend a non-None q_v; the SAIL FA3 interface rejects that argument, so
     # MLA prefill must stay eager on SAIL. DSA models keep their own policy.
