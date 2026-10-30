@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.moe.mega_moe_flydsl import forward_mega_moe
 from sglang.srt.managers.scheduler_components.dp_attn import (
     ForwardMode,
     _update_gather_batch,
@@ -11,6 +12,16 @@ from sglang.srt.managers.scheduler_components.dp_attn import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+def test_forward_supports_moe_without_shared_experts(monkeypatch):
+    expected = torch.ones(2, 3)
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.mega_moe_flydsl._run_mega_routed",
+        lambda moe, hidden_states, forward_batch, input_ids_global: expected,
+    )
+
+    assert forward_mega_moe(SimpleNamespace(), torch.zeros(2, 3)) is expected
 
 
 def test_mlp_sync_retains_full_vector_without_tp_gather():
