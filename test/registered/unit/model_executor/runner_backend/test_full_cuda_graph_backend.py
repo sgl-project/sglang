@@ -144,7 +144,7 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         large_out = (torch.ones((4, 2)), torch.ones((4, 3)))
         small_out = (torch.full((2, 2), 2.0), torch.full((2, 3), 3.0))
         plain_out = torch.full((1, 2), 7.0)
-        outputs = iter([large_out] * 3 + [small_out] * 3 + [plain_out] * 3)
+        outputs = iter([large_out] * 2 + [small_out] * 2 + [plain_out] * 2)
         with mock.patch("torch.cuda.CUDAGraph", side_effect=["G4", "G2", "G1"]):
             backend.capture_one(ShapeKey(size=4), lambda: next(outputs))
             backend.capture_one(ShapeKey(size=2), lambda: next(outputs))
@@ -177,7 +177,7 @@ class TestCaptureOneNoProfiling(CustomTestCase):
 
         first_out = (torch.ones((4, 2)), torch.tensor(0.0))
         second_out = (torch.ones((2, 2)), torch.tensor(1.0))
-        outputs = iter([first_out] * 3 + [second_out] * 3)
+        outputs = iter([first_out] * 2 + [second_out] * 2)
         with mock.patch("torch.cuda.CUDAGraph", side_effect=["G4", "G2"]):
             backend.capture_one(ShapeKey(size=4), lambda: next(outputs))
             backend.capture_one(ShapeKey(size=2), lambda: next(outputs))
