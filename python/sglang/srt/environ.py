@@ -1062,8 +1062,6 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
-    # Opt in to DVPP JPEGD + VPC RGB conversion for tensor-capable processors.
-    SGLANG_ENABLE_NPU_IMAGE_DECODE = EnvBool(False)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the

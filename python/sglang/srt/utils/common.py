@@ -102,6 +102,8 @@ from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     describe_kv_events_publisher,
+    get_context,
+    get_device as get_runtime_device,
     get_exec,
     get_flags,
     get_model,
@@ -2065,7 +2067,7 @@ def is_jpeg_with_cuda(
     2. whether input is recognized as JPEG.
     3. whether GPU image decode is enabled (some models such as CPM forcibly disable this).
     """
-    if not is_cuda() or not device_image_decode:
+    if not device_image_decode or not is_cuda():
         return False
     if image_bytes != b"":
         return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
@@ -2081,6 +2083,19 @@ def _warn_fancy_jpeg_fallback(error: str) -> None:
     )
 
 
+def _image_decode_backend() -> str:
+    """Honor the serving backend; standalone loaders use available hardware."""
+    if get_context().is_config_namespace_published("device"):
+        return get_runtime_device().device
+    if is_cpu():
+        return "cpu"
+    if is_cuda():
+        return "cuda"
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu"
+    return "cpu"
+
+
 def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
@@ -2093,17 +2108,14 @@ def _load_image(
     """
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
-    if (
-        envs.SGLANG_ENABLE_NPU_IMAGE_DECODE.get()
-        and is_npu()
-        and device_image_decode is True
-    ):
+    backend = _image_decode_backend() if device_image_decode else "cpu"
+    if device_image_decode is True and backend == "npu":
         from sglang.srt.hardware_backend.npu.jpeg import decode_jpeg
 
         image_tensor = decode_jpeg(image_bytes)
         if image_tensor is not None:
             return image_tensor
-    if is_jpeg_with_cuda(image_bytes, device_image_decode):
+    if backend == "cuda" and is_jpeg_with_cuda(image_bytes, device_image_decode):
         try:
             if device_image_decode == "nvjpeg_fancy":
                 from sglang.srt.utils.nvjpeg_decoder import (
@@ -2157,9 +2169,13 @@ def load_image(
         image = _fully_load_pil_image(image_file)
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
-        image = _load_image(image_bytes=image_file, device_image_decode=device_image_decode)
+        image = _load_image(
+            image_bytes=image_file, device_image_decode=device_image_decode
+        )
     elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
-        image = _load_image(image_file=image_file, device_image_decode=device_image_decode)
+        image = _load_image(
+            image_file=image_file, device_image_decode=device_image_decode
+        )
     elif isinstance(image_file, str) and image_file.startswith("file://"):
         image = _load_image(
             image_file=unquote(urlparse(image_file).path),
@@ -2168,13 +2184,19 @@ def load_image(
     elif isinstance(image_file, str) and image_file.lower().endswith(
         image_extension_names
     ):
-        image = _load_image(image_file=image_file, device_image_decode=device_image_decode)
+        image = _load_image(
+            image_file=image_file, device_image_decode=device_image_decode
+        )
     elif isinstance(image_file, str) and image_file.startswith("data:"):
-        image = _load_image(image_file=image_file, device_image_decode=device_image_decode)
+        image = _load_image(
+            image_file=image_file, device_image_decode=device_image_decode
+        )
     elif isinstance(
         image_file, str
     ):  # Other formats, try to decode as base64 by default
-        image = _load_image(image_file=image_file, device_image_decode=device_image_decode)
+        image = _load_image(
+            image_file=image_file, device_image_decode=device_image_decode
+        )
     else:
         raise ValueError(f"Invalid image: {image_file}")
     if image_size is not None and isinstance(image, Image.Image):

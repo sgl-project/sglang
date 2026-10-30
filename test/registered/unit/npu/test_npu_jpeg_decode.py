@@ -4,7 +4,6 @@ import importlib.util
 import io
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -29,36 +28,35 @@ class TestNpuJpegDecode(unittest.TestCase):
         from sglang.srt.utils.common import _load_image
 
         retained = []
-        with patch.dict("os.environ", {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "1"}):
-            for w, h in [
-                (64, 32),
-                (65, 32),
-                (64, 33),
-                (65, 33),
-                (4095, 32),
-                (32, 4095),
-            ]:
-                with self.subTest(width=w, height=h):
-                    y, x = np.indices((h, w))
-                    pixels = np.stack((x * 7, y * 11, (x + y) * 5), axis=-1).astype(
-                        np.uint8
+        for w, h in [
+            (64, 32),
+            (65, 32),
+            (64, 33),
+            (65, 33),
+            (4095, 32),
+            (32, 4095),
+        ]:
+            with self.subTest(width=w, height=h):
+                y, x = np.indices((h, w))
+                pixels = np.stack((x * 7, y * 11, (x + y) * 5), axis=-1).astype(
+                    np.uint8
+                )
+                buffer = io.BytesIO()
+                Image.fromarray(pixels).save(
+                    buffer, format="JPEG", quality=95, subsampling=2
+                )
+                data = buffer.getvalue()
+                with Image.open(io.BytesIO(data)) as image:
+                    expected = (
+                        np.asarray(image.convert("RGB")).transpose(2, 0, 1).copy()
                     )
-                    buffer = io.BytesIO()
-                    Image.fromarray(pixels).save(
-                        buffer, format="JPEG", quality=95, subsampling=2
-                    )
-                    data = buffer.getvalue()
-                    with Image.open(io.BytesIO(data)) as image:
-                        expected = (
-                            np.asarray(image.convert("RGB")).transpose(2, 0, 1).copy()
-                        )
-                    result = _load_image(image_bytes=data)
-                    self.assertEqual(result.device, self.device)
-                    self.assertEqual(result.dtype, torch.uint8)
-                    self.assertEqual(tuple(result.shape), (3, h, w))
-                    self.assertTrue(result.is_contiguous())
-                    np.testing.assert_array_equal(result.cpu().numpy(), expected)
-                    retained.append((result, expected))
+                result = _load_image(image_bytes=data)
+                self.assertEqual(result.device, self.device)
+                self.assertEqual(result.dtype, torch.uint8)
+                self.assertEqual(tuple(result.shape), (3, h, w))
+                self.assertTrue(result.is_contiguous())
+                np.testing.assert_array_equal(result.cpu().numpy(), expected)
+                retained.append((result, expected))
         for result, expected in retained:
             np.testing.assert_array_equal(result.cpu().numpy(), expected)
 
@@ -99,11 +97,10 @@ class TestNpuJpegDecode(unittest.TestCase):
             expected = np.array(color, dtype=np.int16)[:, None, None]
             self.assertLessEqual(int(np.abs(actual - expected).max()), 2)
 
-        with patch.dict("os.environ", {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "1"}):
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                list(pool.map(call, [(255, 0, 0), (0, 255, 0), (0, 0, 255)] * 4))
-            # A subsequent request reclaims decoders whose owner threads ended.
-            call((255, 0, 0))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(call, [(255, 0, 0), (0, 255, 0), (0, 0, 255)] * 4))
+        # A subsequent request reclaims decoders whose owner threads ended.
+        call((255, 0, 0))
         self.assertEqual(len(jpeg._live), 1)
 
     def test_unsupported_format_retains_pil_pixels(self):
@@ -112,12 +109,38 @@ class TestNpuJpegDecode(unittest.TestCase):
         buffer = io.BytesIO()
         Image.new("RGB", (65, 33), (31, 127, 235)).save(buffer, format="PNG")
         data = buffer.getvalue()
-        with patch.dict("os.environ", {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "0"}):
-            baseline = _load_image(image_bytes=data)
-        with patch.dict("os.environ", {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "1"}):
-            enabled = _load_image(image_bytes=data)
+        baseline = _load_image(image_bytes=data, device_image_decode=False)
+        enabled = _load_image(image_bytes=data)
         self.assertIsInstance(enabled, Image.Image)
         np.testing.assert_array_equal(np.asarray(enabled), np.asarray(baseline))
+
+    def test_processor_io_threads_decode_without_worker_device_setup(self):
+        from sglang.srt.managers.schedule_batch import Modality
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        class Processor(BaseMultimodalProcessor):
+            async def process_mm_data_async(self, *args, **kwargs):
+                raise NotImplementedError
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (65, 33), (31, 127, 235)).save(
+            buffer, format="JPEG", subsampling=2
+        )
+        data = buffer.getvalue()
+        expected = np.asarray(Image.open(io.BytesIO(data))).transpose(2, 0, 1)
+        processor = object.__new__(Processor)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            processor.io_executor = pool
+            tasks = processor._submit_mm_data_loading_tasks_simple(
+                [data] * 4, Modality.IMAGE, None, True
+            )
+            for _, _, future in tasks:
+                result = future.result()
+                self.assertEqual(result.device, self.device)
+                self.assertTrue(result.is_contiguous())
+                np.testing.assert_array_equal(result.cpu().numpy(), expected)
 
 
 if __name__ == "__main__":

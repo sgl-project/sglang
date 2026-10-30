@@ -250,10 +250,12 @@ class BaseMultimodalProcessor(ABC):
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        if "gpu_image_decode" in cls.__dict__:
-            raise TypeError(
-                f"{cls.__name__}: rename gpu_image_decode to device_image_decode"
-            )
+        for owner in cls.__mro__:
+            if "gpu_image_decode" in owner.__dict__:
+                raise TypeError(
+                    f"{cls.__name__}: rename {owner.__name__}.gpu_image_decode "
+                    "to device_image_decode"
+                )
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs

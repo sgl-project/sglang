@@ -1,4 +1,4 @@
-"""CPU contracts for opt-in NPU JPEG dispatch and decoder ownership."""
+"""CPU contracts for NPU JPEG dispatch and decoder ownership."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -38,12 +38,12 @@ class TestNpuJpegDispatch(unittest.TestCase):
 
     def test_disabled_preserves_pil_and_never_calls_decoder(self):
         with (
-            patch.dict(os.environ, {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "0"}),
-            patch.object(common, "is_npu", return_value=True),
-            patch.object(common, "is_jpeg_with_cuda", return_value=False),
+            patch.object(common, "_image_decode_backend", return_value="npu"),
             patch.object(jpeg, "decode_jpeg") as decode,
         ):
-            result = common._load_image(image_bytes=self.data)
+            result = common._load_image(
+                image_bytes=self.data, device_image_decode=False
+            )
         self.assertIsInstance(result, Image.Image)
         self.assertEqual(result.size, (64, 32))
         decode.assert_not_called()
@@ -51,8 +51,7 @@ class TestNpuJpegDispatch(unittest.TestCase):
     def test_enabled_returns_decoder_tensor(self):
         output = torch.empty((3, 32, 64), dtype=torch.uint8)
         with (
-            patch.dict(os.environ, {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "1"}),
-            patch.object(common, "is_npu", return_value=True),
+            patch.object(common, "_image_decode_backend", return_value="npu"),
             patch.object(jpeg, "decode_jpeg", return_value=output) as decode,
         ):
             self.assertIs(common._load_image(image_bytes=self.data), output)
@@ -62,9 +61,7 @@ class TestNpuJpegDispatch(unittest.TestCase):
         for mode in [False, "nvjpeg_fancy"]:
             with (
                 self.subTest(mode=mode),
-                patch.dict(os.environ, {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "1"}),
-                patch.object(common, "is_npu", return_value=True),
-                patch.object(common, "is_jpeg_with_cuda", return_value=False),
+                patch.object(common, "_image_decode_backend", return_value="npu"),
                 patch.object(jpeg, "decode_jpeg") as decode,
             ):
                 result = common._load_image(
@@ -75,9 +72,7 @@ class TestNpuJpegDispatch(unittest.TestCase):
 
     def test_non_npu_preserves_existing_loader(self):
         with (
-            patch.dict(os.environ, {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "1"}),
-            patch.object(common, "is_npu", return_value=False),
-            patch.object(common, "is_jpeg_with_cuda", return_value=False),
+            patch.object(common, "_image_decode_backend", return_value="cpu"),
             patch.object(jpeg, "decode_jpeg") as decode,
         ):
             self.assertIsInstance(
@@ -87,8 +82,7 @@ class TestNpuJpegDispatch(unittest.TestCase):
 
     def test_npu_runtime_failure_is_visible(self):
         with (
-            patch.dict(os.environ, {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "1"}),
-            patch.object(common, "is_npu", return_value=True),
+            patch.object(common, "_image_decode_backend", return_value="npu"),
             patch.object(
                 jpeg, "decode_jpeg", side_effect=RuntimeError("device failed")
             ),
@@ -99,8 +93,7 @@ class TestNpuJpegDispatch(unittest.TestCase):
     def test_file_input_is_resolved_before_dispatch(self):
         output = object()
         with (
-            patch.dict(os.environ, {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "1"}),
-            patch.object(common, "is_npu", return_value=True),
+            patch.object(common, "_image_decode_backend", return_value="npu"),
             patch.object(common, "get_image_bytes", return_value=self.data) as read,
             patch.object(jpeg, "decode_jpeg", return_value=output) as decode,
         ):
@@ -172,9 +165,7 @@ class TestNpuJpegEligibility(unittest.TestCase):
             large_encoded,
         ]
         with (
-            patch.dict(os.environ, {"SGLANG_ENABLE_NPU_IMAGE_DECODE": "1"}),
-            patch.object(common, "is_npu", return_value=True),
-            patch.object(common, "is_jpeg_with_cuda", return_value=False),
+            patch.object(common, "_image_decode_backend", return_value="npu"),
             patch.object(jpeg, "_decoder", side_effect=AssertionError("device work")),
         ):
             for index, data in enumerate(cases):
