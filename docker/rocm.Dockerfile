@@ -40,8 +40,8 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.17-rocm720-mi35x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + uTLX docker image, for sglang's TLX kernels):
-# Off by default. BUILD_UTLX=1 builds it on gfx950-rocm1000 and gfx1250-rocm1000,
-# and fails on every other flavor.
+# Off by default. BUILD_UTLX=1 builds it on gfx950-rocm1000 and fails on every
+# other flavor.
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx950-rocm1000 --build-arg BUILD_UTLX=1 -t v0.5.17-rocm10-mi35x -f rocm.Dockerfile .
 
 # Default base images
@@ -362,13 +362,7 @@ ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
 # The upstream Triton the gfx1250 bring-up was validated against, carried over
 # from the ROCm 7.14 flavor this image replaced. Built from source below.
-ENV TRITON_REPO_DEFAULT="https://github.com/triton-lang/triton.git"
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
-# uTLX (see the uTLX step): triton-lang/triton#12371 versions libtriton's
-# exported symbols so they stay apart from the SDK's libLLVM. May be removed
-# once TRITON_COMMIT has it.
-ENV UTLX_TRITON_PATCH="triton-ext-llvm-symbols-gfx1250.patch"
-ENV UTLX_TRITON_ROCM="0"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -380,7 +374,6 @@ ENV BUILD_VLLM="0"
 # Triton from source, and that one no longer has block pointers or
 # triton_kernels (triton-lang/triton#10833), which sglang still uses.
 ENV BUILD_TRITON="1"
-ENV TRITON_REPO_DEFAULT="https://github.com/triton-lang/triton.git"
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
 # triton-lang/triton#10833 removed block pointers, which sglang's FLA kernels
 # (fla/, used by Qwen3-Next, MiniMax and Kimi Linear) still call. The revert is
@@ -427,7 +420,7 @@ ARG BRANCH_TYPE=remote
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
 ARG TRITON_REPO=""
-ENV TRITON_REPO="${TRITON_REPO:-${TRITON_REPO_DEFAULT}}"
+ENV TRITON_REPO="${TRITON_REPO:-${TRITON_REPO_DEFAULT:-https://github.com/triton-lang/triton.git}}"
 ENV TRITON_COMMIT="${TRITON_COMMIT:-${TRITON_COMMIT_DEFAULT}}"
 ARG TRITON_REVERT_COMMITS=""
 ENV TRITON_REVERT_COMMITS="${TRITON_REVERT_COMMITS:-${TRITON_REVERT_COMMITS_DEFAULT}}"
@@ -1255,15 +1248,14 @@ RUN case "${GPU_ARCH}" in *-rocm724|gfx1250-rocm1010) python3 -c "import pathlib
 
 # -----------------------
 # uTLX (standalone TLX) for sglang's TLX kernels, built with BUILD_UTLX=1 on the
-# flavors whose stage sets UTLX_TRITON_PATCH (gfx950-rocm1000 and
-# gfx1250-rocm1000). The Triton step above builds their Triton from source in
-# /sgl-workspace/triton-custom with plugin support (TRITON_EXT_ENABLED=ON) and
-# their UTLX_TRITON_PATCH; this step builds the uTLX plugin against it, from
-# /sgl-workspace/triton-ext. Both stay in the image, with Triton's build tree
-# and LLVM, to rebuild in place.
+# flavors whose stage sets UTLX_TRITON_PATCH (gfx950-rocm1000). The Triton step
+# above builds their Triton from source in /sgl-workspace/triton-custom with
+# plugin support (TRITON_EXT_ENABLED=ON) and their UTLX_TRITON_PATCH; this step
+# builds the uTLX plugin against it, from /sgl-workspace/triton-ext. Both stay
+# in the image, with Triton's build tree and LLVM, to rebuild in place.
 #
-# Triton release/3.8 (gfx950) does not install the C++ headers uTLX compiles
-# against, so then they come from the build tree, staged outside the source tree
+# Triton release/3.8 does not install the C++ headers uTLX compiles against,
+# so then they come from the build tree, staged outside the source tree
 # because the component also copies python/ into include/. uTLX's examples and
 # tests are also copied to /sgl-workspace/utlx: triton-ext lists uTLX as
 # disabled, so its conftest.py skips them in the checkout.
