@@ -5,8 +5,6 @@ from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
-from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
-from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -419,7 +417,17 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertEqual(first.calls, [])
         self.assertEqual(second.normal_text, " tail")
 
-    def _feed_all(self, chunks, detector_cls=DeepSeekV4Detector):
+    @staticmethod
+    def _detector_classes():
+        from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+        from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
+        from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+
+        return (DeepSeekV32Detector, DeepSeekV4Detector, DeepSeekV41Detector)
+
+    def _feed_all(self, chunks, detector_cls=None):
+        if detector_cls is None:
+            detector_cls = self._detector_classes()[1]
         """Returns (normal_text, calls) accumulated over chunks plus finish()."""
         detector = detector_cls()
         normal, calls = "", []
@@ -435,7 +443,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
     def test_streaming_drops_unknown_tool_unless_forward_unknown_enabled(self):
         """Streaming and non-streaming must agree on unknown tool calls across
         V3.2, V4, and V4.1 detectors and chunk sizes."""
-        for cls in (DeepSeekV32Detector, DeepSeekV4Detector, DeepSeekV41Detector):
+        for cls in self._detector_classes():
             d = cls()
             p = f"{d.dsml_token}{cls.parameter_tag_name}"
             text = (
@@ -504,10 +512,11 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
     def test_unknown_only_invoke_withholds_trailing_dsml_on_finish(self):
         """When the only invoke in a block is for an unknown tool, the preamble
         is emitted once and finish() does not leak the trailing closing tag."""
+        v32_cls, v4_cls, v41_cls = self._detector_classes()
         for parser_name, cls in (
-            ("deepseekv32", DeepSeekV32Detector),
-            ("deepseekv4", DeepSeekV4Detector),
-            ("deepseekv41", DeepSeekV41Detector),
+            ("deepseekv32", v32_cls),
+            ("deepseekv4", v4_cls),
+            ("deepseekv41", v41_cls),
         ):
             d = cls()
             p = f"{d.dsml_token}{cls.parameter_tag_name}"
@@ -538,7 +547,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
     def test_non_dsml_fullwidth_bar_tag_does_not_stall_streaming(self):
         """A fullwidth bar tag like `<|end|>` is not a DSML tool tag and must
         stream immediately instead of stalling in the buffer until finish()."""
-        for cls in (DeepSeekV32Detector, DeepSeekV4Detector, DeepSeekV41Detector):
+        for cls in self._detector_classes():
             detector = cls()
             first = detector.parse_streaming_increment("hello <｜end｜>", self.tools)
             second = detector.parse_streaming_increment(" world", self.tools)
@@ -551,7 +560,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         """Prose mentioning the bare DSML marker without `<` or `</` must
         stream immediately and never be truncated by _text_before_dsml."""
         text = f"The tag {DSML} marks tool calls."
-        for cls in (DeepSeekV32Detector, DeepSeekV4Detector, DeepSeekV41Detector):
+        for cls in self._detector_classes():
             d = cls()
             p = f"{d.dsml_token}{cls.parameter_tag_name}"
 
@@ -605,7 +614,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
     def test_trailing_partial_dsml_prefix_preserved_at_stream_end(self):
         """A reply ending with `<` or a partial DSML prefix at EOF must flush
         unchanged in finish() and match detect_and_parse."""
-        for cls in (DeepSeekV32Detector, DeepSeekV4Detector, DeepSeekV41Detector):
+        for cls in self._detector_classes():
             for chunks in (
                 ["for (int i = 0; i ", "<"],
                 ["hello\n\n", "<"],
@@ -623,7 +632,7 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
     def test_stray_dsml_fragment_after_invoke_does_not_leak(self):
         """Stray DSML opening or closing fragments after an invoke must remain
         suppressed in streaming mode just as in detect_and_parse."""
-        for cls in (DeepSeekV32Detector, DeepSeekV4Detector, DeepSeekV41Detector):
+        for cls in self._detector_classes():
             d = cls()
             p = f"{d.dsml_token}{cls.parameter_tag_name}"
             inv = (
