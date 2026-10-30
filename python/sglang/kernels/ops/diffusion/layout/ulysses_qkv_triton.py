@@ -26,6 +26,7 @@ def _pack_qkv_destination_major_kernel(
     stride_k_head,
     stride_v_row,
     stride_v_head,
+    PLANE_MAJOR: tl.constexpr,
     IDX64: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -57,10 +58,17 @@ def _pack_qkv_destination_major_kernel(
         v_ptr + row * stride_v_row + global_head * stride_v_head + dim,
         mask=mask,
     )
-    output_base = head_slot * (3 * head_size) + dim
+    if PLANE_MAJOR:
+        # Splitting [3, H, D] after all-to-all leaves packed head/channel
+        # dimensions for Sage FP8's opt-in strided quantizer.
+        plane_stride = local_heads * head_size
+        output_base = row_slot * (3 * plane_stride) + local_head * head_size + dim
+    else:
+        plane_stride = head_size
+        output_base = head_slot * (3 * head_size) + dim
     tl.store(output_ptr + output_base, q, mask=mask)
-    tl.store(output_ptr + output_base + head_size, k, mask=mask)
-    tl.store(output_ptr + output_base + 2 * head_size, v, mask=mask)
+    tl.store(output_ptr + output_base + plane_stride, k, mask=mask)
+    tl.store(output_ptr + output_base + 2 * plane_stride, v, mask=mask)
 
 
 def pack_qkv_destination_major(
@@ -69,8 +77,15 @@ def pack_qkv_destination_major(
     v: torch.Tensor,
     world_size: int,
     out: torch.Tensor | None = None,
+    *,
+    plane_major: bool = False,
 ) -> torch.Tensor:
-    """Pack matching ``[rows, global_heads, head_size]`` Q/K/V tensors."""
+    """Pack matching ``[rows, global_heads, head_size]`` Q/K/V tensors.
+
+    By default returns [world_size, rows, local_heads, 3 * head_size].
+    ``plane_major=True`` returns [world_size, rows, 3, local_heads, head_size]
+    for consumers requiring packed head/channel dimensions.
+    """
     if q.dim() != 3 or q.shape != k.shape or q.shape != v.shape:
         raise ValueError("q, k, and v must have the same 3D shape")
     if not all(t.device.type in _SUPPORTED_DEVICE_TYPES for t in (q, k, v)):
@@ -87,7 +102,11 @@ def pack_qkv_destination_major(
 
     rows, global_heads, head_size = q.shape
     local_heads = global_heads // world_size
-    expected_shape = (world_size, rows, local_heads, 3 * head_size)
+    expected_shape = (
+        (world_size, rows, 3, local_heads, head_size)
+        if plane_major
+        else (world_size, rows, local_heads, 3 * head_size)
+    )
     if out is not None:
         if not (
             out.shape == expected_shape
@@ -136,6 +155,7 @@ def pack_qkv_destination_major(
             k.stride(1),
             v.stride(0),
             v.stride(1),
+            PLANE_MAJOR=plane_major,
             IDX64=max_offset > _MAX_INT32,
             BLOCK_SIZE=block_size,
             num_warps=8,

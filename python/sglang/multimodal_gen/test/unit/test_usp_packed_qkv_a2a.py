@@ -221,6 +221,63 @@ class TestPackedQKVInputA2A(CustomTestCase):
 
         self.assertEqual(collectives, 1)
 
+    def test_plane_major_3d_matches_original_and_reference(self):
+        # Exercise both the Triton pack and the eager fallback, including
+        # non-aligned rows and the 14-local-head shape used by the comparison.
+        for world, rows, heads, dim in ((4, 37, 56, 128), (2, 13, 6, 64)):
+            torch.manual_seed(42)
+            packed = torch.randn(
+                world * rows,
+                3,
+                heads,
+                dim,
+                dtype=torch.bfloat16,
+                device=get_device(),
+            )
+            full = tuple(packed[:, i] for i in range(3))
+            shards = [
+                tuple(t[r * rows : (r + 1) * rows] for t in full) for r in range(world)
+            ]
+            for force_fallback in (False, True):
+                with patch(
+                    f"{_USP}.torch.compiler.is_compiling", return_value=force_fallback
+                ):
+                    original = self._run_all_ranks(
+                        lambda r: usp_mod._usp_input_all_to_all_packed_qkv(*shards[r]),
+                        world,
+                    )
+                    optimized = self._run_all_ranks(
+                        lambda r: usp_mod._usp_input_all_to_all_packed_qkv(
+                            *shards[r], plane_major=True
+                        ),
+                        world,
+                    )
+                local_heads = heads // world
+                for rank in range(world):
+                    for i in range(3):
+                        expected = full[i][
+                            :, rank * local_heads : (rank + 1) * local_heads
+                        ]
+                        self.assertTrue(torch.equal(original[rank][i], expected))
+                        self.assertTrue(torch.equal(optimized[rank][i], expected))
+                        self.assertEqual(
+                            optimized[rank][i].stride(), (3 * local_heads * dim, dim, 1)
+                        )
+                        self.assertEqual(
+                            original[rank][i].stride(),
+                            (heads // world * 3 * dim, 3 * dim, 1),
+                        )
+
+    def test_plane_major_single_rank_returns_original_views(self):
+        qkv = tuple(
+            torch.randn(17, 4, 128, dtype=torch.bfloat16, device=get_device())
+            for _ in range(3)
+        )
+        with patch(f"{_USP}.get_ulysses_parallel_world_size", return_value=1):
+            result = usp_mod._usp_input_all_to_all_packed_qkv(*qkv, plane_major=True)
+        for original, actual in zip(qkv, result):
+            self.assertIs(actual, original)
+
 
 @unittest.skipIf(
     not (torch.cuda.is_available() or torch.xpu.is_available()),
