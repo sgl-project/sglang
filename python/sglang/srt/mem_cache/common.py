@@ -62,8 +62,25 @@ class RetractionBackup(NamedTuple):
     mamba_cpu: Any = None
 
 
-def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
-    return (kv_indices[::page_size] // page_size).cpu().numpy()
+def kv_to_page_indices(
+    kv_indices: torch.Tensor, page_size: int, *, non_blocking: bool = False
+) -> np.ndarray:
+    pages = kv_indices[::page_size] // page_size
+    return to_host_nonblocking(pages) if non_blocking else pages.cpu().numpy()
+
+
+def to_host_nonblocking(tensor: torch.Tensor) -> np.ndarray:
+    """Host copy that never blocks the CPU on a device source.
+
+    A device source is copied into pinned memory on the current stream, so the
+    values are valid only once that stream passes the copy: record an event
+    after the last copy and wait on it before reading.
+    """
+    if tensor.device.type == "cpu":
+        return tensor.numpy()
+    host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+    host.copy_(tensor, non_blocking=True)
+    return host.numpy()
 
 
 def suffix_page_indices(
