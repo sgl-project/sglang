@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum, auto
+from functools import cache
 
 import torch
 import torch.distributed as dist
@@ -28,24 +29,29 @@ from sglang.srt.runtime_context import (
     get_resources,
 )
 
-try:
-    from nixl_ep import Buffer
-
-    use_nixl = True
-except ImportError:
-    use_nixl = False
-
-try:
-    from nixl_ep import topk_idx_t as NIXL_EP_TOPK_INDICES_DTYPE
-except ImportError:
-    NIXL_EP_TOPK_INDICES_DTYPE = torch.int64
-
-assert isinstance(NIXL_EP_TOPK_INDICES_DTYPE, torch.dtype)
-
 logger = logging.getLogger(__name__)
 
 NixlEPDispatchOutput = DeepEPLLDispatchOutput
 NixlEPCombineInput = DeepEPLLCombineInput
+
+
+@cache
+def _load_nixl_ep() -> tuple[type, torch.dtype]:
+    try:
+        from nixl_ep import Buffer
+    except ImportError as exc:
+        raise ImportError(
+            "NixlEP is not installed. Please install NixlEP package from "
+            "https://github.com/ai-dynamo/nixl."
+        ) from exc
+
+    try:
+        from nixl_ep import topk_idx_t
+    except ImportError:
+        topk_idx_t = torch.int64
+
+    assert isinstance(topk_idx_t, torch.dtype)
+    return Buffer, topk_idx_t
 
 
 class NixlEPBuffer:
@@ -125,6 +131,7 @@ class NixlEPBuffer:
                 cls._update_connections(state, state.scale_to)
             return state.buffer
 
+        Buffer, _ = _load_nixl_ep()
         state.hidden_size = hidden_size
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
@@ -207,11 +214,7 @@ class _NixlEPDispatcherImplBase:
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
     ):
-        if not use_nixl:
-            raise ImportError(
-                "NixlEP is not installed. Please install NixlEP package from "
-                "https://github.com/ai-dynamo/nixl."
-            )
+        _, self.topk_indices_dtype = _load_nixl_ep()
 
         self.group = group
         self.router_topk = router_topk
@@ -296,7 +299,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(NIXL_EP_TOPK_INDICES_DTYPE)
+        topk_ids = topk_ids.to(self.topk_indices_dtype)
         state = NixlEPBuffer._state()
         dispatch_ep_size = state.dispatch_ep_size
         num_local_experts = state.num_local_experts

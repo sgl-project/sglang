@@ -1,5 +1,6 @@
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
+    AscendOpsConfig,
     DeepEPMode,
     MoeA2ABackend,
     MoeRunnerBackend,
@@ -8,12 +9,16 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_config,
     get_deepep_mode,
     get_moe_a2a_backend,
+    get_moe_ascend_ops_config,
     get_moe_runner_backend,
     get_tbo_token_distribution_threshold,
     initialize_moe_config,
     is_moe_input_scattered_across_dp_ranks,
     is_tbo_enabled,
     post_experts_all_reduce,
+    post_experts_output_is_complete,
+    post_experts_reduction_group,
+    post_experts_sum_is_one_all_reduce,
     reduce_moe_output,
     should_skip_mlp_all_reduce,
     should_skip_post_experts_all_reduce,
@@ -23,6 +28,7 @@ from sglang.srt.layers.moe.utils import (
 
 __all__ = [
     "DeepEPMode",
+    "AscendOpsConfig",
     "MoeA2ABackend",
     "MoeRunner",
     "MoeRunnerConfig",
@@ -35,6 +41,9 @@ __all__ = [
     "can_merge_post_experts_all_reduce",
     "deferred_post_experts_all_reduce",
     "post_experts_all_reduce",
+    "post_experts_output_is_complete",
+    "post_experts_reduction_group",
+    "post_experts_sum_is_one_all_reduce",
     "reduce_moe_output",
     "should_skip_post_experts_all_reduce",
     "should_use_dp_reduce_scatterv",
@@ -43,4 +52,5 @@ __all__ = [
     "is_tbo_enabled",
     "get_tbo_token_distribution_threshold",
     "get_deepep_config",
+    "get_moe_ascend_ops_config",
 ]

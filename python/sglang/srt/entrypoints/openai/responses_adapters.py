@@ -6,11 +6,16 @@ from __future__ import annotations
 import base64
 import json
 import zlib
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, Optional, Set, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import ResponseTool
 
 CUSTOM_TOOL_INPUT_KEY = "input"
+
+
+def response_tool_name(name, names):
+    return names.get(name, {"name": name})
+
 
 _SIMPLE_ESCAPES = {
     '"': '"',
@@ -66,7 +71,8 @@ def expand_tool_namespaces(tools: list[ResponseTool]) -> list[ResponseTool]:
             expanded.append(tool)
             continue
         for definition in tool.tools or []:
-            child = ResponseTool.model_validate(definition)
+            definition = definition.get("function", definition)
+            child = ResponseTool.model_validate({"type": "function", **definition})
             child.name = f"{tool.name}.{child.name}"
             child.description = (
                 "\n\n".join(
@@ -81,7 +87,8 @@ def expand_tool_namespaces(tools: list[ResponseTool]) -> list[ResponseTool]:
 def tool_call_identity(name: str, tools: list[ResponseTool]) -> dict[str, str]:
     for tool in tools:
         if tool.type == "namespace":
-            for child in tool.tools or []:
+            for definition in tool.tools or []:
+                child = definition.get("function", definition)
                 if name == f"{tool.name}.{child['name']}":
                     return {"name": child["name"], "namespace": tool.name}
     return {"name": name}
@@ -92,6 +99,27 @@ def custom_tool_names(tools: Any) -> Set[str]:
         tool.name
         for tool in expand_tool_namespaces(tools or [])
         if tool.type == "custom" and tool.name
+    }
+
+
+def namespace_functions(tool: Any) -> Iterator[Dict[str, Any]]:
+    """Unwrap the flat and OpenAI-wrapped members accepted by Muse's template."""
+    for member in tool.tools or []:
+        if member.get("type", "function") != "function":
+            continue
+        function = member.get("function", member)
+        if isinstance(function, dict) and function.get("name"):
+            yield function
+
+
+def namespace_function_names(tools: Any) -> Dict[str, Tuple[str, str]]:
+    """Map each namespace member's call name ``<namespace>.<function>`` to
+    ``(namespace, function)``."""
+    return {
+        f"{tool.name}.{member['name']}": (tool.name, member["name"])
+        for tool in tools or []
+        if tool.type == "namespace" and tool.name
+        for member in namespace_functions(tool)
     }
 
 

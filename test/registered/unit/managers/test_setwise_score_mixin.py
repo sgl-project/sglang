@@ -9,11 +9,13 @@ as nested ``scores`` ``[num_items][Nᵢ x num_labels]``. These tests cover the
 grouping, validation, anchor bucketing, and the serialization round-trip on CPU.
 """
 
+import math
 import unittest
 from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.io_struct import RequestOutputStats
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     ScoreResult,
     TokenizerManagerScoreMixin,
@@ -22,7 +24,18 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+_REQUEST_STATS = RequestOutputStats(
+    prompt_tokens=0,
+    cached_tokens=0,
+    cached_tokens_details=None,
+    retraction_count=0,
+    image_tokens=0,
+    audio_tokens=0,
+    video_tokens=0,
+    time_stats=None,
+)
 
 # Config that satisfies _validate_score_extraction (dedicated setwise endpoint).
 _VALID_SETWISE_CONFIG = dict(
@@ -38,6 +51,17 @@ class _ClsHarness(TokenizerManagerScoreMixin):
     is_generation = False
 
     def __init__(self, architecture="Qwen3ForSequenceClassification"):
+        self.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture])
+        )
+
+
+class _GenHarness(TokenizerManagerScoreMixin):
+    """Bare CausalLM harness for the generation result parser."""
+
+    is_generation = True
+
+    def __init__(self, architecture="LlamaForCausalLM"):
         self.model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=[architecture])
         )
@@ -229,6 +253,12 @@ class TestSingleItemScoringResults(CustomTestCase):
         # Multiple items (candidate sets) are allowed with or without --enable-mis;
         # both return one score matrix per item.
         self.h._validate_score_extraction(False, False)
+
+    def test_validation_allows_causal_lm(self):
+        # CausalLM setwise is supported (batched and --enable-mis); generation reads
+        # label-token logprobs at each anchor and skips the SequenceClassification
+        # score_and_pool allow-list check.
+        self.h._validate_score_extraction(True, False)
 
     def test_anchor_counts_per_item_buckets_by_delimiter(self):
         # Fused: q <d0> item0(2 anchors) <d1> item1(1 anchor) <d2>.
@@ -433,6 +463,150 @@ class TestSingleItemScoringResults(CustomTestCase):
             self.h._multi_position_phs_matrix(torch.randn(4), expected_rows=4)
 
 
+class TestGenerationSetwiseResults(CustomTestCase):
+    """CausalLM setwise: label-token logprobs read at each anchor position.
+
+    The head is the LM head; per-anchor logprobs arrive as the request's
+    ``input_token_ids_logprobs`` (one entry per anchor), and the parser groups
+    them into one ``[N x num_labels]`` matrix per item (nested), reusing the
+    pointwise logprob->score conversion.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.h = _GenHarness()
+
+    @staticmethod
+    def _result(anchor_logprobs, prompt_tokens=7):
+        # anchor_logprobs: list (per anchor) of [(logprob, token_id, text), ...].
+        return {
+            "meta_info": {
+                "id": "rid-1",
+                "prompt_tokens": prompt_tokens,
+                "input_token_ids_logprobs": anchor_logprobs,
+            }
+        }
+
+    def test_generation_setwise_one_matrix_per_item(self):
+        result = self._result(
+            [
+                [(-0.1, 10, "a"), (-2.0, 20, "b")],
+                [(-0.5, 10, "a"), (-1.0, 20, "b")],
+            ]
+        )
+        res = self.h._process_single_item_scoring_results(
+            [result],
+            label_token_ids=[[10, 20]],
+            apply_softmax=False,
+            per_item_matrix=True,
+        )
+        self.assertIsInstance(res, ScoreResult)
+        self.assertEqual(len(res.scores), 1)  # one item
+        self.assertEqual(len(res.scores[0]), 2)  # two anchors
+        self.assertAlmostEqual(res.scores[0][0][0], math.exp(-0.1), places=5)
+        self.assertAlmostEqual(res.scores[0][1][1], math.exp(-1.0), places=5)
+        self.assertEqual(res.prompt_tokens, 7)
+
+    def test_generation_setwise_multiple_items_grouped_per_item(self):
+        r0 = self._result([[(-0.1, 10, "a")], [(-0.2, 10, "a")]])
+        r1 = self._result([[(-0.3, 10, "a")]])
+        res = self.h._process_single_item_scoring_results(
+            [r0, r1],
+            label_token_ids=[[10], [10]],
+            apply_softmax=False,
+            per_item_matrix=True,
+        )
+        self.assertEqual(len(res.scores), 2)
+        self.assertEqual(len(res.scores[0]), 2)  # item 0: two anchors
+        self.assertEqual(len(res.scores[1]), 1)  # item 1: one anchor
+
+    def test_generation_setwise_softmax_over_labels(self):
+        result = self._result([[(0.0, 10, "a"), (0.0, 20, "b")]])
+        res = self.h._process_single_item_scoring_results(
+            [result],
+            label_token_ids=[[10, 20]],
+            apply_softmax=True,
+            per_item_matrix=True,
+        )
+        row = res.scores[0][0]
+        self.assertAlmostEqual(sum(row), 1.0, places=5)
+        self.assertAlmostEqual(row[0], 0.5, places=5)
+
+    def test_generation_setwise_missing_label_is_zero(self):
+        # A label token absent from an anchor's logprobs -> -inf -> 0.0 probability.
+        result = self._result([[(-0.1, 10, "a")]])
+        res = self.h._process_single_item_scoring_results(
+            [result],
+            label_token_ids=[[10, 999]],
+            apply_softmax=False,
+            per_item_matrix=True,
+        )
+        self.assertAlmostEqual(res.scores[0][0][0], math.exp(-0.1), places=5)
+        self.assertEqual(res.scores[0][0][1], 0.0)
+
+    def test_generation_setwise_empty_logprobs_raises(self):
+        # No anchor logprobs -> hard error (a missing anchor would silently drop
+        # that item's scores).
+        with self.assertRaisesRegex(RuntimeError, "input_token_ids_logprobs"):
+            self.h._process_single_item_scoring_results(
+                [self._result([])],
+                label_token_ids=[[10]],
+                apply_softmax=False,
+                per_item_matrix=True,
+            )
+
+    def test_generation_pointwise_unchanged(self):
+        # Without per_item_matrix, the pointwise path still reads
+        # output_token_ids_logprobs (last position), one flat row per item.
+        result = {
+            "meta_info": {
+                "id": "rid-1",
+                "prompt_tokens": 5,
+                "output_token_ids_logprobs": [[(-0.1, 10, "a"), (-2.0, 20, "b")]],
+            }
+        }
+        res = self.h._process_single_item_scoring_results(
+            [result],
+            label_token_ids=[[10, 20]],
+            apply_softmax=False,
+        )
+        self.assertEqual(len(res.scores), 1)
+        self.assertAlmostEqual(res.scores[0][0], math.exp(-0.1), places=5)
+
+    def test_generation_mis_extraction_groups_scores_per_item(self):
+        # Fused --enable-mis request: one result with ΣNᵢ anchor logprobs, split
+        # back per item via per_item_anchor_counts (nested scores).
+        result = self._result(
+            [
+                [(-0.1, 10, "a"), (-2.0, 20, "b")],  # item 0, anchor 0
+                [(-0.5, 10, "a"), (-1.0, 20, "b")],  # item 0, anchor 1
+                [(-0.3, 10, "a"), (-1.5, 20, "b")],  # item 1, anchor 0
+            ]
+        )
+        res = self.h._process_multi_item_extraction_results(
+            [result],
+            per_item_anchor_counts=[2, 1],
+            apply_softmax=False,
+            label_token_ids=[[10, 20], [10, 20]],
+        )
+        self.assertEqual(len(res.scores), 2)  # one matrix per item
+        self.assertEqual(len(res.scores[0]), 2)  # item 0: two anchors
+        self.assertEqual(len(res.scores[1]), 1)  # item 1: one anchor
+        self.assertAlmostEqual(res.scores[0][0][0], math.exp(-0.1), places=5)
+        self.assertAlmostEqual(res.scores[1][0][1], math.exp(-1.5), places=5)
+
+    def test_generation_mis_extraction_row_count_mismatch_raises(self):
+        # Anchor logprob count must equal sum(per_item_anchor_counts).
+        result = self._result([[(-0.1, 10, "a")], [(-0.2, 10, "a")]])
+        with self.assertRaisesRegex(RuntimeError, "anchor rows"):
+            self.h._process_multi_item_extraction_results(
+                [result],
+                per_item_anchor_counts=[2, 1],
+                apply_softmax=False,
+                label_token_ids=[[10], [10]],
+            )
+
+
 class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
     """Validate per-position pooled hidden states survive scheduler serialization.
 
@@ -459,16 +633,12 @@ class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
                     http_worker_ipc=None,
                     finished_reason=SimpleNamespace(to_json=lambda: {"type": "stop"}),
                     embedding=[[0.0, 0.0] for _ in range(phs.shape[0])],
-                    origin_input_ids=[1, 2, 3],
-                    cached_tokens=0,
-                    time_stats=SimpleNamespace(),
-                    retraction_count=0,
                     pooled_hidden_state=phs,
                 )
             )
 
         fake_self = SimpleNamespace(
-            get_cached_tokens_details=lambda req: None,
+            build_request_stats=lambda req: _REQUEST_STATS,
             send_to_detokenizer=SimpleNamespace(
                 send_output=lambda obj: captured.append(obj)
             ),

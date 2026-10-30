@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, List, Optional
 
@@ -69,6 +69,8 @@ class ExpertLocationMetadata:
     ep_size: int
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
+    # dispatch algorithm -> int32 (map, replica count), built on first use by mega_gate_maps
+    _mega_gate_maps: dict = field(default_factory=dict, init=False, repr=False)
 
     # -------------------------------- properties ------------------------------------
 
@@ -338,7 +340,38 @@ class ExpertLocationMetadata:
                 mask_update = mask_update.to(self_field.device, non_blocking=True)
                 self_field[...] = torch.where(mask_update, other_field, self_field)
 
+        for algorithm, (to_physical_map, logical_count) in self._mega_gate_maps.items():
+            if algorithm == "static":
+                to_physical_map[..., 0].copy_(
+                    self.logical_to_rank_dispatch_physical_map
+                )
+            else:
+                to_physical_map.copy_(self.logical_to_all_physical_map)
+                logical_count.copy_(self.logical_to_all_physical_map_num_valid)
+
     # -------------------------------- usage ------------------------------------
+
+    def mega_gate_maps(self, algorithm: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """MegaGate's int32 ``(layers, num_logical_experts, dup)`` physical map and
+        ``(layers, num_logical_experts)`` replica count for ``algorithm``."""
+        maps = self._mega_gate_maps.get(algorithm)
+        if maps is not None:
+            return maps
+        if algorithm == "static":
+            rank_map = self.logical_to_rank_dispatch_physical_map
+            maps = (
+                rank_map.to(torch.int32)[..., None],
+                torch.ones_like(rank_map, dtype=torch.int32),
+            )
+        else:
+            maps = (
+                self.logical_to_all_physical_map.to(torch.int32),
+                self.logical_to_all_physical_map_num_valid.to(torch.int32),
+            )
+        # A cast recorded during graph capture has not run yet, so it is not cached.
+        if not (maps[0].is_cuda and torch.cuda.is_current_stream_capturing()):
+            self._mega_gate_maps[algorithm] = maps
+        return maps
 
     def logical_to_all_physical(
         self,
@@ -346,8 +379,8 @@ class ExpertLocationMetadata:
         logical_expert_id: int,
         require_global_experts: bool = False,
     ) -> List[int]:
-        # Use CPU copy to avoid GPU→CPU sync on every call, which is expensive in update weights scenario
-        cpu_map = self.logical_to_all_physical_map_cpu
+        # Use CPU copy to avoid GPU-to-CPU sync on every call, which is expensive in update weights scenario
+        cpu_map = self.physical_to_logical_map_cpu
         # Draft workers can query MoE layers whose layer_id lies beyond the
         # target-sized expert map; fall back to the identity mapping (no EPLB
         # rebalancing for those layers) instead of indexing out of range.
@@ -367,11 +400,14 @@ class ExpertLocationMetadata:
             return list(
                 range(logical_expert_id, num_physical_experts, self.num_logical_experts)
             )
-        return [
-            physical_expert_id
-            for physical_expert_id in cpu_map[layer_id, logical_expert_id].tolist()
-            if physical_expert_id != -1
-        ]
+        if not 0 <= logical_expert_id < self.num_logical_experts:
+            raise IndexError(
+                f"{logical_expert_id=} is not one of the "
+                f"{self.num_logical_experts} logical experts"
+            )
+        # Every replica on every rank: logical_to_all_physical_map may narrow the
+        # dispatch candidates to one replica, but the loaders must fill every slot.
+        return (cpu_map[layer_id] == logical_expert_id).nonzero().flatten().tolist()
 
 
 def format_expert_location_layout(

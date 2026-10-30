@@ -17,7 +17,17 @@ from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 import torch
 from torch.distributed import TCPStore
 
+try:
+    from torch.distributed import all_gather_single as _all_gather_single
+    from torch.distributed import reduce_scatter_single as _reduce_scatter_single
+except ImportError:  # older torch builds only have the *_tensor names
+    from torch.distributed import all_gather_into_tensor as _all_gather_single
+    from torch.distributed import reduce_scatter_tensor as _reduce_scatter_single
+
 from sglang.srt.runtime_context import get_resources
+
+all_gather_single = _all_gather_single
+reduce_scatter_single = _reduce_scatter_single
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +58,11 @@ def get_global_tcp_store() -> Optional[TCPStore]:
             "was called with a tcp:// init method."
         )
     return store
+
+
+def get_group_rank_size(group) -> Tuple[int, int]:
+    """Read rank and size from a retained owner; None denotes an unsharded layout."""
+    return (0, 1) if group is None else (group.rank_in_group, group.world_size)
 
 
 def ensure_divisibility(numerator, denominator):

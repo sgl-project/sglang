@@ -13,15 +13,17 @@
 # ==============================================================================
 """The baseclass of a backend for reasoner grammar-guided constrained decoding."""
 
-import json
 import logging
-from typing import List, Optional, Sequence, Tuple, Union
+from collections import OrderedDict
+from concurrent.futures import Future
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import torch
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.environ import envs
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 from .base_grammar_backend import (
@@ -31,6 +33,11 @@ from .base_grammar_backend import (
 )
 
 logger = logging.getLogger(__name__)
+
+_OPEN_ANSWER_VARIANT = "open_answer"
+_THINK_BUDGET_VARIANT = "think_budget="
+# Arbitrary bound; budgets are a per-request knob, so only recent variants stay cached.
+_BUDGET_VARIANT_CACHE_SIZE = 32
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
@@ -47,10 +54,16 @@ class ReasonerGrammarObject(BaseGrammarObject):
         allocate_vocab_mask_fn=None,
         move_vocab_mask_fn=None,
         apply_vocab_mask_fn=None,
+        think_starts: Sequence[str] = (),
+        decode: Optional[Callable[[List[int]], str]] = None,
     ):
         super().__init__()
         self.grammar = grammar
         self.think_end_ids = tuple(think_end_ids)
+        # Decoded openers match every tokenization the grammar admits; without any,
+        # the reasoning starts at the first token.
+        self.think_starts = tuple(think_starts)
+        self.decode = decode
         self._think_end_matcher = TokenSequenceMatcher(self.think_end_ids)
         self.think_excluded_token_ids = think_excluded_token_ids
         self.max_think_tokens = max_think_tokens
@@ -64,6 +77,12 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.tokens_after_end = -1
         self._matched_think_end_tokens = 0
         self._thinking_match_history: List[int] = []
+        # The grammar also covers output that skips reasoning; reasoning opened by an
+        # opener stays bounded by the budget and strict thinking filter.
+        self.reasoning_in_grammar = False
+        self._opening: List[int] = []
+        self._opening_text = ""
+        self._generated = 0
 
     def maybe_init_reasoning(self, reasoning: bool):
         self._matched_think_end_tokens = 0
@@ -82,11 +101,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
             raise ValueError("request reasoning terminator must not be empty")
         if any(type(token_id) is not int or token_id < 0 for token_id in token_ids):
             raise ValueError("request reasoning terminator must contain token IDs")
-        if (
-            self.current_token is not None
-            or self._thinking_match_history
-            or (self.tokens_in_think, self.tokens_after_end) not in ((0, -1), (-1, 0))
-        ):
+        if self._decoding_started():
             raise RuntimeError(
                 "request reasoning terminator must be selected before decoding"
             )
@@ -94,6 +109,41 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.think_end_ids = token_ids
         self._think_end_matcher = TokenSequenceMatcher(token_ids)
         self._matched_think_end_tokens = 0
+
+    def set_reasoning_in_grammar(self) -> None:
+        """Apply the grammar from the first token, as it also describes the
+        reasoning."""
+        if self._decoding_started():
+            raise RuntimeError(
+                "the grammar must cover the reasoning before decoding starts"
+            )
+        self.reasoning_in_grammar = True
+
+    def _decoding_started(self) -> bool:
+        return (
+            self.current_token is not None
+            or bool(self._thinking_match_history)
+            or (self.tokens_in_think, self.tokens_after_end) not in ((0, -1), (-1, 0))
+        )
+
+    def _grammar_active(self) -> bool:
+        return self.grammar is not None and (
+            self.reasoning_in_grammar or self._is_generation()
+        )
+
+    def _reasoning_opened(self) -> bool:
+        """Whether the output so far opens the reasoning it may skip."""
+        text = self._opening_text
+        return not self.think_starts or any(
+            text.startswith(start) or start.startswith(text)
+            for start in self.think_starts
+        )
+
+    def _opening_undecided(self) -> bool:
+        text = self._opening_text
+        return any(
+            start.startswith(text) and start != text for start in self.think_starts
+        )
 
     def _is_thinking(self):
         return self.tokens_in_think >= 0 and self.tokens_after_end == -1
@@ -140,20 +190,37 @@ class ReasonerGrammarObject(BaseGrammarObject):
         # grammar's is updated, not the wrapper's), so the guard never fires and
         # the token is accepted twice -> "Tokens not accepted" -> FINISH_ABORT.
         self.current_token = token
-        if self._is_generation() and self.grammar is not None:
+        if self._grammar_active():
             self.grammar.accept_token(token)
+        if self.reasoning_in_grammar:
+            if (
+                self.think_starts
+                and self._generated == len(self._opening)
+                and self._opening_undecided()
+            ):
+                self._opening.append(token)
+                self._opening_text = self.decode(self._opening)
+            self._generated += 1
         self.transfer_state(token)
 
     def is_terminated(self):
-        if self._is_generation() and self.grammar is not None:
+        if self._grammar_active():
             return self.grammar.is_terminated()
         return False
 
     def rollback(self, k):
         if self.grammar is not None:
-            steps_after = min(k, max(0, self.tokens_after_end))
+            if self.reasoning_in_grammar:
+                steps_after = k
+            else:
+                steps_after = min(k, max(0, self.tokens_after_end))
             if steps_after > 0:
                 self.grammar.rollback(steps_after)
+        if self.reasoning_in_grammar:
+            self._generated -= k
+            if len(self._opening) > self._generated:
+                del self._opening[self._generated :]
+                self._opening_text = self.decode(self._opening)
         for _ in range(k):
             self.rollback_state()
 
@@ -164,11 +231,44 @@ class ReasonerGrammarObject(BaseGrammarObject):
             < self.max_think_tokens
         )
 
-    def _do_token_filter(self, vocab_mask, token_ids, idx, is_allowed=True):
+    def _do_token_filter(
+        self, vocab_mask, token_ids, idx, is_allowed=True, reset_vocab_mask=True
+    ):
         if self.token_filter_fn is not None:
-            self.token_filter_fn(vocab_mask, token_ids, idx, is_allowed)
+            self.token_filter_fn(
+                vocab_mask,
+                token_ids,
+                idx,
+                is_allowed,
+                reset_vocab_mask=reset_vocab_mask,
+            )
+
+    def _filter_reasoning_in_grammar(self, vocab_mask: torch.Tensor, idx: int):
+        # Budget and strict filters can narrow, but never widen, the grammar mask.
+        if self._can_think_more():
+            if self.think_excluded_token_ids is not None:
+                self._do_token_filter(
+                    vocab_mask,
+                    self.think_excluded_token_ids,
+                    idx,
+                    is_allowed=False,
+                    reset_vocab_mask=False,
+                )
+            return
+        token = self.think_end_ids[self._matched_think_end_tokens]
+        if (int(vocab_mask[idx, token // 32]) >> (token % 32)) & 1:
+            self._do_token_filter(vocab_mask, [token], idx, is_allowed=True)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        if self.reasoning_in_grammar and self.grammar is not None:
+            self.grammar.fill_vocab_mask(vocab_mask, idx)
+            if (
+                self._is_thinking()
+                and self.enable_token_filter
+                and self._reasoning_opened()
+            ):
+                self._filter_reasoning_in_grammar(vocab_mask, idx)
+            return
         if self._is_thinking():
             if not self.enable_token_filter:
                 return
@@ -222,6 +322,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
             allocate_vocab_mask_fn=self.allocate_vocab_mask_fn,
             move_vocab_mask_fn=self.move_vocab_mask_fn,
             apply_vocab_mask_fn=self.apply_vocab_mask_fn,
+            think_starts=self.think_starts,
+            decode=self.decode,
         )
         new_obj.tokens_in_think = self.tokens_in_think
         new_obj.tokens_after_end = self.tokens_after_end
@@ -229,6 +331,10 @@ class ReasonerGrammarObject(BaseGrammarObject):
         new_obj._thinking_match_history = list(self._thinking_match_history)
         new_obj._finished = self._finished
         new_obj.current_token = self.current_token
+        new_obj.reasoning_in_grammar = self.reasoning_in_grammar
+        new_obj._opening = list(self._opening)
+        new_obj._opening_text = self._opening_text
+        new_obj._generated = self._generated
         return new_obj
 
     @property
@@ -271,16 +377,27 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     ):
         super().__init__()
         self.grammar_backend = grammar_backend
-        think_end_ids = tokenizer.encode(
-            reasoning_parser.detector.think_end_token, add_special_tokens=False
-        )
+        self._budget_variant_keys: OrderedDict[Tuple[str, str], None] = OrderedDict()
+        think_end_ids = reasoning_parser.detector.get_think_end_token_ids(tokenizer)
         if not think_end_ids:
             raise ValueError(
                 f"think_end_token '{reasoning_parser.detector.think_end_token}' "
                 f"could not be encoded by the tokenizer."
             )
         self.think_end_ids = think_end_ids
+        detector = reasoning_parser.detector
+        self.think_starts = ()
+        if isinstance(detector, ResponseTemplateReasoningDetector):
+            self.think_starts = tuple(detector.message_start_think_openers)
+        self._decode = lambda token_ids: tokenizer.decode(
+            token_ids, skip_special_tokens=False, spaces_between_special_tokens=False
+        )
         self._enable_strict_thinking = enable_strict_thinking
+        self._answer_frame = reasoning_parser.detector.get_answer_frame()
+        if self._answer_frame is not None:
+            self.grammar_backend.reserve_framing_tokens(
+                self._answer_frame.framing_token_ids()
+            )
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
         )
@@ -335,6 +452,8 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             allocate_vocab_mask_fn=self.grammar_backend.allocate_vocab_mask,
             move_vocab_mask_fn=self.grammar_backend.move_vocab_mask,
             apply_vocab_mask_fn=self.grammar_backend.apply_vocab_mask,
+            think_starts=self.think_starts,
+            decode=self._decode,
         )
         obj.maybe_init_reasoning(reasoning)
         return obj
@@ -347,22 +466,93 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             return None
         return self._make_grammar_object(None, reasoning)
 
+    def get_request_grammar_key(
+        self,
+        key: Tuple[str, str],
+        *,
+        input_ids: Sequence[int],
+        thinking_budget: Optional[int],
+    ) -> Tuple[str, str]:
+        key_type, key_string = key
+        if not self._is_framed(key_type):
+            return key
+        if self._answer_frame.ends_in_open_answer_block(input_ids):
+            return (f"{key_type}:{_OPEN_ANSWER_VARIANT}", key_string)
+        # Mirrors the strict wrapper, which applies a request budget only while filtering.
+        if not self.enable_token_filter or thinking_budget is None:
+            return key
+        budget = max(thinking_budget, -1)
+        if budget == max(self.max_think_tokens, -1):
+            return key
+        return (f"{key_type}:{_THINK_BUDGET_VARIANT}{budget}", key_string)
+
+    def _is_framed(self, key_type: str) -> bool:
+        return (
+            self._answer_frame is not None
+            and key_type in self._answer_frame.framed_key_types
+        )
+
+    def get_cached_or_future_value(
+        self, key: Tuple[str, str], require_reasoning: bool
+    ) -> Tuple[BaseGrammarObject | Future[BaseGrammarObject], bool]:
+        if key in self._budget_variant_keys:
+            self._budget_variant_keys.move_to_end(key)
+        return super().get_cached_or_future_value(key, require_reasoning)
+
+    def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
+        super().set_cache(key, value)
+        if _THINK_BUDGET_VARIANT not in key[0]:
+            return
+        self._budget_variant_keys[key] = None
+        self._budget_variant_keys.move_to_end(key)
+        while len(self._budget_variant_keys) > _BUDGET_VARIANT_CACHE_SIZE:
+            evicted, _ = self._budget_variant_keys.popitem(last=False)
+            self.cache.pop(evicted, None)
+
+    def reset(self):
+        super().reset()
+        self._budget_variant_keys.clear()
+
     def _init_value_dispatch(
         self, key: Tuple[str, str], reasoning: bool
     ) -> Optional[BaseGrammarObject]:
+        key_type, _, variant = key[0].partition(":")
+        key = (key_type, key[1])
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
         if key[0] == "full_assistant_ebnf":
             return ret
-        if not self.enable_strict_thinking and key[0] == "structural_tag":
-            from sglang.srt.function_call.inkling_detector import InklingDetector
-
-            # Only this canonical schema owns the full turn; user restrictions may not.
-            if json.loads(key[1]) == (
-                InklingDetector()
-                .get_auto_tool_call_structural_tag()
-                .model_dump(by_alias=True)
-            ):
-                return ret
+        if self._is_framed(key[0]):
+            # The frame delimits thinking by message kind, so it owns the whole
+            # turn; strict thinking only caps the thinking message.
+            framed = self._frame_answer(ret, variant)
+            if framed is not None:
+                return framed
+        if (
+            not self.enable_strict_thinking
+            and key[0] == "structural_tag"
+            and self._answer_frame is not None
+            and self._answer_frame.owns_turn(key[1])
+        ):
+            return ret
         return self._make_grammar_object(ret, reasoning)
+
+    def _frame_answer(
+        self, grammar: BaseGrammarObject, variant: str
+    ) -> Optional[BaseGrammarObject]:
+        in_answer_block = variant == _OPEN_ANSWER_VARIANT
+        if variant.startswith(_THINK_BUDGET_VARIANT):
+            max_think_tokens = int(variant.removeprefix(_THINK_BUDGET_VARIANT))
+        elif self.enable_strict_thinking:
+            max_think_tokens = self.max_think_tokens
+        else:
+            max_think_tokens = -1
+        return self.grammar_backend.compile_framed_grammar(
+            grammar,
+            lambda content: self._answer_frame.structural_tag(
+                content,
+                in_answer_block=in_answer_block,
+                max_think_tokens=max_think_tokens,
+            ),
+        )

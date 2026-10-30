@@ -2,22 +2,12 @@ import asyncio
 import unittest
 from copy import deepcopy
 from itertools import product
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import orjson
 from openai_harmony import Conversation
-from utils import (
-    StreamFixture,
-    create_response_result,
-    engine_chunk,
-    event_payloads,
-    event_types,
-    find_completed_event,
-    make_serving,
-)
-
 from sglang.srt.entrypoints.harmony_utils import get_encoding
-from sglang.srt.entrypoints.openai.encoding_dsv41 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import ResponsesRequest, ResponsesResponse
 from sglang.srt.entrypoints.openai.responses_adapters import (
     decode_custom_tool_input,
@@ -28,12 +18,51 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     label_developer_content,
 )
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.srt.parser.deepseek_recipe_renderer import (
+    recipe_conversation,
+    pre_normalize,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from utils import (
+    StreamFixture,
+    create_response_result,
+    engine_chunk,
+    event_payloads,
+    event_types,
+    find_completed_event,
+    make_serving,
+)
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+def encode_messages(messages, *, thinking_mode="chat", tools=None):
+    import deepseek_recipe as recipe
+
+    body = pre_normalize(
+        {"messages": messages, "tools": tools, "thinking": thinking_mode != "chat"}
+    )
+    body["model"] = "DeepSeek-V4.1-Flash"
+    converted = recipe_conversation(recipe, body, recipe.ConversionOptions())
+    return recipe.DeepseekV41Encoding().render_conversation(converted).prompt
+
+
+def recipe_adapter(serving):
+    def encode(*, messages, request, tools, **kwargs):
+        return serving.tokenizer_manager.tokenizer.encode(
+            encode_messages(messages, tools=tools)
+        )
+
+    return SimpleNamespace(
+        encode_messages=encode,
+        output=None,
+        collects_openai_media=False,
+        strict_tool_call_arguments=False,
+    )
+
 
 CUSTOM_TOOL = {
     "type": "custom",
@@ -80,7 +109,7 @@ class CustomToolAdapterTestCase(CustomTestCase):
 class CustomToolShimTestCase(CustomTestCase):
     def test_custom_tool_becomes_a_single_string_function_tool(self):
         request = _custom_request()
-        (tool,) = OpenAIServingResponses._response_tools_to_chat_tools(request.tools)
+        (tool,) = make_serving()._response_tools_to_chat_tools(request)
         self.assertEqual(tool.function.name, "emit_command")
         self.assertEqual(list(tool.function.parameters["properties"]), ["input"])
         self.assertEqual(tool.function.parameters["required"], ["input"])
@@ -88,9 +117,7 @@ class CustomToolShimTestCase(CustomTestCase):
         nameless = ResponsesRequest(
             model="x", input="hi", tools=[{"type": "custom"}], store=False
         )
-        self.assertEqual(
-            OpenAIServingResponses._response_tools_to_chat_tools(nameless.tools), []
-        )
+        self.assertEqual(make_serving()._response_tools_to_chat_tools(nameless), [])
 
     def test_grammar_format_is_described_to_the_model(self):
         request = _custom_request(
@@ -105,7 +132,7 @@ class CustomToolShimTestCase(CustomTestCase):
                 }
             ]
         )
-        (tool,) = OpenAIServingResponses._response_tools_to_chat_tools(request.tools)
+        (tool,) = make_serving()._response_tools_to_chat_tools(request)
         self.assertIn("lark", tool.function.description)
         self.assertIn('start: "pwd"', tool.function.description)
 
@@ -523,7 +550,7 @@ class AdditionalToolsTestCase(CustomTestCase):
         serving.reasoning_parser = None
         serving.tool_call_parser = "deepseekv41"
         serving.chat_encoding_spec = "dsv41"
-        serving._dsv41_default_reasoning_effort = "high"
+        serving._encoding_adapter = recipe_adapter(serving)
         model = "deepseek-ai/DeepSeek-V4.1-Flash"
         serving.tokenizer_manager.served_model_name = model
 

@@ -10,6 +10,11 @@ This page focuses on optimal configuration and benchmark results for MiniMax-M2.
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
+<Warning>
+{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
+The optimal configurations on this page are validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Use exactly this version; later versions are not covered by this page and may introduce breaking changes.
+</Warning>
+
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
@@ -312,8 +317,7 @@ python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
-    --dp-size 2 \
-    --enable-dp-attention \
+    --enable-dp-attention --dp-size 2 \
     --mem-fraction-static 0.65 \
     --max-running-requests 4 \
     --reasoning-parser minimax-append-think \
@@ -422,8 +426,7 @@ python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --enable-dp-attention --dp-size 16 \
     --mem-fraction-static 0.53 \
     --max-running-requests 96 \
     --disable-radix-cache \
@@ -527,8 +530,7 @@ python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 6688 \
     --tp-size 16 \
-    --enable-dp-attention \
-    --dp-size 16 \
+    --enable-dp-attention --dp-size 16 \
     --mem-fraction-static 0.75 \
     --max-running-requests 320 \
     --disable-radix-cache \

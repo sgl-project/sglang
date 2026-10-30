@@ -9,7 +9,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 NUM_TOKENS_PER_REQ = 4
 
@@ -41,6 +41,7 @@ def _sync(forward_mode, num_reqs, global_num_tokens):
     )
     model_runner = MagicMock(is_draft_worker=False)
     model_runner.attn_tp_sequence_sharded.return_value = False
+    model_runner.attn_backend.late_layer_num_tokens.return_value = None
     no_prefill_graph = SimpleNamespace(
         graph=SimpleNamespace(
             cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[]))
@@ -52,7 +53,7 @@ def _sync(forward_mode, num_reqs, global_num_tokens):
             get_parallel=lambda: SimpleNamespace(attn_tp_size=1),
             get_exec=lambda: no_prefill_graph,
             _elastic_should_preserve_local_token_counts=lambda **kwargs: False,
-            dp_gather_slot=lambda: 0,
+            dp_slot_in=lambda per_rank: 0,
             set_dp_buffer_len_from_batch=lambda *args: None,
             set_is_extend_in_batch=lambda *args: None,
             _is_cpu=True,

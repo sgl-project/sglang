@@ -45,6 +45,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -75,7 +76,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
-        self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
@@ -126,9 +127,6 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 post_warmup_hook()
 
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
-        captured_fn = (
-            eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
-        )
         size = shape_key.size
         if self._shared_output_buffer is None:
             capacity_rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(
@@ -139,21 +137,34 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             self._shared_output_buffer = self._alloc_full_buffer(
                 warmup_out, capacity_rows
             )
+        buffer = self._shared_output_buffer
         with (
             graph_pool_capture_scope(),
             BreakableCUDAGraphCapture(
                 cuda_graph=graph,
                 pool=self._pool,
                 stream=self._capture_stream,
-                barrier_fn=self._tp_group.barrier,
             ),
         ):
             self._precarve.mint()
-            out = captured_fn()
-            out_rows = self._output_rows(out, size)
-            self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
+            if self._debug_eager:
+                # The whole forward runs as one eager break that writes the
+                # output buffer.
+                # The warmup ran the same forward, so its output gives the
+                # captured rows.
+                out_rows = self._output_rows(warmup_out, size)
 
-        stored = self._slice_output(self._shared_output_buffer, out_rows)
+                @eager_on_graph
+                def forward_into_buffer(output_buffer: Any) -> None:
+                    self._copy_output_to_buffer(forward_fn(), output_buffer, out_rows)
+
+                forward_into_buffer(buffer)
+            else:
+                out = forward_fn()
+                out_rows = self._output_rows(out, size)
+                self._copy_output_to_buffer(out, buffer, out_rows)
+
+        stored = self._slice_output(buffer, out_rows)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
@@ -235,8 +246,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     tensor, output_buffer.tensors[key], num_tokens
                 )
             return
-        if isinstance(output, (list, tuple)) and isinstance(
-            output_buffer, type(output)
+        if (isinstance(output, list) and isinstance(output_buffer, list)) or (
+            isinstance(output, tuple) and isinstance(output_buffer, tuple)
         ):
             if len(output) != len(output_buffer):
                 raise ValueError(

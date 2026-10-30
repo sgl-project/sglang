@@ -10,6 +10,11 @@ This page focuses on optimal configuration and benchmark results for Qwen3-30B-A
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
+<Warning>
+{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
+The optimal configurations on this page are validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Use exactly this version; later versions are not covered by this page and may introduce breaking changes.
+</Warning>
+
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
@@ -105,8 +110,7 @@ python3 -m sglang.launch_server \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 8 \
     --tp-size 2 \
-    --enable-dp-attention \
-    --dp-size 2 \
+    --enable-dp-attention --dp-size 2 \
     --mem-fraction-static 0.85 \
     --cuda-graph-bs-decode 1 2 4 8 16 20 24 28 32 36 40 44 48 52 56 60 64 68 72 76 80 84 \
     --dtype bfloat16 \
@@ -129,8 +133,7 @@ python -m sglang.bench_serving \
     --random-input-len 1000 \
     --random-output-len 100 \
     --random-range-ratio 1 \
-    --seed 1 \
-    --max-attempts 4
+    --seed 1
 ```
 
 ### Qwen3-30B-A3B W8A8 1P IN3K5 OUT1K5 10ms
@@ -424,7 +427,6 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-attempts 5 \
     --max-concurrency 16 \
     --num-prompts 16 \
     --random-input-len 6144 \

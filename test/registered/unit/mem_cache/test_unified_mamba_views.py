@@ -11,8 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Round-trip correctness of ``UnifiedKVPool._build_mamba_views`` -- the
-envelope-strided conv/temporal (SSM) state views that back ``UnifiedMambaPool``.
+"""Round-trip correctness of ``MambaSubPoolSpec.views`` -- the
+envelope-strided conv/temporal (SSM) state views that back ``StateView``.
 Guards against garbled greedy decode from a stride/offset/alignment bug in the
 state views. CPU-only.
 
@@ -30,8 +30,9 @@ import unittest
 import torch
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
+from sglang.test.unified_allocator_fixtures import arena_of
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -44,19 +45,17 @@ def _make_pool(
     temporal_dtype,
     want_slots=8,
     device="cpu",
+    grow_direction="down",
 ):
-    """Minimal 2-sub-pool ``UnifiedKVPool`` sized to hold >= ``want_slots``
+    """Minimal 2-band arena sized to hold >= ``want_slots``
     Mamba slots; returns ``(pool, mamba_spec)``."""
-    from sglang.srt.mem_cache.unified_memory_pool import (
-        MambaSubPoolSpec,
-        MHASubPoolSpec,
-        UnifiedKVPool,
-    )
+    from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+    from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 
     mamba_spec = MambaSubPoolSpec(
         name="mamba",
         layer_num=mamba_layer_num,
-        grow_direction="down",
+        grow_direction=grow_direction,
         conv_state_shapes=tuple(tuple(s) for s in conv_state_shapes),
         conv_dtype=conv_dtype,
         temporal_state_shape=tuple(temporal_state_shape),
@@ -69,7 +68,7 @@ def _make_pool(
         head_num=1,
         head_dim=8,
         store_dtype=torch.bfloat16,
-        grow_direction="up",
+        grow_direction="down" if grow_direction == "up" else "up",
     )
     entry_mamba = mamba_spec.entry_bytes()
     entry_full = full_spec.entry_bytes()
@@ -78,7 +77,7 @@ def _make_pool(
     # multiple of 8 so bf16/fp32 ``.view()`` stays legal.
     total_bytes = want_slots * entry_mamba + 8 * entry_max
     total_bytes = ((total_bytes + 7) // 8) * 8
-    pool = UnifiedKVPool(
+    pool = arena_of(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, mamba_spec],
         device=device,
@@ -101,7 +100,7 @@ class TestUnifiedMambaViews(unittest.TestCase):
         """Write a distinct random tensor to every view, then read all of them
         back: writing all first makes any envelope overlap corrupt an earlier
         write."""
-        conv_views, temporal_view = pool.mamba_views_for("mamba")
+        conv_views, temporal_view = pool.spec("mamba").views(pool)
         torch.manual_seed(0)
         refs = []
         for v in conv_views:
@@ -173,11 +172,11 @@ class TestUnifiedMambaViews(unittest.TestCase):
         """Zero buffer; write a sentinel to ONE view; every OTHER view must read
         all-zero. Pinpoints conv[i]/conv[j]/temporal aliasing if present."""
         pool, spec = _make_pool(**self.FALCON_KW)
-        conv_views, temporal_view = pool.mamba_views_for("mamba")
+        conv_views, temporal_view = pool.spec("mamba").views(pool)
         views = list(conv_views) + [temporal_view]
         names = [f"conv[{i}]" for i in range(len(conv_views))] + ["temporal"]
         for target in range(len(views)):
-            pool._raw.zero_()
+            pool.raw.zero_()
             views[target].fill_(7.0)
             for other in range(len(views)):
                 if other == target:
@@ -196,15 +195,16 @@ class TestUnifiedMambaViews(unittest.TestCase):
         """A per-slot entry that is not a multiple of the temporal itemsize would
         mis-offset the view and must trip the alignment assert; either guard can
         fire first, so match on the shared "misaligned" wording."""
+        pool, spec = _make_pool(
+            mamba_layer_num=1,  # entry = 2 B conv + 4 B temporal = 6 B, not %4
+            conv_state_shapes=[(1, 1)],
+            conv_dtype=torch.bfloat16,
+            temporal_state_shape=(1,),
+            temporal_dtype=torch.float32,
+            want_slots=4,
+        )
         with self.assertRaises(AssertionError) as cm:
-            _make_pool(
-                mamba_layer_num=1,  # entry = 2 B conv + 4 B temporal = 6 B, not %4
-                conv_state_shapes=[(1, 1)],
-                conv_dtype=torch.bfloat16,
-                temporal_state_shape=(1,),
-                temporal_dtype=torch.float32,
-                want_slots=4,
-            )
+            spec.views(pool)
         self.assertIn("misalign", str(cm.exception).lower())
 
 
@@ -249,8 +249,8 @@ class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
     def _build_kda_views(heads_per_rank: int = 12):
         """Real K3 KDA envelope views on CPU for one attn-TP shard; 2 slots
         suffice, the per-slot geometry is slot-count independent."""
-        from sglang.srt.mem_cache.layout.page_major import (
-            build_page_major_mamba_views,
+        from sglang.srt.mem_cache.layout.token_major import (
+            build_mamba_entry_views,
             mamba_entry_bytes,
         )
 
@@ -258,9 +258,7 @@ class TestKDAFlashInferEnvelopeStateContract(unittest.TestCase):
         entry_bytes = mamba_entry_bytes(**geom)
         max_slots = 2
         raw = torch.empty(max_slots * entry_bytes, dtype=torch.uint8, device="cpu")
-        _, temporal_view = build_page_major_mamba_views(
-            raw, max_slots=max_slots, **geom
-        )
+        _, temporal_view = build_mamba_entry_views(raw, max_slots=max_slots, **geom)
         return geom, entry_bytes, temporal_view
 
     def test_k3_tp8_envelope_view_matches_recurrent_kda_contract(self):

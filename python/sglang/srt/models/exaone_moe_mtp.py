@@ -45,7 +45,6 @@ class ExaoneMoEForCausalLMMTP(ExaoneMoEForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         config.num_hidden_layers = 1
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 
