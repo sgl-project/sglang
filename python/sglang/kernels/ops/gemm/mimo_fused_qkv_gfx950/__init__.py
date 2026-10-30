@@ -10,12 +10,17 @@ import torch
 from sglang.kernels.ops.moe.smallm_moe_gfx950 import _check, _hip_lib, _hipcc, _Kernel
 
 _SRC = os.path.join(os.path.dirname(__file__), "smallm_fp8_blockscale_gemm.hip")
-# (N, K) -> (max M, N tiles/block, K steps/wave, waves), first match wins.
+# (N, K) -> (max M, M tiles/block, N tiles/block, K steps/wave, waves),
+# first match wins. Multiple blocks cover M when it exceeds the per-block tile.
 SHAPES = {
-    (3392, 6144): ((16, 2, 6, 16),),
-    (5120, 4096): ((32, 2, 4, 16),),
-    (4608, 4096): ((32, 2, 4, 16),),
-    (4096, 2048): ((8, 1, 4, 8), (16, 1, 2, 16), (32, 1, 4, 8)),
+    (3392, 6144): ((32, 1, 2, 6, 16),),
+    (5120, 4096): ((32, 2, 2, 4, 16),),
+    (4608, 4096): ((32, 2, 2, 4, 16),),
+    (4096, 2048): (
+        (8, 1, 1, 4, 8),
+        (16, 1, 1, 2, 16),
+        (32, 2, 1, 4, 8),
+    ),
 }
 _mod = None
 _fns = {}
@@ -57,7 +62,7 @@ def try_smallm_fp8_bs_linear(x, WQ, w_scale):
             _mod = False
             print(f"[smallm_fp8_bs] disabled: {e}", flush=True)
             return None
-    key = ((M + 15) // 16, *cfg)
+    key = tuple(cfg)
     hip, fn = _hip_lib(), _fns.get(key)
     if fn is None:
         fn = _fns[key] = _Kernel(_mod, "smallm_fp8_bs_m{}_n{}_s{}_w{}".format(*key)).fn
@@ -65,7 +70,11 @@ def try_smallm_fp8_bs_linear(x, WQ, w_scale):
     args = Args(*(t.data_ptr() for t in (x, WQ, w_scale, out)), M, N, x.stride(0))
     params = (ctypes.c_void_p * 1)(ctypes.addressof(args))
     stream = torch.cuda.current_stream().cuda_stream
-    grid, block = N // (16 * key[1]), 64 * key[3]
-    rc = hip.hipModuleLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, stream, params, None)
+    grid_x = N // (16 * key[1])
+    grid_y = (M + 16 * key[0] - 1) // (16 * key[0])
+    block = 64 * key[3]
+    rc = hip.hipModuleLaunchKernel(
+        fn, grid_x, grid_y, 1, block, 1, 1, 0, stream, params, None
+    )
     _check(rc, "launch")
     return out

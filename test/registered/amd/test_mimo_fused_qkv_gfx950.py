@@ -9,11 +9,11 @@ from sglang.srt.layers.quantization import fp8_utils
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 N = 3392
 K = 6144
-MS = (1, 2, 4, 8, 16)
+MS = (1, 2, 4, 8, 16, 32)
 
 
 def _input(m):
@@ -87,12 +87,12 @@ class TestMiMoMonoQKVGfx950(CustomTestCase):
             )
         self.assertIsNone(
             mono.try_smallm_fp8_bs_linear(
-                _input(17), self.weight, self.weight_scale
+                _input(33), self.weight, self.weight_scale
             )
         )
 
     def test_graph_replay_matches_eager(self):
-        x = _input(4)
+        x = _input(32)
         eager = mono.try_smallm_fp8_bs_linear(
             x, self.weight, self.weight_scale
         )

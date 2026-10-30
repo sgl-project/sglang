@@ -33,11 +33,12 @@ __device__ __forceinline__ void gemm_body(const Args& a) {
     __shared__ float s_red[WAVES][OUT];
     const int lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
     const int nb = blockIdx.x * NT, k0 = wave * 64 * STEPS, kb0 = k0 / 128;
+    const int m0 = blockIdx.y * MT * 16;
     const int row = lane & 15, kc = (lane >> 4) * 16;
 
     u32x4 xr[MT][STEPS][2];  // 16 bf16 per lane per step
     for (int mt = 0; mt < MT; ++mt) {
-        const int m = mt * 16 + row;
+        const int m = m0 + mt * 16 + row;
         const uint16_t* xp = a.x + (size_t)m * a.lda + k0 + kc;
         for (int s = 0; s < STEPS; ++s)
             for (int h = 0; h < 2; ++h)
@@ -92,7 +93,7 @@ __device__ __forceinline__ void gemm_body(const Args& a) {
             for (int r = 0; r < 4; ++r) s_red[wave][t * TILE + (mt * 4 + r) * 64 + lane] = acc[t][mt][r];
     __syncthreads();
     for (int e = threadIdx.x; e < OUT; e += WAVES * 64) {
-        const int m = ((e % TILE) >> 8) * 16 + ((e & 63) >> 4) * 4 + ((e >> 6) & 3);
+        const int m = m0 + ((e % TILE) >> 8) * 16 + ((e & 63) >> 4) * 4 + ((e >> 6) & 3);
         if (m >= a.M) continue;
         float v = 0.f;
         for (int w = 0; w < WAVES; ++w) v += s_red[w][e];
@@ -110,4 +111,4 @@ SMALLM_FP8_BS(1, 1, 4, 8)   // K = 2048, M <= 8
 SMALLM_FP8_BS(1, 1, 2, 16)  // K = 2048, 9 <= M <= 16
 SMALLM_FP8_BS(2, 1, 4, 8)   // K = 2048, 17 <= M <= 32
 
-SMALLM_FP8_BS(1, 2, 6, 16)  // MiMo-V2.6 TP8 K = 6144, M <= 16
+SMALLM_FP8_BS(1, 2, 6, 16)  // MiMo-V2.6 TP8 K = 6144, 16-row blocks through M <= 32
