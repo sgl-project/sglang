@@ -391,6 +391,9 @@ class Mxfp4Config(QuantizationConfig):
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
+    # Set in __init__; methods built with __new__ stay on the non-Humming paths.
+    use_humming = False
+
     def __init__(
         self,
         prefix: str,
