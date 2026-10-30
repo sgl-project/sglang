@@ -3913,6 +3913,8 @@ class Scheduler(
             )
             req.pending_bootstrap = False
         self._release_aborted_request(req)
+        # No member rows exist before the leader's prefill ends.
+        self.beam_coordinator.retire_group(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None
