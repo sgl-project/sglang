@@ -182,6 +182,20 @@ def resolve_model_overlay_target(
     return None
 
 
+def is_model_overlay(model_name_or_path: str) -> bool:
+    """A registered overlay source id, or a local overlay dir (no network).
+
+    Unlike ``resolve_model_overlay_target``, a local dir is not matched to a
+    registered source by its basename: only its own overlay manifest counts.
+    """
+    if resolve_model_overlay(model_name_or_path) is not None:
+        return True
+    return (
+        os.path.isdir(model_name_or_path)
+        and load_overlay_manifest_if_present(model_name_or_path) is not None
+    )
+
+
 def load_overlay_manifest_if_present(overlay_dir: str) -> dict[str, Any] | None:
     overlay_manifest_path = os.path.join(
         overlay_dir, "_overlay", "overlay_manifest.json"
