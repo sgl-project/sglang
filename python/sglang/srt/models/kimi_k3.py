@@ -203,6 +203,31 @@ def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
     )
 
 
+def _refresh_replicated_q_proj(self_attn: DeepseekV2AttentionMLA) -> None:
+    """Re-gather the full-head q_b_proj and w_kc that --dcp-replicate-q-proj
+    keeps (gathered once by the model runner) from this rank's current shards,
+    in place: captured CUDA graphs hold them."""
+    dcp_group = get_parallel().dcp_group
+    q_proj = self_attn.q_b_proj if self_attn.has_q_b_proj else self_attn.q_proj
+    self_attn.w_kc_qrep = bind_or_assign(
+        self_attn.w_kc_qrep,
+        dcp_group.all_gather(self_attn.w_kc.contiguous(), dim=0),
+    )
+    if self_attn.q_b_proj_qrep_weight is not None:
+        self_attn.q_b_proj_qrep_weight = bind_or_assign(
+            self_attn.q_b_proj_qrep_weight,
+            dcp_group.all_gather(q_proj.weight.data, dim=0),
+        )
+    if self_attn.q_b_proj_qrep is not None:
+        from sglang.srt.model_executor.model_runner import _gather_block_fp8_linear
+
+        # Gathered and post-processed as at startup, then copied into the
+        # replica the forward reads.
+        replica = _gather_block_fp8_linear(q_proj, dcp_group)
+        for name, param in replica.named_parameters():
+            self_attn.q_b_proj_qrep.get_parameter(name).data.copy_(param.data)
+
+
 def _k3_bf16_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -3376,6 +3401,11 @@ class KimiK3LinearForCausalLM(nn.Module):
             if weight_names is None
             else {get_layer_id(name) for name in weight_names} - {None}
         )
+        attention_layer_ids = (
+            None
+            if weight_names is None
+            else {get_layer_id(name) for name in weight_names if ".self_attn." in name}
+        )
         layers = {
             layer_id: layer
             for layer_id, layer in enumerate(self.model.layers)
@@ -3438,6 +3468,12 @@ class KimiK3LinearForCausalLM(nn.Module):
                 # .data: a Parameter would register under w_scale and hide
                 # kv_b_proj.weight_scale from named_parameters(), so from updates.
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale.data
+            # None until the model runner gathers it after the first load. Every
+            # DCP rank loads the same attention weights, so the gathers line up.
+            if self_attn.w_kc_qrep is not None and (
+                attention_layer_ids is None or layer_id in attention_layer_ids
+            ):
+                _refresh_replicated_q_proj(self_attn)
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the
