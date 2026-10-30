@@ -5,10 +5,16 @@ one with prefill graphs disabled (eager CP) for live chunk lengths that sit on
 a capture bucket, one below it, lengths not divisible by the CP size, and short
 uncached suffixes (1-16 tokens) that pad every rank to the minimum local shard, and
 checks (i) greedy tokens / prompt logprobs agree, (ii) the captured path was
-taken for lengths under the capture cap, and (iii) KV rows of a neighbouring
-cached request are untouched (radix-cache canary: a request whose KV slots are
-allocated next to the probe is replayed from cache afterwards and must
-reproduce its logprobs).
+taken for lengths under the capture cap (and not taken for chunks too short to
+activate CP), (iii) KV rows of a neighbouring cached request are untouched
+(radix-cache canary: a request whose KV slots are allocated next to the probe
+is replayed from cache afterwards and must reproduce its logprobs), and (iv)
+each short chunk is causally consistent with the PREFIX_REF_LENGTH-token chunk
+on the same server: its prompt logprobs must equal the first L-1 logprobs of
+the longer prompt that shares its prefix. (iv) is the check with teeth for the
+RoPE-position fault: it is a per-server property, so it also catches an eager
+CP path that is wrong in the same way as graph replay (graphs-on vs eager then
+agree and (i) passes).
 """
 
 import json
@@ -42,6 +48,16 @@ LOGPROB_TOL = 0.1
 # bracket it. Then bucket-exact, bucket-1 and not divisible by the CP size.
 LENGTHS = (1, 2, 3, 4, 5, 8, 16, 100, 127, 128, 333, 511, 512, 1001)
 MAX_NEW_TOKENS = 16
+# Causal self-consistency reference: every length <= PREFIX_REF_LENGTH shares
+# its prefix with the PREFIX_REF_LENGTH-token probe and sits in the same
+# (minimum) capture bucket, so prompt logprobs must match to within kernel
+# noise; the position fault moves them by O(1) nat (3.7 at length 4 on the
+# pre-fix tree). Longer lengths cross bucket regimes and are not compared.
+# Chunks shorter than attn_cp_size leave ranks without live tokens; eager CP
+# on main is already off by 0.2-1.0 nat there (independent of this PR), so
+# they are excluded until that is fixed upstream.
+PREFIX_REF_LENGTH = 16
+PREFIX_TOL = 0.05
 # Canary: natural text (low-entropy greedy continuation) so a prefix-cache
 # replay reproduces the output unless its KV rows were overwritten. The replay
 # runs a 64-token extend over cached rows instead of a full prefill, so it is
@@ -208,12 +224,17 @@ class TestDsaCpBcgBoundaryCP4(CustomTestCase):
             probe = self._generate(self._prompt(length), MAX_NEW_TOKENS)
             graph_passes = self._prefill_graph_passes() - before
             self.assertEqual(probe["meta_info"]["prompt_tokens"], length)
-            if prefill_graphs and length <= CAPTURE_CAP:
+            if prefill_graphs and self.attn_cp_size <= length <= CAPTURE_CAP:
                 self.assertGreater(
                     graph_passes, 0, f"length={length}: eager fallback, no graph pass"
                 )
-            elif not prefill_graphs:
-                self.assertEqual(graph_passes, 0, f"length={length}")
+            else:
+                # Eager server, or a chunk too short to activate CP (fewer
+                # tokens than ranks): the runner must not replay a body
+                # captured with CP-local rows.
+                self.assertEqual(
+                    graph_passes, 0, f"length={length}: unexpected graph pass"
+                )
             # Replay the canary from the radix cache: every cached KV row is
             # read again, so a pad-row write into its slots changes the result.
             canary_hit = self._generate(
@@ -253,7 +274,29 @@ class TestDsaCpBcgBoundaryCP4(CustomTestCase):
                 f"canary_rows={rows[length]['canary_rows']} "
                 f"canary_max_delta={canary_delta:.4g} canary_same={canary_same}/{n}"
             )
+        self._check_prefix_consistency(rows, prefill_graphs)
         return rows
+
+    def _check_prefix_consistency(self, rows, prefill_graphs: bool):
+        """Prompt logprobs of each short chunk must equal the matching prefix
+        of the PREFIX_REF_LENGTH-token chunk run on the same server."""
+        ref = rows[PREFIX_REF_LENGTH]["prompt_logprobs"]
+        for length in LENGTHS:
+            if not self.attn_cp_size <= length < PREFIX_REF_LENGTH:
+                continue
+            got = rows[length]["prompt_logprobs"]
+            delta = self._max_delta(got, ref[: len(got)])
+            rows[length]["prefix_max_delta"] = delta
+            print(
+                f"cp={self.attn_cp_size} graphs={'on' if prefill_graphs else 'off'} "
+                f"length={length} prefix_max_delta_vs_{PREFIX_REF_LENGTH}={delta:.4g}"
+            )
+            self.assertLessEqual(
+                delta,
+                PREFIX_TOL,
+                f"length={length}: prompt logprobs differ from the "
+                f"{PREFIX_REF_LENGTH}-token prefix (wrong RoPE positions?)",
+            )
 
     def test_graphs_on_vs_eager_cp(self):
         self._launch(prefill_graphs=True)
@@ -283,6 +326,8 @@ class TestDsaCpBcgBoundaryCP4(CustomTestCase):
                 "canary_max_delta_off": b["canary_max_delta"],
                 "canary_same_tokens_on": a["canary_same_tokens"],
                 "canary_same_tokens_off": b["canary_same_tokens"],
+                "prefix_max_delta_on": a.get("prefix_max_delta"),
+                "prefix_max_delta_off": b.get("prefix_max_delta"),
             }
             print(f"summary length={length}: {summary[length]}")
             self.assertLessEqual(prompt_delta, LOGPROB_TOL, f"length={length}")
