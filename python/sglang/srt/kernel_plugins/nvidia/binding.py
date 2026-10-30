@@ -57,8 +57,8 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
-    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
         HybridLinearAttnBackend,
     )
@@ -295,7 +295,9 @@ class ForwardView:
             self._swa_out_cache_loc = lambda: backend.get_swa_out_cache_loc
             self._low_ratio_sources = lambda: backend.forward_low_ratio_sources
             self._core_compressor = lambda: backend.forward_core_compressor
-            self._use_fused_topk = lambda: bool(getattr(backend, "use_fused_topk", False))
+            self._use_fused_topk = lambda: bool(
+                getattr(backend, "use_fused_topk", False)
+            )
             self.metadata = backend.forward_metadata
             self.kv_pool = KvPoolView(backend.token_to_kv_pool, seal_cache)
 
@@ -1168,7 +1170,7 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
 
 class _InstalledMegakernel(msgspec.Struct, frozen=True):
     built: BuiltMegakernel
-    binding: MegakernelBinding
+    binding: Any
     prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]]
 
 
@@ -1477,9 +1479,12 @@ class _Dispatch:
                 return self.original(
                     input_ids, positions, forward_batch, *args, **kwargs
                 )
-            view = self.binding.forward_view(forward_batch)
-            if capturing:
-                self.binding.seal_capture_view(forward_batch, view)
+            if isinstance(self.binding, MegakernelBinding):
+                view = self.binding.forward_view(forward_batch)
+                if capturing:
+                    self.binding.seal_capture_view(forward_batch, view)
+            else:
+                view = self.binding.forward_view()
             return self.built.forward(
                 msgspec.structs.replace(step, view=view),
                 self.original,
@@ -1512,7 +1517,8 @@ class _CaptureCheck:
         if self.is_done or not set(runner.capture_bs) <= set(captured):
             return
         self.is_done = True
-        self.dispatch.binding.seal_capture_buffers(runner)
+        if isinstance(self.dispatch.binding, MegakernelBinding):
+            self.dispatch.binding.seal_capture_buffers(runner)
         self.dispatch.binding.assert_live()
         routed = sorted(bs for bs, step in captured.items() if step is not None)
         if not routed:
