@@ -462,13 +462,13 @@ def init_threads_binding(
     if omp_cpuids == "all":
         assert world_size <= n_node, (
             f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
-            f"the total number of ranks (dp_size * tp_size * pp_size = {world_size}) should be smaller than or equal to number of numa/CBB nodes on the machine {n_node}. "
+            f"the total number of ranks (dp_size * tp_size * pp_size = {world_size}) should be smaller than or equal to number of numa/CBB nodes on the machine ({n_node}). "
             f"If you need more ranks than the number of numa/CBB nodes, please set the CPU cores for each rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
             f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
-            f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
+            f"it is suggested to use --tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
             f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
-            f"If you do need more ranks than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
-            f"If you don't want each rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
+            f"If you do need more ranks than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with --tp 4. "
+            f"If you don't want each rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with --tp 2."
         )
         if world_size < n_node:
             logger.warning(
