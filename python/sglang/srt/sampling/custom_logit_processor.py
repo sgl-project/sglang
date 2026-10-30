@@ -73,7 +73,7 @@ def supports_sampling_mask(serialized_processor: str) -> bool:
         return False
 
 
-def _open_thinking_start(ids: list[int], start_id: int, end_id: int) -> int:
+def _open_thinking_start(ids, start_id: int, end_id: int) -> int:
     """Return the index of the start token of the currently open thinking block, or -1."""
     for idx in reversed(range(len(ids))):
         if ids[idx] == start_id:
@@ -81,6 +81,25 @@ def _open_thinking_start(ids: list[int], start_id: int, end_id: int) -> int:
         if ids[idx] == end_id:
             return -1
     return -1
+
+
+def _open_thinking_tokens_after_start(
+    origin_input_ids,
+    output_ids,
+    start_id: int,
+    end_id: int,
+) -> int:
+    """Return the number of tokens after the currently open thinking start token, or -1."""
+    for idx in reversed(range(len(output_ids))):
+        token_id = output_ids[idx]
+        if token_id == start_id:
+            return len(output_ids) - idx - 1
+        if token_id == end_id:
+            return -1
+    in_idx = _open_thinking_start(origin_input_ids, start_id, end_id)
+    if in_idx < 0:
+        return -1
+    return len(origin_input_ids) + len(output_ids) - in_idx - 1
 
 
 class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
@@ -102,24 +121,22 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
             # Skip if thinking_budget is unset, or not an integer, or negative
             if (
                 thinking_budget is None
+                or isinstance(thinking_budget, bool)
                 or not isinstance(thinking_budget, int)
                 or thinking_budget < 0
             ):
                 continue
             req: Req = param_dict.get("__req__")
-            cur_ids: list[int] = [*req.origin_input_ids, *req.output_ids]
-
-            # Check if out of thinking stage
-            start_index = _open_thinking_start(
-                cur_ids, self.THINKING_START_TOKEN_ID, self.THINKING_END_TOKEN_ID
-            )
-            if start_index < 0:
+            if req is None:
                 continue
 
-            # Count the number of tokens after the thinking start token
-            num_tokens_after_start = len(cur_ids) - start_index - 1
-
-            if num_tokens_after_start < thinking_budget:
+            num_tokens_after_start = _open_thinking_tokens_after_start(
+                req.origin_input_ids,
+                req.output_ids,
+                self.THINKING_START_TOKEN_ID,
+                self.THINKING_END_TOKEN_ID,
+            )
+            if num_tokens_after_start < 0 or num_tokens_after_start < thinking_budget:
                 continue
 
             # Ensure new line token before thinking end token

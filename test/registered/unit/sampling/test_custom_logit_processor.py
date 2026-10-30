@@ -222,6 +222,24 @@ class TestThinkingBudgetLogitProcessor(CustomTestCase):
         result = self.processor(logits, params)
         self.assertTrue(torch.equal(result, original))
 
+    def test_skips_when_budget_is_bool(self):
+        """Test that boolean thinking_budget values are rejected rather than treated as 0/1."""
+        req = _make_req(origin_input_ids=[self.START], output_ids=[100] * 10)
+        for budget in (False, True):
+            params = [{"thinking_budget": budget, "__req__": req}]
+            logits = self._logits()
+            original = logits.clone()
+            result = self.processor(logits, params)
+            self.assertTrue(torch.equal(result, original))
+
+    def test_skips_when_req_is_none(self):
+        """Test that missing __req__ is skipped without raising AttributeError."""
+        params = [{"thinking_budget": 0}]
+        logits = self._logits()
+        original = logits.clone()
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
     def test_none_params_returns_unchanged(self):
         """Test that passing None as param list returns logits unchanged."""
         logits = self._logits()
