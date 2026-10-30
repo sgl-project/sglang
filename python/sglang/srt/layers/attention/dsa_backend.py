@@ -25,7 +25,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
-    get_schedule,
     get_spec,
 )
 
@@ -431,7 +430,6 @@ def _validate_flashmla_sparse_q8_backend(
     qk_rope_head_dim: int,
     device_sm_major: int,
     hisparse_enabled: bool = False,
-    mixed_chunk_enabled: bool = False,
 ) -> None:
     # flashmla_sparse_q8 casts q and KV to fp8 per call, so the KV cache may be
     # bfloat16 or fp8_e4m3.
@@ -465,16 +463,6 @@ def _validate_flashmla_sparse_q8_backend(
             raise ValueError(
                 "--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute "
                 f"capability sm_{device_sm_major}x."
-            )
-        # A mixed batch takes the PAGED top-k transform, which belongs to the
-        # bf16 kernel. forward_extend refuses it, but the flag is readable here,
-        # so the refusal belongs at launch rather than on the first mixed batch
-        # formed under load.
-        if mixed_chunk_enabled:
-            raise ValueError(
-                "--dsa-prefill-backend flashmla_sparse_q8 does not support "
-                "--enable-mixed-chunk: q8 prefill runs on RAGGED extend batches "
-                "only."
             )
         # The q8 route hands top-k to the kernel as ragged ids and never binds the
         # page table HiSparse would translate, so the two cannot be combined.
@@ -710,7 +698,6 @@ class DeepseekSparseAttnBackend(
             qk_rope_head_dim=self.qk_rope_head_dim,
             device_sm_major=self.device_sm_major,
             hisparse_enabled=self.hisparse_coordinator is not None,
-            mixed_chunk_enabled=get_schedule().enable_mixed_chunk,
         )
 
         if self.dsa_prefill_impl == "triton_sparse_mla":
@@ -2310,10 +2297,10 @@ class DeepseekSparseAttnBackend(
             and topk_transform_method != TopkTransformMethod.RAGGED
         ):
             raise NotImplementedError(
-                "--dsa-prefill-backend flashmla_sparse_q8 supports EXTEND prefill "
-                f"batches only; got forward_mode={forward_batch.forward_mode.name} "
+                "--dsa-prefill-backend flashmla_sparse_q8 supports EXTEND and MIXED "
+                f"prefill batches only; got forward_mode={forward_batch.forward_mode.name} "
                 "(SPLIT_PREFILL under --enable-pdmux, or DLLM_EXTEND under "
-                "--dllm-algorithm; --enable-mixed-chunk is rejected at launch)."
+                "--dllm-algorithm)."
             )
 
         if self.use_fused_topk:
@@ -2951,8 +2938,9 @@ class DeepseekSparseAttnBackend(
         """
         if self.dsa_prefill_impl != "flashmla_sparse_q8":
             return False
-        # RAGGED routing requires exactly EXTEND (excludes decode/idle, MIXED,
-        # target-verify and draft-extend, which use dsa_decode_impl anyway).
+        # Born-fp8 q is EXTEND-only. MIXED routes RAGGED as well but stays on
+        # the bf16-q hand-off (the helper casts); decode/idle, target-verify and
+        # draft-extend use dsa_decode_impl.
         if forward_batch.forward_mode != ForwardMode.EXTEND:
             return False
         # Per-batch dense fallback (il <= threshold) reads bf16 q directly.
@@ -4253,7 +4241,9 @@ class DeepseekSparseAttnBackend(
             # dequantizes inside the RAGGED branch and its kernel is bf16-only.
             and self.dsa_prefill_impl
             in ("flashmla_sparse", "flashmla_sparse_q8", "triton_sparse_mla")
-            and forward_mode == ForwardMode.EXTEND
+            # MIXED matches EXTEND: the prefill graph runner builds metadata from
+            # MIXED but replays EXTEND graphs.
+            and forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
         else:
