@@ -210,6 +210,7 @@ def _attach_core(processor, strategy):
     core.strategy = strategy
     core.mm_processor_executor = None
     core._worker_thread_device = None
+    core._video_preprocessing_device = None
     core.FEATURE_NAMES = sorted(strategy.mm_feature_fields)
     core.keep_mm_features_on_device = False
     processor._core = core
