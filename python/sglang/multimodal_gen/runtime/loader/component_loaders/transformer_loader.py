@@ -69,6 +69,18 @@ def _minimax_h3_adaln_cache_key_filter(name: str) -> bool:
     return ".adaln_proj.linear." not in name
 
 
+def _resolve_minimax_h3_adaln_variant(model_variant: str | None) -> str:
+    # FastH3 ships a single t2va-distilled partition and rejects an explicit
+    # --model-variant, so an unset variant must fall back to the default fl2va
+    # partition used for checkpoint selection.
+    variant = model_variant or "fl2va"
+    if variant not in ("fl2va", "ref2va"):
+        raise ValueError(
+            "MiniMax H3 AdaLN cache requires --model-variant fl2va or ref2va"
+        )
+    return variant
+
+
 def _default_quantized_attention_backend(
     quant_spec: TransformerQuantLoadSpec, server_args: ServerArgs
 ) -> AttentionBackendEnum | None:
@@ -433,14 +445,11 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 raise ValueError(
                     "--minimax-h3-adaln-cache-path is only supported by MiniMax H3"
                 )
-            if component_server_args.model_variant not in ("fl2va", "ref2va"):
-                raise ValueError(
-                    "MiniMax H3 AdaLN cache requires --model-variant fl2va or ref2va"
-                )
-            init_params["adaln_cache_path"] = adaln_cache_path
-            init_params["adaln_cache_model_variant"] = (
+            variant = _resolve_minimax_h3_adaln_variant(
                 component_server_args.model_variant
             )
+            init_params["adaln_cache_path"] = adaln_cache_path
+            init_params["adaln_cache_model_variant"] = variant
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
         if component_server_args.minimax_h3_adaln_online:
             if not is_minimax_h3:
