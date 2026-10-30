@@ -20,7 +20,7 @@ on:
         type: string
         default: main
   schedule:
-    - cron: "0 12 * * *"
+    - cron: "0 11 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.number || github.sha }}

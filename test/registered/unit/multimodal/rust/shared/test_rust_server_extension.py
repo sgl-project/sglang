@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 import unittest
 from array import array
 from contextlib import contextmanager
@@ -52,22 +53,37 @@ NO_EXTRAS = dict.fromkeys(
 
 def build_rust_frame_metadata_fixture() -> dict:
     """The headers `push_generation` and `push_abort` send for the weight-version,
-    media-count and decode-latency columns, and the `meta_info` keys Python's
-    TokenizerManager derives from the same values, with "launch" as the
-    server's weight version.
+    media-count, decode-latency and cached-token-split columns, and the
+    `meta_info` keys Python's TokenizerManager derives from the same values,
+    with "launch" as the server's weight version, plus the
+    `sglang:cached_tokens_total` increments by `cache_source` its metrics
+    collector records for each request of the cache-tier batches.
     Regenerate the fixture with ``json.dump(build_rust_frame_metadata_fixture(),
     f, indent=2)`` after changing either side."""
+    from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.srt.managers.io_struct import AbortReq
+    from sglang.srt.managers.scheduler_components.output_streamer import (
+        SchedulerOutputStreamer,
+    )
+    from sglang.srt.observability.metrics_collector import (
+        TokenizerMetricsCollector,
+    )
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
     from sglang.srt.utils.weight_versions import (
         WeightVersionSpan,
         add_weight_versions_to_meta_info,
     )
 
-    def meta_info(spans, completion_tokens, image=0, audio=0, video=0):
-        # TokenizerManager._handle_batch_output / _handle_abort_req.
+    def meta_info(
+        spans, completion_tokens, image=0, audio=0, video=0, *, cached=None, abort=False
+    ):
+        # TokenizerManager._handle_batch_output / _handle_abort_req; only the
+        # former reports the cached-token details.
         meta = {"weight_version": "launch"}
         if spans is not None:
             add_weight_versions_to_meta_info(meta, spans, completion_tokens)
+        if not abort:
+            meta["cached_tokens_details"] = cached
         for key, count in (
             ("image_tokens", image),
             ("audio_tokens", audio),
@@ -77,11 +93,19 @@ def build_rust_frame_metadata_fixture() -> dict:
                 meta[key] = count
         return meta
 
-    def push_generation(multimodal, decode_latencies, **columns):
+    def push_generation(
+        multimodal,
+        decode_latencies,
+        cached_tokens_split=None,
+        storage_backend=None,
+        **columns,
+    ):
         server = RustServer(Mock(), http_port=0)
         server._multimodal_enabled = multimodal
         payload = SimpleNamespace(**{**NO_EXTRAS, **columns})
-        server.push_generation(payload, decode_latencies)
+        server.push_generation(
+            payload, decode_latencies, cached_tokens_split, storage_backend
+        )
         header, data = server.server.push_decode_result_batch.call_args.args
         return {
             "header": header.hex(),
@@ -137,6 +161,112 @@ def build_rust_frame_metadata_fixture() -> dict:
         "logprobs": meta_info(single, 2),
         "plain": meta_info(None, 1),
     }
+
+    class HiCacheFile:
+        """Stands in for a storage backend, which the details name by type."""
+
+    def cache_batch(storage_attached, rows):
+        """A frame from a cache with a host tier and, when `storage_attached`,
+        a storage tier, whose `rows` map rid -> (cached_tokens, device, host,
+        storage)."""
+        with patch(
+            "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
+            return_value=SimpleNamespace(
+                enable_metrics=False, enable_request_time_stats_logging=False
+            ),
+        ):
+            streamer = SchedulerOutputStreamer(
+                send_to_detokenizer=None,
+                tree_cache=SimpleNamespace(
+                    cache_controller=SimpleNamespace(
+                        storage_backend=HiCacheFile() if storage_attached else None
+                    )
+                ),
+                server_args=SimpleNamespace(enable_lmcache=False),
+                is_generation=True,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                disaggregation_mode=DisaggregationMode.NULL,
+                skip_tokenizer_init=False,
+                enable_hicache_storage=lambda: storage_attached,
+            )
+        reqs = {
+            rid: SimpleNamespace(
+                cached_tokens=cached,
+                cached_tokens_device=device,
+                cached_tokens_host=host,
+                cached_tokens_storage=storage,
+            )
+            for rid, (cached, device, host, storage) in rows.items()
+        }
+        rids = list(reqs)
+        frame = push_generation(
+            False,
+            {},
+            rids=rids,
+            finished_reasons=[{"type": "length", "length": 1}] * len(rids),
+            prompt_tokens=[16] * len(rids),
+            output_ids=[array("q", [1])] * len(rids),
+            cached_tokens=[req.cached_tokens for req in reqs.values()],
+            reasoning_tokens=[0] * len(rids),
+            weight_versions=None,
+            cached_tokens_split=[
+                (
+                    req.cached_tokens_device,
+                    req.cached_tokens_host,
+                    req.cached_tokens_storage,
+                )
+                for req in reqs.values()
+            ],
+            storage_backend=(
+                streamer._get_storage_backend_type() if storage_attached else None
+            ),
+        )
+        details = {
+            rid: streamer.get_cached_tokens_details(req) for rid, req in reqs.items()
+        }
+        frame["meta_info"] = {
+            rid: meta_info(None, 1, cached=cached) for rid, cached in details.items()
+        }
+        frame["cached_tokens_total"] = {
+            rid: cached_tokens_total(reqs[rid].cached_tokens, cached)
+            for rid, cached in details.items()
+        }
+        return frame
+
+    def cached_tokens_total(cached_tokens, details):
+        # TokenizerMetricsCollector.observe_one_finished_request's increments.
+        collector = Mock()
+        counts = {}
+        collector.cached_tokens_total.labels.side_effect = lambda **labels: Mock(
+            inc=lambda value: counts.__setitem__(labels["cache_source"], value)
+        )
+        TokenizerMetricsCollector.observe_one_finished_request(
+            collector, {}, 16, 1, cached_tokens, 0.0, False, details
+        )
+        return counts
+
+    host_tier = cache_batch(
+        False,
+        {
+            "miss": (0, 0, 0, 0),
+            "device": (4, 4, 0, 0),
+            "host": (6, 2, 4, 0),
+            # A PD decode server's storage hit, reported by prefill.
+            "storage": (5, 1, 1, 3),
+            # A hit the scheduler did not split, and one it split short.
+            "unsplit": (3, 0, 0, 0),
+            "short": (5, 4, 0, 0),
+        },
+    )
+    storage_tier = cache_batch(
+        True,
+        {
+            "miss": (0, 0, 0, 0),
+            "device": (4, 4, 0, 0),
+            "storage": (8, 2, 2, 4),
+            "unsplit": (2, 0, 0, 0),
+        },
+    )
     # The scheduler's spans run past the three tokens the client received.
     aborted = [
         WeightVersionSpan(version="old", start=0, end=2),
@@ -149,10 +279,12 @@ def build_rust_frame_metadata_fixture() -> dict:
     return {
         "batch": batch,
         "logprob_batch": logprob_batch,
+        "host_tier": host_tier,
+        "storage_tier": storage_tier,
         "abort": {
             "header": abort_header.hex(),
             "completion_tokens": 3,
-            "meta_info": meta_info(aborted, 3),
+            "meta_info": meta_info(aborted, 3, abort=True),
         },
     }
 
@@ -301,9 +433,10 @@ def build_rust_customized_info_fixture() -> dict:
 
 
 @contextmanager
-def launch_context(server_cls):
+def launch_context(server_cls, cores=(None, None)):
     """Patch what `launch` reads so it runs as DP rank 1 of a two-rank node,
-    unpinned; yields the `_build_server_args` mock."""
+    with `cores` as the `(launch_cores, server_cores)` partition (unpinned by
+    default); yields the `_build_server_args` mock."""
     with (
         patch.object(
             server_module,
@@ -326,7 +459,7 @@ def launch_context(server_cls):
                 attn_cp_size=1,
             ),
         ),
-        patch.object(server_cls, "_partition_cores", return_value=(None, None)),
+        patch.object(server_cls, "_partition_cores", return_value=cores),
         patch.object(
             server_module,
             "get_mm",
@@ -490,7 +623,7 @@ class TestRustServerExtension(CustomTestCase):
         """An abort the scheduler sends outside the output stream becomes a
         one-request terminal batch in Rust mode, keeping the request's counts
         and marked as outside the stream; without the Rust server it still
-        goes to the tokenizer socket."""
+        goes to the tokenizer socket, with the request's detokenizer state released."""
         import msgspec
 
         from sglang.srt.managers.io_struct import AbortReq
@@ -501,7 +634,9 @@ class TestRustServerExtension(CustomTestCase):
         )
         abort = AbortReq(rid="r#1", abort_message="gone")
         server = RustServer(Mock(), http_port=30000)
-        scheduler = SimpleNamespace(rust_server=server, ipc_channels=Mock())
+        scheduler = SimpleNamespace(
+            rust_server=server, ipc_channels=Mock(), output_streamer=Mock()
+        )
         Scheduler.send_abort_output(scheduler, abort, req)
         header, cols = server.server.push_decode_result_batch.call_args.args
         self.assertEqual(
@@ -512,12 +647,14 @@ class TestRustServerExtension(CustomTestCase):
         )
         self.assertEqual(cols, [b""])
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        scheduler.output_streamer.release_detokenize_state.assert_not_called()
 
         scheduler.rust_server = None
         Scheduler.send_abort_output(scheduler, abort, req)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once_with(
             abort, req
         )
+        scheduler.output_streamer.release_detokenize_state.assert_called_once_with(req)
 
     def test_customized_info_goes_out_as_python_responses_render_it(self):
         """The egress sends customized_info as the JSON Python's responses
@@ -597,6 +734,49 @@ class TestRustServerExtension(CustomTestCase):
         )
         self.assertIs(instance.mm_spec, sentinel.spec)
         self.assertTrue(instance._multimodal_enabled)
+
+    @unittest.skipUnless(
+        hasattr(os, "sched_getaffinity") and len(os.sched_getaffinity(0)) >= 2,
+        "needs two CPUs",
+    )
+    def test_launch_confines_mm_threads_but_leaves_the_scheduler_unpinned(self):
+        """MM threads are created on the server cores, and the scheduler
+        thread gets its full mask back: pinned to the few reserved cores, it
+        waits out whatever else runs there, and every TP rank waits on it."""
+        full_mask = os.sched_getaffinity(0)
+        launch_core, *server_cores = sorted(full_mask)
+        extension = ModuleType("model_server")
+        extension.Server = Mock()
+        masks = {}
+
+        class ModelServer(RustServer):
+            @classmethod
+            def _load_extension(cls):
+                return extension
+
+            @classmethod
+            def _resolve_multimodal(cls, scheduler):
+                return None
+
+            def _start_multimodal(self, scheduler):
+                masks["mm"] = os.sched_getaffinity(0)
+
+        def launch():
+            # Affinity is per thread: launch on a thread of its own, as the
+            # scheduler's launch thread, so the test runner keeps its mask.
+            scheduler = SimpleNamespace(
+                model_config=SimpleNamespace(is_multimodal=True)
+            )
+            with launch_context(ModelServer, cores=([launch_core], server_cores)):
+                ModelServer.launch(scheduler)
+            masks["scheduler"] = os.sched_getaffinity(0)
+
+        thread = threading.Thread(target=launch)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(masks["mm"], set(server_cores))
+        self.assertEqual(masks["scheduler"], full_mask)
 
 
 if __name__ == "__main__":
