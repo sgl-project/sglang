@@ -8,7 +8,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
