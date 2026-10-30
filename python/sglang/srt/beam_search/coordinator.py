@@ -57,9 +57,9 @@ from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
     FINISH_LENGTH,
     FINISH_MATCHED_TOKEN,
+    BaseFinishReason,
     Req,
     ScheduleBatch,
 )
@@ -326,7 +326,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if group.retired:
             return
         if req.to_finish is not None:
-            self._abort_group(group)
+            self._abort_group(group, req.to_finish)
             return
         self._reclaim_orphans(group, up_to_tick)
         if group.commit_pending(up_to_tick):
@@ -395,7 +395,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             # already mutated req_to_token, so the orphans are real either way.
             self._reclaim_orphans(group, batch.forward_iter)
             if req.to_finish is not None:
-                self._abort_group(group)
+                self._abort_group(group, req.to_finish)
                 newly_finished.add(id(group))
                 continue
             if group.commit_pending(batch.forward_iter):
@@ -493,16 +493,19 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         self._free_member_rows(group)
         self._retire_group(group)
 
-    def _abort_group(self, group: BeamGroup) -> None:
+    def _abort_group(self, group: BeamGroup, reason: BaseFinishReason) -> None:
         group.state = BeamGroupState.FINISHED
         group.final_results = []
         leader = group.leader
-        # The group takes over the leader's requested finish as its reason.
-        reason = leader.to_finish or FINISH_ABORT("Beam group aborted.")
         leader.clear_requested_finish()
         leader.finish_outside_step(reason)
         self._free_member_rows(group)
         self._retire_group(group)
+
+    def abort_group(self, leader: Req, reason: BaseFinishReason) -> None:
+        """End a running leader's group outside a commit (an abort): its
+        member rows go back and the leader finishes with ``reason``."""
+        self._abort_group(leader.beam_group, reason)
 
     def retire_group(self, req: Req) -> None:
         """Leader ended outside the commit path -- retracted, or aborted while

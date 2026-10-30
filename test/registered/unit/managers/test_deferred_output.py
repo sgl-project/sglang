@@ -15,6 +15,9 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.managers.scheduler_components.pending_finishes import (
+    PendingFinishes,
+)
 from sglang.srt.runtime_context import get_serving
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.weight_versions import (
@@ -221,6 +224,7 @@ def test_scheduler_polls_until_a_held_response_completes(state):
     scheduler = MagicMock()
     scheduler._deferred_responses = None
     scheduler.batch_result_processor.deferred_releases = {}
+    scheduler.pending_finishes = PendingFinishes()
     scheduler.output_streamer = _scheduler().output_streamer
     scheduler.stream_released_deferred_outputs = lambda: (
         Scheduler.stream_released_deferred_outputs(scheduler)

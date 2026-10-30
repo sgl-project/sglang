@@ -22,8 +22,11 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
 )
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pending_finishes import (
+    PendingFinishes,
+)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
@@ -87,6 +90,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.req_to_token_pool = MagicMock()
         scheduler.hisparse_coordinator = MagicMock()
         scheduler.result_queue = deque()
+        scheduler.pending_finishes = PendingFinishes()
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
@@ -383,6 +387,25 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertFalse(scheduler.running_batch.batch_is_full)
         self.assertIsNone(scheduler.chunked_req)
         self.assertIsNone(scheduler.last_batch)
+
+    def test_retract_hands_a_pending_finish_to_the_next_commit(self):
+        """A finish pending when a retract-mode pause retracts its request
+        rides along in to_finish, so the requeued request still ends with it."""
+        scheduler = self._new_scheduler()
+        aborted, kept = self._make_req("aborted"), self._make_req("kept")
+        scheduler.running_batch = self._make_batch(
+            scheduler, reqs=[aborted, kept], with_tensors=True
+        )
+        reason = FINISH_ABORT("Request running timeout reached.", 503)
+        scheduler.pending_finishes.add(aborted, reason)
+        requeue_log = self._spy_requeue(scheduler)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual([entry["req"] for entry in requeue_log], [aborted, kept])
+        self.assertIs(aborted.to_finish, reason)
+        self.assertIsNone(kept.to_finish)
+        self.assertFalse(scheduler.pending_finishes)
 
     def test_retract_after_dp_conversion_releases_each_req_once(self):
         """retract after DP attention converted the running batch to extend

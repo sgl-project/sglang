@@ -1584,10 +1584,10 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
 def is_unadmitted_reject(req: Req) -> bool:
     """A request rejected at intake, before it acquired anything.
 
-    A preempted or resumed request can also carry a pending abort -- "Abort
-    method 3" marks a *running* request and `filter_batch` does not drop it,
-    since `finished()` is still False -- and its queue owns the release of
-    whatever it still holds.
+    A preempted or resumed request can also carry a pending abort in
+    `to_finish` -- from a session replace, or a pending finish a retract-mode
+    pause handed over -- while `finished()` is still False, and its queue owns
+    the release of whatever it still holds.
 
     `req.is_retracted` catches the two re-entries that declare nothing:
     priority preemption and the pause/retract-all path both requeue through a

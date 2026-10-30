@@ -17,6 +17,9 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.pending_finishes import (  # noqa: E402
+    PendingFinishes,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -50,6 +53,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.result_queue = deque()
     sched.chunked_req = chunked_req
     sched._pending_chunked_abort_req = pending_req
+    sched.pending_finishes = PendingFinishes()
     sched.waiting_queue = []
     sched.dllm_config = None
     sched.grammar_manager = Mock()
@@ -74,7 +78,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
 
         sched.process_pending_chunked_abort()
 
-        self.assertIsNotNone(req.to_finish, "recorded abort was never applied")
+        self.assertEqual(sched.pending_finishes.reqs(), [req])
         self.assertIsNone(sched._pending_chunked_abort_req)
 
     def test_discarded_chunk_keeps_its_abort_reason(self):

@@ -216,6 +216,7 @@ class SchedulerMlxOverlapMixin:
                 break
 
             self.ingest_requests()
+            self.drain_pending_finishes()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue

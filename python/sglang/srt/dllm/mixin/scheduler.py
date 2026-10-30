@@ -104,6 +104,9 @@ class SchedulerDllmMixin:
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx in range(batch.batch_size()):
                 req = batch.reqs[idx]
+                if req.finished():
+                    # Finished outside the commit (an abort) with this step in flight.
+                    continue
 
                 if not fdfo_mode:
                     next_token_ids = result.next_token_ids[idx].tolist()
