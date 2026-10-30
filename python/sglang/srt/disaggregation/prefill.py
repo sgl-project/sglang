@@ -25,7 +25,7 @@ import time
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -318,6 +318,13 @@ class PrefillBootstrapQueue:
         self.pp_poll_send_window = PPSyncSendWindow(
             parallel.pp_size + parallel.pp_async_batch_depth
         )
+        # Retraction recomputes whose room's previous request has not been
+        # released yet; see add().
+        self.room_waiters = IndexedReqList(
+            ListKind.PD_ROOM_WAITERS,
+            abort=self._abort_room_waiters,
+            req_of=lambda waiter: waiter[0],
+        )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -552,8 +559,9 @@ class PrefillBootstrapQueue:
         )
 
     def add(self, req: Req, num_kv_heads: int) -> None:
-        """Queue a request for bootstrap, moving it out of the list it is in;
-        one refused at the door is finished and leaves for no list."""
+        """Queue a request for bootstrap, or among the room waiters, moving it
+        out of the list it is in; one refused at the door is finished and leaves
+        for no list."""
         # Rejected at intake: `set_finish_with_abort` left the verdict in
         # `to_finish`, which `finished()` does not read, and swapped the prompt
         # for a one-token stub. Bootstrapping it costs a handshake, a metadata
@@ -561,10 +569,43 @@ class PrefillBootstrapQueue:
         if is_unadmitted_reject(req):
             self.scheduler.request_retirer.retire_unadmitted(req)
             return
+        deferred = self.kv_manager.deferred_bootstrap
+        if (
+            deferred is not None
+            and req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+            and deferred.awaits_release(req.bootstrap_room)
+        ):
+            # Decode heard the previous request's Success from the transfer
+            # worker and recomputes before this side released the room. Every
+            # PP stage releases at the same loop iteration, so they agree.
+            move([(req, num_kv_heads)], self.room_waiters)
+            return
         if self._check_if_req_exceed_kv_capacity(req):
             return
         self.create_sender(req, num_kv_heads)
         move([req], self.queue)
+
+    def admit_room_waiters(self) -> None:
+        """Enqueue the waiting recomputes whose rooms have been released."""
+        if not self.room_waiters:
+            return
+        deferred = self.kv_manager.deferred_bootstrap
+        for req, num_kv_heads in list(self.room_waiters.items()):
+            if deferred.awaits_release(req.bootstrap_room):
+                continue
+            # A refused request is retired out of room_waiters.
+            if self._check_if_req_exceed_kv_capacity(req):
+                continue
+            self.create_sender(req, num_kv_heads)
+            move([req], self.queue)
+
+    def _abort_room_waiters(self, recv_req: AbortReq) -> None:
+        # Waiters have no sender yet and hold no KV.
+        for req in [r for r in self.room_waiters if recv_req.matches(r.rid)]:
+            logger.debug(f"Abort room-waiting request. {req.rid=}")
+            self.scheduler.request_retirer.abort(
+                req, finished_reason=recv_req.finished_reason
+            )
 
     def _abort(self, recv_req: AbortReq) -> None:
         for req in self.queue:
@@ -606,6 +647,8 @@ class PrefillBootstrapQueue:
         ``polls`` is a PP consensus poll of ``self.queue`` the caller already synced.
         """
 
+        if polls is None:
+            self.admit_room_waiters()
         bootstrapped_reqs = []
 
         if len(self.queue) == 0:
@@ -1604,6 +1647,8 @@ class SchedulerDisaggregationPrefillMixin:
         would halve that depth and tie the stages together again.
         """
         bootstrap_queue = self.disagg_prefill_bootstrap_queue
+        # Before the poll sections are fixed: the queue must match on every stage.
+        bootstrap_queue.admit_room_waiters()
         # A pending chunked_req resolves once parked: freeing it here would race
         # its earlier chunks still queued on the forward stream.
         waiting = [
