@@ -15,7 +15,7 @@ weights / distributed init needed).
 """
 
 import unittest
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -70,7 +70,6 @@ class TestViTPosEmbedInterpolate(CustomTestCase):
             for dtype in (torch.bfloat16, torch.float32):
                 stub = SimpleNamespace(
                     num_grid_per_side=int(NUM_POS**0.5),
-                    use_fp32_pos_embed_interpolation=False,
                     spatial_merge_size=MERGE,
                     num_position_embeddings=NUM_POS,
                     pos_embed=nn.Embedding(NUM_POS, HIDDEN).to(
@@ -86,139 +85,6 @@ class TestViTPosEmbedInterpolate(CustomTestCase):
                         M.fast_pos_embed_interpolate_vectorized,
                         grid,
                         f"qwen3_vl/{name}/{dtype}/{device.type}",
-                    )
-
-    def test_qwen3_vl_interpolation_accumulates_in_fp32(self):
-        from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel as M
-
-        for device in _devices():
-            for dtype in (torch.bfloat16, torch.float16):
-                with self.subTest(device=device, dtype=dtype):
-                    embedding = nn.Embedding(4, 1, device=device, dtype=dtype)
-                    embedding.weight.data.copy_(
-                        torch.tensor(
-                            [[1.0], [1.5], [2.0], [3.0]], device=device, dtype=dtype
-                        )
-                    )
-                    stub = SimpleNamespace(
-                        num_grid_per_side=2,
-                        use_fp32_pos_embed_interpolation=True,
-                        spatial_merge_size=2,
-                        pos_embed=embedding,
-                        dtype=dtype,
-                        device=device,
-                    )
-                    expected = (
-                        torch.nn.functional.interpolate(
-                            embedding.weight.float().reshape(1, 1, 2, 2),
-                            size=(4, 4),
-                            mode="bilinear",
-                            align_corners=True,
-                        )
-                        .reshape(2, 2, 2, 2)
-                        .permute(0, 2, 1, 3)
-                        .reshape(-1, 1)
-                        .to(dtype)
-                    )
-                    for method in (
-                        M.fast_pos_embed_interpolate_from_list,
-                        M.fast_pos_embed_interpolate_vectorized,
-                    ):
-                        actual = method(stub, [[1, 4, 4]])
-                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                    stub.align_corners = True
-                    for name in (
-                        "_get_interpolation_indices",
-                        "_calculate_indices_and_weights",
-                        "_get_position_embedding",
-                    ):
-                        setattr(stub, name, MethodType(getattr(M, name), stub))
-                    actual = M.fast_pos_embed_interpolate(
-                        stub, torch.tensor([[1, 4, 4]])
-                    )
-                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-    def test_qwen3_vl_default_preserves_upstream_rounding(self):
-        from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel as M
-
-        # Frozen output of the upstream BF16/FP16 interpolation path.
-        expected_values = {
-            torch.bfloat16: [
-                1.0,
-                1.171875,
-                1.3359375,
-                1.5625,
-                1.3359375,
-                1.5,
-                1.78125,
-                2.0,
-                1.671875,
-                1.9453125,
-                2.0,
-                2.34375,
-                2.21875,
-                2.5,
-                2.671875,
-                3.0,
-            ],
-            torch.float16: [
-                1.0,
-                1.166015625,
-                1.3330078125,
-                1.5546875,
-                1.3330078125,
-                1.5,
-                1.77734375,
-                2.0,
-                1.666015625,
-                1.9443359375,
-                2.0,
-                2.33203125,
-                2.22265625,
-                2.5,
-                2.666015625,
-                3.0,
-            ],
-        }
-        for device in _devices():
-            for dtype, values in expected_values.items():
-                with self.subTest(device=device, dtype=dtype):
-                    embedding = nn.Embedding(4, 1, device=device, dtype=dtype)
-                    embedding.weight.data.copy_(
-                        torch.tensor(
-                            [[1.0], [1.5], [2.0], [3.0]], device=device, dtype=dtype
-                        )
-                    )
-                    stub = SimpleNamespace(
-                        num_grid_per_side=2,
-                        spatial_merge_size=2,
-                        use_fp32_pos_embed_interpolation=False,
-                        pos_embed=embedding,
-                        dtype=dtype,
-                        device=device,
-                        align_corners=True,
-                    )
-                    expected = torch.tensor(values, device=device, dtype=dtype).reshape(
-                        -1, 1
-                    )
-                    for method in (
-                        M.fast_pos_embed_interpolate_from_list,
-                        M.fast_pos_embed_interpolate_vectorized,
-                    ):
-                        torch.testing.assert_close(
-                            method(stub, [[1, 4, 4]]), expected, rtol=0, atol=0
-                        )
-                    for name in (
-                        "_get_interpolation_indices",
-                        "_calculate_indices_and_weights",
-                        "_get_position_embedding",
-                    ):
-                        setattr(stub, name, MethodType(getattr(M, name), stub))
-                    torch.testing.assert_close(
-                        M.fast_pos_embed_interpolate(stub, torch.tensor([[1, 4, 4]])),
-                        expected,
-                        rtol=0,
-                        atol=0,
                     )
 
     def test_moss_vl_vectorized_matches_loop(self):

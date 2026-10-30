@@ -216,8 +216,6 @@ class SenseNovaLoopForConditionalGeneration(qwen3_5.Qwen3_5ForConditionalGenerat
             prefix=prefix,
             language_model_cls=SenseNovaLoopModel,
         )
-        if not self.language_model_only:
-            self.visual.use_fp32_pos_embed_interpolation = True
 
     def set_dflash_layers_to_capture(self, layer_ids):
         raise NotImplementedError(
