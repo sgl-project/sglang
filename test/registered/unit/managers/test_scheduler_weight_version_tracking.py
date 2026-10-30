@@ -298,6 +298,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
 
 def _runner(result=(True, "ok")):
     runner = Mock()
+    runner.weight_updater.get_model.return_value = torch.nn.Module()
     for method in (
         "update_weights_from_disk",
         "update_weights_from_tensor",
@@ -453,6 +454,23 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
 
 class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
+    def test_rejects_all_runners_before_restoring_any_derived_weights(self):
+        target, draft = _runner(), _runner()
+        draft.weight_updater.get_model.return_value._derived_weight_cache_error = (
+            "CP decode attention TP requires restart"
+        )
+        manager = self._manager(target, draft, session=False)
+        with patch(
+            "sglang.kernels.ops.gemm.bf16_fp32.hpc_bf16xfp32_gemm_enabled",
+            return_value=False,
+        ):
+            result = manager.begin_weight_update(BeginWeightUpdateReqInput())
+        self.assertFalse(result.success)
+        self.assertIn("CP decode attention TP", result.message)
+        self.assertIsNone(manager._session)
+        target.weight_updater.begin_weight_update.assert_not_called()
+        draft.weight_updater.begin_weight_update.assert_not_called()
+
     def test_distributed_update_receives_once_on_target_loads_into_each(self):
         """A draft runner that received its own broadcast would deadlock the update group."""
         target, draft = _runner(), _runner()
