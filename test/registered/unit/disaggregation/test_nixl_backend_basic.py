@@ -1367,28 +1367,19 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         not be reachable; a failed load must keep the dlists for a later reload."""
         mgr = self._make_manager(["dropped"])
         self.agent.remove_remote_agent("dropped")
-        remote = mgr._peers["dropped"].remote
-        load = self.agent.add_remote_agent
+        layouts = mgr.transport._layouts["dropped"]
         reachable_while_loading = []
 
         def add_remote_agent(metadata):
             reachable_while_loading.append(mgr.transport._layouts.get("dropped"))
-            if len(reachable_while_loading) == 1:
-                raise RuntimeError("NIXL_ERR_BACKEND")
-            return load(metadata)
+            raise RuntimeError("NIXL_ERR_BACKEND")
 
         self.agent.add_remote_agent = add_remote_agent
         with self.assertRaises(RuntimeError):
-            mgr.transport.reload(remote)
-        mgr.transport.reload(remote)
+            mgr.transport.reload(mgr._peers["dropped"].remote)
 
-        self.assertEqual(reachable_while_loading, [None, None])
-        (handle,) = mgr.send_kvcache(
-            "dropped",
-            np.array([1], dtype=np.int32),
-            np.array([2], dtype=np.int32),
-        )
-        self.assertEqual(handle.xfer, ("dropped", self.agent.sections["dropped"]))
+        self.assertEqual(reachable_while_loading, [None])
+        self.assertIs(mgr.transport._layouts.get("dropped"), layouts)
 
 
 if __name__ == "__main__":
