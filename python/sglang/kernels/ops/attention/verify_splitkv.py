@@ -27,8 +27,9 @@ Two Triton kernels:
 ``extend_attention_fwd``; it runs the split-KV path when it can serve the case
 bit-equivalently and returns True, otherwise returns False (doing nothing) so
 the caller falls back to ``extend_attention_fwd``. Supported case: causal
-(topk=1) verify with a constant per-sequence extend length, no sinks /
-sliding-window / logit-cap / xai-temperature. Correctness is never violated.
+(topk=1) verify with a constant per-sequence extend length, optionally with
+per-head attention sinks (gpt-oss); no sliding-window / logit-cap /
+xai-temperature. Correctness is never violated.
 """
 
 import torch
@@ -284,6 +285,7 @@ def _verify_combine_stage2(
     K_Extend,  # [extend_tokens, H_KV, D]
     V_Extend,  # [extend_tokens, H_KV, Dv]
     O_Out,  # [extend_tokens, H_Q, Dv]  (final, written)
+    Sinks,  # [H_Q] per-head sink logits (read only if HAS_SINK)
     sm_scale,
     qo_indptr,  # [BS+1] int32
     stride_ob,
@@ -308,6 +310,7 @@ def _verify_combine_stage2(
     V_HEAD_DIM: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
+    HAS_SINK: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -407,7 +410,13 @@ def _verify_combine_stage2(
     m = tl.maximum(lse_prefix, lse_draft)
     wp = tl.exp(lse_prefix - m)
     wd = tl.exp(lse_draft - m)
-    o = (o_prefix * wp[:, None] + o_draft * wd[:, None]) / (wp + wd)[:, None]
+    denom = wp + wd
+    if HAS_SINK:
+        # As in extend_attention_fwd: the sink adds exp(sink) to the softmax
+        # denominator and contributes no value.
+        sink = tl.load(Sinks + cur_head).to(tl.float32)
+        denom += tl.exp(sink - m)
+    o = (o_prefix * wp[:, None] + o_draft * wd[:, None]) / denom[:, None]
 
     offs_oo = (
         (cur_q_start + offs_l)[:, None] * stride_oobs
@@ -527,7 +536,7 @@ class VerifySplitKV:
         )
 
     def _run_combine_kernel(
-        self, bs, q_extend, k_extend, v_extend, o_out, qo_indptr, sm_scale
+        self, bs, q_extend, k_extend, v_extend, o_out, qo_indptr, sm_scale, sinks
     ):
         grid = (bs, self.h_q)
         _verify_combine_stage2[grid](
@@ -537,6 +546,7 @@ class VerifySplitKV:
             k_extend,
             v_extend,
             o_out,
+            sinks,
             sm_scale,
             qo_indptr,
             self.att_out.stride(0),
@@ -561,6 +571,7 @@ class VerifySplitKV:
             V_HEAD_DIM=self.v_head_dim,
             BLOCK_DMODEL=triton.next_power_of_2(self.head_dim),
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
+            HAS_SINK=sinks is not None,
             num_warps=1,
             num_stages=1,
         )
@@ -579,6 +590,7 @@ class VerifySplitKV:
         o_out=None,
         k_scale=1.0,
         v_scale=1.0,
+        sinks=None,
     ):
         if o_out is None:
             o_out = torch.empty(
@@ -602,7 +614,7 @@ class VerifySplitKV:
             k_scale,
             v_scale,
         )
-        # 2+3+4. fused combine + draft-draft + merge
+        # 2+3+4. fused combine + draft-draft + merge (+ sink)
         self._run_combine_kernel(
             bs,
             q_extend,
@@ -611,6 +623,7 @@ class VerifySplitKV:
             o_out,
             qo_indptr,
             sm_scale,
+            sinks,
         )
         return o_out
 
@@ -679,9 +692,7 @@ def can_handle(
     speculative topk == 1. The caller therefore MUST gate enablement on topk == 1
     (TritonAttnBackend does: ``use_verify_splitkv = ... and self.topk == 1``).
     At topk > 1 the tree is not causal and this path must stay disabled."""
-    # No exotic features.
-    if sinks is not None:
-        return False
+    # No exotic features (sinks excepted, checked below).
     if sliding_window_size is not None and sliding_window_size > 0:
         return False
     if logit_cap and logit_cap > 0:
@@ -697,6 +708,9 @@ def can_handle(
     h_q = q_extend.shape[1]
     h_kv = k_extend.shape[1]
     if h_kv == 0 or h_q % h_kv != 0:
+        return False
+    # One sink logit per local query head.
+    if sinks is not None and (sinks.dim() != 1 or sinks.shape[0] != h_q):
         return False
     # head dims must match buffers.
     if k_buffer.shape[1] != h_kv or v_buffer.shape[1] != h_kv:
@@ -852,6 +866,7 @@ def verify_splitkv_fwd(
         o_out=o_extend,
         k_scale=k_scale,
         v_scale=v_scale,
+        sinks=sinks,
     )
 
     return True
