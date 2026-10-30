@@ -11,11 +11,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The multi-step draft's sliding-window rails on the Triton backend.
+"""The multi-step draft's sliding-window rails.
 
-Every cuda-graph forward mode must fill the sliding-window READ rail, and each
-draft step must write its window layers through its OWN columns of the
-iteration's write window.
+Every Triton cuda-graph forward mode must fill the sliding-window READ rail,
+and each draft step of every multi-step draft backend must write its window
+layers through its OWN columns of the iteration's write window.
 
 BUG REGRESSION. `_build_cuda_graph_forward_metadata` builds one
 `ForwardMetadata` per captured forward mode. The draft-extend branch passed
@@ -41,12 +41,13 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind, KVLocPlan
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _BUILDER = "_build_cuda_graph_forward_metadata"
 _RAIL = "window_kv_indices"
@@ -120,13 +121,26 @@ class TestDraftStepWriteColumns(CustomTestCase):
     on, since the window lays each row out step-minor. Each step must bind its
     own columns while its backend derives the ids."""
 
-    def _check(self, *, bs, topk, num_steps, window_cols):
+    def _backends(self):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            FlashInferMultiStepDraftBackend,
+        )
         from sglang.srt.layers.attention.triton_backend import (
             TritonMultiStepDraftBackend,
         )
+        from sglang.srt.layers.attention.trtllm_mha_backend import (
+            TRTLLMHAAttnMultiStepDraftBackend,
+        )
 
+        return (
+            TritonMultiStepDraftBackend,
+            FlashInferMultiStepDraftBackend,
+            TRTLLMHAAttnMultiStepDraftBackend,
+        )
+
+    def _batch(self, *, bs, topk, num_steps, window_cols):
         reader = _Reader()
-        plan = KVLocPlan(
+        plan = IterationIds(
             source=reader,
             req_pool_indices=torch.arange(bs),
             seq_lens=torch.ones(bs, dtype=torch.int64),
@@ -139,30 +153,136 @@ class TestDraftStepWriteColumns(CustomTestCase):
         cols = None if window_cols == num_steps else slice(0, num_steps)
         batch = SimpleNamespace(
             batch_size=bs,
-            kv_loc_plan=plan,
-            kv_loc_cols=cols,
+            iteration_ids=plan,
+            iteration_cols=cols,
             out_cache_loc=plan.write_ids(reader, cols=cols),
         )
-        backend = object.__new__(TritonMultiStepDraftBackend)
-        backend.topk = topk
-        backend.speculative_num_steps = num_steps
-        backend.attn_backends = [
-            SimpleNamespace(use_sliding_window_kv_pool=True)
-        ] * num_steps
         swa = plan.write_ids(reader, kind=IdSpaceKind.SLIDING_WINDOW, cols=cols)
         per_step = per_step_draft_out_cache_loc(swa, bs, topk, num_steps)
-        for step in range(num_steps):
-            with backend._step_writes(batch, step):
-                ids = plan.write_ids(
-                    reader, kind=IdSpaceKind.SLIDING_WINDOW, cols=batch.kv_loc_cols
-                )
-                torch.testing.assert_close(ids, per_step[step], rtol=0, atol=0)
-                torch.testing.assert_close(
-                    batch.out_cache_loc * 10, ids, rtol=0, atol=0
-                )
-            self.assertIs(batch.kv_loc_cols, cols)
         # The whole window's leading ids are not step 1's slots.
         self.assertFalse(torch.equal(swa[: bs * topk], per_step[1]))
+        return reader, plan, batch, cols, per_step
+
+    def _backend(self, cls, step_backends, *, topk, num_steps):
+        backend = object.__new__(cls)
+        backend.topk = topk
+        backend.speculative_num_steps = num_steps
+        backend.attn_backends = step_backends
+        return backend
+
+    def _check(self, *, bs, topk, num_steps, window_cols):
+        reader, plan, batch, cols, per_step = self._batch(
+            bs=bs, topk=topk, num_steps=num_steps, window_cols=window_cols
+        )
+        for cls in self._backends():
+            backend = self._backend(
+                cls,
+                [SimpleNamespace(use_sliding_window_kv_pool=True)] * num_steps,
+                topk=topk,
+                num_steps=num_steps,
+            )
+            for step in range(num_steps):
+                with self.subTest(backend=cls.__name__, step=step):
+                    with backend._step_writes(batch, step):
+                        ids = plan.write_ids(
+                            reader,
+                            kind=IdSpaceKind.SLIDING_WINDOW,
+                            cols=batch.iteration_cols,
+                        )
+                        torch.testing.assert_close(ids, per_step[step], rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            batch.out_cache_loc * 10, ids, rtol=0, atol=0
+                        )
+                    self.assertIs(batch.iteration_cols, cols)
+
+    def test_trtllm_steps_init_from_their_own_columns(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import (
+            TRTLLMHAAttnMultiStepDraftBackend,
+        )
+
+        bs, topk, num_steps = 3, 1, 4
+        reader, plan, batch, cols, per_step = self._batch(
+            bs=bs, topk=topk, num_steps=num_steps, window_cols=num_steps
+        )
+        seen = []
+
+        def step_backend():
+            def init(fb):
+                seen.append(
+                    plan.write_ids(
+                        reader, kind=IdSpaceKind.SLIDING_WINDOW, cols=fb.iteration_cols
+                    )
+                )
+
+            return SimpleNamespace(
+                use_sliding_window_kv_pool=True, init_forward_metadata=init
+            )
+
+        backend = self._backend(
+            TRTLLMHAAttnMultiStepDraftBackend,
+            [step_backend() for _ in range(num_steps)],
+            topk=topk,
+            num_steps=num_steps,
+        )
+        backend.init_forward_metadata(batch)
+        self.assertEqual(len(seen), num_steps - 1)
+        for step, ids in enumerate(seen):
+            torch.testing.assert_close(ids, per_step[step], rtol=0, atol=0)
+        self.assertIs(batch.iteration_cols, cols)
+
+    def test_trtllm_steps_capture_their_own_contiguous_writes(self):
+        """BUG REGRESSION. Under CUDA graphs a static window pool's per-step
+        backend derives its window write ids in a captured metadata kernel
+        that reads ``bs * topk`` ids by contiguous offsets from the batch's
+        write ids. Every step was handed the whole draft window, so each
+        wrote its window layers at the first step's slots (request 0's steps
+        for two requests). Each step must capture its own ids, contiguous."""
+        from unittest.mock import patch
+
+        from sglang.srt.layers.attention.trtllm_mha_backend import (
+            TRTLLMHAAttnMultiStepDraftBackend,
+        )
+        from sglang.srt.model_executor import forward_batch_info
+
+        for bs, topk, num_steps in ((2, 1, 3), (3, 1, 4), (2, 2, 3)):
+            with self.subTest(bs=bs, topk=topk, num_steps=num_steps):
+                batch = SimpleNamespace(
+                    batch_size=bs,
+                    iteration_ids=None,
+                    iteration_cols=None,
+                    out_cache_loc=torch.arange(1, bs * topk * num_steps + 1),
+                    spec_info=SimpleNamespace(is_draft_input=lambda: True),
+                    encoder_lens=None,
+                )
+                expected = per_step_draft_out_cache_loc(
+                    batch.out_cache_loc, bs, topk, num_steps
+                )
+                read = []
+
+                def step_backend():
+                    def init_in_graph(fb):
+                        loc = fb.out_cache_loc
+                        # What the kernel reads: n ids from the data pointer.
+                        read.append(loc.as_strided((bs * topk,), (1,)).clone())
+
+                    return SimpleNamespace(
+                        use_sliding_window_kv_pool=True,
+                        init_forward_metadata_in_graph=init_in_graph,
+                    )
+
+                backend = self._backend(
+                    TRTLLMHAAttnMultiStepDraftBackend,
+                    [step_backend() for _ in range(num_steps)],
+                    topk=topk,
+                    num_steps=num_steps,
+                )
+                with patch.object(
+                    forward_batch_info, "build_inner_fb_view", lambda fb, **kw: fb
+                ):
+                    backend.init_forward_metadata_in_graph(batch)
+                self.assertEqual(len(read), num_steps - 1)
+                for step, ids in enumerate(read):
+                    torch.testing.assert_close(ids, expected[step], rtol=0, atol=0)
 
     def test_the_draft_window(self):
         self._check(bs=3, topk=1, num_steps=3, window_cols=3)

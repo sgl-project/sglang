@@ -6,6 +6,7 @@ import torch
 
 import sglang.srt.layers.moe.moe_runner.aiter as aiter_runner
 from sglang.srt.environ import envs
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterMoeQuantInfo,
     AiterQuantType,
@@ -144,6 +145,54 @@ def test_aiter_runner_uses_epv2_output_when_kernel_supports_it(
         runner_input.output,
         torch.full_like(result, 3 if supports_output else 0),
     )
+
+
+def _fused_moe_writing_threes(hidden_states, w2, output=None, **kwargs):
+    result = torch.full(
+        (hidden_states.shape[0], w2.shape[1]), 3.0, dtype=hidden_states.dtype
+    )
+    if output is not None:
+        output.copy_(result)
+        return output
+    return result
+
+
+@pytest.mark.parametrize(
+    "published_shape,expect_zero_copy",
+    [((1, 4), True), ((2, 4), False), ((1, 8), False)],
+)
+def test_aiter_runner_writes_into_published_moe_output(
+    monkeypatch, published_shape, expect_zero_copy
+):
+    """fused_moe raises on an output buffer unlike the one it would allocate,
+    so only a published buffer of shape (M, w2.shape[1]) may be passed."""
+    _install_fake_aiter(monkeypatch, _fused_moe_writing_threes)
+    monkeypatch.setattr(aiter_runner, "_aiter_fused_moe_supports_output", lambda: True)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+    published = torch.zeros(published_shape, dtype=torch.bfloat16)
+
+    with zero_copy_context.set_moe_output(published):
+        result = runner.run(
+            _runner_input(), _quant_info(), running_state={}
+        ).hidden_states
+
+    torch.testing.assert_close(result, torch.full_like(result, 3))
+    assert (result.data_ptr() == published.data_ptr()) == expect_zero_copy
+
+
+def test_aiter_runner_prefers_epv2_output_over_published_moe_output(monkeypatch):
+    _install_fake_aiter(monkeypatch, _fused_moe_writing_threes)
+    monkeypatch.setattr(aiter_runner, "_aiter_fused_moe_supports_output", lambda: True)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+    runner_input = _runner_input()
+    runner_input.output = torch.zeros((1, 4), dtype=torch.bfloat16)
+    published = torch.zeros((1, 4), dtype=torch.bfloat16)
+
+    with zero_copy_context.set_moe_output(published):
+        result = runner.run(runner_input, _quant_info(), running_state={}).hidden_states
+
+    assert result.data_ptr() == runner_input.output.data_ptr()
+    torch.testing.assert_close(published, torch.zeros_like(published))
 
 
 @pytest.mark.parametrize(

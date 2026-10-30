@@ -133,9 +133,14 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
+        ragged_verify_layout=None,
         *args,
         **kwargs,
     ):
+        if ragged_verify_layout is not None:
+            raise NotImplementedError(
+                "Ascend hybrid linear attention does not support ragged verify"
+            )
         # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
         if seq_lens_cpu is None:
             num_padding = 0
@@ -252,7 +257,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             ]
         )
 
-        mamba_caches = self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        mamba_caches = self.linear_attn_backend.state_pool.get_speculative_mamba2_params_all_layers()
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
