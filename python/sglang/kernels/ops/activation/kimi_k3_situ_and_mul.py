@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.jit.utils.common import empty_sentinel, is_sail_runtime
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -78,3 +79,106 @@ def situ_and_mul(
         has_linear_beta,
     )
     return out
+
+
+@cache_once
+def _jit_situ_masked_module() -> Module:
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        _make_name("situ_and_mul_masked"),
+        *args,
+        cuda_files=["kimi_k3/situ_and_mul.cuh"],
+        cuda_wrappers=[("run", f"SituAndMulMaskedKernel<{args}>::run")],
+        extra_cuda_cflags=get_activation_cuda_cflags(),
+    )
+
+
+@cache_once
+def _jit_situ_mxfp4_module(masked: bool) -> Module:
+    if not is_sail_runtime() and (
+        torch.version.hip is not None
+        or not torch.cuda.is_available()
+        or torch.cuda.get_device_capability()[0] < 10
+    ):
+        raise RuntimeError(
+            "SiTU MXFP4 requires SAIL or an SM100+ CUDA device with FP4 instructions."
+        )
+    args = make_cpp_args(masked, is_arch_support_pdl())
+    return load_jit(
+        _make_name("situ_and_mul_mxfp4"),
+        *args,
+        cuda_files=["kimi_k3/situ_and_mul.cuh"],
+        cuda_wrappers=[("run", f"SituAndMulMxfp4Kernel<{args}>::run")],
+        extra_cuda_cflags=[*get_activation_cuda_cflags(), "-DSGLANG_SITU_MXFP4"],
+    )
+
+
+def situ_and_mul_masked(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor],
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+    topk: int = 8,
+    expected_m: Optional[int] = None,
+) -> torch.Tensor:
+    """Only the valid rows selected by masked_m are written; expected_m is just a
+    scheduling hint."""
+    if out is None:
+        out = input.new_empty(*input.shape[:-1], input.shape[-1] // 2)
+    _jit_situ_masked_module().run(
+        input,
+        out,
+        masked_m,
+        topk,
+        int(expected_m) if expected_m is not None else int(input.shape[1]),
+        float(beta),
+        float(linear_beta) if linear_beta is not None else 0.0,
+        linear_beta is not None,
+    )
+    return out
+
+
+def situ_and_mul_post_quant_mxfp4(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+) -> None:
+    """SiTU rounds to BF16 before quantizing; scales are physically [D/64, T] uint16."""
+    _jit_situ_mxfp4_module(False).run(
+        input,
+        output,
+        output_scale,
+        empty_sentinel(input.device, torch.int32),
+        1,
+        int(input.shape[0]),
+        float(beta),
+        float(linear_beta) if linear_beta is not None else 0.0,
+        linear_beta is not None,
+    )
+
+
+def situ_and_mul_masked_post_quant_mxfp4(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+    topk: int = 8,
+    expected_m: Optional[int] = None,
+) -> None:
+    """Masked SiTU+MXFP4 that preserves padding; scales are [E, D/64, T] uint16."""
+    _jit_situ_mxfp4_module(True).run(
+        input,
+        output,
+        output_scale,
+        masked_m,
+        topk,
+        int(expected_m) if expected_m is not None else int(input.shape[1]),
+        float(beta),
+        float(linear_beta) if linear_beta is not None else 0.0,
+        linear_beta is not None,
+    )
