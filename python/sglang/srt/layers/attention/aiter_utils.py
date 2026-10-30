@@ -33,7 +33,9 @@ except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backen
     pa_decode_gluon = None
     get_recommended_splits = None
 
-from sglang.kernels.ops.attention.utils import launch_gather_shuffle_5d_to_linear
+from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+    launch_gather_shuffle_5d_to_linear,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
 if TYPE_CHECKING:
@@ -92,13 +94,13 @@ def forward_extend_vectorized_5d(
         kv_indices_lin = torch.arange(
             total_tokens, dtype=torch.int32, device=k_lin.device
         )
-        kv_indptr_lin = backend.qo_indptr[:bs0]
+        kv_indptr_lin = backend.forward_metadata.qo_indptr[:bs0]
         max_q = int(backend.forward_metadata.max_q_len)
         o = mha_batch_prefill_func(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             k_lin,
             v_lin,
-            backend.qo_indptr[:bs0],
+            backend.forward_metadata.qo_indptr[:bs0],
             kv_indptr_lin,
             kv_indices_lin,
             max_q,
@@ -135,15 +137,10 @@ def forward_extend_vectorized_5d(
     else:
         slot_ids = backend.forward_metadata.kv_indices[:total_kv]
 
-    # Resolve the raw 5D K/V buffer for this layer (going through the
-    # SWA→sub-pool mapping when applicable).
-    pool = backend.token_to_kv_pool
-    if hasattr(pool, "layers_mapping"):
-        sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
-        sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
-    else:
-        sub_pool = pool
-        sub_layer_id = layer.layer_id
+    # Resolve the raw 5D K/V buffer for this layer from the view holding it.
+    kv = backend.token_to_kv_pool.layer_router.layer(layer.layer_id)
+    sub_pool = kv.view
+    sub_layer_id = kv.view_layer_id
     k_buf = sub_pool.k_buffer[sub_layer_id - sub_pool.start_layer]
     v_buf = sub_pool.v_buffer[sub_layer_id - sub_pool.start_layer]
 
@@ -185,7 +182,7 @@ def forward_extend_vectorized_5d(
         q_local.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
         k_lin,
         v_lin,
-        backend.qo_indptr[:bs0],
+        backend.forward_metadata.qo_indptr[:bs0],
         kv_indptr_lin,
         kv_indices_lin,
         max_q,

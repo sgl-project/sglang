@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.kernels.ops.attention import kda_fused_decode, kda_fused_decode_aiter_hip
+from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -224,7 +224,7 @@ class KDAKernelDispatcher:
                 # SM100 chunk prefill pipeline.
                 self.extend_kernel = cutedsl_kernel
             else:
-                # CuTe DSL prefill kernels need SM100 (Blackwell); on older GPUs
+                # CuTe DSL prefill kernels need SM10x (tcgen05); elsewhere
                 # fall back to the Triton chunk kernel.
                 self.extend_kernel = triton_kernel
                 rank0_log(
@@ -402,10 +402,16 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
-    def effective_extend_kernel(self, lower_bound: Optional[float], num_tokens: int):
-        """The packed FlashInfer prefill kernel requires more than one token."""
+    def effective_extend_kernel(
+        self, lower_bound: Optional[float], num_tokens: int, num_seqs: int = 1
+    ):
+        """The packed FlashInfer prefill kernel requires more than one token per
+        sequence. A batch where every sequence extends exactly one token (e.g.
+        retracted requests re-entering with a fully cached prefix) would fall to
+        FlashInfer's grouped recurrent kernel, which only accepts a bf16 state
+        pool; the KDA pool is fp32, so route those batches to Triton."""
         kernel = self.extend_kernel
-        if self.prefill_backend.is_flashinfer() and num_tokens <= 1:
+        if self.prefill_backend.is_flashinfer() and num_tokens <= max(num_seqs, 1):
             return self.triton_kernel
         if lower_bound is not None and not getattr(kernel, "supports_safe_gate", True):
             kernel = self.triton_kernel
@@ -424,7 +430,9 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        kernel = self.effective_extend_kernel(kwargs.get("lower_bound"), q.shape[1])
+        kernel = self.effective_extend_kernel(
+            kwargs.get("lower_bound"), q.shape[1], query_start_loc.numel() - 1
+        )
         return kernel.extend(
             q,
             k,
@@ -484,9 +492,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
         # Mamba2/GDN's [dim, kernel-1] — so expose the transposed shape here.
         self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
-            .transpose(-1, -2)
-            .shape
+            self.state_pool.mamba_cache.conv[0].transpose(-1, -2).shape
         )
         backends = model_runner.linear_attn_backends
         decode_backend = backends.decode
@@ -523,7 +529,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             and verify_backend.is_triton()
             and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
         ):
-            from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
+            from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import (
                 fused_kda_conv_gating_verify,
             )
 
@@ -616,8 +622,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def supports_prefill_graph_extend(self) -> bool:
         return (
             not envs.SGLANG_DISABLE_KDA_PREFILL_GRAPH_EXTEND.get()
-            # Only the Triton chain guards padded rows (-1 state slots, chunks past T).
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonKDAKernel)
+            and (
+                isinstance(self.kernel_dispatcher.extend_kernel, TritonKDAKernel)
+                or getattr(
+                    self.kernel_dispatcher.extend_kernel,
+                    "prefill_graph_wrapper_cls",
+                    None,
+                )
+                is not None
+            )
             # Fused-accept staging (flashinfer verify) writes per extend.
             and self.accept_lens_pool is None
         )
@@ -630,13 +643,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
     ) -> KDAPrefillGraphMetadata:
         cache_indices = self._prefill_graph_cache_indices(forward_batch)
         meta = KDAPrefillGraphMetadata.allocate(
-            num_tokens=forward_batch.positions.shape[0],
+            # KDA sees global sequence order, even when CP positions are local.
+            num_tokens=forward_batch.extend_num_tokens,
             max_seqs_cap=self.prefill_graph_max_seqs,
             # Any replay of this bucket may carry prefix-cache snapshots (the
             # extra buffer is only on with the radix cache).
             track=get_exec().mamba.enable_mamba_extra_buffer,
             cache_index_dtype=cache_indices.dtype,
             device=self.device,
+            flashinfer_wrapper_cls=getattr(
+                self.kernel_dispatcher.extend_kernel, "prefill_graph_wrapper_cls", None
+            ),
         )
         self._fill_prefill_graph_metadata(
             meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
@@ -757,7 +774,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
@@ -779,6 +796,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if replayssm_d is None and deferred_f_b and is_gfx95_supported():
             fused_static = getattr(layer, "_k3_hip_fused_decode_args", None)
             fused_backend = getattr(layer, "_k3_hip_fused_decode_backend", "")
+            fused_ops = getattr(layer, "_k3_hip_fused_decode_ops", None)
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             if fused_static is not None and onorm_gate is not None:
                 f_b_weight, norm_weight, norm_eps, a_log = fused_static
@@ -789,7 +807,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 out = mixed_qkv.new_empty(
                     (1, mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim)
                 )
-                if fused_backend == "aiter" and kda_fused_decode_aiter_hip.covered(
+                if fused_ops is not None and fused_ops.covered(
                     a,
                     f_b_weight,
                     mixed_qkv,
@@ -800,7 +818,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     output_gate,
                     norm_weight,
                 ):
-                    core_attn_out = kda_fused_decode_aiter_hip.run(
+                    core_attn_out = fused_ops.run(
                         f_a=a,
                         f_b_weight=f_b_weight,
                         mixed_qkv=mixed_qkv,
@@ -1032,12 +1050,32 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # MTP / speculative-decode verify is a multi-token-per-seq path with
         # per-step state checkpointing + central rollback; handled separately.
         if forward_batch.forward_mode.is_target_verify():
-            return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
+            physical_num_tokens = mixed_qkv.shape[0]
+            logical_num_tokens = physical_num_tokens
+            if forward_batch.ragged_verify_layout is None:
+                # MoE may append token padding that is not a complete verify
+                # sequence. Keep it out of convolution and state updates.
+                logical_num_tokens = (
+                    self.forward_metadata.query_start_loc.shape[0] - 1
+                ) * forward_batch.spec_info.draft_token_num
+                mixed_qkv = mixed_qkv[:logical_num_tokens]
+                a = a[:, :logical_num_tokens]
+                b = b[:, :logical_num_tokens]
+            core_attn_out = self._forward_target_verify(
+                layer, forward_batch, mixed_qkv, a, b
+            )
+            if logical_num_tokens < physical_num_tokens:
+                pad = core_attn_out.new_zeros(
+                    (1, physical_num_tokens - logical_num_tokens)
+                    + tuple(core_attn_out.shape[2:])
+                )
+                core_attn_out = torch.cat((core_attn_out, pad), dim=1)
+            return core_attn_out
 
         if self.prefill_graph_metadata is not None:
             # Breakable prefill CUDA graph bucket: host-free chain on static
             # tables refreshed before each replay.
-            layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+            layer_cache = self.state_layer_cache(layer.layer_id)
             return kda_extend_in_graph(
                 layer=layer,
                 meta=self.prefill_graph_metadata,
@@ -1052,7 +1090,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        mamba_cache_params = self.state_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
 
         ssm_states = mamba_cache_params.temporal
@@ -1110,7 +1148,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # Check the kernel the dispatcher will actually run (safe-gate
             # reroute included), not just the configured one.
             extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
-                layer.lower_bound, q.shape[1]
+                layer.lower_bound, q.shape[1], query_start_loc.numel() - 1
             )
             assert extend_kernel.supports_track_state_snapshot, (
                 f"{type(extend_kernel).__name__} cannot write the fp32 track "
@@ -1217,7 +1255,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         retrieve_next_sibling = fm.retrieve_next_sibling
         retrieve_parent_token = fm.retrieve_parent_token
 
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        mamba_cache_params = self.state_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         intermediate_state_cache = getattr(mamba_cache_params, "intermediate_ssm", None)
@@ -1261,7 +1299,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
-        ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        ragged_layout = forward_batch.ragged_verify_layout
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,

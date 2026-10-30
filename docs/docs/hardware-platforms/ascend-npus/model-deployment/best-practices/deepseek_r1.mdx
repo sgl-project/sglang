@@ -10,6 +10,11 @@ This page focuses on optimal configuration and benchmark results for DeepSeek-R1
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
+<Warning>
+{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
+The optimal configurations on this page are validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Use exactly this version; later versions are not covered by this page and may introduce breaking changes.
+</Warning>
+
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
@@ -125,7 +130,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --attn-dp-size 8 \
+        --enable-dp-attention --dp-size 8 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --reasoning-parser deepseek-r1 \
@@ -159,7 +164,7 @@ do
         --port 8001 \
         --nnodes 1 \
         --tp-size 16 \
-        --attn-dp-size 16 \
+        --enable-dp-attention --dp-size 16 \
         --mem-fraction-static 0.9 \
         --max-running-requests 416 \
         --quantization modelslim \
@@ -300,7 +305,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 3000 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
-    --attn-dp-size 16 \
+    --enable-dp-attention --dp-size 16 \
     --enable-dp-lm-head \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
@@ -427,7 +432,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --attn-dp-size 2 \
+        --enable-dp-attention --dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -464,7 +469,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --attn-dp-size 16 \
+        --enable-dp-attention --dp-size 16 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
@@ -631,7 +636,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --attn-dp-size 4 \
+        --enable-dp-attention --dp-size 4 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -669,7 +674,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --attn-dp-size 32 \
+        --enable-dp-attention --dp-size 32 \
         --mem-fraction-static 0.82 \
         --max-running-requests 1024 \
         --quantization modelslim \
@@ -831,7 +836,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --attn-dp-size 2 \
+        --enable-dp-attention --dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -868,7 +873,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --attn-dp-size 16 \
+        --enable-dp-attention --dp-size 16 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
@@ -1031,7 +1036,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --attn-dp-size 2 \
+        --enable-dp-attention --dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -1068,7 +1073,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --attn-dp-size 16 \
+        --enable-dp-attention --dp-size 16 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \
@@ -1230,7 +1235,7 @@ do
         --speculative-num-steps 1 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 2 \
-        --attn-dp-size 2 \
+        --enable-dp-attention --dp-size 2 \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
@@ -1267,7 +1272,7 @@ do
         --node-rank $i \
         --nnodes 2 \
         --tp-size 32 \
-        --attn-dp-size 8 \
+        --enable-dp-attention --dp-size 8 \
         --mem-fraction-static 0.75 \
         --max-running-requests 32 \
         --quantization modelslim \

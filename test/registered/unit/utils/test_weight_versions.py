@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     published_topology,
 )
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ReqStub:
@@ -316,6 +316,7 @@ class _SchedulerStub:
         self.waiting_queue = waiting
         self.chunked_req = chunked
         self.hisparse_coordinator = hisparse
+        self._deferred_responses = None
 
 
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):
@@ -478,11 +479,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
         scheduler = SimpleNamespace(
             enable_priority_scheduling=False,
             abort_on_priority_when_disabled=True,
-            ipc_channels=SimpleNamespace(
-                send_to_tokenizer=SimpleNamespace(
-                    send_output=lambda obj, req_arg: sent.append(obj)
-                )
-            ),
+            send_abort_output=lambda obj, req_arg: sent.append(obj),
         )
 
         with patch(

@@ -1,6 +1,7 @@
 //! Request validation for scheduler intake.
 
 use crate::message::request::{GenerateRequest, Request, RequestKind};
+use crate::message::types::TokenIds;
 use crate::utils::{
     error::Error,
     fsm::{Event, ValidationOutcome},
@@ -120,22 +121,25 @@ pub(super) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result
 
 /// The context-window checks that need the tokenized length, mirroring Python
 /// `TokenizerManager._validate_one_request`: the input alone must fit, and then
-/// input + `max_new_tokens` must fit. Without them the scheduler silently clamps
-/// and the client gets a 200 with a truncated completion instead of an actionable
-/// 400.
+/// input + the client's own `max_new_tokens` must fit. Without them the
+/// scheduler silently clamps and the client gets a 200 with a truncated
+/// completion instead of an actionable 400. A defaulted `max_new_tokens` (see
+/// [`GenerateRequest::max_new_tokens_defaulted`]) is left to that clamp.
 ///
 /// Under `allow_auto_truncate` both clamp instead of rejecting — the launch flag
 /// opted into that.
-pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
+/// The input-length half of [`check_total_tokens`]: `input_ids` truncated to
+/// the context under `allow_auto_truncate`, else the rejection of an input that
+/// does not fit. The MM worker applies it too, so its
+/// [`processed`](crate::MmProcessor::processed) hook sees the ids the
+/// scheduler will.
+pub(crate) fn fit_input(input_ids: &mut TokenIds, limits: &Limits) -> Result<(), Error> {
     let max_req_len = limits.context_len;
     // Python counts the reserved slots as part of the input, so a request can be
     // rejected for them even when the prompt alone fits.
-    let input_len =
-        g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
-
-    // Input length first, and unconditionally: `max_new_tokens: null` means "no
-    // cap", which must not disable this. Python's comparison is `>=` — a prompt
-    // that exactly fills the window leaves no room to generate.
+    let input_len = input_ids.len() as u64 + limits.num_reserved_tokens;
+    // Python's comparison is `>=` — a prompt that exactly fills the window
+    // leaves no room to generate.
     if input_len >= max_req_len {
         if !limits.allow_auto_truncate {
             return Err(Error::Validation(format!(
@@ -143,13 +147,22 @@ pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Re
                  length ({max_req_len} tokens)."
             )));
         }
-        if let Some(ids) = &mut g.input_ids {
-            ids.truncate(max_req_len as usize);
-        }
+        input_ids.truncate(max_req_len as usize);
     }
+    Ok(())
+}
+
+pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
+    let max_req_len = limits.context_len;
+    // Input length first, and unconditionally: `max_new_tokens: null` means "no
+    // cap", which must not disable this.
+    fit_input(g.input_ids.as_mut().unwrap_or(&mut Vec::new()), limits)?;
     let input_len =
         g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
 
+    if g.max_new_tokens_defaulted {
+        return Ok(()); // not the client's value → the scheduler clamps it
+    }
     let Some(max_new_tokens) = g.sampling_params.max_new_tokens else {
         return Ok(()); // no cap requested → nothing to add to the input length
     };

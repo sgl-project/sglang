@@ -74,14 +74,18 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         disaggregation_mode=None,
         enable_overlap=False,
         enable_overlap_mlx=False,
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(
+            think_end_ids=None, self_opened_think_start_ids=None
+        ),
         token_to_kv_pool_allocator=None,
         tree_cache=None,
         hisparse_coordinator=None,
         req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,
-        metrics_reporter=SimpleNamespace(),
+        metrics_reporter=SimpleNamespace(
+            snapshot_spec_decode_metrics=lambda batch, result: None,
+        ),
         draft_worker=None,
         model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
         logprob_result_processor=None,
@@ -118,7 +122,7 @@ def _commit_disagg_handoff(
     processor: SchedulerBatchResultProcessor,
     token_id: int,
     *,
-    replayed_boundary: bool = False,
+    is_rebootstrap: bool = False,
 ) -> None:
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
     queue.scheduler = SimpleNamespace(
@@ -145,13 +149,11 @@ def _commit_disagg_handoff(
     )
     req.bootstrap_host = "127.0.0.1"
     req.bootstrap_room = 1
-    if replayed_boundary:
-        req.pd_rebootstrap_forced_output_id = token_id
     decode_req = DecodeRequest(
         req=req,
         kv_receiver=SimpleNamespace(clear=lambda: None),
         metadata_buffer_index=0,
-        is_rebootstrap=replayed_boundary,
+        is_rebootstrap=is_rebootstrap,
     )
 
     queue._commit_transfer_to_req(decode_req)
@@ -239,6 +241,43 @@ class TestReasoningTokenAccounting(CustomTestCase):
         self.assertEqual(req.reasoning_tokens, 2)
         self.assertTrue(req._is_reasoning_over)
 
+    def test_unforced_reply_that_opens_thinking_counts_reasoning(self):
+        """Adaptive thinking is not forced, so the model emits the start tag itself;
+        that reasoning must be counted rather than reported as 0."""
+        req = _make_req(terminate_after=99)
+        processor = _make_processor()
+        processor.model_config.think_end_ids = [9]
+        processor.model_config.self_opened_think_start_ids = [5]
+
+        for token in [5, 10, 10, 9, 11, 11]:
+            processor._maybe_update_reasoning_tokens(req, token)
+
+        self.assertEqual(req.reasoning_tokens, 4)
+
+    def test_unforced_reply_without_start_tag_has_no_reasoning(self):
+        processor = _make_processor()
+        processor.model_config.think_end_ids = [9]
+        processor.model_config.self_opened_think_start_ids = [5]
+        # A direct answer, and a multi-turn reply opening with a stray closer.
+        for output in ([11, 5, 10, 9], [9, 11, 11]):
+            req = _make_req(terminate_after=99)
+            for token in output:
+                processor._maybe_update_reasoning_tokens(req, token)
+            self.assertEqual(req.reasoning_tokens, 0)
+
+    def test_unforced_reasoning_spans_multi_token_steps(self):
+        req = _make_req(terminate_after=99)
+        processor = _make_processor()
+        processor.model_config.think_end_ids = [8, 9]
+        processor.model_config.self_opened_think_start_ids = [4, 5]
+
+        processor._maybe_update_reasoning_tokens(req, [4])
+        processor._maybe_update_reasoning_tokens(req, [5, 10, 8])
+        processor._maybe_update_reasoning_tokens(req, [9, 11, 11])
+
+        self.assertEqual(req.reasoning_tokens, 5)
+        self.assertTrue(req._is_reasoning_over)
+
     def test_disagg_rebootstrap_does_not_recount_boundary(self):
         req = _make_req(terminate_after=99)
         req.require_reasoning = True
@@ -249,8 +288,11 @@ class TestReasoningTokenAccounting(CustomTestCase):
             [17],
         ]
 
-        _commit_disagg_handoff(req, processor, 17, replayed_boundary=True)
+        # The kept output id 17 was counted before the retract.
+        req.output_ids = [17]
+        _commit_disagg_handoff(req, processor, 17, is_rebootstrap=True)
 
+        self.assertEqual(req.output_ids, [17])
         self.assertEqual(req.reasoning_tokens, 0)
         self.assertFalse(req._is_reasoning_over)
 
@@ -312,6 +354,7 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
             tree.supports_mamba.return_value = True
             tree.claim_kv_row.return_value = False
             tree.token_to_kv_pool_allocator.page_size = 1
+            tree.logical_page_size = 1
             processor = replace(
                 _make_processor(),
                 tree_cache=tree,
