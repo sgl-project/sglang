@@ -100,10 +100,8 @@ class AttnBankState:
     # The bank stays on each rank's attention-TP slice across layers;
     # otherwise every rank writes every row and the attention reads them all.
     reads_slices: bool = False
-    # Whether a batch of this many tokens completes the attention output's sum
-    # onto this rank's 1/TP of the rows, reads the FFN input there and gathers
-    # it, leaving the written residual on the shard for an FFN that consumes
-    # it there (K3's row-sharded MoE tail on gfx950), or None.
+    # per batch size: read the FFN input on this rank's rows and leave the written
+    # residual there, for an FFN that consumes it on the shard (K3 gfx950 prefill)
     ffn_row_shards: Optional[Callable[[int], bool]] = None
 
     def _aggregate(
@@ -152,10 +150,8 @@ class AttnBankState:
     def reduce_scatter_rows_and_read_ffn_input(
         self, hidden_states, residual, forward_batch, norm
     ):
-        """The attention output's sum onto this rank's 1/TP of the rows (padded
-        to a multiple of TP), the FFN read there, and the all-gather of the
-        normed input. Returns (normed input on every row, written residual on
-        this rank's padded shard, zero past the last token)."""
+        """Returns (normed FFN input on every row, written residual on this rank's
+        padded 1/TP of the rows, zero past the last token)."""
         num_tokens, hidden_size = hidden_states.shape
         if not self.ffn_row_shards(num_tokens):
             return None

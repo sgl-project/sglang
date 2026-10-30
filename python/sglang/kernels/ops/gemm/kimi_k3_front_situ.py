@@ -1,10 +1,7 @@
-"""Kimi-K3 latent-MoE input step in one Triton GEMM with the shared experts' SiTU in its epilogue.
+"""Kimi-K3's merged MoE front GEMM with the shared experts' SiTU in its epilogue.
 
-One launch over the merged front weight [shared gate | shared up | router | latent down] (rows).
-A gated tile pairs gate row j with up row N_HALF + j in adjacent columns, so it streams the same
-weight bytes as any other tile and writes SiTU(gate) * up; the rest write router logits and the
-latent input. Replaces the merged-front GEMM followed by a separate SiTU kernel for the prefill
-batch sizes covered() admits.
+Weight rows are [shared gate | shared up | router | latent down]; a gated tile pairs gate row j
+with up row N_HALF + j, so it streams the same bytes as any other tile and writes SiTU(gate) * up.
 """
 
 from __future__ import annotations

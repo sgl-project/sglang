@@ -1534,8 +1534,7 @@ class KimiK3MoE(nn.Module):
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
 
     def _row_sharded_tail_eligible(self, num_tokens: int, has_prefix: bool) -> bool:
-        """Whether the tail runs on this rank's 1/TP of the rows (gfx950 prefill
-        batches; see _row_sharded_tail)."""
+        """gfx950 prefill batches large enough for _row_sharded_tail."""
         min_tokens = envs.SGLANG_ROCM_K3_ROW_SHARDED_TAIL_MIN_TOKENS.get()
         return (
             _is_gfx95
@@ -1547,8 +1546,7 @@ class KimiK3MoE(nn.Module):
         )
 
     def takes_row_sharded_tail(self, num_tokens: int) -> bool:
-        """Whether a batch of num_tokens runs _row_sharded_tail, which then
-        also takes the written residual on this rank's padded rows."""
+        """Whether _row_sharded_tail runs, taking the residual on this rank's rows."""
         return self._eligible_for_fused_front and self._row_sharded_tail_eligible(
             num_tokens, True
         )
@@ -1560,11 +1558,8 @@ class KimiK3MoE(nn.Module):
         num_tokens: int,
         prefix_sum: torch.Tensor,
     ) -> torch.Tensor:
-        """Reduce-scatter the [latent | shared] partials by rows, run the latent
-        norm, up-projection and shared + residual add on this rank's 1/TP of
-        the rows, and all-gather the stream. latent_rows / shared_rows hold
-        num_tokens rows padded to a multiple of TP; prefix_sum is the residual
-        on every row or already on this rank's padded rows."""
+        """The latent tail on this rank's 1/TP of the rows (padded to a multiple of
+        TP); prefix_sum is the residual on every row or already on this rank's."""
         tp_group = get_parallel().tp_group
         padded_rows, hidden_size = shared_rows.shape
         rows = padded_rows // self.tp_size
@@ -1605,9 +1600,8 @@ class KimiK3MoE(nn.Module):
         )
 
     def _front_situ(self, hidden_states: torch.Tensor):
-        """(None, router logits, latent, SiTU of the shared gate_up) from one GEMM
-        over the merged front weight with the activation in its epilogue, for the
-        prefill sizes where it beats the GEMM + SiTU pair; None otherwise."""
+        """(None, router logits, latent, SiTU of the shared gate_up), or None where
+        the GEMM + SiTU pair is faster."""
         from sglang.kernels.ops.gemm import kimi_k3_front_situ
 
         num_tokens = hidden_states.shape[0]
@@ -2788,9 +2782,7 @@ class KimiK3DecoderLayer(nn.Module):
         )
 
     def _ffn_row_shards(self):
-        """gfx950: the batch-size predicate under which the FFN read completes the
-        attention output's sum on this rank's rows and leaves the written
-        residual there for the row-sharded latent-MoE tail, or None."""
+        """Batch-size predicate for reading the FFN input on this rank's rows, or None."""
         if self._sp_moe or self.all_reduce_fusion:
             return None
         if not (

@@ -23,9 +23,8 @@ from sglang.srt.utils import is_gfx95_supported
 # next_pow2(nvb)=8 is 2.0x faster, 16 is 1.2x, 32 is 0.2x. K3 sits right at the
 # limit with H=7168 (one masked tile of 8192) and nvb <= 8.
 MAX_REGISTER_TILE: int = 8 * 8192
-# On gfx950, batches of at least STREAM_MIN_ROWS whose bank tile pads to 8 rows read
-# the bank two rows at a time instead (_agg_stream_kernel): many CTAs per CU then beat
-# one register-bound CTA. Measured on MI350X; at 4 rows the register tile still wins.
+# gfx950, from 64 rows with a bank tile of >= 8: many CTAs streaming the bank two rows
+# at a time beat one register-bound CTA (_agg_stream_kernel); at 4 rows the tile wins
 STREAM_MIN_ROWS: int = 64
 STREAM_MIN_TILE_ROWS: int = 8
 
@@ -165,10 +164,8 @@ def _agg_stream_kernel(
     WRITE_BANK: tl.constexpr,
     APPLY_OUT_NORM: tl.constexpr,
 ):
-    """_agg_kernel for prefill-sized batches: the bank is read ROWS rows at a time
-    (a runtime loop with an online softmax), so a CTA holds a bounded tile instead
-    of the whole bank and enough CTAs share a CU to stream at HBM bandwidth. Same
-    math as _agg_kernel; the running rescale rounds differently in the last ulp."""
+    """_agg_kernel reading the bank ROWS rows at a time with an online softmax, so
+    CTAs stay small enough to share a CU; rounding differs in the last ulp."""
     t = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, BLOCK_H)
     mask = offs < H
