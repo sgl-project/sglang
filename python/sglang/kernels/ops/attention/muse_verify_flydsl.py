@@ -22,15 +22,15 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import rocdl as _rocdl
-from flydsl.expr import arith, range_constexpr
+from flydsl.expr import arith
 from flydsl.expr import math as fmath
+from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
-
-from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw
 
 QL = 8
 GQA = 8
@@ -99,7 +99,11 @@ def _global_load16(addr):
 
 
 def _i64(lo, hi):
-    return _to_raw(fx.Vector.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32).bitcast(fx.Int64)[0])
+    return _to_raw(
+        fx.Vector.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32).bitcast(
+            fx.Int64
+        )[0]
+    )
 
 
 def _fp8x8(vals):
@@ -108,9 +112,17 @@ def _fp8x8(vals):
     for w in range(2):
         # the high half is written by the second convert: start from poison, not a materialized zero
         lo = _rocdl.cvt_pk_fp8_f32(
-            T.i32, _to_raw(vals[4 * w]), _to_raw(vals[4 * w + 1]), llvm.mlir_poison(T.i32), False
+            T.i32,
+            _to_raw(vals[4 * w]),
+            _to_raw(vals[4 * w + 1]),
+            llvm.mlir_poison(T.i32),
+            False,
         )
-        words.append(_rocdl.cvt_pk_fp8_f32(T.i32, _to_raw(vals[4 * w + 2]), _to_raw(vals[4 * w + 3]), lo, True))
+        words.append(
+            _rocdl.cvt_pk_fp8_f32(
+                T.i32, _to_raw(vals[4 * w + 2]), _to_raw(vals[4 * w + 3]), lo, True
+            )
+        )
     return _i64(words[0], words[1])
 
 
@@ -119,21 +131,43 @@ def _v2(x):
 
 
 def _half(vec4, hi):
-    return fx.Vector(vec4, shape=4, dtype=fx.Float32).shuffle(fx.Vector(vec4, shape=4, dtype=fx.Float32), [2, 3] if hi else [0, 1])
+    return fx.Vector(vec4, shape=4, dtype=fx.Float32).shuffle(
+        fx.Vector(vec4, shape=4, dtype=fx.Float32), [2, 3] if hi else [0, 1]
+    )
 
 
 def _max4(vec):
     return arith.maximumf(
-        arith.maximumf(_to_raw(vec[0]), _to_raw(vec[1])), arith.maximumf(_to_raw(vec[2]), _to_raw(vec[3]))
+        arith.maximumf(_to_raw(vec[0]), _to_raw(vec[1])),
+        arith.maximumf(_to_raw(vec[2]), _to_raw(vec[3])),
     )
 
 
 def _sum4(vec):
-    return arith.addf(arith.addf(_to_raw(vec[0]), _to_raw(vec[1])), arith.addf(_to_raw(vec[2]), _to_raw(vec[3])))
+    return arith.addf(
+        arith.addf(_to_raw(vec[0]), _to_raw(vec[1])),
+        arith.addf(_to_raw(vec[2]), _to_raw(vec[3])),
+    )
 
 
 @functools.lru_cache(maxsize=64)
-def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q_lds, qf8, pvf8, fence_vmem, wg_per_cu, addr64):
+def _launcher(
+    heads,
+    kvh,
+    hpg,
+    kv_s0,
+    kv_s1,
+    scale,
+    waves_per_eu,
+    vec_ids,
+    NS,
+    q_lds,
+    qf8,
+    pvf8,
+    fence_vmem,
+    wg_per_cu,
+    addr64,
+):
     W = hpg
     groups = kvh // hpg
     lds_wave = 2 * CHUNK * HD  # two V stages of 32 rows x 64 bytes per wave
@@ -148,7 +182,11 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
     class Lds:
         # occupancy pin: V stages padded so at most wg_per_cu workgroups share a CU (the grid is sized for exactly
         # that; when registers allow 2 waves / SIMD the dispatcher otherwise stacks workgroups unevenly)
-        v: fx.Array[fx.Int8, max(W * lds_wave, (LDS_CU // wg_per_cu - 1024) if wg_per_cu else 0), 16]
+        v: fx.Array[
+            fx.Int8,
+            max(W * lds_wave, (LDS_CU // wg_per_cu - 1024) if wg_per_cu else 0),
+            16,
+        ]
         q: fx.Array[fx.Int8, W * q_wave if q_lds else 16, 16]
 
     @flyc.kernel(name="muse_verify_fly")
@@ -195,8 +233,14 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
         m_r = buffer_ops.create_buffer_resource(maxi, max_size=True)
         d_r = buffer_ops.create_buffer_resource(den, max_size=True)
 
-        kvlen = fx.Int32(buffer_ops.buffer_load(sl_r, seq, vec_width=1, dtype=T.i32, is_scalar=True))
-        kd_bits = fx.Int32(buffer_ops.buffer_load(kd_r, fx.Int32(0), vec_width=1, dtype=T.i32, is_scalar=True))
+        kvlen = fx.Int32(
+            buffer_ops.buffer_load(sl_r, seq, vec_width=1, dtype=T.i32, is_scalar=True)
+        )
+        kd_bits = fx.Int32(
+            buffer_ops.buffer_load(
+                kd_r, fx.Int32(0), vec_width=1, dtype=T.i32, is_scalar=True
+            )
+        )
         c_scale = arith.mulf(arith.bitcast(T.f32, _to_raw(kd_bits)), _f32(exp_scale))
         ctx = kvlen - QL
         last_page = (kvlen - 1) // PAGE
@@ -223,13 +267,20 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
             qrow = seq * QL + n // GQA
             qhead = h * GQA + n % GQA
             halves = [
-                buffer_ops.buffer_load(q_r, qrow * q_s0 + qhead * HD + g * 16 + ks * 8, vec_width=8, dtype=T.bf16)
+                buffer_ops.buffer_load(
+                    q_r,
+                    qrow * q_s0 + qhead * HD + g * 16 + ks * 8,
+                    vec_width=8,
+                    dtype=T.bf16,
+                )
                 for ks in range_constexpr(2)
             ]
             if fx.const_expr(qf8):
                 vals = []
                 for ks in range_constexpr(2):
-                    hv = fx.Vector(halves[ks], shape=8, dtype=fx.BFloat16).to(fx.Float32)
+                    hv = fx.Vector(halves[ks], shape=8, dtype=fx.BFloat16).to(
+                        fx.Float32
+                    )
                     vals.extend(_to_raw(hv[j]) for j in range(8))
                 amax = _f32(1e-20)
                 for x in vals:
@@ -238,7 +289,11 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
                 inv = arith.divf(_f32(FP8_MAX), amax)
                 c_col.append(arith.mulf(arith.divf(amax, _f32(FP8_MAX)), c_scale))
                 sv = [
-                    arith.minimumf(arith.maximumf(arith.mulf(x, inv), _f32(-FP8_MAX)), _f32(FP8_MAX)) for x in vals
+                    arith.minimumf(
+                        arith.maximumf(arith.mulf(x, inv), _f32(-FP8_MAX)),
+                        _f32(FP8_MAX),
+                    )
+                    for x in vals
                 ]
                 qf.append(_fp8x8(sv[:8]))
                 qf.append(_fp8x8(sv[8:]))
@@ -255,12 +310,20 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
             # Q B-fragments parked in LDS (lane-contiguous 16-byte slots, conflict free) to free 32 VGPRs
             qptr = lds.q.ptr
             for f in range_constexpr(8):
-                fx.ptr_store(fx.Vector(qf[f]).bitcast(fx.Int32), qptr + fx.Int64(wave * q_wave + (f * 64 + lane) * 16))
+                fx.ptr_store(
+                    fx.Vector(qf[f]).bitcast(fx.Int32),
+                    qptr + fx.Int64(wave * q_wave + (f * 64 + lane) * 16),
+                )
 
         def qfrag(f):
             if fx.const_expr(q_lds and not qf8):
-                raw = fx.ptr_load(qptr + fx.Int64(wave * q_wave + (f * 64 + lane) * 16), result_type=T.vec(4, T.i32))
-                return _to_raw(fx.Vector(raw, shape=4, dtype=fx.Int32).bitcast(fx.BFloat16))
+                raw = fx.ptr_load(
+                    qptr + fx.Int64(wave * q_wave + (f * 64 + lane) * 16),
+                    result_type=T.vec(4, T.i32),
+                )
+                return _to_raw(
+                    fx.Vector(raw, shape=4, dtype=fx.Int32).bitcast(fx.BFloat16)
+                )
             return qf[f]
 
         def page_ids(chunk):
@@ -271,11 +334,27 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
             p1 = (p1 < last_page).select(p1, last_page)
             if fx.const_expr(vec_ids):
                 # vector loads, in order with the K / V loads: the vmcnt wait for an older chunk covers them
-                a = fx.Int32(buffer_ops.buffer_load(tb_r, row_base + p0, vec_width=1, dtype=T.i32))
-                b = fx.Int32(buffer_ops.buffer_load(tb_r, row_base + p1, vec_width=1, dtype=T.i32))
+                a = fx.Int32(
+                    buffer_ops.buffer_load(
+                        tb_r, row_base + p0, vec_width=1, dtype=T.i32
+                    )
+                )
+                b = fx.Int32(
+                    buffer_ops.buffer_load(
+                        tb_r, row_base + p1, vec_width=1, dtype=T.i32
+                    )
+                )
             else:
-                a = fx.Int32(buffer_ops.buffer_load(tb_r, row_base + p0, vec_width=1, dtype=T.i32, is_scalar=True))
-                b = fx.Int32(buffer_ops.buffer_load(tb_r, row_base + p1, vec_width=1, dtype=T.i32, is_scalar=True))
+                a = fx.Int32(
+                    buffer_ops.buffer_load(
+                        tb_r, row_base + p0, vec_width=1, dtype=T.i32, is_scalar=True
+                    )
+                )
+                b = fx.Int32(
+                    buffer_ops.buffer_load(
+                        tb_r, row_base + p1, vec_width=1, dtype=T.i32, is_scalar=True
+                    )
+                )
             return a, b
 
         def clamp(chunk):
@@ -308,13 +387,21 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
                 if fx.const_expr(addr64):
                     loads.append(_global_load16(k_lane + fx.Int64(page) * kv_s0))
                 else:
-                    loads.append(buffer_ops.buffer_load(k_r, page * s0w + k_off, vec_width=4, dtype=T.i32))
+                    loads.append(
+                        buffer_ops.buffer_load(
+                            k_r, page * s0w + k_off, vec_width=4, dtype=T.i32
+                        )
+                    )
             for u in range_constexpr(2):
                 page = (v_keys[u] < 16).select(p0, p1)
                 if fx.const_expr(addr64):
                     loads.append(_global_load16(v_lane[u] + fx.Int64(page) * kv_s0))
                 else:
-                    loads.append(buffer_ops.buffer_load(v_r, page * s0w + v_offs[u], vec_width=4, dtype=T.i32))
+                    loads.append(
+                        buffer_ops.buffer_load(
+                            v_r, page * s0w + v_offs[u], vec_width=4, dtype=T.i32
+                        )
+                    )
             return loads
 
         def prepare(chunk, loaded, stage, masked):
@@ -326,13 +413,18 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
                 zero = fx.full(4, 0, fx.Int32)
                 vraw = [
                     _to_raw(
-                        (chunk * CHUNK + v_keys[u] < kvlen).select(fx.Vector(vraw[u], shape=4, dtype=fx.Int32), zero)
+                        (chunk * CHUNK + v_keys[u] < kvlen).select(
+                            fx.Vector(vraw[u], shape=4, dtype=fx.Int32), zero
+                        )
                     )
                     for u in range_constexpr(2)
                 ]
             vbase = lds_base + stage * (CHUNK * HD)
             for u in range_constexpr(2):
-                fx.ptr_store(fx.Vector(vraw[u], shape=4, dtype=fx.Int32), vptr + fx.Int64(vbase + u * 1024 + lane * 16))
+                fx.ptr_store(
+                    fx.Vector(vraw[u], shape=4, dtype=fx.Int32),
+                    vptr + fx.Int64(vbase + u * 1024 + lane * 16),
+                )
             ka = []
             for mt in range_constexpr(2):
                 words = fx.Vector(kraw[mt], shape=4, dtype=fx.Int32)
@@ -396,15 +488,24 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
                 o_new = list(o_acc)
                 for nt in range_constexpr(4):
                     mx = _allreduce_groups(lmax[nt], True)
-                    m_old = arith.subf(_f32(p_bias), _to_raw(fx.Vector(negm[nt], shape=2, dtype=fx.Float32)[0]))
+                    m_old = arith.subf(
+                        _f32(p_bias),
+                        _to_raw(fx.Vector(negm[nt], shape=2, dtype=fx.Float32)[0]),
+                    )
                     mn = arith.maximumf(m_old, arith.mulf(mx, c_col[nt]))
                     alpha = fx.rocdl.exp2(T.f32, arith.subf(m_old, mn))
                     negm_new.append(_to_raw(_v2(arith.subf(_f32(p_bias), mn))))
                     thr_new.append(arith.mulf(arith.addf(mn, _f32(rescale)), inv_c[nt]))
-                    l_new.append(_to_raw(fx.Vector(l_run[nt], shape=2, dtype=fx.Float32) * fx.Float32(alpha)))
+                    l_new.append(
+                        _to_raw(
+                            fx.Vector(l_run[nt], shape=2, dtype=fx.Float32)
+                            * fx.Float32(alpha)
+                        )
+                    )
                     for mt in range_constexpr(4):
                         o_new[mt * 4 + nt] = _to_raw(
-                            fx.Vector(o_acc[mt * 4 + nt], shape=4, dtype=fx.Float32) * fx.Float32(alpha)
+                            fx.Vector(o_acc[mt * 4 + nt], shape=4, dtype=fx.Float32)
+                            * fx.Float32(alpha)
                         )
                 negm = negm_new
                 thr = thr_new
@@ -419,19 +520,33 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
                 for mt in range_constexpr(2):
                     for hi in range_constexpr(2):
                         z = fx.Vector(
-                            fmath.fma(_to_raw(_half(s[mt * 4 + nt], hi)), _to_raw(c_pair[nt]), _to_raw(nm)),
+                            fmath.fma(
+                                _to_raw(_half(s[mt * 4 + nt], hi)),
+                                _to_raw(c_pair[nt]),
+                                _to_raw(nm),
+                            ),
                             shape=2,
                             dtype=fx.Float32,
                         )
-                        ps.extend(fx.Float32(fx.rocdl.exp2(T.f32, _to_raw(z[j]))) for j in range(2))
-                t = fx.Vector.from_elements(ps[:4], fx.Float32) + fx.Vector.from_elements(ps[4:], fx.Float32)
+                        ps.extend(
+                            fx.Float32(fx.rocdl.exp2(T.f32, _to_raw(z[j])))
+                            for j in range(2)
+                        )
+                t = fx.Vector.from_elements(
+                    ps[:4], fx.Float32
+                ) + fx.Vector.from_elements(ps[4:], fx.Float32)
                 l_out.append(
-                    _to_raw(fx.Vector(l_run[nt], shape=2, dtype=fx.Float32) + (_half(t, False) + _half(t, True)))
+                    _to_raw(
+                        fx.Vector(l_run[nt], shape=2, dtype=fx.Float32)
+                        + (_half(t, False) + _half(t, True))
+                    )
                 )
                 if fx.const_expr(pvf8):
                     pf.append(_fp8x8(ps))
                 else:
-                    pf.append(_to_raw(fx.Vector.from_elements(ps, fx.Float32).to(fx.BFloat16)))
+                    pf.append(
+                        _to_raw(fx.Vector.from_elements(ps, fx.Float32).to(fx.BFloat16))
+                    )
             # O^T += V^T P^T, V^T fragments read transposed from LDS just in time
             out = [_to_raw(x) for x in o_acc]
             kp = g * 8 + li // 2
@@ -439,7 +554,9 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
             for mt in range_constexpr(4):
                 phys = fx.Int32(arith.xori(_to_raw(fx.Int32(mt)), _to_raw(swz)))
                 addr = vbase + kp * HD + phys * 16 + (li % 2) * 8
-                raw = _rocdl.ds_read_tr8_b64(T.vec(2, T.i32), fx.to_llvm_ptr(vptr + fx.Int64(addr))).result
+                raw = _rocdl.ds_read_tr8_b64(
+                    T.vec(2, T.i32), fx.to_llvm_ptr(vptr + fx.Int64(addr))
+                ).result
                 pair = fx.Vector(raw, shape=2, dtype=fx.Int32)
                 if fx.const_expr(pvf8):
                     vf = _i64(pair[0], pair[1])
@@ -458,14 +575,21 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
         def group_step(c0, st, masked):
             # chunks c0 .. c0 + NS - 1 from load slots 0 .. NS - 1; slot j is refilled with chunk c0 + NS + j right
             # after use, with page ids loaded one group earlier (carried)
-            o_a, n_a, t_a, l_a = list(st[:16]), list(st[16:20]), list(st[20:24]), list(st[24:28])
+            o_a, n_a, t_a, l_a = (
+                list(st[:16]),
+                list(st[16:20]),
+                list(st[20:24]),
+                list(st[24:28]),
+            )
             pids = [fx.Int32(x) for x in st[28 + 4 * NS : 28 + 6 * NS]]
             nxt = []
             for j in range_constexpr(NS):
                 nxt.extend(page_ids(clamp(c0 + 2 * NS + j)))
             refill = []
             for j in range_constexpr(NS):
-                ka, vb = prepare(c0 + j, list(st[28 + 4 * j : 32 + 4 * j]), j % 2, masked)
+                ka, vb = prepare(
+                    c0 + j, list(st[28 + 4 * j : 32 + 4 * j]), j % 2, masked
+                )
                 refill.extend(issue((pids[2 * j], pids[2 * j + 1])))
                 _fence(fence_vmem)
                 o_a, n_a, t_a, l_a = finish(c0 + j, ka, vb, o_a, n_a, t_a, l_a, masked)
@@ -505,17 +629,26 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
             state = ((seq * QL + t) * heads + h * GQA + qh) * splits + split
             l2 = fx.Vector(l_run[nt], shape=2, dtype=fx.Float32)
             l_tot = _allreduce_groups(arith.addf(_to_raw(l2[0]), _to_raw(l2[1])), False)
-            m_fin = arith.subf(_f32(p_bias), _to_raw(fx.Vector(n_run[nt], shape=2, dtype=fx.Float32)[0]))
+            m_fin = arith.subf(
+                _f32(p_bias),
+                _to_raw(fx.Vector(n_run[nt], shape=2, dtype=fx.Float32)[0]),
+            )
             buffer_ops.buffer_store(m_fin, m_r, state)
             buffer_ops.buffer_store(l_tot, d_r, state)
             for mt in range_constexpr(4):
-                buffer_ops.buffer_store(o_acc[mt * 4 + nt], p_r, state * HD + mt * 16 + g * 4)
+                buffer_ops.buffer_store(
+                    o_acc[mt * 4 + nt], p_r, state * HD + mt * 16 + g * 4
+                )
             if split + work_splits < splits:
                 pad = state + work_splits
                 buffer_ops.buffer_store(_f32(M_INIT), m_r, pad)
                 buffer_ops.buffer_store(_f32(0.0), d_r, pad)
                 for mt in range_constexpr(4):
-                    buffer_ops.buffer_store(_to_raw(fx.full(4, 0.0, fx.Float32)), p_r, pad * HD + mt * 16 + g * 4)
+                    buffer_ops.buffer_store(
+                        _to_raw(fx.full(4, 0.0, fx.Float32)),
+                        p_r,
+                        pad * HD + mt * 16 + g * 4,
+                    )
 
     @flyc.jit
     def launch(
@@ -536,7 +669,19 @@ def _launcher(heads, kvh, hpg, kv_s0, kv_s1, scale, waves_per_eu, vec_ids, NS, q
         stream: fx.Stream,
     ):
         kernel(
-            q, k, v, table, seqlens, kd, part, maxi, den, splits, work_splits, t_stride, q_s0,
+            q,
+            k,
+            v,
+            table,
+            seqlens,
+            kd,
+            part,
+            maxi,
+            den,
+            splits,
+            work_splits,
+            t_stride,
+            q_s0,
             value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
         ).launch(grid=(fx.Int64(grid), 1, 1), block=(W * 64, 1, 1), stream=stream)
 
@@ -575,8 +720,18 @@ def verify_fly_partials(
     heads, kvh = q.shape[1], k.shape[2]
     hpg = heads_per_group or kvh
     assert kvh % hpg == 0
-    assert q.dtype == torch.bfloat16 and q.shape[-1] == HD and heads == GQA * kvh and q.shape[0] == n * QL
-    assert k.shape[1] == PAGE and k.stride() == v.stride() and k.stride(2) == HD and k.stride(3) == 1
+    assert (
+        q.dtype == torch.bfloat16
+        and q.shape[-1] == HD
+        and heads == GQA * kvh
+        and q.shape[0] == n * QL
+    )
+    assert (
+        k.shape[1] == PAGE
+        and k.stride() == v.stride()
+        and k.stride(2) == HD
+        and k.stride(3) == 1
+    )
     assert q.stride(2) == 1 and q.stride(1) == HD
     assert work_splits is None or splits <= 2 * work_splits <= 2 * splits
     # buffer offsets are 32-bit byte offsets: a pool past them takes the 64-bit loads
@@ -585,9 +740,29 @@ def verify_fly_partials(
     part = torch.empty((*st, HD), dtype=torch.float32, device=q.device)
     maxi = torch.empty(st, dtype=torch.float32, device=q.device)
     den = torch.empty(st, dtype=torch.float32, device=q.device)
-    kd = k_descale if k_descale is not None else torch.ones(1, dtype=torch.float32, device=q.device)
+    kd = (
+        k_descale
+        if k_descale is not None
+        else torch.ones(1, dtype=torch.float32, device=q.device)
+    )
     _run_compiled(
-        _launcher(heads, kvh, hpg, k.stride(0), k.stride(1), float(softmax_scale), waves_per_eu, vec_ids, slots, q_lds, qf8, pvf8, fence_vmem, wg_per_cu, addr64),
+        _launcher(
+            heads,
+            kvh,
+            hpg,
+            k.stride(0),
+            k.stride(1),
+            float(softmax_scale),
+            waves_per_eu,
+            vec_ids,
+            slots,
+            q_lds,
+            qf8,
+            pvf8,
+            fence_vmem,
+            wg_per_cu,
+            addr64,
+        ),
         q,
         k.view(torch.uint8),
         v.view(torch.uint8),
@@ -653,4 +828,3 @@ def gqa_verify_flydsl(
         partial, maximum, denom, out, v_descale, heads, splits, out.stride(0), out.stride(1), num_warps=2,
     )  # fmt: skip
     return out
-

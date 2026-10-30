@@ -84,9 +84,16 @@ def _accept_kernel(
         tok = tl.load(cand_ptr + pid * stride_cand_b + step * stride_cand_s)
         row = pid * NUM_SLOTS + cur_row
         M, Z = _row_norm(stats_ptr, row, SPLITS)
-        x = tl.load(logits_ptr + row.to(tl.int64) * logits_row_stride + tok).to(tl.float32) / temp
+        x = (
+            tl.load(logits_ptr + row.to(tl.int64) * logits_row_stride + tok).to(
+                tl.float32
+            )
+            / temp
+        )
         p = tl.exp(x - M) / Z
-        q = tl.load(draft_ptr + pid * stride_dp_b + cur_row * stride_dp_s + tok * stride_dp_v)
+        q = tl.load(
+            draft_ptr + pid * stride_dp_b + cur_row * stride_dp_s + tok * stride_dp_v
+        )
         coin = tl.load(uni_ptr + pid * stride_uni_b + (step - 1) * stride_uni_s)
         q_is_prob = (q > 0.0) & (q <= 1.0)
         if q_is_prob & (coin * q < p):
@@ -94,7 +101,9 @@ def _accept_kernel(
             cur_row = step
             tl.store(predicts_ptr + last, tok)
             last = tl.load(idx_ptr + pid * stride_idx_b + step * stride_idx_s)
-            tl.store(accept_index_ptr + pid * stride_idx_b + num_accept * stride_idx_s, last)
+            tl.store(
+                accept_index_ptr + pid * stride_idx_b + num_accept * stride_idx_s, last
+            )
             step += 1
         else:
             cont = 0
@@ -110,9 +119,20 @@ def _residual_vals(
 ):  # fmt: skip
     """The final sample's unnormalized weights on ``offs``: p when every draft was
     accepted, else max(p - q, 0) with a non-probability q read as 0."""
-    x = tl.load(logits_ptr + row.to(tl.int64) * logits_row_stride + offs, mask=mask, other=-float("inf")).to(tl.float32) / temp
+    x = (
+        tl.load(
+            logits_ptr + row.to(tl.int64) * logits_row_stride + offs,
+            mask=mask,
+            other=-float("inf"),
+        ).to(tl.float32)
+        / temp
+    )
     p = tl.where(mask, tl.exp(x - M) / Z, 0.0)
-    q = tl.load(draft_ptr + pid * stride_dp_b + drow * stride_dp_s + offs * stride_dp_v, mask=mask & (all_accepted == 0), other=0.0)
+    q = tl.load(
+        draft_ptr + pid * stride_dp_b + drow * stride_dp_s + offs * stride_dp_v,
+        mask=mask & (all_accepted == 0),
+        other=0.0,
+    )
     q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
     diff = p - q
     return tl.where(all_accepted == 1, p, tl.where(diff > 0.0, diff, 0.0))
@@ -130,7 +150,9 @@ def _residual_part_kernel(
     s = tl.program_id(1)
     cur_row = tl.load(sel_row_ptr + pid)
     all_accepted = (cur_row == NUM_SLOTS - 1).to(tl.int32)
-    drow = tl.minimum(cur_row, NUM_SLOTS - 2)  # draft rows: NUM_SLOTS - 1 (unused when all accepted)
+    drow = tl.minimum(
+        cur_row, NUM_SLOTS - 2
+    )  # draft rows: NUM_SLOTS - 1 (unused when all accepted)
     row = pid * NUM_SLOTS + cur_row
     temp = tl.load(temp_ptr + pid).to(tl.float32)
     M, Z = _row_norm(stats_ptr, row, SPLITS)

@@ -446,11 +446,7 @@ def _dense_linear(
     if prefill_fp8 and fp8_prefill_gemm_applies(x, linear.small_m_fp8_weight):
         xq, xs = x_fp8 if x_fp8 is not None else quantize_rows_fp8(x)
         return fp8_prefill_gemm(xq, xs, linear.small_m_fp8_weight)
-    if (
-        _DENSE_TILED
-        and linear.bias is None
-        and rowmajor_gemm_applies(x, linear.weight)
-    ):
+    if _DENSE_TILED and linear.bias is None and rowmajor_gemm_applies(x, linear.weight):
         return rowmajor_gemm(x, linear.weight)
     tiled = getattr(linear, "small_m_tiled_weight", None)
     if tiled is not None and linear.bias is None and tiled_gemm_applies(x, tiled):
@@ -702,7 +698,9 @@ class MuseSpark1xAttention(nn.Module):
             VERIFY_REDUCE_DEFERRAL.requested = False
         state = VERIFY_REDUCE_DEFERRAL.take() if defer else None
         if state is not None:
-            output = self._fused_o_norm_gate.forward_verify_partials(state, output, o_gate)
+            output = self._fused_o_norm_gate.forward_verify_partials(
+                state, output, o_gate
+            )
         else:
             output = self._fused_o_norm_gate.forward(output, o_gate)
         o_fp8 = self.o_proj.small_m_fp8_weight if prefill_fp8 else None

@@ -135,4 +135,3 @@ def test_router_pooler_topk_compact_a4_input(m):
     ref = [torch.empty_like(t) for t in quant]
     _prepare_a4[(m * 4,)](got[2], *ref, num_warps=4)
     assert torch.equal(quant[0], ref[0]) and torch.equal(quant[1], ref[1])
-

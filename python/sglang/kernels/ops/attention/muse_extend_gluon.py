@@ -177,7 +177,13 @@ def _step(
     cb = j % 2
     ka = gl.amd.cdna4.async_copy.load_shared_relaxed(k_bufs.index(cb), a_op)
     s = gl.amd.cdna4.mfma_scaled(
-        ka, None, "e4m3", qt, None, "e4m3", gl.zeros([TILE, BM], gl.float32, layout=mfma)
+        ka,
+        None,
+        "e4m3",
+        qt,
+        None,
+        "e4m3",
+        gl.zeros([TILE, BM], gl.float32, layout=mfma),
     )
     if MASKED:
         kpos = j * TILE + gl.arange(0, TILE, layout=gl.SliceLayout(1, mfma))
@@ -358,7 +364,17 @@ def muse_extend_applies(q: torch.Tensor, k_cache: torch.Tensor) -> bool:
 
 
 def muse_extend_attention(
-    q, k_cache, v_cache, out, cu_seqlens_q, seq_lens, block_table, q_descale, k_descale, v_descale, scale
+    q,
+    k_cache,
+    v_cache,
+    out,
+    cu_seqlens_q,
+    seq_lens,
+    block_table,
+    q_descale,
+    k_descale,
+    v_descale,
+    scale,
 ):
     """Causal full-attention extend: ``out [tokens, heads, 64]`` (BF16) from FP8 ``q`` and the paged FP8 cache.
 

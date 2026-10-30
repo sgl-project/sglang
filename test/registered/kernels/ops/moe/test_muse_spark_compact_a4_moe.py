@@ -112,4 +112,3 @@ def test_compact_a4_prequantized_input(m):
     flat = ids.flatten()
     rows = ((flat >= start) & (flat < start + 64)).nonzero().flatten()
     assert torch.equal(got[rows], ref[rows])
-

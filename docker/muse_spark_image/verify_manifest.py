@@ -15,5 +15,7 @@ for group in ("files", "aiter_files"):
             bad.append(path)
 if bad:
     sys.exit(f"{len(bad)} files differ from the manifest, e.g. {bad[:5]}")
-print(f"manifest ok: tree {manifest['tree_commit']}, {len(manifest['files'])} package files, "
-      f"{len(manifest['aiter_files'])} aiter files")
+print(
+    f"manifest ok: tree {manifest['tree_commit']}, {len(manifest['files'])} package files, "
+    f"{len(manifest['aiter_files'])} aiter files"
+)

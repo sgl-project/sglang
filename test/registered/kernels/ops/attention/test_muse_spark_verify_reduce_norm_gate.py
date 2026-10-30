@@ -78,7 +78,19 @@ def test_merge_inside_norm_gate(kernel, kv_heads, with_weight):
                 q, kc, vc, out, seq, table, 0.125, kd, vd, splits=16, defer_reduce=defer
             )
         return gqa_verify_splitkv(
-            q, kc, vc, out, cu, seq, table, 0.125, 0, kd, vd, splits=16, defer_reduce=defer
+            q,
+            kc,
+            vc,
+            out,
+            cu,
+            seq,
+            table,
+            0.125,
+            0,
+            kd,
+            vd,
+            splits=16,
+            defer_reduce=defer,
         )
 
     merged = run(torch.empty_like(q), False).reshape(q.shape[0], -1)

@@ -38,8 +38,8 @@ index 3cd6300..5682f98 100644
 +++ b/aiter/ops/triton/_triton_kernels/attention/unified_attention.py
 @@ -52,6 +52,22 @@ def find_seq_idx(
      return left - 1
- 
- 
+
+
 +@triton.jit
 +def find_seq_idx_exact_q_blocks(query_start_len_ptr, q_block_idx, num_seqs, BLOCK_Q: tl.constexpr):
 +    # Request owning q-block q_block_idx when every request's query length is a multiple of BLOCK_Q, so request s
@@ -140,9 +140,9 @@ index 3cd6300..5682f98 100644
 +            q_block_start_idx = (
 +                tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
 +            )
- 
+
          q_block_local_idx = q_block_global_idx - q_block_start_idx
- 
+
 diff --git a/aiter/ops/triton/attention/unified_attention.py b/aiter/ops/triton/attention/unified_attention.py
 index 8218bf7..49e29c0 100644
 --- a/aiter/ops/triton/attention/unified_attention.py
@@ -154,7 +154,7 @@ index 8218bf7..49e29c0 100644
 +    prefill_config=None,
  ):
      arch = get_arch()
- 
+
 @@ -112,6 +113,10 @@ def select_2d_config(
              if max_seqlen_q >= 256:
                  BLOCK_M = 64 if arch.is_rdna else 128
@@ -165,7 +165,7 @@ index 8218bf7..49e29c0 100644
 +                    )
              else:
                  num_stages_2d, num_warps = 1, 2
- 
+
 @@ -366,7 +371,26 @@ def unified_attention(
      sinks=None,
      shuffled_kv_cache: bool = False,
@@ -191,7 +191,7 @@ index 8218bf7..49e29c0 100644
 +      ``None`` keeps ``select_3d_config``'s choice.
 +    """
      assert causal, "Only causal attention is supported"
- 
+
      use_alibi_slopes = alibi_slopes is not None
 @@ -423,6 +447,13 @@ def unified_attention(
      BLOCK_M = (
@@ -259,4 +259,4 @@ index 8218bf7..49e29c0 100644
 +                **({"EXACT_Q_BLOCKS": True} if exact_q_blocks else {}),
                  **attn_config,
              )
- 
+

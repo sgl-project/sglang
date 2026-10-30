@@ -76,7 +76,11 @@ def _sum_scaled(P, XS, WS, Y, M, N: tl.constexpr, SK: tl.constexpr, B: tl.conste
     ok = i < M * N
     s = tl.arange(0, SK)
     p = tl.load(P + s[:, None] * M * N + i[None, :], mask=ok[None, :], other=0.0)
-    y = tl.sum(p, axis=0) * tl.load(XS + i // N, mask=ok, other=0.0) * tl.load(WS + i % N, mask=ok, other=0.0)
+    y = (
+        tl.sum(p, axis=0)
+        * tl.load(XS + i // N, mask=ok, other=0.0)
+        * tl.load(WS + i % N, mask=ok, other=0.0)
+    )
     tl.store(Y + i, y.to(Y.dtype.element_ty), mask=ok)
 
 

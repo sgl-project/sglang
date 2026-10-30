@@ -66,7 +66,9 @@ def test_rowmajor_gemm(n, k, m):
     _close(rowmajor_gemm(x, w), ref, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("n,k", [(4608, 8192), (8192, 2048), (4096, 8192), (8192, 4096)])
+@pytest.mark.parametrize(
+    "n,k", [(4608, 8192), (8192, 2048), (4096, 8192), (8192, 4096)]
+)
 @pytest.mark.parametrize("m", [17, 64, 96, 128])
 def test_fp8_gemm(n, k, m):
     from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (

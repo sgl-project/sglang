@@ -138,7 +138,9 @@ def _fused_norm_residual_triton_kernel(
     if HAS_FP8:
         # per-row FP8 e4m3 copy for the next layer's FP8 QKV GEMM (448 = e4m3 max)
         scale = tl.maximum(tl.max(tl.where(mask, tl.abs(normed), 0.0)), 1e-20) / 448.0
-        tl.store(OUT_FP8 + row * H + offs, (normed / scale).to(tl.float8e4nv), mask=mask)
+        tl.store(
+            OUT_FP8 + row * H + offs, (normed / scale).to(tl.float8e4nv), mask=mask
+        )
         tl.store(OUT_SCALE + row, scale)
 
 
@@ -366,7 +368,11 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             num_stages=num_stages,
             **extra,
         )
-        res = (output, new_stream_out, (router_out if router_dtype is not None else None))
+        res = (
+            output,
+            new_stream_out,
+            (router_out if router_dtype is not None else None),
+        )
         return (*res, out_fp8, out_scale) if fp8_out else res
 
     def forward_fp8(
