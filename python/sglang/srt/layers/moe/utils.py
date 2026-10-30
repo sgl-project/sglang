@@ -379,6 +379,7 @@ class DispatcherOutputDtype(Enum):
     - BF16: dispatch hidden states in bf16
     - FP8: dispatch hidden states in fp8
     - INT8: dispatch hidden states in int8
+    - UINT8: dispatch hidden states in uint8 (mxfp4, SAIL only)
     - NVFP4: dispatch hidden states in nvfp4
     - MXFP4: dispatch hidden states in mxfp4 (fp4_e2m1 + e8m0 block scale)
     - MXFP8: dispatch hidden states in mxfp8 (fp8_e4m3 + e8m0 block scale)
@@ -387,6 +388,7 @@ class DispatcherOutputDtype(Enum):
     BF16 = "bf16"
     FP8 = "fp8"
     INT8 = "int8"
+    UINT8 = "uint8"
     NVFP4 = "nvfp4"
     MXFP4 = "mxfp4"
     MXFP8 = "mxfp8"

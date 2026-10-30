@@ -8,11 +8,14 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -28,15 +31,21 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_host_cpu_arm64,
+    is_sail,
     set_weight_attrs,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
+logger = logging.getLogger(__name__)
+ACTIVATION_SCHEMES = ["static", "dynamic"]
+
 _is_cuda = is_cuda()
+_is_sail = is_sail()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
@@ -58,7 +67,25 @@ if _is_cuda:
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
 
-logger = logging.getLogger(__name__)
+def gemm_nt_i8i8bf16_fake(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    return
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=gemm_nt_i8i8bf16_fake)
+def gemm_nt_i8i8bf16(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    deep_gemm_wrapper.gemm_nt_i8i8bf16((A, As), (B, Bs), C)
 
 
 class W8A8Int8Config(QuantizationConfig):
@@ -221,6 +248,22 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
         output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
 
+        if (
+            _is_sail
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and envs.SGLANG_SAIL_DEEPGEMM_DENSE.get()
+            and bias is None
+        ):
+            out = torch.empty(
+                (x_q_2d.shape[0], layer.weight.shape[1]),
+                dtype=torch.bfloat16,
+                device=x_q.device,
+            )
+            gemm_nt_i8i8bf16(
+                x_q_2d, x_scale_2d, layer.weight.t(), layer.weight_scale, out
+            )
+            return out.to(x.dtype).view(output_shape)
+
         output = int8_scaled_mm(
             x_q_2d,
             layer.weight,
@@ -325,8 +368,30 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        # Other platforms keep the existing Triton INT8 path; SAIL DeepEP must use
+        # a compatible runner.
+        moe_runner_backend = MoeRunnerBackend.TRITON
+        if _is_sail:
+            requested_backend = get_moe_runner_backend()
+            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_mooncake()
+                or requested_backend.is_deep_gemm()
+                or (requested_backend.is_auto() and envs.SGLANG_SAIL_DEEPGEMM_MOE.get())
+            ):
+                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+                import sglang.srt.layers.moe.moe_runner.sail_deepgemm_moe  # noqa: F401
+            elif get_moe_a2a_backend().is_deepep() or requested_backend.is_deep_gemm():
+                raise ValueError(
+                    "SAIL INT8 DeepEP requires an available DeepGEMM backend"
+                )
+        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(
@@ -346,9 +411,20 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DeepEPLLDispatchOutput,
+            DeepEPNormalDispatchOutput,
+        )
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
+        # SAIL's DeepEP INT8 dispatch carries the routing tensors on the dispatch
+        # output itself instead of a TopKOutput.
+        if _is_sail and isinstance(
+            dispatch_output, (DeepEPLLDispatchOutput, DeepEPNormalDispatchOutput)
+        ):
+            topk_output = (dispatch_output.topk_weights, dispatch_output.topk_ids)
+        else:
+            topk_output = dispatch_output.topk_output
 
         if use_intel_amx_backend(layer) or _is_cpu_arm64:
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
@@ -380,5 +456,25 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
-        quant_info = self.get_triton_quant_info(layer)
+        if self.runner.runner_backend.is_deep_gemm():
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_int8=True,
+                per_channel_quant=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                block_shape=None,
+            )
+        else:
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_int8_w8a8=True,
+                per_channel_quant=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
         return self.runner.run(dispatch_output, quant_info)

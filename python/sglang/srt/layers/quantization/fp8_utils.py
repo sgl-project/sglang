@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     is_gfx1250_supported,
     is_hip,
     is_musa,
+    is_sail,
     is_xpu,
     offloader,
 )
@@ -67,6 +68,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
+_is_sail = is_sail()
 
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
@@ -375,6 +377,27 @@ use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
 TORCH_DEVICE_IDENTITY = None
+
+
+def gemm_nt_f8f8bf16_fake(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    return
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=gemm_nt_f8f8bf16_fake)
+def gemm_nt_f8f8bf16(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
 
 def use_rowwise_torch_scaled_mm():
@@ -1562,13 +1585,23 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d, block_size[1], scale_ue8m0=True
         )
-    elif not _is_musa:
+    elif not _is_musa and not _is_sail:
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d,
             block_size[1],
             column_major_scales=True,
             scale_tma_aligned=True,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+    elif _is_sail:
+        # SAIL DeepGEMM needs a column-major LHS scale; producing that layout
+        # directly lets get_col_major_tma_aligned_tensor short-circuit and avoids
+        # a transpose copy on every GEMM. scale_tma_aligned stays off because SAIL
+        # DeepGEMM uses aligned_m == m and does not pad the M axis.
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            block_size[1],
+            column_major_scales=True,
         )
     else:
         q_input, x_scale = sglang_per_token_group_quant_fp8(
@@ -2637,6 +2670,26 @@ def apply_fp8_linear(
                     qinput, x_scale = per_token_group_quant_fp8(
                         input_2d, group_size=input_2d.shape[1]
                     )
+    # SAIL: use DeepGEMM for channelwise fp8 (no bias support)
+    if (
+        _is_sail
+        and get_device_sm() >= 89
+        and weight_scale.numel() == weight.shape[1]
+        and bias is None
+    ):
+        out = torch.empty(
+            output_shape,
+            dtype=torch.bfloat16,
+            device=qinput.device,
+        )
+        gemm_nt_f8f8bf16(
+            qinput,
+            x_scale,
+            weight.t(),
+            weight_scale,
+            out,
+        )
+        return out.view(*output_shape).to(input.dtype)
 
     if channelwise_cutlass:
         # A tuned config exists only for shapes where tuned Triton beat the
