@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.models.sensenova_loop import (
     SenseNovaLoopForConditionalGeneration,
     SenseNovaLoopModel,
@@ -48,7 +49,9 @@ class TestSenseNovaMHCRouter(CustomTestCase):
                         num_kv_heads=1,
                         layer_id=4,
                     )
-                visit = SenseNovaLoopModel._new_visit(physical, idx=28, linear=linear)
+                visit = SenseNovaLoopModel._new_visit(
+                    physical, execution_layer_id=28, is_linear_attention=linear
+                )
                 source_params = dict(physical.named_parameters())
                 for name, parameter in visit.named_parameters():
                     self.assertIs(parameter, source_params[name])
@@ -139,6 +142,32 @@ class TestSenseNovaMHCRouter(CustomTestCase):
         x = torch.empty(0, 32, device="cuda", dtype=torch.bfloat16)
         branch, mix, post, _ = router(x)
         self.assertEqual(router.merge(branch, x, mix, post).shape, x.shape)
+
+
+class TestSenseNovaLoopForward(CustomTestCase):
+    def test_forward_rejects_unsupported_inputs(self):
+        """Unsupported PP/DeepStack inputs must not be silently discarded."""
+        model = SenseNovaLoopModel.__new__(SenseNovaLoopModel)
+        torch.nn.Module.__init__(model)
+        model.layers = torch.nn.ModuleList()
+        model.norm = torch.nn.Identity()
+        hidden_states = torch.ones(1, 16)
+        for name, value, message in (
+            (
+                "pp_proxy_tensors",
+                PPProxyTensors({"hidden_states": hidden_states}),
+                "pipeline parallel",
+            ),
+            ("input_deepstack_embeds", hidden_states, "DeepStack"),
+        ):
+            with self.subTest(input=name), self.assertRaisesRegex(ValueError, message):
+                model(
+                    input_ids=None,
+                    positions=torch.zeros(1, dtype=torch.long),
+                    forward_batch=SimpleNamespace(),
+                    input_embeds=hidden_states,
+                    **{name: value},
+                )
 
 
 class TestSenseNovaLoopWeights(CustomTestCase):
