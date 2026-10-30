@@ -497,10 +497,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         group.state = BeamGroupState.FINISHED
         group.final_results = []
         leader = group.leader
-        leader.finish_outside_step(
-            leader.to_finish or FINISH_ABORT("Beam group aborted.")
-        )
+        # The group takes over the leader's requested finish as its reason.
+        reason = leader.to_finish or FINISH_ABORT("Beam group aborted.")
         leader.clear_requested_finish()
+        leader.finish_outside_step(reason)
         self._free_member_rows(group)
         self._retire_group(group)
 
