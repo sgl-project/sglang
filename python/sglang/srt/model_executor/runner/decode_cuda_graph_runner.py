@@ -52,8 +52,8 @@ from sglang.srt.layers.attention.graph_variants import (
     AttentionGraphVariants,
     Dsv41CandidateGraphVariants,
     create_attention_graph_variants,
-    create_k3_mla_verify_graph_variants,
     create_dsv41_candidate_graph_variants,
+    create_k3_mla_verify_graph_variants,
 )
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
