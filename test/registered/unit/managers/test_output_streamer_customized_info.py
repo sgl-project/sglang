@@ -569,7 +569,9 @@ class TestOutputStreamerDecodeLatency(unittest.TestCase):
         streamer = SchedulerOutputStreamer(
             send_to_detokenizer=None,
             tree_cache=None,
-            server_args=SimpleNamespace(),
+            server_args=SimpleNamespace(
+                enable_hierarchical_cache=False, enable_lmcache=False
+            ),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
@@ -586,7 +588,7 @@ class TestOutputStreamerDecodeLatency(unittest.TestCase):
             ],
             False,
         )
-        payload, decode_latencies = rust_server.push_generation.call_args.args
+        payload, decode_latencies = rust_server.push_generation.call_args.args[:2]
         self.assertEqual(payload.rids[1], "timed")
         self.assertEqual(list(decode_latencies), [1])
         self.assertGreaterEqual(decode_latencies[1], 0.5)
@@ -731,6 +733,81 @@ class TestOutputStreamerRequestStats(unittest.TestCase):
             finished.cached_tokens_details,
             {"device": 2, "host": 0, "storage": 0, "storage_backend": "none"},
         )
+
+
+class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
+    def setUp(self):
+        for target, value in (
+            ("get_serving", SimpleNamespace(stream_interval=1, weight_version="v")),
+            (
+                "get_observability",
+                SimpleNamespace(
+                    enable_metrics=False, enable_request_time_stats_logging=False
+                ),
+            ),
+        ):
+            patcher = patch(
+                f"sglang.srt.managers.scheduler_components.output_streamer.{target}",
+                return_value=value,
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        enter_scope(self, published_topology(ranks={"dp_rank": 0}))
+
+    def _split_sent(
+        self,
+        *,
+        hierarchical_cache,
+        storage_backend=None,
+        disaggregation_mode=DisaggregationMode.NULL,
+    ):
+        """The cached-token split and storage backend one Rust egress frame
+        carries for a request with cached tokens on every tier."""
+        rust_server = Mock()
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=None,
+            tree_cache=SimpleNamespace(
+                cache_controller=SimpleNamespace(storage_backend=storage_backend)
+            ),
+            server_args=SimpleNamespace(
+                enable_hierarchical_cache=hierarchical_cache, enable_lmcache=False
+            ),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=disaggregation_mode,
+            enable_hicache_storage=lambda: storage_backend is not None,
+            rust_server=rust_server,
+        )
+        req = _FakeReq("r0", [1])
+        req.stream = True
+        req.cached_tokens = 6
+        req.cached_tokens_device = 1
+        req.cached_tokens_host = 2
+        req.cached_tokens_storage = 3
+        streamer._stream_output_generation([req], False)
+        return rust_server.push_generation.call_args.args[2:]
+
+    def test_rust_frames_split_cached_tokens_by_tier(self):
+        """A cache with a host or storage tier, or a PD decode server, sends
+        each request's cached tokens by tier and the attached storage
+        backend's type; a device-only cache sends neither."""
+
+        class HiCacheFile:
+            pass
+
+        self.assertEqual(self._split_sent(hierarchical_cache=True), ([(1, 2, 3)], None))
+        self.assertEqual(
+            self._split_sent(hierarchical_cache=True, storage_backend=HiCacheFile()),
+            ([(1, 2, 3)], "HiCacheFile"),
+        )
+        self.assertEqual(
+            self._split_sent(
+                hierarchical_cache=False,
+                disaggregation_mode=DisaggregationMode.DECODE,
+            ),
+            ([(1, 2, 3)], None),
+        )
+        self.assertEqual(self._split_sent(hierarchical_cache=False), (None, None))
 
 
 class TestOutputStreamerStreamInterval(unittest.TestCase):
