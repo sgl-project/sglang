@@ -74,3 +74,24 @@ For strict output comparisons, enable `--enable-deterministic-inference` with
 a supported attention backend on both PD servers. Prefix reuse changes the
 prefill computation shape; non-deterministic kernels can produce different
 tokens even when the restored prefix KV is byte-identical.
+
+### Validate PD reuse
+
+With SGLang, LMCache, and the PD transfer backend installed in the same active
+Python environment, run the manual end-to-end test from the repository root:
+
+```bash
+LMCACHE_MP_TRANSFER_MODE=engine_driven \
+  python test/manual/mem_cache/test_disaggregation_lmcache.py -v
+```
+
+The test starts its own daemon and prefill/decode servers. It compares greedy
+tokens against a no-LMCache baseline, verifies external hits after a local
+cache flush and both engine restarts, and checks cache-salt isolation.
+It requires two GPUs, or four with `SGLANG_TEST_LMCACHE_TP_SIZE=2`.
+Set `LMCACHE_MP_TRANSFER_MODE=lmcache_driven` to exercise IPC transfers and
+`SGLANG_TEST_LMCACHE_DISABLE_OVERLAP=1` to disable overlap scheduling.
+The default model is `Qwen/Qwen3-0.6B`; override it with
+`SGLANG_TEST_LMCACHE_MODEL`. `SGLANG_TEST_LMCACHE_BASE_PORT` (default `31500`)
+reserves the next seven ports for this test. This is a functional test, not a
+latency or throughput benchmark.
