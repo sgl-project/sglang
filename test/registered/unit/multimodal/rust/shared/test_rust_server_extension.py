@@ -731,10 +731,10 @@ class TestRustServerExtension(CustomTestCase):
         def all_gather_object(obj):
             gathered.append(obj)
             return [
-                {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
-                None,
+                (0, {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"}),
+                (0, None),
                 obj,
-                None,
+                (0, None),
             ]
 
         with (
@@ -750,6 +750,7 @@ class TestRustServerExtension(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(
                     nnodes=1,
+                    node_rank=0,
                     pp_size=1,
                     tp_size=2,
                     tp_rank=0,
@@ -774,9 +775,11 @@ class TestRustServerExtension(CustomTestCase):
             others_only = RustServer.gather_server_endpoints(hosts_listener=False)
 
         self.assertEqual(
-            gathered[0], {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}
+            gathered[0], (0, {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"})
         )
-        self.assertIsNone(gathered[1], "a non-listener rank contributes nothing")
+        self.assertEqual(
+            gathered[1], (0, None), "a non-listener rank contributes nothing"
+        )
         self.assertEqual(
             others_only, [{"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"}]
         )
@@ -789,23 +792,30 @@ class TestRustServerExtension(CustomTestCase):
         )
 
     def test_gather_server_endpoints_refuses_a_loopback_endpoint_across_nodes(self):
-        """A multi-node table with a loopback entry fails startup on every rank,
-        listener or not, naming the rank, endpoint and rendezvous address,
-        unless the nodes rendezvous on loopback too (emulated on one machine)."""
+        """When listeners span nodes, a loopback entry fails startup on every
+        rank, listener or not, naming the rank, endpoint and rendezvous
+        address, unless the nodes rendezvous on loopback too (emulated on one
+        machine). Listeners all on one node never dial each other across
+        machines, so plain multi-node TP with the default --host 127.0.0.1
+        still starts."""
         loopback = {"dp_rank": 1, "endpoint": "http://127.0.0.1:30001"}
         routable = {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}
-        for dist_init_addr, raises in (
-            ("10.0.0.1:5000", True),
-            ("node-0:5000", True),
-            (None, True),
-            ("127.0.0.1:5000", False),
-            ("[::1]:5000", False),
+        across_nodes = [(0, routable), (1, None), (1, loopback)]
+        for dist_init_addr, gathered, raises in (
+            ("10.0.0.1:5000", across_nodes, True),
+            ("node-0:5000", across_nodes, True),
+            (None, across_nodes, True),
+            ("127.0.0.1:5000", across_nodes, False),
+            ("[::1]:5000", across_nodes, False),
+            ("10.0.0.1:5000", [(0, routable), (1, None), (0, loopback)], False),
+            ("10.0.0.1:5000", [(0, loopback), (1, None)], False),
         ):
             parallel = SimpleNamespace(
                 nnodes=2,
+                node_rank=1,
                 dist_init_addr=dist_init_addr,
                 world_group=SimpleNamespace(
-                    all_gather_object=Mock(return_value=[routable, None, loopback])
+                    all_gather_object=Mock(return_value=gathered)
                 ),
             )
             with (
@@ -818,7 +828,14 @@ class TestRustServerExtension(CustomTestCase):
             ):
                 if not raises:
                     table = RustServer.gather_server_endpoints(hosts_listener=False)
-                    self.assertEqual(table, [routable, loopback], dist_init_addr)
+                    self.assertEqual(
+                        table,
+                        sorted(
+                            (entry for _, entry in gathered if entry is not None),
+                            key=lambda entry: entry["dp_rank"],
+                        ),
+                        dist_init_addr,
+                    )
                     continue
                 with self.assertRaises(ValueError, msg=dist_init_addr) as raised:
                     RustServer.gather_server_endpoints(hosts_listener=False)
@@ -831,16 +848,20 @@ class TestRustServerExtension(CustomTestCase):
     def test_gather_server_endpoints_advertises_the_rendezvous_facing_address(self):
         """A wildcard-bound listener on a multi-node launch advertises the local
         address that routes to the rendezvous, not whichever interface address
-        enumeration finds first; SGLANG_HOST_IP still overrides it."""
+        enumeration finds first. A loopback answer (the rendezvous name
+        resolves to this machine, as a hostname /etc/hosts maps to 127.0.1.1
+        does on the rendezvous node) falls through to enumeration, and
+        SGLANG_HOST_IP still overrides both."""
         gathered = []
 
         def all_gather_object(obj):
-            gathered.append(obj)
+            gathered.append(obj[1])
             return [obj]
 
         parallel = SimpleNamespace(
             nnodes=2,
-            dist_init_addr="127.0.0.1:5000",
+            node_rank=0,
+            dist_init_addr="10.0.0.1:5000",
             pp_size=1,
             tp_size=2,
             tp_rank=0,
@@ -879,13 +900,25 @@ class TestRustServerExtension(CustomTestCase):
             ),
             patch.dict(os.environ, env, clear=True),
         ):
+            with patch(
+                "sglang.srt.utils.network.get_local_ip_towards",
+                return_value="10.0.0.2",
+            ) as towards:
+                RustServer.gather_server_endpoints(hosts_listener=True)
+            towards.assert_called_once_with("10.0.0.1:5000")
+            # The real probe: a loopback rendezvous answers with loopback.
+            parallel.dist_init_addr = "127.0.0.1:5000"
             RustServer.gather_server_endpoints(hosts_listener=True)
             os.environ["SGLANG_HOST_IP"] = "10.0.0.9"
             RustServer.gather_server_endpoints(hosts_listener=True)
 
         self.assertEqual(
             [entry["endpoint"] for entry in gathered],
-            ["http://127.0.0.1:30000", "http://10.0.0.9:30000"],
+            [
+                "http://10.0.0.2:30000",
+                "http://172.17.0.1:30000",
+                "http://10.0.0.9:30000",
+            ],
         )
 
     def test_scheduler_aborts_reach_the_rust_egress(self):

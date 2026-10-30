@@ -85,7 +85,7 @@ def _rendezvous_is_loopback(dist_init_addr: Optional[str]) -> bool:
 def _refuse_loopback_endpoints(
     table: List[Dict[str, Any]], dist_init_addr: Optional[str]
 ) -> None:
-    """Fail a multi-node startup whose table has a loopback listener entry.
+    """Fail a startup whose listeners span nodes and include a loopback entry.
 
     Listener ports are node-local offsets, so another node dialing a loopback
     entry reaches its own listener at that offset and serves the wrong rank.
@@ -228,7 +228,6 @@ class RustServer:
     @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
         """Collective: every rank calls once; returns listener endpoints by DP rank."""
-        multi_node = get_parallel().nnodes > 1
         host = get_serving().host
         if host in ("", "0.0.0.0", "::"):
             # An unspecified bind address is not reachable from another node;
@@ -236,7 +235,9 @@ class RustServer:
             # other nodes share.
             host = get_local_ip_auto(
                 fallback="127.0.0.1",
-                towards=get_parallel().dist_init_addr if multi_node else None,
+                towards=(
+                    get_parallel().dist_init_addr if get_parallel().nnodes > 1 else None
+                ),
             )
         config = None
         if hosts_listener:
@@ -249,14 +250,17 @@ class RustServer:
                 ),
                 "endpoint": NetworkAddress(host, port).to_url(),
             }
-        gathered = get_parallel().world_group.all_gather_object(config)
-        table = sorted(
-            (entry for entry in gathered if entry is not None),
-            key=lambda entry: entry["dp_rank"],
+        gathered = get_parallel().world_group.all_gather_object(
+            (get_parallel().node_rank, config)
         )
-        if multi_node:
-            # Checked on the gathered table so every rank fails together
-            # rather than leaving the others blocked in the collective.
+        listeners = [(node, entry) for node, entry in gathered if entry is not None]
+        table = sorted(
+            (entry for _, entry in listeners), key=lambda entry: entry["dp_rank"]
+        )
+        if len({node for node, _ in listeners}) > 1:
+            # Only listeners on different nodes dial each other across
+            # machines. Checked on the gathered table so every rank fails
+            # together rather than leaving the others blocked in the collective.
             _refuse_loopback_endpoints(
                 table=table, dist_init_addr=get_parallel().dist_init_addr
             )

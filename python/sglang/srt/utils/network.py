@@ -414,7 +414,9 @@ def get_local_ip_auto(fallback: str = None, towards: Optional[str] = None) -> st
             Defaults to None.
         towards (str, optional): A ``host:port`` peers are known to reach; when
             given, the address of the interface that routes to it is preferred
-            over interface enumeration. Defaults to None.
+            over interface enumeration, unless that address is loopback (the
+            name resolves to this machine, e.g. a hostname /etc/hosts maps to
+            127.0.1.1). Defaults to None.
 
     Returns:
         str: The detected local IP address, or the fallback value if detection fails.
@@ -434,7 +436,8 @@ def get_local_ip_auto(fallback: str = None, towards: Optional[str] = None) -> st
         return host_ip
     logger.debug("get_ip failed")
     if towards and (ip := get_local_ip_towards(towards)):
-        return ip
+        if not ipaddress.ip_address(ip).is_loopback:
+            return ip
     # Fallback
     if ip := get_local_ip_by_nic():
         return ip
