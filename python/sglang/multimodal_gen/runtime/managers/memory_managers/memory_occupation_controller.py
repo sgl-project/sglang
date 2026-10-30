@@ -98,6 +98,24 @@ class MemoryOccupationController:
         self._sleeping = False
         self._sleep_restore_map: dict[str, str] = {}
 
+    def resident_bytes(self) -> int:
+        """Bytes of module weights currently on this rank's accelerator.
+
+        Counts the tensors actually on the device, so layerwise offload, TP
+        sharding and quantization are reflected, unlike the checkpoint size.
+        """
+        if self.pipeline is None:
+            return 0
+        seen: set[int] = set()
+        total = 0
+        for module in get_updatable_modules(self.pipeline).values():
+            for t in list(module.parameters()) + list(module.buffers()):
+                if t.device.type == "cpu" or t.data_ptr() in seen:
+                    continue
+                seen.add(t.data_ptr())
+                total += t.numel() * t.element_size()
+        return total
+
     def is_sleeping(self) -> bool:
         return self._sleeping
 

@@ -123,7 +123,7 @@ def test_native_models_are_not_selected_through_options() -> None:
 def test_rejected_options_keep_the_running_worker() -> None:
     """A config error used to surface only after the previous worker was killed."""
     runtime = SGLDiffusionGenerator()
-    runtime.get_comfyui_model = lambda *a: (SimpleNamespace(), None, "flux")
+    runtime.get_comfyui_model = lambda *a: (SimpleNamespace(), None, "flux", 0)
     runtime.close_generator = Mock()
     runtime.init_generator = Mock(side_effect=AssertionError("worker must not start"))
     with pytest.raises(ValueError, match="cuda_graph is not supported"):
