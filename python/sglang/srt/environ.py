@@ -712,6 +712,9 @@ class Envs:
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
+    # Most per-request states the detokenizer keeps; past it, the oldest is
+    # evicted. See https://github.com/sgl-project/sglang/issues/2812
+    SGLANG_DETOKENIZER_MAX_STATES = EnvInt(1 << 16)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
@@ -736,9 +739,14 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # PP rank 0 posts its output recv only after its own forward. Enable it if PP
+    # hangs or stalls on kernels that need every SM (e.g. flashinfer MLA).
+    SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
+    # Opt-in: retire finished prefill KV transfers while a forward result is pending.
+    SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
     SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 
@@ -1153,10 +1161,10 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
-    # time so arch35 (Atlas A5) dense linears run on the native quantized
-    # GEMM instead of the Triton emulation path. Lossy (128x128 fp32 block
-    # scales -> 1x32 UE8M0): off by default; enable explicitly for
-    # performance after validating accuracy for the workload.
+    # time for arch35 (Atlas A5) Linear and MoE MXFP8 GEMMs. Disabled keeps
+    # supported 128x128 FP32-scale checkpoints on native block-FP8 GEMMs.
+    # Requantization is lossy (128x128 FP32 scales -> 1x32 UE8M0): enable
+    # explicitly for performance after validating workload accuracy.
     SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
