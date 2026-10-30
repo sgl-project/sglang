@@ -1,35 +1,13 @@
-import logging
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     BENCHMARK_TOOL_DEFAULT,
 )
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
-import sglang.test.ascend.e2e.test_npu_performance_utils as npu_perf_utils
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH, TestNpuPerfMultiNodePdMixTestCaseBase, AISBENCHMARK_DATASET_DEFAULT,
 )
 from sglang.test.ci.ci_register import register_npu_ci
-
-logger = logging.getLogger(__name__)
-
-# Metrics dict of the latest benchmark run. The runtime base class does not
-# expose metrics from run_throughput(), so intercept run_bench_serving (called
-# by run_throughput via the module global) to capture them for this file.
-LAST_METRICS = {}
-
-_orig_run_bench_serving = npu_perf_utils.run_bench_serving
-
-
-def _run_bench_serving_capture(**kwargs):
-    metrics = _orig_run_bench_serving(**kwargs)
-    LAST_METRICS.clear()
-    if metrics:
-        LAST_METRICS.update(metrics)
-    return metrics
-
-
-npu_perf_utils.run_bench_serving = _run_bench_serving_capture
 
 register_npu_ci(
     est_time=9600,
@@ -114,26 +92,13 @@ DEEPSEEK_V4_PRO_W4A8_16P_MODEL_CONFIG = {
     "node_envs": DEEPSEEK_V4_PRO_W4A8_16P_ENVS,
 }
 
-# Same launch arguments as above but with radix-cache enabled
-# (remove "--disable-radix-cache") to compare TTFT against the disabled case.
-DEEPSEEK_V4_PRO_W4A8_16P_RADIX_CACHE_OTHER_ARGS = [
-    arg for arg in DEEPSEEK_V4_PRO_W4A8_16P_OTHER_ARGS if arg != "--disable-radix-cache"
-]
-
-DEEPSEEK_V4_PRO_W4A8_16P_RADIX_CACHE_MODEL_CONFIG = {
-    "model_path": DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
-    "other_args": DEEPSEEK_V4_PRO_W4A8_16P_RADIX_CACHE_OTHER_ARGS,
-    "node_envs": DEEPSEEK_V4_PRO_W4A8_16P_ENVS,
-}
-
-
 class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90RadixCache(
     TestNpuPerfMultiNodePdMixTestCaseBase
 ):
     """Test NPU performance for DeepSeek-V4-Pro W4A8 16p two-node in128k out1k prefix90 """
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    model_config = DEEPSEEK_V4_PRO_W4A8_16P_RADIX_CACHE_MODEL_CONFIG
+    model_config = DEEPSEEK_V4_PRO_W4A8_16P_MODEL_CONFIG
     dataset_name = "generated-shared-prefix"
     warmup_requests = 8
     max_concurrency = 8
