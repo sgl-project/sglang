@@ -9,13 +9,20 @@ instead of failing with a duplicate error. Covers:
   * failed-upsert rollback (no half-updated live adapter)
   * num_pinned_loras consistency across pinned flips
   * LoRAManager.validate_new_adapter duplicate-name / starvation checks
-  * TokenizerControlMixin from_distributed id reuse; the from_tensors route
-    rejects upsert explicitly (only from_distributed supports in-place refresh)
+  * LoRAManager.load_lora_adapter(upsert=True): a loaded adapter is refreshed
+    from its PEFT directory under the same lora_id, via the staged tensor path
+  * /load_lora_adapter with upsert in TokenizerControlMixin: lora_name resolves
+    to the registered lora_id, the registry is refreshed only after the backend
+    succeeded, and a plain load of a held name is still rejected
 """
 
 import asyncio
+import json
+import os
+import tempfile
 import unittest
-from unittest.mock import MagicMock, Mock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -24,8 +31,12 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.lora.mem_pool import LoRAMemoryPool
+from sglang.srt.managers.io_struct import LoadLoRAAdapterReqInput, LoRAUpdateOutput
+from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -53,6 +64,7 @@ def _make_manager(*, lora_no_cpu_backup=False) -> LoRAManager:
     manager.lora_refs = {}
     manager.num_pinned_loras = 0
     manager.lora_no_cpu_backup = lora_no_cpu_backup
+    manager.attn_dp_enabled = False
     manager.max_loras_per_batch = 4
     manager.base_hf_config = MagicMock(vocab_size=32000)
     manager.lora_modules = []
@@ -62,6 +74,10 @@ def _make_manager(*, lora_no_cpu_backup=False) -> LoRAManager:
     manager.memory_pool = MagicMock()
     manager.memory_pool.can_support.return_value = True
     manager.memory_pool.uid_to_buffer_id = {}
+    manager.memory_pool.invalid_uids = set()
+    manager.memory_pool.install_streamed_adapter.side_effect = lambda uid, *_: (
+        manager.memory_pool.uid_to_buffer_id.setdefault(uid, 0)
+    )
     # Weight loading needs a real base model / backend; just build a stub.
     manager._create_lora_adapter_from_tensors = Mock(
         side_effect=lambda ref, config, tensors: MagicMock()
@@ -95,6 +111,8 @@ class TestLoRAManagerUpsert(CustomTestCase):
         manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
         # Simulate the adapter occupying a memory-pool buffer slot.
         manager.memory_pool.uid_to_buffer_id = {ref.lora_id: 3}
+        manager._notify_lora_slots_updated = Mock()
+        manager.memory_pool.invalid_uids.add(ref.lora_id)
 
         new_config = dict(CONFIG_DICT, lora_alpha=32)
         result = manager.load_lora_adapter_from_tensors(
@@ -110,6 +128,8 @@ class TestLoRAManagerUpsert(CustomTestCase):
         self.assertEqual(call.args[1], 3)
         # The pinned slot is not double-counted.
         self.assertEqual(manager.num_pinned_loras, 1)
+        manager._notify_lora_slots_updated.assert_called_once_with({3})
+        self.assertEqual(manager.memory_pool.invalid_uids, set())
 
     def test_upsert_skips_pool_copy_when_not_resident(self):
         manager = _make_manager()
@@ -134,6 +154,38 @@ class TestLoRAManagerUpsert(CustomTestCase):
         self.assertTrue(result.success)
         self.assertIn(ref.lora_id, manager.loras)
         self.assertEqual(manager.num_pinned_loras, 1)
+
+    def test_partial_tp_update_blocks_inference(self):
+        from sglang.srt.managers.tp_worker import BaseTpWorker
+
+        manager = _make_manager()
+        request = LoadLoRAAdapterReqInput(
+            lora_name="a", lora_path="/v2", lora_id="adapter-a", upsert=True
+        )
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                lora_manager=manager,
+                load_lora_adapter=lambda *_args, **_kwargs: (
+                    manager.create_lora_update_result(False)
+                ),
+            )
+        )
+        group = MagicMock(world_size=2)
+        with patch(
+            "sglang.srt.managers.tp_worker.get_parallel",
+            return_value=SimpleNamespace(tp_group=group),
+        ):
+            for states in (
+                [(False, False), (True, False)],
+                [(False, False), (False, True)],
+            ):
+                with self.subTest(states=states):
+                    manager.memory_pool.invalid_uids.clear()
+                    group.all_gather_object.return_value = states
+                    result = BaseTpWorker.load_lora_adapter(worker, request)
+                    self.assertFalse(result.success)
+                    with self.assertRaisesRegex(RuntimeError, "adapter-a"):
+                        LoRAMemoryPool.check_valid(manager.memory_pool)
 
 
 class TestLoRARegistryRegisterOrReuse(CustomTestCase):
@@ -239,6 +291,8 @@ class TestUpsertRollback(CustomTestCase):
         old_config = manager.configs[ref.lora_id]
         old_lora = manager.loras[ref.lora_id]
         manager.memory_pool.uid_to_buffer_id = {ref.lora_id: 3}
+        manager._notify_lora_slots_updated = Mock()
+        manager.memory_pool.invalid_uids.add(ref.lora_id)
         manager.memory_pool.load_lora_weight_to_buffer.side_effect = [
             RuntimeError("copy failed at layer k"),
             None,  # the restore pass
@@ -257,6 +311,8 @@ class TestUpsertRollback(CustomTestCase):
         calls = manager.memory_pool.load_lora_weight_to_buffer.call_args_list
         self.assertEqual(len(calls), 2)
         self.assertIs(calls[1].args[2], old_lora)
+        manager._notify_lora_slots_updated.assert_called_once_with({3})
+        self.assertEqual(manager.memory_pool.invalid_uids, {ref.lora_id})
 
 
 class TestStreamedUpsert(CustomTestCase):
@@ -280,6 +336,8 @@ class TestStreamedUpsert(CustomTestCase):
         self.assertIs(manager.loras[ref.lora_id], old_lora)
         self.assertIs(manager.lora_refs[ref.lora_id], ref)
         self.assertEqual(manager.num_pinned_loras, 0)
+        self.assertEqual(manager.memory_pool.invalid_uids, set())
+        LoRAMemoryPool.check_valid(manager.memory_pool)
 
     def test_failed_fresh_install_publishes_no_metadata(self):
         manager = _make_manager(lora_no_cpu_backup=True)
@@ -294,6 +352,8 @@ class TestStreamedUpsert(CustomTestCase):
         self.assertEqual(manager.configs, {})
         self.assertEqual(manager.loras, {})
         self.assertEqual(manager.lora_refs, {})
+        self.assertEqual(manager.memory_pool.invalid_uids, set())
+        LoRAMemoryPool.check_valid(manager.memory_pool)
 
     def test_install_precedes_metadata_publication(self):
         manager = _make_manager(lora_no_cpu_backup=True)
@@ -304,13 +364,26 @@ class TestStreamedUpsert(CustomTestCase):
         def install(uid, adapter, *_args):
             self.assertIs(manager.loras[uid], old_lora)
             self.assertIsNot(adapter, old_lora)
+            manager.memory_pool.uid_to_buffer_id[uid] = 0
 
         manager.memory_pool.install_streamed_adapter.side_effect = install
+        manager._notify_lora_slots_updated = Mock()
         result = manager.load_lora_adapter_from_tensors(
             ref, {"weight": torch.ones(1)}, CONFIG_DICT, upsert=True
         )
         self.assertTrue(result.success)
         self.assertIsNot(manager.loras[ref.lora_id], old_lora)
+        manager._notify_lora_slots_updated.assert_called_once_with({0})
+
+        installed = manager.loras[ref.lora_id]
+        manager.memory_pool.install_streamed_adapter.side_effect = None
+        manager._notify_lora_slots_updated.side_effect = RuntimeError("refresh failed")
+        result = manager.load_lora_adapter_from_tensors(
+            ref, {"weight": torch.ones(1)}, CONFIG_DICT, upsert=True
+        )
+        self.assertFalse(result.success)
+        self.assertIs(manager.loras[ref.lora_id], installed)
+        self.assertEqual(manager.memory_pool.invalid_uids, {ref.lora_id})
 
     def test_re_registration_installs_zero_weights_into_resident_slot(self):
         manager = _make_manager(lora_no_cpu_backup=True)
@@ -419,6 +492,79 @@ class TestValidateNewAdapterDuplicates(CustomTestCase):
         config = MagicMock(lora_added_tokens_size=0, use_dora=False)
 
         manager.validate_new_adapter(config, existing, is_update=True)
+
+
+@patch("sglang.srt.lora.lora_manager.get_available_gpu_memory", return_value=0.0)
+class TestPathUpsert(CustomTestCase):
+    def test_path_refresh_and_failed_read_preserve_identity(self, _):
+        manager = _make_manager()
+        manager.load_config = LoadConfig()
+        with (
+            tempfile.TemporaryDirectory() as path,
+            patch(
+                "sglang.srt.lora.lora_manager.DefaultModelLoader._get_weights_iterator",
+                return_value=[],
+            ) as read,
+        ):
+            with open(os.path.join(path, "adapter_config.json"), "w") as config:
+                json.dump(dict(CONFIG_DICT, revision="base-model-sha"), config)
+            ref = LoRARef(lora_name="a", lora_path=path)
+            manager.load_lora_adapter_from_tensors(ref, {}, CONFIG_DICT)
+            previous = manager.loras[ref.lora_id]
+            result = manager.load_lora_adapter(ref, upsert=True)
+            self.assertTrue(result.success, result.error_message)
+            self.assertIsNot(manager.loras[ref.lora_id], previous)
+            self.assertIsNone(read.call_args.args[0].revision)
+
+            previous = manager.loras[ref.lora_id]
+            manager._read_adapter_tensors = Mock(side_effect=OSError("failed read"))
+            self.assertFalse(manager.load_lora_adapter(ref, upsert=True).success)
+            self.assertIs(manager.loras[ref.lora_id], previous)
+
+
+def _load(registry, *, backend_success=True, pp_size=1):
+    async def communicator(obj):
+        return [LoRAUpdateOutput(success=backend_success, loaded_adapters={})]
+
+    tm = TokenizerControlMixin()
+    tm.__dict__.update(
+        auto_create_handle_loop=lambda: None,
+        lora_update_lock=asyncio.Lock(),
+        pending_lora_unloads={},
+        _pending_lora_publications={},
+        lora_registry=registry,
+        lora_ref_cache={},
+        update_lora_adapter_communicator=communicator,
+    )
+    obj = LoadLoRAAdapterReqInput(lora_name="a", lora_path="/v2", upsert=True)
+    with patch.multiple(
+        "sglang.srt.managers.tokenizer_control_mixin",
+        get_lora=lambda: SimpleNamespace(enable_lora=True, max_loaded_loras=None),
+        get_parallel=lambda: SimpleNamespace(dp_size=1, pp_size=pp_size),
+        get_serving=lambda: SimpleNamespace(tokenizer_worker_num=1),
+    ):
+        return obj, asyncio.run(tm.load_lora_adapter(obj))
+
+
+class TestLoadLoRAAdapterUpsertRoute(CustomTestCase):
+    def test_registry_refresh_follows_backend_success(self):
+        for success in (False, True):
+            with self.subTest(backend_success=success):
+                registry = LoRARegistry()
+                first = LoRARef(lora_name="a", lora_path="/v1")
+                asyncio.run(registry.register(first))
+                obj, result = _load(registry, backend_success=success)
+                self.assertEqual(result.success, success)
+                registered = registry.get_all_adapters()["a"]
+                self.assertEqual(obj.lora_id, first.lora_id)
+                self.assertEqual(registered.lora_path, "/v2" if success else "/v1")
+
+    def test_loaded_upsert_rejects_pipeline_parallelism(self):
+        registry = LoRARegistry()
+        asyncio.run(registry.register(LoRARef(lora_name="a", lora_path="/v1")))
+        _, result = _load(registry, pp_size=2)
+        self.assertFalse(result.success)
+        self.assertIn("pipeline parallelism", result.error_message)
 
 
 if __name__ == "__main__":

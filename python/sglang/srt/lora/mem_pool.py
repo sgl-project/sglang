@@ -376,7 +376,11 @@ class LoRAMemoryPool:
         should_apply_lora = getattr(base_model, "should_apply_lora", None)
         return any(
             isinstance(module, FusedMoE)
-            and (should_apply_lora is None or should_apply_lora(name))
+            # init_lora_modules() runs first, so wrapped experts sit at `<name>.base_layer`
+            and (
+                should_apply_lora is None
+                or should_apply_lora(name.removesuffix(".base_layer"))
+            )
             for name, module in base_model.named_modules()
         )
 
@@ -962,7 +966,7 @@ class LoRAMemoryPool:
         if self.invalid_uids:
             raise RuntimeError(
                 f"LoRA adapters {sorted(self.invalid_uids)} have incomplete GPU installs; "
-                "reload or unload them before resuming inference."
+                "refusing inference. This terminates the scheduler; restart the engine."
             )
 
     def install_streamed_adapter(
@@ -1006,9 +1010,9 @@ class LoRAMemoryPool:
         device = next(self.base_model.parameters()).device
         if device.type == "cuda":
             torch.cuda.current_stream(device).synchronize()
-        self.invalid_uids.remove(uid)
         self.eviction_policy.mark_used(uid)
         lora_adapter.release_staged_weights()
+        self.invalid_uids.remove(uid)
 
     def _clear_buffer_slot_for_base(self, buffer_id: int) -> None:
         """Make an evicted slot safe for graph-captured base-model replay."""
@@ -1029,6 +1033,7 @@ class LoRAMemoryPool:
         """Remove a resident adapter and return its cleared pool slot."""
         buffer_id = self.uid_to_buffer_id.get(uid)
         if buffer_id is None:
+            self.invalid_uids.discard(uid)
             return None
 
         self._clear_buffer_slot_for_base(buffer_id)

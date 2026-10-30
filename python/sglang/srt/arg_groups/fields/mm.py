@@ -63,10 +63,18 @@ class Mm(msgspec.Struct):
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(
-            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`, "
+            "and `video_preprocessing_device`, the device the token-space processor decodes and preprocesses "
+            'a video request on (e.g. `{"video_preprocessing_device": "cpu"}`)',
             type_parser=json.loads,
         ),
     ] = None
+    enable_token_space_processor: A[
+        bool,
+        "Enable token-space multimodal preprocessing for supported models. "
+        "Unsupported models keep their existing processor. Not supported with "
+        "--encoder-only or --language-only.",
+    ] = False
     mm_processor_worker_num: A[
         int,
         "Number of threads for multimodal processor calls. 0 selects the "

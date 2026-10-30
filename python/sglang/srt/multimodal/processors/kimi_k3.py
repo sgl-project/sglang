@@ -408,7 +408,7 @@ class KimiK3ImageProcessor(
         """
         if (
             not images
-            or self.mm_feature_transport != "cpu"
+            or self._feature_transport.mm_feature_transport != "cpu"
             or not is_cuda()
             or not all(
                 isinstance(image, Image.Image)

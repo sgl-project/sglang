@@ -331,6 +331,10 @@ class Model(msgspec.Struct):
         bool,
         "Start seed server via transfer engine backend for remote instance weight loader.",
     ] = False
+    remote_instance_weight_loader_start_seed_via_nixl: A[
+        bool,
+        "Start seed server via NIXL for remote instance weight loader: each runner publishes a NIXL agent that peers write its weights through.",
+    ] = False
     enable_engine_info_bootstrap: A[
         bool,
         "Start the EngineInfoBootstrapServer and register per-rank parallelism config, without the mooncake/verbs P2P transfer-engine seeding.",

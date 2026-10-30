@@ -6,12 +6,31 @@ each drive their own GPU, which no process-global value can express — the
 device has to come from what the worker was handed.
 """
 
+import asyncio
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+from transformers import BaseImageProcessor, PreTrainedTokenizerFast
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
+from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
+    TokenSpaceProcessStrategy,
+)
+from sglang.srt.multimodal.token_space_mm_process.processor import (
+    TokenSpaceProcessor,
+)
+from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
+    TokenSpaceServingSpec,
+)
+from sglang.srt.multimodal.token_space_mm_process.sglang import (
+    TokenSpaceSGLangProcessor,
+)
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -20,6 +39,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 BASE = "sglang.srt.multimodal.processors.base_processor"
+PLACEMENT = "sglang.srt.multimodal.serving_preprocessing"
 
 
 class _Processor:
@@ -46,6 +66,12 @@ def _make(**fields):
     return processor
 
 
+def _make_wrapper(**fields):
+    wrapper = TokenSpaceSGLangProcessor.__new__(TokenSpaceSGLangProcessor)
+    wrapper._server_args = _make(**fields).server_args
+    return wrapper
+
+
 class TestFastImageProcessorDevice(CustomTestCase):
     def setUp(self):
         reset_context()
@@ -60,7 +86,7 @@ class TestFastImageProcessorDevice(CustomTestCase):
                 device_type=device_type,
             )
         )
-        with patch.multiple(BASE, platforms=platforms, **flags):
+        with patch.multiple(PLACEMENT, platforms=platforms, **flags):
             return processor._fast_image_processor_device(_Processor())
 
     def test_device_follows_the_instance_base_gpu_id(self):
@@ -94,7 +120,7 @@ class TestFastImageProcessorDevice(CustomTestCase):
             pass
 
         processor = _make(base_gpu_id=3)
-        with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True):
+        with patch.multiple(PLACEMENT, _is_cpu=False, _is_xpu=False, _is_npu=True):
             device = processor._fast_image_processor_device(Glm4vProcessor())
         self.assertIsNone(device)
 
@@ -116,6 +142,160 @@ class TestFastImageProcessorDevice(CustomTestCase):
                 )
 
 
+class TestTokenSpaceDevices(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def test_wrapper_fills_the_image_device_unless_pil_decodes(self):
+        for use_pil, expected in ((False, "cuda:3"), (True, None)):
+            wrapper = _make_wrapper(base_gpu_id=3)
+            wrapper._core = SimpleNamespace(
+                _processor=SimpleNamespace(
+                    image_processor=object.__new__(BaseImageProcessor)
+                )
+            )
+            wrapper._disable_fast_image_processor = use_pil
+            wrapper._rl_on_policy_target = None
+            wrapper._true_on_policy_enabled = False
+            platforms = SimpleNamespace(
+                current_platform=SimpleNamespace(
+                    is_cuda_alike=lambda: True, device_type="cuda"
+                )
+            )
+            with (
+                self.subTest(use_pil=use_pil),
+                patch.multiple(
+                    PLACEMENT,
+                    platforms=platforms,
+                    _is_cpu=False,
+                    _is_xpu=False,
+                    _is_npu=False,
+                ),
+            ):
+                self.assertEqual(wrapper._serving_image_processor_device(), expected)
+
+    def test_wrapper_media_threads_start_on_the_instance_gpu(self):
+        """Pool threads otherwise decode media on cuda:0 whatever base_gpu_id is."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            base_gpu_id=3,
+            mm_process_config={},
+            enable_token_space_processor=True,
+            mm_processor_worker_num=1,
+        )
+        publish(server_args, role="test")
+        with patch(
+            "sglang.srt.multimodal.token_space_mm_process.sglang.is_cuda_alike",
+            return_value=True,
+        ):
+            wrapper = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+                TokenSpaceProcessStrategy, TokenSpaceServingSpec
+            )(
+                None,
+                server_args,
+                PreTrainedTokenizerFast(tokenizer_object=_empty_tokenizer()),
+                None,
+            )
+        self.addCleanup(wrapper.shutdown)
+        self.assertEqual(wrapper._core.io_executor._initializer.args, (3,))
+
+    def test_video_requests_use_the_configured_video_device(self):
+        # As in process_mm_data: a video request runs all its media on that device.
+        for config_device, strategy_device, expected in (
+            (None, None, None),
+            (None, "cpu", "cpu"),
+            ("cpu", None, "cpu"),
+            ("cuda:1", "cpu", "cuda:1"),
+        ):
+
+            class _Strategy(TokenSpaceProcessStrategy):
+                video_preprocessing_device = strategy_device
+
+            mm_process_config = (
+                {}
+                if config_device is None
+                else {"video_preprocessing_device": config_device}
+            )
+            processor = TokenSpaceProcessor.for_strategy(_Strategy)(
+                None,
+                PreTrainedTokenizerFast(tokenizer_object=_empty_tokenizer()),
+                processor_config=MultimodalProcessorConfig(
+                    mm_process_config=mm_process_config, mm_processor_worker_num=1
+                ),
+            )
+            self.addCleanup(processor.shutdown)
+            for video_data, image_device, video_device in (
+                (["video"], expected or "cuda:5", expected),
+                (None, "cuda:5", None),
+            ):
+                with (
+                    self.subTest(
+                        config_device=config_device,
+                        strategy_device=strategy_device,
+                        video=bool(video_data),
+                    ),
+                    patch.object(
+                        processor,
+                        "_load_media_lists",
+                        AsyncMock(return_value=([], [], [])),
+                    ) as load,
+                    patch.object(
+                        processor, "_process_items", AsyncMock(side_effect=_Stop)
+                    ) as process_items,
+                    self.assertRaises(_Stop),
+                ):
+                    asyncio.run(
+                        processor.process(
+                            ["image"],
+                            video_data,
+                            input_ids=[1],
+                            image_device="cuda:5",
+                        )
+                    )
+                self.assertEqual(
+                    load.call_args.kwargs["video_decode_device"], video_device
+                )
+                self.assertEqual(
+                    process_items.call_args.args[1],
+                    {"image_device": image_device, "video_device": video_device},
+                )
+
+    def test_videos_decode_on_cpu_only_when_their_device_is_cpu(self):
+        """The decode device can change pixels, so the trainer must decode as rollout did."""
+        processor = TokenSpaceProcessor.for_strategy(TokenSpaceProcessStrategy)(
+            None,
+            PreTrainedTokenizerFast(tokenizer_object=_empty_tokenizer()),
+            processor_config=MultimodalProcessorConfig(mm_processor_worker_num=1),
+        )
+        self.addCleanup(processor.shutdown)
+        for video_device, use_gpu in ((None, True), ("cuda:3", True), ("cpu", False)):
+            with (
+                self.subTest(video_device=video_device),
+                patch(
+                    "sglang.srt.multimodal.multimodal_processor_mixin.load_video"
+                ) as load_video,
+                self.assertRaises(_Stop),
+                patch.object(processor, "_list_media_items", side_effect=_Stop),
+            ):
+                asyncio.run(
+                    processor.process(
+                        None, ["clip.mp4"], input_ids=[1], video_device=video_device
+                    )
+                )
+            load_video.assert_called_once_with("clip.mp4", use_gpu=use_gpu)
+
+
+class _Stop(Exception):
+    pass
+
+
+def _empty_tokenizer():
+    from tokenizers import Tokenizer, models
+
+    return Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+
+
 class TestFastImageProcessorMemoryPool(CustomTestCase):
     def setUp(self):
         reset_context()
@@ -123,7 +303,9 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
 
     def _processor(self, *, transport="cpu", precompute_hash=False):
         processor = _make(base_gpu_id=0)
-        processor.mm_feature_transport = transport
+        processor._feature_transport = MultimodalFeatureTransport(
+            transport, base_gpu_id=0, skip_mm_pool=True
+        )
         processor.precompute_hash_before_cpu_transfer = precompute_hash
         return processor
 
@@ -138,7 +320,10 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
         )
         for processor, device, expected in cases:
             with (
-                self.subTest(device=device, transport=processor.mm_feature_transport),
+                self.subTest(
+                    device=device,
+                    transport=processor._feature_transport.mm_feature_transport,
+                ),
                 patch(f"{BASE}.torch.cuda.device", return_value=nullcontext()),
                 patch(f"{BASE}.torch.cuda.MemPool", return_value="pool") as mem_pool,
                 patch(f"{BASE}.torch.cuda.use_mem_pool", return_value=nullcontext()),
@@ -185,7 +370,7 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
 
         with (
             patch.multiple(
-                BASE,
+                PLACEMENT,
                 _is_cpu=False,
                 _is_xpu=False,
                 _is_npu=False,

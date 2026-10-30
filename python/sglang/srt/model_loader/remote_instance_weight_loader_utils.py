@@ -97,13 +97,13 @@ def get_remote_instance_transfer_engine_info_per_rank(
                 logger.error(
                     "Failed to get `remote_instance_transfer_engine_info` in response."
                 )
-                return None, None
+                return None
         else:
             logger.error(f"request.get failed: {response.status_code}")
-            return None, None
+            return None
     except Exception as e:
         logger.error(f"Exception: {e}")
-        return None, None
+        return None
 
 
 def register_memory_region(model, transfer_engine):
@@ -139,6 +139,33 @@ def register_memory_region_v1(model, transfer_engine):
 def register_memory_region_v2(model, transfer_engine):
     start_tic = time.time()
 
+    weight_mr_dict, weight_blocks_for_reg_mr = _collect_weight_blocks(model)
+
+    # Register merged memory blocks that hold weights.
+    for weight_block in weight_blocks_for_reg_mr:
+        address, size = weight_block
+        ret = transfer_engine.register_memory(address, size)
+        if ret != 0:
+            raise RuntimeError(
+                f"register memory failed for weight block at address {address} with size {size}, error: {ret}"
+            )
+
+    end_tic = time.time()
+    logger.debug(f"Register memory region v2 time: {(end_tic - start_tic):.4f}s")
+    return weight_mr_dict
+
+
+def register_memory_region_nixl(model, nixl_agent, gpu_id):
+    """Registers the weights with `nixl_agent` as VRAM blocks; returns the weight table and the registration,
+    which must stay referenced while peers write."""
+    weight_mr_dict, weight_blocks = _collect_weight_blocks(model)
+    registration = nixl_agent.register_memory(
+        [(address, size, gpu_id, "") for address, size in weight_blocks], "VRAM"
+    )
+    return weight_mr_dict, registration
+
+
+def _collect_weight_blocks(model):
     weight_mr_dict = {}
     weight_addr_set = set()
     for name, weight in model.named_parameters():
@@ -179,16 +206,4 @@ def register_memory_region_v2(model, transfer_engine):
                         current_weight_block = (address, size)
         if current_weight_block is not None:
             weight_blocks_for_reg_mr.append(current_weight_block)
-
-    # Register merged memory blocks that hold weights.
-    for weight_block in weight_blocks_for_reg_mr:
-        address, size = weight_block
-        ret = transfer_engine.register_memory(address, size)
-        if ret != 0:
-            raise RuntimeError(
-                f"register memory failed for weight block at address {address} with size {size}, error: {ret}"
-            )
-
-    end_tic = time.time()
-    logger.debug(f"Register memory region v2 time: {(end_tic - start_tic):.4f}s")
-    return weight_mr_dict
+    return weight_mr_dict, weight_blocks_for_reg_mr

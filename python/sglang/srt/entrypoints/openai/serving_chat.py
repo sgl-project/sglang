@@ -191,6 +191,21 @@ def normalize_assistant_tool_call_arguments(
                     raise
 
 
+def _collect_message_media(messages):
+    """Each message's media in message order, without rendering the template."""
+    image_data, video_data, audio_data, modalities = [], [], [], []
+    for message in messages:
+        process_content_for_template_format(
+            message.model_dump(),
+            "openai",
+            image_data,
+            video_data,
+            audio_data,
+            modalities,
+        )
+    return image_data, video_data, audio_data, modalities
+
+
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_vals = []
     vid_vals = []
@@ -1301,6 +1316,7 @@ class OpenAIServingChat(OpenAIServingBase):
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
+            mm_token_expansion_start_len=request.mm_token_expansion_start_len,
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
@@ -1473,17 +1489,19 @@ class OpenAIServingChat(OpenAIServingBase):
             # A pre-tokenized request (e.g. the miles TITO session server) keeps the
             # media in its messages; the client's ids carry one placeholder per item,
             # which the multimodal processor expands in place (SGLANG_MM_AVOID_RETOKENIZE).
+            # A partially expanded request also sends every media item of the
+            # conversation, for the token-space processor to match to its IDs.
             image_data, video_data, audio_data, modalities = (
-                self._collect_media_for_pretokenized(request)
-                if is_multimodal
+                _collect_message_media(request.messages)
+                if is_multimodal or request.mm_token_expansion_start_len
                 else ([], [], [], [])
             )
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
-                image_data=image_data if image_data else None,
-                audio_data=audio_data if audio_data else None,
-                video_data=video_data if video_data else None,
+                image_data=image_data or None,
+                audio_data=audio_data or None,
+                video_data=video_data or None,
                 modalities=modalities,
                 stop=request.stop or [],
             )
@@ -1531,23 +1549,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             result.reasoning_end_token_ids = list(token_ids)
         return result
-
-    def _collect_media_for_pretokenized(self, request: ChatCompletionRequest):
-        """The images, videos and audio of a request whose prompt arrives as
-        ``input_ids``: the same extraction the template path runs, without
-        rendering. The client's ids carry one placeholder per item."""
-        image_data: List[Any] = []
-        video_data: List[Any] = []
-        audio_data: List[Any] = []
-        modalities: List[str] = []
-        for message in request.messages:
-            msg_dict = message.model_dump()
-            if msg_dict.get("content") is None:
-                msg_dict["content"] = ""
-            process_content_for_template_format(
-                msg_dict, "openai", image_data, video_data, audio_data, modalities
-            )
-        return image_data, video_data, audio_data, modalities
 
     def _apply_jinja_template(
         self,
