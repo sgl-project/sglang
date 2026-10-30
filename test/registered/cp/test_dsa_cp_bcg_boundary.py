@@ -2,7 +2,8 @@
 
 Runs the same prompts through a server with breakable prefill graphs on and
 one with prefill graphs disabled (eager CP) for live chunk lengths that sit on
-a capture bucket, one below it, and lengths not divisible by the CP size, and
+a capture bucket, one below it, lengths not divisible by the CP size, and short
+uncached suffixes (1-16 tokens) that pad every rank to the minimum local shard, and
 checks (i) greedy tokens / prompt logprobs agree, (ii) the captured path was
 taken for lengths under the capture cap, and (iii) KV rows of a neighbouring
 cached request are untouched (radix-cache canary: a request whose KV slots are
@@ -33,8 +34,13 @@ SERVER_LAUNCH_TIMEOUT = 1800
 # Max |delta logprob| between graphs on/off over the prompt tokens (teacher
 # forced, so no divergence effect) and the greedy continuation.
 LOGPROB_TOL = 0.1
-# Bucket-exact, bucket-1 and not divisible by the CP size.
-LENGTHS = (100, 127, 128, 333, 511, 512, 1001)
+# Short uncached suffixes first: interleave BCG aligns the global chunk to
+# attn_cp_size**2 (16 for CP4), so every length <= 16 pads each rank's local
+# K to 4 rows. length == 4 is the case where the padded local K row count
+# equals the global position count and a shape-based "already sharded" test
+# would skip sharding (review of sgl-project/sglang#46890); 1-3 and 5-16
+# bracket it. Then bucket-exact, bucket-1 and not divisible by the CP size.
+LENGTHS = (1, 2, 3, 4, 5, 8, 16, 100, 127, 128, 333, 511, 512, 1001)
 MAX_NEW_TOKENS = 16
 # Canary: natural text (low-entropy greedy continuation) so a prefix-cache
 # replay reproduces the output unless its KV rows were overwritten. The replay
