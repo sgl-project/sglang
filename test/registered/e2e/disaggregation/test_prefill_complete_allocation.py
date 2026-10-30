@@ -20,20 +20,24 @@ register_cuda_ci(est_time=168, stage="extra-a", runner_config="2-gpu-large")
 class _PrefillCompleteServer(PDDisaggregationServerBase):
     model = "Qwen/Qwen3-0.6B"
 
-    model_revision = "c1899de289a04d12100db370d81485cdf75e47ca"
+    model_args = [
+        "--revision",
+        "c1899de289a04d12100db370d81485cdf75e47ca",
+        "--attention-backend",
+        "flashinfer",
+    ]
+
+    # Parallelism flags beyond --tp, on prefill only.
+    prefill_parallel_args = []
 
     policy = "prefill_complete"
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        common = [
-            "--revision",
-            cls.model_revision,
+        common = cls.model_args + [
             "--disaggregation-decode-allocation-policy",
             cls.policy,
-            "--attention-backend",
-            "flashinfer",
             "--mem-fraction-static",
             "0.65",
             "--max-total-tokens",
@@ -46,7 +50,9 @@ class _PrefillCompleteServer(PDDisaggregationServerBase):
             "16",
             "--enable-metrics",
         ]
-        cls.extra_prefill_args = common + ["--chunked-prefill-size", "512"]
+        cls.extra_prefill_args = (
+            common + ["--chunked-prefill-size", "512"] + cls.prefill_parallel_args
+        )
         cls.extra_decode_args = list(common)
         cls.launch_all()
 

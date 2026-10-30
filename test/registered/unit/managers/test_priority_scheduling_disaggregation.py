@@ -26,11 +26,13 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     FINISH_ABORT,
     Req,
     ReqKvInfo,
+    ScheduleBatch,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.observability import req_time_stats
@@ -229,6 +231,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         queue = queue_cls.__new__(queue_cls)
         queue.scheduler_stage_metrics = None
         queue.pp_size = 1
+        queue.room_waiters = []
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.cache_controller = SimpleNamespace(write_policy=write_policy)
         queue.scheduler = SimpleNamespace(
@@ -433,7 +436,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         sender.abort.assert_called_once()
         self.assertFalse(req.pending_bootstrap)
 
-    def test_scheduler_waiting_abort_delegates_release_once(self):
+    def _prefill_abort_scheduler(self, *, waiting_queue, room_waiters):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
@@ -442,7 +445,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         )
         scheduler.chunked_req = None
         scheduler.mm_receiver = None
-        scheduler.waiting_queue = [MagicMock(rid="req")]
+        scheduler.waiting_queue = waiting_queue
         scheduler.beam_coordinator = MagicMock()
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
@@ -452,21 +455,82 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.release_aborted_prefill_waiting_req = MagicMock()
         scheduler.dllm_config = None
         scheduler.grammar_manager = MagicMock()
-        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.queue, queue.room_waiters = [], room_waiters
+        scheduler.disagg_prefill_bootstrap_queue = queue
         scheduler.disagg_prefill_transfer_queue = []
         scheduler.collect_inflight_reqs = MagicMock(return_value=set())
         scheduler.tree_cache = MagicMock()
+        return scheduler
 
+    def _abort(self, scheduler, rid):
         with (
             patch("sglang.srt.managers.scheduler.get_serving") as get_serving,
             patch("sglang.srt.managers.scheduler.release_kv_cache") as release,
         ):
             get_serving.return_value.weight_version = None
-            scheduler.abort_request(AbortReq(rid="req"))
+            scheduler.abort_request(AbortReq(rid=rid))
+        return release
 
+    def test_scheduler_waiting_abort_delegates_release_once(self):
+        scheduler = self._prefill_abort_scheduler(
+            waiting_queue=[MagicMock(rid="req")], room_waiters=[]
+        )
+        release = self._abort(scheduler, "req")
         scheduler.release_aborted_prefill_waiting_req.assert_called_once()
         scheduler.tree_cache.finish.assert_called_once()
         release.assert_not_called()
+
+    def test_scheduler_abort_retires_room_waiting_recompute(self):
+        """A recompute waiting for its room's release sits in no scanned queue.
+        An AbortReq that reaches only prefill must still retire it; otherwise it
+        is prefilled after the release and parks until the bootstrap timeout."""
+        waiter = MagicMock(rid="req-retract1", session=None)
+        other = MagicMock(rid="other-retract1")
+        scheduler = self._prefill_abort_scheduler(
+            waiting_queue=[], room_waiters=[(waiter, 8), (other, 8)]
+        )
+        scheduler.send_abort_output = MagicMock()
+        self._abort(scheduler, "req")
+        self.assertEqual(
+            scheduler.disagg_prefill_bootstrap_queue.room_waiters, [(other, 8)]
+        )
+        scheduler.tree_cache.finish.assert_called_once_with(
+            waiter.cache_request_handle, CacheRequestOutcome.ABORT
+        )
+        scheduler.send_abort_output.assert_called_once()
+        self.assertIs(scheduler.send_abort_output.call_args.args[1], waiter)
+
+    def test_room_waiting_recompute_keeps_prefill_busy(self):
+        """A recompute waiting for its room's release holds no KV but is live
+        work: a cache flush or weight update that waits for idleness waits for
+        it, while health checks do not count it."""
+        scheduler = self._prefill_abort_scheduler(
+            waiting_queue=[], room_waiters=[(MagicMock(rid="req-retract1"), 8)]
+        )
+        scheduler.running_batch = ScheduleBatch(reqs=[])
+        scheduler.dllm_manager = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler.last_batch = None
+        scheduler.enable_overlap = False
+        scheduler._pp_microbatches_drained = MagicMock(return_value=True)
+        scheduler.grammar_manager.grammar_queue = []
+        scheduler.prefill_launched_reqs = RequestList()
+        scheduler.running_reqs = RequestList()
+        scheduler.disagg_decode_prealloc_queue = None
+        scheduler.disagg_decode_transfer_queue = None
+        scheduler.hisparse_coordinator = None
+        scheduler.uocr_runtime = None
+        scheduler._engine_paused = False
+        scheduler.request_receiver = MagicMock()
+        scheduler.request_receiver.has_pending.return_value = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_lmcache = False
+
+        self.assertTrue(scheduler.is_fully_idle(for_health_check=True))
+        self.assertFalse(scheduler.is_fully_idle())
+        scheduler.disagg_prefill_bootstrap_queue.room_waiters = []
+        self.assertTrue(scheduler.is_fully_idle())
 
 
 class TestDecodePreallocQueuePriority(CustomTestCase):

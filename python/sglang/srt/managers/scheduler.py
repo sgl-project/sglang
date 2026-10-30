@@ -4681,6 +4681,10 @@ class Scheduler(
         # Read at call time: a PD role switch rebuilds the PD queues.
         if self.disagg_prefill_bootstrap_queue is not None:
             lists["prefill_bootstrap"] = self.disagg_prefill_bootstrap_queue.queue
+            # Retraction recomputes waiting for their bootstrap room's release.
+            lists["prefill_room_waiters"] = [
+                req for req, _ in self.disagg_prefill_bootstrap_queue.room_waiters
+            ]
         if self.disagg_prefill_transfer_queue is not None:
             lists["prefill_transfer"] = self.disagg_prefill_transfer_queue
         if self.dllm_config is not None:
@@ -6096,6 +6100,16 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
                     if get_parallel().pp_size > 1:
                         prepare_abort(req, "Aborted by AbortReq.")
+
+            # Abort retraction recomputes waiting for their room's release
+            for req in self.disagg_prefill_bootstrap_queue.pop_aborted_room_waiters(
+                rid=recv_req.rid, abort_all=recv_req.abort_all
+            ):
+                logger.debug(f"Abort room-waiting request. {req.rid=}")
+                self._release_aborted_request(req)
+                self.send_abort_output(
+                    _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                )
 
             # Abort in-flight requests
             for req in self.disagg_prefill_transfer_queue:
