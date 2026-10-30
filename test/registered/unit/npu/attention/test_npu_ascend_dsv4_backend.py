@@ -575,11 +575,9 @@ class TestCompressorStateTableABI(unittest.TestCase):
 
         backend.is_hybrid_swa = False
         backend.page_size = 1
-        backend.req_to_token = torch.arange(
-            8 * 4, dtype=torch.int32
-        ).view(8, 4)
+        backend.req_to_token = torch.arange(8 * 4, dtype=torch.int32).view(8, 4)
         backend.graph_metadata = {
-            2: SimpleNamespace(block_tables=torch.zeros(2, 4,dtype=torch.int64))
+            2: SimpleNamespace(block_tables=torch.zeros(2, 4, dtype=torch.int64))
         }
         graph_mode = MagicMock()
         graph_mode.is_decode.return_value = False
@@ -632,10 +630,10 @@ class TestCompressorStateTableABI(unittest.TestCase):
         forward_mode = MagicMock()
         forward_mode.is_target_verify.return_value = False
         forward_mode.is_draft_extend_v2.return_value = False
-        forward_batch = SimpleNamespace( batch_size=2,forward_mode=forward_mode)
+        forward_batch = SimpleNamespace(batch_size=2, forward_mode=forward_mode)
 
         backend._init_dsv4_graph_metadata(
-            metadata_key=2,forward_batch=forward_batch, ragged_layout=None
+            metadata_key=2, forward_batch=forward_batch, ragged_layout=None
         )
 
         metadata = backend.graph_metadata[2]
@@ -655,7 +653,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
         backend.forward_metadata = SimpleNamespace(
             dsv4_cycle_state_block_table=table,
             positions_cmp_padding_c128=torch.empty(0, dtype=torch.int64),
-            actual_seq_lengths_q_pa=torch.tensor([0, 1, 2], dtype=torch.int32),
+            actual_seq_lengths_q_pa=torch.tensor([0, 1, 2], dtype=torch.intg32),
             seqused=torch.ones(2, dtype=torch.int32),
             start_pos=torch.zeros(2, dtype=torch.int32),
             c128_loc=None,
