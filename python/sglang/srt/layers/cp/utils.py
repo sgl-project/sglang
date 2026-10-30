@@ -350,21 +350,16 @@ def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
 def cp_local_rope_positions(forward_batch, positions: Any, local_k: Any) -> Any:
     """Return the CP-local positions matching the local K shard, row for row.
 
-    The breakable prefill graph adapter stamps the local, physically padded
-    rows on attn_cp_metadata (``presharded_positions``); eager CP leaves it
-    unset and hands over the full-sequence positions, which are sharded here.
+    ``forward_batch.positions`` stays global in every mode (eager CP and
+    breakable prefill graph capture/replay); the shard is taken here from the
+    CP metadata, which BCG rewrites to the captured per-rank geometry, so the
+    result is padded to the same physical rows as the local K shard.
     """
     assert is_cp_active(forward_batch)
-    metadata = forward_batch.attn_cp_metadata
-    presharded = getattr(metadata, "presharded_positions", None)
-    if presharded is not None:
-        positions = presharded
-    else:
-        positions = cp_shard_position_ids(positions, forward_batch)
+    positions = cp_shard_position_ids(positions, forward_batch)
     assert positions.shape[0] == local_k.shape[0], (
         "CP prefill: rope positions do not match the local K shard "
-        f"(positions={positions.shape[0]}, k={local_k.shape[0]}, "
-        f"presharded={presharded is not None})"
+        f"(positions={positions.shape[0]}, k={local_k.shape[0]})"
     )
     return positions
 
