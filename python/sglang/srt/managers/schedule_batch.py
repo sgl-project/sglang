@@ -1068,6 +1068,7 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs.merge(image_inputs)
 
         self.multimodal_inputs.mrope_position_delta_repeated_cache = None
+        self.multimodal_inputs.mrope_position_delta_device_cache = None
         if positions is not None:
             self.multimodal_inputs.mrope_positions = positions
             self.multimodal_inputs.mrope_position_delta = (
