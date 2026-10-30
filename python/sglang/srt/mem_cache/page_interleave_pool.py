@@ -219,6 +219,10 @@ class PageInterleaveKVPoolMixin:
             device=shard_group.device,
             cta_policy=NCCL_CTA_POLICY_ZERO if self._use_symmetric_scratch else None,
         )
+        if not self.kv_gather_comm.available:
+            raise RuntimeError(
+                "Page-interleave KV cache requires an available PyNccl communicator."
+            )
         self.kv_gather_stream = self.device_module.Stream()
 
         # Scratch: [prefix | chunk | trash page], double-buffered.
@@ -329,28 +333,6 @@ class PageInterleaveKVPoolMixin:
         raise NotImplementedError(
             "prefix-valid commit is unsupported under logical-page KV sharding "
             "(it writes pool rows directly, bypassing the ownership filter)"
-        )
-
-    def register_layer_transfer_counter(self, layer_transfer_counter):
-        # `None` is the in-tree "disable" signal from the SWA/hybrid wrappers,
-        # so it has to stay a no-op.
-        if layer_transfer_counter is None:
-            super().register_layer_transfer_counter(None)
-            return
-        # Layer-wise KV load-back is unsupported here, and refusing it at
-        # registration is the only safe answer. The gather in `_prefetch_layer`
-        # reads pool rows directly (`_gather_pairs`), so it never passes
-        # through the base getters' `wait_until` hook -- and the first gather
-        # is kicked from `begin_shard_extend`, before any getter runs. Adding
-        # the wait would not make the combination work: the loader writes whole
-        # pool rows at LOGICAL indices with no ownership filter, while this
-        # pool's rows are local physical ones, so ordering the read would only
-        # turn a race into a silent wrong-row read. Same reason as
-        # `set_kv_buffer_prefix_valid` above.
-        raise NotImplementedError(
-            "layer-wise KV load-back (HiCache / external linker) is "
-            "unsupported under logical-page KV sharding (the gather reads "
-            "pool rows directly and the load-back writes them unfiltered)"
         )
 
     # ---- subclass hooks -------------------------------------------------------
@@ -541,6 +523,10 @@ class PageInterleaveKVPoolMixin:
         # writes that produced the prefix rows.
         self.kv_gather_stream.wait_stream(self.device_module.current_stream())
         with self.device_module.stream(self.kv_gather_stream):
+            if self.layer_transfer_counter is not None:
+                # HiCache loads this layer's rows on its own stream, and the gather
+                # bypasses the waiting base getters.
+                self.layer_transfer_counter.wait_until(local_layer)
             for pool_buf, name in self._gather_pairs(local_layer):
                 send_rows = self._gather_send_rows(name)
                 block = send_rows.numel()
@@ -838,8 +824,11 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
-        slot = self._acquire_slot_for_read(layer.layer_id)
+        slot = self._acquire_slot_for_read(
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         rows = self._translate_loc_cached(loc)
         kv_buffer = slot.tensors["kv"]
         if self.store_dtype != self.dtype:
@@ -1049,6 +1038,7 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
         """Read logical rows as separate NoPE and RoPE tensors.
 
@@ -1058,9 +1048,13 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
         converts those decoded values to the requested type.
         """
         if not self.dsa_kv_cache_store_fp8:
-            return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+            return super().get_mla_kv_buffer(
+                layer, loc, dst_dtype, layer_id_override=layer_id_override
+            )
 
-        slot = self._acquire_slot_for_read(layer.layer_id)
+        slot = self._acquire_slot_for_read(
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         rows = self.translate_loc_to_scratch(loc)
         kv = dequantize_k_cache_paged_dsa(self._scratch_kv(slot), rows)
         if dst_dtype is not None:

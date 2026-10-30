@@ -5,7 +5,6 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import pynvml
 import pytest
 import torch
 
@@ -45,6 +44,9 @@ def test_gpu_idle_discounts_reserved_memory_by_uuid(external_gib):
 )
 def test_gpu_idle_with_real_cached_allocation_and_other_process():
     """Retained CUDA cache is allowed; another process still blocks startup."""
+    # ROCm images do not ship pynvml
+    import pynvml
+
     pynvml.nvmlInit()
     process = None
     try:
