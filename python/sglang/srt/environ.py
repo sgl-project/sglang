@@ -1174,7 +1174,13 @@ class Envs:
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # DSA prefill: each attention-TP rank scores only its shard of the indexer
-    # queries, and the top-k is all-gathered.
+    # queries, and the top-k is all-gathered. Cases the code can see (attn_tp 1,
+    # scattered input, prefill CP) already skip it. Set false when:
+    # - bisecting a prefill accuracy or hang issue: off is the old path, with
+    #   no extra collective;
+    # - attention TP spans nodes: the top-k all-gather (int32, tokens x top-k)
+    #   crosses the slow link and may cost more than the scoring it saves;
+    # - prefills are short: little scoring is saved, the all-gather still runs.
     SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING = EnvBool(True)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
