@@ -238,8 +238,8 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model_config = DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG
     dataset_name = "generated-shared-prefix"
-    max_concurrency = 60
-    num_prompts = 85
+    max_concurrency = 55
+    num_prompts = 90
     input_len = 131072
     output_len = 1024
     random_range_ratio = 1
