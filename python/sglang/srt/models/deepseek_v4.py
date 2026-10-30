@@ -5623,6 +5623,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 skipped_checking_pattern not in p
                 for skipped_checking_pattern in skipped_checking_patterns
             )
+            and not getattr(params_dict[p], "engram_external", False)
         }
         if unloaded_params:
             logger.warning(

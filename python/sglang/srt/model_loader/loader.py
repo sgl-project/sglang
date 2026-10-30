@@ -631,6 +631,16 @@ class DefaultModelLoader(BaseModelLoader):
             hf_weights_files = list(resolved_source.weight_files)
             use_safetensors = resolved_source.use_safetensors
 
+        from sglang.srt.arg_groups.engram_config import EngramPlacement
+
+        configured_engram = get_exec().offload.engram_config
+        if (
+            configured_engram is not None
+            and configured_engram.placement == EngramPlacement.EXTERNAL
+            and not use_safetensors
+        ):
+            raise ValueError("external Engram requires safetensors checkpoint files")
+
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -647,8 +657,37 @@ class DefaultModelLoader(BaseModelLoader):
                 load_group=self.load_config.load_group,
             )
         elif use_safetensors:
+            external_engram = (
+                configured_engram is not None
+                and configured_engram.placement == EngramPlacement.EXTERNAL
+            )
+            skip_names = frozenset()
+            if external_engram:
+                if self.load_config.load_format not in (
+                    LoadFormat.AUTO,
+                    LoadFormat.SAFETENSORS,
+                ):
+                    raise ValueError(
+                        "external Engram requires ordinary lazy safetensors loading"
+                    )
+                layers = (
+                    source.model_config.hf_text_config.engram_layer_ids
+                    if source.model_config is not None
+                    else ()
+                )
+                skip_names = frozenset(
+                    f"layers.{layer}.engram.embed.{field}"
+                    for layer in layers
+                    for field in ("weight", "scale")
+                )
+                # Both alternate iterators materialize before yielding names.
+                use_multithread = False
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
+            if external_engram and weight_loader_disable_mmap:
+                raise ValueError("external Engram requires safetensors mmap loading")
             configured_prefetch = get_model().weight_loader_prefetch_checkpoints
+            if external_engram:
+                configured_prefetch = False
             start_iterator_prefetch = (
                 configured_prefetch and not startup_prefetch_started
             )
@@ -713,6 +752,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    skip_names=skip_names,
                 )
 
         else:

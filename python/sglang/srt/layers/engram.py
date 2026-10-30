@@ -16,6 +16,7 @@ import mmap
 import os
 import re
 import time
+from pathlib import Path
 from typing import Optional
 
 import msgspec
@@ -969,6 +970,11 @@ def resolve_engram_config(columns: int) -> EngramConfig:
     per process, at model construction, when the parallel layout and the GPUs are
     known; the result is recorded in the config so later layers read it."""
     config = get_exec().offload.engram_config or EngramConfig()
+    if config.placement == EngramPlacement.EXTERNAL:
+        config = dataclasses.replace(config, lookup=EngramLookup.DIRECT)
+        get_context().override("resolve_engram_config", engram_config=config)
+        logger.info("Engram lookup auto -> direct external table")
+        return config
     if config.lookup != EngramLookup.AUTO:
         return config
     parallel = get_parallel()
@@ -1059,6 +1065,7 @@ class EngramEmbedding(nn.Module):
         )
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
+        self.external_table = None
         self._sort_host_reads = False
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
@@ -1072,6 +1079,10 @@ class EngramEmbedding(nn.Module):
             self.scale = nn.Parameter(scale, requires_grad=False)
         elif config.placement == EngramPlacement.CPU:
             self._init_host_table(num_embeddings, dim, layer_id, config.replication)
+        elif config.placement == EngramPlacement.EXTERNAL:
+            self._init_external_table(
+                num_embeddings, dim, layer_id, column_bounds, config
+            )
         else:
             self.weight = nn.Parameter(
                 torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
@@ -1085,6 +1096,46 @@ class EngramEmbedding(nn.Module):
             )
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
+
+    def _init_external_table(
+        self,
+        num_embeddings: int,
+        dim: int,
+        layer_id: int,
+        column_bounds: tuple[int, ...],
+        config: EngramConfig,
+    ) -> None:
+        from sglang.srt.layers.engram_external import attach_table
+
+        assert config.shared_host_endpoint is not None
+        assert config.shared_host_token_file is not None
+        assert config.shared_host_generation is not None
+        head_sizes = tuple(
+            end - start for start, end in zip(column_bounds, column_bounds[1:])
+        )
+        self.external_table = attach_table(
+            endpoint=config.shared_host_endpoint,
+            token_file=Path(config.shared_host_token_file),
+            generation=config.shared_host_generation,
+            checkpoint_dir=Path(get_model().model_path),
+            layer=layer_id,
+            rows=num_embeddings,
+            dim=dim,
+            head_sizes=head_sizes,
+            device=torch.cuda.current_device(),
+        )
+        self._host_table_ptrs = (
+            self.external_table.weight_ptr,
+            self.external_table.scale_ptr,
+        )
+        self.weight = nn.Parameter(
+            torch.empty(0, dtype=torch.float8_e4m3fn), requires_grad=False
+        )
+        self.scale = nn.Parameter(
+            torch.empty(0, dtype=torch.float8_e8m0fnu), requires_grad=False
+        )
+        self.weight.engram_external = True
+        self.scale.engram_external = True
 
     def _init_host_table(
         self, num_embeddings: int, dim: int, layer_id: int, replication: str
@@ -1110,7 +1161,7 @@ class EngramEmbedding(nn.Module):
 
     @property
     def _shared(self) -> bool:
-        return (
+        return self.external_table is not None or (
             self.host_table is not None
             and self.host_table.replication == EngramReplication.PER_NODE
         )
@@ -1118,7 +1169,11 @@ class EngramEmbedding(nn.Module):
     @property
     def shared_host_table_without_ats(self) -> bool:
         """The shared host layout (every row mapped here) on a GPU without ATS."""
-        return self._shared and self._sort_host_reads
+        return (
+            self.host_table is not None
+            and self.host_table.replication == EngramReplication.PER_NODE
+            and self._sort_host_reads
+        )
 
     def enable_scheduler_staging(self) -> None:
         """Read the rows the scheduler stages (EngramRowStager) instead of
@@ -1127,11 +1182,13 @@ class EngramEmbedding(nn.Module):
         self.staged_by_scheduler = True
 
     def _table_ptrs(self) -> tuple[int, int]:
-        if self.host_table is None:
+        if self.host_table is None and self.external_table is None:
             return self.weight.data_ptr(), self.scale.data_ptr()
         return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if self.external_table is not None:
+            raise RuntimeError("external Engram table weights belong to the owner")
         rows = slice(self.row_start, self.row_start + self.rows)
         if self._shared:
             param.data[rows].copy_(loaded_weight[rows])
