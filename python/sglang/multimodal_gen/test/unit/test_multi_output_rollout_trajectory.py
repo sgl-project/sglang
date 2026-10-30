@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutDenoisingEnv,
     RolloutDitTrajectory,
     RolloutTrajectoryData,
     concat_rollout_trajectory_data,
@@ -17,6 +18,10 @@ def _per_output_trajectory(output_index: int) -> RolloutTrajectoryData:
     tag = float(output_index + 1)
     return RolloutTrajectoryData(
         rollout_log_probs=torch.full((1, _STEPS), tag),
+        denoising_env=RolloutDenoisingEnv(
+            pos_cond_kwargs={"prompt_embedding": torch.full((1, 2), tag)},
+            guidance=torch.full((1,), tag),
+        ),
         dit_trajectory=RolloutDitTrajectory(
             latents=torch.full((1, _STEPS + 1, 2), tag),
             timesteps=torch.arange(_STEPS).float(),
@@ -79,6 +84,24 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
             self.assertEqual(
                 tuple(entry.dit_trajectory.latents.shape), (1, _STEPS + 1, 2)
             )
+
+    def test_merge_and_select_preserve_per_output_denoising_environment(self):
+        merged = concat_rollout_trajectory_data(
+            [_per_output_trajectory(i) for i in range(3)]
+        )
+
+        self.assertEqual(
+            merged.denoising_env.pos_cond_kwargs["prompt_embedding"].flatten().tolist(),
+            [1.0, 1.0, 2.0, 2.0, 3.0, 3.0],
+        )
+        selected = [
+            select_output_rollout_trajectory(merged, index).denoising_env
+            for index in range(3)
+        ]
+        self.assertEqual(
+            [env.pos_cond_kwargs["prompt_embedding"][0, 0].item() for env in selected],
+            [1.0, 2.0, 3.0],
+        )
 
     def test_select_without_output_index_returns_group_trajectory(self):
         merged = concat_rollout_trajectory_data(
