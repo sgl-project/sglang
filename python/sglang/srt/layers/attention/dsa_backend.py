@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.configs.model_config import (
     dsa_draft_shards_under_dcp,
+    dsa_shared_kv_providers,
     dsa_supports_dense_attention,
     get_dsa_index_topk,
     is_deepseek_dsa,
@@ -552,6 +553,7 @@ class DeepseekSparseAttnBackend(
         hf_config = model_runner.model_config.hf_config
         self.use_dsa = is_deepseek_dsa(hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
+        self.has_shared_kv_consumers = bool(dsa_shared_kv_providers(hf_config))
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
@@ -2427,17 +2429,32 @@ class DeepseekSparseAttnBackend(
             "triton_sparse_mla",
         ):
             if topk_transform_method == TopkTransformMethod.RAGGED:
-                _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
+                # A shared-KV consumer's provider has already written the current rows.
+                _has_prefix = any(forward_batch.extend_prefix_lens_cpu) or (
+                    not save_kv_cache and self.has_shared_kv_consumers
+                )
                 page_table_1 = topk_indices
+                page_table_1_flattened = self.forward_metadata.page_table_1_flattened
+                if (
+                    not save_kv_cache
+                    and self.has_shared_kv_consumers
+                    and page_table_1_flattened is None
+                ):
+                    metadata = self.forward_metadata
+                    page_table_1_flattened = torch.cat(
+                        [
+                            metadata.page_table_1[i, :length]
+                            for i, length in enumerate(
+                                metadata.indexer_seq_lens_cpu.tolist()
+                            )
+                        ]
+                    )
 
                 # flashmla_sparse_q8: FP8 compute on SM90 over a bf16 or fp8_e4m3 KV
                 # cache. The helper fuses the q concat with the bf16->fp8 cast; prefix
                 # batches hand over the paged cache as-is, others pass fresh bf16 KV.
                 if dsa_impl == "flashmla_sparse_q8":
                     if _has_prefix:
-                        page_table_1_flattened = (
-                            self.forward_metadata.page_table_1_flattened
-                        )
                         assert page_table_1_flattened is not None
                         return self._forward_flashmla_sparse_q8kv8(
                             q_nope=q_nope,
@@ -2484,9 +2501,6 @@ class DeepseekSparseAttnBackend(
                 # same inputs (concatenated q, dequantized bf16 KV, top-k list
                 # as the slot table) and differ only in the kernel they call.
                 if _has_prefix:
-                    page_table_1_flattened = (
-                        self.forward_metadata.page_table_1_flattened
-                    )
                     assert page_table_1_flattened is not None
                     kv_cache = dequantize_k_cache_paged_dsa(
                         kv_cache, page_table_1_flattened
