@@ -9,6 +9,8 @@ from unittest.mock import patch
 import pytest
 import torch
 from safetensors.torch import save_file
+from torch.nn import functional as F
+
 from sglang.multimodal_gen.configs.models.dits.nomas import NomasArchConfig, NomasConfig
 from sglang.multimodal_gen.configs.models.vaes.nomas import (
     NomasVAEArchConfig,
@@ -55,7 +57,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.n
     NomasSegmentCondition,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from torch.nn import functional as F
 
 # The framework's parallel linears resolve the TP group at construction.
 pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
