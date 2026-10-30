@@ -187,11 +187,16 @@ def handle_load_format(server_args: Any):
         )
 
     if is_runai_obj_uri(cfg.model_path):
-        declare_resolution(
-            server_args,
-            "_handle_load_format",
-            load_format="runai_streamer",
-        )
+        # ModelExpress handles peer loading and its own storage fallback.
+        if not (
+            cfg.load_format == "remote_instance"
+            and cfg.remote_instance_weight_loader_backend == "modelexpress"
+        ):
+            declare_resolution(
+                server_args,
+                "_handle_load_format",
+                load_format="runai_streamer",
+            )
     elif is_remote_url(cfg.model_path):
         declare_resolution(
             server_args,
@@ -203,6 +208,11 @@ def handle_load_format(server_args: Any):
         cfg.speculative_draft_model_path is not None
         and is_runai_obj_uri(cfg.speculative_draft_model_path)
         and cfg.speculative_draft_load_format is None
+        # An unset draft format inherits the explicitly selected MX loader.
+        and not (
+            cfg.load_format == "remote_instance"
+            and cfg.remote_instance_weight_loader_backend == "modelexpress"
+        )
     ):
         declare_resolution(
             server_args,
