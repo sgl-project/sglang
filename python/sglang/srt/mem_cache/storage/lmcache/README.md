@@ -95,3 +95,10 @@ The default model is `Qwen/Qwen3-0.6B`; override it with
 `SGLANG_TEST_LMCACHE_MODEL`. `SGLANG_TEST_LMCACHE_BASE_PORT` (default `31500`)
 reserves the next seven ports for this test. This is a functional test, not a
 latency or throughput benchmark.
+
+On the tested MI355X / ROCm 10 stack, TP=2 passed this test with engine-driven
+LMCache transfers and `MC_FORCE_TCP=1` for Mooncake. The default same-host
+Mooncake HIP path failed cold-request token parity, and TP=2 LMCache-driven
+IPC retrieval faulted even in colocated SGLang. These paths need separate
+validation; the TCP result does not establish their correctness or RDMA
+performance.
