@@ -482,6 +482,83 @@ def test_split_attention_matches_flex(log_scale, fp8, full_clip_f):
     torch.testing.assert_close(split_out, flex_out, rtol=2e-2, atol=2e-2)
 
 
+def _torch_varlen_attention(query, key, value, cu_q, cu_k, max_q, max_k, **_):
+    """CPU stand-in for FA3 varlen: per-segment softmax attention returning (out, lse [H, N])."""
+    outs, lses = [], []
+    for i in range(len(cu_q) - 1):
+        qs = query[cu_q[i] : cu_q[i + 1]].float().transpose(0, 1)
+        ks = key[cu_k[i] : cu_k[i + 1]].float().transpose(0, 1)
+        vs = value[cu_k[i] : cu_k[i + 1]].float().transpose(0, 1)
+        scores = qs @ ks.transpose(-1, -2) * qs.shape[-1] ** -0.5
+        outs.append((scores.softmax(-1) @ vs).transpose(0, 1))
+        lses.append(scores.logsumexp(-1))
+    return torch.cat(outs).to(query.dtype), torch.cat(lses, dim=-1)
+
+
+def _torch_merge_state(out_a, lse_a, out_b, lse_b):
+    lse = torch.logaddexp(lse_a, lse_b)
+    weight_a = (lse_a - lse).exp().unsqueeze(-1)
+    weight_b = (lse_b - lse).exp().unsqueeze(-1)
+    return out_a * weight_a + out_b * weight_b, lse
+
+
+@pytest.mark.parametrize("log_scale", [0.0, -1.3])
+@pytest.mark.parametrize("full_clip_f", [3, 5])  # full clip, short last clip
+def test_split_attention_matches_dense_masked_attention_on_cpu(log_scale, full_clip_f):
+    layout = _InContextLayout((3, 2, 4), (2, 2, 4), (full_clip_f, 2, 4))
+    g = torch.Generator().manual_seed(0)
+    heads, dim = 2, 8
+    q, k, v = (
+        torch.randn(1, layout.generation_video_num_tokens, heads, dim, generator=g)
+        for _ in range(3)
+    )
+    ref_k, ref_v = (
+        _pad_reference_video_kv(
+            torch.randn(1, layout.reference_video_num_tokens, heads, dim, generator=g),
+            layout,
+        )
+        for _ in range(2)
+    )
+
+    # Dense reference over the padded layout flex sees; the mask comes from the block mask itself.
+    padded_gen, padded_kv = layout.padded_generation_video_len, layout.padded_kv_len
+
+    def padded_keys(generation, reference):
+        out = torch.zeros(padded_kv, heads, dim)
+        out[: generation.shape[1]] = generation[0]
+        out[padded_gen : padded_gen + reference.shape[1]] = reference[0]
+        return out
+
+    key, value = padded_keys(k, ref_k), padded_keys(v, ref_v)
+    n = layout.generation_video_num_tokens
+    kv_idx = torch.arange(padded_kv)
+    frame_1_keys = (kv_idx >= layout.max_tokens_per_frame) & (
+        kv_idx < 2 * layout.max_tokens_per_frame
+    )
+    scores = torch.einsum("qhd,khd->hqk", q[0], key) * dim**-0.5
+    scores = scores + log_scale * frame_1_keys
+    allowed = layout.block_mask_fn()(
+        None, None, torch.arange(n)[:, None], kv_idx[None, :]
+    )
+    scores = scores.masked_fill(~allowed, float("-inf"))
+    expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1), value).unsqueeze(0)
+
+    stub = SimpleNamespace(log_scale=log_scale)
+    with (
+        patch(
+            "sglang.kernels.ops.attention.flash_attention.flash_attn_varlen_func",
+            _torch_varlen_attention,
+        ),
+        patch(
+            "sglang.srt.layers.attention.merge_state.merge_state", _torch_merge_state
+        ),
+    ):
+        actual = WanAnimate2TransformerBlock._split_in_context_attention(
+            stub, q, k, v, ref_k, ref_v, layout, None, None
+        )
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
 def test_make_score_mod_is_cached_by_key():
     # Compiled flex_attention guards on score_mod identity; a fresh closure per call
     # would recompile every clip.
