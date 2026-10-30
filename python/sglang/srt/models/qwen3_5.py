@@ -184,18 +184,23 @@ _qknorm_use_alt_stream = _is_cuda or (
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
+_gdn_online_mxfp4 = (
+    ("in_proj_qkvz", "out_proj")
+    if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
+    else ()
+)
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
 # covered by the fused kernel, which removes the two `.contiguous()` copies
-# plus the `torch.cat` of the unfused fallback. On CUDA the ratio-3 dense 27B
-# layout is handled by the Triton kernel's per-head walk (the CPU fused op
+# plus the `torch.cat` of the unfused fallback. On CUDA and AMD/aiter, ratio-3
+# layouts are handled by the Triton kernel's per-head walk (the CPU fused op
 # still requires a power-of-two group). Other backends keep the original
 # tuple so their control flow is unchanged.
 _GDN_FUSED_QKVZBA_RATIOS = (
-    (1, 2, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
+    (1, 2, 3, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
 )
 
 cached_get_processor = lru_cache(get_processor)
@@ -527,6 +532,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
+
+        if _gdn_online_mxfp4 and config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+            from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+                AiterMxfp4OnlineLinearMethod,
+            )
+
+            # The loader quantizes these in process_weights_after_loading.
+            # gemm_a4w4 needs N, K % 256 == 0; other shapes stay BF16.
+            for name in _gdn_online_mxfp4:
+                proj = getattr(self, name)
+                if (
+                    isinstance(proj.quant_method, UnquantizedLinearMethod)
+                    and proj.weight.dtype == torch.bfloat16
+                    and all(d % 256 == 0 for d in proj.weight.shape)
+                ):
+                    proj.quant_method = AiterMxfp4OnlineLinearMethod()
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -1878,13 +1899,24 @@ class Qwen3_5ForCausalLM(nn.Module):
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
         if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
             packed = 0
+            mxfp4 = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
+                    mxfp4 += sum(
+                        hasattr(getattr(module, name, None), "mxfp4_preshuffle_tuned")
+                        for name in _gdn_online_mxfp4
+                    )
                     module.finalize_fused_in_proj()
                     packed += int(module._fused_in_proj_weight is not None)
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
+            if _gdn_online_mxfp4:
+                logger.info(
+                    "Online MXFP4 GDN %s: %d projections",
+                    ",".join(_gdn_online_mxfp4),
+                    mxfp4,
+                )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture

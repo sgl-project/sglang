@@ -28,7 +28,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import get_kv_layers
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -52,6 +52,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _has_fused_qk_norm_mrope = False
 _has_fused_qk_norm_rope = False
 if _use_aiter:
+    from aiter import dtypes as aiter_dtypes
+
     try:
         from aiter import fused_qk_norm_mrope_3d_cache_pts_quant_shuffle
 
@@ -93,8 +95,10 @@ def aiter_fused_qk_norm_rope_set_kv(
 
     ``qkv`` is the (num_tokens, (num_heads + 2 * num_kv_heads) * head_dim) QKV
     projection; ``k_cache`` / ``v_cache`` are the NHD (slots, num_kv_heads,
-    head_dim) pool buffers. ``k_scale`` / ``v_scale`` must be CPU tensors: the
-    kernel reads them on the host. Returns q as (num_tokens, num_heads * head_dim).
+    head_dim) pool buffers, in ``qkv``'s dtype or ``aiter.dtypes.fp8``. An fp8
+    cache stores k / k_scale and v / v_scale; other caches ignore the scales.
+    ``k_scale`` / ``v_scale`` must be CPU tensors: the kernel reads them on the
+    host. Returns q as (num_tokens, num_heads * head_dim).
     """
     num_tokens = qkv.shape[0]
     q_out = torch.empty(
@@ -137,6 +141,23 @@ def aiter_fused_qk_norm_rope_set_kv(
     else:
         fused_qk_norm_rope_cache_pts_quant_shuffle(**kernel_kwargs)
     return q_out.view(num_tokens, -1)
+
+
+def _host_kv_scale(scale, scale_float) -> float:
+    """Host value of a RadixAttention per-tensor KV scale. ``BaseKVCacheMethod``
+    pairs its device scale with a float, ``load_kv_cache_scales`` sets a plain
+    float, and without a scale the pool writes unscaled."""
+    if scale is None:
+        return 1.0
+    if scale_float is not None:
+        return float(scale_float)
+    if isinstance(scale, (int, float)):
+        return float(scale)
+    # Reading it here would be a device-to-host sync, which graph capture forbids.
+    raise ValueError(
+        f"the fused KV write needs a host copy of the KV scale, got a "
+        f"{type(scale).__name__} without one"
+    )
 
 
 class Qwen3Attention(nn.Module):
@@ -245,13 +266,23 @@ class Qwen3Attention(nn.Module):
             and self.head_dim in (64, 128, 256, 512)
             and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
         )
-        if self.use_fused_qk_norm_mrope or self.use_fused_qk_norm_rope:
-            # Scale tensors MUST stay on CPU: the C++ kernel uses .item<float>()
-            # which triggers hipMemcpy D2H + sync on CUDA tensors, breaking graph capture.
-            # Explicit device='cpu' is required because SGLang constructs models inside
-            # a `with torch.device('cuda'):` context that changes the default device.
-            self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
-            self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
+        # Built on first use: the KV scales are set after __init__, by
+        # process_weights_after_loading or load_kv_cache_scales.
+        self._fused_kv_scales: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    def _aiter_fused_kv_scales(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(k_scale, v_scale) for the fused KV write as CPU float32 tensors. The
+        kernel reads them on the host at launch, so a device tensor would sync
+        and break graph capture, and a captured graph keeps the values it was
+        captured with."""
+        if self._fused_kv_scales is None:
+            k_scale = _host_kv_scale(self.attn.k_scale, self.attn.k_scale_float)
+            v_scale = _host_kv_scale(self.attn.v_scale, self.attn.v_scale_float)
+            self._fused_kv_scales = (
+                torch.tensor(k_scale, dtype=torch.float32, device="cpu"),
+                torch.tensor(v_scale, dtype=torch.float32, device="cpu"),
+            )
+        return self._fused_kv_scales
 
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -305,8 +336,7 @@ class Qwen3Attention(nn.Module):
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
-            self._fused_k_scale,
-            self._fused_v_scale,
+            *self._aiter_fused_kv_scales(),
         )
         return q, None, None
 
@@ -327,11 +357,11 @@ class Qwen3Attention(nn.Module):
             and get_exec().deterministic.rl_on_policy_target is None
         )
         if can_try_aiter_fused:
-            k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.attn.layer_id)
-            # The fused write targets the NHD layout in the activation dtype and
-            # does not apply per-layer KV scales.
-            use_aiter_fused = (
-                k_cache.dim() == 3 and k_cache.dtype == hidden_states.dtype
+            k_cache, v_cache = get_kv_layers().read(self.attn.layer_id).kv()
+            # The fused write targets the NHD layout, in the activation dtype or
+            # the one fp8 dtype the kernel quantizes to.
+            use_aiter_fused = k_cache.dim() == 3 and (
+                k_cache.dtype in (hidden_states.dtype, aiter_dtypes.fp8)
             )
 
         if use_aiter_fused:
