@@ -614,6 +614,86 @@ class TestFieldContinuationRendering(CustomTestCase):
 
 
 class TestFieldContinuationParser(CustomTestCase):
+    def _assert_suffix(self, model_type, request, text, expected):
+        parser = ReasoningParser(model_type, request=request)
+        self.assertEqual(parser.parse_non_stream(text), expected)
+        for stream_reasoning in (False, True):
+            for chunks in ((text,), tuple(text)):
+                with self.subTest(
+                    model_type=model_type,
+                    text=text,
+                    stream_reasoning=stream_reasoning,
+                    chunks=len(chunks),
+                ):
+                    parser = ReasoningParser(
+                        model_type, stream_reasoning=stream_reasoning, request=request
+                    )
+                    parts = [parser.parse_stream_chunk(chunk) for chunk in chunks]
+                    parts.append(parser.parse_stream_end())
+                    self.assertEqual(
+                        tuple("".join(part[i] or "" for part in parts) for i in (0, 1)),
+                        expected,
+                    )
+
+    @staticmethod
+    def _request(target):
+        return ChatCompletionRequest(
+            messages=[
+                {"role": "assistant", "reasoning_content": "I mention ", "content": ""}
+            ],
+            continue_final_message=target,
+        )
+
+    def test_content_continuation_preserves_literal_think_tags(self):
+        text = "<think>literal</think> tail"
+        for model_type in ("qwen3", "deepseek-r1"):
+            self._assert_suffix(model_type, self._request("content"), text, ("", text))
+
+    def test_reasoning_continuation_preserves_literal_think_opener(self):
+        for model_type in ("qwen3", "deepseek-r1"):
+            for close in ("", "</think>Answer."):
+                self._assert_suffix(
+                    model_type,
+                    self._request("reasoning_content"),
+                    "<think> as an example." + close,
+                    ("<think> as an example.", "Answer." if close else ""),
+                )
+
+    def test_reasoning_continuation_tool_literal_is_chunk_invariant(self):
+        for close in ("", "</think>Answer."):
+            self._assert_suffix(
+                "qwen3",
+                self._request("reasoning_content"),
+                "<tool_call> is the tag being discussed." + close,
+                (
+                    "<tool_call> is the tag being discussed.",
+                    "Answer." if close else "",
+                ),
+            )
+
+    def test_legacy_tool_interruption_and_openers_survive_other_requests(self):
+        # Explicit continuation changes only its own detector instance.
+        ReasoningParser("qwen3", request=self._request("content"))
+        for target in (None, False, True):
+            with self.subTest(target=target):
+                kwargs = {} if target is None else {"continue_final_message": target}
+                request = ChatCompletionRequest(
+                    messages=[{"role": "assistant", "content": "<think>prefix"}],
+                    **kwargs,
+                )
+                self._assert_suffix(
+                    "qwen3-thinking",
+                    request,
+                    "<tool_call>unfinished",
+                    ("", "<tool_call>unfinished"),
+                )
+                self._assert_suffix(
+                    "qwen3-thinking",
+                    request,
+                    "<think>reason</think>answer",
+                    ("reason", "answer"),
+                )
+
     def test_selected_field_overrides_defaults_and_previous_literal_tags(self):
         for model_type in ("qwen3", "qwen3-thinking", "deepseek-r1"):
             for target in ("content", "reasoning_content"):
