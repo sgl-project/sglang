@@ -175,6 +175,10 @@ def disagg_transfers_in_flight(scheduler):
     - DECODE: `pop_preallocated` publishes one request's destinations and keeps
       allocating for the next, whose allocation can urgently flush the peer
       sub-allocator; the batch reaches the transfer queue only after the loop.
+
+    A decode request receiving into the host pool (`host_staged`) exposes host
+    pages only and holds no device page until `allocate_host_staged`, so it
+    does not close the gate while it waits on the transfer queue.
     """
 
     # The scheduler and pool outlive the queues rebuilt by a PD role switch.
@@ -187,7 +191,10 @@ def disagg_transfers_in_flight(scheduler):
         if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             decode_offload_manager = scheduler.decode_offload_manager
             return bool(
-                scheduler.disagg_decode_transfer_queue.queue
+                any(
+                    not decode_req.host_staged
+                    for decode_req in scheduler.disagg_decode_transfer_queue.queue
+                )
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
                 or (
                     decode_offload_manager is not None
@@ -1563,7 +1570,7 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
     # populate finish metadata and stream output
-    req.finished_reason = FINISH_ABORT(error_message, status_code)
+    req.finish_outside_step(FINISH_ABORT(error_message, status_code))
 
     if req.return_logprob:
         req.logprob.input_token_logprobs_val = []

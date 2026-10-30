@@ -501,7 +501,9 @@ public:
 
     static_assert(NUM_EXTRA_SLOTS * sizeof(uint64_t) >= NUM_ELEMS_IN_INIT_WINDOW * sizeof(ValueT),
                 "the init window must fit in the extra pairs region");
-    static_assert(NUM_EXTRA_SLOTS * sizeof(uint64_t) / sizeof(uint32_t) >= MAX_VOCAB_SIZE / NUM_ELEMS_PER_SEG,
+    // [SGLang] The delta table is built only under SORT_BY_INDEX.
+    static_assert(!Config::sorted_index ||
+                      NUM_EXTRA_SLOTS * sizeof(uint64_t) / sizeof(uint32_t) >= MAX_VOCAB_SIZE / NUM_ELEMS_PER_SEG,
                 "the index sort's window delta table must fit in the extra pairs region");
     // array `incoming_topk_pairs` will be used as
     //     1. tma buffer during init phase
