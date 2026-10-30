@@ -14,7 +14,9 @@ from sglang.srt.models.dspark import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
+    DraftParams,
     draft_markov_block,
+    resolve_draft_params,
     sample_draft_block,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
@@ -27,6 +29,38 @@ register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 DEVICE = torch.device("cuda")
 VOCAB, RANK, BS, GAMMA = 10000, 16, 8, 5
+
+
+class TestResolveDraftParams(CustomTestCase):
+    def test_one_launch_matches_the_torch_chain(self):
+        # clamped temperatures (a NaN stays NaN), the top-k <= 1 mask and 0 there,
+        # into the leading rows of wider static buffers
+        temps = torch.tensor(
+            [[0.0], [1e-7], [0.7], [float("nan")], [2.0], [1.0]], device=DEVICE
+        )
+        top_ks = torch.tensor([1, 0, 50, 1, 2, 1], dtype=torch.int32, device=DEVICE)
+        info = SimpleNamespace(temperatures=temps, top_ks=top_ks)
+        bs = 5
+        out = DraftParams(
+            temperatures=torch.full((8,), -1.0, device=DEVICE),
+            greedy_mask=torch.zeros(8, dtype=torch.bool, device=DEVICE),
+            step_temperatures=torch.full((8,), -1.0, device=DEVICE),
+        )
+        got = resolve_draft_params(sampling_info=info, bs=bs, out=out)
+        ref_t = temps.view(-1)[:bs].float().clamp(min=1e-5)
+        ref_g = top_ks[:bs] <= 1
+        ref_s = torch.where(ref_g, torch.zeros((), device=DEVICE), ref_t)
+        torch.testing.assert_close(
+            got.temperatures, ref_t, rtol=0, atol=0, equal_nan=True
+        )
+        self.assertTrue(torch.equal(got.greedy_mask, ref_g))
+        torch.testing.assert_close(
+            got.step_temperatures, ref_s, rtol=0, atol=0, equal_nan=True
+        )
+        # rows past bs keep the buffer's values
+        self.assertTrue(
+            torch.equal(out.temperatures[bs:], torch.full((3,), -1.0, device=DEVICE))
+        )
 
 
 class TestDraftMarkovBlockGraph(CustomTestCase):

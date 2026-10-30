@@ -107,14 +107,18 @@ def _case_build_out_tokens(tc):
     for cl_dtype in (torch.int32, torch.int64):
         # Bonus insertion swept through every position 0..gamma.
         cl = (torch.arange(bs, device=DEVICE) % (gamma + 1)).to(cl_dtype)
-        tc._parity(
-            dspark_verify_window.BuildOutTokens,
+        kw = dict(
             draft_tokens=_ri(0, VOCAB, (bs, gamma)),
             correct_len=cl,
             bonus=_ri(0, VOCAB, (bs,)),
             verify_num_draft_tokens=gamma + 1,
             gamma=gamma,
         )
+        got, _ = tc._parity(dspark_verify_window.BuildOutTokens, **kw)
+        # into the in-graph accept's static buffer
+        out = torch.full((bs, gamma + 1), -1, dtype=torch.int64, device=DEVICE)
+        dspark_verify_window.BuildOutTokens.triton(**kw, out=out)
+        tc._eq(out, got)
 
 
 def _case_build_ragged_verify_window(tc):
@@ -354,6 +358,30 @@ def _case_finalize_accept_lens(tc):
             cap_trim_lens=_ri(0, 4, (bs,)),
             prefix_lens=_ri(1, 4000, (bs,), prefix_dtype),
         )
+    # The in-graph accept's static buffers: the plain call's lengths, widened
+    # where the buffer is, with correct_len and bonus copied through.
+    kw = dict(
+        correct_len=_ri(0, 7, (bs,), torch.int32),
+        cap_trim_lens=_ri(0, 4, (bs,)),
+        prefix_lens=_ri(1, 4000, (bs,), torch.int32),
+    )
+    bonus = _ri(0, VOCAB, (bs,))
+    want = dspark_accept.FinalizeAcceptLens.torch(**kw)
+    cls = dspark_accept.FinalizeAcceptLens
+    for impl in (cls.triton, cls.torch):
+        out = types.SimpleNamespace(
+            correct_len=torch.full((bs,), -1, dtype=torch.int64, device=DEVICE),
+            bonus=torch.full((bs,), -1, dtype=torch.int64, device=DEVICE),
+            cap_trim_lens=torch.full((bs,), -1, dtype=torch.int32, device=DEVICE),
+            commit_lens=torch.full((bs,), -1, dtype=torch.int32, device=DEVICE),
+            new_seq_lens=torch.full((bs,), -1, dtype=torch.int64, device=DEVICE),
+        )
+        impl(**kw, bonus=bonus, out=out)
+        tc._eq(out.correct_len, kw["correct_len"].long())
+        tc._eq(out.bonus, bonus)
+        tc._eq(out.cap_trim_lens, want.cap_trim_lens)
+        tc._eq(out.commit_lens, want.commit_lens)
+        tc._eq(out.new_seq_lens, want.new_seq_lens.long())
 
 
 def _case_mixed_accept_select(tc):

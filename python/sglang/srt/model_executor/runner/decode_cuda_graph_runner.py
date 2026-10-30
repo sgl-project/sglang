@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import inspect
+import itertools
 import logging
 import os
 from types import SimpleNamespace
@@ -139,6 +140,13 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+# suffix of the variant captured without ``ModelRunner.optional_capture_tail_hooks``
+NO_TAIL = "notail"
+
+
+def _no_tail_label(label: Optional[str]) -> str:
+    return f"{label}-{NO_TAIL}" if label else NO_TAIL
 
 
 @contextlib.contextmanager
@@ -789,6 +797,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             sizes is None or bs in sizes
         )
 
+    def _resolve_variant(self, forward_batch: ForwardBatch):
+        """The LoRA variant, without the optional tail hooks if the step skips them."""
+        label = self._resolve_lora_variant(forward_batch)
+        runner = self.model_runner
+        if runner.optional_capture_tail_hooks and not runner.want_optional_tail:
+            return _no_tail_label(label)
+        return label
+
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not self.record_nolora_graph:
             return None
@@ -911,7 +927,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         graph_key = self._make_graph_key(
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
-            variant_label=self._resolve_lora_variant(forward_batch),
+            variant_label=self._resolve_variant(forward_batch),
             attention_variant=(
                 self._resolve_attention_variant(forward_batch, cuda_graph_bs)
                 if self.disable_padding
@@ -1383,8 +1399,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
-            for variant_label in lora_variants:
-                with capture_lora_variant(variant_label):
+            # each shape also without the optional tail hooks, if there are any
+            optional_hooks = self.model_runner.optional_capture_tail_hooks
+            skip_tails = (False, True) if optional_hooks else (False,)
+            for lora_label, skip_tail in itertools.product(lora_variants, skip_tails):
+                variant_label = _no_tail_label(lora_label) if skip_tail else lora_label
+                with capture_lora_variant(lora_label):
                     for attention_variant in attention_variants:
                         _set_capture_attention_variant(attention_variant)
                         self._set_profile_trace_tag(
@@ -1508,6 +1528,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         )
                     for capture_hook in self.model_runner.capture_tail_hooks:
                         capture_hook(self, out, forward_batch, num_tokens)
+                    if not (variant_label or "").endswith(NO_TAIL):
+                        hooks = self.model_runner.optional_capture_tail_hooks
+                        for capture_hook in hooks:
+                            capture_hook(self, out, forward_batch, num_tokens)
                     return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -1630,7 +1654,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
-            variant_label = self._resolve_lora_variant(forward_batch)
+            variant_label = self._resolve_variant(forward_batch)
             attention_variant = self._resolve_attention_variant(forward_batch, self.bs)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
@@ -1741,7 +1765,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
-        variant_label = self._resolve_lora_variant(forward_batch)
+        variant_label = self._resolve_variant(forward_batch)
         if self._early_verify_metadata is not None:
             self._early_verify_metadata.count_variant(
                 attention_variant, taken=early_staged
