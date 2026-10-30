@@ -42,6 +42,7 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
     # The embedded text worker admits 8192 prefill tokens shared by the two
     # CFG sequences and each sequence appends 256 query tokens.
     max_request_text_tokens: int = 3584
+    num_query_tokens: int = 256
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         if sigmas is not None:
@@ -120,14 +121,18 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
             )
         self._validate_spatial_rope_bounds(width, height)
         if editing:
-            # Lower bound without the prompt, the DiT checks the exact length.
+            # A caption holds at least one text token and the query tokens.
+            # The bound is exact for short prompts and the DiT checks the rest.
+            caption_tokens = 1 + self.num_query_tokens
             image_tokens = (width // self.latent_scale_factor) * (
                 height // self.latent_scale_factor
             )
             sigvq_tokens = (width // self.editing_size_multiple) * (
                 height // self.editing_size_multiple
             )
-            rows = editing_rope_rows(0, [image_tokens, image_tokens], sigvq_tokens)
+            rows = editing_rope_rows(
+                caption_tokens, [image_tokens, image_tokens], sigvq_tokens
+            )
             limit = self.dit_config.arch_config.axes_lens[0]
             if rows > limit:
                 raise ValueError(
