@@ -60,8 +60,11 @@ from sglang.srt.runtime_context import (
 )
 
 from .protocol import (
+    PROTOCOL_VERSION,
     CacheConfig,
+    ProtocolVersionError,
     check_ipc_quant_support,
+    check_protocol_version,
     cleanup_stale_daemon_files,
     compute_env_stamp,
     compute_global_rank,
@@ -556,6 +559,26 @@ class WeightCacheDaemon:
     def _handle_connection(self, conn: socket.socket):
         """Handle a single client connection."""
         req = recv_msg(conn)
+
+        try:
+            if req.get("type") == "handshake":
+                check_protocol_version(req.get("protocol_version"))
+                send_msg(conn, {"status": "ok", "protocol_version": PROTOCOL_VERSION})
+                req = recv_msg(conn)
+
+            if req.get("type") == "fetch_state":
+                # Reject legacy clients before they reach config or IPC handling.
+                check_protocol_version(req.get("protocol_version"))
+        except ProtocolVersionError as e:
+            send_msg(
+                conn,
+                {
+                    "status": "protocol_mismatch",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "message": str(e),
+                },
+            )
+            return
 
         if req.get("type") == "query_config":
             # Client asks for config without requesting handles
