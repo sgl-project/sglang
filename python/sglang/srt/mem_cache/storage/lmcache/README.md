@@ -170,7 +170,10 @@ reserves the next seven ports for this test. This is a functional test, not a
 latency or throughput benchmark.
 
 On the tested MI355X / ROCm 10 stack, TP=2 passed this test with engine-driven
-LMCache transfers and `MC_FORCE_TCP=1` for Mooncake. The default same-host
+LMCache transfers and `MC_FORCE_TCP=1` for Mooncake. Named SHM also passed
+with Qwen3-0.6B and Qwen3-8B, including both engine restarts and strict
+16-token output parity. These are functional smoke tests rather than a model
+accuracy benchmark. The default same-host
 Mooncake HIP path failed cold-request token parity, and TP=2 LMCache-driven
 IPC retrieval faulted even in colocated SGLang. These paths need separate
 validation; the TCP result does not establish their correctness or RDMA
