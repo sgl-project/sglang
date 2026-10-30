@@ -748,7 +748,7 @@ class UnifiedTreeCoreInterface(ABC):
         key: RadixKey,
         start: int,
         end: int,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[tuple[int, int]]:
         """Return maximal missing SWA ranges within the matched [start, end) span."""
         ...
@@ -760,7 +760,7 @@ class UnifiedTreeCoreInterface(ABC):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
-        component_type: ComponentType = ComponentType.SWA,
+        component_type: ComponentType,
     ) -> list[CacheAction | ComponentAction]:
         """Attach a loaded SWA window to tombstoned spans, returning split actions.
 

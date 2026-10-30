@@ -166,21 +166,22 @@ void paged_experts_decide(
     tvm::ffi::TensorView run_ids,
     tvm::ffi::TensorView run_w) {
   using namespace sglang::host;
+  using sglang::kDLGPU;
 
   SymbolicSize E = {"num_experts"}, K = {"num_slots"}, T = {"num_entries"}, One = {"one"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
-  TensorMatcher({E}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(expert_slot);
+  device_.set_options<kDLGPU>();
+  TensorMatcher({E}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(expert_slot);
   TensorMatcher({K})
       .with_dtype<int32_t>()
-      .with_device<kDLCUDA>(device_)
+      .with_device<kDLGPU>(device_)
       .verify(slot_expert)
       .verify(slot_lastuse)
       .verify(src)
       .verify(dst);
-  TensorMatcher({T}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk).verify(run_ids);
-  TensorMatcher({T}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(weights).verify(run_w);
-  TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(step).verify(count);
+  TensorMatcher({T}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(topk).verify(run_ids);
+  TensorMatcher({T}).with_dtype<float>().with_device<kDLGPU>(device_).verify(weights).verify(run_w);
+  TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(step).verify(count);
   RuntimeCheck(T.unwrap() <= K.unwrap(), "paged_experts_decide needs at most K routed entries, got ", T.unwrap());
 
   LaunchKernel(1, 32, device_.unwrap())(
@@ -209,13 +210,14 @@ void paged_experts_gather(
     tvm::ffi::TensorView dst,
     tvm::ffi::TensorView count) {
   using namespace sglang::host;
+  using sglang::kDLGPU;
 
   SymbolicSize P = {"num_tensors"}, K = {"num_slots"}, One = {"one"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
-  TensorMatcher({P}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(hosts).verify(gpus).verify(row_bytes);
-  TensorMatcher({K}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(src).verify(dst);
-  TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(count);
+  device_.set_options<kDLGPU>();
+  TensorMatcher({P}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(hosts).verify(gpus).verify(row_bytes);
+  TensorMatcher({K}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(src).verify(dst);
+  TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(count);
 
   // Decode pages few experts per step, so launch cost matters more than link saturation: a
   // 2048x512 grid saturates the link better but measured 5% slower end to end (Qwen3-30B, K=90).
