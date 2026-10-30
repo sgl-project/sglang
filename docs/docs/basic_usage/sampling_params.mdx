@@ -100,6 +100,11 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Custom logit processor for advanced sampling control. Must be a serialized instance of `CustomLogitProcessor` using its `to_str()` method. For usage see below.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>bidir_prefix_len</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[Union[List[int], int]] = None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Block-bidirectional (prefix-LM) attention for decision models trained that way, such as Base Labs' elephant-1 and mammoth-1. Prompt tokens before this index form the state block and attend to each other in both directions; tokens at or after it form the question block and attend to the whole prompt. Linear-attention (GDN/Mamba) layers stay causal. The radix cache reuses the state block only when it matches in full, and requests on the same state are serialized so later questions hit the cache. Requires `--attention-backend triton`; the prompt must fit in `--chunked-prefill-size`. `None` or `-1` is ordinary causal attention.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>return_hidden_states</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Union[List[bool], bool] = False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Whether to return hidden states.</td>
