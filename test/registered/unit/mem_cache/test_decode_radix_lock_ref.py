@@ -34,6 +34,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+import sglang.srt.observability.trace as trace_mod
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
@@ -49,7 +50,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     TreeLock,
 )
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -57,6 +58,17 @@ from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
 from sglang.test.test_utils import CustomTestCase
+
+try:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    _has_otel = True
+except ImportError:
+    _has_otel = False
 
 
 def _make_cache_with_pools(page_size=1):
@@ -589,6 +601,112 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         self.assertEqual(shared.lock_ref, 2)
         self.assertEqual(req_to_token[0, :3].tolist(), prefix_vals)
+
+
+@unittest.skipUnless(_has_otel, "opentelemetry not installed")
+class TestCheckpointTracing(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
+        self.exporter = InMemorySpanExporter()
+        self.provider = TracerProvider()
+        self.provider.add_span_processor(SimpleSpanProcessor(self.exporter))
+        self.addCleanup(self.provider.shutdown)
+        for name, value in (
+            ("tracer", self.provider.get_tracer("cache-checkpoint-test")),
+            ("opentelemetry_initialized", True),
+            ("threads_info", {}),
+        ):
+            patcher = patch.object(trace_mod, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def make_request_and_cache(self, *, traced=True):
+        cache, indices = _make_cache_with_pools()
+        req = Req(
+            rid="checkpoint-request",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2, 3, 4]),
+            sampling_params=SamplingParams(max_new_tokens=8),
+        )
+        req.refresh_fill_ids()
+        req.extend_end = 4
+        req.kv = ReqKvInfo(req_pool_idx=0, kv_committed_len=4, kv_allocated_len=4)
+        req.last_node = cache.root_node
+        indices[0, :4] = torch.arange(10, 14)
+        if traced:
+            req.time_stats.trace_ctx = trace_mod.TraceReqContext(
+                rid=req.rid, trace_level=3
+            )
+            req.time_stats.trace_ctx.trace_req_start()
+        return req, cache
+
+    def checkpoint_spans(self):
+        return [
+            s
+            for s in self.exporter.get_finished_spans()
+            if s.name == "cache_checkpoint_cpu"
+        ]
+
+    def test_running_and_release_checkpoints_keep_real_prefix_and_trace(self):
+        for final in (False, True):
+            with self.subTest(final=final):
+                self.exporter.clear()
+                req, cache = self.make_request_and_cache()
+                ctx = req.time_stats.trace_ctx
+                trace_id = ctx.root_span.get_span_context().trace_id
+                # Instrumentation must not introduce a device synchronization.
+                with patch.object(
+                    torch.cuda, "synchronize", side_effect=AssertionError
+                ):
+                    if final:
+                        req.finished_reason = "finished"
+                        release_kv_cache(req, cache, checkpoint=True)
+                    else:
+                        checkpoint_kv_cache(req, cache)
+                        self.assertEqual(req.prefix_len, 4)
+                result = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4])))
+                )
+                self.assertEqual(result.device_prefix_len, 4)
+                spans = self.checkpoint_spans()
+                self.assertEqual(len(spans), 1)
+                self.assertEqual(spans[0].context.trace_id, trace_id)
+                self.assertEqual(spans[0].attributes["cache.checkpoint.up_to"], 4)
+                self.assertEqual(
+                    spans[0].attributes["cache.checkpoint.phase"],
+                    "release" if final else "running",
+                )
+                self.assertTrue(spans[0].attributes["cache.checkpoint.succeeded"])
+                self.assertGreaterEqual(spans[0].end_time, spans[0].start_time)
+                self.assertFalse(ctx.thread_context.cur_slice_stack)
+                ctx.trace_req_finish()
+
+    def test_failed_checkpoint_closes_span_and_preserves_request_position(self):
+        req, cache = self.make_request_and_cache()
+        ctx = req.time_stats.trace_ctx
+        with patch.object(cache, "checkpoint", side_effect=ValueError("copy failure")):
+            with self.assertRaisesRegex(ValueError, "copy failure"):
+                checkpoint_kv_cache(req, cache)
+        self.assertEqual(req.prefix_len, 0)
+        spans = self.checkpoint_spans()
+        self.assertEqual(len(spans), 1)
+        self.assertFalse(spans[0].attributes["cache.checkpoint.succeeded"])
+        self.assertFalse(ctx.thread_context.cur_slice_stack)
+        checkpoint_kv_cache(req, cache)
+        self.assertEqual(req.prefix_len, 4)
+        ctx.trace_req_finish()
+
+    def test_disabled_and_skipped_checkpoints_emit_no_spans(self):
+        for traced, skip in ((False, False), (True, True)):
+            with self.subTest(traced=traced, skip=skip):
+                req, cache = self.make_request_and_cache(traced=traced)
+                req.skip_radix_cache_insert = skip
+                checkpoint_kv_cache(req, cache)
+                self.assertEqual(req.prefix_len, 4)
+                self.assertFalse(self.checkpoint_spans())
+                req.time_stats.trace_ctx.trace_req_finish()
 
 
 if __name__ == "__main__":

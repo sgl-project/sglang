@@ -18,8 +18,9 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
 
 import msgspec
 from typing_extensions import Self
@@ -148,6 +149,7 @@ class RequestStage:
         level=3,
         metrics_is_observed=True,
     )
+    CACHE_CHECKPOINT_CPU = RequestStageConfig("cache_checkpoint_cpu", level=1)
 
     # EPD disaggregation Encode process
     MM_ENCODE = RequestStageConfig(
@@ -324,6 +326,31 @@ class ReqTimeStatsBase:
                 attrs=attrs,
             )
             self.trace_ctx.trace_slice(_slice)
+
+    @contextmanager
+    def trace_cache_checkpoint(self, *, up_to: int, phase: str) -> Iterator[None]:
+        if not self.trace_ctx.tracing_enable:
+            yield
+            return
+
+        stage = RequestStage.CACHE_CHECKPOINT_CPU
+        self.trace_ctx.trace_slice_start(stage.stage_name, stage.level)
+        succeeded = False
+        try:
+            yield
+            succeeded = True
+        finally:
+            # This is CPU call time, including any waits inside checkpoint().
+            # It is not a DMA timer and must not add device synchronization.
+            self.trace_ctx.trace_slice_end(
+                stage.stage_name,
+                stage.level,
+                attrs={
+                    "cache.checkpoint.phase": phase,
+                    "cache.checkpoint.up_to": up_to,
+                    "cache.checkpoint.succeeded": succeeded,
+                },
+            )
 
     def __getstate__(self) -> object:
         # The object is propagated to other processes via serialization and deserialization methods,

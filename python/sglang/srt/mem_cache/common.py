@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
@@ -300,6 +301,17 @@ def match_kv_cache(
     return match_result
 
 
+def _checkpoint_with_trace(
+    req: Req, tree_cache: BasePrefixCache, *, up_to: int, phase: str
+) -> None:
+    if not get_global_tracing_enabled():
+        tree_cache.checkpoint(req, up_to=up_to)
+        return
+
+    with req.time_stats.trace_cache_checkpoint(up_to=up_to, phase=phase):
+        tree_cache.checkpoint(req, up_to=up_to)
+
+
 def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     """Publish what the running request has computed so far, unless it is
     barred from the tree."""
@@ -307,7 +319,7 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
     if not req.skip_radix_cache_insert:
-        tree_cache.checkpoint(req, up_to=req.extend_end)
+        _checkpoint_with_trace(req, tree_cache, up_to=req.extend_end, phase="running")
     # The next extend resumes after this one, published or not.
     req.prefix_len = req.extend_end
 
@@ -477,7 +489,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         )
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req.refresh_fill_ids()
-        tree_cache.checkpoint(req, up_to=owned_kv_len)
+        _checkpoint_with_trace(req, tree_cache, up_to=owned_kv_len, phase="release")
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
     tree_cache.unlock(req.lock)
