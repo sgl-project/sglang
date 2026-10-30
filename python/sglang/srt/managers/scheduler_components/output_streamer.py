@@ -10,6 +10,7 @@ from typing import (
     Any,
     Callable,
     ClassVar,
+    Dict,
     List,
     Optional,
 )
@@ -37,9 +38,17 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.runtime_context import get_observability, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_observability,
+    get_parallel,
+    get_serving,
+    get_spec,
+)
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_decoding_metrics import (
+    populate_spec_info,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
@@ -190,6 +199,33 @@ class SchedulerOutputStreamer:
         if req.detokenize_header_sent:
             self.send_to_detokenizer.send_output(DetokenizeReleaseReq(rid=req.rid))
 
+    def get_request_stats(self, req: Req, completion_tokens: int) -> Dict[str, Any]:
+        """A finished request's ``meta_info`` keys that Python's
+        TokenizerManager derives from scheduler state, built with the helpers
+        it uses, for the Rust frontend to report as they are: the retraction
+        count, the scheduler's timings when metrics are on, and the
+        speculative-decoding stats. TokenizerManager also reports the first
+        two on intermediate frames; the frontend reports them only on the
+        terminal one."""
+        stats: Dict[str, Any] = {"num_retractions": req.retraction_count}
+        if get_observability().enable_metrics:
+            output_time_stats = req.time_stats.to_output_time_stats()
+            if output_time_stats is not None:
+                stats.update(output_time_stats.to_meta_info())
+        if not self.spec_algorithm.is_none():
+            populate_spec_info(
+                stats,
+                num_draft_tokens=get_spec().speculative_num_draft_tokens,
+                completion_tokens=completion_tokens,
+                verify_ct=req.spec_verify_ct,
+                num_correct_drafts=req.spec_num_correct_drafts,
+                num_cap_tokens=req.spec_num_cap_tokens,
+                num_block_accept_tokens=req.spec_num_block_accept_tokens,
+                correct_drafts_histogram=req.spec_correct_drafts_histogram,
+                cap_lens_histogram=req.spec_cap_lens_histogram,
+            )
+        return stats
+
     def stream_output(
         self,
         reqs: List[Req],
@@ -258,6 +294,9 @@ class SchedulerOutputStreamer:
             cached_tokens_split=(
                 [] if self._rust_frames_split_cached_tokens() else None
             ),
+            get_request_stats=(
+                self.get_request_stats if self.rust_server is not None else None
+            ),
         )
         for req in reqs:
             if req is skip_req:
@@ -303,6 +342,7 @@ class SchedulerOutputStreamer:
                         if acc.cached_tokens_split and self.enable_hicache_storage()
                         else None
                     ),
+                    acc.rust_request_stats,
                 )
             else:
                 self.send_to_detokenizer.send_output(payload)
@@ -470,6 +510,12 @@ class _GenerationStreamAccumulator:
     # request's cached tokens per tier, as (device, host, storage). None
     # otherwise.
     cached_tokens_split: Optional[list] = None
+    # Rust server mode: builds a finished request's `request_stats` from it and
+    # its completion tokens (`SchedulerOutputStreamer.get_request_stats`).
+    # None otherwise.
+    get_request_stats: Optional[Callable[[Req, int], Dict[str, Any]]] = None
+    # By row, the finished requests' `request_stats`.
+    rust_request_stats: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.output_sink is OutputSink.RUST:
@@ -626,6 +672,15 @@ class _GenerationStreamAccumulator:
                 if latency is not None:
                     self.decode_latencies[len(self.rids) - 1] = latency
             self.prefill_weight_versions.append(req.prefill_weight_versions)
+            if self.get_request_stats is not None:
+                self.rust_request_stats[len(self.rids) - 1] = self.get_request_stats(
+                    req,
+                    (
+                        beam_completion_tokens(beam_output)
+                        if beam_output is not None
+                        else len(output_ids_)
+                    ),
+                )
         else:
             self.weight_versions.append(None)
             self.prefill_weight_versions.append(None)
