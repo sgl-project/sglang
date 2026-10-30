@@ -20,6 +20,7 @@ Import torch_npu only when an NPU operation actually needs it.
 
 import logging
 import time
+from collections import deque
 from functools import wraps
 from typing import Callable
 
@@ -75,12 +76,31 @@ def warmup_eplb_communication() -> None:
     )
 
 
+class NpuEplbAccumulatorMixin:
+    """Share TP communication and initialize migration channels before recording."""
+
+    def __init__(self, *args, **kwargs):
+        from sglang.srt.runtime_context import get_exec
+
+        moe = get_exec().moe
+        if moe.enable_eplb and not moe.elastic_ep_backend:
+            # Join/scale paths need their own collective initialization order.
+            warmup_eplb_communication()
+        super().__init__(*args, **kwargs)
+
+    @property
+    def _communication_group(self) -> dist.ProcessGroup:
+        # Resolve lazily so a replaced TP group is used by subsequent dumps.
+        return get_eplb_device_group()
+
+
 def prepare_expert_weight_update(
     *,
     weights_by_layer: dict[int, list[torch.Tensor]],
     layer_ids: list[int],
     old_map: torch.Tensor,
     new_map: torch.Tensor,
+    update_layer_fn: Callable[..., None],
 ) -> tuple[list[int], list[torch.Tensor] | None, Callable[..., None] | None]:
     """Return selected layers, receive buffers, and a single-layer update callable.
 
@@ -91,9 +111,6 @@ def prepare_expert_weight_update(
     ND staging keeps only the current layer's conversion results.
     """
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-    from sglang.srt.eplb.expert_location_updater import (
-        update_expert_weights_single_layer,
-    )
 
     elastic_ep_enabled = ElasticEPStateManager.instance() is not None
     if not elastic_ep_enabled:
@@ -131,7 +148,7 @@ def prepare_expert_weight_update(
         if not temp_buffers:
             temp_buffers.extend(staging.create_temp_buffers(routed_experts_weights))
         migration_weights = staging.load(routed_experts_weights)
-        update_expert_weights_single_layer(
+        update_layer_fn(
             routed_experts_weights=migration_weights,
             group=group,
             **kwargs,
@@ -186,6 +203,7 @@ class ExpertWeightStaging:
     def __init__(self, needs_staging: list[bool]):
         # Convert internal formats and pack strided ND before migrating slices.
         self._needs_staging = needs_staging
+        self._pending_layers = deque(maxlen=2)
 
     def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         return [
@@ -194,6 +212,13 @@ class ExpertWeightStaging:
         ]
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+        # Each fence covers the previous layer's P2P waits and writeback.
+        # Bound queued migration work so freed ND tensors can be reused.
+        if len(self._pending_layers) == self._pending_layers.maxlen:
+            self._pending_layers.popleft().synchronize()
+        done = torch.npu.Event()
+        done.record()
+        self._pending_layers.append(done)
         # Keep the conversion result; copy_ would add another ND-to-ND copy.
         return [
             torch.ops.npu.npu_format_cast(weight, 2).contiguous() if needed else weight

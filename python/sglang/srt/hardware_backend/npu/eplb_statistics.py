@@ -16,30 +16,16 @@
 
 from contextlib import contextmanager
 
-import torch
-
 from sglang.srt.eplb import expert_distribution as distribution
-from sglang.srt.hardware_backend.npu.eplb import (
-    get_eplb_device_group,
-    warmup_eplb_communication,
-)
+from sglang.srt.hardware_backend.npu.eplb import NpuEplbAccumulatorMixin
 
 
-class _NpuAccumulatorMixin:
-    """Share the TP device group across NPU statistics modes and migration."""
-
-    # Resolve lazily so a replaced TP group is used by subsequent dumps.
-    @property
-    def _communication_group(self) -> torch.distributed.ProcessGroup:
-        return get_eplb_device_group()
-
-
-class _NpuDetailAccumulator(_NpuAccumulatorMixin, distribution._DetailAccumulator):
+class _NpuDetailAccumulator(NpuEplbAccumulatorMixin, distribution._DetailAccumulator):
     pass
 
 
 class NpuExpertDistributionAccumulator(
-    _NpuAccumulatorMixin, distribution._StatAccumulator
+    NpuEplbAccumulatorMixin, distribution._StatAccumulator
 ):
     pass
 
@@ -48,14 +34,10 @@ class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal
     """Reuse upstream recording with Ascend counters and communication."""
 
     def _create_accumulator(self, expert_location_metadata, rank):
-        moe = distribution.get_exec().moe
         accumulator_class = {
             distribution._StatAccumulator: NpuExpertDistributionAccumulator,
             distribution._DetailAccumulator: _NpuDetailAccumulator,
         }[distribution._Accumulator.get_class()]
-        if moe.enable_eplb and not moe.elastic_ep_backend:
-            # Join/scale paths need their own collective initialization order.
-            warmup_eplb_communication()
         return accumulator_class(expert_location_metadata, rank)
 
     def _create_gatherer(self, expert_location_metadata, rank):
