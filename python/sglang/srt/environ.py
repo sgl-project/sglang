@@ -1008,6 +1008,9 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # gfx950 KDA chain spec-verify with the ReplaySSM ring as one HIP kernel instead of
+    # the two Triton kernels.
+    SGLANG_ENABLE_ROCM_KDA_VERIFY_HIP = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override

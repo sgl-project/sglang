@@ -4,6 +4,10 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention.linear.kda_verify_gfx950 import (
+    kda_verify_gfx950,
+    supports_kda_verify_gfx950,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -23,6 +27,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -535,6 +540,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
             self._fused_chain_verify_fn = fused_kda_conv_gating_verify
             rank0_log("KDA fused chain-verify kernel enabled (topk==1 path).")
+        self._hip_chain_verify = (
+            is_hip()
+            and is_gfx95_supported()
+            and verify_backend.is_triton()
+            and envs.SGLANG_ENABLE_ROCM_KDA_VERIFY_HIP.get()
+        )
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
         # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
@@ -1296,15 +1307,32 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_beta=replayssm_beta,
             )
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = select_verify_intermediate_state_indices(
-            self.verify_intermediate_state_indices,
-            forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-            self.req_to_token_pool.size,
-        )
+        intermediate_state_indices = self.verify_intermediate_state_indices
+        # Only PP spec reads the validity mask; building it is a launch per layer.
+        if pp_spec_stable_rows_enabled():
+            intermediate_state_indices = select_verify_intermediate_state_indices(
+                self.verify_intermediate_state_indices,
+                forward_batch.req_pool_indices,
+                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                self.req_to_token_pool.size,
+            )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.ragged_verify_layout
+        hip_chain = ragged_layout is None and self._can_run_hip_chain_verify(
+            layer=layer,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            draft_token_num=draft_token_num,
+            ssm_states=ssm_states,
+            intermediate_state_cache=intermediate_state_cache,
+            intermediate_conv_window_cache=intermediate_conv_window_cache,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_parent_token=retrieve_parent_token,
+            replayssm_rawv=replayssm_rawv,
+        )
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,
@@ -1339,6 +1367,35 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
             conv_state_indices = cache_indices[:batch_size]
+            if hip_chain:
+                return kda_verify_gfx950(
+                    mixed_qkv=mixed_qkv,
+                    conv_weight=layer.conv_weights,
+                    conv_bias=layer.bias,
+                    conv_state=conv_states.transpose(-1, -2),
+                    conv_state_indices=conv_state_indices,
+                    intermediate_conv_window=(
+                        intermediate_conv_window_cache.transpose(-1, -2)
+                    ),
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    a=a,
+                    b=b,
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    ssm_states=ssm_states,
+                    cache_indices=conv_state_indices,
+                    intermediate_states_buffer=(
+                        None if replayssm_on else intermediate_state_cache
+                    ),
+                    scale=layer.head_k_dim**-0.5,
+                    T=draft_token_num,
+                    num_q_heads=layer.num_q_heads,
+                    num_v_heads=layer.num_v_heads,
+                    head_k_dim=layer.head_k_dim,
+                    head_v_dim=layer.head_v_dim,
+                    lower_bound=layer.lower_bound,
+                    **ring_kwargs,
+                )
             # Fused chain-verify fast path: one kernel replaces the transpose-copy +
             # conv1d + transpose-copy + recurrence sequence. Chain (topk==1) only --
             # retrieve_* are None there; the tree path and any unsupported shape keep
@@ -1492,6 +1549,46 @@ class KDAAttnBackend(MambaAttnBackendBase):
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
         return core_attn_out
 
+    def _can_run_hip_chain_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        draft_token_num: int,
+        ssm_states: torch.Tensor,
+        intermediate_state_cache: Optional[torch.Tensor],
+        intermediate_conv_window_cache: torch.Tensor,
+        retrieve_next_token: Optional[torch.Tensor],
+        retrieve_next_sibling: Optional[torch.Tensor],
+        retrieve_parent_token: Optional[torch.Tensor],
+        replayssm_rawv: Optional[torch.Tensor],
+    ) -> bool:
+        return (
+            self._hip_chain_verify
+            and retrieve_next_token is None
+            and retrieve_next_sibling is None
+            and retrieve_parent_token is None
+            and layer.bias is None
+            and isinstance(layer.conv_weights, torch.Tensor)
+            and supports_kda_verify_gfx950(
+                num_q_heads=layer.num_q_heads,
+                num_v_heads=layer.num_v_heads,
+                head_k_dim=layer.head_k_dim,
+                head_v_dim=layer.head_v_dim,
+                T=draft_token_num,
+                mixed_qkv=mixed_qkv,
+                conv_weight=layer.conv_weights,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                replayssm_rawv=replayssm_rawv,
+                intermediate_states_buffer=intermediate_state_cache,
+                intermediate_conv_window=intermediate_conv_window_cache,
+            )
+        )
+
     def _can_run_fused_chain_verify(
         self,
         *,
@@ -1544,8 +1641,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
-        if replayssm_on and (
-            batch_size != 1 or not (get_platform().is_sm90 or get_platform().is_sm100)
+        # On gfx950 the ring writes beat the per-step snapshots at every batch
+        # the HIP gate below admits.
+        if (
+            replayssm_on
+            and not is_gfx95_supported()
+            and (
+                batch_size != 1
+                or not (get_platform().is_sm90 or get_platform().is_sm100)
+            )
         ):
             # The runtime still uses BV=4, not the benchmark's best-BV sweep:
             # fused+ring wins at B=1 but regresses from B=4 (B=2 at T=8) on
@@ -1556,7 +1660,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if is_hip() and not (
             is_gfx95_supported()
             and 1 <= batch_size <= 16
-            and draft_token_num in (6, 8)
+            and draft_token_num in (4, 6, 8)
             and mixed_qkv.dtype == torch.bfloat16
             and layer.conv_weights.dtype == torch.float32
         ):
