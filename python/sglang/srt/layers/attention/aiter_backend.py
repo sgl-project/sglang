@@ -3189,32 +3189,35 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 kv_lens = seq_lens
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
-            if seq_lens_sum is not None:
-                kv_indices_used = seq_lens_sum + (
-                    self.num_draft_tokens * bs if self.use_mla else 0
+            # Unified verify reads the page table, not these flat indices.
+            kv_indptr = kv_indices = None
+            if self.use_mla or not self._use_unified_verify:
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
+                if seq_lens_sum is not None:
+                    kv_indices_used = seq_lens_sum + (
+                        self.num_draft_tokens * bs if self.use_mla else 0
+                    )
+                    assert_buffer_fits(
+                        kv_indices_used,
+                        kv_indices.numel(),
+                        "aiter target_verify kv_indices",
+                        bs=bs,
+                        seq_lens_sum=seq_lens_sum,
+                    )
+                num_token_blocks = self._kv_index_blocks(bs)
+                create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    kv_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                    TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                 )
-                assert_buffer_fits(
-                    kv_indices_used,
-                    kv_indices.numel(),
-                    "aiter target_verify kv_indices",
-                    bs=bs,
-                    seq_lens_sum=seq_lens_sum,
-                )
-            num_token_blocks = self._kv_index_blocks(bs)
-            create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
-                self.req_to_token,
-                req_pool_indices,
-                kv_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-                TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
-            )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
 
             if self.use_mla and self.dcp_world_size > 1:
