@@ -318,6 +318,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         state_tensors.clear()
         if not plan.alloc_sizes:
             return plan.entries
+        self._log_pack_plan(plan)
 
         offsets = _prefix_offsets(plan.alloc_sizes)
         self._reservation = VmmReservation(
@@ -359,6 +360,33 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
             time.perf_counter() - tic,
         )
         return plan.entries
+
+    def _log_pack_plan(self, plan) -> None:
+        """Log the sizes ``plan`` will allocate, before anything is allocated
+        or copied."""
+        largest = max(plan.slots, key=lambda slot: slot.nbytes)
+        slot_key = (largest.alloc_index, largest.offset, largest.nbytes)
+        name = next(
+            (
+                name
+                for name, entry in plan.entries.items()
+                if (entry["alloc_index"], entry["offset"], entry["storage_nbytes"])
+                == slot_key
+            ),
+            None,
+        )
+        logger.info(
+            "[weight_cache] vmm_fd: pack plan: %d slot(s) in %d allocation(s), "
+            "cap %d bytes, largest slot %d bytes%s, largest allocation %d bytes, "
+            "%d bytes in total",
+            len(plan.slots),
+            len(plan.alloc_sizes),
+            self._max_alloc_bytes,
+            largest.nbytes,
+            f" ({name})" if name is not None else "",
+            max(plan.alloc_sizes),
+            sum(plan.alloc_sizes),
+        )
 
     def _export_fds(self) -> List[int]:
         """Export a fresh POSIX fd per allocation; the caller closes them."""

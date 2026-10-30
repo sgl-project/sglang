@@ -9,6 +9,7 @@ standing in for the VMM allocations:
   - the daemon's export path (WeightCacheDaemon._export_state ->
     VmmFdTransportBackend.prepare_export): values, ties, and freeing every
     original as its allocation is filled
+  - the packing plan's sizes, logged before anything is allocated or copied
   - the fetch_state exchange over a socketpair, then rebuilding every tensor
     on the engine side
   - engine-side layout validation
@@ -505,6 +506,90 @@ class TestVmmExportAndImport(CustomTestCase):
         torch.testing.assert_close(exported, live_weight * 2, rtol=0, atol=0)
         # The live parameter was not repointed at the hook's output.
         torch.testing.assert_close(model.weight.detach(), live_weight, rtol=0, atol=0)
+
+
+class TestPackPlanLog(CustomTestCase):
+    """prepare_export logs the sizes of its packing plan before it allocates
+    or copies anything."""
+
+    def _pack(self, state, max_alloc_bytes):
+        """Pack ``state`` on host memory; returns the backend and the plan line."""
+        backend = VmmFdTransportBackend(
+            device=CPU, granularity=GRANULARITY, max_alloc_bytes=max_alloc_bytes
+        )
+        with _host_vmm(), self.assertLogs(transport.logger, "INFO") as logs:
+            backend.prepare_export(state)
+        self.addCleanup(backend.close)
+        (line,) = [msg for msg in logs.output if "pack plan" in msg]
+        return backend, line
+
+    def test_a_storage_larger_than_the_cap_sets_the_largest_allocation(self):
+        cap = GRANULARITY
+        backend, line = self._pack(
+            {
+                "small": (torch.zeros(16), True),
+                "big": (torch.zeros(5000), True),  # 20000 bytes
+                "after": (torch.zeros(16), True),
+            },
+            cap,
+        )
+        largest = max(backend._alloc_sizes)
+        self.assertEqual(largest, 20480)  # 20000 bytes, rounded up to the granule
+        self.assertGreater(largest, cap)
+        self.assertIn(
+            f"3 slot(s) in 3 allocation(s), cap {cap} bytes, largest slot 20000 "
+            f"bytes (big), largest allocation {largest} bytes, "
+            f"{sum(backend._alloc_sizes)} bytes in total",
+            line,
+        )
+
+    def test_storages_smaller_than_the_cap_keep_every_allocation_within_it(self):
+        # The cap is a multiple of the granularity, as 1 GiB is on CUDA.
+        cap = GRANULARITY
+        backend, line = self._pack(
+            {f"t{i}": (torch.zeros(256), True) for i in range(10)},  # 1 KiB each
+            cap,
+        )
+        largest = max(backend._alloc_sizes)
+        self.assertLessEqual(largest, cap)
+        self.assertIn(
+            f"largest slot 1024 bytes (t0), largest allocation {largest} bytes", line
+        )
+
+    def test_the_plan_is_logged_before_anything_is_allocated_or_copied(self):
+        events = []
+
+        class RecordingReservation(_HostReservation):
+            def __init__(self, *args, **kwargs):
+                events.append("reserve")
+                super().__init__(*args, **kwargs)
+
+            def map(self, offset, size, *, retain_handle):
+                events.append("map")
+                return super().map(offset, size, retain_handle=retain_handle)
+
+        pack_slot = transport.pack_slot
+
+        def recording_pack_slot(slot, dst):
+            events.append("copy")
+            pack_slot(slot, dst)
+
+        def recording_info(msg, *args):
+            events.append(msg % args)
+
+        backend = VmmFdTransportBackend(
+            device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
+        )
+        self.addCleanup(backend.close)
+        with (
+            _host_vmm(),
+            mock.patch.object(cuda_vmm_utils, "VmmReservation", RecordingReservation),
+            mock.patch.object(transport, "pack_slot", recording_pack_slot),
+            mock.patch.object(transport.logger, "info", side_effect=recording_info),
+        ):
+            backend.prepare_export({f"t{i}": (torch.randn(8), True) for i in range(3)})
+        self.assertIn("pack plan", events[0])
+        self.assertLessEqual({"reserve", "map", "copy"}, set(events[1:]))
 
 
 class TestValidateVmmLayout(CustomTestCase):
