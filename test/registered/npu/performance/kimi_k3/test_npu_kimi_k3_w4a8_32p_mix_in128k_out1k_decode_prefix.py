@@ -80,7 +80,11 @@ KIMI_K3_W4A8_32P_ENVS = {
     "DEEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "512",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "ASCEND_USE_FIA": "1",
-    "SGLANG_NPU_USE_FIAS_V2_BSND": "1",
+    # Temporarily disabled: the current image's sglang/kernel build
+    # conflicts with FIAS_V2_BSND and the DSPARK draft acceptance drops to
+    # zero (accept len 1.00, runs 40820212836/40864543937), which the dev
+    # team confirmed. Re-enable once a fixed image ships.
+    # "SGLANG_NPU_USE_FIAS_V2_BSND": "1",
 }
 
 KIMI_K3_W4A8_32P_OTHER_ARGS = [
