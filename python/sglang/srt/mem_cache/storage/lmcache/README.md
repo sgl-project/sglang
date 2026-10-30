@@ -54,3 +54,18 @@ python -m sglang.launch_server \
 ```
 
 For full LMCache config options see https://docs.lmcache.ai/api_reference/configurations.html.
+
+## Disaggregated prefill
+
+Enable LMCache on the prefill server with `--disaggregation-mode prefill`
+alongside the usual PD transfer configuration. The prefill server retrieves
+reusable KV from LMCache and sends it to decode through the configured PD
+backend. Run the decode server without `--enable-lmcache`.
+
+The standalone LMCache service can retain KV across prefill server restarts.
+Keep the model, KV dtype, tensor-parallel layout, and LMCache configuration
+consistent between runs. Early prefix sends wait for asynchronous LMCache
+loads on the forward stream, including with `--disable-overlap-schedule`.
+
+PD decode, DP attention, DCP, and speculative decoding remain unsupported
+with `--enable-lmcache`.

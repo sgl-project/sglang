@@ -1550,8 +1550,9 @@ class SchedulerDisaggregationPrefillMixin:
         # but under overlap scheduling the PRIOR step's prefill forward may still
         # be writing these prefix pages on forward_stream. Record a completion
         # event now so the transfer worker can wait on those writes before the
-        # RDMA read, instead of racing them.
-        if self.enable_overlap:
+        # RDMA read, instead of racing them. LMCache also orders asynchronous
+        # retrieves on forward_stream when overlap scheduling is disabled.
+        if self.enable_overlap or self.enable_lmcache:
             ev = self.device_module.Event()
             ev.record(self.forward_stream)
             req.disagg_kv_sender._early_send_wait_event = ev

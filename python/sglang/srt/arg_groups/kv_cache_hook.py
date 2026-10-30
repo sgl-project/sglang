@@ -510,10 +510,10 @@ def handle_cache_compatibility(server_args: Any) -> None:
             raise ValueError(
                 "--hicache-host-memory-mode=buffer_only is a HiCache-only mode"
             )
-        if cfg.disaggregation_mode != "null":
+        if cfg.disaggregation_mode == "decode":
             raise NotImplementedError(
-                "LMCacheUnifiedRadixCache currently supports colocated "
-                "prefill/decode scheduling only"
+                "--enable-lmcache is supported on colocated and PD prefill "
+                "servers only; PD decode does not support LMCache yet"
             )
 
 

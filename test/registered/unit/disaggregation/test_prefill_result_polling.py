@@ -1244,6 +1244,7 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.disaggregation_mode = DisaggregationMode.PREFILL
         self.enable_staging = False
         self.enable_overlap = False
+        self.enable_lmcache = False
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)
         self.send_kv_chunk = Mock()
 

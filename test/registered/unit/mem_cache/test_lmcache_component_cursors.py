@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     IncLockRefResult,
     InsertResult,
     MatchResult,
@@ -124,6 +125,67 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
     assert req.lock.receipt.node_id == 42
     assert flow.prefix_published
     assert flow.mamba_value is None
+
+
+def test_prefill_session_finishes_only_after_the_last_store(cache_class):
+    cache = cache_class.__new__(cache_class)
+    cache._external_flows = {}
+    first = SimpleNamespace(request_id="prefill")
+    last = SimpleNamespace(request_id="prefill")
+    cache._pending_stores = [
+        SimpleNamespace(operation=first, node_id=10, lock_params="first"),
+        SimpleNamespace(operation=last, node_id=20, lock_params="last"),
+    ]
+    cache._pending_store_counts = {"prefill": 2}
+    cache._session_finish_requested = set()
+    cache.dec_lock_ref = mock.Mock()
+    cache.lmcache_connector = mock.Mock()
+    cache.lmcache_connector.ready_prefix_count.side_effect = [0, 1, 0, 1]
+
+    # PD transfer can finish while external stores still read the same KV.
+    cache._request_session_finish("prefill")
+    cache.lmcache_connector.finish_request.assert_not_called()
+    cache.check_hicache_events()
+    cache.dec_lock_ref.assert_called_once_with(10, "first")
+    cache.lmcache_connector.finish_request.assert_not_called()
+    assert cache.has_pending_cache_operations()
+
+    cache.check_hicache_events()
+    cache.dec_lock_ref.assert_any_call(20, "last")
+    cache.lmcache_connector.finish_request.assert_called_once_with("prefill")
+    assert not cache.has_pending_cache_operations()
+    assert not cache._pending_store_counts
+
+
+def test_prefill_abort_defers_retrieve_cleanup_until_completion(cache_class):
+    cache = cache_class.__new__(cache_class)
+    handle = CacheRequestHandle("prefill", 0)
+    flow = SimpleNamespace(
+        load=SimpleNamespace(),
+        load_completed=False,
+        mamba_value=None,
+        cancelled=False,
+        retire_requested=False,
+    )
+    cache._external_flows = {"prefill": flow}
+    cache._pending_stores = []
+    cache._pending_store_counts = {}
+    cache._session_finish_requested = set()
+    cache.prefetch_loaded_tokens_by_reqid = {handle: 8}
+    cache.prefetch_loaded_storage_start_by_reqid = {handle: 0}
+    cache.lmcache_connector = mock.Mock()
+    cache.lmcache_connector.ready_prefix_count.side_effect = [0, 0, 1, 0]
+    cache._finish_failed_load = mock.Mock()
+
+    cache.release_aborted_request(handle)
+    assert flow.cancelled and flow.retire_requested
+    assert handle not in cache.prefetch_loaded_tokens_by_reqid
+    cache._finish_failed_load.assert_not_called()
+    cache.check_hicache_events()
+    cache._finish_failed_load.assert_not_called()
+    cache.check_hicache_events()
+    cache._finish_failed_load.assert_called_once_with(flow)
+    assert flow.load_completed
 
 
 if __name__ == "__main__":
