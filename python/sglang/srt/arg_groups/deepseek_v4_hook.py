@@ -138,6 +138,26 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
         raise ValueError(
             "--engram-config: replication 'per_node' needs the TP group on one node."
         )
+    # A sharded table's lookup exchanges rows over the TP group, and under CP
+    # the layer picks between the CP all-gather and the DP exchange from the
+    # batch: an idle attention-DP peer sees no CP batch and would enter the DP
+    # exchange alone. Both collective-free layouts (a per-node shared mapping
+    # or peer shards) keep every rank's lookup local, so require one of them.
+    if (
+        cfg.attn_dp_size > 1
+        and (cfg.enable_prefill_cp or cfg.attn_cp_size > 1)
+        and cfg.tp_size > 1
+        and config.lookup != EngramLookup.PEER_READ
+        and not (
+            config.placement == EngramPlacement.CPU
+            and config.replication == EngramReplication.PER_NODE
+        )
+    ):
+        raise ValueError(
+            "--engram-config: DP attention with context parallelism needs a "
+            "lookup without TP collectives: 'peer_read', or placement 'cpu' "
+            "with replication 'per_node'."
+        )
     declare_resolution(server_args, "_resolve_engram_config", engram_config=config)
     logger.info("DeepSeek-V4.1 Engram tables: %s", config)
 
@@ -303,9 +323,11 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         attn_cp_size=cfg.tp_size // attn_dp_size,
     )
     if not is_npu():
-        assert attn_dp_size == 1, (
-            "For round-robin split mode, dp attention is not supported."
-        )
+        assert attn_dp_size == 1 or (
+            get_platform().is_cuda
+            and cfg.cp_strategy == "interleave"
+            and cfg.moe_a2a_backend in ("none", "megamoe")
+        ), "DP attention with CP requires CUDA interleave and none/megamoe MoE."
         assert cfg.tp_size <= 8, (
             "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
         )
@@ -464,18 +486,38 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "both servers use the same block size and target/draft KV layout."
             )
 
+    # This validator precedes validate_deepseek_v4_cp, which normalizes
+    # --attn-cp-size to TP/DP. Validate that effective geometry, not the
+    # user's pre-normalization CP argument.
+    bounded_dp_size = (
+        context_parallel_attn_dp_size(cfg, "DeepSeek-V4 context parallelism")
+        if cfg.enable_prefill_cp
+        else cfg.attn_dp_size
+    )
+    bounded_cp_size = (
+        cfg.tp_size // bounded_dp_size if cfg.enable_prefill_cp else cfg.attn_cp_size
+    )
     incompatible = (
         (
             "the prefill CUDA graph",
             cfg.cuda_graph_config.prefill.backend
             not in (Backend.DISABLED, Backend.BREAKABLE),
         ),
+        # Late-layer communication uses one row count per attention-DP rank.
+        # Interleave CP supplies an equal-padded, rank-major tail layout.
         (
-            "DP attention other than attention TP 1 with supported MoE backends",
+            "DP attention other than attention TP 1 with supported MoE/CP layouts",
             attn_dp_enabled_of(cfg)
             and not (
-                cfg.attn_dp_size == cfg.tp_size
-                and cfg.attn_cp_size == 1
+                bounded_dp_size * bounded_cp_size == cfg.tp_size
+                and (
+                    bounded_cp_size == 1
+                    or (
+                        get_platform().is_cuda
+                        and cfg.enable_prefill_cp
+                        and cfg.cp_strategy == "interleave"
+                    )
+                )
                 and (
                     (get_platform().is_hip and cfg.moe_a2a_backend == "none")
                     or (

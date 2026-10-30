@@ -1009,6 +1009,17 @@ class HummingLinearMethod(LinearMethodBase):
             force_input_schema=self.force_input_schema,
         )
 
+        # Prepare the independent CP decode layout before the full weight is
+        # transformed. This also keeps all allocations out of graph capture.
+        if getattr(layer, "_cp_decode_attn_tp_shard", False):
+            from sglang.srt.layers.cp.cp_decode_attn_tp import (
+                get_cp_decode_attn_tp_ctx,
+            )
+
+            get_cp_decode_attn_tp_ctx().prepare_humming_decode_shard(
+                layer, self.weight_schema, self.input_schema
+            )
+
         # prepare layer config from humming kernel
         HummingMethod.prepare_layer_meta(
             layer=layer,

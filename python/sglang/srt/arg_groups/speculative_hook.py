@@ -666,6 +666,41 @@ def _target_checkpoint_dspark_subfolder(
     return os.path.join(snapshot, _DSPARK_DRAFT_SUBFOLDER)
 
 
+def _validate_dspark_dp_prefill_cp(cfg, hf_config) -> None:
+    """Admit only the audited DP4/CP2 replicated-attention V4 layout.
+
+    attn_cp_size is the static weight topology, not active token sharding:
+    only target prefill is CP; draft blocks and target verify keep DP-local
+    rows replicated on CP partners and use decode attention TP instead.
+    """
+    supported = (
+        cfg.device.startswith("cuda")
+        and cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.enable_cp_decode_attn_tp
+        and (cfg.tp_size, cfg.attn_dp_size, cfg.attn_cp_size) == (8, 4, 2)
+        and cfg.pp_size == 1
+        and cfg.moe_a2a_backend in ("none", "megamoe")
+        and getattr(hf_config, "model_type", None) in ("deepseek_v4", "deepseek_v41")
+        and "DeepseekV4ForCausalLM" in getattr(hf_config, "architectures", ())
+    )
+    if not supported:
+        raise ValueError(
+            "DSpark with DP attention and CP requires CUDA DeepSeek-V4/V4.1, "
+            "TP8/DP4/CP2, PP1, interleave prefill-only CP, "
+            "--enable-cp-decode-attn-tp, and none/megamoe MoE."
+        )
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+        raise ValueError(
+            "DSpark DP prefill CP requires SGLANG_RAGGED_VERIFY_MODE=static."
+        )
+
+
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
@@ -698,10 +733,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
         if cfg.attn_cp_size > 1:
-            raise ValueError(
-                "DSpark with dp attention does not support context parallel "
-                f"(attn_cp_size={cfg.attn_cp_size})."
-            )
+            _validate_dspark_dp_prefill_cp(cfg, model_config_of(server_args).hf_config)
         if (
             not _is_npu
             and cfg.speculative_moe_a2a_backend is not None

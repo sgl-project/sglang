@@ -46,6 +46,7 @@ from sglang.srt.layers.cp.base import (
 from sglang.srt.layers.cp.padding import pad_local_rows
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
+    dp_gather_slot,
     is_allocation_symmetric,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -144,6 +145,93 @@ def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows)
         .transpose(0, 1)
         .flatten(0, 1)
         .contiguous()
+    )
+
+
+def cp_moe_slot_rows(forward_batch) -> int:
+    """Rows one attention-DP rank contributes to the gathered MoE buffer.
+
+    This is the width the DP gather/scatter move for this rank's slot
+    (``global_num_tokens``), which the union of the CP shards must fill. It
+    equals ``attn_cp_size * local_rows`` only when the DP padding agrees with
+    the CP physical shard size, so callers fit the rank-major buffer to it
+    instead of assuming the two agree.
+    """
+    counts = forward_batch.global_num_tokens_cpu
+    if counts is not None and len(counts) > 1:
+        return int(counts[dp_gather_slot()])
+    return sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
+
+
+def cp_fit_slot_rows(x: torch.Tensor, forward_batch, slot_rows: int) -> torch.Tensor:
+    """Fit a rank-major CP buffer to one attention-DP rank's MoE slot.
+
+    The buffer is ``[rank0 rows | rank1 rows | ...]``; the DP gather/scatter
+    moves exactly ``slot_rows`` rows per rank, and ``memcpy`` silently copies
+    ``min(slot, local)`` rows. Truncating this buffer at its head would keep
+    only the leading CP ranks' blocks, so trim (or zero-pad) every block by the
+    same amount instead. Padding stays zero, like the CP shard's own padding.
+    """
+    total = x.shape[0]
+    if total == slot_rows:
+        return x
+    size = get_parallel().attn_cp_size
+    if total % size or slot_rows % size:
+        raise ValueError(
+            f"a {total}-row rank-major CP buffer cannot fill a {slot_rows}-row "
+            f"attention-DP slot over attn_cp_size={size}"
+        )
+    rows, keep = total // size, slot_rows // size
+    metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    logical = getattr(metadata, "per_rank_logical_token", None)
+    if rows > keep and logical is not None:
+        # Block trimming may only drop padding, never a rank's real rows.
+        if keep < max(logical):
+            raise ValueError(
+                f"attention-DP slot of {keep} rows per CP rank cannot hold "
+                f"logical shard lengths {logical}"
+            )
+    blocks = x.reshape(size, rows, *x.shape[1:])
+    if keep <= rows:
+        return blocks[:, :keep].reshape(slot_rows, *x.shape[1:]).contiguous()
+    padded = x.new_zeros((size, keep, *x.shape[1:]))
+    padded[:, :rows] = blocks
+    return padded.reshape(slot_rows, *x.shape[1:]).contiguous()
+
+
+def cp_take_slot_rows(x: torch.Tensor, forward_batch, rows: int) -> torch.Tensor:
+    """This CP rank's ``rows`` rows back out of a fitted attention-DP slot."""
+    parallel = get_parallel()
+    block = x.reshape(parallel.attn_cp_size, -1, *x.shape[1:])[parallel.attn_cp_rank]
+    if block.shape[0] == rows:
+        return block.contiguous()
+    out = x.new_zeros((rows, *x.shape[1:]))
+    keep = min(rows, block.shape[0])
+    out[:keep] = block[:keep]
+    return out
+
+
+def cp_interleave_local_input_ids(forward_batch, local_rows: int, slot_rows: int):
+    """This rank's token IDs laid out like its fitted attention-DP MoE slot.
+
+    Derived from the same interleave map as the CP hidden-state gather
+    (``cp_sequence_to_interleave_order`` / ``forward_batch.input_ids_global``),
+    so row i of the IDs belongs to row i of the MoE input for every CP rank.
+    """
+    ids = getattr(forward_batch, "input_ids_global", None)
+    if ids is None:
+        # A prefill-graph batch carries the full prompt, not a CP shard.
+        metadata = forward_batch.attn_cp_metadata
+        ids = cp_sequence_to_interleave_order(
+            forward_batch.input_ids[: metadata.total_seq_lens],
+            forward_batch,
+            sum(metadata.per_rank_actual_token),
+        )
+    # Use the hidden gather's own block width first: the IDs and the hidden
+    # states must have identical per-CP-rank blocks before either is fitted.
+    width = local_rows * get_parallel().attn_cp_size
+    return cp_fit_slot_rows(
+        cp_fit_slot_rows(ids, forward_batch, width), forward_batch, slot_rows
     )
 
 
