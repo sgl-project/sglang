@@ -184,10 +184,10 @@ def _cutlass_moe_tune_max_num_tokens(num_tokens: int) -> int:
     )
 
 
-# One workspace per (device, stream), reused across eager calls: without one,
-# FlashInfer allocates and frees about 1 GiB of scratch on every prefill MoE call,
-# which a running server's caching allocator often cannot serve from its cache
-# (it retries after an OOM on every chunk).
+# One workspace per (device, stream), reused across eager calls. Without one,
+# FlashInfer allocates scratch sized by each call's token count on every MoE
+# call (about 1 GiB for an 8K-token MXFP4 prefill chunk), so chunks of different
+# sizes leave differently sized large blocks in the caching allocator.
 _MXFP4_MOE_WORKSPACES: dict = {}
 # Set if FlashInfer ever rejects a queried size; calls then allocate per call.
 _MXFP4_MOE_WORKSPACE_REJECTED = False
