@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
+import math
 from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
@@ -89,16 +90,22 @@ def get_batch_sizes_to_capture(
     if get_exec().overlap.enable_two_batch_overlap:
         alignment_width = 1
 
-    # pad `num_max_requests` to avoid being filtered out
-    num_max_requests = ceil_align(num_max_requests, mul_base)
-    if max(capture_bs) > num_max_requests:
-        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
-        # is very small. We add more values here to make sure we capture the maximum bs.
-        capture_bs += [num_max_requests]
+    # Model input rows = bs * alignment_width must be a multiple of mul_base,
+    # so a request count only needs mul_base / gcd(mul_base, width) alignment.
+    request_alignment = mul_base // math.gcd(mul_base, alignment_width)
+    num_max_requests = min(max(capture_bs), num_max_requests)
+    if not get_exec().graph.disable_cuda_graph_padding:
+        # Pad the largest serviceable batch up to the next aligned bucket and keep
+        # it, so an unaligned --cuda-graph-max-bs or request pool still leaves a
+        # graph covering every batch size instead of an eager tail.
+        num_max_requests = ceil_align(num_max_requests, request_alignment)
+        capture_bs.append(num_max_requests)
 
-    # Model input token count = bs * alignment_width; must be a multiple of attn_tp_size.
-    capture_bs = [bs for bs in capture_bs if bs * alignment_width % mul_base == 0]
-    capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
+    capture_bs = [
+        bs
+        for bs in capture_bs
+        if bs % request_alignment == 0 and bs <= num_max_requests
+    ]
     capture_bs = list(sorted(set(capture_bs)))
 
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"

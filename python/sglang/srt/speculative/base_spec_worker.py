@@ -14,6 +14,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
+from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -139,6 +140,11 @@ class EagleDraftWorkerBase(ABC):
             get_schedule().max_running_requests or 0,
             1,
         )
+        # Graph buckets and eager DP padding round the batch up to the
+        # attention-TP alignment (x2 under TBO); full TP bounds it before the
+        # draft parallel state exists.
+        alignment = sa.tp_size * (2 if sa.enable_two_batch_overlap else 1)
+        max_bs = ceil_align(max_bs, alignment)
         # A single-step chain has no parent entries (slow path drops the last
         # step). repeat (not expand): the kernel reads these as contiguous.
         parent_width = num_steps if num_steps > 1 else 0

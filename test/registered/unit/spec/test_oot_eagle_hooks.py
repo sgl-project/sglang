@@ -210,7 +210,7 @@ class TestOOTSpecGraphRunnerSelection(CustomTestCase):
                 ("check_cuda_graph_backend", lambda *args: False),
                 ("get_model", lambda: SimpleNamespace(model_impl="auto")),
                 ("get_exec", lambda: exec_cfg),
-                ("get_batch_sizes_to_capture", lambda runner: ([1], None)),
+                ("get_batch_sizes_to_capture", lambda runner, width: ([1], None)),
                 ("get_available_gpu_memory", lambda *args: 0.0),
             ):
                 stack.enter_context(patch.object(eagle_worker_v2, name, value))

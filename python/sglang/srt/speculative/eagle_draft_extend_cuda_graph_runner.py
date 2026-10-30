@@ -146,11 +146,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_forward_mode = self.forward_mode
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
-        self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-
         # Static capture width: full tree width (num_draft_tokens), not
         # num_steps + 1 -- topk > 1 draft-extend overflows the buffers.
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
+        self.capture_bs, _ = get_batch_sizes_to_capture(
+            model_runner, self.captured_req_width
+        )
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 

@@ -191,13 +191,14 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_forward_mode = self.forward_mode
         self.capture_hidden_mode = CaptureHiddenMode.FULL
 
-        self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-
         # Fixed window: every step extends each request by the same number of
         # tokens, which lets all steps share one buffer set.
         self.num_front_tokens = eagle_worker.draft_extend_num_front_tokens
         self.captured_req_width = (
             resolve_num_tokens_per_req(phase="draft_extend") + self.num_front_tokens
+        )
+        self.capture_bs, _ = get_batch_sizes_to_capture(
+            model_runner, self.captured_req_width
         )
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
