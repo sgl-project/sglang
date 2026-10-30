@@ -1,14 +1,7 @@
 """M-RoPE axis mapping on Ascend NPU.
 
-``MRotaryEmbedding`` used to route the NPU path through ``torch_npu.npu_mrope``,
-which takes the axis map as ``cache_mode``. Not every CANN release accepts that
-keyword, and when it is absent the op silently applies the contiguous map, so an
-interleaved model (Qwen2-VL style) gets a different rotation than the one it was
-trained with -- on NPU only, and silently: the output looks plausible, accuracy
-just degrades.
-
-``forward_npu`` now runs the Triton kernel that ``forward_cuda`` uses for 3-axis
-positions, and keeps the fused CANN op for 1-D text positions. Both are compared
+``forward_npu`` runs the Triton kernel that ``forward_cuda`` uses for 3-axis
+positions, and keeps the fused CANN op for 1-D positions. Both are compared
 against ``forward_native`` here: exactly in fp32, and within bf16 rounding for
 the deployment dtype.
 """
@@ -93,8 +86,8 @@ class TestMRotaryEmbeddingNpuSection(CustomTestCase):
         ):
             self._assert_2d_matches_native(torch.bfloat16, **flags)
 
-    def test_text_positions_stay_on_fused_rope(self):
-        # 1-D positions carry no axis map; the fused op must still give plain RoPE.
+    def test_text_positions_match_native(self):
+        # 1-D positions carry no axis map; they must still get plain RoPE.
         rot = self._build(torch.float32)
         torch.manual_seed(0)
         seq = 16

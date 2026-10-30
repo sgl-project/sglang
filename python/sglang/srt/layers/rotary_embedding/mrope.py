@@ -304,11 +304,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         if query.shape[0] == 0:
             return query, key
         self._match_cos_sin_cache_dtype(query)
-        # torch_npu.npu_mrope reads the axis map from cache_mode, which older
-        # CANN releases ignore; the Triton kernel reads mrope_section directly.
         if positions.ndim == 2 and self.mrope_section:
             return self.forward_triton(positions, query, key)
-        # Text-only: fused NPU rope; an all-zero section means plain RoPE.
+        # 1-D text: the fused CANN op; an all-zero section means plain RoPE.
         if query.shape[1] > 4096:
             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half" if self.is_neox_style else "interleave"
