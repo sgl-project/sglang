@@ -137,15 +137,10 @@ def forward_extend_vectorized_5d(
     else:
         slot_ids = backend.forward_metadata.kv_indices[:total_kv]
 
-    # Resolve the raw 5D K/V buffer for this layer (going through the
-    # SWA→sub-pool mapping when applicable).
-    pool = backend.token_to_kv_pool
-    if hasattr(pool, "layers_mapping"):
-        sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
-        sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
-    else:
-        sub_pool = pool
-        sub_layer_id = layer.layer_id
+    # Resolve the raw 5D K/V buffer for this layer from the view holding it.
+    kv = backend.token_to_kv_pool.layer_router.layer(layer.layer_id)
+    sub_pool = kv.view
+    sub_layer_id = kv.view_layer_id
     k_buf = sub_pool.k_buffer[sub_layer_id - sub_pool.start_layer]
     v_buf = sub_pool.v_buffer[sub_layer_id - sub_pool.start_layer]
 

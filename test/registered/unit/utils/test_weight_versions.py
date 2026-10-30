@@ -316,6 +316,7 @@ class _SchedulerStub:
         self.waiting_queue = waiting
         self.chunked_req = chunked
         self.hisparse_coordinator = hisparse
+        self._deferred_responses = None
 
 
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):

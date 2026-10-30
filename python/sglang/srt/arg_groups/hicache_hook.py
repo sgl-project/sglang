@@ -78,6 +78,9 @@ def handle_hicache(server_args: Any):
             server_args, "handle_hicache", hicache_mem_layout="layer_first"
         )
 
+    # The key scheme pins the layout and I/O backend before compatibility checks.
+    resolve_hicache_key_scheme(server_args)
+
     # Step 1: Initial layout-io compatibility normalization.
     resolve_layout_io_compatibility(server_args)
 
@@ -168,8 +171,97 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     )
 
 
+def resolve_hicache_key_scheme(server_args: Any):
+    """Validate --hicache-storage-key-scheme and resolve what it implies."""
+    cfg = resolving_view(server_args)
+    unified = cfg.hicache_storage_key_scheme == "unified"
+    partition_configs = (
+        cfg.hicache_storage_head_partition is not None
+        or cfg.hicache_storage_layer_partition is not None
+    )
+    if not unified:
+        if (
+            cfg.hicache_mem_layout == "page_unified"
+            and cfg.hicache_storage_backend is not None
+        ):
+            raise ValueError(
+                "--hicache-mem-layout page_unified with storage requires "
+                "--hicache-storage-key-scheme unified to distinguish its byte order."
+            )
+        if partition_configs:
+            raise ValueError(
+                "--hicache-storage-head-partition / --hicache-storage-layer-partition "
+                "require --hicache-storage-key-scheme unified."
+            )
+        return
+
+    for name in ("hicache_storage_head_partition", "hicache_storage_layer_partition"):
+        value = getattr(cfg, name)
+        if value is not None and value <= 0:
+            raise ValueError(
+                f"--{name.replace('_', '-')} must be positive, got {value}."
+            )
+    if cfg.hicache_storage_backend is None:
+        raise ValueError(
+            "--hicache-storage-key-scheme unified names L3 objects, so it needs "
+            "--hicache-storage-backend."
+        )
+    if cfg.hicache_storage_backend != "file":
+        raise NotImplementedError(
+            f"--hicache-storage-key-scheme unified supports only the file "
+            f"backend; got {cfg.hicache_storage_backend!r}."
+        )
+    if cfg.speculative_algorithm is not None:
+        # Draft layers are appended to the host pool's layer axis but are not
+        # part of the model-global grid, so they would land inside a named
+        # chunk unnamed.
+        raise NotImplementedError(
+            "--hicache-storage-key-scheme unified does not support speculative "
+            "decoding: the draft layers are not part of the L3 layer grid."
+        )
+    if cfg.dcp_size > 1:
+        raise NotImplementedError(
+            "--hicache-storage-key-scheme unified does not support decode "
+            "context parallelism (--dcp-size > 1): a DCP rank holds "
+            "sub-page slices, which need token-granule storage keys."
+        )
+
+    # The layout IS part of the object identity, so it is pinned rather than
+    # checked: a unified deployment that silently kept another layout would
+    # publish byte-permuted KV under keys a reader trusts.
+    resolutions = {}
+    if cfg.hicache_mem_layout != "page_unified":
+        logger.warning(
+            "--hicache-storage-key-scheme unified stores objects in the "
+            "page_unified byte order; replacing --hicache-mem-layout %r.",
+            cfg.hicache_mem_layout,
+        )
+        resolutions["hicache_mem_layout"] = "page_unified"
+    if cfg.hicache_io_backend != "kernel":
+        # Only the kernel backend relayouts; the copy engine moves a page block
+        # verbatim and cannot produce this order.
+        logger.warning(
+            "--hicache-storage-key-scheme unified needs the kernel io backend; "
+            "replacing --hicache-io-backend %r.",
+            cfg.hicache_io_backend,
+        )
+        resolutions["hicache_io_backend"] = "kernel"
+    if resolutions:
+        declare_resolution(server_args, "_resolve_hicache_key_scheme", **resolutions)
+
+
 def resolve_layout_io_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.hicache_mem_layout == "page_unified":
+        # page_unified is only ever driven by the kernel backend's relayout
+        # pair; the rewrites below are about the other page layouts.
+        if cfg.hicache_io_backend != "kernel":
+            raise ValueError(
+                "--hicache-mem-layout page_unified requires "
+                "--hicache-io-backend kernel: the direct backend copies a page "
+                "block verbatim and cannot produce this byte order."
+            )
+        return
     if (
         cfg.hicache_mem_layout == "page_first_direct"
         and cfg.hicache_io_backend == "kernel"
