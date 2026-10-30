@@ -407,12 +407,17 @@ class TestLLaDA2LanguageModel(CustomTestCase):
     def test_language_checkpoint_layout_is_normalized(self):
         """Prefixed names and fused expert tensors load as the native layout."""
         fused = torch.arange(24).reshape(2, 3, 4)
+        fused_scale = torch.rand(2, 1, 1)
         lm_head = torch.randn(4, 3)
 
         expanded = list(
             _prepare_llada2_language_weights(
                 [
                     ("model.language_model.layers.1.mlp.experts.gate_proj", fused),
+                    (
+                        "model.language_model.layers.1.mlp.experts.gate_proj_scale",
+                        fused_scale,
+                    ),
                     ("model.lm_head.weight", lm_head),
                 ],
                 num_experts=2,
@@ -424,12 +429,16 @@ class TestLLaDA2LanguageModel(CustomTestCase):
             [
                 "model.layers.1.mlp.experts.0.gate_proj.weight",
                 "model.layers.1.mlp.experts.1.gate_proj.weight",
+                "model.layers.1.mlp.experts.0.gate_proj.weight_scale_inv",
+                "model.layers.1.mlp.experts.1.gate_proj.weight_scale_inv",
                 "lm_head.weight",
             ],
         )
         torch.testing.assert_close(expanded[0][1], fused[0])
         torch.testing.assert_close(expanded[1][1], fused[1])
-        torch.testing.assert_close(expanded[2][1], lm_head)
+        torch.testing.assert_close(expanded[2][1], fused_scale[0])
+        torch.testing.assert_close(expanded[3][1], fused_scale[1])
+        torch.testing.assert_close(expanded[4][1], lm_head)
         with self.assertRaisesRegex(ValueError, "expected first dimension 2"):
             list(
                 _prepare_llada2_language_weights(
