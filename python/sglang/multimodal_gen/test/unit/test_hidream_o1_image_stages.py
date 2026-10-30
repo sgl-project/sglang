@@ -281,6 +281,30 @@ class TestHiDreamO1Config(unittest.TestCase):
                 SimpleNamespace(sp_degree=1, enable_breakable_cuda_graph=True)
             )
 
+    def test_weight_and_quantization_overrides_are_refused(self) -> None:
+        """The loader reads only the base checkpoint, so overrides must not be dropped."""
+        config = HiDreamO1ImagePipelineConfig()
+        no_overrides = dict(
+            sp_degree=1,
+            enable_breakable_cuda_graph=False,
+            transformer_weights_path=None,
+            quantization=None,
+            quantization_ignored_layers=None,
+            component_paths={},
+            component_weights_paths={},
+            component_quantizations={},
+        )
+        for option, value, flag in (
+            ("transformer_weights_path", "/ckpt/fp8", "--transformer-weights-path"),
+            ("quantization", "fp8", "--quantization"),
+            ("component_weights_paths", {"transformer": "/ckpt"}, "--component"),
+            ("component_quantizations", {"transformer": "fp8"}, "--component"),
+        ):
+            with self.subTest(option=option), self.assertRaisesRegex(ValueError, flag):
+                config.validate_server_args(
+                    SimpleNamespace(**{**no_overrides, option: value})
+                )
+
     def test_dynamic_batching_is_disabled(self) -> None:
         """A merged multi-prompt batch fails every request in it."""
         self.assertFalse(HiDreamO1ImagePipelineConfig().supports_dynamic_batching())

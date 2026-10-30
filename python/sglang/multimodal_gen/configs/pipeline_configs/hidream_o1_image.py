@@ -17,6 +17,15 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 # inputs, since HiDream-O1 conditions on token ids rather than text embeddings.
 HIDREAM_O1_COND_KEY = "hidream_o1_pos_cond"
 HIDREAM_O1_NEG_COND_KEY = "hidream_o1_neg_cond"
+# ServerArgs fields the pipeline's own loader does not read.
+_UNSUPPORTED_WEIGHT_OVERRIDES = (
+    "transformer_weights_path",
+    "quantization",
+    "quantization_ignored_layers",
+    "component_paths",
+    "component_weights_paths",
+    "component_quantizations",
+)
 
 
 @dataclass
@@ -56,6 +65,20 @@ class HiDreamO1ImagePipelineConfig(ImagePipelineConfig):
                 "HiDream-O1-Image conditions on token ids rather than text "
                 "embeddings, which the breakable CUDA graph prompt padding does "
                 "not support yet. Drop --enable-breakable-cuda-graph."
+            )
+        # The pipeline builds the transformer straight from the base checkpoint
+        # with no quant config, so these would otherwise be silently ignored.
+        # --enable-svdquant is covered: it requires --transformer-weights-path.
+        unsupported_overrides = [
+            f"--{option.replace('_', '-')}"
+            for option in _UNSUPPORTED_WEIGHT_OVERRIDES
+            if getattr(server_args, option)
+        ]
+        if unsupported_overrides:
+            raise ValueError(
+                "HiDream-O1-Image loads only its released bfloat16 checkpoint and "
+                "does not support weight or quantization overrides yet. Drop "
+                f"{', '.join(unsupported_overrides)}."
             )
         super().validate_server_args(server_args)
 
