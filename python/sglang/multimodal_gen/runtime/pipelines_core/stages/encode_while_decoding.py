@@ -33,6 +33,7 @@ def can_encode_while_decoding(
         batch.save_output
         and batch.return_file_paths_only
         and not batch.return_raw_frames
+        and not (batch.extra or {}).get("retain_decoded_frames", False)
         and batch.data_type == DataType.VIDEO
         and not batch.enable_frame_interpolation
         and not batch.enable_upscaling

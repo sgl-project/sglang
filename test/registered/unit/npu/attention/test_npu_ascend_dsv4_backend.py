@@ -517,6 +517,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
     )
     def test_arch35_eager_metadata_builds_cycle_table(self, _):
         backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
+        backend._is_dspark_algorithm = False
         backend.forward_metadata = SimpleNamespace()
         backend.token_to_kv_pool = MagicMock()
         backend.req_to_token = torch.empty((0, 0), dtype=torch.int32)

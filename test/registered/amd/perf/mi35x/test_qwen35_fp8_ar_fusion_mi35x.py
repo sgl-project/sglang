@@ -32,7 +32,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file
 
-register_amd_ci(est_time=4800, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=4800, suite="nightly-amd-8-gpu-mi35x", nightly=True)
 
 QWEN35_FP8_MODEL_PATH = os.environ.get(
     "QWEN35_FP8_MODEL_PATH",

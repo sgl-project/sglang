@@ -62,3 +62,28 @@ MINIMAX_H3_DEFAULT_BRANCHES: tuple = ({"name": "cond_1"},)
 # configuration at all. Process-wide SGLANG_CACHE_DIT_* environment controls
 # remain available for manual experiments and are independent of this field.
 MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG: tuple[int, float, int] = (4, 0.04, 1)
+
+# Supported reference-image resize policies for Ref2VA. All modes preserve the
+# source aspect ratio, avoid cropping, and independently round the resolved width
+# and height to the nearest multiple of 32 after applying the scale factor.
+#
+# - ``match`` matches the reference-image pixel area to the target canvas without
+#   upscaling a smaller reference:
+#       scale = min(1, sqrt(target_area / reference_area))
+#   This is the preprocessing policy used to train the ModelTC Ref2VA Turbo LoRA
+#   and is therefore recommended for that checkpoint.
+# - ``max`` only downsizes references whose short edge exceeds 2048 pixels:
+#       scale = min(1, 2048 / reference_short_edge)
+# - ``diffusers`` always scales the reference short edge to 2048 pixels, including
+#   upscaling smaller inputs:
+#       scale = 2048 / reference_short_edge
+#   This preserves the original Diffusers and SGLang reference-image behavior and
+#   should remain the compatibility default unless a checkpoint specifies another
+#   preprocessing policy.
+#
+# See the following references for the policy definitions and training guidance:
+# - https://docs.comfy.org/tutorials/video/minimax/minimax-h3#prompting-tips-3
+# - https://github.com/ModelTC/Minimax-H3-Turbo#note-on-reference-image-resizing
+MINIMAX_H3_REFERENCE_RESIZE_MODES: frozenset[str] = frozenset(
+    {"match", "max", "diffusers"}
+)

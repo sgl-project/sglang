@@ -16,16 +16,18 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     ComputeDsparkWindowGather,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend,ForwardMetadata
+from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+    AscendAttnBackend,
+    ForwardMetadata,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.speculative.spec_info import SpecInputType
+from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -41,16 +43,27 @@ _NPU_ARCH35_KV_TILE_SIZE = 64
 _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
 
 
-def _sparse_attn_ops():
+def _sparse_attn_ops(is_dspark=False):
     """(metadata op, attention op) for the DSV4 shared-KV sparse attention.
 
-    A5 reads a quantized KV cache, which is a different kernel rather than a
-    flag on the pre-A5 one.
+    ``is_dspark`` selects the DSpark draft-worker pair: it reads its sequence
+    lengths from CPU mirrors (host metadata) and, on A5, uses a dedicated
+    quantized sparse-attention kernel rather than a flag on the pre-A5 one.
     """
     if is_npu_arch35():
+        if is_dspark:
+            return (
+                torch.ops.npu.kv_quant_sparse_attn_sharedkv_metadata_host,
+                torch.ops.npu.kv_quant_sparse_attn_sharedkv,
+            )
         return (
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata,
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv,
+        )
+    if is_dspark:
+        return (
+            torch.ops.npu.sparse_attn_sharedkv_metadata_host,
+            torch.ops.npu.sparse_attn_sharedkv,
         )
     return (
         torch.ops.custom.npu_sparse_attn_sharedkv_metadata,
@@ -153,12 +166,11 @@ def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tens
 
 
 class CompressorAscendBackendMixin:
-
     def _dspark_ragged_verify_layout(self, forward_batch: ForwardBatch):
         if not self._is_dspark_algorithm:
             return None
 
-        layout = resolve_ragged_verify_layout(forward_batch)
+        layout = forward_batch.ragged_verify_layout
         if layout is None:
             return None
 
@@ -1043,7 +1055,6 @@ class DeepseekV4AscendAttnBackend(
         [T, N_kv, K], where K must be 128-aligned.
         """
         fm = self.forward_metadata
-        fm.ori_sparse_indices = None
         fm.ori_win_left = self._dsv4_sliding_window_size - 1
         fm.ori_win_right = 0
 
@@ -1059,6 +1070,18 @@ class DeepseekV4AscendAttnBackend(
             out_cache_loc=out_cache_loc,
             block_size=block_size,
         )
+        # The query is padded to an attn_tp multiple (prepare_mlp_sync_batch),
+        # but seq_lens is not, so pad the tail with -1 ("skip") to match.
+        num_padded_tokens = out_cache_loc.shape[0]
+        if ori_sparse_indices.shape[0] < num_padded_tokens:
+            pad_rows = num_padded_tokens - ori_sparse_indices.shape[0]
+            pad = torch.full(
+                (pad_rows, ori_sparse_indices.shape[1]),
+                -1,
+                dtype=ori_sparse_indices.dtype,
+                device=ori_sparse_indices.device,
+            )
+            ori_sparse_indices = torch.cat([ori_sparse_indices, pad], dim=0)
         ori_sparse_indices = ori_sparse_indices.unsqueeze(1).contiguous()
 
         fm.ori_sparse_indices = ori_sparse_indices
@@ -1600,7 +1623,7 @@ class DeepseekV4AscendAttnBackend(
                     # reusable spec_info does not carry live_seq_lens_cpu.
                     # Recover the committed/live prefix from the expanded KV lengths.
                     live_seq_lens_cpu = torch.clamp(
-                        final_seq_lens_cpu  - int(tokens_per_bs),
+                        final_seq_lens_cpu - int(tokens_per_bs),
                         min=0,
                     )
 
@@ -1612,11 +1635,14 @@ class DeepseekV4AscendAttnBackend(
                     ).flatten()
 
                     live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
-                    num_live_rows = min(raw_bs if ragged_layout is not None else bs,
-                        explicit_live_cpu.numel(),)
+                    num_live_rows = min(
+                        raw_bs if ragged_layout is not None else bs,
+                        explicit_live_cpu.numel(),
+                    )
                     if num_live_rows > 0:
                         live_seq_lens_cpu[:num_live_rows].copy_(
-                            explicit_live_cpu[:num_live_rows])
+                            explicit_live_cpu[:num_live_rows]
+                        )
 
                 if ragged_layout is not None:
                     # Query rows beyond raw_bs are graph-tier ghosts. Keep their
@@ -1624,10 +1650,7 @@ class DeepseekV4AscendAttnBackend(
                     # compressor state for them.
                     effective_verify_lens_cpu = verify_lens_cpu.clone()
                     effective_verify_lens_cpu[raw_bs:].zero_()
-                    final_seq_lens_cpu = (
-                            live_seq_lens_cpu
-                            + effective_verify_lens_cpu
-                    )
+                    final_seq_lens_cpu = live_seq_lens_cpu + effective_verify_lens_cpu
             else:
                 # EAGLE and the other uniform verify callers keep
                 # seq_lens_cpu at the committed/live prefix length.
@@ -2197,20 +2220,31 @@ class DeepseekV4AscendAttnBackend(
         c1a_kwargs = base_kwargs | common
         if self._is_dspark_draft_worker:
             cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
-            if cu_q_cpu is not None and cu_q_cpu.numel() > bs + 1:
+            seq_kv_cpu = fm.seq_lens_cpu_int
+            if (
+                cu_q_cpu is None
+                or seq_kv_cpu is None
+                or cu_q_cpu.device.type != "cpu"
+                or seq_kv_cpu.device.type != "cpu"
+            ):
+                raise RuntimeError(
+                    "DSpark host metadata requires CPU query and KV length mirrors"
+                )
+            if cu_q_cpu.numel() > bs + 1:
                 cu_q_cpu = cu_q_cpu[: bs + 1]
-            host_inputs = {"seqused_kv": fm.seq_lens_cpu_int[:bs].int()}
-            if cu_q_cpu is not None:
-                host_inputs["cu_seqlens_q"] = cu_q_cpu
-            c1a_kwargs = c1a_kwargs | host_inputs
-            metadata_op = torch.ops.npu.sparse_attn_sharedkv_metadata_host
+            host_inputs = {
+                "seqused_kv": seq_kv_cpu[:bs].to(dtype=torch.int32).contiguous()
+            }
+            host_inputs["cu_seqlens_q"] = cu_q_cpu.to(dtype=torch.int32).contiguous()
+            metadata_op, _ = _sparse_attn_ops(is_dspark=True)
+            c1a_metadata = metadata_op(**(c1a_kwargs | host_inputs))
         else:
             c1a_kwargs = c1a_kwargs | {
                 "cu_seqlens_q": actual_seq_lengths_q_pa,
                 "seqused_kv": actual_seq_lengths_kv,
             }
             metadata_op, _ = _sparse_attn_ops()
-        c1a_metadata = metadata_op(**c1a_kwargs)
+            c1a_metadata = metadata_op(**c1a_kwargs)
         kernel_metadata = {"c1a_metadata": c1a_metadata}
 
         if self._dsv4_has_c4:
@@ -2314,14 +2348,13 @@ class DeepseekV4AscendAttnBackend(
             softmax_scale=layer.scaling,
             cmp_ratio=1,
         )
-        _, attn_op = _sparse_attn_ops()
-        if self._is_dspark_draft_worker:
+        if self._is_dspark_draft_worker and not is_npu_arch35():
             attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
-            attn_op = torch.ops.npu.sparse_attn_sharedkv
         ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
+        _, attn_op = _sparse_attn_ops(self._is_dspark_draft_worker)
         out, _ = attn_op(q_arg, **attn_kwargs)
         return out
 
