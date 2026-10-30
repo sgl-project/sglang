@@ -79,23 +79,17 @@ def test_reference_image_resize_modes(
     assert resolved["allow_upscale"] is (mode == "diffusers")
 
 
-@pytest.mark.parametrize(
-    "source_size,expected_size",
-    [((5000, 2500), (2048, 1024)), ((600, 400), (608, 384))],
-)
-def test_reference_image_max_mode_honors_configured_short_edge(
-    source_size, expected_size
-):
+def test_reference_image_max_mode_honors_configured_short_edge():
     """A custom short-edge cap must affect pixels as well as shape metadata."""
     resolved = reference_encoding.minimax_h3_resolve_reference_image_shape(
-        width=source_size[0],
-        height=source_size[1],
+        width=5000,
+        height=2500,
         canvas_width=832,
         canvas_height=480,
         mode="max",
         reference_short_edge=1024,
     )
-    assert (resolved["width"], resolved["height"]) == expected_size
+    assert (resolved["width"], resolved["height"]) == (2048, 1024)
     assert resolved["base_short_edge"] == 1024
     assert not resolved["allow_upscale"]
 

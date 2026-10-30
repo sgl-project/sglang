@@ -588,6 +588,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         }
 
     def test_minimax_h3_prompt_lengths_share_bucket_signature(self):
+        """Host sequence boundaries must not split one prompt bucket into many graphs."""
         with self._patch_buckets(64, 128):
             short = self.stage._bcg_pad_prompt_kwargs(
                 self._minimax_h3_kwargs(19), current_model=self.minimax_h3_model

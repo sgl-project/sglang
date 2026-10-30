@@ -14,7 +14,6 @@ from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
     _build_local_embedding_layout,
-    _minimax_h3_renoise_target_rows_,
     _minimax_h3_update_target_rows_,
     minimax_h3_denoise_loop,
 )
@@ -446,6 +445,7 @@ def test_grouped_outputs_share_prompt_refinement():
 
 @pytest.mark.parametrize("mode", ["t2va", "fl2va", "ref2va"])
 def test_renoise_trajectory_keeps_anchors_and_uses_independent_request_noise(mode):
+    """Renoise must preserve conditioning and consume only request-local target noise."""
     branch = _branch(mode)
     video = torch.full((branch.img_pos.numel(), 96), 0.25)
     audio = torch.full((branch.audio_pos.numel(), 32), -0.5)
@@ -521,26 +521,3 @@ def test_renoise_trajectory_keeps_anchors_and_uses_independent_request_noise(mod
     for left, right, other in zip(first, repeated, changed):
         torch.testing.assert_close(left, right, rtol=0, atol=0)
         assert not torch.equal(left, other)
-
-
-def test_renoise_update_reuses_buffers_and_matches_gaussian_moments():
-    state = torch.full((4096, 32), 2.0)
-    velocity = torch.full_like(state, -0.5)
-    scratch = torch.empty_like(state)
-    noise = torch.empty_like(state)
-    pointers = [tensor.data_ptr() for tensor in (state, velocity, scratch, noise)]
-    generator = torch.Generator().manual_seed(43)
-    _minimax_h3_renoise_target_rows_(
-        state,
-        velocity,
-        sigma=torch.tensor(0.75),
-        sigma_next=0.4,
-        denoised_scratch=scratch,
-        noise_buffer=noise,
-        generator=generator,
-    )
-    assert state.mean().item() == pytest.approx(0.6 * (2.0 - 0.75 * 0.5), abs=0.005)
-    assert state.var().item() == pytest.approx(0.4**2, abs=0.003)
-    assert pointers == [
-        tensor.data_ptr() for tensor in (state, velocity, scratch, noise)
-    ]

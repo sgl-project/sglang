@@ -174,6 +174,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual((defaults.num_frames, defaults.fps), (1, 24))
 
     def test_explicit_warmup_prompt_reaches_the_request(self):
+        """Normal and compile warmup must preserve the caller's prompt."""
         server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
         prompt = "A red sailboat on a lake with birds calling."
         for compile_enabled in (False, True):
