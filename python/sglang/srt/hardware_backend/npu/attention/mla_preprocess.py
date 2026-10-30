@@ -112,9 +112,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.no_rope_mlaprolog = None
         if rotary_emb is None:
             # MLAProlog V4 supports no-RoPE with BF16 or FP8 KV.
-            from sgl_kernel_npu.operators.attention import mla_prolog_norope
+            from sgl_kernel_npu.operators.attention import mlaprolog_v4
 
-            self.no_rope_mlaprolog = mla_prolog_norope
+            self.no_rope_mlaprolog = mlaprolog_v4
 
         # Resolve the MLAProlog mode once from the loaded projection methods.
         # INT8 dtype alone cannot distinguish static from dynamic W8A8.
