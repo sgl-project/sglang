@@ -3491,16 +3491,23 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
-        if (
-            topk_indices is not None
-            or self.use_mla
-            or (not self.use_fia and layer.qk_head_dim > 128)
-        ):
+        if topk_indices is not None:
+            # DSA path: a mixed batch is just a varlen extend batch (decode
+            # rows are 1-token extends), same as a prefill batch.
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                topk_indices=topk_indices,
+            )
+        if self.use_mla:
             raise NotImplementedError(
-                "The 'enable-mixed-chunk' feature is currently unsupported in the following scenarios: "
-                "1. When using the MLA backend on Ascend NPU devices, "
-                "2. When using the deepseekv3.2 model on Ascend NPU devices, "
-                "3. When the environment variable ASCEND_USE_FIA is set to 0 and qk_head_dim exceeds 128 on Ascend NPU devices."
+                "The 'enable-mixed-chunk' feature is currently unsupported when using the MLA backend (without DSA sparse attention) on Ascend NPU devices."
             )
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
