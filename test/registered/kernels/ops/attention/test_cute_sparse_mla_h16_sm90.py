@@ -33,12 +33,8 @@ TORCH_REF_MAX_ABS_ERROR = 1.0e-3
 TORCH_REF_MAX_MEAN_ABS_ERROR = 1.0e-4
 
 
-def _sm90_available() -> bool:
-    return is_sm90_supported()
-
-
 requires_sm90 = pytest.mark.skipif(
-    not _sm90_available(), reason="native H16 CuTe sparse MLA requires SM90 CUDA"
+    not is_sm90_supported(), reason="native H16 CuTe sparse MLA requires SM90 CUDA"
 )
 
 
@@ -148,6 +144,19 @@ def _pad_flashmla_inputs(
     return q_padded, sink_padded
 
 
+def _h16_inputs(q, kv, indices, topk_length, attn_sink, *, sm_scale=D_QK**-0.5):
+    """Prepare the production H64 query and compact KV/index views once."""
+    q_padded, sink_padded = _pad_flashmla_inputs(q, attn_sink)
+    return dict(
+        q=q_padded,
+        kv=kv.squeeze(1),
+        indices=indices.squeeze(1),
+        topk_length=topk_length,
+        attn_sink=sink_padded,
+        sm_scale=sm_scale,
+    )
+
+
 def _unaligned_contiguous_copy(tensor: torch.Tensor) -> torch.Tensor:
     storage = torch.empty(tensor.numel() + 1, dtype=tensor.dtype, device=tensor.device)
     result = storage[1:].view(tensor.shape)
@@ -187,7 +196,7 @@ def _torch_fp32_reference(
     indices: torch.Tensor,
     topk_length: torch.Tensor,
     attn_sink: torch.Tensor,
-    sm_scale: float,
+    sm_scale: float = D_QK**-0.5,
 ) -> torch.Tensor:
     """Small, direct FP32 definition of sparse attention plus a zero-V sink."""
 
@@ -221,6 +230,24 @@ def _torch_fp32_reference(
         rows.append(torch.matmul(key_prob, selected_kv))
 
     return torch.stack(rows)
+
+
+def _assert_matches_torch(actual, expected, *, active_rows=slice(None), label=""):
+    assert actual.shape == expected.shape
+    assert actual.shape[1:] == (H_LOGICAL, D_V)
+    assert actual.dtype == torch.bfloat16 and expected.dtype == torch.float32
+    actual = actual.float().cpu()
+    assert torch.isfinite(actual).all() and torch.isfinite(expected).all(), label
+    diff = (actual - expected).abs()
+    assert diff.max().item() <= TORCH_REF_MAX_ABS_ERROR, label
+    assert diff[active_rows].mean().item() <= TORCH_REF_MAX_MEAN_ABS_ERROR, label
+    torch.testing.assert_close(
+        actual,
+        expected,
+        atol=TORCH_REF_MAX_ABS_ERROR,
+        rtol=1.0e-2,
+        msg=lambda message: f"{label}: {message}",
+    )
 
 
 def _assert_matches_flashmla(
@@ -288,48 +315,18 @@ def test_cute_sparse_mla_h16_matches_independent_torch_fp32_reference():
         device="cuda",
     )
 
-    q_padded, sink_padded = _pad_flashmla_inputs(q, attn_sink)
-    kv_compact = kv.squeeze(1)
-    indices_compact = indices.squeeze(1)
-    sm_scale = D_QK**-0.5
-    actual = cute_h16.cute_sparse_mla_h16_fwd(
-        q=q_padded,
-        kv=kv_compact,
-        indices=indices_compact,
-        topk_length=topk_length,
-        attn_sink=sink_padded,
-        sm_scale=sm_scale,
-    )
+    h16_inputs = _h16_inputs(q, kv, indices, topk_length, attn_sink)
+    actual = cute_h16.cute_sparse_mla_h16_fwd(**h16_inputs)
     expected_fp32 = _torch_fp32_reference(
-        q=q,
-        kv=kv_compact,
-        indices=indices_compact,
-        topk_length=topk_length,
-        attn_sink=attn_sink,
-        sm_scale=sm_scale,
+        q, kv.squeeze(1), indices.squeeze(1), topk_length, attn_sink
     )
     torch.cuda.synchronize()
 
-    assert actual.shape == expected_fp32.shape == (tq, H_LOGICAL, D_V)
-    assert actual.dtype == torch.bfloat16
-    assert expected_fp32.dtype == torch.float32
-    assert torch.isfinite(actual.float()).all()
-    assert torch.isfinite(expected_fp32).all()
+    _assert_matches_torch(actual, expected_fp32, active_rows=[1, 3])
     # Rows with zero valid keys contain only the zero-valued virtual sink.
     assert torch.count_nonzero(actual[[0, 2]]).item() == 0
     assert torch.count_nonzero(expected_fp32[[0, 2]]).item() == 0
     assert torch.count_nonzero(expected_fp32[[1, 3]]).item() > 0
-
-    actual_fp32 = actual.float().cpu()
-    diff = (actual_fp32 - expected_fp32).abs()
-    # This compares BF16 WGMMA/output rounding directly with an FP32 definition;
-    # the max gate is a few BF16 ULPs at this test's ~1e-2 output scale, while
-    # the mean gate prevents a broad low-amplitude drift from hiding underneath.
-    assert diff.max().item() <= TORCH_REF_MAX_ABS_ERROR
-    assert diff[[1, 3]].mean().item() <= TORCH_REF_MAX_MEAN_ABS_ERROR
-    torch.testing.assert_close(
-        actual_fp32, expected_fp32, atol=TORCH_REF_MAX_ABS_ERROR, rtol=1.0e-2
-    )
 
 
 @requires_sm90
@@ -378,37 +375,14 @@ def test_cute_sparse_mla_h16_multitile_matches_independent_torch_fp32_reference(
         attn_sink = torch.full(
             (H_LOGICAL,), sink_score, dtype=torch.float32, device="cuda"
         )
-        q_padded, sink_padded = _pad_flashmla_inputs(q, attn_sink)
-        actual = cute_h16.cute_sparse_mla_h16_fwd(
-            q=q_padded,
-            kv=kv_compact,
-            indices=indices_compact,
-            topk_length=topk_length,
-            attn_sink=sink_padded,
-            sm_scale=sm_scale,
-        )
+        h16_inputs = _h16_inputs(q, kv_compact, indices_compact, topk_length, attn_sink)
+        actual = cute_h16.cute_sparse_mla_h16_fwd(**h16_inputs)
         expected_fp32 = _torch_fp32_reference(
-            q=q,
-            kv=kv_compact,
-            indices=indices_compact,
-            topk_length=topk_length,
-            attn_sink=attn_sink,
-            sm_scale=sm_scale,
+            q, kv_compact, indices_compact, topk_length, attn_sink
         )
         torch.cuda.synchronize()
 
-        actual_fp32 = actual.float().cpu()
-        diff = (actual_fp32 - expected_fp32).abs()
-        assert torch.isfinite(actual_fp32).all(), name
-        assert diff.max().item() <= TORCH_REF_MAX_ABS_ERROR, name
-        assert diff.mean().item() <= TORCH_REF_MAX_MEAN_ABS_ERROR, name
-        torch.testing.assert_close(
-            actual_fp32,
-            expected_fp32,
-            atol=TORCH_REF_MAX_ABS_ERROR,
-            rtol=1.0e-2,
-            msg=lambda message: f"sink case {name}: {message}",
-        )
+        _assert_matches_torch(actual, expected_fp32, label=f"sink case {name}")
 
 
 @requires_sm90
@@ -426,15 +400,8 @@ def test_cute_sparse_mla_h16_fresh_jit_dynamic_shapes_and_repeat_allocation():
         lengths=[128, 65],
         seed=101,
     )
-    q1_padded, sink1_padded = _pad_flashmla_inputs(q1, sink1)
-    actual1 = cute_h16.cute_sparse_mla_h16_fwd(
-        q=q1_padded,
-        kv=kv1.squeeze(1),
-        indices=indices1.squeeze(1),
-        topk_length=lengths1,
-        attn_sink=sink1_padded,
-        sm_scale=D_QK**-0.5,
-    )
+    h16_inputs1 = _h16_inputs(q1, kv1, indices1, lengths1, sink1)
+    actual1 = cute_h16.cute_sparse_mla_h16_fwd(**h16_inputs1)
     torch.cuda.synchronize()
 
     assert actual1.is_contiguous()
@@ -448,14 +415,7 @@ def test_cute_sparse_mla_h16_fresh_jit_dynamic_shapes_and_repeat_allocation():
     # Every public call owns its output. A repeated launch must not alias or
     # overwrite the first allocation and must remain deterministic.
     snapshot1 = actual1.clone()
-    actual1_repeat = cute_h16.cute_sparse_mla_h16_fwd(
-        q=q1_padded,
-        kv=kv1.squeeze(1),
-        indices=indices1.squeeze(1),
-        topk_length=lengths1,
-        attn_sink=sink1_padded,
-        sm_scale=D_QK**-0.5,
-    )
+    actual1_repeat = cute_h16.cute_sparse_mla_h16_fwd(**h16_inputs1)
     torch.cuda.synchronize()
     assert actual1_repeat.data_ptr() != actual1.data_ptr()
     assert torch.equal(actual1, snapshot1)
@@ -470,15 +430,8 @@ def test_cute_sparse_mla_h16_fresh_jit_dynamic_shapes_and_repeat_allocation():
         lengths=[0, 1, 64, 127, 128],
         seed=202,
     )
-    q2_padded, sink2_padded = _pad_flashmla_inputs(q2, sink2)
-    actual2 = cute_h16.cute_sparse_mla_h16_fwd(
-        q=q2_padded,
-        kv=kv2.squeeze(1),
-        indices=indices2.squeeze(1),
-        topk_length=lengths2,
-        attn_sink=sink2_padded,
-        sm_scale=D_QK**-0.5,
-    )
+    h16_inputs2 = _h16_inputs(q2, kv2, indices2, lengths2, sink2)
+    actual2 = cute_h16.cute_sparse_mla_h16_fwd(**h16_inputs2)
     expected2 = _flashmla_reference(
         flash_mla_sparse_fwd, q2, kv2, indices2, lengths2, sink2
     )
@@ -501,16 +454,11 @@ def test_cute_sparse_mla_h16_matches_flashmla_boundaries(topk: int):
         lengths=lengths,
         seed=1000 + topk,
     )
-    q_padded, sink_padded = _pad_flashmla_inputs(q, attn_sink)
-
-    actual = cute_h16.cute_sparse_mla_h16_fwd(
-        q=q_padded,
-        kv=kv.squeeze(1),
-        indices=indices.squeeze(1),
-        topk_length=topk_length,
-        attn_sink=sink_padded,
-        sm_scale=1.0 / math.sqrt(D_QK),
+    h16_inputs = _h16_inputs(
+        q, kv, indices, topk_length, attn_sink, sm_scale=1.0 / math.sqrt(D_QK)
     )
+
+    actual = cute_h16.cute_sparse_mla_h16_fwd(**h16_inputs)
     expected = _flashmla_reference(
         flash_mla_sparse_fwd, q, kv, indices, topk_length, attn_sink
     )
@@ -557,15 +505,8 @@ def test_cute_sparse_mla_h16_rms1_multitile_online_rescale():
     assert 0.9 < q.float().square().mean().sqrt().item() < 1.1
     assert 0.9 < kv.float().square().mean().sqrt().item() < 1.1
 
-    q_padded, sink_padded = _pad_flashmla_inputs(q, attn_sink)
-    actual = cute_h16.cute_sparse_mla_h16_fwd(
-        q=q_padded,
-        kv=kv_compact,
-        indices=indices_compact,
-        topk_length=topk_length,
-        attn_sink=sink_padded,
-        sm_scale=sm_scale,
-    )
+    h16_inputs = _h16_inputs(q, kv_compact, indices_compact, topk_length, attn_sink)
+    actual = cute_h16.cute_sparse_mla_h16_fwd(**h16_inputs)
     expected = _flashmla_reference(
         flash_mla_sparse_fwd, q, kv, indices, topk_length, attn_sink
     )
@@ -657,15 +598,8 @@ def test_cute_sparse_mla_h16_invalid_redirects_mask_poisoned_kv_zero():
         valid = (prefix >= 0) & (prefix < kv.shape[0])
         assert not bool(torch.any(prefix[valid] == 0))
 
-    q_padded, sink_padded = _pad_flashmla_inputs(q, attn_sink)
-    actual = cute_h16.cute_sparse_mla_h16_fwd(
-        q=q_padded,
-        kv=kv.squeeze(1),
-        indices=indices.squeeze(1),
-        topk_length=topk_length,
-        attn_sink=sink_padded,
-        sm_scale=D_QK**-0.5,
-    )
+    h16_inputs = _h16_inputs(q, kv, indices, topk_length, attn_sink)
+    actual = cute_h16.cute_sparse_mla_h16_fwd(**h16_inputs)
     expected = _flashmla_reference(
         flash_mla_sparse_fwd, q, kv, indices, topk_length, attn_sink
     )
@@ -729,17 +663,10 @@ def test_cute_sparse_mla_h16_two_nondefault_streams_share_executor():
     )
     q_a, kv_a, indices_a, lengths_a, sink_a = case_a
     q_b, kv_b, indices_b, lengths_b, sink_b = case_b
-    q_a64, sink_a64 = _pad_flashmla_inputs(q_a, sink_a)
-    q_b64, sink_b64 = _pad_flashmla_inputs(q_b, sink_b)
+    h16_inputs1 = _h16_inputs(q_a, kv_a, indices_a, lengths_a, sink_a)
+    h16_inputs2 = _h16_inputs(q_b, kv_b, indices_b, lengths_b, sink_b)
 
-    warm_a = cute_h16.cute_sparse_mla_h16_fwd(
-        q=q_a64,
-        kv=kv_a.squeeze(1),
-        indices=indices_a.squeeze(1),
-        topk_length=lengths_a,
-        attn_sink=sink_a64,
-        sm_scale=D_QK**-0.5,
-    )
+    warm_a = cute_h16.cute_sparse_mla_h16_fwd(**h16_inputs1)
     torch.cuda.synchronize()
     assert len(cute_h16._COMPILE_CACHE) == 1
 
@@ -749,23 +676,9 @@ def test_cute_sparse_mla_h16_two_nondefault_streams_share_executor():
     stream_a.wait_stream(default_stream)
     stream_b.wait_stream(default_stream)
     with torch.cuda.stream(stream_a):
-        actual_a = cute_h16.cute_sparse_mla_h16_fwd(
-            q=q_a64,
-            kv=kv_a.squeeze(1),
-            indices=indices_a.squeeze(1),
-            topk_length=lengths_a,
-            attn_sink=sink_a64,
-            sm_scale=D_QK**-0.5,
-        )
+        actual_a = cute_h16.cute_sparse_mla_h16_fwd(**h16_inputs1)
     with torch.cuda.stream(stream_b):
-        actual_b = cute_h16.cute_sparse_mla_h16_fwd(
-            q=q_b64,
-            kv=kv_b.squeeze(1),
-            indices=indices_b.squeeze(1),
-            topk_length=lengths_b,
-            attn_sink=sink_b64,
-            sm_scale=D_QK**-0.5,
-        )
+        actual_b = cute_h16.cute_sparse_mla_h16_fwd(**h16_inputs2)
     stream_a.synchronize()
     stream_b.synchronize()
 

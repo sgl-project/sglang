@@ -206,37 +206,20 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
             DSV4_CUTEDSL_H16_TOPK_ALIGNMENT,
             SPARSE_PREFILL_TOPK_ALIGNMENT,
         )
-        self.assertEqual(
-            deepseek_v4_backend._validate_dsv4_cutedsl_h16_combined_topk(
-                max_context_len=31744,
-                c4_topk=512,
-            ),
-            384,
-        )
-        self.assertEqual(
-            deepseek_v4_backend._validate_dsv4_cutedsl_h16_combined_topk(
-                max_context_len=40960,
-                c4_topk=512,
-            ),
-            512,
-        )
-        self.assertEqual(
-            deepseek_v4_backend._validate_dsv4_cutedsl_h16_combined_topk(
-                max_context_len=8064 * 128,
-                c4_topk=8064,
-            ),
-            DSV4_CUTEDSL_H16_MAX_TOPK,
-        )
-        with self.assertRaisesRegex(ValueError, "8192"):
-            deepseek_v4_backend._validate_dsv4_cutedsl_h16_combined_topk(
-                max_context_len=8065 * 128,
-                c4_topk=512,
-            )
-        with self.assertRaisesRegex(ValueError, "8192"):
-            deepseek_v4_backend._validate_dsv4_cutedsl_h16_combined_topk(
-                max_context_len=40960,
-                c4_topk=8065,
-            )
+        validate = deepseek_v4_backend._validate_dsv4_cutedsl_h16_combined_topk
+        for context, topk, expected in (
+            (31744, 512, 384),
+            (40960, 512, 512),
+            (8064 * 128, 8064, DSV4_CUTEDSL_H16_MAX_TOPK),
+        ):
+            with self.subTest(context=context, topk=topk):
+                self.assertEqual(
+                    validate(max_context_len=context, c4_topk=topk), expected
+                )
+        for context, topk in ((8065 * 128, 512), (40960, 8065)):
+            with self.subTest(context=context, topk=topk):
+                with self.assertRaisesRegex(ValueError, "8192"):
+                    validate(max_context_len=context, c4_topk=topk)
 
         cache = object.__new__(SparsePrefillChunkCache)
         cache.num_qo_tokens = 2
@@ -276,50 +259,51 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
             cache.get_c128_combined(450)
 
     def test_unbound_c128_sparse_prefill_uses_fixed_cached_bucket(self):
+        self._check_sparse_prefill_dispatch(compress_ratio=128)
+
+    def test_unbound_sparse_prefill_dispatch_preserves_cutedsl_contract(self):
+        self._check_sparse_prefill_dispatch(compress_ratio=0)
+
+    def _check_sparse_prefill_dispatch(self, compress_ratio):
         from sglang.srt.layers.attention import deepseek_v4_backend
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
             CompressedGather,
             SparsePrefillChunkCache,
         )
 
-        num_queries = 2
-        num_compressed_tokens = 3
-        num_swa_tokens = 2
-        q = torch.empty(
-            (num_queries, 1, 64, 512),
-            dtype=torch.bfloat16,
+        compressed = compress_ratio == 128
+        n_compressed, n_swa = (3, 2) if compressed else (0, 3)
+        n_tokens = n_compressed + n_swa
+        width = 384 if compressed else 128
+        q = torch.empty((2, 1, 64, 512), dtype=torch.bfloat16)
+        workspace = torch.empty((n_tokens, 1, 512), dtype=torch.bfloat16)
+        indices = torch.zeros((2, width), dtype=torch.int32)
+        lengths = torch.tensor(
+            [321, 384] if compressed else [127, 128], dtype=torch.int32
         )
-        workspace = torch.empty(
-            (num_compressed_tokens + num_swa_tokens, 1, 512),
-            dtype=torch.bfloat16,
-        )
-        live_indices = torch.zeros((num_queries, 384), dtype=torch.int32)
-        lengths = torch.tensor([321, 384], dtype=torch.int32)
         sink = torch.arange(64, dtype=torch.float32)
-        expected = torch.empty(
-            (num_queries, 16, 512),
-            dtype=torch.bfloat16,
-        )
+        expected = torch.empty((2, 16, 512), dtype=torch.bfloat16)
 
         cache = object.__new__(SparsePrefillChunkCache)
-        cache.num_qo_tokens = num_queries
-        cache.swa_token_ids = torch.arange(num_swa_tokens, dtype=torch.int32)
+        cache.num_qo_tokens = 2
+        cache.swa_token_ids = torch.arange(n_swa, dtype=torch.int32)
         cache.swa_page_size = 256
+        cache.c0_combined_indices, cache.c0_combined_lens = indices, lengths
+        cache.c128_padded_combined_indices = {}
         cache.compressed = {
             128: CompressedGather(
-                flat_token_ids=torch.arange(num_compressed_tokens, dtype=torch.int32),
+                flat_token_ids=torch.arange(n_compressed, dtype=torch.int32),
                 compressed_base=torch.zeros(1, dtype=torch.int32),
-                swa_base=torch.full((1,), num_compressed_tokens, dtype=torch.int32),
-                combined_indices=live_indices,
+                swa_base=torch.full((1,), n_compressed, dtype=torch.int32),
+                combined_indices=indices,
                 combined_lens=lengths,
             )
         }
-        cache.c128_padded_combined_indices = {}
-
-        workspace_get = mock.Mock(side_effect=[(workspace, False), (workspace, True)])
-        extra_buffer = torch.empty(1)
-        swa_buffer = object()
-        token_to_kv_pool = SimpleNamespace(
+        workspace_get = mock.Mock(return_value=workspace)
+        if compressed:
+            workspace_get.side_effect = [(workspace, False), (workspace, True)]
+        extra_buffer, swa_buffer = torch.empty(1), object()
+        pool = SimpleNamespace(
             get_extra_key_page_size=mock.Mock(return_value=16),
             get_extra_key_buffer=mock.Mock(return_value=extra_buffer),
             get_swa_key_buffer_radix=mock.Mock(return_value=swa_buffer),
@@ -328,186 +312,102 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
         )
         backend = SimpleNamespace(
             forward_metadata=SimpleNamespace(sparse_prefill_cache=cache),
-            sparse_prefill_kv_buffer=SimpleNamespace(get_with_head=workspace_get),
+            sparse_prefill_kv_buffer=SimpleNamespace(
+                get=workspace_get, get_with_head=workspace_get
+            ),
             softmax_scale=512**-0.5,
             _cutedsl_h16_c128_combined_topk=512,
             _cutedsl_h16_prefill_log_emitted=True,
         )
-        core_attn_metadata = SimpleNamespace(
+        metadata = SimpleNamespace(
             sparse_page_indices=mock.Mock(
-                return_value=torch.zeros((num_queries, 1), dtype=torch.int32)
-            ),
+                return_value=torch.zeros((2, 1), dtype=torch.int32)
+            )
         )
-
         with (
             mock.patch.object(
-                deepseek_v4_backend,
-                "dequantize_k_cache_paged_dsv4",
+                deepseek_v4_backend, "dequantize_k_cache_paged_dsv4"
             ) as dequantize,
             mock.patch.object(
                 deepseek_v4_backend,
                 "_run_dsv4_cutedsl_h16_sparse_prefill",
                 return_value=expected,
-            ) as run_cutedsl,
+            ) as run,
         ):
-            first = deepseek_v4_backend.DeepseekV4AttnBackend._forward_prefill_sparse(
-                backend,
-                q=q,
-                layer_id=3,
-                compress_ratio=128,
-                forward_batch=SimpleNamespace(),
-                token_to_kv_pool=token_to_kv_pool,
-                core_attn_metadata=core_attn_metadata,
-                attn_sink=sink,
-                use_cutedsl_h16=True,
+            # Repeat C128 to cover padded-index and shared-dequant reuse.
+            for _ in range(2 if compressed else 1):
+                actual = (
+                    deepseek_v4_backend.DeepseekV4AttnBackend._forward_prefill_sparse(
+                        backend,
+                        q=q,
+                        layer_id=3,
+                        compress_ratio=compress_ratio,
+                        forward_batch=SimpleNamespace(),
+                        token_to_kv_pool=pool,
+                        core_attn_metadata=metadata,
+                        attn_sink=sink,
+                        use_cutedsl_h16=True,
+                    )
+                )
+                self.assertIs(actual, expected)
+                self.assertEqual(tuple(actual.shape), (2, 16, 512))
+                kwargs = run.call_args.kwargs
+                self.assertEqual(tuple(kwargs["q"].shape), (2, 64, 512))
+                self.assertEqual(kwargs["q"].data_ptr(), q.data_ptr())
+                self.assertEqual(tuple(kwargs["kv"].shape), (n_tokens, 512))
+                self.assertEqual(kwargs["kv"].data_ptr(), workspace.data_ptr())
+                self.assertIs(kwargs["topk_length"], lengths)
+                self.assertIs(kwargs["attn_sink"], sink)
+                self.assertEqual(kwargs["sm_scale"], 512**-0.5)
+                if compressed:
+                    self.assertIs(
+                        kwargs["indices"], cache.c128_padded_combined_indices[512]
+                    )
+                    self.assertEqual(tuple(kwargs["indices"].shape), (2, 512))
+                    torch.testing.assert_close(kwargs["indices"][:, :384], indices)
+                    self.assertTrue(torch.all(kwargs["indices"][:, 384:] == -1))
+                else:
+                    self.assertIs(kwargs["indices"], indices)
+                    self.assertEqual(kwargs["indices"].ndim, 2)
+
+        if compressed:
+            self.assertIs(run.call_args_list[0].kwargs["indices"], kwargs["indices"])
+            head_source = (
+                extra_buffer.data_ptr(),
+                cache.compressed[128].flat_token_ids.data_ptr(),
+                3,
             )
-            first_indices = run_cutedsl.call_args.kwargs["indices"]
-            second = deepseek_v4_backend.DeepseekV4AttnBackend._forward_prefill_sparse(
-                backend,
-                q=q,
-                layer_id=3,
-                compress_ratio=128,
-                forward_batch=SimpleNamespace(),
-                token_to_kv_pool=token_to_kv_pool,
-                core_attn_metadata=core_attn_metadata,
-                attn_sink=sink,
-                use_cutedsl_h16=True,
+            workspace_get.assert_has_calls(
+                [mock.call(n_tokens, head_source=head_source)] * 2
             )
-            second_kwargs = run_cutedsl.call_args.kwargs
-
-        self.assertIs(first, expected)
-        self.assertIs(second, expected)
-        head_source = (
-            extra_buffer.data_ptr(),
-            cache.compressed[128].flat_token_ids.data_ptr(),
-            3,
-        )
-        workspace_get.assert_has_calls(
-            [
-                mock.call(5, head_source=head_source),
-                mock.call(5, head_source=head_source),
-            ]
-        )
-        # A shared compressed KV source is dequantized once; SWA stays per-layer.
-        self.assertEqual(dequantize.call_count, 3)
-        self.assertEqual(tuple(first_indices.shape), (num_queries, 512))
-        torch.testing.assert_close(first_indices[:, :384], live_indices)
-        self.assertTrue(torch.all(first_indices[:, 384:] == -1))
-        self.assertIs(first_indices, second_kwargs["indices"])
-        self.assertIs(
-            first_indices,
-            cache.c128_padded_combined_indices[512],
-        )
-        self.assertEqual(tuple(second_kwargs["q"].shape), (num_queries, 64, 512))
-        self.assertEqual(second_kwargs["q"].data_ptr(), q.data_ptr())
-        self.assertEqual(tuple(second_kwargs["kv"].shape), (5, 512))
-        self.assertEqual(second_kwargs["kv"].data_ptr(), workspace.data_ptr())
-        self.assertIs(second_kwargs["topk_length"], lengths)
-        self.assertIs(second_kwargs["attn_sink"], sink)
-        self.assertEqual(second_kwargs["sm_scale"], 512**-0.5)
-
-        compressed_call, swa_call = dequantize.call_args_list[:2]
-        self.assertIs(compressed_call.args[0], extra_buffer)
-        self.assertIs(compressed_call.args[1], cache.compressed[128].flat_token_ids)
-        self.assertEqual(compressed_call.kwargs["page_size"], 16)
-        self.assertEqual(compressed_call.kwargs["layout"], "compressed_layout")
-        self.assertEqual(swa_call.kwargs["layout"], "swa_layout")
-        self.assertEqual(
-            tuple(compressed_call.kwargs["out"].shape),
-            (num_compressed_tokens, 1, 512),
-        )
-        self.assertIs(swa_call.args[0], swa_buffer)
-        self.assertIs(swa_call.args[1], cache.swa_token_ids)
-        self.assertEqual(swa_call.kwargs["page_size"], 256)
-        self.assertEqual(
-            tuple(swa_call.kwargs["out"].shape),
-            (num_swa_tokens, 1, 512),
-        )
-
-    def test_unbound_sparse_prefill_dispatch_preserves_cutedsl_contract(self):
-        from sglang.srt.layers.attention import deepseek_v4_backend
-
-        num_queries = 2
-        num_workspace_tokens = 3
-        q = torch.empty(
-            (num_queries, 1, 64, 512),
-            dtype=torch.bfloat16,
-        )
-        workspace = torch.empty(
-            (num_workspace_tokens, 1, 512),
-            dtype=torch.bfloat16,
-        )
-        indices = torch.zeros((num_queries, 128), dtype=torch.int32)
-        lengths = torch.tensor([127, 128], dtype=torch.int32)
-        sink = torch.arange(64, dtype=torch.float32)
-        expected = torch.empty(
-            (num_queries, 16, 512),
-            dtype=torch.bfloat16,
-        )
-        cache = SimpleNamespace(
-            swa_token_ids=torch.arange(num_workspace_tokens, dtype=torch.int32),
-            swa_page_size=256,
-            c0_combined_indices=indices,
-            c0_combined_lens=lengths,
-        )
-        workspace_get = mock.Mock(return_value=workspace)
-        swa_buffer = object()
-        get_swa_buffer = mock.Mock(return_value=swa_buffer)
-        backend = SimpleNamespace(
-            forward_metadata=SimpleNamespace(sparse_prefill_cache=cache),
-            sparse_prefill_kv_buffer=SimpleNamespace(get=workspace_get),
-            softmax_scale=512**-0.5,
-            _cutedsl_h16_prefill_log_emitted=True,
-        )
-        token_to_kv_pool = SimpleNamespace(
-            get_swa_key_buffer_radix=get_swa_buffer,
-            get_swa_key_layout=mock.Mock(return_value="swa_layout"),
-        )
-
-        with (
-            mock.patch.object(
-                deepseek_v4_backend,
-                "dequantize_k_cache_paged_dsv4",
-            ) as dequantize,
-            mock.patch.object(
-                deepseek_v4_backend,
-                "_run_dsv4_cutedsl_h16_sparse_prefill",
-                return_value=expected,
-            ) as run_cutedsl,
-        ):
-            actual = deepseek_v4_backend.DeepseekV4AttnBackend._forward_prefill_sparse(
-                backend,
-                q=q,
-                layer_id=3,
-                compress_ratio=0,
-                forward_batch=SimpleNamespace(),
-                token_to_kv_pool=token_to_kv_pool,
-                core_attn_metadata=SimpleNamespace(),
-                attn_sink=sink,
-                use_cutedsl_h16=True,
+            # A shared compressed source is dequantized once; SWA stays per-layer.
+            self.assertEqual(dequantize.call_count, 3)
+            compressed_call = dequantize.call_args_list[0]
+            self.assertIs(compressed_call.args[0], extra_buffer)
+            self.assertIs(compressed_call.args[1], cache.compressed[128].flat_token_ids)
+            self.assertEqual(compressed_call.kwargs["page_size"], 16)
+            self.assertEqual(compressed_call.kwargs["layout"], "compressed_layout")
+            self.assertEqual(
+                tuple(compressed_call.kwargs["out"].shape), (n_compressed, 1, 512)
             )
-
-        self.assertIs(actual, expected)
-        self.assertEqual(tuple(actual.shape), (num_queries, 16, 512))
-        workspace_get.assert_called_once_with(num_workspace_tokens)
-        get_swa_buffer.assert_called_once_with(3)
-        dequantize.assert_called_once_with(
-            swa_buffer,
-            cache.swa_token_ids,
-            page_size=256,
-            out=workspace,
-            layout="swa_layout",
-        )
-        kwargs = run_cutedsl.call_args.kwargs
-        self.assertEqual(tuple(kwargs["q"].shape), (num_queries, 64, 512))
-        self.assertEqual(kwargs["q"].data_ptr(), q.data_ptr())
-        self.assertEqual(tuple(kwargs["kv"].shape), (num_workspace_tokens, 512))
-        self.assertEqual(kwargs["kv"].data_ptr(), workspace.data_ptr())
-        self.assertIs(kwargs["indices"], indices)
-        self.assertEqual(kwargs["indices"].ndim, 2)
-        self.assertIs(kwargs["topk_length"], lengths)
-        self.assertIs(kwargs["attn_sink"], sink)
-        self.assertEqual(kwargs["sm_scale"], 512**-0.5)
+            swa_calls = dequantize.call_args_list[1:]
+        else:
+            workspace_get.assert_called_once_with(n_tokens)
+            pool.get_swa_key_buffer_radix.assert_called_once_with(3)
+            dequantize.assert_called_once_with(
+                swa_buffer,
+                cache.swa_token_ids,
+                page_size=256,
+                out=workspace,
+                layout="swa_layout",
+            )
+            swa_calls = dequantize.call_args_list
+        for call in swa_calls:
+            self.assertIs(call.args[0], swa_buffer)
+            self.assertIs(call.args[1], cache.swa_token_ids)
+            self.assertEqual(call.kwargs["page_size"], 256)
+            self.assertEqual(call.kwargs["layout"], "swa_layout")
+            self.assertEqual(tuple(call.kwargs["out"].shape), (n_swa, 1, 512))
 
     def test_shared_sparse_gate_preserves_current_main_exclusions(self):
         from sglang.srt.layers.attention import deepseek_v4_backend as backend_module
