@@ -1492,7 +1492,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         if n_src == 0:
             return
-        assert self.src_mem_kind is not None
         decode_only_spec_dec = n_dst > n_src
 
         if peer_info.requires_dcp_relayout:
@@ -2240,7 +2239,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_indices: npt.NDArray[np.int32],
     ) -> List[Handle]:
-        assert self.src_mem_kind is not None
         remote = self._peers[peer_name].remote
         if self.transport.is_prepared(
             remote=None, layout=_KV_LAYOUT
