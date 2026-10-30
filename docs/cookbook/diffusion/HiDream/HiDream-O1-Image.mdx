@@ -23,14 +23,14 @@ request fields override the recipe.
 
 | Model ID | Weights | Scheduler | Steps | Guidance | Noise (start -> end, clip) |
 | --- | --- | --- | --- | --- | --- |
-| `hidream-ai/HiDream-O1-Image-Dev-2604` | fp32 | flash | 28 | 0.0 | 8.0 -> 8.0, clip 8.0 |
-| `hidream-ai/HiDream-O1-Image-Dev` | bf16 | flash | 28 | 0.0 | 7.5 -> 7.5, clip 2.5 |
-| `hidream-ai/HiDream-O1-Image` (Full) | bf16 | UniPC | 50 | 5.0 | none (z-init scale 8.0) |
+| `hidream-ai/HiDream-O1-Image-Dev-2604` | fp32 | flash | 28 | 0.0 | 7.5 -> 7.5, clip 2.5 |
+| `hidream-ai/HiDream-O1-Image-Dev` | fp32 | flash | 28 | 0.0 | 8.0 -> 8.0, clip 8.0 |
+| `hidream-ai/HiDream-O1-Image` (Full) | fp32 | UniPC | 50 | 5.0 | none (z-init scale 7.5) |
 
-Dev-2604 loads fp32 weights (about 2x the memory and latency of bf16).
-Latents and autocast compute stay bf16 for every variant, matching the
-official pipeline; NPU attention kernels require bf16/fp16 activations, so
-fp32 weights are never run without the bf16 autocast.
+All variants load fp32 master weights (about 2x the memory and latency of
+bf16). Latents and autocast compute stay bf16 for every variant, matching
+the official pipeline; NPU attention kernels require bf16/fp16 activations,
+so fp32 weights are never run without the bf16 autocast.
 
 ## 2. Installation
 
@@ -85,14 +85,19 @@ response.raise_for_status()
 ## 5. Request constraints
 
 - Resolution snaps to the closest supported preset (2048x2048 up to
-  3104x1312, multiples of 32). For a single-reference edit,
-  `keep_original_aspect=true` sizes the target from the reference instead.
+  3104x1312, multiples of 32). A single-reference edit keeps the reference
+  aspect by default: the target size is derived from the reference resized
+  to 2048 (patch aligned). Passing an explicit `width` and `height` snaps
+  the target to the closest preset instead.
 - Editing with exactly one reference image uses the flow_match scheduler on
   Dev checkpoints; the Full model always uses UniPC.
 - Generation is deterministic per request: the seed fixes the initial noise
-  and every random draw. The distilled Dev checkpoints are sensitive to the
-  draw; if an edit comes out flat or uncolored, re-roll the seed or use the
-  Full model, which the official README recommends for editing.
+  and every random draw. Deterministic editing (Dev flow_match, Full UniPC)
+  is sensitive to the draw, so the pipeline validates the first prediction
+  and automatically re-rolls the initial noise when it leaves the image
+  range (up to 8 alternatives, keeping the cleanest). A seed that already
+  produces a clean draw is honored as-is. The official README recommends
+  the Full model for editing.
 - Short prompts under-condition the model and can produce uncolored line
   art. The official workflow refines prompts with the Prompt Agent; connect
   `--prompt-enhancer-config` and set `enhance_prompt=true` (text-to-image

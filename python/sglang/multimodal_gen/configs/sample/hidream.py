@@ -65,17 +65,13 @@ _VARIANT_DEFAULTS = {
 
 @dataclass
 class HiDreamSamplingParams(SamplingParams):
-    """Sampling parameters for the HiDream-O1-Image family.
-
-    Recipe fields are None sentinels resolved in _adjust from the served
-    model path; an explicit per-request value (non-None) keeps precedence.
-    """
+    """Sampling parameters for the HiDream-O1-Image family."""
 
     num_inference_steps: Optional[int] = None
     num_frames: int = 1
     height: int = 2048
     width: int = 2048
-    guidance_scale: Optional[float] = None
+    guidance_scale: float = 5.0
     shift: Optional[float] = None
     seed: int = 42
     negative_prompt: str = " "
@@ -94,7 +90,6 @@ class HiDreamSamplingParams(SamplingParams):
 
     model_type: Optional[str] = None
 
-    # captured before super()._adjust() (base fills guidance_scale=1.0)
     _RECIPE_FIELDS = (
         "guidance_scale",
         "shift",
@@ -106,7 +101,11 @@ class HiDreamSamplingParams(SamplingParams):
     )
 
     def _adjust(self, server_args):
-        unset = {name: getattr(self, name) is None for name in self._RECIPE_FIELDS}
+        explicit = getattr(self, "_explicit_fields", None)
+        if explicit is None:
+            unset = {name: getattr(self, name) is None for name in self._RECIPE_FIELDS}
+        else:
+            unset = {name: name not in explicit for name in self._RECIPE_FIELDS}
         super()._adjust(server_args)
         # serve --num-inference-steps default; explicit request wins.
         if self.num_inference_steps is None:

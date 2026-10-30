@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-from glob import glob
 from typing import Any
 
 import torch
@@ -27,6 +26,9 @@ from sglang.multimodal_gen.configs.sample.hidream import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    load_llm_encoder_weights as load_weights,
+)
 from sglang.multimodal_gen.runtime.models.dits.hidream import HiDreamForCausalLM
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -78,48 +80,33 @@ class HiDreamPipeline(ComposedPipelineBase):
 
         # TP linears shard via param.weight_loader, not load_state_dict
         index_path = os.path.join(model_path, "model.safetensors.index.json")
-        if os.path.exists(index_path):
-            with open(index_path, "r") as f:
-                index = json.load(f)
-            weight_files = sorted(set(index["weight_map"].values()))
-        else:
-            weight_files = sorted(glob(os.path.join(model_path, "*.safetensors")))
+        with open(index_path, "r") as f:
+            index = json.load(f)
+        weight_files = sorted(set(index["weight_map"].values()))
 
         params_dict = dict(model.named_parameters())
-        loaded_keys = set()
-        # SRT fused layers: (checkpoint suffix, target suffix, shard_id)
-        stacked_mapping = {
-            "self_attn.q_proj.": ("self_attn.qkv_proj.", "q"),
-            "self_attn.k_proj.": ("self_attn.qkv_proj.", "k"),
-            "self_attn.v_proj.": ("self_attn.qkv_proj.", "v"),
-            "mlp.gate_proj.": ("mlp.gate_up_proj.", 0),
-            "mlp.up_proj.": ("mlp.gate_up_proj.", 1),
-        }
-        for wf in weight_files:
-            shard = load_file(os.path.join(model_path, wf))
-            for key, value in shard.items():
-                model_key = key[6:] if key.startswith("model.") else key
-                # reused SRT VisionAttention names the fused layer qkv_proj
-                if ".attn.qkv." in model_key:
-                    model_key = model_key.replace(".attn.qkv.", ".attn.qkv_proj.")
-                shard_id = None
-                for src_suffix, (dst_suffix, sid) in stacked_mapping.items():
-                    if src_suffix in model_key:
-                        model_key = model_key.replace(src_suffix, dst_suffix)
-                        shard_id = sid
-                        break
-                if model_key not in params_dict:
-                    continue
-                param = params_dict[model_key]
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader is not None:
-                    if shard_id is not None:
-                        weight_loader(param, value, shard_id)
-                    else:
-                        weight_loader(param, value)
-                else:
-                    param.data.copy_(value)
-                loaded_keys.add(model_key)
+        # SRT fused layers: (target param name, checkpoint name, shard_id)
+        stacked_params_mapping = [
+            ("self_attn.qkv_proj.", "self_attn.q_proj.", "q"),
+            ("self_attn.qkv_proj.", "self_attn.k_proj.", "k"),
+            ("self_attn.qkv_proj.", "self_attn.v_proj.", "v"),
+            ("mlp.gate_up_proj.", "mlp.gate_proj.", 0),
+            ("mlp.gate_up_proj.", "mlp.up_proj.", 1),
+        ]
+
+        def checkpoint_weights():
+            for wf in weight_files:
+                for key, value in load_file(os.path.join(model_path, wf)).items():
+                    if key.startswith("model."):
+                        key = key[6:]
+                    # reused SRT VisionAttention names the fused layer qkv_proj
+                    if ".attn.qkv." in key:
+                        key = key.replace(".attn.qkv.", ".attn.qkv_proj.")
+                    yield key, value
+
+        loaded_keys = load_weights(
+            checkpoint_weights(), params_dict, stacked_params_mapping
+        )
 
         missing_keys = set(params_dict.keys()) - loaded_keys
         if missing_keys:
@@ -142,9 +129,8 @@ class HiDreamPipeline(ComposedPipelineBase):
         model = model.to(w_dtype).eval()
         logger.info("HiDream %s weights cast to %s", variant, w_dtype)
         device = get_local_torch_device()
-        if device.type != "cpu":
-            model = model.to(device)
-            logger.info("HiDream model moved to %s", device)
+        model = model.to(device)
+        logger.info("HiDream model moved to %s", device)
 
         return {"model": model, "processor": processor}
 

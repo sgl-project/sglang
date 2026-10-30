@@ -1804,7 +1804,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
         return (
             getattr(default_params, "negative_prompt", None) is not None
-            and (getattr(default_params, "guidance_scale", 0) or 0) > 1.0
+            and getattr(default_params, "guidance_scale", 0) > 1.0
         )
 
     @staticmethod
