@@ -35,13 +35,14 @@ _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
 
 
 def torch_default_sdpa_backends():
-    """Context in which SDPA picks from every PyTorch backend, cuDNN included.
+    """Reference SDPA with a stable cuDNN-first preference and fallback set.
 
     The CUDA platform disables cuDNN SDPA process-wide (diffusers#9704). Modules
-    whose reference outputs were produced with PyTorch's defaults opt back in
-    around their own ``scaled_dot_product_attention`` calls.
+    opt back in locally. Priority must be explicit: restoring another SDPA
+    context can move disabled backends to the end of the ambient priority list,
+    otherwise changing reference outputs after the first DiT forward.
     """
-    return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+    return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
 
 
 class SDPABackend(AttentionBackend):
@@ -255,6 +256,20 @@ class CudnnSDPAImpl(SDPAImpl):
         return nullcontext()
 
 
+# B300/sm_103 self-attention at head_dim 128 from this many tokens runs faster on
+# FA4 (hardware exp2) than on cuDNN under a sustained, power-capped load: 1.5-2%
+# from 16K to 75.6K tokens; at 8K and below the two are even
+_SM103_FA4_MIN_SELF_ATTN_TOKENS = 16384
+
+
+def _prefers_fa4_on_sm103(query: torch.Tensor, key: torch.Tensor) -> bool:
+    return (
+        query.shape[-1] == 128
+        and query.shape[1] == key.shape[1]
+        and query.shape[1] >= _SM103_FA4_MIN_SELF_ATTN_TOKENS
+    )
+
+
 class DynamicCudnnSDPABackend(SDPABackend):
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
@@ -283,9 +298,11 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
 
         self.causal = causal
         self.head_size = head_size
-        self._is_sm100 = (
-            torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+        capability = (
+            torch.cuda.get_device_capability() if torch.cuda.is_available() else None
         )
+        self._is_sm100 = capability is not None and capability[0] == 10
+        self._is_sm103 = capability == (10, 3)
         # Set once cuDNN SDPA raised for this layer; permanently pins the
         # fail-safe FA path so we do not retry a failing kernel every step.
         self._cudnn_failed = False
@@ -321,14 +338,32 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             return False
         if query.shape[2] != key.shape[2]:
             return False
+        if self._is_sm103 and _prefers_fa4_on_sm103(query, key):
+            return False
         if self._is_sm100:
             # B200/sm_100: cuDNN SDPA measured 1.25-1.5x faster than FA4 CuTe
             # for dense non-causal diffusion attention, both self-attn
-            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len).
-            return True
+            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len). A side
+            # shorter than one 128-row tile while the other is not drops cuDNN to
+            # an sm80 kernel that FA4 beats 2-3x (B300, 126 x 1536 tokens:
+            # 24.9 vs 12.1 us)
+            short_side, long_side = sorted((query.shape[1], key.shape[1]))
+            return short_side >= 128 or long_side < 128
         if query.shape[1] != key.shape[1]:
             return False
         return query.shape[-1] == 64 and query.shape[1] == 1024 and query.shape[0] >= 4
+
+    def forward_into(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        out: torch.Tensor | None,
+        attn_metadata: AttentionMetadata,
+    ) -> bool:
+        if self._use_cudnn_sdpa(query, key, value):
+            return False
+        return self.fa_impl.forward_into(query, key, value, out, attn_metadata)
 
     def forward(
         self,

@@ -7,20 +7,23 @@ import pytest
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
     WarmupMemoryRecord,
     estimate_default_workload_peak_bytes,
-    estimate_default_workload_timing,
-    estimate_layerwise_layer_uses,
-    estimate_workload_phase_peaks,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_MAX_VIDEO_FRAMES,
+    SERVER_WARMUP_VIDEO_STEPS,
     _resolve_auto_residency_warmup_shape,
     _resolve_warmup_num_frames,
+    build_warmup_reqs,
 )
+
+PLANNER_UNAVAILABLE = "residency planner not available"
 
 
 def _record(
@@ -30,19 +33,7 @@ def _record(
     num_frames=17,
     baseline_gib=10,
     peak_gib=12,
-    peak_reserved_gib=0,
     succeeded=True,
-    num_inference_steps=1,
-    total_duration_ms=0.0,
-    stage_duration_ms=None,
-    step_duration_ms=(),
-    step_duration_ms_by_stage=None,
-    stage_iterations=None,
-    phase_active_components=None,
-    phase_used_components=None,
-    phase_full_weight_transition_components=None,
-    layerwise_layer_uses=None,
-    layerwise_layer_uses_by_stage=None,
 ) -> WarmupMemoryRecord:
     return WarmupMemoryRecord(
         width=width,
@@ -51,223 +42,7 @@ def _record(
         baseline_allocated_bytes=baseline_gib * GIB_BYTES,
         peak_allocated_bytes=peak_gib * GIB_BYTES,
         succeeded=succeeded,
-        peak_reserved_bytes=peak_reserved_gib * GIB_BYTES,
-        num_inference_steps=num_inference_steps,
-        total_duration_ms=total_duration_ms,
-        stage_duration_ms=stage_duration_ms or {},
-        step_duration_ms=step_duration_ms,
-        step_duration_ms_by_stage=step_duration_ms_by_stage or {},
-        stage_iterations=stage_iterations or {},
-        phase_active_components=phase_active_components or {},
-        phase_used_components=phase_used_components or {},
-        phase_full_weight_transition_components=(
-            phase_full_weight_transition_components or {}
-        ),
-        layerwise_layer_uses=layerwise_layer_uses or {},
-        layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage or {},
     )
-
-
-class TestEstimateDefaultWorkloadTiming:
-    def test_scales_only_denoising_with_target_steps(self):
-        record = _record(
-            num_inference_steps=2,
-            total_duration_ms=1_200,
-            stage_duration_ms={
-                "TextEncodingStage": 100,
-                "DenoisingStage": 1_000,
-            },
-            phase_active_components={
-                "0:TextEncodingStage:use:text_encoder": ("text_encoder",),
-                "1:DenoisingStage:use:transformer": ("transformer",),
-            },
-        )
-
-        request_ns, stage_ns, component_stages = estimate_default_workload_timing(
-            records=[record],
-            target_units=record.workload_units(),
-            target_num_inference_steps=40,
-        )
-
-        assert stage_ns == {
-            "TextEncodingStage": 100_000_000,
-            "DenoisingStage": 20_000_000_000,
-        }
-        assert request_ns == 20_200_000_000
-        assert component_stages == {
-            "text_encoder": ("TextEncodingStage",),
-            "transformer": ("DenoisingStage",),
-        }
-
-    def test_uses_steady_step_instead_of_scaling_first_step_setup(self):
-        record = _record(
-            num_inference_steps=2,
-            total_duration_ms=720,
-            stage_duration_ms={
-                "TextEncodingStage": 100,
-                "DenoisingStage": 620,
-            },
-            step_duration_ms=(500, 100),
-            phase_active_components={
-                "0:TextEncodingStage:use:text_encoder": ("text_encoder",),
-                "1:DenoisingStage:use:transformer": ("transformer",),
-            },
-        )
-
-        request_ns, stage_ns, _ = estimate_default_workload_timing(
-            records=[record],
-            target_units=record.workload_units(),
-            target_num_inference_steps=10,
-        )
-
-        assert stage_ns["DenoisingStage"] == 1_020_000_000
-        assert request_ns == 1_120_000_000
-
-    def test_scales_standard_and_nonstandard_denoising_stages_together(self):
-        record = _record(
-            num_inference_steps=2,
-            total_duration_ms=1_200,
-            stage_duration_ms={
-                "TextEncodingStage": 100,
-                "DenoisingStage": 500,
-                "CustomDenoisingStage": 600,
-            },
-            phase_active_components={
-                "0:TextEncodingStage:use:text_encoder": ("text_encoder",),
-                "1:DenoisingStage:use:transformer": ("transformer",),
-                "2:CustomDenoisingStage:use:custom_refiner": ("custom_refiner",),
-            },
-        )
-
-        request_ns, stage_ns, _ = estimate_default_workload_timing(
-            records=[record],
-            target_units=record.workload_units(),
-            target_num_inference_steps=10,
-        )
-
-        assert stage_ns == {
-            "TextEncodingStage": 100_000_000,
-            "DenoisingStage": 2_500_000_000,
-            "CustomDenoisingStage": 3_000_000_000,
-        }
-        assert request_ns == 5_600_000_000
-
-    def test_uses_each_stage_iteration_target(self):
-        record = _record(
-            num_inference_steps=4,
-            total_duration_ms=1_100,
-            stage_duration_ms={
-                "ShapeDenoisingStage": 500,
-                "PaintStage": 600,
-            },
-            step_duration_ms_by_stage={
-                "ShapeDenoisingStage": (200, 100, 100, 100),
-            },
-            stage_iterations={
-                "ShapeDenoisingStage": (4, 50),
-                "PaintStage": (4, 30),
-            },
-            phase_active_components={
-                "0:ShapeDenoisingStage:use:hy3dshape_model": ("hy3dshape_model",),
-                "1:PaintStage:use:paint_transformer": ("paint_transformer",),
-            },
-        )
-
-        request_ns, stage_ns, _ = estimate_default_workload_timing(
-            records=[record],
-            target_units=record.workload_units(),
-            target_num_inference_steps=50,
-        )
-
-        assert stage_ns == {
-            "ShapeDenoisingStage": 5_000_000_000,
-            "PaintStage": 4_500_000_000,
-        }
-        assert request_ns == 9_500_000_000
-
-
-class TestEstimateLayerwiseLayerUses:
-    def test_scales_repeated_groups_but_not_one_shot_groups(self):
-        record = _record(
-            num_inference_steps=2,
-            layerwise_layer_uses={
-                "transformer": {
-                    "token_refiner.blocks": (1, 1),
-                    "blocks": (2, 2, 2),
-                },
-                "vae": {
-                    "encoder.down_blocks": (0, 0),
-                    "decoder.up_blocks": (1, 1),
-                },
-            },
-        )
-
-        uses = estimate_layerwise_layer_uses(
-            records=[record],
-            target_units=record.workload_units(),
-            target_num_inference_steps=10,
-        )
-
-        assert uses["transformer"] == {
-            "token_refiner.blocks": (1, 1),
-            "blocks": (10, 10, 10),
-        }
-        assert uses["vae"] == {
-            "encoder.down_blocks": (0, 0),
-            "decoder.up_blocks": (1, 1),
-        }
-
-    def test_stage_role_scales_nonstandard_denoiser_but_not_encoder_repeats(self):
-        record = _record(
-            num_inference_steps=2,
-            phase_used_components={
-                "0:TextEncodingStage:use:custom_encoder": ("custom_encoder",),
-                "1:CustomDenoisingStage:use:custom_refiner": ("custom_refiner",),
-            },
-            layerwise_layer_uses={
-                "custom_encoder": {"layers": (2, 2)},
-                "custom_refiner": {"blocks": (2, 2)},
-            },
-        )
-
-        uses = estimate_layerwise_layer_uses(
-            records=[record],
-            target_units=record.workload_units(),
-            target_num_inference_steps=10,
-        )
-
-        assert uses["custom_encoder"]["layers"] == (2, 2)
-        assert uses["custom_refiner"]["blocks"] == (10, 10)
-
-    def test_scales_each_stage_calls_with_its_own_iteration_target(self):
-        record = _record(
-            num_inference_steps=4,
-            phase_used_components={
-                "0:ShapeStage:use:transformer": ("transformer",),
-                "1:PaintStage:use:transformer": ("transformer",),
-            },
-            stage_iterations={
-                "ShapeStage": (4, 50),
-                "PaintStage": (4, 30),
-            },
-            layerwise_layer_uses={
-                "transformer": {"blocks": (9, 9), "one_shot": (2, 2)}
-            },
-            layerwise_layer_uses_by_stage={
-                "ShapeStage": {"transformer": {"blocks": (4, 4), "one_shot": (1, 1)}},
-                "PaintStage": {"transformer": {"blocks": (4, 4), "one_shot": (1, 1)}},
-            },
-        )
-
-        uses = estimate_layerwise_layer_uses(
-            records=[record],
-            target_units=record.workload_units(),
-            target_num_inference_steps=50,
-        )
-
-        # one untracked one-shot call + 50 shape calls + 30 paint calls
-        assert uses["transformer"]["blocks"] == (81, 81)
-        assert uses["transformer"]["one_shot"] == (2, 2)
 
 
 class TestEstimateDefaultWorkloadPeak:
@@ -427,154 +202,6 @@ class TestEstimateDefaultWorkloadPeak:
         assert (
             estimate_default_workload_peak_bytes(records=[], target_units=None) is None
         )
-
-    def test_phase_estimation_preserves_active_component_membership(self):
-        small = _record(num_frames=9, peak_gib=30)
-        large = _record(num_frames=17, peak_gib=32)
-        small = WarmupMemoryRecord(
-            width=small.width,
-            height=small.height,
-            num_frames=small.num_frames,
-            baseline_allocated_bytes=small.baseline_allocated_bytes,
-            peak_allocated_bytes=small.peak_allocated_bytes,
-            succeeded=small.succeeded,
-            phase_peak_allocated_bytes={"denoise": 30 * GIB_BYTES},
-            phase_active_components={"denoise": ("transformer",)},
-        )
-        large = WarmupMemoryRecord(
-            width=large.width,
-            height=large.height,
-            num_frames=large.num_frames,
-            baseline_allocated_bytes=large.baseline_allocated_bytes,
-            peak_allocated_bytes=large.peak_allocated_bytes,
-            succeeded=large.succeeded,
-            phase_peak_allocated_bytes={"denoise": 32 * GIB_BYTES},
-            phase_active_components={"denoise": ("transformer",)},
-        )
-
-        peaks, active, used, _ = estimate_workload_phase_peaks(
-            records=[small, large],
-            target_units=832 * 480 * 81,
-            component_weight_bytes={"transformer": 28 * GIB_BYTES},
-        )
-
-        assert peaks["denoise"] >= 32 * GIB_BYTES
-        assert active == {"denoise": ("transformer",)}
-        assert used == active
-
-    def test_phase_estimation_uses_allocated_peak(self):
-        record = WarmupMemoryRecord(
-            width=1024,
-            height=1024,
-            num_frames=1,
-            baseline_allocated_bytes=5 * GIB_BYTES,
-            peak_allocated_bytes=12 * GIB_BYTES,
-            succeeded=True,
-            phase_peak_allocated_bytes={"denoise": 11 * GIB_BYTES},
-            phase_active_components={"denoise": ("transformer",)},
-        )
-
-        peaks, _, _, _ = estimate_workload_phase_peaks(
-            records=[record],
-            target_units=record.workload_units(),
-            component_weight_bytes={"transformer": 10 * GIB_BYTES},
-        )
-
-        assert peaks["denoise"] == 11 * GIB_BYTES
-
-    def test_phase_estimation_preserves_full_weight_transition_components(self):
-        record = WarmupMemoryRecord(
-            width=1024,
-            height=1024,
-            num_frames=1,
-            baseline_allocated_bytes=2 * GIB_BYTES,
-            peak_allocated_bytes=4 * GIB_BYTES,
-            succeeded=True,
-            phase_peak_allocated_bytes={"lora_switch": 4 * GIB_BYTES},
-            phase_full_weight_transition_components={"lora_switch": ("transformer",)},
-        )
-
-        peaks, _, _, transitions = estimate_workload_phase_peaks(
-            records=[record],
-            target_units=record.workload_units(),
-            component_weight_bytes={"transformer": 2 * GIB_BYTES},
-        )
-
-        assert peaks == {"lora_switch": 4 * GIB_BYTES}
-        assert transitions == {"lora_switch": ("transformer",)}
-
-    def test_phase_estimation_prefers_target_layout_over_smaller_warmup(self):
-        small = WarmupMemoryRecord(
-            width=256,
-            height=256,
-            num_frames=9,
-            baseline_allocated_bytes=2 * GIB_BYTES,
-            peak_allocated_bytes=30 * GIB_BYTES,
-            succeeded=True,
-            phase_peak_allocated_bytes={"denoise": 30 * GIB_BYTES},
-            phase_active_components={"denoise": ()},
-        )
-        target = WarmupMemoryRecord(
-            width=768,
-            height=512,
-            num_frames=25,
-            baseline_allocated_bytes=2 * GIB_BYTES,
-            peak_allocated_bytes=48 * GIB_BYTES,
-            succeeded=True,
-            phase_peak_allocated_bytes={"denoise": 48 * GIB_BYTES},
-            phase_active_components={"denoise": ("transformer",)},
-        )
-
-        peaks, active, used, _ = estimate_workload_phase_peaks(
-            records=[small, target],
-            target_units=target.workload_units(),
-            component_weight_bytes={"transformer": 40 * GIB_BYTES},
-        )
-
-        assert peaks == {"denoise": 48 * GIB_BYTES}
-        assert active == {"denoise": ("transformer",)}
-        assert used == active
-
-    def test_phase_estimation_keeps_distinct_active_layouts_separate(self):
-        transformer_phase = WarmupMemoryRecord(
-            width=768,
-            height=512,
-            num_frames=25,
-            baseline_allocated_bytes=2 * GIB_BYTES,
-            peak_allocated_bytes=48 * GIB_BYTES,
-            succeeded=True,
-            phase_peak_allocated_bytes={"denoise": 48 * GIB_BYTES},
-            phase_active_components={"denoise": ("transformer",)},
-        )
-        encoder_phase = WarmupMemoryRecord(
-            width=768,
-            height=512,
-            num_frames=25,
-            baseline_allocated_bytes=2 * GIB_BYTES,
-            peak_allocated_bytes=20 * GIB_BYTES,
-            succeeded=True,
-            phase_peak_allocated_bytes={"denoise": 20 * GIB_BYTES},
-            phase_active_components={"denoise": ("text_encoder",)},
-        )
-
-        peaks, active, used, _ = estimate_workload_phase_peaks(
-            records=[transformer_phase, encoder_phase],
-            target_units=transformer_phase.workload_units(),
-            component_weight_bytes={
-                "transformer": 40 * GIB_BYTES,
-                "text_encoder": 10 * GIB_BYTES,
-            },
-        )
-
-        assert peaks == {
-            "denoise:layout:0": 20 * GIB_BYTES,
-            "denoise:layout:1": 48 * GIB_BYTES,
-        }
-        assert active == {
-            "denoise:layout:0": ("text_encoder",),
-            "denoise:layout:1": ("transformer",),
-        }
-        assert used == active
 
 
 class TestWarmupFrameAdjustment:
@@ -834,8 +461,9 @@ class TestAutoResidencySkipReason:
     ):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args(**overrides))
-        assert reason is None or reason == "requires CUDA"
+        assert reason == PLANNER_UNAVAILABLE
 
     def test_cache_dit_excluded(self, monkeypatch):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
@@ -851,15 +479,53 @@ class TestAutoResidencySkipReason:
             {"use_fsdp_inference": True},
         ],
     )
-    def test_parallel_paths_reach_platform_gate(self, monkeypatch, overrides):
+    def test_parallel_paths_reach_planner_gate(self, monkeypatch, overrides):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args(**overrides))
-        assert reason is None or reason == "requires CUDA"
+        assert reason == PLANNER_UNAVAILABLE
 
-    def test_eligible_path_reaches_platform_gate(self, monkeypatch):
+    def test_eligible_path_reaches_planner_gate(self, monkeypatch):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args())
-        # on a CUDA host everything passes; CPU CI stops at the platform gate
-        assert reason is None or reason == "requires CUDA"
+        assert reason == PLANNER_UNAVAILABLE
+
+    def test_eligible_server_warmup_runs_no_probe_or_step_floor(self, monkeypatch):
+        # no calibration consumer yet: one bounded warmup, not probe + 4-step floor
+        monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
+        monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+        args = self._base_args(
+            warmup_steps=1,
+            enable_cfg_parallel=False,
+            num_gpus=1,
+            pipeline_config=SimpleNamespace(
+                task_type=ModelTaskType.T2V,
+                supports_auto_residency=True,
+                adjust_num_frames=lambda value: value,
+                vae_stride=None,
+                vae_scale_factor=None,
+                vae_config=SimpleNamespace(arch_config=None),
+            ),
+            is_arg_explicitly_set=lambda _name: False,
+        )
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            lambda _args: SamplingParams(
+                width=1280,
+                height=720,
+                num_frames=81,
+                num_inference_steps=35,
+                adjust_frames=False,
+                supported_resolutions=[(1280, 720), (832, 480)],
+            ),
+        )
+        reqs = build_warmup_reqs(
+            args, warmup_resolutions=None, server_based_warmup=True
+        )
+        assert len(reqs) == 1
+        assert not reqs[0].extra.get("auto_residency_full_shape_probe")
+        assert reqs[0].num_inference_steps == SERVER_WARMUP_VIDEO_STEPS

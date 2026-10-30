@@ -1,5 +1,6 @@
 import dataclasses
 import pickle
+import time
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -16,18 +17,24 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
+    DetokenizeReleaseReq,
+    RequestOutputStats,
     msgpack_decode,
     msgpack_encode,
     unwrap_from_pickle,
 )
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.output_streamer import (
+    OutputSink,
     SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
+from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import (
     WeightVersionSpan,
@@ -37,6 +44,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+_REQUEST_STATS = RequestOutputStats(
+    prompt_tokens=0,
+    cached_tokens=0,
+    cached_tokens_details=None,
+    retraction_count=0,
+    image_tokens=0,
+    audio_tokens=0,
+    video_tokens=0,
+    time_stats=None,
+)
 
 
 class _FakeReq:
@@ -69,12 +87,16 @@ class _FakeReq:
         self.output_ids_through_stop = output_ids
         self.send_token_offset = 0
         self.send_output_token_logprobs_offset = 0
-        self.send_decode_id_offset = 0
-        self.decoded_text = ""
+        self.detokenize_header_sent = False
         self.origin_input_ids = []
+        self.origin_input_ids_unpadded = array("q")
         self.reasoning_tokens = 0
         self.cached_tokens = 0
+        self.cached_tokens_device = 0
+        self.cached_tokens_host = 0
+        self.cached_tokens_storage = 0
         self.retraction_count = 0
+        self.request_stats_retraction_count = None
         self.time_stats = None
         self.return_hidden_states = False
         self.return_routed_experts = False
@@ -91,11 +113,11 @@ class _FakeReq:
     def finished(self):
         return self._finished
 
+    take_request_stats_due = Req.take_request_stats_due
+    take_detokenize_header_due = Req.take_detokenize_header_due
+
     def get_mm_token_counts(self):
         return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
-
-    def init_incremental_detokenize(self):
-        return self.output_ids_through_stop, 0
 
     def check_match_stop_str_prefix(self):
         return False
@@ -105,6 +127,7 @@ def _accumulator(
     current_weight_version="default",
     return_sampling_mask=False,
     request_level_keys=frozenset(),
+    output_sink=OutputSink.DETOKENIZER,
 ):
     return _GenerationStreamAccumulator(
         return_logprob=False,
@@ -116,27 +139,35 @@ def _accumulator(
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
         default_force_stream_interval=1,
-        get_cached_tokens_details=lambda req: None,
+        build_request_stats=lambda req: _REQUEST_STATS,
         is_request_level_customized_info_key=request_level_keys.__contains__,
         current_weight_version=current_weight_version,
+        output_sink=output_sink,
     )
+
+
+def _enter_streamer_scope(test):
+    """Patch what `SchedulerOutputStreamer` reads per call, for `test`."""
+    serving_patch = patch(
+        "sglang.srt.managers.scheduler_components.output_streamer.get_serving",
+        return_value=SimpleNamespace(stream_interval=1, weight_version="default"),
+    )
+    observability_patch = patch(
+        "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
+        return_value=SimpleNamespace(
+            enable_metrics=False, enable_request_time_stats_logging=False
+        ),
+    )
+    serving_patch.start()
+    observability_patch.start()
+    enter_scope(test, published_topology(ranks={"dp_rank": 0}))
+    test.addCleanup(serving_patch.stop)
+    test.addCleanup(observability_patch.stop)
 
 
 class TestOutputStreamerCustomizedInfo(unittest.TestCase):
     def setUp(self):
-        serving_patch = patch(
-            "sglang.srt.managers.scheduler_components.output_streamer.get_serving",
-            return_value=SimpleNamespace(stream_interval=1, weight_version="default"),
-        )
-        observability_patch = patch(
-            "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
-            return_value=SimpleNamespace(enable_request_time_stats_logging=False),
-        )
-        serving_patch.start()
-        observability_patch.start()
-        enter_scope(self, published_topology(ranks={"dp_rank": 0}))
-        self.addCleanup(serving_patch.stop)
-        self.addCleanup(observability_patch.stop)
+        _enter_streamer_scope(self)
 
     def test_customized_info_is_padded_for_mixed_batches(self):
         accumulator = _accumulator()
@@ -263,6 +294,21 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             {key: [[], [386.25]]},
         )
 
+    def test_rust_egress_takes_each_steps_values_unpickled(self):
+        """Each step sends the values for its new tokens; the Rust egress
+        encodes the lists itself."""
+        probed = _FakeReq("r0", [20, 21], customized_info={"probe": [200, 201]})
+        steps = []
+        for _ in range(2):
+            accumulator = _accumulator(output_sink=OutputSink.RUST)
+            accumulator.accept(req=probed)
+            payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+            steps.append(payload.customized_info)
+            probed.output_ids.append(22)
+            probed.customized_info["probe"].append(202)
+
+        self.assertEqual(steps, [{"probe": [[200, 201]]}, {"probe": [[202]]}])
+
     def test_additional_customized_info_uses_the_existing_payload(self):
         class Streamer(SchedulerOutputStreamer):
             has_additional_customized_info = True
@@ -284,6 +330,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
 
@@ -316,6 +363,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
         quiet = _FakeReq("quiet", [10, 11])
@@ -353,6 +401,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
         terminal = _FakeReq("terminal", [20], finished=True)
@@ -393,6 +442,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
         first = _FakeReq("duplicate", [10], finished=True)
@@ -417,6 +467,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
 
@@ -442,6 +493,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: False,
         )
 
@@ -455,7 +507,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         class Streamer(SchedulerOutputStreamer):
             has_additional_customized_info = True
 
-        with self.assertRaisesRegex(ValueError, "Rust egress"):
+        with self.assertRaisesRegex(ValueError, "Rust frontend does not run"):
             Streamer(
                 send_to_detokenizer=SimpleNamespace(),
                 tree_cache=None,
@@ -463,6 +515,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
                 disaggregation_mode=DisaggregationMode.NULL,
+                skip_tokenizer_init=False,
                 enable_hicache_storage=lambda: False,
                 rust_server=object(),
             )
@@ -499,6 +552,273 @@ class TestOutputStreamerWeightVersions(unittest.TestCase):
         payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
 
         self.assertIsNone(payload.weight_versions)
+
+
+class TestOutputStreamerDecodeLatency(unittest.TestCase):
+    def setUp(self):
+        _enter_streamer_scope(self)
+
+    def test_rust_mode_times_finished_non_streaming_requests(self):
+        """In Rust mode a finished non-streaming request's decode latency runs
+        from the prefill stamp, which Python's TokenizerManager reads only with
+        metrics on, and the scheduler hands it to the Rust frontend by payload
+        row with the batch; other requests, and Python mode, record none."""
+        stamp = time.perf_counter() - 0.5
+
+        def req(rid, *, stream=False, finished=True, metrics=True, stamp=stamp):
+            req = _FakeReq(rid, [1], finished=finished)
+            req.stream = stream
+            req.time_stats = SimpleNamespace(
+                enable_metrics=metrics, prefill_finished_time=stamp
+            )
+            return req
+
+        rust_server = Mock()
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=None,
+            tree_cache=None,
+            server_args=SimpleNamespace(
+                enable_hierarchical_cache=False, enable_lmcache=False
+            ),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=False,
+            enable_hicache_storage=lambda: False,
+            rust_server=rust_server,
+        )
+        streamer._stream_output_generation(
+            [
+                req("streaming", stream=True),
+                req("timed"),
+                req("running", finished=False),
+                req("no_metrics", metrics=False),
+                req("no_stamp", stamp=0.0),
+            ],
+            False,
+        )
+        payload, decode_latencies = rust_server.push_generation.call_args.args[:2]
+        self.assertEqual(payload.rids[1], "timed")
+        self.assertEqual(list(decode_latencies), [1])
+        self.assertGreaterEqual(decode_latencies[1], 0.5)
+
+        python_mode = _accumulator()
+        python_mode.accept(req=req("timed"))
+        self.assertEqual(python_mode.decode_latencies, {})
+
+
+def _metered_req():
+    sampling_params = SamplingParams()
+    sampling_params.normalize(None)
+    req = Req("r", "", array("q", [1, 2, 3]), sampling_params, stream=True)
+    req.time_stats.set_metrics_collector(Mock())
+    return req
+
+
+def _streamer(outputs, enable_hicache_storage=lambda: False, is_generation=True):
+    return SchedulerOutputStreamer(
+        send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+        tree_cache=None,
+        server_args=SimpleNamespace(enable_lmcache=False),
+        is_generation=is_generation,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        disaggregation_mode=DisaggregationMode.NULL,
+        skip_tokenizer_init=False,
+        enable_hicache_storage=enable_hicache_storage,
+    )
+
+
+class TestOutputStreamerRequestStats(unittest.TestCase):
+    def setUp(self):
+        _enter_streamer_scope(self)
+
+    def _set_metrics(self, enabled):
+        observability = patch(
+            "sglang.srt.managers.scheduler_components.output_streamer.get_observability",
+            return_value=SimpleNamespace(
+                enable_metrics=enabled, enable_request_time_stats_logging=False
+            ),
+        )
+        observability.start()
+        self.addCleanup(observability.stop)
+
+    def test_request_stats_carry_time_stats_only_with_metrics_on(self):
+        timed = SchedulerReqTimeStats(enable_metrics=True)
+        timed.queue_duration_s = 0.25
+
+        def time_stats(enable_metrics, req_time_stats):
+            self._set_metrics(enable_metrics)
+            req = _FakeReq("r", [1])
+            req.time_stats = req_time_stats
+            return _streamer([]).build_request_stats(req).time_stats
+
+        self.assertEqual(time_stats(True, timed), timed.to_output_time_stats())
+        self.assertIsNone(time_stats(True, SchedulerReqTimeStats()))
+        self.assertIsNone(time_stats(False, timed))
+
+    def test_request_stats_go_out_on_first_output_retraction_and_finish(self):
+        """A request's stats go out with its first output, with the first
+        output after each retraction, and with its finished row; other rows
+        carry none, so they keep the values last sent."""
+        self._set_metrics(True)
+        outputs = []
+        streamer = _streamer(outputs)
+        req = _metered_req()
+        req.cached_tokens = 2
+
+        def output(finished=False):
+            req.output_ids.append(7)
+            if finished:
+                req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+            streamer.stream_output([req], False)
+            return outputs[-1].request_stats
+
+        [first] = output()
+        self.assertEqual(
+            (first.prompt_tokens, first.cached_tokens, first.retraction_count),
+            (3, 2, 0),
+        )
+        self.assertIsNone(output())
+
+        req.reset_for_retract()
+        # The overlap schedule outputs the retracted request's last decode step.
+        [retracted] = output()
+        self.assertEqual(retracted.retraction_count, 1)
+        # Re-admission adds the second wait to the queue time.
+        req.time_stats.queue_duration_s += 0.5
+        req.is_retracted = False
+        self.assertIsNone(output())
+
+        [finished] = output(finished=True)
+        self.assertEqual(finished.retraction_count, 1)
+        self.assertEqual(finished.time_stats.queue_time, 0.5)
+
+    def test_embedding_rows_carry_their_request_stats(self):
+        """An embedding request is output once, finished, and its row carries
+        its stats; embedding outputs carry no time stats even with metrics on."""
+        self._set_metrics(True)
+        outputs = []
+        streamer = _streamer(outputs, is_generation=False)
+        req = _metered_req()
+        req.cached_tokens = 2
+        req.retraction_count = 1
+        req.embedding = [0.5]
+        req.finished_reason = FINISH_LENGTH(length=1)
+
+        streamer.stream_output([req], False)
+
+        [stats] = outputs[-1].request_stats
+        self.assertIsInstance(stats, RequestOutputStats)
+        self.assertEqual(
+            (stats.prompt_tokens, stats.cached_tokens, stats.retraction_count),
+            (3, 2, 1),
+        )
+        self.assertIsNone(stats.time_stats)
+
+    def test_finished_output_carries_current_request_stats(self):
+        """A finished output carries the request's current stats even when a
+        value changed after the last one was sent: HiCache storage attached
+        mid-request adds the storage keys to cached_tokens_details."""
+        attached = False
+        outputs = []
+        streamer = _streamer(outputs, enable_hicache_storage=lambda: attached)
+        req = _metered_req()
+        req.cached_tokens = req.cached_tokens_device = 2
+
+        req.output_ids.append(7)
+        streamer.stream_output([req], False)
+        [first] = outputs[-1].request_stats
+        self.assertEqual(first.cached_tokens_details, {"device": 2, "host": 0})
+
+        attached = True
+        req.output_ids.append(8)
+        streamer.stream_output([req], False)
+        self.assertIsNone(outputs[-1].request_stats)
+
+        req.output_ids.append(9)
+        req.finished_reason = FINISH_LENGTH(length=3)
+        streamer.stream_output([req], False)
+        [finished] = outputs[-1].request_stats
+        self.assertEqual(
+            finished.cached_tokens_details,
+            {"device": 2, "host": 0, "storage": 0, "storage_backend": "none"},
+        )
+
+
+class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
+    def setUp(self):
+        for target, value in (
+            ("get_serving", SimpleNamespace(stream_interval=1, weight_version="v")),
+            (
+                "get_observability",
+                SimpleNamespace(
+                    enable_metrics=False, enable_request_time_stats_logging=False
+                ),
+            ),
+        ):
+            patcher = patch(
+                f"sglang.srt.managers.scheduler_components.output_streamer.{target}",
+                return_value=value,
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        enter_scope(self, published_topology(ranks={"dp_rank": 0}))
+
+    def _split_sent(
+        self,
+        *,
+        hierarchical_cache,
+        storage_backend=None,
+        disaggregation_mode=DisaggregationMode.NULL,
+    ):
+        """The cached-token split and storage backend one Rust egress frame
+        carries for a request with cached tokens on every tier."""
+        rust_server = Mock()
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=None,
+            tree_cache=SimpleNamespace(
+                cache_controller=SimpleNamespace(storage_backend=storage_backend)
+            ),
+            server_args=SimpleNamespace(
+                enable_hierarchical_cache=hierarchical_cache, enable_lmcache=False
+            ),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=disaggregation_mode,
+            skip_tokenizer_init=False,
+            enable_hicache_storage=lambda: storage_backend is not None,
+            rust_server=rust_server,
+        )
+        req = _FakeReq("r0", [1])
+        req.stream = True
+        req.cached_tokens = 6
+        req.cached_tokens_device = 1
+        req.cached_tokens_host = 2
+        req.cached_tokens_storage = 3
+        streamer._stream_output_generation([req], False)
+        return rust_server.push_generation.call_args.args[2:]
+
+    def test_rust_frames_split_cached_tokens_by_tier(self):
+        """A cache with a host or storage tier, or a PD decode server, sends
+        each request's cached tokens by tier and the attached storage
+        backend's type; a device-only cache sends neither."""
+
+        class HiCacheFile:
+            pass
+
+        self.assertEqual(self._split_sent(hierarchical_cache=True), ([(1, 2, 3)], None))
+        self.assertEqual(
+            self._split_sent(hierarchical_cache=True, storage_backend=HiCacheFile()),
+            ([(1, 2, 3)], "HiCacheFile"),
+        )
+        self.assertEqual(
+            self._split_sent(
+                hierarchical_cache=False,
+                disaggregation_mode=DisaggregationMode.DECODE,
+            ),
+            ([(1, 2, 3)], None),
+        )
+        self.assertEqual(self._split_sent(hierarchical_cache=False), (None, None))
 
 
 class TestOutputStreamerStreamInterval(unittest.TestCase):
@@ -675,6 +995,97 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                             received[i][0].extend(masks)
                             received[i][1].extend(logprobs)
                 self.assertEqual(received, expected)
+
+
+class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
+    def setUp(self):
+        _enter_streamer_scope(self)
+
+    def _req(self, rid="r", ipc="worker-a"):
+        sampling_params = SamplingParams(skip_special_tokens=False)
+        sampling_params.normalize(None)
+        req = Req(rid, "", array("q", range(7)), sampling_params, stream=True)
+        req.http_worker_ipc = ipc
+        return req
+
+    def test_header_goes_out_on_first_output_only(self):
+        """A retraction does not resend the header; the detokenizer still holds it."""
+        outputs = []
+        streamer = _streamer(outputs)
+        req = self._req()
+
+        def output():
+            req.output_ids.append(7)
+            streamer.stream_output([req], False)
+            [payload] = outputs
+            outputs.clear()
+            return payload.detokenize_headers
+
+        [first] = output()
+        self.assertEqual(list(first.prompt_tail_ids), [2, 3, 4, 5, 6])
+        self.assertFalse(first.skip_special_tokens)
+        self.assertEqual(first.http_worker_ipc, "worker-a")
+        self.assertIsNone(output())
+        req.reset_for_retract()
+        self.assertIsNone(output())
+
+    def test_release_follows_a_sent_header_only(self):
+        outputs = []
+        streamer = _streamer(outputs)
+        req = self._req()
+
+        streamer.release_detokenize_state(req)
+        self.assertEqual(outputs, [])
+
+        req.output_ids.append(7)
+        streamer.stream_output([req], False)
+        streamer.release_detokenize_state(req)
+        self.assertEqual(outputs[-1], DetokenizeReleaseReq(rid="r"))
+
+    def test_finished_rows_carry_their_route(self):
+        outputs = []
+        streamer = _streamer(outputs)
+        running, done = self._req("running"), self._req("done", ipc="worker-b")
+
+        for step in range(2):
+            for req in (running, done):
+                req.output_ids.append(7)
+            if step == 1:
+                done.finished_reason = FINISH_LENGTH(length=2)
+            streamer.stream_output([running, done], False)
+
+        self.assertIsNone(outputs[0].http_worker_ipcs)
+        self.assertEqual(outputs[1].http_worker_ipcs, [None, "worker-b"])
+
+    def test_skip_tokenizer_init_rows_carry_ipc_and_no_header(self):
+        outputs = []
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
+            tree_cache=None,
+            server_args=SimpleNamespace(enable_lmcache=False),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            disaggregation_mode=DisaggregationMode.NULL,
+            skip_tokenizer_init=True,
+            enable_hicache_storage=lambda: False,
+        )
+        req = self._req()
+        for _ in range(2):
+            req.output_ids.append(7)
+            streamer.stream_output([req], False)
+            self.assertEqual(outputs[-1].http_worker_ipcs, ["worker-a"])
+            self.assertIsNone(outputs[-1].detokenize_headers)
+        streamer.release_detokenize_state(req)
+        self.assertEqual(len(outputs), 2)
+
+    def test_skip_tokenizer_init_idle_batch_carries_an_empty_ipc_list(self):
+        """The tokenizer-side router iterates http_worker_ipcs on every batch;
+        an idle one (a DP rank with no work) must send a list, not None."""
+        payload = _accumulator(output_sink=OutputSink.TOKENIZER).to_payload(
+            dp_rank=0, is_idle_batch=True
+        )
+
+        self.assertEqual(payload.http_worker_ipcs, [])
 
 
 if __name__ == "__main__":
