@@ -429,6 +429,9 @@ class ModelRunner:
             get_spec().speculative_algorithm
         )
         self.capture_tail_hooks = []
+        # the same, for the prefill graph runner. Separate so that a hook
+        # registered for decode captures is never handed a prefill capture.
+        self.prefill_capture_tail_hooks = []
         # Called as hook(graph_runner, forward_batch) first inside each decode graph capture.
         self.capture_head_hooks = []
         self.page_size = get_schedule().page_size
@@ -780,6 +783,7 @@ class ModelRunner:
             model=self.model,
             hf_config=self.model_config.hf_config,
             capture_tail_hooks=self.capture_tail_hooks,
+            prefill_capture_tail_hooks=self.prefill_capture_tail_hooks,
             is_draft=self.is_draft_worker,
         )
         allocate_mega_moe_buffers(self.model)
