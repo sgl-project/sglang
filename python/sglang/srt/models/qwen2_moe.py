@@ -300,6 +300,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 get_parallel().moe_ep_size,
             )
             self.enable_shared_expert_fusion = False
+        if self.enable_shared_expert_fusion and get_parallel().dwdp_size > 1:
+            logger.warning_once(
+                "Disabling Qwen shared-expert fusion under DWDP: DWDP prefetches "
+                "only the routed experts, and the fused slot's 1/ep_size weight "
+                "expects a post-experts all-reduce that DWDP skips. Using the "
+                "separate shared-expert MLP instead."
+            )
+            self.enable_shared_expert_fusion = False
 
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
@@ -376,6 +384,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_flashinfer_megamoe()
                         or get_moe_a2a_backend().is_megamoe()
                         or get_moe_a2a_backend().is_ascend_fuseep()
+                        # DWDP feeds the block DP-local tokens and sums
+                        # nothing after the experts.
+                        or get_parallel().dwdp_size > 1
                     )
                     else {}
                 ),
