@@ -89,8 +89,8 @@ def prepare_expert_weight_update(
     *,
     weights_by_layer: dict[int, list[torch.Tensor]],
     layer_ids: list[int],
-    old_map: torch.Tensor,
-    new_map: torch.Tensor,
+    old_placement_by_layer: torch.Tensor,
+    new_placement_by_layer: torch.Tensor,
     update_layer_fn: Callable[..., None],
 ) -> tuple[list[int], list[torch.Tensor] | None, Callable[..., None] | None]:
     """Return selected layers, receive buffers, and a single-layer update callable.
@@ -100,7 +100,8 @@ def prepare_expert_weight_update(
     shared migration algorithm, and writes changed local slots back in place.
     The caller owns the receive buffers and passes them to each layer update.
     They are allocated lazily and reused across compatible layers in this chunk.
-    ND staging keeps only the current layer's conversion results.
+    Weights are converted one layer at a time; completion events bound queued
+    device work before allocating the next layer's ND tensors.
     """
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
@@ -110,14 +111,16 @@ def prepare_expert_weight_update(
         layer_ids = [
             layer
             for layer in layer_ids
-            if not torch.equal(old_map[layer], new_map[layer])
+            if not torch.equal(
+                old_placement_by_layer[layer], new_placement_by_layer[layer]
+            )
         ]
     if not layer_ids:
         return layer_ids, None, None
 
     rank = dist.get_rank()
     needs_staging = _validate_migration_weights(weights_by_layer, layer_ids, rank)
-    staging = ExpertWeightStaging(needs_staging)
+    staging = _ExpertWeightStaging(needs_staging)
     group = _get_migration_group()
 
     def update_layer(
@@ -198,7 +201,7 @@ def _validate_migration_weights(
     return [needs_staging for _, _, _, needs_staging in expected]
 
 
-class ExpertWeightStaging:
+class _ExpertWeightStaging:
     """Prepare ND migration weights for a validated chunk's tensor formats.
 
     load() prepares the tensors that the updater mutates; store() copies the

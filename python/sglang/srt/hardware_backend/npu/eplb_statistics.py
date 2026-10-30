@@ -48,7 +48,7 @@ def isolate_draft_expert_recording(forward):
     return wrapped
 
 
-class NpuEplbAccumulatorMixin:
+class _NpuEplbAccumulatorMixin:
     """Share TP communication and initialize migration channels before recording."""
 
     def __init__(self, *args, **kwargs):
@@ -64,11 +64,11 @@ class NpuEplbAccumulatorMixin:
         return get_eplb_device_group()
 
 
-class _NpuDetailAccumulator(NpuEplbAccumulatorMixin, _DetailAccumulator):
+class _NpuDetailAccumulator(_NpuEplbAccumulatorMixin, _DetailAccumulator):
     pass
 
 
-class NpuExpertDistributionAccumulator(NpuEplbAccumulatorMixin, _StatAccumulator):
+class _NpuStatAccumulator(_NpuEplbAccumulatorMixin, _StatAccumulator):
     pass
 
 
@@ -77,7 +77,7 @@ class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
 
     def _create_accumulator(self, expert_location_metadata, rank):
         accumulator_class = {
-            _StatAccumulator: NpuExpertDistributionAccumulator,
+            _StatAccumulator: _NpuStatAccumulator,
             _DetailAccumulator: _NpuDetailAccumulator,
         }[_Accumulator.get_class()]
         return accumulator_class(expert_location_metadata, rank)

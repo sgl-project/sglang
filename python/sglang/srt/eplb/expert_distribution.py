@@ -741,7 +741,7 @@ _SINGLE_PASS_GATHERER_KEY_PRIMARY = "primary"
 
 
 class _Accumulator(ABC):
-    # Backends may override this to use a dedicated statistics communicator.
+    # Backends may override this to select the statistics communication group.
     _communication_group: Optional[torch.distributed.ProcessGroup] = None
 
     @staticmethod

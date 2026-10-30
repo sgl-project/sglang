@@ -154,8 +154,8 @@ def _update_expert_weights_raw(
         update_layer_ids, temp_buffers, update_layer = prepare_expert_weight_update(
             weights_by_layer=routed_experts_weights_of_layer,
             layer_ids=update_layer_ids,
-            old_map=old_expert_location_metadata.physical_to_logical_map_cpu,
-            new_map=new_expert_location_metadata.physical_to_logical_map_cpu,
+            old_placement_by_layer=old_expert_location_metadata.physical_to_logical_map_cpu,
+            new_placement_by_layer=new_expert_location_metadata.physical_to_logical_map_cpu,
             update_layer_fn=update_expert_weights_single_layer,
         )
     else:
