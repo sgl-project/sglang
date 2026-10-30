@@ -101,6 +101,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
+    set_kv_cache_layer_scales,
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
@@ -1226,8 +1227,12 @@ class MiMoV2Model(nn.Module):
             if not isinstance(self.layers[layer_idx], nn.Identity):
                 layer_self_attn = self.layers[layer_idx].self_attn
             if hasattr(layer_self_attn.attn, "k_scale"):
-                layer_self_attn.attn.k_scale = scaling_factor
-                layer_self_attn.attn.v_scale = scaling_factor
+                parameter = next(layer_self_attn.parameters(), None)
+                set_kv_cache_layer_scales(
+                    layer_self_attn.attn,
+                    scaling_factor,
+                    device=parameter.device if parameter is not None else None,
+                )
             else:
                 raise RuntimeError(
                     "Self attention has no KV cache scaling factor attribute!"

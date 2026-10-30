@@ -1932,6 +1932,28 @@ class QuantParamSchema(BaseModel):
         return self
 
 
+def set_kv_cache_layer_scales(
+    layer: torch.nn.Module,
+    scaling_factor: float,
+    *,
+    device: Optional[torch.device] = None,
+) -> None:
+    """Update a layer's device and host copies of its per-tensor KV scale."""
+    scale_value = float(scaling_factor)
+    for name in ("k_scale", "v_scale"):
+        scale = getattr(layer, name, None)
+        if isinstance(scale, torch.Tensor):
+            with torch.no_grad():
+                scale.fill_(scale_value)
+        else:
+            setattr(
+                layer,
+                name,
+                torch.tensor(scale_value, dtype=torch.float32, device=device),
+            )
+        setattr(layer, f"{name}_float", scale_value)
+
+
 def kv_cache_scales_loader(
     filename: str,
     tp_rank: int,
