@@ -312,6 +312,8 @@ class DeepseekMLAForwardMixin:
         q_lora: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
+        return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         return self.indexer(
             x=hidden_states,
@@ -319,6 +321,7 @@ class DeepseekMLAForwardMixin:
             positions=positions,
             forward_batch=forward_batch,
             layer_id=self.layer_id,
+            return_indices=return_indices,
         )
 
     def prepare_mla_qkv(
@@ -472,6 +475,8 @@ class DeepseekMLAForwardMixin:
                     and self.alt_stream is not None
                     and q_lora is not None
                     and self.rotary_emb is not None
+                    and getattr(self.prepare_mla_qkv, "__func__", None)
+                    is DeepseekMLAForwardMixin.prepare_mla_qkv
                 ):
                     _born_backend_early = self._q8kv8_born_fp8_q_backend(
                         forward_batch, llama_4_scaling

@@ -8,7 +8,10 @@ import pytest
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mla
+from sglang.srt.models.deepseek_common.attention_forward_methods import (
+    forward_mha,
+    forward_mla,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -22,8 +25,9 @@ MLA = forward_mla.DeepseekMLAForwardMixin
 @pytest.mark.parametrize("reuse_indices", [False, True])
 @pytest.mark.parametrize("born_fp8", [False, True])
 @pytest.mark.parametrize("interleave_cp", [False, True])
+@pytest.mark.parametrize("kv_only", [False, True])
 def test_prepare_dispatches_hooks_and_preserves_index_reuse(
-    monkeypatch, mode, reuse_indices, born_fp8, interleave_cp
+    monkeypatch, mode, reuse_indices, born_fp8, interleave_cp, kv_only
 ):
     torch.manual_seed(0)
     rows, heads, rank, rope = 3, 2, 128 if born_fp8 else 4, 2
@@ -43,7 +47,8 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
         num_local_heads=heads,
         layer_id=7,
         dcp_size=1,
-        alt_stream=None,
+        alt_stream=object() if kv_only else None,
+        attn_mqa=SimpleNamespace(layer_id=7),
         use_dsa=True,
         use_deep_gemm_bmm=False,
         skip_topk=reuse_indices,
@@ -76,12 +81,12 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
         q, q_pe, k, k_pe = MLA.prepare_mla_qkv(
             attn, pos, q, q_pe, k, k_pe, forward_batch
         )
-        result = (q + 1, q_pe, k + 2, k_pe)
+        result = (q if kv_only else q + 1, q_pe, k + 2, k_pe)
         prepared.append(result)
         return result
 
     attn.prepare_mla_qkv = Mock(side_effect=prepare)
-    attn.needs_unfused_mla_qkv = True
+    attn.needs_unfused_mla_qkv = not kv_only
     monkeypatch.setattr(
         forward_mla,
         "get_attn_tp_context",
@@ -89,15 +94,26 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
     )
     monkeypatch.setattr(forward_mla, "is_kv_b_lora_active", lambda _: False)
     monkeypatch.setattr(
-        forward_mla, "is_graph_dsa_split_op_surface", lambda _: not born_fp8
+        forward_mla,
+        "is_graph_dsa_split_op_surface",
+        lambda _: not born_fp8 and not kv_only,
     )
     monkeypatch.setattr(forward_mla, "_SGLANG_EXPERIMENTAL_LORA_OPTI", False)
     monkeypatch.setattr(forward_mla, "_ENABLE_DSA_Q8KV8_BORN_FP8_Q", born_fp8)
+    monkeypatch.setattr(forward_mla, "_ENABLE_DSA_Q8KV8_QPREP_OVERLAP", True)
     monkeypatch.setattr(forward_mla, "_is_cpu", False)
     monkeypatch.setattr(forward_mla, "_is_hip", False)
     monkeypatch.setattr(forward_mla, "is_in_full_prefill_graph", lambda: False)
     monkeypatch.setattr(forward_mla, "is_in_breakable_cuda_graph", lambda: False)
-    backend = SimpleNamespace(q8kv8_born_fp8_q_eligible=lambda batch, heads: True)
+    sentinel = torch.zeros(rows, heads, rank)
+    backend = SimpleNamespace(
+        q8kv8_born_fp8_q_eligible=lambda batch, heads: True,
+        q8kv8_acquire_born_q_buffer=Mock(return_value=object()),
+        q8kv8_stash_born_q=Mock(),
+        q8kv8_born_q_sentinel=lambda *args: sentinel,
+    )
+    monkeypatch.setattr(forward_mla, "absorbed_bmm_concat_cast_q_fp8", Mock())
+    monkeypatch.setattr(forward_mla, "padded_extend_real_tokens", lambda *args: None)
     monkeypatch.setattr(forward_mla, "get_attn_backend", lambda: backend)
     monkeypatch.setattr(
         forward_mla, "maybe_capture_indexer_topk", lambda layer, value: value
@@ -120,15 +136,72 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
     rotary.assert_called_once()
     q, q_pe, k, k_pe = prepared[0]
     assert result[0] is q_pe and result[1] is k_pe
-    assert result[2] is q and result[3] is k
+    assert result[2] is (sentinel if born_fp8 and kv_only else q)
+    assert result[3] is k
     assert kv_prepare.call_args.args[2] is k
     assert kv_prepare.call_args.args[3] is k_pe
-    torch.testing.assert_close(
-        q, torch.bmm(query[..., :rank].transpose(0, 1), attn.w_kc).transpose(0, 1) + 1
-    )
+    if born_fp8 and kv_only:
+        assert q is None
+        backend.q8kv8_stash_born_q.assert_called_once_with(rows, 7)
+    else:
+        torch.testing.assert_close(
+            q,
+            torch.bmm(query[..., :rank].transpose(0, 1), attn.w_kc).transpose(0, 1)
+            + (0 if kv_only else 1),
+        )
     torch.testing.assert_close(q_pe, query[..., rank:] + 10)
     torch.testing.assert_close(k, latent[:, rank : 2 * rank].unsqueeze(1) + 2)
     torch.testing.assert_close(k_pe, latent[:, 2 * rank :].unsqueeze(1) + 20)
+
+
+@pytest.mark.parametrize("seed", [False, True])
+def test_dense_prefill_dispatches_custom_indexer(monkeypatch, seed):
+    rows, rank, rope, heads = 3, 4, 2, 2
+    hidden = torch.ones(rows, 8)
+    positions = torch.arange(rows)
+    indices = torch.zeros(rows, 2, dtype=torch.int32)
+    seed_buffer = torch.empty_like(indices) if seed else None
+    batch = SimpleNamespace(
+        spec_info=SimpleNamespace(dsa_seed_topk_capture=seed_buffer)
+    )
+    attn = SimpleNamespace(
+        q_lora_rank=rank,
+        kv_lora_rank=rank,
+        qk_rope_head_dim=rope,
+        qk_nope_head_dim=rank,
+        qk_head_dim=rank + rope,
+        num_local_heads=heads,
+        use_dsa=True,
+        q_a_layernorm=lambda x: x,
+        kv_a_layernorm=lambda x: x,
+        q_b_proj=lambda x: (torch.ones(rows, heads * (rank + rope)), None),
+        should_run_indexer=lambda: True,
+        indexer=Mock(side_effect=AssertionError("custom indexer bypassed")),
+        run_mla_indexer=Mock(return_value=indices),
+    )
+    monkeypatch.setattr(
+        forward_mha,
+        "get_attn_tp_context",
+        lambda: SimpleNamespace(
+            fetch_qkv_latent=lambda: torch.ones(rows, 2 * rank + rope)
+        ),
+    )
+    backend = SimpleNamespace(prepare_prefill_qkv=lambda **kwargs: (None, None, None))
+    monkeypatch.setattr(forward_mha, "resolve_attn_backend", lambda _: backend)
+    publish = Mock()
+    monkeypatch.setattr(forward_mha, "write_mtp_seed", publish)
+    forward_mha.DeepseekMHAForwardMixin.forward_normal_prepare(
+        attn, positions, hidden, batch, None
+    )
+    attn.run_mla_indexer.assert_called_once()
+    kwargs = attn.run_mla_indexer.call_args.kwargs
+    assert kwargs["hidden_states"] is hidden
+    assert kwargs["forward_batch"] is batch
+    assert kwargs["return_indices"] is seed
+    if seed:
+        publish.assert_called_once_with(batch, seed_buffer, indices)
+    else:
+        publish.assert_not_called()
 
 
 def test_default_prepare_keeps_bmm_attention_fusion(monkeypatch):

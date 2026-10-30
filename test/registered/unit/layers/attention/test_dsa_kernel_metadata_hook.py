@@ -35,6 +35,7 @@ def test_graph_metadata_hook_runs_after_refresh_on_each_batch(in_capture):
             seq_lens_cpu=seq_lens.clone(),
             req_pool_indices=torch.arange(batch_size),
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             spec_info=None,
             out_cache_loc=torch.arange(batch_size),
         )
@@ -194,6 +195,7 @@ def test_multistep_refreshes_custom_metadata_for_every_child(monkeypatch, path):
             seq_lens=lengths,
             seq_lens_cpu=lengths,
             seq_lens_sum=4 * size,
+            ragged_verify_layout=None,
             spec_info=None,
             out_cache_loc=torch.arange(size),
         )
