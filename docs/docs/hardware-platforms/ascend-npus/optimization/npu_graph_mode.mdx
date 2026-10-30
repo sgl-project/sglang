@@ -1,0 +1,400 @@
+---
+title: "NPU Graph Mode"
+metatags:
+    description: "Ascend NPU graph mode guide for SGLang: capture and replay NPUGraph on Atlas 800T A2/A3, size batch-size buckets, update graphs at replay time, profile capture and replay, and troubleshoot capture failures."
+---
+
+On Ascend NPU, SGLang runs the **decode** forward pass in **graph mode**: the
+whole decode step is recorded once per batch-size bucket into a
+`torch.npu.NPUGraph` and replayed afterwards, so per-step kernel launch and host
+dispatch overhead is paid at capture time instead of every token. This page
+covers when capture happens, how to size the captured buckets, how SGLang
+rebinds sequence lengths on a captured graph between replays, how to profile
+capture and replay, and what to check when capture fails.
+
+Platform: Atlas 800T A2 or A3 with CANN + `torch_npu`. Flags and code paths on
+this page are checked against `sgl-project/sglang` `main` (2026-10-29); older
+releases may only accept the legacy `--disable-cuda-graph` spelling.
+
+## What is captured, and what is not
+
+| Phase | Captured on NPU | Notes |
+|---|---|---|
+| Decode | Yes, by default | One `torch.npu.NPUGraph` per batch-size bucket, attention metadata inside the graph |
+| Decode, speculative verify | Yes | Captured by the draft and target-verify runners |
+| Prefill | No | No NPU prefill backend is wired; keep prefill graph disabled |
+| Multi-modal encoder (ViT) | Opt-in | Separate ViT graph runner, enabled by its own switch |
+
+Two details matter when you read the code:
+
+- The decode backend for NPU is always the Full-style `NPUCudaGraphBackend`,
+  whatever the decode backend name says. `resolve_decode_backend` returns
+  `NPUCudaGraphBackend` as soon as `device == "npu"`, so `breakable` and `full`
+  behave the same on Ascend and only `disabled` changes anything
+  ([`runner_backend/utils.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/runner_backend/utils.py#L48-L103)).
+- Prefill capture has no NPU branch. `resolve_prefill_backend` only constructs
+  the CUDA-backed `BreakableCudaGraphBackend` / `FullCudaGraphBackend`
+  ([`runner_backend/utils.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/runner_backend/utils.py#L107-L124)),
+  and the default prefill backend is `disabled` on non-CUDA platforms
+  ([`cuda_graph_config.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/cuda_graph_config.py#L119-L124)).
+  Leave `--cuda-graph-backend-prefill` at `disabled` on Ascend.
+
+Capture happens once, after the weights are loaded and the KV pool is sized.
+The scheduler then reports `npu graph: True` on decode iterations that replay a
+captured graph, which is the quickest way to confirm graph mode is active.
+
+## Prerequisites
+
+1. A working SGLang + `torch_npu` installation on Atlas 800T A2/A3. See
+   [Installation](/docs/hardware-platforms/ascend-npus/getting-started/installation).
+2. `torch_npu` exposes the graph API:
+
+   ```bash
+   python -c "import torch, torch_npu; print(torch.npu.NPUGraph, torch.npu.graph)"
+   ```
+
+3. Enough free HBM for the graphs themselves. Capture allocates the graph pool
+   and one workspace per bucket, on top of the KV pool:
+
+   ```bash
+   npu-smi info
+   ```
+
+4. A version pair that carries the graph-update stream fix. Too many captured
+   graphs used to collide on the graph update stream; CANN 8.5 + `torch_npu`
+   2.8 and later are reported to fix it. On older stacks, keep the number of
+   captured graphs at 10 or fewer (see
+   [Troubleshooting and FAQ](/docs/hardware-platforms/ascend-npus/faq), item 2).
+
+## Enabling and disabling graph mode
+
+Graph mode is on for decode by default, so the common case needs no flag. Pass
+an explicit bucket list when you want full control over what gets captured:
+
+```bash Command
+sglang serve \
+  --model-path /path/to/your/model \
+  --attention-backend ascend \
+  --tp-size 8 \
+  --cuda-graph-bs-decode 1 2 4 8 16 32 48 64 \
+  --host 0.0.0.0 --port 30000
+```
+
+Turn decode capture off (baseline measurements and capture-failure isolation):
+
+```bash Command
+sglang serve \
+  --model-path /path/to/your/model \
+  --attention-backend ascend \
+  --cuda-graph-backend-decode disabled \
+  --host 0.0.0.0 --port 30000
+```
+
+Graph-mode knobs that apply to Ascend NPU:
+
+<table>
+  <thead>
+    <tr>
+      <th>Flag</th>
+      <th>Effect on NPU</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>--cuda-graph-bs-decode</code></td>
+      <td>Explicit batch-size buckets to capture. Overrides the automatic bucket list; <code>max_bs</code> becomes the largest value given.</td>
+    </tr>
+    <tr>
+      <td><code>--cuda-graph-max-bs-decode</code></td>
+      <td>Upper bound for the automatic bucket list. Lower it to cut capture time, capture memory, and stream pressure.</td>
+    </tr>
+    <tr>
+      <td><code>--cuda-graph-backend-decode</code></td>
+      <td><code>full</code> (default) or <code>disabled</code>. <code>breakable</code> is accepted but maps to the same NPU backend.</td>
+    </tr>
+    <tr>
+      <td><code>--disable-decode-cuda-graph</code></td>
+      <td>Shorthand for <code>--cuda-graph-backend-decode disabled</code>.</td>
+    </tr>
+    <tr>
+      <td><code>--disable-cuda-graph</code></td>
+      <td>Legacy global switch, still parsed but deprecated. Prefer the per-phase flags.</td>
+    </tr>
+    <tr>
+      <td><code>--cuda-graph-config</code></td>
+      <td>JSON form of the per-phase settings, e.g. <code>&#123;"decode":&#123;"max_bs":96&#125;&#125;</code>. Highest precedence.</td>
+    </tr>
+    <tr>
+      <td><code>--cuda-graph-bs-prefill</code>, <code>--cuda-graph-backend-prefill</code></td>
+      <td>CUDA-only; do not enable on Ascend.</td>
+    </tr>
+    <tr>
+      <td><code>--enable-profile-cuda-graph</code></td>
+      <td>Profiles the capture pass itself; see <em>Profiling</em> below.</td>
+    </tr>
+    <tr>
+      <td><code>--disable-cuda-graph-padding</code></td>
+      <td>Captures every batch size from 1 to <code>max_bs</code> instead of bucketing. Removes padding waste, multiplies graph count.</td>
+    </tr>
+  </tbody>
+</table>
+
+<Note>
+  `--debug-cuda-graph` only affects the breakable CUDA backend, so it does
+  nothing on Ascend. Isolate capture problems by disabling decode capture
+  instead.
+</Note>
+
+## Sizing the captured batch-size buckets
+
+If you do not pass `--cuda-graph-bs-decode`, the bucket list is generated from
+`max_bs` ([`cuda_graph_hook.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/arg_groups/cuda_graph_hook.py#L500-L534)):
+
+- no speculative decoding:
+  `[1, 2, 4, 8, 12]` + `16, 24, ... 256` (step 8) + `272, 288, ... 496` (step 16)
+  + `512 ... max_bs` (step 32)
+- with speculative decoding the small sizes are denser:
+  `1 ... 8` (step 1) + `10 ... 32` (step 2) + `40 ... 64` (step 4) +
+  `72 ... 256` (step 8) + `272 ... max_bs` (step 16)
+- `max_bs` itself is always included. With the default `max_bs` of 256 this is
+  36 buckets, i.e. 36 captured graphs per rank.
+
+`max_bs` defaults come from the device-memory tier, then get clamped to
+`--max-running-requests` when that is smaller
+([`memory_hook.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/arg_groups/memory_hook.py#L137-L186)):
+256 for `tp_size < 4` and 512 otherwise on 64–90 GB devices — a single Atlas 800T
+A2/A3 die — and 160 when the memory tier cannot be determined.
+
+Practical rules:
+
+- Cap `max_bs` at the concurrency you actually serve. Buckets above your peak
+  batch size are captured and never replayed, but they still cost HBM and
+  capture time.
+- A live batch that fits no bucket is padded up to the next one, and the padding
+  slots replay with a sentinel sequence length
+  ([`decode_cuda_graph_runner.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py#L453),
+  [`base_cuda_graph_runner.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/runner/base_cuda_graph_runner.py#L166)).
+  A coarse list saves memory but burns compute on padding; a dense list does the
+  opposite.
+- When in doubt on an unfamiliar CANN/`torch_npu` pair, start with a short list
+  such as `1 2 4 8 16 32` and raise it after capture is confirmed stable.
+- Every captured graph shares one device graph pool
+  ([`npu_cudagraph_backend.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py#L78-L88)),
+  so the marginal HBM cost per bucket is the workspace it needs, not a full
+  private pool.
+
+## Capturing: what the run does per bucket
+
+For each bucket the backend synchronizes, runs the forward pass **twice** as
+warm-up, then records the third pass under `torch.npu.graph(...)` with
+`auto_dispatch_capture=True`
+([`npu_cudagraph_backend.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py#L89-L138)):
+
+```python
+for _ in range(2):
+    self._device_module.synchronize()
+    self._tp_group.barrier()
+    forward_fn()
+
+graph = torch.npu.NPUGraph()
+with torch.npu.graph(
+    graph, pool=self._pool, stream=self._capture_stream, auto_dispatch_capture=True
+):
+    out = forward_fn()
+```
+
+Consequences worth knowing before you tune anything:
+
+- Warm-up runs are real forward passes; expect a few seconds per bucket plus a
+  TP barrier, and expect capture time to scale with bucket count.
+- `auto_dispatch_capture=True` is what makes a later `graph.update(...)` legal.
+  A graph captured without it cannot be updated at all
+  ([`torch_npu` graph API](https://github.com/Ascend/pytorch/blob/master/torch_npu/npu/graphs.py#L655-L663)).
+- The captured graph keeps the output tensors of the capture run; replay returns
+  them, which is why replay can skip allocation entirely.
+
+The runner logs a begin/end pair per capture, which is the primary evidence that
+capture succeeded:
+
+```text
+Capture target decode NPU graph begin. backend=full, num_tokens_per_req=1, avail mem=... GB
+Capture target decode NPU graph end. bs=[1, 2, 4, ...], elapsed=... s, mem usage=... GB, avail mem=... GB.
+```
+
+## Graph update: rebinding sequence lengths between replays
+
+A captured decode graph has fixed tensor addresses, but the KV length of each
+request changes every step. SGLang does not re-capture for that: it rewrites the
+host-side sequence-length array that the graph reads, then replays.
+
+The attribute that gets rebound depends on the attention path and on FIAS v2
+([`npu_graph_runner.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py#L139-L205)):
+
+| Case | Rebound input | Type |
+|---|---|---|
+| Default decode path (including draft graphs) | `actual_seq_lengths_kv` | `int32` tensor or Python list, per recorded input |
+| FIAS v2 BSND target verify | `actual_seq_kvlen` | Python list (must stay a list) |
+
+The architecture map also declares `context_lens` for MHA models; the default
+selector still uses the MLA key, so keep the names in sync if you add a backend
+that selects the MHA entry.
+
+How an update is issued
+([`npu_cudagraph_backend.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py#L156-L194)):
+
+1. The runner builds the per-request lengths for this step, pads the tail up to
+   the bucket size, and converts to `int32` when the recorded input is a tensor.
+2. `graph.update(cpu_update_input=[{attr: seq_lens}])` is submitted to a
+   single-threaded executor pinned to the device, then `graph.replay()` is
+   called.
+3. A device event is recorded after the replay, and the **next** update waits on
+   it, so the host array is never rewritten while the device is still reading
+   it.
+
+Operational consequences:
+
+- Update cost is host-side and small, but it is on the critical path of every
+  decode step. If decode does not get faster with graph mode on, re-run the same
+  workload with `--cuda-graph-backend-decode disabled`; if eager is not slower,
+  the update path is the first thing to look at.
+- Only inputs recorded during capture can be rebound. Changing the request count
+  beyond the bucket, swapping the KV pool, or changing a tensor's dtype means
+  falling back to another bucket or to eager execution, not editing the graph.
+- DeepSeek DSA and DeepSeek-V4 skip the rebind entirely and replay with
+  attention metadata prepared outside the graph
+  ([`npu_graph_runner.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py#L372-L425)).
+  If you are porting a new attention backend, decide explicitly which of the two
+  paths it takes.
+
+## Adapting a model or backend to graph mode
+
+Graph capture requires a forward pass whose control flow and tensor shapes do
+not depend on tensor values. The failure hints that `torch_npu` prints on a
+broken capture name the usual causes: work on the default stream, CPU-side ops
+inside the captured region, tensors on several devices, and data-dependent
+control flow
+([`torch_npu` graph API](https://github.com/Ascend/pytorch/blob/master/torch_npu/npu/graphs.py#L908-L932)).
+
+Checklist when a model fails to capture:
+
+1. No host round-trips inside the captured region. Anything that reads a device
+   value into Python (`.item()`, `.cpu()`, `if tensor > 0`) must move to the
+   pre-capture metadata path.
+2. Sequence lengths and request indices must arrive as fixed-shape buffers, not
+   as freshly allocated tensors with new addresses.
+3. Custom ops must be launchable on device. Ops that fall back to host-side
+   assembly inside the captured region need an out-of-graph pre-computation.
+4. Multi-modal models: the encoder has its own graph runner. Enable it
+   separately (`SGLANG_VIT_ENABLE_CUDA_GRAPH=1`) and see the note in
+   [Support New Models](/docs/hardware-platforms/ascend-npus/development/support_new_models).
+5. Speculative decoding: draft and target-verify graphs have NPU subclasses. If
+   only the draft-extend graph misbehaves, the documented kill-switch is
+   `SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH=1`.
+6. `--enable-torch-compile` with graph capture takes a different path: the
+   model is wrapped in `torch.compile(..., backend="npugraph_ex")`
+   ([`npu_graph_runner.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py#L78-L94)).
+   Treat it as experimental; if capture or recompilation misbehaves, disable
+   decode capture first to confirm the model itself is healthy.
+
+Feature-level compatibility with graph mode (tensor/data/expert parallelism, PD
+disaggregation, quantization, chunked prefill, speculative decoding, overlap
+scheduling) is tracked as a matrix in
+[Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning);
+most combinations are marked partial, and PrefixCache is the one marked full.
+
+## Profiling graph mode
+
+There are two different things to profile, and they use different switches.
+
+### Profiling capture
+
+Capture cost is a one-off startup cost, but it is where capture-time OOM shows up
+and where the per-bucket memory footprint is decided. With
+`--enable-profile-cuda-graph`, each capture pass is recorded with
+the `torch_npu` profiler and written to disk under
+`$SGLANG_TORCH_PROFILER_DIR/graph_capture_profile`
+([`npu_graph_runner.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py#L210-L236)):
+
+```bash Command
+export SGLANG_TORCH_PROFILER_DIR=./sglang_profile
+
+sglang serve \
+  --model-path /path/to/your/model \
+  --attention-backend ascend \
+  --tp-size 8 \
+  --cuda-graph-bs-decode 1 2 4 8 16 \
+  --enable-profile-cuda-graph \
+  --host 0.0.0.0 --port 30000
+```
+
+The trace is written as text (`ExportType.Text`) at profiler level 1 with
+`record_shapes` and `profile_memory` enabled, through the asynchronous
+tensorboard trace handler. On NPU the profiler exports to disk instead of
+building the in-memory summary table used on CUDA, so read the trace directory
+rather than the log tables, and expect no memory snapshot file.
+
+### Profiling replay
+
+Use the regular SGLang profiler API around steady-state decode; the mechanics
+are the same as on CUDA and are described in
+[Performance Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling):
+
+```bash Command
+export SGLANG_TORCH_PROFILER_DIR=./sglang_profile
+
+# 1. start profiling after 3 warm-up steps, stop automatically after 10 steps
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{"output_dir": "./sglang_profile", "start_step": 3, "num_steps": 10, "activities": ["CPU", "GPU"]}'
+
+# 2. drive decode traffic
+python -m sglang.bench_serving \
+  --backend sglang --base-url http://127.0.0.1:30000 \
+  --model /path/to/your/model --tokenizer /path/to/your/model \
+  --dataset-name random --random-input-len 1024 --random-output-len 128 \
+  --num-prompts 16
+```
+
+`activities: ["CPU", "GPU"]` is mapped to NPU activities by `torch_npu`, so no
+separate activity name is needed. Useful environment variables for the runtime
+profiler: `SGLANG_PROFILE_WITH_STACK` (Python stacks, default on) and
+`SGLANG_PROFILE_RECORD_SHAPES` (operator input shapes, default on).
+
+Because a graphed decode step replay is a single graph launch, per-kernel time
+inside it is not attributed the way eager execution is. To get an eager
+comparison, profile the same workload twice: once with graph mode on, once with
+`--cuda-graph-backend-decode disabled`. The delta between the two end-to-end
+numbers is the launch-overhead saving; the eager trace is the one that shows
+individual kernels.
+
+## Troubleshooting
+
+| Symptom | Likely cause | What to do |
+|---|---|---|
+| `aclnnInplaceFillScalar failed, error code is 507000` in decode, `Fill` kernel launch failure | Too many captured graphs colliding on the graph update stream (pre-CANN 8.5 / `torch_npu` 2.8 stacks) | Cut the captured set to 10 or fewer (`--cuda-graph-max-bs-decode 10` or a short `--cuda-graph-bs-decode` list), or upgrade the CANN/`torch_npu` pair. See [FAQ item 2](/docs/hardware-platforms/ascend-npus/faq) |
+| Capture aborts with the `torch_npu` DFX hint listing default stream / CPU ops / multi-device tensors / dynamic control flow | The captured region contains work that cannot be recorded | Move host-side work out of the captured path; check the model hooks listed in *Adapting a model or backend to graph mode* |
+| `RuntimeError: ... does not support update, Try to capture by setting auto_dispatch_capture=True` | A graph was captured without dispatch capture and is now being updated | Capture with `auto_dispatch_capture=True`, as SGLang does; only hand-written captures hit this |
+| Scheduler decode log shows `npu graph: False` at low concurrency | Decode capture disabled, or the batch exceeds the largest bucket | Check `--cuda-graph-backend-decode` / `--disable-decode-cuda-graph`, and raise `max_bs` or add the missing bucket |
+| Startup OOM or `Not enough memory` right after the graph capture phase | Graph pool plus per-bucket workspaces do not fit next to the KV pool | Lower `--mem-fraction-static`, or lower `--cuda-graph-max-bs-decode`. See [FAQ item 4](/docs/hardware-platforms/ascend-npus/faq) |
+| Decode regresses when the task queue is set aggressively | `TASK_QUEUE_ENABLE=2` can interfere with graph-launched tasks | Keep `TASK_QUEUE_ENABLE=1`, or `0` on decode-heavy nodes; see [Environment Variables](/docs/hardware-platforms/ascend-npus/reference/environment_variables) |
+| Capture succeeds but the first requests return wrong lengths | Stale host-side sequence lengths — an update path that was skipped | Verify the model uses the update path (`actual_seq_lengths_kv` / `context_lens` / `actual_seq_kvlen`) and is not accidentally on the DSA replay-only path |
+
+## Verify graph mode on your machine
+
+1. Start the server with an explicit bucket list and `--enable-profile-cuda-graph`.
+2. Confirm the capture log shows one begin/end pair per bucket with a plausible
+   `mem usage` and `bs` list.
+3. Send a short request and confirm decode iterations log `npu graph: True`.
+4. Run the same workload with `--cuda-graph-backend-decode disabled` and compare
+   end-to-end latency and throughput.
+5. Re-check `npu-smi info` after capture to see how much HBM the graphs hold,
+   then decide whether `max_bs` can grow.
+
+## See also
+
+- [Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning) — feature compatibility matrix and the NPU Graph entry
+- [Performance Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling) — profiler API, `bench_serving --profile`, trace analysis
+- [Environment Variables](/docs/hardware-platforms/ascend-npus/reference/environment_variables) — `STREAMS_PER_DEVICE`, `TASK_QUEUE_ENABLE`, `SGLANG_NPU_*` switches
+- [Troubleshooting and FAQ](/docs/hardware-platforms/ascend-npus/faq) — graph mode `aclnnInplaceFillScalar` error and its fix
+- [`torch_npu` graph API](https://github.com/Ascend/pytorch/blob/master/torch_npu/npu/graphs.py) — `NPUGraph`, `torch.npu.graph`, `graph.update(cpu_update_input=...)`
+- [`npu_graph_runner.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py), [`npu_cudagraph_backend.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py) — the NPU capture, update, and replay implementation
