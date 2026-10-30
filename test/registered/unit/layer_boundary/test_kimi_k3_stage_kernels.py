@@ -5,6 +5,7 @@ With SGLANG_K3_SP_ATTN_RES the bank and the stream stay on each rank's shard
 across SP-MoE layers."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -56,9 +57,10 @@ def moe_layer(*, bank, sp_moe, all_reduce_fusion):
     return layer
 
 
-def declare(layers, *, sp_moe, carries=False, config=CONFIG):
+def declare(layers, *, sp_moe, carries=False, sp_collective=True, config=CONFIG):
     """Declare ``layers`` (index -> layer) in one layer stack, as if the
-    stack carried the bank's shards (``carries``). A bank stack ends on the
+    stack carried the bank's shards (``carries``); None uses K3's actual
+    eligibility check with SGLANG_K3_SP_ATTN_RES enabled. A bank stack ends on the
     model's final read of the bank, which gathers an SP-MoE layer's rows in
     K3's tuned all-gather."""
     bank = AttnBank()
@@ -73,18 +75,24 @@ def declare(layers, *, sp_moe, carries=False, config=CONFIG):
             None,
             None,
             fixture.Norm(),
-            attn_tp_gather=k3_sp_collective.all_gather if sp_moe else None,
-            reads_attn_tp_slices=carries,
+            attn_tp_gather=(
+                k3_sp_collective.all_gather if sp_moe and sp_collective else None
+            ),
+            reads_attn_tp_slices=True if carries is None else carries,
         )
         if has_bank
         else None
     )
     with (
-        patch.object(k3_sp_collective, "enabled", return_value=True),
+        patch.object(k3_sp_collective, "enabled", return_value=sp_collective),
         patch.object(k3_ar_fusion, "enabled", return_value=True),
         patch.object(kimi_k3, "_shards_moe_rows", return_value=sp_moe),
-        patch.object(kimi_k3, "_carries_bank_slices", return_value=carries),
-        envs.SGLANG_K3_SP_ATTN_RES.override(carries),
+        (
+            nullcontext()
+            if carries is None
+            else patch.object(kimi_k3, "_carries_bank_slices", return_value=carries)
+        ),
+        envs.SGLANG_K3_SP_ATTN_RES.override(True if carries is None else carries),
         fixture.planning(
             fixture.parallel_of(attn_dp=1, attn_tp=2),
             a2a=sp_moe,
@@ -142,6 +150,43 @@ class TestKimiK3StageKernels(CustomTestCase):
 
 
 class TestKimiK3BankOnShards(CustomTestCase):
+    def test_nccl_keeps_bank_shards_without_custom_collectives(self):
+        layers = {
+            idx: moe_layer(bank=True, sp_moe=True, all_reduce_fusion=False)
+            for idx in (1, 2, 3)
+        }
+        config = SimpleNamespace(**vars(CONFIG), num_hidden_layers=4)
+        # Exercise the real eligibility check and stage planner. No custom
+        # communicator or device tuning table is available on this path.
+        with (
+            patch.object(
+                kimi_k3,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_algorithm=None),
+            ),
+            patch.object(
+                kimi_k3,
+                "get_parallel",
+                return_value=fixture.parallel_of(attn_dp=1, attn_tp=2, pp_size=1),
+            ),
+        ):
+            declare(
+                layers, sp_moe=True, carries=None, sp_collective=False, config=config
+            )
+        for idx, layer in layers.items():
+            with self.subTest(layer=idx):
+                attn = layer.attn_boundary.plan.paths[BatchVariant.ORDINARY]
+                ffn = layer.ffn_boundary.plan.paths[BatchVariant.ORDINARY]
+                self.assertIs(ffn.output_move, keep_output)
+                step = ffn.entry.prepare.keywords["step"]
+                self.assertIs(step.func, comm_ops._attn_tp_reduce_scatter_update_read)
+                self.assertEqual(step.keywords["read_fusions"], ())
+                self.assertEqual(step.keywords["scatters_residual"], idx == 1)
+                if idx > 1:
+                    self.assertIs(attn.entry.input_move, attn_tp_gather_input)
+                    read = attn.entry.prepare.keywords["step"]
+                    self.assertEqual(read.keywords["read_gathers"], ())
+
     def stack(self, *, carries):
         layers = {
             idx: moe_layer(bank=True, sp_moe=True, all_reduce_fusion=False)
@@ -221,9 +266,7 @@ class TestKimiK3BankOnShards(CustomTestCase):
                     lambda: SimpleNamespace(speculative_algorithm=algorithm),
                 ),
             ):
-                self.assertEqual(
-                    kimi_k3._carries_bank_slices(config, sp_collective=True), carries
-                )
+                self.assertEqual(kimi_k3._carries_bank_slices(config), carries)
 
 
 if __name__ == "__main__":
