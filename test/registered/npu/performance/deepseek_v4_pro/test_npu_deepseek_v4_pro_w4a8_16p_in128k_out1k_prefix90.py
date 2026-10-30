@@ -5,6 +5,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
     TestNpuPerfMultiNodePdMixTestCaseBase,
+    BENCHMARK_TOOL_DEFAULT,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
