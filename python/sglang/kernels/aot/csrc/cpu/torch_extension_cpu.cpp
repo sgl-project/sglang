@@ -515,6 +515,17 @@ at::Tensor conv3d_embed_weight_pack(const at::Tensor& weight);
 
 at::Tensor conv3d_embed_cpu(const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias, bool is_vnni);
 
+// conv1d
+at::Tensor conv1d_weight_pack(const at::Tensor& weight);
+
+at::Tensor conv1d_cpu(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    int64_t stride,
+    int64_t padding,
+    bool is_vnni);
+
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
@@ -967,6 +978,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("conv3d_embed_cpu(Tensor input, Tensor weight, Tensor bias, bool is_vnni) -> Tensor");
   m.impl("conv3d_embed_cpu", torch::kCPU, &conv3d_embed_cpu);
 
+  // conv1d
+  m.def("conv1d_weight_pack(Tensor weight) -> Tensor");
+  m.impl("conv1d_weight_pack", torch::kCPU, &conv1d_weight_pack);
+  m.def("conv1d_cpu(Tensor input, Tensor weight, Tensor? bias, int stride, int padding, bool is_vnni) -> Tensor");
+  m.impl("conv1d_cpu", torch::kCPU, &conv1d_cpu);
+
+  // all reduce
   // shared memory
   m.def("initialize(int size, int rank) -> ()");
 
