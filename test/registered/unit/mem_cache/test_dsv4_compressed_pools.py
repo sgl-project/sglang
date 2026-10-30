@@ -18,6 +18,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
+    SparsePrefillKVBuffer,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
@@ -26,6 +27,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     _num_dsv4_physical_kv_pages,
 )
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -34,25 +40,10 @@ from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
-    def test_swa_key_page_size_uses_physical_paged_size(self):
-        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-        pool.request_window = None
-        pool.swa_page_size = 256
-        for physical_page_size in (256, 64):
-            with self.subTest(physical_page_size=physical_page_size):
-                pool.swa_kv_pool = SimpleNamespace(page_size=physical_page_size)
-                self.assertEqual(pool.get_swa_key_page_size(), physical_page_size)
-
-    def test_swa_key_page_size_without_paged_pool(self):
-        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-        pool.swa_kv_pool = None
-        pool.request_window = SimpleNamespace(page_size=256)
-        self.assertEqual(pool.get_swa_key_page_size(), 256)
-
     def test_physical_kv_pages_cover_reserved_logical_page(self):
         size = 8192
         self.assertEqual(_num_dsv4_physical_kv_pages(size, 256, 256), 33)
@@ -337,38 +328,61 @@ class TestV41KVPoolLayouts(CustomTestCase):
             self.assertEqual(view.stride(0), pool.bytes_per_page_padded)
 
     def test_v41_pool_buffers(self):
-        for option, expect in ((None, KVLayout.V41_FP4), ("fp8", KVLayout.V41)):
-            with self.subTest(compressed=option):
-                pool = self.make_pool([0, 0, 2, 1, 1], [2, 3], KVLayout.V41, option)
-                self.assert_kernel_requirements(pool.swa_kv_pool, KVLayout.V41)
-                self.assertEqual(pool.get_swa_key_bytes_per_token(), 528)
-                for ratio in (1, 2):
-                    layer_id = pool.sources_by_ratio[ratio][0]
-                    self.assertIs(pool.get_extra_key_layout(layer_id), expect)
-                    self.assertEqual(
-                        pool.get_extra_key_bytes_per_token(layer_id),
-                        expect.bytes_per_token,
-                    )
-                    self.assertTrue(is_valid_kv_layout_pair(pool.kv_layout, expect))
-                    self.assert_kernel_requirements(pool.kv_pools[ratio], expect)
-        # A pool of the fp4 layout cannot be the main cache.
-        with self.assertRaises(AssertionError):
-            self.make_pool([0], [], KVLayout.V41_FP4)
+        for main in (KVLayout.V41, KVLayout.V41_NEW):
+            for option, encoding in (
+                (None, KVLayout.V41_FP4),
+                ("fp8", KVLayout.V41),
+            ):
+                expect = encoding.with_interleaved(main.is_interleaved)
+                with self.subTest(main=main, compressed=option):
+                    pool = self.make_pool([0, 0, 2, 1, 1], [2, 3], main, option)
+                    self.assert_kernel_requirements(pool.swa_kv_pool, main)
+                    self.assertIs(pool.get_swa_key_layout(), main)
+                    self.assertEqual(pool.get_swa_key_bytes_per_token(), 528)
+                    for ratio in (1, 2):
+                        layer_id = pool.sources_by_ratio[ratio][0]
+                        self.assertIs(pool.get_extra_key_layout(layer_id), expect)
+                        self.assertEqual(
+                            pool.get_extra_key_bytes_per_token(layer_id),
+                            expect.bytes_per_token,
+                        )
+                        self.assertTrue(is_valid_kv_layout_pair(pool.kv_layout, expect))
+                        self.assert_kernel_requirements(pool.kv_pools[ratio], expect)
+        # A pool of an fp4 layout cannot be the main cache.
+        for fp4 in (KVLayout.V41_FP4, KVLayout.V41_FP4_NEW):
+            with self.assertRaises(AssertionError):
+                self.make_pool([0], [], fp4)
 
     def test_v41_pool_with_c4_c128(self):
-        pool = self.make_pool(
-            [0, 4, 128],
-            [],
-            KVLayout.V41,
-            c4_size=PAGE_SIZE,
-            c128_size=PAGE_SIZE,
-            c4_state_pool_size=16,
-            c128_state_pool_size=16,
-        )
-        for ratio in (4, 128):
-            self.assertEqual(pool.kv_pools[ratio].page_size, PAGE_SIZE // ratio)
-        # The 2-token c128 page is the only production page that pads.
-        self.assertEqual(pool.kv_pools[128].bytes_per_page_padded, 1536)
+        # The 2-token c128 page is the only production page the block-split
+        # layout pads; the interleaved one never pads.
+        for main, c128_page_bytes in ((KVLayout.V41, 1536), (KVLayout.V41_NEW, 1056)):
+            with self.subTest(main=main):
+                pool = self.make_pool(
+                    [0, 4, 128],
+                    [],
+                    main,
+                    c4_size=PAGE_SIZE,
+                    c128_size=PAGE_SIZE,
+                    c4_state_pool_size=16,
+                    c128_state_pool_size=16,
+                )
+                for ratio in (4, 128):
+                    self.assertEqual(pool.kv_pools[ratio].page_size, PAGE_SIZE // ratio)
+                    self.assertIs(pool.kv_pools[ratio].kv_layout, main)
+                self.assertEqual(
+                    pool.kv_pools[128].bytes_per_page_padded, c128_page_bytes
+                )
+
+    def test_pd_layout_names_the_arrangement(self):
+        """Prefill and decode servers must refuse to pair the two arrangements:
+        their pages have the same size, so a mismatch would read garbage."""
+        names = {
+            main: self.make_pool([0, 0, 2, 1, 1], [2, 3], main).pd_kv_layout()
+            for main in (KVLayout.V41, KVLayout.V41_NEW)
+        }
+        self.assertNotEqual(names[KVLayout.V41], names[KVLayout.V41_NEW])
+        self.assertIn("v41_fp4_new", names[KVLayout.V41_NEW])
 
     def test_pd_entries_cover_the_c4_kv_page_count(self):
         """The PD transfer walks every registered entry with the c4 KV pool's
@@ -391,7 +405,7 @@ class TestV41KVPoolLayouts(CustomTestCase):
 
 
 class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
-    RING = 128 + 6  # sliding window + the largest draft token count
+    RING = 256  # sliding window + the largest draft token count, in whole pages
 
     def setUp(self):
         super().setUp()
@@ -441,6 +455,63 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
         self.assertEqual(draft.swa_req_ring_size, self.RING)
         self.assertGreaterEqual(draft.swa_kv_pool.size, 3 * self.RING)
 
+    def test_pd_swa_state_pairs_with_a_paged_decode(self):
+        target = self.make_pool(draft=False)
+        draft = self.make_pool(draft=True)
+        self.assertEqual(target.request_window.capacity, draft.swa_req_ring_size)
+        override = get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=False
+        )
+        override.install()
+        try:
+            decode_target = self.make_pool(draft=False)
+            decode_draft = self.make_pool(draft=True)
+        finally:
+            override.restore()
+        for prefill, decode in ((target, decode_target), (draft, decode_draft)):
+            self.assertEqual(
+                prefill.get_state_buf_infos()[2], decode.get_state_buf_infos()[2]
+            )
+
+    def test_dspark_draft_keeps_the_mark_for_either_storage(self):
+        # Ring or paged, a DSpark draft sends one request-row item, so the PD
+        # roles' state pairs; another algorithm's draft and the target keep none.
+        item = torch.zeros(1, dtype=torch.int64).nbytes
+        for algorithm, encoder_replay, expected in (
+            ("DSPARK", True, [item]),
+            ("DSPARK", False, [item]),
+            ("EAGLE", False, []),
+        ):
+            with self.subTest(algorithm=algorithm, encoder_replay=encoder_replay):
+                override = get_context().override_server_args(
+                    speculative_algorithm=algorithm,
+                    enable_encoder_swa_bounded_replay=encoder_replay,
+                )
+                override.install()
+                try:
+                    target = self.make_pool(draft=False)
+                    draft = self.make_pool(draft=True)
+                finally:
+                    override.restore()
+                self.assertEqual(draft.get_swa_valid_from_buf_infos()[2], expected)
+                self.assertEqual(target.get_swa_valid_from_buf_infos(), ([], [], []))
+
+    def test_pd_window_pages_carry_the_last_window(self):
+        window = self.make_pool(draft=False).request_window
+        page, slot, sliding = window.page_size, 2, 128
+        for seq_len in (300, 1000, 1030):
+            with self.subTest(seq_len=seq_len):
+                # A row holds the newest committed position with its residue.
+                held = torch.full((window.rows + page,), -1)
+                newest = torch.arange(seq_len - window.capacity, seq_len)
+                held[window.row_loc(slot, newest)] = newest
+                start = (seq_len - sliding) // page * page
+                pages = torch.from_numpy(window.page_indices(slot, start, seq_len))
+                # Decode lays the received pages out by position from start.
+                received = held.view(-1, page)[pages.long()].flatten()
+                last = torch.arange(seq_len - sliding, seq_len)
+                self.assertEqual(received[last - start].tolist(), last.tolist())
+
     def _block_inputs(self, prefix_lens, slots, block_size=5):
         seq_lens_casual = build_block_seq_lens_causal(
             seq_lens=torch.tensor(prefix_lens),
@@ -459,48 +530,54 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
         mapping = torch.full((3000,), -1, dtype=torch.int64)
         for slot in range(3):
             mapping[req_to_token[slot]] = slot * self.RING + positions % self.RING
-        gather = compute_dspark_window_gather(
-            seq_lens_casual=seq_lens_casual,
-            req_pool_indices_repeated=req_rep,
-            block_size=block_size,
-            swa_window=128,
-        )
         out_loc = torch.cat(
             [req_to_token[s, p : p + block_size] for s, p in zip(slots, prefix_lens)]
         )
-        paged = build_dspark_swa_page_indices(
-            req_to_token=req_to_token,
-            full_to_swa_mapping=mapping,
-            req_pool_indices_per_request=gather.req_pool_indices_per_request,
-            offsets=gather.offsets,
-            invalid=gather.invalid,
-            out_loc=out_loc,
-            context_lens=gather.context_lens,
-            block_size=block_size,
-            swa_window=128,
-            page_index_aligned_size=64,
-        )
-        ring = BuildDsparkSwaRingIndices.torch(
-            seq_lens_casual=seq_lens_casual,
-            req_pool_indices_repeated=req_rep,
-            valid_from=torch.zeros(3, dtype=torch.int64),
-            ring_size=self.RING,
-            block_size=block_size,
-            swa_window=128,
-            page_index_aligned_size=64,
-        )
-        for got, want in zip(ring, paged):
-            torch.testing.assert_close(got, want)
+        # Per slot: a fresh request, and PD decode's marks from two prefix hits,
+        # one inside the window and one past its start.
+        for valid_from in ([0, 0, 0], [150, 290, 0]):
+            with self.subTest(valid_from=valid_from):
+                valid_from = torch.tensor(valid_from, dtype=torch.int64)
+                gather = compute_dspark_window_gather(
+                    seq_lens_casual=seq_lens_casual,
+                    req_pool_indices_repeated=req_rep,
+                    block_size=block_size,
+                    swa_window=128,
+                    valid_from=valid_from,
+                )
+                paged = build_dspark_swa_page_indices(
+                    req_to_token=req_to_token,
+                    full_to_swa_mapping=mapping,
+                    req_pool_indices_per_request=gather.req_pool_indices_per_request,
+                    offsets=gather.offsets,
+                    invalid=gather.invalid,
+                    out_loc=out_loc,
+                    context_lens=gather.context_lens,
+                    block_size=block_size,
+                    swa_window=128,
+                    page_index_aligned_size=64,
+                )
+                ring = BuildDsparkSwaRingIndices.torch(
+                    seq_lens_casual=seq_lens_casual,
+                    req_pool_indices_repeated=req_rep,
+                    valid_from=valid_from,
+                    ring_size=self.RING,
+                    block_size=block_size,
+                    swa_window=128,
+                    page_index_aligned_size=64,
+                )
+                for got, want in zip(ring, paged):
+                    torch.testing.assert_close(got, want)
 
     def test_ring_window_starts_at_valid_from(self):
         draft = self.make_pool(draft=True)
         # Slot 1 was placed at a 290-token prefix hit; 10 positions are its own.
-        draft.reset_swa_req_ring(torch.tensor([1]), torch.tensor([290]))
+        draft.set_swa_valid_from(torch.tensor([1]), torch.tensor([290]))
         seq_lens_casual, req_rep = self._block_inputs([300], [1])
         indices, lengths = BuildDsparkSwaRingIndices.torch(
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_rep,
-            valid_from=draft.swa_req_ring_valid_from,
+            valid_from=draft.swa_valid_from,
             ring_size=self.RING,
             block_size=5,
             swa_window=128,
@@ -544,8 +621,8 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-    def test_sparse_prefill_chunk_cache_builds_without_mapping(self):
-        pool = DeepSeekV4TokenToKVPool(
+    def _make_pool(self):
+        return DeepSeekV4TokenToKVPool(
             max_num_reqs=2,
             num_req_slots=3,
             swa_size=0,
@@ -567,6 +644,25 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
             compression_ratios=[0, 0, 0],
             full_size=2048,
         )
+
+    def test_workspace_covers_the_largest_prefill_graph_bucket(self):
+        override = get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=True,
+            page_size=256,
+            max_running_requests=2,
+            chunked_prefill_size=256,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.BREAKABLE, bs=[64, 1024])
+            ),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        history = (3 + 1) * 128  # (num_req_slots + 1) * sliding_window
+        workspace = self._make_pool().request_window.workspace
+        self.assertGreaterEqual(workspace.size, history + 1024)
+
+    def test_sparse_prefill_chunk_cache_builds_without_mapping(self):
+        pool = self._make_pool()
         self.assertIsNotNone(pool.request_window)
         self.assertFalse(pool.needs_paged_swa_allocator)
         self.assertIsNone(pool.full_to_swa_index_mapping)
@@ -576,6 +672,7 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         layout = window_layout(
             torch.ones(rows, dtype=torch.int64),
             torch.arange(rows),
+            zero_row=pool.request_window.zero_row,
             capacity=pool.request_window.capacity,
             num_groups=1,
         )
@@ -583,6 +680,7 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         backend.token_to_kv_pool = pool
         backend.req_to_token = torch.zeros((3, 2048), dtype=torch.int32)
         backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
+        backend.sparse_prefill_kv_buffer = SparsePrefillKVBuffer(torch.device("cpu"))
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             seq_lens=torch.tensor([rows]),
