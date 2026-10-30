@@ -440,8 +440,6 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     the configured linear-attention backend (pure read)."""
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
-    if get_platform().is_xpu:
-        return False
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
@@ -1107,7 +1105,10 @@ def _deterministic_attention_backend(view: Any) -> dict:
 
     if view.attention_backend is None:
         # User didn't specify attention backend, fallback based on GPU architecture
-        if get_platform().is_sm100 or get_platform().is_sm120:
+        if get_platform().is_xpu:
+            # fa3 and flashinfer have no XPU kernels.
+            backend = "intel_xpu"
+        elif get_platform().is_sm100 or get_platform().is_sm120:
             # Blackwell and newer architectures
             if _deterministic_is_deepseek_model(view):
                 # fallback to triton for DeepSeek models because flashinfer
@@ -1361,11 +1362,15 @@ def _hybrid_swa_memory_backend_disable(view: Any) -> dict:
 def _intel_xpu_page_constraint(view: Any) -> dict:
     prefill_backend, decode_backend = attention_backends_of(view)
     if "intel_xpu" in (prefill_backend, decode_backend):
-        supported_page_sizes = [64, 128]
-        msg = "Intel XPU attention backend"
         if use_mla_backend(view):
-            supported_page_sizes.extend([16, 32])
-            msg = msg + " for MLA"
+            # sgl_kernel's mla_decode accepts only these; it has no page_size 1 path.
+            supported_page_sizes = [16, 32, 64, 128]
+            msg = "Intel XPU attention backend for MLA"
+        else:
+            # MHA page_size 1 goes through sgl_kernel's workaround (KV gather +
+            # non-paged varlen attention); the paged kernel accepts only 64/128.
+            supported_page_sizes = [1, 64, 128]
+            msg = "Intel XPU attention backend"
         if view.page_size not in supported_page_sizes:
             logger.warning(
                 f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."

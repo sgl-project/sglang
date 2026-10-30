@@ -68,6 +68,8 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indices
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -1017,7 +1019,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # Its KV never landed: abort instead of sending it to decode.
                 if req.discard_output_reason is not None:
-                    req.to_finish = req.discard_output_reason
+                    req.request_finish(req.discard_output_reason)
                 if is_aborted(req):
                     if self._retire_aborted_prefill_result(req):
                         req.time_stats.set_completion_time()
@@ -1042,7 +1044,7 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     )
                 if sampling_mask_finish_reason is not None:
-                    req.to_finish = sampling_mask_finish_reason
+                    req.request_finish(sampling_mask_finish_reason)
                     req.time_stats.trace_ctx.abort(
                         abort_info={"reason": sampling_mask_finish_reason.message}
                     )
@@ -1275,7 +1277,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if req.return_routed_experts:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
-                    req.finished_reason = FINISH_LENGTH(length=0)
+                    req.finish_outside_step(FINISH_LENGTH(length=0))
                 # unlock the tree
                 release_kv_cache(req, self.tree_cache, checkpoint=True)
                 self.tree_cache.finish(
@@ -1352,7 +1354,7 @@ class SchedulerDisaggregationPrefillMixin:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.finished_reason is None:
-            req.finished_reason = FINISH_LENGTH(length=0)
+            req.finish_outside_step(FINISH_LENGTH(length=0))
         # unlock the tree
         release_kv_cache(req, self.tree_cache, checkpoint=True)
         self._release_aborted_request(req)
@@ -1664,6 +1666,12 @@ class SchedulerDisaggregationPrefillMixin:
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, window_start:seq_len
                 ]
+                if is_cp_sharded_padded():
+                    window_kv_indices_full = (
+                        get_cp_sharded_padded_cache_transfer_indices(
+                            window_kv_indices_full
+                        )
+                    )
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
                         window_kv_indices_full
@@ -1796,6 +1804,10 @@ class SchedulerDisaggregationPrefillMixin:
             ]
             # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
             # physical ones. Per segment, since each is its own gather.
+            if is_cp_sharded_padded():
+                raw_kv_indices = get_cp_sharded_padded_cache_transfer_indices(
+                    raw_kv_indices
+                )
             kv_indices = (
                 self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
                     raw_kv_indices
