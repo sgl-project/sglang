@@ -440,6 +440,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        if hasattr(self.draft_model, "prepare_refinement"):
+            from sglang.srt.arg_groups.overrides import resolved_view
+            from sglang.srt.configs.dspine import validate_dspine_runtime
+
+            validate_dspine_runtime(resolved_view(server_args), self.draft_model.config)
+            target_model = self.target_worker.model_runner.model
+            self.draft_model.prepare_refinement(
+                unwrap_lora_layer(getattr(target_model, "lm_head", None))
+            )
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
