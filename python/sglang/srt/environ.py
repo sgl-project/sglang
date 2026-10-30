@@ -712,6 +712,9 @@ class Envs:
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
+    # Most per-request states the detokenizer keeps; past it, the oldest is
+    # evicted. See https://github.com/sgl-project/sglang/issues/2812
+    SGLANG_DETOKENIZER_MAX_STATES = EnvInt(1 << 16)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
