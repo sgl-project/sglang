@@ -155,10 +155,28 @@ docker pull quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12
 
 Pick one of the two methods below based on your situation:
 
-| Your situation                                                            | Recommended path                                                                                 |
-|---------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
-| New to SGLang on Ascend, or deploying a serving environment               | [Using Docker Image](#method-2-using-docker-image)                                               |
-| Developing or debugging SGLang, or pinning/customizing component versions | [Installing from source with prerequisites](#method-1-installing-from-source-with-prerequisites) |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "38%"}} />
+    <col style={{width: "62%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Method</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Recommended scenarios</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#method-2-using-docker-image">Using Docker Image</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>New to SGLang on Ascend, or deploying a serving environment</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#method-1-installing-from-source-with-prerequisites">Installing from source with prerequisites</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Developing or debugging SGLang, or pinning/customizing component versions</td>
+    </tr>
+  </tbody>
+</table>
 
 **For most users, the Docker image is the recommended path.** It is the most convenient option: the matched component
 set from the [version mapping table](#component-version-mapping-for-sglang) comes pre-installed, and validated image
