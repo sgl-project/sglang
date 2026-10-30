@@ -9,9 +9,9 @@ that layout transformation.
 from functools import wraps
 
 import torch
+from sgl_kernel_npu.operators.mm import flatten_patches
 
 from sglang.srt.hardware_backend.npu.modules.glm_vl_utils import (
-    _npu_safe_flatten_patches,
     _patch_processor_method,
 )
 
@@ -25,7 +25,7 @@ def npu_wrapper_glm5_next_image_patchify(func):
         merge_size: int,
         temporal_patch_size: int,
     ) -> tuple[torch.Tensor, int, int]:
-        flatten_patches, grid_t, grid_h, grid_w = _npu_safe_flatten_patches(
+        flattened_patches, grid_t, grid_h, grid_w = flatten_patches(
             images.unsqueeze(1),
             patch_size=patch_size,
             merge_size=merge_size,
@@ -33,7 +33,7 @@ def npu_wrapper_glm5_next_image_patchify(func):
         )
         if grid_t != 1:
             raise ValueError(f"Expected one temporal image grid, got {grid_t}")
-        return flatten_patches, grid_h, grid_w
+        return flattened_patches, grid_h, grid_w
 
     return patchify
 
@@ -47,7 +47,7 @@ def npu_wrapper_glm5_next_video_patchify(func):
         merge_size: int,
         temporal_patch_size: int,
     ) -> tuple[torch.Tensor, int, int, int]:
-        return _npu_safe_flatten_patches(
+        return flatten_patches(
             videos,
             patch_size=patch_size,
             merge_size=merge_size,
