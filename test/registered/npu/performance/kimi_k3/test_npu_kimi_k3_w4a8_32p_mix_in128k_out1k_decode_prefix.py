@@ -3,7 +3,6 @@ import unittest
 
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    AISBENCHMARK,
     BENCHSERVING,
     KIMI_K3_DSPARK_MODEL_PATH,
     KIMI_K3_W4A8_MODEL_PATH,
