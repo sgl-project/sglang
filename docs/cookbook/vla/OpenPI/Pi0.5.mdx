@@ -287,6 +287,7 @@ For resident single-GPU NVIDIA CUDA inference, set these options in the JSON pas
 | --- | --- | --- |
 | `enable_action_loop_cuda_graph` | `false` | Capture the full denoising loop; requires `enable_action_cuda_graph=true`. |
 | `enable_action_time_cache` | `false` | Cache timestep conditioning; requires `enable_action_loop_cuda_graph=true`. |
+| `enable_fused_norm` | `false` | Fuse normalization pointwise operations with bitwise verification and Torch fallback. |
 
 ## 6. VRAM Tuning
 

@@ -5,11 +5,12 @@ import pytest
 import torch
 
 from sglang.kernels.ops.diffusion import (
+    rmsnorm_modulate_preserve_reduction,
     rmsnorm_preserve_reduction,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,
@@ -66,6 +67,71 @@ def test_compile_and_graph_replay():
     weight.normal_()
     graph.replay()
     torch.testing.assert_close(out, reference(x, weight, 1e-6), atol=0, rtol=0)
+
+
+def modulate_reference(x, affine, adaptive):
+    # Separate FP32 square, mean and affine operations, with a final dtype cast.
+    variance = torch.mean(torch.square(x.float()), dim=-1, keepdim=True)
+    normalized = x * torch.rsqrt(variance + 1e-6)
+    if adaptive:
+        scale, shift, gate = affine.unsqueeze(1).chunk(3, dim=-1)
+        return (normalized * (1.0 + scale.float()) + shift.float()).to(
+            x.dtype
+        ), gate.to(x.dtype)
+    return (normalized * (1.0 + affine.float())).to(x.dtype), None
+
+
+@pytest.mark.parametrize(
+    "shape,dtype,affine_dtype,adaptive",
+    [
+        ((1, 50, 1024), torch.bfloat16, torch.bfloat16, True),
+        ((1, 819, 2048), torch.bfloat16, torch.bfloat16, False),
+        ((2, 7, 1024), torch.float16, torch.float32, True),
+        ((2, 7, 1024), torch.float16, torch.float32, False),
+    ],
+)
+def test_pointwise_fusion_preserves_torch_rounding(
+    shape, dtype, affine_dtype, adaptive
+):
+    """Changing reduction order or contracting the affine FMA breaks exact parity."""
+    torch.manual_seed(42)
+    # Exercise a non-current input device when multiple GPUs are available.
+    device = torch.device("cuda", torch.cuda.device_count() - 1)
+    x = torch.randn(shape, device=device, dtype=dtype)
+    x[:, 0] *= 1e-4
+    affine_shape = (shape[0], shape[2] * 3) if adaptive else (shape[2],)
+    affine = torch.randn(affine_shape, device=device, dtype=affine_dtype)
+    with torch.cuda.device(0), torch.inference_mode():
+        expected, expected_gate = modulate_reference(x, affine, adaptive)
+        actual, gate = rmsnorm_modulate_preserve_reduction(
+            x, None if adaptive else affine, affine if adaptive else None, 1e-6
+        )
+        assert torch.cuda.current_device() == 0
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if adaptive:
+        torch.testing.assert_close(gate, expected_gate, rtol=0, atol=0)
+
+
+def test_norm_replay_reads_current_modulation_and_preserves_owned_outputs():
+    x = torch.randn(2, 50, 1024, device="cuda", dtype=torch.bfloat16)
+    modulation = torch.randn(2, 3072, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream), torch.inference_mode():
+        retained, _ = rmsnorm_modulate_preserve_reduction(x, None, modulation, 1e-6)
+        snapshot = retained.clone()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.inference_mode(), torch.cuda.graph(graph, stream=stream):
+        actual, gate = rmsnorm_modulate_preserve_reduction(x, None, modulation, 1e-6)
+    with torch.inference_mode():
+        x.add_(0.25)
+        modulation.mul_(0.5)
+        graph.replay()
+        expected, expected_gate = modulate_reference(x, modulation, True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(gate, expected_gate, rtol=0, atol=0)
+    torch.testing.assert_close(retained, snapshot, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

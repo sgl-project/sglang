@@ -56,6 +56,8 @@ class Pi05PipelineConfig(PipelineConfig):
     enable_action_loop_cuda_graph: bool = False
     # Reuse timestep-only conditioning within the full-loop graph path.
     enable_action_time_cache: bool = False
+    # Fuse pointwise normalization while retaining Torch's FP32 mean reduction.
+    enable_fused_norm: bool = False
     action_cuda_graph_max_entries: int = 4
     prefix_cache_max_entries: int = 1
     prefix_cache_layout_version: str = "pi05-prefix-v1"

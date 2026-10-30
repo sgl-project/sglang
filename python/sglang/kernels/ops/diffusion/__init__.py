@@ -406,6 +406,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.rmsnorm_modulate_preserve_reduction",
+        KernelBackend.TRITON,
+        "norm.rmsnorm_preserve_reduction:rmsnorm_modulate_preserve_reduction",
+        _CUDA,
+    ),
+    (
         "diffusion.silu_mul",
         KernelBackend.TRITON,
         "activation.silu_mul_bitexact:fused_silu_mul_bitexact",
@@ -699,6 +705,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
+    "rmsnorm_modulate_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     "can_use_channel_rmsnorm_finish_silu": "norm.channel_rmsnorm_finish_silu_jit",
     "channel_rmsnorm_finish_silu": "norm.channel_rmsnorm_finish_silu_jit",
     "can_use_channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",

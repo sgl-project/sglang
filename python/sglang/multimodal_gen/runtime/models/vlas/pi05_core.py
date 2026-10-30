@@ -16,6 +16,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma.configuration_gemma import GemmaConfig
 
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
@@ -37,12 +38,15 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.vla.prefix_cache import VLADensePrefixCache
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.rotary_embedding import (
     apply_rotary_pos_emb as native_apply_rotary_pos_emb,
 )
 from sglang.srt.models.siglip import SiglipVisionModel
+
+logger = init_logger(__name__)
 
 
 def config_compute_dtype(config: GemmaConfig) -> torch.dtype | None:
@@ -131,6 +135,8 @@ class PiGemmaRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.dim = dim
+        self.enable_fusion = False
+        self.fusion_gate = BitExactFusionGate("Pi05 RMSNorm", per_signature=True)
         if cond_dim is None:
             self.weight = nn.Parameter(torch.zeros(dim))
             self.dense = None
@@ -144,6 +150,41 @@ class PiGemmaRMSNorm(nn.Module):
         cond: torch.Tensor | None = None,
         modulation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if (
+            self.enable_fusion
+            and not torch.is_grad_enabled()
+            and x.device.type == "cuda"
+            and torch.version.cuda is not None
+            and x.ndim == 3
+            and x.is_contiguous()
+            and x.dtype in (torch.bfloat16, torch.float16)
+        ):
+            from sglang.kernels.ops.diffusion import rmsnorm_modulate_preserve_reduction
+
+            if self.dense is not None and modulation is None and cond is not None:
+                modulation = self.dense(cond.to(dtype=self.dense.weight.dtype))
+            weight = self.weight if self.dense is None else None
+            affine = weight if weight is not None else modulation
+            return self.fusion_gate.run(
+                lambda: rmsnorm_modulate_preserve_reduction(
+                    x, weight, modulation if weight is None else None, self.eps
+                ),
+                lambda: self.forward_native(x, cond, modulation),
+                sig=(
+                    x.device,
+                    x.dtype,
+                    x.shape,
+                    None if affine is None else affine.dtype,
+                ),
+                equal=lambda a, b: all(
+                    x is y if x is None or y is None else torch.equal(x, y)
+                    for x, y in zip(a, b, strict=True)
+                ),
+                logger=logger,
+            )
+        return self.forward_native(x, cond, modulation)
+
+    def forward_native(self, x, cond=None, modulation=None):
         dtype = x.dtype
         variance = torch.mean(torch.square(x.float()), dim=-1, keepdim=True)
         normed = x * torch.rsqrt(variance + self.eps)
@@ -1279,6 +1320,9 @@ class Pi05CoreModel(nn.Module):
             torch.empty(0, dtype=torch.float64),
             persistent=False,
         )
+        for module in self.modules():
+            if isinstance(module, PiGemmaRMSNorm):
+                module.enable_fusion = config.enable_fused_norm
 
     def prepare_attention_masks_4d(
         self,
