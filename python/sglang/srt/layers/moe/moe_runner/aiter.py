@@ -22,6 +22,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported
 
 _SMALLM_MOE_ON = envs.SGLANG_ROCM_SMALLM_MOE.get()
@@ -133,6 +134,14 @@ def aiter_swiglu_oai_limit(config: MoeRunnerConfig) -> Optional[float]:
     return float(config.gemm1_clamp_limit)
 
 
+def aiter_runs_swiglu(config: MoeRunnerConfig) -> bool:
+    """Whether AITER runs these experts with its SwiGLU (SwiGLU-OAI) activation."""
+    return (
+        _AITER_ACTIVATIONS.get(config.activation) == "Swiglu"
+        or aiter_swiglu_oai_limit(config) is not None
+    )
+
+
 def _aiter_activation(config: MoeRunnerConfig):
     from aiter import ActivationType
 
@@ -165,6 +174,45 @@ def _aiter_fused_moe_supports_output() -> bool:
     from aiter.fused_moe import fused_moe
 
     return "output" in inspect.signature(fused_moe).parameters
+
+
+@functools.cache
+def _aiter_fused_moe_supports_deterministic() -> bool:
+    from aiter.fused_moe import fused_moe
+
+    return "deterministic" in inspect.signature(fused_moe).parameters
+
+
+@functools.cache
+def _warn_no_deterministic_moe() -> None:
+    logger.warning(
+        "This AITER build's fused_moe has no deterministic option, so MXFP4 MoE "
+        "results can depend on the batch in deterministic mode."
+    )
+
+
+def _use_aiter_deterministic_moe(
+    config: MoeRunnerConfig,
+    w13_weight: torch.Tensor,
+    expert_mask: Optional[torch.Tensor],
+) -> bool:
+    """Whether to run MXFP4 experts with AITER's fused_moe(deterministic=True).
+
+    That option uses one fixed configuration with no atomics and no split-K, so a
+    token's result does not depend on its batch. It covers SwiGLU experts without
+    expert-parallel masking; other activations keep the default path.
+    """
+    if not (
+        w13_weight.element_size() == 1
+        and expert_mask is None
+        and aiter_runs_swiglu(config)
+        and get_exec().deterministic.enable_deterministic_inference
+    ):
+        return False
+    if not _aiter_fused_moe_supports_deterministic():
+        _warn_no_deterministic_moe()
+        return False
+    return True
 
 
 class AiterRunnerCore(MoeRunnerCore):
@@ -213,6 +261,10 @@ class AiterRunnerCore(MoeRunnerCore):
         extra: dict = {}
         if quant_info.fused_moe_kwargs:
             extra.update(quant_info.fused_moe_kwargs)
+        if _use_aiter_deterministic_moe(
+            self.config, quant_info.w13_weight, quant_info.expert_mask
+        ):
+            extra["deterministic"] = True
         if runner_input.num_local_tokens is not None:
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
@@ -279,6 +331,7 @@ class AiterRunnerCore(MoeRunnerCore):
             _SMALLM_MOE_ON
             and quant_info.w13_weight.element_size() == 1
             and not quant_info.fp8_activations
+            and not extra.get("deterministic")
         ):
             from sglang.kernels.ops.moe import smallm_moe_gfx950 as _smallm
 
