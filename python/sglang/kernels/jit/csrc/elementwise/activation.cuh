@@ -148,6 +148,60 @@ __global__ void act_kernel(const __grid_constant__ UnaryActivationParams params)
   PDLTriggerSecondary<kUsePDL>();
 }
 
+// SiLU rounded to T depends only on the 16-bit input, so the rounded gated kernel
+// can read it from a table holding every bit pattern's value instead of running
+// expf and the IEEE divide per element (which made it ALU-bound at power-capped clocks).
+constexpr uint32_t kSiluTableSize = 1u << 16;
+constexpr uint32_t kSiluTableThreads = 1024;
+
+template <typename T>
+__global__ void silu_rounding_table_kernel(T* __restrict__ table) {
+  const auto bits = static_cast<uint16_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  const T x = reinterpret_cast<const T&>(bits);
+  table[bits] = device::cast<T>(apply_activation_f32<ActivationKind::kSiLU>(device::cast<fp32_t>(x)));
+}
+
+/// \brief `act_and_mul_kernel<T, kSiLU, kUsePDL, false, true, kReuseInput>` with the
+/// rounded SiLU looked up in a shared-memory copy of the table; same bytes out.
+template <typename T, bool kUsePDL, bool kReuseInput>
+__global__ void __launch_bounds__(kSiluTableThreads)
+    silu_and_mul_rounded_table_kernel(const __grid_constant__ ActivationParams params, const T* __restrict__ table) {
+  using namespace device;
+  static_assert(sizeof(T) == sizeof(uint16_t));
+  constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
+  using vec_t = AlignedVector<T, kMaxVecBytes / sizeof(T)>;
+  extern __shared__ uint16_t silu_table[];
+  using table_vec_t = AlignedVector<uint16_t, 8>;
+  for (uint32_t i = threadIdx.x; i < kSiluTableSize / 8; i += blockDim.x) {
+    store_as<table_vec_t>(silu_table, load_as<table_vec_t>(table, i), i);
+  }
+  __syncthreads();
+
+  const uint32_t num_vecs = params.hidden_dim / kVecSize;
+  const uint32_t num_items = params.num_tokens * num_vecs;
+  PDLWaitPrimary<kUsePDL>();
+  for (uint32_t item = blockIdx.x * blockDim.x + threadIdx.x; item < num_items; item += gridDim.x * blockDim.x) {
+    const uint32_t token_id = item / num_vecs;
+    const uint32_t input_offset = token_id * (num_vecs * 2) + item % num_vecs;
+    const auto gate = load_as<vec_t>(params.input, input_offset);
+    const auto up = load_as<vec_t>(params.input, input_offset + num_vecs);
+    vec_t out;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      const T gate_value = gate[i];
+      const uint16_t activated_bits = silu_table[reinterpret_cast<const uint16_t&>(gate_value)];
+      const T activated = reinterpret_cast<const T&>(activated_bits);
+      out[i] = cast<T>(cast<fp32_t>(activated) * cast<fp32_t>(up[i]));
+    }
+    if constexpr (kReuseInput) {
+      store_as<vec_t>(const_cast<void*>(params.input), out, input_offset);
+    } else {
+      store_as<vec_t>(params.out, out, item);
+    }
+  }
+  PDLTriggerSecondary<kUsePDL>();
+}
+
 template <typename T, bool kUsePDL>
 struct ActivationKernel {
   static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
@@ -276,6 +330,81 @@ struct ActivationKernel {
   static void run_activation_with_rounding_input_inplace(
       const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type) {
     launch<true, true>(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1);
+  }
+
+  static void build_silu_rounding_table(const tvm::ffi::TensorView table) {
+    using namespace host;
+    if constexpr (sizeof(T) != sizeof(uint16_t)) {
+      Panic("the SiLU table covers 16-bit types only");
+    } else {
+      auto device_ = SymbolicDevice{};
+      device_.set_options<kDLGPU>();
+      TensorMatcher({kSiluTableSize}).with_dtype<T>().with_device(device_).verify(table);
+      LaunchKernel(kSiluTableSize / 256, 256, device_.unwrap())(
+          silu_rounding_table_kernel<T>, static_cast<T*>(table.data_ptr()));
+    }
+  }
+
+  /// \brief run_activation_with_rounding[_input_inplace] for SiLU through the table.
+  template <bool kReuseInput>
+  static void run_silu_and_mul_rounded_table(
+      const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, const tvm::ffi::TensorView table) {
+    using namespace host;
+    if constexpr (sizeof(T) != sizeof(uint16_t)) {
+      Panic("the SiLU table covers 16-bit types only");
+    } else {
+      auto N = SymbolicSize{"num_tokens"};
+      auto D_in = SymbolicSize{"input_width"};
+      auto D_out = SymbolicSize{"output_width"};
+      auto device_ = SymbolicDevice{};
+      device_.set_options<kDLGPU>();
+      if constexpr (kReuseInput) {
+        TensorMatcher({N, D_out}).with_strides({D_in, 1}).with_dtype<T>().with_device(device_).verify(out);
+      } else {
+        TensorMatcher({N, D_out}).with_dtype<T>().with_device(device_).verify(out);
+      }
+      TensorMatcher({N, D_in}).with_dtype<T>().with_device(device_).verify(input);
+      TensorMatcher({kSiluTableSize}).with_dtype<T>().with_device(device_).verify(table);
+      const auto hidden_size = static_cast<uint32_t>(D_out.unwrap());
+      const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+      const auto device = device_.unwrap();
+      if (num_tokens == 0) return;
+      RuntimeCheck(hidden_size * 2 == D_in.unwrap(), "invalid activation dimension");
+      RuntimeCheck(hidden_size % kVecSize == 0, "hidden size must be divisible by vector size");
+      if constexpr (kReuseInput) {
+        RuntimeCheck(input.data_ptr() == out.data_ptr(), "in-place activation output must alias input");
+      }
+      const auto num_items = static_cast<uint64_t>(num_tokens) * (hidden_size / kVecSize);
+      RuntimeCheck(num_items <= std::numeric_limits<uint32_t>::max(), "too many items for 32-bit indexing");
+      constexpr auto kernel = silu_and_mul_rounded_table_kernel<T, kUsePDL, kReuseInput>;
+      constexpr std::size_t kSmemBytes = kSiluTableSize * sizeof(T);
+      [[maybe_unused]] static const bool smem_set = [] {
+        RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+        return true;
+      }();
+      const auto num_sm = runtime::get_sm_count(device.device_id);
+      const auto per_sm = runtime::get_blocks_per_sm(kernel, kSiluTableThreads, kSmemBytes);
+      const auto num_blocks = std::min<uint64_t>(
+          static_cast<uint64_t>(num_sm) * std::max(per_sm, 1u), div_ceil(num_items, uint64_t{kSiluTableThreads}));
+      const auto params = ActivationParams{
+          .input = input.data_ptr(),
+          .out = kReuseInput ? nullptr : out.data_ptr(),
+          .hidden_dim = hidden_size,
+          .num_tokens = num_tokens,
+      };
+      LaunchKernel(static_cast<uint32_t>(num_blocks), kSiluTableThreads, device, kSmemBytes)
+          .enable_pdl(kUsePDL)(kernel, params, static_cast<const T*>(table.data_ptr()));
+    }
+  }
+
+  static void run_silu_and_mul_rounded_table_out(
+      const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, const tvm::ffi::TensorView table) {
+    run_silu_and_mul_rounded_table<false>(input, out, table);
+  }
+
+  static void run_silu_and_mul_rounded_table_input_inplace(
+      const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, const tvm::ffi::TensorView table) {
+    run_silu_and_mul_rounded_table<true>(input, out, table);
   }
 
   static void run_activation_filtered(
