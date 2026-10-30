@@ -11,6 +11,9 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTConfig,
 )
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+    BaseBreakableCudaGraphRunner,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
@@ -59,6 +62,55 @@ def _ensure_single_process_parallel_runtime() -> None:
         return
     ensure_distributed_env_defaults()
     maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay")
+@torch.no_grad()
+def test_embedding_pool_outputs_match_eager_across_replays():
+    state = SimpleNamespace(
+        hidden_size=4,
+        arch=SimpleNamespace(time_embed_dim=2),
+        video_patch_proj=lambda x: (x * 2, None),
+        audio_patch_proj=lambda x: (x * 3, None),
+        _time_embedding=lambda t: torch.stack((t, t + 1), dim=-1),
+    )
+
+    class Embedding(torch.nn.Module):
+        def forward(self, **kwargs):
+            return MiniMaxH3DiTModel._embed(state, **kwargs)
+
+    device = torch.device("cuda:0")
+    kwargs = dict(
+        x=torch.randn(4, 4, device=device),
+        audio_x=torch.randn(5, 4, device=device),
+        text_embeddings_selected=torch.randn(2, 4, device=device, dtype=torch.bfloat16),
+        unique_timesteps=torch.tensor([0.5], device=device),
+        img_pos=torch.tensor([2, 3], device=device),
+        audio_pos=torch.tensor([4], device=device),
+        text_pos=torch.tensor([0, 1], device=device),
+        refiner_cu_seqlens=torch.tensor([0, 2, 2], device=device),
+        refiner_max_seqlen=2,
+        row_start=0,
+        row_stop=6,
+        device=device,
+        refined_prompt_embeds_length=2,
+    )
+    model = Embedding()
+    runner = BaseBreakableCudaGraphRunner(model, device)
+    try:
+        assert runner.capture(**kwargs)
+        assert next(iter(runner.entries.values())).num_segments == 2
+        for value in (0.25, 0.75):
+            kwargs["unique_timesteps"].fill_(value)
+            kwargs["x"].normal_()
+            kwargs["audio_x"].normal_()
+            kwargs["text_embeddings_selected"].normal_()
+            expected = model(**kwargs)
+            actual = runner(**kwargs)
+            for result, reference in zip(actual, expected):
+                torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    finally:
+        runner.reset()
 
 
 def test_pruned_adaln_lora_projection_preserves_affine_term():
