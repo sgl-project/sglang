@@ -504,6 +504,9 @@ class Envs:
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
+    # Check each schedule step that the scheduler's running requests equal the
+    # ones its batches hold (scheduler_components/running_reqs.py).
+    SGLANG_DEBUG_CHECK_RUNNING_REQS = EnvBool(False)
     # The explicit environment variable still takes precedence over this CI
     # default, so production remains opt-in and CI remains opt-out if needed.
     SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_tree_cache_sanity_check)

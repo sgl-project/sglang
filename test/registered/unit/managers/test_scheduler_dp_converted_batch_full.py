@@ -5,13 +5,19 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -20,7 +26,9 @@ class _RunningBatch:
     """A full running batch that DP attention converts to extend in place."""
 
     def __init__(self, num_reqs):
-        self.reqs = [SimpleNamespace(finished=False) for _ in range(num_reqs)]
+        self.reqs = [
+            Mock(rid=str(i), finished=Mock(return_value=False)) for i in range(num_reqs)
+        ]
         self.forward_mode = SimpleNamespace(is_extend=lambda: False)
         self.chunked_req = None
         self.is_prefill_only = False
@@ -38,7 +46,7 @@ class _RunningBatch:
 
     def filter_batch(self, reqs_to_exclude=()):
         self.reqs = [
-            r for r in self.reqs if not r.finished and r not in reqs_to_exclude
+            r for r in self.reqs if not r.finished() and r not in reqs_to_exclude
         ]
 
     def merge_batch(self, other):
@@ -56,6 +64,7 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         s.dllm_config = None
         s.chunked_req = None
         s.enable_hisparse = False
+        s.running_reqs = RunningReqs()
         s.require_mlp_sync = False
         s._should_defer_prefill = Mock(return_value=False)
         s.dp_attn_adapter = Mock()
@@ -75,10 +84,15 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         s.get_new_batch_prefill = get_new_batch_prefill
         return s
 
+    def setUp(self):
+        enter_scope(self, published_topology())
+        enter_scope(self, envs.SGLANG_DEBUG_CHECK_RUNNING_REQS.override(True))
+
     def test_converted_batch_stays_running_and_reopens_admission(self):
         seen = []
         s = self._scheduler(seen)
         running = _RunningBatch(num_reqs=3)
+        s.running_reqs.join(running.reqs)
 
         # Step N: decode is converted to extend because a peer rank extends.
         plan = s.get_next_batch_to_run(running_batch=running, last_batch=None)
@@ -86,7 +100,7 @@ class TestDpConvertedBatchFull(unittest.TestCase):
         self.assertIs(plan.running_batch, running)
 
         # Step N+1: one row finished; the batch comes back as last_batch.
-        running.reqs[0].finished = True
+        running.reqs[0].finished.return_value = True
         plan = s.get_next_batch_to_run(
             running_batch=plan.running_batch, last_batch=plan.batch_to_run
         )
