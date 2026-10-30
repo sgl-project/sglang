@@ -136,7 +136,9 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     if _is_npu and memory_config.enable_hierarchical_cache:
         return False
     return (
-        not memory_config.enable_hisparse
+        # HiSparse target shared-topk layers never read index-K. Keep the
+        # speculative path dense until its cache lifecycle is validated too.
+        (not memory_config.enable_hisparse or get_spec().speculative_algorithm is None)
         and not is_draft_worker
         and not memory_config.enable_unified_cache_external_linker
     )
