@@ -258,6 +258,9 @@ class TestTracePackage(CustomTestCase):
 class TestTraceServer(CustomTestCase):
     """Integration tests for tracing with server - starts server once for all tests."""
 
+    # SGLANG_TRACE_DECODE_MAX_STEPS of the launched server; None = default (unlimited).
+    trace_decode_max_steps = None
+
     @classmethod
     def setUpClass(cls):
         """Start collector and server once for all tests."""
@@ -398,6 +401,53 @@ class TestTraceServer(CustomTestCase):
             f"No expected spans found. Expected any of {EXPECTED_SPANS_LEVEL_3}, "
             f"got {sorted(span_names)}",
         )
+
+    def _wait_for_decode_loop_counts(self, num_traces, timeout=10.0):
+        """Poll until decode_loop spans of `num_traces` traces stop growing."""
+        counts, stable_rounds, deadline = {}, 0, time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.5)
+            new_counts = {}
+            for span in self.collector.get_spans_by_name(
+                RequestStage.DECODE_LOOP.stage_name
+            ):
+                new_counts[span.trace_id] = new_counts.get(span.trace_id, 0) + 1
+            stable_rounds = stable_rounds + 1 if new_counts == counts else 0
+            counts = new_counts
+            if len(counts) >= num_traces and stable_rounds >= 2:
+                break
+        return counts
+
+    def test_trace_level_3_decode_loop_limit(self):
+        """Level 3 traces every decode step by default, or the first N if set."""
+        limit = self.trace_decode_max_steps
+        decode_steps_floor = 10
+        batch_size = 2
+        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/set_trace_level?level=3")
+        self.assertEqual(response.status_code, 200)
+        self.collector.clear()
+
+        # ignore_eos guarantees more decode steps than both the limit and the floor.
+        response = requests.post(
+            f"{DEFAULT_URL_FOR_TEST}/generate",
+            json={
+                "text": ["The capital of France is"] * batch_size,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 2 * max(limit or 0, decode_steps_floor) + 2,
+                    "ignore_eos": True,
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+
+        counts = self._wait_for_decode_loop_counts(batch_size)
+        self.assertEqual(len(counts), batch_size, counts)
+        for trace_id, count in counts.items():
+            if limit is None:
+                self.assertGreater(count, decode_steps_floor, trace_id)
+            else:
+                self.assertEqual(count, limit, trace_id)
 
     def test_batch_request(self):
         """Test tracing with batch requests (multiple prompts in one request)."""
@@ -557,7 +607,10 @@ class TestTraceEngine(CustomTestCase):
 
 
 class TestTraceServerAsync(TestTraceServer):
-    """Async tracing variant — same server setup with SGLANG_TRACE_ASYNC=1."""
+    """Async tracing variant — same server setup with SGLANG_TRACE_ASYNC=1,
+    also tracing only the first N decode steps per request."""
+
+    trace_decode_max_steps = 10
 
     @classmethod
     def setUpClass(cls):
@@ -574,7 +627,10 @@ class TestTraceServerAsync(TestTraceServer):
                 "--otlp-traces-endpoint",
                 "127.0.0.1:4317",
             ],
-            env={"SGLANG_TRACE_ASYNC": "1"},
+            env={
+                "SGLANG_TRACE_ASYNC": "1",
+                "SGLANG_TRACE_DECODE_MAX_STEPS": str(cls.trace_decode_max_steps),
+            },
         )
 
         response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
@@ -582,7 +638,8 @@ class TestTraceServerAsync(TestTraceServer):
 
         cls.collector.clear()
 
-    # Only run trace_level_3 — the most comprehensive check.
+    # Run trace_level_3 (the most comprehensive check) and the decode_loop
+    # limit through the async exporter.
     test_trace_level_0 = None
     test_trace_level_1 = None
     test_trace_level_2 = None
@@ -642,6 +699,7 @@ class TestTraceServerMultiTokenizer(TestTraceServer):
     test_trace_level_0 = None
     test_trace_level_1 = None
     test_trace_level_2 = None
+    test_trace_level_3_decode_loop_limit = None
     test_batch_request = None
     test_parallel_sample = None
 
