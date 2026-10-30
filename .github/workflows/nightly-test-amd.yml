@@ -799,6 +799,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU Grok1-INT4)
+        if: ${{ !cancelled() }}
         timeout-minutes: 60
         continue-on-error: true
         run: |
@@ -852,6 +853,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU Grok1-INT4)
+        if: ${{ !cancelled() }}
         timeout-minutes: 60
         continue-on-error: true
         run: |
@@ -906,6 +908,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU Grok2)
+        if: ${{ !cancelled() }}
         timeout-minutes: 60
         continue-on-error: true
         run: |
@@ -959,6 +962,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU Grok2)
+        if: ${{ !cancelled() }}
         timeout-minutes: 60
         continue-on-error: true
         run: |
@@ -1017,6 +1021,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU DeepSeek-V3.2 Basic)
+        if: ${{ !cancelled() }}
         timeout-minutes: 150
         continue-on-error: true
         run: |
@@ -1066,6 +1071,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU DeepSeek-V3.2 MTP)
+        if: ${{ !cancelled() }}
         timeout-minutes: 180
         continue-on-error: true
         run: |
@@ -1123,6 +1129,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4)
+        if: ${{ !cancelled() }}
         timeout-minutes: 300
         continue-on-error: true
         run: |
@@ -1230,6 +1237,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4 KV FP8)
+        if: ${{ !cancelled() }}
         timeout-minutes: 300
         continue-on-error: true
         run: |
@@ -1284,6 +1292,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4 AllReduce Fusion)
+        if: ${{ !cancelled() }}
         timeout-minutes: 300
         continue-on-error: true
         run: |
@@ -1788,6 +1797,7 @@ jobs:
       # continue-on-error matches every other combined accuracy + perf job here,
       # so a perf hiccup cannot turn the accuracy result red.
       - name: Performance Test MI35x ROCm (8-GPU Kimi-K3)
+        if: ${{ !cancelled() }}
         timeout-minutes: 300
         continue-on-error: true
         run: |
@@ -1845,6 +1855,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU Qwen 3.5 FP8)
+        if: ${{ !cancelled() }}
         timeout-minutes: 120
         continue-on-error: true
         run: |
@@ -1899,6 +1910,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU Qwen 3.5 FP8)
+        if: ${{ !cancelled() }}
         timeout-minutes: 120
         continue-on-error: true
         run: |
@@ -2232,6 +2244,7 @@ jobs:
       # Run perf only after correctness passes. Keeping both steps in this job
       # reuses the cached checkpoint and one scarce MI35x slot.
       - name: Performance Test MI35x ROCm (4-GPU MiniMax-M3 MXFP8)
+        if: ${{ !cancelled() }}
         timeout-minutes: 120
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
         run: |
@@ -2333,6 +2346,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU MiniMax-M2.7)
+        if: ${{ !cancelled() }}
         timeout-minutes: 120
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
         run: |
