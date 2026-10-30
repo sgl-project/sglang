@@ -702,7 +702,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 config.text_config,
                 quant_config,
                 prefix=(
-                    "language_model" if isinstance(quant_config, prefix_config) else ""
+                    add_prefix("language_model", prefix)
+                    if isinstance(quant_config, prefix_config)
+                    else ""
                 ),
             )
 
