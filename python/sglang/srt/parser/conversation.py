@@ -35,7 +35,12 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from typing_extensions import Literal
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.utils import ImageData, VideoData, read_system_prompt_from_file
+from sglang.srt.utils import (
+    GLM_MEDIA_CONFIG_KEYS,
+    ImageData,
+    VideoData,
+    read_system_prompt_from_file,
+)
 
 
 class SeparatorStyle(IntEnum):
@@ -506,9 +511,9 @@ matching_function_registry: List[Callable] = []
 def register_conv_template(template: Conversation, override: bool = False):
     """Register a new conversation template."""
     if not override:
-        assert (
-            template.name not in chat_templates
-        ), f"{template.name} has been registered."
+        assert template.name not in chat_templates, (
+            f"{template.name} has been registered."
+        )
 
     chat_templates[template.name] = template
 
@@ -681,7 +686,16 @@ def generate_chat_conv(
                         )
                     elif content.type == "video_url":
                         real_content += video_token
-                        conv.append_video(content.video_url.url)
+                        preprocess_kwargs = {
+                            key: value
+                            for key in GLM_MEDIA_CONFIG_KEYS
+                            if (value := getattr(content.video_url, key, None))
+                            is not None
+                        }
+                        conv.append_video(
+                            content.video_url.url,
+                            preprocess_kwargs=preprocess_kwargs or None,
+                        )
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)
@@ -1104,6 +1118,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "moss_vl": "moss-vl",
     "deepseek-ocr": "deepseek-ocr",
     "unlimited-ocr": "unlimited-ocr",
+    "unlimited_ocr": "unlimited-ocr",
     "paddleocr_vl": "paddle-ocr",
     "whisper": "whisper",
 }
@@ -1182,11 +1197,11 @@ def match_minicpm(model_path: str):
     # must NOT fall back to the legacy `minicpmv` conv template (which encodes
     # the old `(<image>./</image>)` placeholder used by 2.x/4.0/4.5).
     model_type = get_model_type(model_path)
-    if model_type == "minicpmv4_6":
+    if model_type in ("minicpmv4_6", "minicpmv4_7"):
         return None
     # For HF-hub paths (where config.json isn't on local disk yet), fall back
     # to a path-version check: exclude 4.6 and later, match only legacy 2.x/4.0/4.5.
-    if re.search(r"minicpm-(v|o)-4[._]6", model_path, re.IGNORECASE):
+    if re.search(r"minicpm-(v|o)-4[._][67]", model_path, re.IGNORECASE):
         return None
     match = re.search(r"minicpm-(v|o)", model_path, re.IGNORECASE)
     if match:
@@ -1216,7 +1231,7 @@ def match_unlimited_ocr(model_path: str):
     if "unlimited" in model_path.lower():
         return "unlimited-ocr"
     model_type = get_model_type(model_path)
-    if model_type == "unlimited-ocr":
+    if model_type in ("unlimited-ocr", "unlimited_ocr"):
         return "unlimited-ocr"
     return None
 

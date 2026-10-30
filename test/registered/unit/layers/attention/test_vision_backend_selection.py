@@ -10,8 +10,8 @@ from einops import rearrange
 from sglang.srt.layers.attention import vision
 from sglang.test.ci.ci_register import register_cpu_ci, register_npu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
-register_npu_ci(est_time=2, suite="stage-b-test-1-npu-a3")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_npu_ci(est_time=2, suite="base-b-test-1-npu-a3")
 register_npu_ci(est_time=2, suite="nightly-1-npu-a3", nightly=True)
 
 
@@ -50,6 +50,115 @@ def test_npu_backend_selection_priority(
     backend = vision.VisionAttention._determine_attention_backend(None, passed_backend)
 
     assert backend == expected
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [
+        ((9, 0), "fa3"),
+        ((10, 0), "fa4"),
+        ((10, 3), "fa4"),
+        ((12, 0), "triton_attn"),
+    ],
+)
+def test_cuda_default_backend_by_capability(monkeypatch, capability, expected):
+    monkeypatch.setattr(vision, "is_cuda", lambda: True)
+    monkeypatch.setattr(vision, "get_device_capability", lambda: capability)
+    monkeypatch.setattr(
+        vision, "get_platform", lambda: SimpleNamespace(is_blackwell=False)
+    )
+    monkeypatch.setattr(
+        vision, "get_mm", lambda: SimpleNamespace(mm_attention_backend=None)
+    )
+
+    backend = vision.VisionAttention._determine_attention_backend(None, None)
+
+    assert backend == expected
+
+
+@pytest.mark.parametrize("graph_env", ["0", "1"])
+def test_fa4_seqlens_from_vit_cuda_graph_list(monkeypatch, graph_env):
+    # ViT CUDA graph runners pass [cu_seqlens, max_seqlen]; tensors must keep
+    # working even when SGLANG_VIT_ENABLE_CUDA_GRAPH is set for another model.
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", graph_env)
+    monkeypatch.setattr(vision, "_is_cuda", True)
+    calls = []
+
+    def fake_flash_attn_func(q, k, v, **kwargs):
+        calls.append(kwargs)
+        return q
+
+    monkeypatch.setattr(vision, "flash_attn_func", fake_flash_attn_func, raising=False)
+    q = torch.randn(6, 2, 8)
+    cu_seqlens = torch.tensor([0, 4, 6], dtype=torch.int32)
+    backend = vision.VisionFlash4Attention()
+
+    backend(q, q, q, cu_seqlens=[cu_seqlens, 4], bsz=1, seq_len=6)
+    backend(q, q, q, cu_seqlens=cu_seqlens, bsz=1, seq_len=6, max_seqlen=4)
+
+    for kwargs in calls:
+        assert kwargs["ver"] == 4
+        assert torch.equal(kwargs["cu_seqlens_q"], cu_seqlens)
+        assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_k"] == 4
+    assert calls[0]["cu_seqlens_q"] is cu_seqlens
+
+
+def test_explicit_backend_without_published_mm_context(monkeypatch, npu_platform):
+    monkeypatch.setattr(
+        vision,
+        "get_mm",
+        Mock(side_effect=ValueError("config namespace 'mm' not published")),
+    )
+    monkeypatch.setattr(
+        vision,
+        "get_context",
+        lambda: SimpleNamespace(is_config_namespace_published=lambda namespace: False),
+    )
+
+    backend = vision.VisionAttention._determine_attention_backend(None, "sdpa")
+
+    assert backend == "sdpa"
+
+
+def test_explicit_backend_keeps_published_context_errors(monkeypatch, npu_platform):
+    monkeypatch.setattr(
+        vision,
+        "get_mm",
+        Mock(side_effect=ValueError("mm namespace is not available for this role")),
+    )
+    monkeypatch.setattr(
+        vision,
+        "get_context",
+        lambda: SimpleNamespace(is_config_namespace_published=lambda namespace: True),
+    )
+
+    with pytest.raises(ValueError, match="not available for this role"):
+        vision.VisionAttention._determine_attention_backend(None, "sdpa")
+
+
+def test_sdpa_preserves_flattened_batch_layout():
+    torch.manual_seed(0)
+    bsz, seq_len, num_heads, head_dim = 3, 5, 2, 8
+    q, k, v = [torch.randn(bsz * seq_len, num_heads, head_dim) for _ in range(3)]
+    backend = vision.VisionSdpaAttention(
+        head_dim=head_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+    )
+
+    output = backend(q=q, k=k, v=v, bsz=bsz)
+    q_ref, k_ref, v_ref = [
+        x.reshape(bsz, seq_len, num_heads, head_dim).transpose(1, 2) for x in (q, k, v)
+    ]
+    expected = F.scaled_dot_product_attention(
+        q_ref,
+        k_ref,
+        v_ref,
+        scale=backend.scale,
+    )
+    expected = expected.transpose(1, 2).reshape(bsz * seq_len, num_heads, head_dim)
+
+    torch.testing.assert_close(output, expected)
 
 
 @pytest.mark.parametrize("mask_kind", ["causal", "padding"])
@@ -150,3 +259,64 @@ def test_ascend_attention_unmasked_inputs_keep_fused_path(
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+SDPA_NUM_HEADS = 2
+SDPA_HEAD_DIM = 8
+
+
+def _sdpa_qkv(s):
+    torch.manual_seed(0)
+    return [torch.randn(s, SDPA_NUM_HEADS, SDPA_HEAD_DIM) for _ in range(3)]
+
+
+def _masked_forward(backend, q, k, v, cu_seqlens):
+    """The original path: an explicit attention_mask bypasses the per-sequence split."""
+    mask = backend.generate_patch_attention_mask(
+        q.shape[0], cu_seqlens, flatten_batch=backend.flatten_batch
+    )
+    return backend(q=q, k=k, v=v, bsz=1, cu_seqlens=cu_seqlens, attention_mask=mask)
+
+
+@pytest.mark.parametrize(
+    ("flatten_batch", "cu"),
+    [
+        (False, [0, 12]),  # one image: the mask is all-True
+        (True, [0, 12]),
+        (True, [0, 5, 12, 20]),  # several images: block-diagonal mask
+        (True, [0, 5, 5, 12]),  # zero-length segment
+    ],
+)
+def test_per_sequence_sdpa_matches_masked(flatten_batch, cu):
+    backend = vision.VisionSdpaAttention(
+        head_dim=SDPA_HEAD_DIM,
+        num_heads=SDPA_NUM_HEADS,
+        num_kv_heads=SDPA_NUM_HEADS,
+        flatten_batch=flatten_batch,
+    )
+    cu_seqlens = torch.tensor(cu, dtype=torch.int32)
+    q, k, v = _sdpa_qkv(cu[-1])
+
+    assert backend._maskless_seq_lens(s=cu[-1], bsz=1, cu_seqlens=cu_seqlens)
+    output = backend(q=q, k=k, v=v, bsz=1, cu_seqlens=cu_seqlens)
+
+    torch.testing.assert_close(output, _masked_forward(backend, q, k, v, cu_seqlens))
+
+
+@pytest.mark.parametrize(
+    ("flatten_batch", "cu", "s"),
+    [
+        (True, [0, 6, 10], 12),  # cu_seqlens does not cover the padded tail
+        (False, [0, 6, 12], 12),  # non-flatten masks are padding masks, not blocks
+    ],
+)
+def test_mask_kept_when_not_block_diagonal(flatten_batch, cu, s):
+    backend = vision.VisionSdpaAttention(
+        head_dim=SDPA_HEAD_DIM,
+        num_heads=SDPA_NUM_HEADS,
+        num_kv_heads=SDPA_NUM_HEADS,
+        flatten_batch=flatten_batch,
+    )
+    cu_seqlens = torch.tensor(cu, dtype=torch.int32)
+
+    assert backend._maskless_seq_lens(s=s, bsz=1, cu_seqlens=cu_seqlens) is None

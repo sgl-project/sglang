@@ -10,7 +10,10 @@
 #include <cmath>
 #include <cstdint>
 
-namespace {
+namespace sglang {
+
+// Hash routing ignores scores, so an all-underflowed row would renorm 0/0 to NaN.
+constexpr float kRenormalizeSumEpsilon = 1e-20f;
 
 [[maybe_unused]]
 SGL_DEVICE float act_sqrt_softplus(float x) {
@@ -61,7 +64,8 @@ __global__ void moe_hash_topk_fused(const MoEHashTopKParams __grid_constant__ pa
     const bool is_shared = lane_id >= topk;
     const auto output_offset = warp_id * topk_fused + lane_id;
     topk_ids[output_offset] = is_shared ? num_routed_experts + lane_id - topk : expert_id;
-    topk_weights[output_offset] = is_shared ? 1.0f / routed_scaling_factor : routed_weight / routed_sum;
+    topk_weights[output_offset] =
+        is_shared ? 1.0f / routed_scaling_factor : routed_weight / (routed_sum + kRenormalizeSumEpsilon);
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -107,7 +111,7 @@ struct HashTopKKernel {
     auto E = SymbolicSize{"num_routed_experts"};
     auto K = SymbolicSize{"topk_fused"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, E})  //
         .with_dtype<float>()
@@ -168,7 +172,7 @@ struct MaskKernel {
     auto K = SymbolicSize{"topk"};
     auto D = SymbolicSize{"stride"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({N, K})  //
         .with_strides({D, 1})
         .with_dtype<int32_t>()
@@ -179,7 +183,7 @@ struct MaskKernel {
     const int32_t* ntn_ptr = nullptr;
     int32_t ntn_value = 0;
     const auto ntn_dev = num_token_non_padded.device().device_type;
-    if (ntn_dev == kDLCUDA) {
+    if (ntn_dev == kDLGPU) {
       RuntimeCheck(is_type<int32_t>(num_token_non_padded.dtype()), "num_token_non_padded on CUDA must be int32");
       ntn_ptr = static_cast<const int32_t*>(num_token_non_padded.data_ptr());
     } else if (ntn_dev == kDLCPU) {
@@ -211,4 +215,4 @@ struct MaskKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

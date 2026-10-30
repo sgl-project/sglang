@@ -11,6 +11,9 @@ from sglang.multimodal_gen.configs.models.dits.sana_wm_refiner import (
     SanaWMRefinerArchConfig,
     SanaWMRefinerConfig,
 )
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_blocks_or_transformer_blocks,
+)
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -210,11 +213,8 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
     `strict=False` state_dict load.
     """
 
-    _fsdp_shard_conditions = SanaWMRefinerArchConfig()._fsdp_shard_conditions
-    _compile_conditions = SanaWMRefinerArchConfig()._compile_conditions
-    _supported_attention_backends = (
-        SanaWMRefinerArchConfig()._supported_attention_backends
-    )
+    _fsdp_shard_conditions = [is_blocks_or_transformer_blocks]
+    _compile_conditions = [is_blocks_or_transformer_blocks]
     param_names_mapping = SanaWMRefinerArchConfig().param_names_mapping
     reverse_param_names_mapping: dict = {}
     lora_param_names_mapping: dict = {}
@@ -226,7 +226,7 @@ class SanaWMLTX2VideoRefiner(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__(config, hf_config=hf_config)
-        arch = config.arch_config
+        arch = self.config
 
         self.in_channels = int(arch.in_channels)
         self.out_channels = int(arch.out_channels)

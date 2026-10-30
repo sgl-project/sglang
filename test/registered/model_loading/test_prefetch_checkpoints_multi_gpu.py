@@ -4,7 +4,7 @@ import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=300, suite="nightly-4-gpu")
+register_cuda_ci(est_time=300, stage="weekly", runner_config="4-gpu-h100")
 
 PROMPTS = [
     "Hello, my name is",
@@ -22,8 +22,7 @@ class TestPrefetchCheckpointsMultiGPU(CustomTestCase):
         cls.engine = sgl.Engine(
             model_path="Qwen/Qwen1.5-MoE-A2.7B-Chat",
             tp_size=4,
-            dp_size=4,
-            enable_dp_attention=True,
+            attn_dp_size=4,
             disable_radix_cache=True,
             weight_loader_prefetch_checkpoints=True,
             cuda_graph_max_bs_decode=1,

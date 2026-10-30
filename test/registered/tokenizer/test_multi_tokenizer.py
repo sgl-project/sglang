@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=220, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=231, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=355, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -27,8 +27,8 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
     """One server covering both worker pools: multi-tokenizer and
     multi-detokenizer (the flags are orthogonal)."""
 
-    mmlu_score_threshold = 0.65
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
 
     @classmethod

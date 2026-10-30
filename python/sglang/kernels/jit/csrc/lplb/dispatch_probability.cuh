@@ -28,7 +28,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 template <int MAX_COPIES, int BLOCK_DIM>
 __global__ void dispatch_probability_kernel(
@@ -97,10 +97,10 @@ void dispatch_probability(
   SymbolicSize NUM_LOGICAL{"num_logical"};
   SymbolicDevice device_;
 
-  TensorMatcher({N}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(out_topk_ids).verify(in_topk_ids);
-  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(log2phy_prob);
-  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(log2phy_map);
-  TensorMatcher({N}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(random_vals);
+  TensorMatcher({N}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(out_topk_ids).verify(in_topk_ids);
+  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<float>().with_device<kDLGPU>(device_).verify(log2phy_prob);
+  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(log2phy_map);
+  TensorMatcher({N}).with_dtype<float>().with_device<kDLGPU>(device_).verify(random_vals);
 
   const int n = static_cast<int>(N.unwrap());
   const int grid = (n + BLOCK_DIM - 1) / BLOCK_DIM;
@@ -119,4 +119,4 @@ void dispatch_probability(
       n);
 }
 
-}  // namespace
+}  // namespace sglang

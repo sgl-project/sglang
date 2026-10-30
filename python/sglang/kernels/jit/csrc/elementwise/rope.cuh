@@ -11,7 +11,7 @@
 
 #include <numeric>
 
-namespace {
+namespace sglang {
 
 struct FusedRopeParams {
   void* __restrict__ q_ptr;
@@ -280,7 +280,7 @@ struct FusedRopeKernel {
     auto device = SymbolicDevice{};
     auto id_type = SymbolicDType{};
     D.set_value(kRopeDim);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({N, Q, D})  // q input
         .with_strides({Dq, Dd, 1})
         .with_dtype<QDType>()
@@ -377,7 +377,7 @@ struct FusedRopeKernel {
     auto device = SymbolicDevice{};
     auto id_type = SymbolicDType{};
     D.set_value(kRopeDim);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, Q, D})  // q input
         .with_strides({Dq, Dd, 1})
@@ -466,4 +466,4 @@ struct FusedRopeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

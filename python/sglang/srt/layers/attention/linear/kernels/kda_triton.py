@@ -5,25 +5,34 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu
+from sglang.srt.utils import is_cpu, is_hip, is_npu, is_xpu
+
+_is_hip = is_hip()
+if _is_hip:
+    from sglang.kernels.ops.attention.linear import kda_gfx950_prefill
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_kda_packed_decode,
     )
-    from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
+    from sglang.kernels.ops.attention.fla.kda import chunk_kda
+    from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
         fused_recurrent_linear_replayssm_decode,
     )
-    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
-    from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
 
 class TritonKDAKernel(LinearAttnKernelBase):
     """Triton-based kernel for KDA (Kimi Delta Attention) linear attention."""
 
-    supports_packed_decode: bool = not is_cpu() and not is_npu()
+    # XPU has no tvm_ffi CUDA JIT kernel for KDA packed decode; route XPU to the
+    # non-packed Triton decode() path (fused_sigmoid_gating_delta_rule_update),
+    # the same fallback CPU/NPU use. Batched decode is handled via query_start_loc.
+    supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
+    supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
+    supports_track_state_snapshot: bool = True
 
     def packed_decode(
         self,
@@ -63,7 +72,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_write_pos = kwargs.get("replayssm_write_pos")
         replayssm_force_flush = kwargs.get("replayssm_force_flush")
         if (
-            replayssm_d is not None
+            lower_bound is None
+            and replayssm_d is not None
             and replayssm_k is not None
             and replayssm_g is not None
             and replayssm_write_pos is not None
@@ -166,7 +176,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         intermediate_states_buffer: torch.Tensor,
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
-        retrieve_parent_token: torch.Tensor,
+        retrieve_parent_token: Optional[torch.Tensor],
         lower_bound: Optional[float] = None,
         # fused ReplaySSM ring-write (dense verify only; off elsewhere).
         cache_ring: bool = False,
@@ -224,9 +234,29 @@ class TritonKDAKernel(LinearAttnKernelBase):
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
+        beta_is_raw: bool = False,
         return_intermediate_states: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if _is_hip:
+            out = kda_gfx950_prefill.extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                beta_is_raw=beta_is_raw,
+                return_intermediate_states=return_intermediate_states,
+                **kwargs,
+            )
+            if out is not None:
+                return out
         return chunk_kda(
             q=q,
             k=k,
@@ -240,5 +270,10 @@ class TritonKDAKernel(LinearAttnKernelBase):
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
             output_intermediate_states=return_intermediate_states,
+            track_state=kwargs.get("track_state"),
+            track_chunk_idx=kwargs.get("track_chunk_idx"),
+            chunk_indices=kwargs.get("chunk_indices"),
+            chunk_offsets=kwargs.get("chunk_offsets"),
         )

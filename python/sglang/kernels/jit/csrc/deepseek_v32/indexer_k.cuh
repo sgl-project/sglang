@@ -24,7 +24,7 @@
 #include <bit>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 using deepseek_v4::fp8::pack_fp8;
 
@@ -167,7 +167,7 @@ struct FusedKIndexerNormRopeKernel {
 
     auto B = SymbolicSize{"batch_size"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, kHeadDim})  //
         .with_strides({-1, 1})
@@ -368,7 +368,7 @@ struct FusedKIndexerNormRopeStoreKernel {
 
     auto B = SymbolicSize{"batch_size"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, kHeadDim})  //
         .with_strides({-1, 1})
@@ -426,4 +426,4 @@ struct FusedKIndexerNormRopeStoreKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

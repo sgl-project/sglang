@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-1-npu-a3", nightly=False)
+register_npu_ci(est_time=400, suite="base-b-test-1-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendAutoRoundDense(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
@@ -68,7 +67,7 @@ class TestAscendAutoRoundDense(CustomTestCase):
                             num_questions=1319,
                             max_new_tokens=512,
                             parallel=128,
-                            host=f"http://{self.url.hostname}",
+                            host=self.url.hostname,
                             port=int(self.url.port),
                         )
 

@@ -22,7 +22,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-namespace {
+namespace sglang {
 
 struct RMSNormHFParams {
   const void* input;
@@ -166,7 +166,7 @@ struct HFRMSNormWarpKernel {
     auto SO = SymbolicSize{"output_stride"};
     auto device_ = SymbolicDevice{};
     D.set_value(kDim);
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, D}).with_strides({SI, 1}).with_dtype<DType>().with_device(device_).verify(input);
     TensorMatcher({D}).with_dtype<DType>().with_device(device_).verify(weight);
@@ -215,7 +215,7 @@ struct HFRMSNormKernel {
     auto SO = SymbolicSize{"output_stride"};
     auto device_ = SymbolicDevice{};
     D.set_value(kDim);
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, D})  // input
         .with_strides({SI, 1})
@@ -250,4 +250,4 @@ struct HFRMSNormKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

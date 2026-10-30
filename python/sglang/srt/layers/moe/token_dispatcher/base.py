@@ -21,12 +21,14 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import (
-        AscendTPCombineInput,
-        AscendTPDispatchOutput,
+        AscendOpsCombineInput,
+        AscendOpsDispatchOutput,
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
+        DeepEPv2CombineInput,
+        DeepEPv2DispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
         StandardCombineInput,
@@ -39,7 +41,6 @@ if TYPE_CHECKING:
 
 
 class _RemovableDispatcherHandle:
-
     next_id = 0  # Global counter for unique IDs
 
     def __init__(self, hooks_dict: OrderedDict):
@@ -54,7 +55,6 @@ class _RemovableDispatcherHandle:
 
 
 class DispatcherBaseHooks:
-
     def __init__(self):
         self.hook_dict = OrderedDict[int, Callable]()
 
@@ -68,7 +68,6 @@ class DispatcherBaseHooks:
 
 
 class _PreDispatchHooks(DispatcherBaseHooks):
-
     def __call__(
         self,
         dispatcher: BaseDispatcher,
@@ -83,7 +82,6 @@ class _PreDispatchHooks(DispatcherBaseHooks):
 
 
 class _PostDispatchHooks(DispatcherBaseHooks):
-
     def __call__(
         self, dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
     ) -> Optional[DispatchOutput]:
@@ -95,7 +93,6 @@ class _PostDispatchHooks(DispatcherBaseHooks):
 
 
 class _PreCombineHooks(DispatcherBaseHooks):
-
     def __call__(
         self, dispatcher: BaseDispatcher, combine_input: CombineInput
     ) -> Optional[CombineInput]:
@@ -107,7 +104,6 @@ class _PreCombineHooks(DispatcherBaseHooks):
 
 
 class _PostCombineHooks(DispatcherBaseHooks):
-
     def __call__(
         self, dispatcher: BaseDispatcher, hidden_states: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -122,7 +118,6 @@ class _PostCombineHooks(DispatcherBaseHooks):
 
 
 class DispatchOutputChecker:
-
     @staticmethod
     def format_is_standard(
         dispatch_output: DispatchOutput,
@@ -136,10 +131,10 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
-    def format_is_ascend_tp(
+    def format_is_ascend_ops(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[AscendTPDispatchOutput]:
-        return dispatch_output.format.is_ascend_tp()
+    ) -> TypeGuard[AscendOpsDispatchOutput]:
+        return dispatch_output.format.is_ascend_ops()
 
     @staticmethod
     def format_is_deepep_normal(
@@ -165,20 +160,26 @@ class DispatchOutputChecker:
     ) -> TypeGuard[FlashinferDispatchOutput]:
         return dispatch_output.format.is_flashinfer()
 
+    @staticmethod
+    def format_is_deepep_v2(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[DeepEPv2DispatchOutput]:
+        return dispatch_output.format.is_deepep_v2()
+
 
 class DispatchOutputFormat(Enum):
-
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
-    ASCEND_TP = "ascend_tp"
+    DEEPEP_V2 = "deepep_v2"
+    ASCEND_OPS = "ascend_ops"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
 
-    def is_ascend_tp(self) -> bool:
-        return self == DispatchOutputFormat.ASCEND_TP
+    def is_ascend_ops(self) -> bool:
+        return self == DispatchOutputFormat.ASCEND_OPS
 
     def is_deepep_normal(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_NORMAL
@@ -194,6 +195,9 @@ class DispatchOutputFormat(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DispatchOutputFormat.FLASHINFER
+
+    def is_deepep_v2(self) -> bool:
+        return self == DispatchOutputFormat.DEEPEP_V2
 
 
 @runtime_checkable
@@ -211,16 +215,26 @@ class DispatchOutput(Protocol):
 
 class CombineInputChecker:
     @staticmethod
+    def needs_model_route_finalization(
+        combine_input: CombineInput,
+    ) -> TypeGuard[RoutewiseCombineInput]:
+        """Whether expert output still needs routewise model finalization."""
+        return (
+            isinstance(combine_input, RoutewiseCombineInput)
+            and combine_input.routewise_layout is not None
+        )
+
+    @staticmethod
     def format_is_standard(
         combine_input: CombineInput,
     ) -> TypeGuard[StandardCombineInput]:
         return combine_input.format == CombineInputFormat.STANDARD
 
     @staticmethod
-    def format_is_ascend_tp(
+    def format_is_ascend_ops(
         combine_input: CombineInput,
-    ) -> TypeGuard[AscendTPCombineInput]:
-        return combine_input.format == CombineInputFormat.ASCEND_TP
+    ) -> TypeGuard[AscendOpsCombineInput]:
+        return combine_input.format == CombineInputFormat.ASCEND_OPS
 
     @staticmethod
     def format_is_deepep_normal(
@@ -249,13 +263,37 @@ class CombineInputChecker:
     ) -> TypeGuard[FlashinferCombineInput]:
         return combine_input.format == CombineInputFormat.FLASHINFER
 
+    @staticmethod
+    def format_is_deepep_v2(
+        combine_input: CombineInput,
+    ) -> TypeGuard[DeepEPv2CombineInput]:
+        return combine_input.format == CombineInputFormat.DEEPEP_V2
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
-    ASCEND_TP = "ascend_tp"
+    DEEPEP_V2 = "deepep_v2"
+    ASCEND_OPS = "ascend_ops"
+
+
+class RoutewiseLayout(Enum):
+    """Layout of unweighted routes awaiting model finalization; H is hidden size.
+
+    TOKEN_TOPK: outputs [T, K, H], router weights [T, K]. T counts received
+    token rows on this EP rank; K is router top-k. Model finalization reduces
+    K to produce [T, H] before dispatcher combine.
+
+    EXPANDED: outputs [R, H], router weights [R]. Each valid row is one
+    token-expert route; R includes alignment padding and unused capacity.
+    Model finalization preserves row positions; dispatcher combine maps and
+    sums valid routes back to the original sender's tokens.
+    """
+
+    TOKEN_TOPK = "token_topk"
+    EXPANDED = "expanded"
 
 
 @runtime_checkable
@@ -266,6 +304,15 @@ class CombineInput(Protocol):
 
     @property
     def format(self) -> CombineInputFormat: ...
+
+
+@runtime_checkable
+class RoutewiseCombineInput(CombineInput, Protocol):
+    """Combine input whose router weighting is deferred to the model layer."""
+
+    hidden_states: torch.Tensor
+    topk_weights: torch.Tensor
+    routewise_layout: RoutewiseLayout
 
 
 # ------------------------------ Base Dispatcher -------------------------------------
@@ -282,6 +329,7 @@ class BaseDispatcher(ABC):
 
     def __init__(self):
         self.quant_config: dict = {}
+        self.runner_backend = None
 
         # Overlap args
         self.overlap_args: Optional[CombineOverlapArgs] = None

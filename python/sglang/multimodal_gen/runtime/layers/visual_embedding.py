@@ -22,9 +22,7 @@ from diffusers.models.embeddings import (
     get_timestep_embedding as timestep_embedding_diffusers,
 )
 
-from sglang.kernels.ops.diffusion.timestep_embedding import (
-    timestep_embedding as timestep_embedding_cuda,
-)
+from sglang.kernels.ops.diffusion import timestep_embedding as timestep_embedding_cuda
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
@@ -80,7 +78,8 @@ class PatchEmbed(nn.Module):
         )
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x, tokens: bool = False):
+        """``tokens`` returns ``[B, T'*H'*W', C]`` even when ``flatten`` is off."""
         if x.dim() == 5:
             B, C, T, H, W = x.shape
             pt, ph, pw = self.patch_size
@@ -97,7 +96,7 @@ class PatchEmbed(nn.Module):
                 w = self.proj.weight.reshape(self.proj.weight.shape[0], -1)
                 x = F.linear(x, w, self.proj.bias)  # [B, T'*H'*W', embed_dim]
 
-                if not self.flatten:
+                if not (self.flatten or tokens):
                     x = x.reshape(B, T_, H_, W_, -1).permute(0, 4, 1, 2, 3).contiguous()
 
                 x = self.norm(x)
@@ -105,7 +104,7 @@ class PatchEmbed(nn.Module):
 
         # Fallback to Conv3d for non-5D input or indivisible spatial dims.
         x = self.proj(x)
-        if self.flatten:
+        if self.flatten or tokens:
             x = x.flatten(2).transpose(1, 2)
         x = self.norm(x)
         return x
@@ -260,9 +259,9 @@ class TimestepEmbedder(nn.Module):
             t, self.frequency_embedding_size, self.max_period, dtype=self.freq_dtype
         ).to(self.mlp.fc_in.weight.dtype)
         if timestep_seq_len is not None:
-            assert (
-                t_freq.shape[0] % timestep_seq_len == 0
-            ), "timestep length is not divisible by timestep_seq_len"
+            assert t_freq.shape[0] % timestep_seq_len == 0, (
+                "timestep length is not divisible by timestep_seq_len"
+            )
             batch_size = t_freq.shape[0] // timestep_seq_len
             t_freq = t_freq.unflatten(0, (batch_size, timestep_seq_len))
         # t_freq = t_freq.to(self.mlp.fc_in.weight.dtype)

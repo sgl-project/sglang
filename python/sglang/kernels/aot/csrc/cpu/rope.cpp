@@ -265,6 +265,47 @@ void rotary_embedding_kernel_impl(
 
 }  // namespace
 
+// query: [num_tokens, num_heads, head_dim]
+// key:   [num_tokens, num_heads, head_dim]
+// cos:   [num_tokens, head_dim]
+// sin:   [num_tokens, head_dim]
+// Gemma 4's vision tower rotates ndim = 2 head_dim chunks independently, so
+// this is apply_rotary_pos_emb_cpu run once per chunk, in place.
+void apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
+  CHECK_DIM(3, query);
+  const auto input_dtype = query.scalar_type();
+  int64_t num_tokens = query.size(0);
+  int64_t num_heads = query.size(1);
+  int64_t head_size = query.size(2);
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
+  CHECK_INPUT_SHAPE_DTYPE<true>(key, {num_tokens, num_heads, head_size}, input_dtype);
+  CHECK_INPUT_SHAPE_DTYPE<false>(cos, {num_tokens, head_size}, cos.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<false>(sin, {num_tokens, head_size}, sin.scalar_type());
+  CHECK_EQ(cos.scalar_type(), sin.scalar_type());
+
+  constexpr int64_t ndim = 2;
+  TORCH_CHECK(
+      head_size % (2 * ndim) == 0, "head_size must be divisible by ", 2 * ndim, " for ndim = ", ndim, " rotary chunks");
+  const int64_t chunk_size = head_size / ndim;
+
+  const RopeParams p{query, key, head_size, chunk_size};
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(input_dtype, cos.scalar_type(), [&] {
+    scalar_t* q_ptr = query.data_ptr<scalar_t>();
+    scalar_t* k_ptr = key.data_ptr<scalar_t>();
+    const param_t* cos_ptr = cos.data_ptr<param_t>();
+    const param_t* sin_ptr = sin.data_ptr<param_t>();
+    for (int64_t d = 0; d < ndim; ++d) {
+      const int64_t offset = d * chunk_size;
+      auto cache_pos = [cos_ptr, sin_ptr, head_size, offset](int64_t token) -> SplitCosSinRow<param_t> {
+        return {cos_ptr + token * head_size + offset, sin_ptr + token * head_size + offset};
+      };
+      rotary_embedding_kernel_impl<scalar_t, RotaryMode::NeoxFull, true>(
+          q_ptr + offset, k_ptr + offset, q_ptr + offset, k_ptr + offset, p, cache_pos);
+    }
+  });
+}
+
 // 2D : [num_tokens, num_heads*head_size] inplace
 // 3D : [num_tokens, num_heads, head_size] outplace
 // 4D : [batch_size, seq_len, num_heads, head_size] inplace
@@ -376,7 +417,7 @@ apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at
 // key: [num_tokens, num_kv_heads * head_size]
 // cos_sin_cache: [max_position_embeddings, rotary_dim]
 // mrope_section: [t, h, w]
-std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
+void multimodal_rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,
@@ -449,5 +490,4 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
       }
     }
   });
-  return std::make_tuple(query, key);
 }

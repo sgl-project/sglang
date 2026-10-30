@@ -14,7 +14,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 using Plan = device::compress::PrefillPlan;
 
@@ -187,7 +187,7 @@ struct FusedNormRopeKernel {
     auto B = SymbolicSize{"num_q_tokens"};
     auto N = SymbolicSize{"num_compress_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, kHeadDim})  // input
         .with_dtype<DType>()
@@ -251,4 +251,4 @@ struct FusedNormRopeKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

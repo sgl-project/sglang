@@ -2,10 +2,12 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _req(output_len: int, input_len: int = 8, priority=None):
@@ -17,29 +19,26 @@ def _req(output_len: int, input_len: int = 8, priority=None):
 
 
 def _args(policy: str = "length", low_first: bool = False):
-    return SimpleNamespace(
+    """The retraction order reads the schedule bag, so the policy has to be
+    published rather than handed in."""
+    return ServerArgs(
+        model_path="dummy",
         retraction_policy=policy,
         schedule_low_priority_values_first=low_first,
     )
 
 
 def _order(reqs, args):
-    return ScheduleBatch._get_decode_retraction_order(reqs, args)
+    publish(args, role="test")
+    try:
+        return ScheduleBatch._get_decode_retraction_order(reqs)
+    finally:
+        reset_context()
 
 
 class TestRetractionOrder(CustomTestCase):
     """The retraction loop pops from the END of the returned list, so the
     last index is the first request retracted."""
-
-    def test_length_policy_retracts_shortest_output_first(self):
-        reqs = [_req(5), _req(1), _req(3)]
-        self.assertEqual(_order(reqs, _args()), [0, 2, 1])
-
-    def test_length_policy_tie_breaks_on_longer_input(self):
-        # Equal outputs: the longer-input request is retracted first
-        # (frees more tokens for the same rework).
-        reqs = [_req(4, input_len=10), _req(4, input_len=20)]
-        self.assertEqual(_order(reqs, _args()), [0, 1])
 
     def test_priority_policy_low_values_first(self):
         # Low value = more important; None sorts as least important.

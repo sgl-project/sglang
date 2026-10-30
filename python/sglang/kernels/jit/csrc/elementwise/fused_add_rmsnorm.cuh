@@ -12,7 +12,7 @@
 #include <cooperative_groups.h>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 template <typename T, int VEC_SIZE_IN_BYTE>
 struct VecTypeTrait;
@@ -147,7 +147,7 @@ struct FusedAddRMSNormKernel {
     auto N = SymbolicSize{"num_tokens"};
     auto D = SymbolicSize{"hidden_size"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, D})  // input
         .with_strides({D, 1})
@@ -194,4 +194,4 @@ struct FusedAddRMSNormKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

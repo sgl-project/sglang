@@ -14,7 +14,7 @@
 #include <cstdint>
 #include <cuda_fp8.h>
 
-namespace {
+namespace sglang {
 
 struct FusedStoreCacheParam {
   const void* __restrict__ input;
@@ -94,7 +94,7 @@ struct FusedStoreCacheIndexerKernel {
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({N, 128})  // input
         .with_dtype<KeyT>()
         .with_device(device_)
@@ -121,4 +121,4 @@ struct FusedStoreCacheIndexerKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

@@ -23,6 +23,7 @@ from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibra
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs as sglang_envs
 from sglang.srt.utils import is_cuda, is_hip, is_musa
+from sglang.srt.utils.cuda_vmm_utils import _gpu_fabric_clique
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ def update_environment_variables(envs: Dict[str, str]):
     for k, v in envs.items():
         if k in os.environ and os.environ[k] != v:
             logger.warning(
-                "Overwriting environment variable %s " "from '%s' to '%s'",
+                "Overwriting environment variable %s from '%s' to '%s'",
                 k,
                 os.environ[k],
                 v,
@@ -391,27 +392,6 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
         return True
 
 
-# NVML_GPU_FABRIC_STATE_COMPLETED: the GPU has joined its NVLink fabric clique.
-_NVML_GPU_FABRIC_STATE_COMPLETED = 3
-
-
-def _gpu_fabric_clique(device: torch.device):
-    """(cluster_uuid, clique_id) of the local GPU's NVLink fabric clique, or None if
-    the GPU has not joined a fabric (single-node box / fabric init incomplete)."""
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_ids = list(map(int, cuda_visible_devices.split(",")))
-    else:
-        device_ids = list(range(torch.cuda.device_count()))
-    handle = pynvml.nvmlDeviceGetHandleByIndex(device_ids[device.index])
-    fabric = pynvml.c_nvmlGpuFabricInfo_v3_t()
-    fabric.version = pynvml.nvmlGpuFabricInfo_v3
-    pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric))
-    if fabric.state != _NVML_GPU_FABRIC_STATE_COMPLETED:
-        return None
-    return (bytes(fabric.clusterUuid), int(fabric.cliqueId))
-
-
 @with_nvml_context
 def is_one_nvlink_clique(
     group: torch.distributed.ProcessGroup, device: torch.device
@@ -459,39 +439,12 @@ def can_p2p(rank: int, world_size: int) -> bool:
     return True
 
 
-def can_use_custom_all_reduce_with_nvlink(
-    group: torch.distributed.ProcessGroup,
-    device: torch.device,
-    supported_world_size: List[int],
-    cls_name: str,
-) -> Optional[bool]:  # None if fail; otherwise return whether NVLink is available
-    assert (
-        dist.get_backend(group) != dist.Backend.NCCL
-    ), f"{cls_name} should be attached to a non-NCCL group."
-
-    rank = dist.get_rank(group=group)
+def gather_physical_device_ids(
+    group: torch.distributed.ProcessGroup, device: torch.device
+) -> List[int]:
+    """Every rank's physical GPU index (before CUDA_VISIBLE_DEVICES), gathered
+    over a CPU group."""
     world_size = dist.get_world_size(group=group)
-
-    # No need to initialize custom allreduce for single GPU case.
-    if world_size == 1:
-        return
-
-    # No need to initialize custom allreduce for multi-node case.
-    if not all(in_the_same_node_as(group, source_rank=0)):
-        logger.warning(
-            f"{cls_name} is disabled because this process group" " spans across nodes."
-        )
-        return
-
-    # For not supported world size, we disable custom allreduce.
-    if world_size not in supported_world_size:
-        logger.warning(
-            f"{cls_name} is disabled due to an unsupported world"
-            f" size: {world_size}. Supported world sizes: {supported_world_size}. "
-            "To silence this warning, specify disable_custom_all_reduce=True explicitly.",
-        )
-        return
-
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
     if cuda_visible_devices:
         device_ids = list(map(int, cuda_visible_devices.split(",")))
@@ -504,6 +457,54 @@ def can_use_custom_all_reduce_with_nvlink(
     ]
     dist.all_gather(gather_list, tensor, group=group)
     physical_device_ids = [int(t) for t in gather_list]
+    return physical_device_ids
+
+
+def in_one_nvlink_domain(
+    group: torch.distributed.ProcessGroup, device: torch.device
+) -> bool:
+    """True iff every rank's GPU reaches every other's memory over NVLink: one
+    node with full NVLink, or one multi-node NVLink fabric clique."""
+    world_size = dist.get_world_size(group=group)
+    if not all(in_the_same_node_as(group, source_rank=0)):
+        return is_one_nvlink_clique(group, device)
+    return is_full_nvlink(gather_physical_device_ids(group, device), world_size)
+
+
+def can_use_custom_all_reduce_with_nvlink(
+    group: torch.distributed.ProcessGroup,
+    device: torch.device,
+    supported_world_size: List[int],
+    cls_name: str,
+) -> Optional[bool]:  # None if fail; otherwise return whether NVLink is available
+    assert dist.get_backend(group) != dist.Backend.NCCL, (
+        f"{cls_name} should be attached to a non-NCCL group."
+    )
+
+    rank = dist.get_rank(group=group)
+    world_size = dist.get_world_size(group=group)
+
+    # No need to initialize custom allreduce for single GPU case.
+    if world_size == 1:
+        return
+
+    # No need to initialize custom allreduce for multi-node case.
+    if not all(in_the_same_node_as(group, source_rank=0)):
+        logger.warning(
+            f"{cls_name} is disabled because this process group spans across nodes."
+        )
+        return
+
+    # For not supported world size, we disable custom allreduce.
+    if world_size not in supported_world_size:
+        logger.warning(
+            f"{cls_name} is disabled due to an unsupported world"
+            f" size: {world_size}. Supported world sizes: {supported_world_size}. "
+            "To silence this warning, specify disable_custom_all_reduce=True explicitly.",
+        )
+        return
+
+    physical_device_ids = gather_physical_device_ids(group, device)
     full_nvlink = is_full_nvlink(physical_device_ids, world_size)
 
     # test nvlink first, this will filter out most of the cases
