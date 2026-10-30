@@ -212,13 +212,14 @@ class SDPAImpl(AttentionImpl):
             if start == stop:
                 continue
             if query.device.type != "mps":
-                segment = self.forward(
-                    query[start:stop].unsqueeze(0),
-                    key[start:stop].unsqueeze(0),
-                    value[start:stop].unsqueeze(0),
-                    None,
+                q_seg, k_seg, v_seg = (
+                    t[start:stop].unsqueeze(0) for t in (query, key, value)
                 )
-                output[start:stop].copy_(segment[0])
+                # same call as forward, written in place instead of copied
+                if not self.forward_into(
+                    q_seg, k_seg, v_seg, output[start:stop].unsqueeze(0), None
+                ):
+                    output[start:stop].copy_(self.forward(q_seg, k_seg, v_seg, None)[0])
                 continue
 
             # mps SDPA materializes a quadratic temporary for a varlen segment
