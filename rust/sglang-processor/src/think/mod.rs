@@ -45,14 +45,11 @@ pub(crate) enum ThinkConfig {
 
 #[cfg(feature = "openai")]
 impl ThinkConfig {
-    /// `_get_reasoning_from_request` for a template without a reasoning
-    /// config, by the detector's `reasoning_default`. `None` for `"always"`,
-    /// which the host resolves from the template instead.
-    pub(crate) fn default_thinking(&self, kwargs: &Map<String, Value>) -> Option<bool> {
+    /// The detector's `reasoning_default`.
+    pub(crate) fn reasoning_default(&self) -> ReasoningDefault {
         match self {
-            ThinkConfig::Tags(_) => None,
-            // `"thinking"`: on unless the merged kwargs turn `thinking` off.
-            ThinkConfig::KimiK3 => Some(kwargs.get("thinking") != Some(&Value::Bool(false))),
+            ThinkConfig::Tags(tags) => tags.reasoning_default,
+            ThinkConfig::KimiK3 => ReasoningDefault::on_unless("thinking"),
         }
     }
 
@@ -112,6 +109,38 @@ pub(crate) struct TagConfig {
     pub end: &'static str,
     pub tool_start: Option<&'static str>,
     pub tool_start_at_line_start: bool,
+    // Read only by the OpenAI layer.
+    #[cfg_attr(not(feature = "openai"), allow(dead_code))]
+    pub reasoning_default: ReasoningDefault,
+}
+
+/// A detector's `reasoning_default`: reasoning is `on` unless `kwarg` says
+/// otherwise (`"enable_thinking"`), or off unless it does (`"explicit_thinking"`).
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "openai"), allow(dead_code))]
+pub(crate) struct ReasoningDefault {
+    pub kwarg: &'static str,
+    pub on: bool,
+}
+
+impl ReasoningDefault {
+    pub(crate) const fn on_unless(kwarg: &'static str) -> Self {
+        Self { kwarg, on: true }
+    }
+
+    #[cfg(feature = "openai")]
+    pub(crate) const fn off_unless(kwarg: &'static str) -> Self {
+        Self { kwarg, on: false }
+    }
+
+    /// `_get_reasoning_from_request` for a template without a reasoning config.
+    #[cfg(feature = "openai")]
+    pub(crate) fn enabled(&self, kwargs: &Map<String, Value>) -> bool {
+        match kwargs.get(self.kwarg) {
+            Some(Value::Bool(enabled)) => *enabled,
+            _ => self.on,
+        }
+    }
 }
 
 /// Streaming and one-shot `<think>` splitting, as SGLang's base detector does it.

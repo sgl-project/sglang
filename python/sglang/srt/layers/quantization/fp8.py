@@ -420,6 +420,18 @@ class Fp8Config(QuantizationConfig):
 
                 return NPUMXFP8OnlineMoEMethod(self)
 
+            if (
+                is_npu_arch35()
+                and self.is_checkpoint_fp8_serialized
+                and not self.is_fp4_experts
+                and self.weight_block_size == [128, 128]
+            ):
+                from sglang.srt.hardware_backend.npu.quantization.block_fp8_moe import (
+                    NPUBlockFp8MoEMethod,
+                )
+
+                return NPUBlockFp8MoEMethod(self)
+
             fp8_method = Fp8MoEMethod(self)
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
@@ -531,12 +543,25 @@ class Fp8LinearMethod(LinearMethodBase):
             else per_config
         )
         self.weight_block_size = self.quant_config.weight_block_size
+        self.use_npu_block_fp8 = (
+            is_npu_arch35()
+            and self.quant_config.is_checkpoint_fp8_serialized
+            and not self.use_mxfp8
+            and not getattr(self.quant_config, "is_fp4_experts", False)
+            and self.weight_block_size == [128, 128]
+            and getattr(self.quant_config, "scale_fmt", None) != "ue8m0"
+            and not envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get()
+        )
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
         self.mxfp8_dense_backend = None
         # Set by a model-owned startup hook after opting into prefill tuning.
         self.mxfp8_prefill_autotune_min_tokens = None
-        if self.use_mxfp8 and not self.convert_mxfp8_to_block:
+        if self.use_npu_block_fp8:
+            from sglang.kernels.ops.gemm import npu_w8a8_block_fp8_linear
+
+            self.w8a8_block_fp8_linear = npu_w8a8_block_fp8_linear
+        elif self.use_mxfp8 and not self.convert_mxfp8_to_block:
             self.mxfp8_dense_backend = resolve_mxfp8_dense_gemm_backend()
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
@@ -552,8 +577,12 @@ class Fp8LinearMethod(LinearMethodBase):
             )
         # Method-wide gate; a layer that cannot take the MXFP8 view stays on the
         # block kernel (see _prepare_block_fp8_as_mxfp8).
-        self.block_fp8_as_mxfp8 = not self.use_mxfp8 and can_serve_block_fp8_as_mxfp8(
-            self.weight_block_size, getattr(self.quant_config, "scale_fmt", None)
+        self.block_fp8_as_mxfp8 = (
+            not self.use_mxfp8
+            and not self.use_npu_block_fp8
+            and can_serve_block_fp8_as_mxfp8(
+                self.weight_block_size, getattr(self.quant_config, "scale_fmt", None)
+            )
         )
         if self.block_fp8_as_mxfp8:
             self.mxfp8_dense_backend = resolve_block_fp8_mxfp8_backend()
@@ -741,6 +770,9 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if self.use_npu_block_fp8:
+            # G-B consumes checkpoint-layout E4M3 weights and FP32 scales.
+            return
         use_deepgemm_runner = (
             getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
             is deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -1398,6 +1430,14 @@ class Fp8LinearMethod(LinearMethodBase):
             return out
 
         if self.block_quant:
+            if self.use_npu_block_fp8:
+                return self.w8a8_block_fp8_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv,
+                    bias=bias,
+                )
+
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
@@ -2751,14 +2791,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if get_moe_runner_backend().is_hpc_ops():
             self._prepare_hpc_ops_weights(layer)
 
-        if (
-            is_npu_arch35()
-            and self._owns_moe_runner
-            and self.runner.runner_backend.is_ascend()
-        ):
-            layer.w13_kernel.process_weights_after_loading(layer, "w13")
-            layer.w2_kernel.process_weights_after_loading(layer, "w2")
-
         if hasattr(layer, "dispatcher"):
             # Execution kernels may declare the dispatch wire format they
             # need (DISPATCHER_QUANT_CONFIG, e.g. the NPU W4A8 MXFP GMMs
@@ -2976,27 +3008,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
-            elif is_npu_arch35():
-                moe_runner_backend = MoeRunnerBackend.ASCEND
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
-
-        if is_npu_arch35() and moe_runner_backend.is_ascend():
-            if (
-                not self.block_quant
-                or self.use_mxfp8
-                or self.weight_block_size != [128, 128]
-            ):
-                raise ValueError("A5 FP8 MoE requires [128, 128] block quantization")
-            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-                NPUFp8MoEMethod,
-            )
-
-            # Set kernel types before the runner selects its activation.
-            # Weight layout conversion happens after checkpoint loading.
-            moe_runner_config.layer = layer
-            layer.w13_kernel = NPUFp8MoEMethod()
-            layer.w2_kernel = NPUFp8MoEMethod()
 
         if (
             moe_runner_backend.is_flashinfer_cutlass()
@@ -3018,7 +3031,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_trtllm_routed()
             or moe_runner_backend.is_hpc_ops()
             or moe_runner_backend.is_flashinfer_megamoe()
-            or (is_npu_arch35() and moe_runner_backend.is_ascend())
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
@@ -3379,15 +3391,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_hpc_ops():
             quant_info = self._get_hpc_ops_quant_info(layer)
-        elif is_npu_arch35() and self.runner.runner_backend.is_ascend():
-            from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
-
-            quant_info = AscendQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_weight_scale=layer.w13_weight_scale_inv,
-                w2_weight_scale=layer.w2_weight_scale_inv,
-            )
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)
         else:

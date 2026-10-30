@@ -268,6 +268,9 @@ class BaseMultimodalProcessor(ABC):
     # `process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
+    # Placeholder tokens that the loader matches per modality; a processor without
+    # them reads media its own way, so callers cannot tell which media it reads.
+    mm_tokens: Optional[MultimodalSpecialTokens] = None
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -1990,6 +1993,9 @@ class BaseMultimodalProcessor(ABC):
                         modality=modality,
                         feature=feature,
                         format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
+                        offsets=dict_item.pop("offsets", None),
+                        # Trusted media identity for KV trie reuse and KV-event hashes.
+                        hash=dict_item.pop("hash", None),
                         model_specific_data=dict_item,
                     )
                 )

@@ -89,7 +89,9 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
     ) -> dict[str, Any]:
         pipeline_config = server_args.pipeline_config
 
-        model_path = maybe_download_model(self.model_path)
+        model_path = maybe_download_model(
+            self.model_path, revision=server_args.revision
+        )
         self.model_path = model_path
         logger.info("Loading HunyuanImage-3 components from %s", model_path)
 
@@ -119,7 +121,7 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 server_args, pipeline_config, model_path, vae_config_dict
             ),
             "tokenizer": self._load_tokenizer(server_args, model_path),
-            "scheduler": FlowMatchEulerDiscreteScheduler(shift=flow_shift),
+            "scheduler": self._build_scheduler(flow_shift),
             "processor": self._load_processor(server_args, model_path, hf_config),
             "vision_model": self._load_component(
                 HunyuanImage3VisionModel(config_dict["vit"]),
@@ -323,6 +325,14 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             if name.startswith(prefix):
                 state_dict[name[len(prefix) :]] = tensor
         return state_dict
+
+    @staticmethod
+    def _build_scheduler(flow_shift: float) -> FlowMatchEulerDiscreteScheduler:
+        # Official schedule: shift(linspace(1, 0, N + 1))[:-1], i.e. uniform
+        # sigmas shifted once, not the double-shifted training-sigma range.
+        return FlowMatchEulerDiscreteScheduler(
+            shift=flow_shift, use_uniform_sigmas=True
+        )
 
     @staticmethod
     def _read_flow_shift(model_path: str) -> float:

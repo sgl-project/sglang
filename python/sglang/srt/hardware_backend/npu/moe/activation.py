@@ -28,20 +28,17 @@ class NPUSwiglu(BaseActivation):
         return torch.ops.npu.npu_swiglu(hidden_states), None
 
 
-class NPUSwigluClamp(BaseActivation):
-    """GLM SwiGLU: clamp gate before SiLU, and clamp up on both sides."""
+class NPUSwigluWithLimit(BaseActivation):
+    """Clip gate/up before SiLU, keeping the floating output dtype."""
 
     def __init__(self, limit: float):
-        self._limit = float(limit)
+        self.limit = float(limit)
 
     def _apply_activation(self, hidden_states: torch.Tensor):
-        # Keep sigmoid and both products in FP32, then round once before the
-        # FP8 GMM2 quantizer, as in the fused GLM activation.
         gate, up = hidden_states.float().chunk(2, dim=-1)
-        gate = gate.clamp(max=self._limit)
-        up = up.clamp(min=-self._limit, max=self._limit)
-        output = gate * torch.sigmoid(gate) * up
-        return output.to(hidden_states.dtype), None
+        gate = gate.clamp(max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        return (F.silu(gate) * up).to(hidden_states.dtype), None
 
 
 class NPUSwigluQuant(BaseActivation):
