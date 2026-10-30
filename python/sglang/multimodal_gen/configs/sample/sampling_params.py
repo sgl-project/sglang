@@ -426,6 +426,9 @@ class SamplingParams:
     profile_all_stages: bool = field(
         default=False, metadata={"batch_sig_exclude": True}
     )
+    record_execution_trace: bool = field(
+        default=False, metadata={"batch_sig_exclude": True}
+    )
 
     # Debugging
     debug: bool = field(default=False, metadata={"batch_sig_exclude": True})
@@ -1265,6 +1268,15 @@ class SamplingParams:
             action="store_true",
             dest="profile_all_stages",
             help="Used with --profile, profile all pipeline stages",
+        )
+        add_argument(
+            "--export-et-trace",
+            "--export_et_trace",
+            action="store_true",
+            dest="record_execution_trace",
+            help="Used with --profile, also capture a PyTorch Execution Trace (ET) "
+            "alongside the chrome trace, saved as *.et.json "
+            "(CUDA/ROCm/CPU/XPU only, ignored on NPU and MPS)",
         )
 
         add_argument(
