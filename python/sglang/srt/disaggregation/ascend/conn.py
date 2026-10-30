@@ -161,6 +161,11 @@ class AscendKVManager(MooncakeKVManager):
             raise RuntimeError(
                 "Ascend PD DCP layout does not match its source KV entries"
             )
+        num_draft = self.kv_args.num_draft_entries
+        if num_draft:
+            # Remote decode draft KV uses global slots regardless of the local
+            # prefill pool's worker role.
+            return layout[:-num_draft] + [True] * num_draft
         return layout
 
     def prepare_dcp_token_item_lens(

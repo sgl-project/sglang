@@ -12,6 +12,27 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestAscendPageDcpSend(CustomTestCase):
+    def test_draft_global_slots_preserve_target_layout(self):
+        for target_layout in (
+            [False, False],
+            [False, False, True],
+            [False, False, True, True],
+        ):
+            for draft_layout in ([], [False], [False, False], [True, True]):
+                with self.subTest(target=target_layout, draft=draft_layout):
+                    pool_layout = target_layout + draft_layout
+                    mgr = object.__new__(AscendKVManager)
+                    mgr.kv_args = SimpleNamespace(
+                        kv_data_ptrs=list(range(len(pool_layout))),
+                        num_draft_entries=len(draft_layout),
+                    )
+                    mgr._dcp_remote_decode_layout = pool_layout
+                    self.assertEqual(
+                        mgr._get_dcp_remote_decode_layout(),
+                        target_layout + [True] * len(draft_layout),
+                    )
+                    self.assertEqual(pool_layout, target_layout + draft_layout)
+
     def test_rejects_incorrect_destination_geometry(self):
         mgr = object.__new__(AscendKVManager)
         mgr.is_hybrid_mla_backend = False
@@ -21,6 +42,7 @@ class TestAscendPageDcpSend(CustomTestCase):
             kv_item_lens=[20, 8, 4],
             page_size=2,
             mla_compression_ratios=None,
+            num_draft_entries=0,
         )
         mgr._dcp_remote_decode_layout = [False, True, True]
         mgr._transfer_data = Mock(return_value=0)
@@ -63,10 +85,10 @@ class TestAscendPageDcpSend(CustomTestCase):
             kv_layer_ids=src_ids,
             kv_item_lens=widths,
             page_size=2,
+            num_draft_entries=2 if with_draft else 0,
         )
-        mgr._dcp_remote_decode_layout = [False] * (2 * len(stage_ids)) + (
-            [True, True] if with_draft else []
-        )
+        # The prefill pools report local roles; Ascend resolves remote draft slots.
+        mgr._dcp_remote_decode_layout = [False] * len(src_ids)
         mgr.get_mla_kv_ptrs_with_pp = Mock(side_effect=AssertionError("legacy pairing"))
         mgr._transfer_data = Mock(return_value=0)
         kwargs = dict(
