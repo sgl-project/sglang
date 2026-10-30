@@ -7,7 +7,7 @@ import os
 import struct
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import msgspec
 import numpy as np
@@ -50,7 +50,6 @@ from sglang.srt.disaggregation.nixl.buffers import (
 )
 from sglang.srt.disaggregation.nixl.transport import (
     NixlHandle,
-    NixlPreparedList,
     NixlRemoteBuffers,
     NixlTransport,
     Registration,
@@ -218,9 +217,33 @@ class _PreparedStateComponent(msgspec.Struct, frozen=True):
 
 
 class _PreparedStatePlan(msgspec.Struct, frozen=True):
-    src_handle: NixlPreparedList
-    dst_handle: NixlPreparedList
     components: Dict[int, _PreparedStateComponent]
+
+
+class _SliceSrcGeometry(msgspec.Struct, frozen=True):
+    num_groups: int
+    num_ptr_pairs: int
+    num_slots: int
+
+
+class _SliceDstGeometry(msgspec.Struct, frozen=True):
+    num_slots: int
+    head_group_idx: int
+
+
+# Names of the dlists NixlTransport keeps. A state layout lists only the
+# components prepared for its peer, so this side keeps one per peer.
+_KV_LAYOUT = "kv"
+_KV_SLICE_LAYOUT = "kv_slice"
+_STATE_LAYOUT = "state"
+
+
+def _state_src_layout(peer_name: str) -> str:
+    return f"{_STATE_LAYOUT}:{peer_name}"
+
+
+def _kv_segment_layout(*, start: int, end: int, mem_kind: str) -> str:
+    return f"{_KV_LAYOUT}:{start}:{end}:{mem_kind}"
 
 
 class PeerBuffers(msgspec.Struct, frozen=True):
@@ -367,12 +390,11 @@ def _kv_xfer_mem_segments(
     return segments
 
 
-@dataclasses.dataclass
-class _KVXferPreparedSegment:
+class _KVXferPreparedSegment(msgspec.Struct, frozen=True):
     start: int
     end: int
-    src_handle: NixlPreparedList
-    dst_handle: NixlPreparedList
+    src_layout: str
+    dst_layout: str
     dst_num_slots: int
 
 
@@ -650,13 +672,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._prepared_state_plans: Dict[str, _PreparedStatePlan] = {}
         self._state_layout_rejections: Dict[str, str] = {}
         self.kv_buffer_tensors = None
-        self.prep_handles: Dict[str, Any] = {}
-        self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = (
-            None  # (handle, num_groups, num_ptr_pairs, num_slots)
-        )
-        self.prep_handles_slice_dst: Dict[str, Tuple[Any, int, int]] = {}
-        # peer_name -> (handle, num_slots, head_group_idx)
-        self.prep_handles_segment_src: Dict[Tuple[int, int, str], Any] = {}
+        # This side's layouts shared by every peer, once prepared.
+        self._prepared_src_layouts: Set[str] = set()
+        # Peers with a _KV_LAYOUT dlist on both sides.
+        self._kv_layout_peers: Set[str] = set()
+        self._slice_src: Optional[_SliceSrcGeometry] = None
+        self._slice_dst: Dict[str, _SliceDstGeometry] = {}
         self._num_slots_src: int = 0
         self._peer_reload_lock = threading.Lock()
         self._peer_reload_times: Dict[str, float] = {}
@@ -876,9 +897,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         try:
             # Never expand to one descriptor per slot; a state pool holds millions.
-            src_handle = self.transport.prepare(None, src_runs, allow_expansion=False)
-            dst_handle = self.transport.prepare(
-                self._peers[peer_name].remote, dst_runs, allow_expansion=False
+            self.transport.prepare(
+                remote=None,
+                layout=_state_src_layout(peer_name),
+                runs=src_runs,
+                allow_expansion=False,
+            )
+            self.transport.prepare(
+                remote=self._peers[peer_name].remote,
+                layout=_STATE_LAYOUT,
+                runs=dst_runs,
+                allow_expansion=False,
             )
         except TypeError:
             logger.warning_once(
@@ -893,12 +922,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 e,
             )
             return None
-        return _PreparedStatePlan(
-            src_handle=src_handle, dst_handle=dst_handle, components=components
-        )
+        return _PreparedStatePlan(components=components)
 
     def _send_prepared_states(
-        self, *, plan: _PreparedStatePlan, prefill_state_indices, dst_state_indices
+        self,
+        *,
+        peer_name: str,
+        plan: _PreparedStatePlan,
+        prefill_state_indices,
+        dst_state_indices,
     ):
         src_parts, dst_parts = [], []
         for index, component in plan.components.items():
@@ -939,7 +971,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_parts[0] if len(dst_parts) == 1 else np.concatenate(dst_parts)
         )
         handles = self.transport.write_prepared(
-            plan.src_handle, src_selectors, plan.dst_handle, dst_selectors
+            src_layout=_state_src_layout(peer_name),
+            src_indices=src_selectors,
+            remote=self._peers[peer_name].remote,
+            dst_layout=_STATE_LAYOUT,
+            dst_indices=dst_selectors,
         )
         _raise_if_not_created(
             handles,
@@ -1147,13 +1183,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
     def _prep_equal_tp_dlist(
         self,
+        *,
         peer_name: str,
+        layout: str,
         keys: Sequence[BufferKey],
         kv_item_lens: list[int],
         kv_data_lens: list[int],
         num_slots: Optional[int] = None,
         kv_xfer_lens: Optional[list[int]] = None,
-    ) -> NixlPreparedList:
+    ) -> None:
         if kv_xfer_lens is None:
             kv_xfer_lens = kv_item_lens
         if not (
@@ -1178,7 +1216,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             runs.append(
                 StridedRun(key=key, offset=0, length=xfer_len, stride=item_len, count=n)
             )
-        return self.transport.prepare(self._remote(peer_name), runs)
+        self.transport.prepare(remote=self._remote(peer_name), layout=layout, runs=runs)
 
     def _init_equal_tp_prep_handle(
         self,
@@ -1202,14 +1240,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             kv_item_lens = self.kv_args.kv_item_lens
         if kv_data_lens is None:
             kv_data_lens = self.kv_args.kv_data_lens
-        self.prep_handles[peer_name] = self._prep_equal_tp_dlist(
-            peer_name,
-            keys,
-            kv_item_lens,
-            kv_data_lens,
+        self._prep_equal_tp_dlist(
+            peer_name=peer_name,
+            layout=_KV_LAYOUT,
+            keys=keys,
+            kv_item_lens=kv_item_lens,
+            kv_data_lens=kv_data_lens,
             num_slots=num_slots,
             kv_xfer_lens=kv_xfer_lens,
         )
+        if peer_name:
+            self._kv_layout_peers.add(peer_name)
+        else:
+            self._prepared_src_layouts.add(_KV_LAYOUT)
 
     def _init_hetero_tp_prep_handle(
         self,
@@ -1292,7 +1335,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # Src dlist built once and shared. One run per region: [slot, token, group]
         # is one dense progression of head slices, the flat index
         # expand_page_indices_for_slice computes.
-        if self.prep_handle_slice_src is None:
+        if self._slice_src is None:
             src_runs = [
                 StridedRun(
                     key=key,
@@ -1303,12 +1346,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 for key in src_keys
             ]
-            src_handle = self.transport.prepare(None, src_runs)
-            self.prep_handle_slice_src = (
-                src_handle,
-                num_groups,
-                num_ptr_pairs,
-                num_slots,
+            self.transport.prepare(remote=None, layout=_KV_SLICE_LAYOUT, runs=src_runs)
+            self._slice_src = _SliceSrcGeometry(
+                num_groups=num_groups, num_ptr_pairs=num_ptr_pairs, num_slots=num_slots
             )
 
         # Dst dlist per-peer; use decode's slot count (may exceed prefill's).
@@ -1329,11 +1369,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             for key in dst_keys
         ]
-        dst_handle = self.transport.prepare(self._remote(peer_name), dst_runs)
-        self.prep_handles_slice_dst[peer_name] = (
-            dst_handle,
-            num_slots_dst,
-            head_group_idx,
+        self.transport.prepare(
+            remote=self._remote(peer_name), layout=_KV_SLICE_LAYOUT, runs=dst_runs
+        )
+        self._slice_dst[peer_name] = _SliceDstGeometry(
+            num_slots=num_slots_dst, head_group_idx=head_group_idx
         )
 
     def _init_mixed_equal_tp_prep_handles(
@@ -1343,17 +1383,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     ):
         prepared_segments = []
         for seg in mem_segments:
-            src_key = (seg.start, seg.end, seg.src_mem_kind)
-            src_handle = self.prep_handles_segment_src.get(src_key)
-            if src_handle is None:
-                src_handle = self._prep_equal_tp_dlist(
-                    "",
-                    self._local_keys.kv[seg.start : seg.end],
-                    self.kv_args.kv_item_lens[seg.start : seg.end],
-                    self.kv_args.kv_data_lens[seg.start : seg.end],
+            src_layout = _kv_segment_layout(
+                start=seg.start, end=seg.end, mem_kind=seg.src_mem_kind
+            )
+            if src_layout not in self._prepared_src_layouts:
+                self._prep_equal_tp_dlist(
+                    peer_name="",
+                    layout=src_layout,
+                    keys=self._local_keys.kv[seg.start : seg.end],
+                    kv_item_lens=self.kv_args.kv_item_lens[seg.start : seg.end],
+                    kv_data_lens=self.kv_args.kv_data_lens[seg.start : seg.end],
                     num_slots=self._num_slots_src,
                 )
-                self.prep_handles_segment_src[src_key] = src_handle
+                self._prepared_src_layouts.add(src_layout)
 
             dst_num_slots = (
                 peer_info.dst_num_slots
@@ -1364,11 +1406,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_kv_data_lens = [
                 item_len * dst_num_slots for item_len in dst_kv_item_lens
             ]
-            dst_handle = self._prep_equal_tp_dlist(
-                peer_info.agent_name,
-                self._peers[peer_info.agent_name].keys.kv[seg.start : seg.end],
-                dst_kv_item_lens,
-                dst_kv_data_lens,
+            dst_layout = _kv_segment_layout(
+                start=seg.start, end=seg.end, mem_kind=seg.dst_mem_kind
+            )
+            self._prep_equal_tp_dlist(
+                peer_name=peer_info.agent_name,
+                layout=dst_layout,
+                keys=self._peers[peer_info.agent_name].keys.kv[seg.start : seg.end],
+                kv_item_lens=dst_kv_item_lens,
+                kv_data_lens=dst_kv_data_lens,
                 num_slots=peer_info.dst_num_slots,
                 kv_xfer_lens=self.kv_args.kv_item_lens[seg.start : seg.end],
             )
@@ -1376,8 +1422,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 _KVXferPreparedSegment(
                     start=seg.start,
                     end=seg.end,
-                    src_handle=src_handle,
-                    dst_handle=dst_handle,
+                    src_layout=src_layout,
+                    dst_layout=dst_layout,
                     dst_num_slots=dst_num_slots,
                 )
             )
@@ -1506,7 +1552,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             peer_info.dst_homogeneous_mem_kind = dst_mem_kind
             # Build the shared src dlist on the first equal-TP/MLA peer; later
             # peers reuse it. Skipped entirely on heterogeneous-TP-only setups.
-            if "" not in self.prep_handles:
+            if _KV_LAYOUT not in self._prepared_src_layouts:
                 self._init_equal_tp_prep_handle(
                     "",
                     self._local_keys.kv,
@@ -2054,9 +2100,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # NIXL drops a peer's metadata after a remote-disconnect error and never
         # restores it; reload it from the registration we already hold.
         for agent_name in list(room_transfer_infos):
-            peer_info = self.decode_kv_args_table.get(agent_name)
             peer = self._peers.get(agent_name)
-            if peer_info is None or peer is None:
+            if peer is None:
                 continue
             remote = peer.remote
             try:
@@ -2074,20 +2119,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         "NIXL invalidated remote agent %s; reloading its metadata",
                         agent_name,
                     )
-                    # No other thread holds these dlists: every room with this
-                    # peer has the same peer set, so all shard to this worker.
-                    self.prep_handles.pop(agent_name, None)
-                    self.prep_handles_slice_dst.pop(agent_name, None)
-                    self._prepared_state_plans.pop(agent_name, None)
-                    peer_info.kv_xfer_segments = None
+                    # Every room with this peer has the same peer set and shards to
+                    # this worker, so none writes to it while reload() rebuilds.
                     self.transport.reload(remote)
-                    try:
-                        self._prepare_payload_xfer(peer_info)
-                        self._prepare_state_xfer(peer_info)
-                    except Exception:
-                        # Leave the peer invalid so a later failure retries.
-                        self.transport.unload(remote)
-                        raise
             except Exception:
                 logger.exception(
                     "Failed to reload NIXL metadata for remote agent %s", agent_name
@@ -2210,7 +2244,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
     ) -> List[Handle]:
         assert self.src_mem_kind is not None
-        if "" in self.prep_handles and peer_name in self.prep_handles:
+        if peer_name in self._kv_layout_peers:
             info = self.decode_kv_args_table[peer_name]
             num_slots_dst = (
                 info.dst_num_slots
@@ -2226,10 +2260,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             return _require_posted(
                 self.transport.write_prepared(
-                    self.prep_handles[""],
-                    src_indices,
-                    self.prep_handles[peer_name],
-                    dst_indices,
+                    src_layout=_KV_LAYOUT,
+                    src_indices=src_indices,
+                    remote=self._peers[peer_name].remote,
+                    dst_layout=_KV_LAYOUT,
+                    dst_indices=dst_indices,
                 ),
                 create_msg="KVSender failed to create prepped transfer",
                 post_msg="KVSender failed to post prepped transfer",
@@ -2358,6 +2393,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if not segments:
             raise RuntimeError(f"Missing NIXL mixed KV transfer plan for {peer_name}")
 
+        remote = self._peers[peer_name].remote
         handles = []
         for seg in segments:
             num_layers = seg.end - seg.start
@@ -2370,7 +2406,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             handles.extend(
                 _require_posted(
                     self.transport.write_prepared(
-                        seg.src_handle, src_indices, seg.dst_handle, dst_indices
+                        src_layout=seg.src_layout,
+                        src_indices=src_indices,
+                        remote=remote,
+                        dst_layout=seg.dst_layout,
+                        dst_indices=dst_indices,
                     ),
                     create_msg="KVSender failed to create mixed prepped transfer",
                     post_msg="KVSender failed to post mixed prepped transfer",
@@ -2385,32 +2425,32 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
     ):
         # Prepped path: src dlist is shared per decode_tp_size; dst is per peer.
-        assert self.prep_handle_slice_src is not None
-        assert peer_name in self.prep_handles_slice_dst
-        src_handle, num_groups, num_ptr_pairs, num_slots_src = (
-            self.prep_handle_slice_src
-        )
-        dst_handle, num_slots_dst, head_group_idx = self.prep_handles_slice_dst[
-            peer_name
-        ]
+        src = self._slice_src
+        assert src is not None
+        assert peer_name in self._slice_dst
+        dst = self._slice_dst[peer_name]
         page_size = self.kv_args.page_size
         src_indices = expand_page_indices_for_slice(
             np.asarray(prefill_kv_indices, dtype=np.int32),
-            num_ptr_pairs,
-            num_slots_src,
+            src.num_ptr_pairs,
+            src.num_slots,
             page_size,
-            num_groups=num_groups,
-            head_group_idx=head_group_idx,
+            num_groups=src.num_groups,
+            head_group_idx=dst.head_group_idx,
         )
         dst_indices = expand_page_indices_for_slice(
             np.asarray(dst_kv_indices, dtype=np.int32),
-            num_ptr_pairs,
-            num_slots_dst,
+            src.num_ptr_pairs,
+            dst.num_slots,
             page_size,
         )
         return _require_posted(
             self.transport.write_prepared(
-                src_handle, src_indices, dst_handle, dst_indices
+                src_layout=_KV_SLICE_LAYOUT,
+                src_indices=src_indices,
+                remote=self._peers[peer_name].remote,
+                dst_layout=_KV_SLICE_LAYOUT,
+                dst_indices=dst_indices,
             ),
             create_msg="KVSender failed to create prepped slice transfer",
             post_msg="KVSender failed to post prepped slice transfer",
@@ -2958,6 +2998,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         plan = self._prepared_state_plans.get(peer_name)
         if plan is not None:
             yield from self._send_prepared_states(
+                peer_name=peer_name,
                 plan=plan,
                 prefill_state_indices=prefill_state_indices,
                 dst_state_indices=dst_state_indices,

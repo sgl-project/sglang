@@ -1091,8 +1091,8 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
             mgr, self.agent, kv=self.SRC_PTRS, peers=(peer,), peer_kv=self.DST_PTRS
         )
         mgr.attn_tp_size = 1  # prefill attention TP = 1 (DP attention)
-        mgr.prep_handle_slice_src = None
-        mgr.prep_handles_slice_dst = {}
+        mgr._slice_src = None
+        mgr._slice_dst = {}
         mgr.kv_args = SimpleNamespace(
             gpu_id=0,
             engine_rank=0,
@@ -1125,8 +1125,7 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
         )
 
         # num_groups must be 2 (one per unique KV head), not decode_tp//prefill_tp=4.
-        src_handle, num_groups, _num_ptr_pairs, _num_slots = mgr.prep_handle_slice_src
-        self.assertEqual(num_groups, 2)
+        self.assertEqual(mgr._slice_src.num_groups, 2)
 
         # Every source run must lie inside a registered base region
         # [ptr, ptr+REGION_LEN), gaps between its blocks included. Pre-fix,
@@ -1152,9 +1151,7 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
             mgr._init_hetero_tp_prep_handle(
                 peer_name=f"decode_{rank}", decode_kv_args=self._decode_args(rank)
             )
-            _dst_handle, _num_slots_dst, head_group_idx = mgr.prep_handles_slice_dst[
-                f"decode_{rank}"
-            ]
+            head_group_idx = mgr._slice_dst[f"decode_{rank}"].head_group_idx
             self.assertEqual(
                 head_group_idx,
                 expected[rank],
@@ -1223,8 +1220,8 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         mgr.pp_size = 1
         mgr.src_mem_kind = "VRAM"
         mgr._num_slots_src = 4
-        mgr.prep_handles = {}
-        mgr.prep_handles_slice_dst = {}
+        mgr._prepared_src_layouts = set()
+        mgr._kv_layout_peers = set()
         mgr._prepared_state_plans = {}
         mgr._prepared_state_components = frozenset()
         mgr._state_layout_rejections = {}
@@ -1268,7 +1265,7 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         the failed room's posted handles fail and the room is cleared."""
         peers = ["healthy", "dropped"]
         mgr = self._make_manager(peers)
-        healthy_dlist = mgr.prep_handles["healthy"]
+        healthy_layouts = dict(mgr.transport._layouts["healthy"])
         mgr.request_status = {}
         mgr.transfer_infos = {}
         mgr.req_to_decode_prefix_len = {}
@@ -1337,7 +1334,8 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         self.assertEqual(mgr.request_status[31], KVPoll.Failed)
         self.assertIn(31, mgr.failure_records)
         self.assertEqual(mgr.request_status[32], KVPoll.Success)
-        self.assertIs(mgr.prep_handles["healthy"], healthy_dlist)
+        for name, layout in healthy_layouts.items():
+            self.assertIs(mgr.transport._layouts["healthy"][name], layout)
 
     def test_failed_rebuild_leaves_the_peer_to_a_later_reload(self):
         """A reload whose dlists cannot be rebuilt must leave the peer invalid,

@@ -107,12 +107,13 @@ class NixlHandle(Handle):
         self.error = error
 
 
-class NixlPreparedList:
-    """A NIXL dlist prepared once; write_prepared() selects its blocks by flat
-    index, runs in order."""
+class _Layout(msgspec.Struct, frozen=True):
+    """A NIXL dlist prepared from `runs`; write_prepared() selects its blocks by
+    flat index, runs in order."""
 
-    def __init__(self, *, dlist: Any):
-        self.dlist = dlist
+    runs: Tuple[StridedRun, ...]
+    allow_expansion: bool
+    dlist: Any
 
 
 class NixlTransport(Transport):
@@ -130,6 +131,9 @@ class NixlTransport(Transport):
         # region share one engine registration.
         self._registrations: Dict[BufferKey, _Region] = {}
         self._remotes: Dict[str, NixlRemoteBuffers] = {}
+        # Prepared dlists by side ("" for this side, else the peer's agent name)
+        # and layout name; reload() rebuilds a peer's from their kept runs.
+        self._layouts: Dict[str, Dict[str, _Layout]] = {}
         # Newer NIXL prepares compressed (addr, len, dev_id, stride, count) runs
         # directly; cleared on the first TypeError to expand per block instead.
         self._use_strided_descs = True
@@ -279,8 +283,25 @@ class NixlTransport(Transport):
         return self._agent.check_remote_metadata(remote.agent_name)
 
     def reload(self, remote: NixlRemoteBuffers) -> None:
-        """Load a dropped peer again; lists prepared over it before stay invalid."""
+        """Load a dropped peer again and rebuild the dlists prepared over it, which
+        the reload invalidates. A failed rebuild leaves the peer dropped.
+
+        No write_prepared() over this peer may run concurrently."""
         self._agent.add_remote_agent(remote.metadata)
+        layouts = self._layouts.get(remote.agent_name, {})
+        try:
+            for name, layout in list(layouts.items()):
+                layouts[name] = msgspec.structs.replace(
+                    layout,
+                    dlist=self._prepare_dlist(
+                        remote=remote,
+                        runs=layout.runs,
+                        allow_expansion=layout.allow_expansion,
+                    ),
+                )
+        except Exception:
+            self.unload(remote)
+            raise
 
     def unload(self, remote: NixlRemoteBuffers) -> None:
         self._agent.remove_remote_agent(remote.agent_name)
@@ -357,17 +378,33 @@ class NixlTransport(Transport):
     def prepare(
         self,
         remote: Optional[NixlRemoteBuffers],
+        layout: str,
         runs: Sequence[StridedRun],
         *,
         allow_expansion: bool = True,
-    ) -> NixlPreparedList:
-        """Prepare a NIXL dlist handle from runs over local buffers (remote None)
-        or a peer's.
+    ) -> None:
+        """Prepare and keep the NIXL dlist `layout` from runs over local buffers
+        (remote None) or a peer's, replacing one of that name.
 
         Tries the strided API first and falls back to expanding one descriptor
         per block when the installed NIXL rejects the Nx5 layout; with
         allow_expansion False that raises TypeError instead.
         """
+        dlist = self._prepare_dlist(
+            remote=remote, runs=runs, allow_expansion=allow_expansion
+        )
+        side = "" if remote is None else remote.agent_name
+        self._layouts.setdefault(side, {})[layout] = _Layout(
+            runs=tuple(runs), allow_expansion=allow_expansion, dlist=dlist
+        )
+
+    def _prepare_dlist(
+        self,
+        *,
+        remote: Optional[NixlRemoteBuffers],
+        runs: Sequence[StridedRun],
+        allow_expansion: bool,
+    ) -> Any:
         peer_name = "" if remote is None else remote.agent_name
         located = [self._locate(remote, r.key) for r in runs]
         # The protocol prepares one memory kind per list (see _kv_xfer_mem_segments).
@@ -382,8 +419,7 @@ class NixlTransport(Transport):
         ).reshape(-1, 5)
         if self._use_strided_descs:
             try:
-                dlist = self._agent.prep_xfer_dlist(peer_name, array, kind)
-                return NixlPreparedList(dlist=dlist)
+                return self._agent.prep_xfer_dlist(peer_name, array, kind)
             except TypeError:
                 logger.warning_once(
                     "Installed NIXL does not support strided descriptors, "
@@ -393,20 +429,24 @@ class NixlTransport(Transport):
         if not allow_expansion:
             raise TypeError("Installed NIXL does not support strided descriptors")
         descs = self._agent.get_xfer_descs(_expand_runs(array), kind)
-        return NixlPreparedList(
-            dlist=self._agent.prep_xfer_dlist(peer_name, descs, kind)
-        )
+        return self._agent.prep_xfer_dlist(peer_name, descs, kind)
 
     def write_prepared(
         self,
-        src: NixlPreparedList,
+        *,
+        src_layout: str,
         src_indices: np.ndarray,
-        dst: NixlPreparedList,
+        remote: NixlRemoteBuffers,
+        dst_layout: str,
         dst_indices: np.ndarray,
     ) -> List[NixlHandle]:
+        """Write the blocks of local `src_layout` at `src_indices` into those of
+        the peer's `dst_layout` at `dst_indices`."""
+        src = self._layouts[""][src_layout].dlist
+        dst = self._layouts[remote.agent_name][dst_layout].dlist
         try:
             xfer = self._agent.make_prepped_xfer(
-                "WRITE", src.dlist, src_indices, dst.dlist, dst_indices
+                "WRITE", src, src_indices, dst, dst_indices
             )
         except Exception as e:
             return [self._never_posted(f"NIXL could not create the transfer: {e}", e)]
@@ -457,6 +497,7 @@ class NixlTransport(Transport):
         return result
 
     def close(self) -> None:
+        self._layouts.clear()
         for remote in list(self._remotes.values()):
             if self.is_loaded(remote):
                 self.unload(remote)
