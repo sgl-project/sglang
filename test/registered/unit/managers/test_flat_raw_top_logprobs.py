@@ -730,12 +730,7 @@ def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
     fields = dict(
         rids=["r0", "r1"],
         finished_reasons=[None] * n,
-        decode_ids=[array("q", [1]), array("q", [2])],
-        read_offsets=[0] * n,
         output_ids=None,
-        skip_special_tokens=[True] * n,
-        spaces_between_special_tokens=[True] * n,
-        no_stop_trim=[False] * n,
         reasoning_tokens=[0] * n,
         completion_tokens=[1] * n,
         input_token_logprobs_val=[[], []],
