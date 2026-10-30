@@ -294,6 +294,7 @@ from sglang.srt.managers.utils import (
     GenerationBatchResult,
     allocate_distinct_stream,
     is_health_check_generate_req,
+    is_war_barrier_enabled,
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
@@ -2022,7 +2023,7 @@ class Scheduler(
                 )
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
-        self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        self._war_barrier_enabled = is_war_barrier_enabled()
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
