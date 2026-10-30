@@ -33,6 +33,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGeneration,
 )
 from sglang.srt.models.qwen3_5_classification import (
+    Qwen3_5ForSequenceClassification,
     Qwen3_5VLForSequenceClassification,
 )
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
@@ -344,6 +345,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         Qwen3_5ForConditionalGeneration,
         Qwen3_5MoeForConditionalGeneration,
         Qwen3_5VLForSequenceClassification,
+        Qwen3_5ForSequenceClassification,
         Qwen3_5ForCausalLMMTP,
         InternS2PreviewForConditionalGeneration,
         InternS2MobiusForConditionalGeneration,

@@ -87,4 +87,10 @@ class Qwen3_5VLForSequenceClassification(Qwen3_5ForConditionalGeneration):
         raise NotImplementedError(_NO_LM_HEAD_MSG)
 
 
-EntryClass = [Qwen3_5VLForSequenceClassification]
+class Qwen3_5ForSequenceClassification(Qwen3_5VLForSequenceClassification):
+    """The Transformers name, which quantized (AWQ/GPTQ) exports declare."""
+
+    pass
+
+
+EntryClass = [Qwen3_5VLForSequenceClassification, Qwen3_5ForSequenceClassification]
