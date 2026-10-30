@@ -22,6 +22,9 @@ ROCM_VERSION="rocm10"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
 LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
+# Oldest local image (in days) a pull_request run uses before pulling a newer one.
+# 2 covers the hours before the runners' preloaded image is refreshed.
+PR_LOCAL_IMAGE_MAX_AGE_DAYS="${PR_LOCAL_IMAGE_MAX_AGE_DAYS:-2}"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -144,6 +147,23 @@ find_latest_image() {
       mi35x) base_tag="${MI35X_BASE_TAG}" ;;
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
+
+  # PR runs: use an image already on the runner if it is at most
+  # PR_LOCAL_IMAGE_MAX_AGE_DAYS old. ARC runners start with a preloaded image
+  # that lags the newest one by about a day, and a pull takes ~3 min per job
+  # because each runner is used once. PR jobs install the checkout's sglang,
+  # so a day-old image is enough. Scheduled, nightly and manual runs skip this
+  # and take the newest image below.
+  if [[ "${GITHUB_EVENT_NAME:-}" == "pull_request" ]]; then
+    for ((days_back = 0; days_back <= PR_LOCAL_IMAGE_MAX_AGE_DAYS; days_back++)); do
+      image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
+      if [[ -n "$(docker images -q "rocm/sgl-dev:${image_tag}")" ]]; then
+        echo "Found cached image locally (pull_request, <= ${PR_LOCAL_IMAGE_MAX_AGE_DAYS} days old): rocm/sgl-dev:${image_tag}" >&2
+        echo "rocm/sgl-dev:${image_tag}"
+        return 0
+      fi
+    done
+  fi
 
   # Prefer the newest date, checking both local and remote before falling back.
   for days_back in {0..6}; do
