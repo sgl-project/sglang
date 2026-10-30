@@ -160,9 +160,12 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         # Warm up kernels and one-time setup before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         # Pre-carving measures scratch after persistent first-run allocations.
+        # Compiled kernels can defer autotuning until their second invocation.
         warmups = (
             2
-            if profiler is not None or envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.get()
+            if profiler is not None
+            or envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.get()
+            or shape_key.size in getattr(runner, "compile_bs", ())
             else 1
         )
         for _ in range(warmups):

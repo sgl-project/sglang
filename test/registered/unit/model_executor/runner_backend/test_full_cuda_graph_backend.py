@@ -113,6 +113,35 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         self.assertEqual(backend._graphs[shape_key], "GRAPH")
         self.assertIs(backend._outputs[shape_key], sentinel_out)
 
+    def test_compiled_shape_finishes_deferred_tuning_before_capture(self):
+        runner = _make_runner(enable_profile=False, profiler=None)
+        runner.compile_bs = [4]
+        backend = _make_backend(runner)
+        calls = 0
+
+        def forward():
+            nonlocal calls
+            calls += 1
+            # The first call compiles; the second tunes and synchronizes.
+            if calls == 2:
+                runner.device_module.synchronize()
+            return torch.ones(4, 2)
+
+        @contextlib.contextmanager
+        def capture(**kwargs):
+            self.assertEqual(calls, 2)
+            with mock.patch.object(
+                runner.device_module,
+                "synchronize",
+                side_effect=AssertionError("autotuning during capture"),
+            ):
+                yield
+
+        runner.device_module.graph.side_effect = capture
+        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
+            backend.capture_one(ShapeKey(size=4), forward)
+        self.assertEqual(calls, 3)
+
     def test_prefill_shapes_share_one_output_storage(self):
         runner = _make_runner(enable_profile=False, profiler=None, mode_name="EXTEND")
         backend = _make_backend(runner)
