@@ -55,6 +55,10 @@ class Requirements(msgspec.Struct, frozen=True):
     dtypes: frozenset[str] = frozenset()
     # the decode CUDA graph backends the served steps run under
     decode_graph_backends: frozenset[str] = frozenset({"full", "disabled"})
+    # the prefill CUDA graph backends, for a spec that also covers prefill or
+    # extend steps. Empty means the spec covers neither, and SGLang then neither
+    # checks the prefill graph backend nor expects any prefill graph to run it.
+    prefill_graph_backends: frozenset[str] = frozenset()
     # a server argument -> its accepted values, as resolved for this server
     server_args: Mapping[str, frozenset] = {}
     # an HF config field -> the value the kernels are built for
@@ -80,8 +84,12 @@ class Numerics(msgspec.Struct, frozen=True):
 
 
 class BuildContext(msgspec.Struct, frozen=True):
-    widths: tuple[int, ...]  # step rows to build, ascending
+    widths: tuple[int, ...]  # decode step rows to build, ascending
     tokens_per_request: int
+    # prefill token counts to build, ascending: the captured prefill graph
+    # buckets. Empty when prefill graphs are off or the spec declares no
+    # prefill_graph_backends, and a spec that covers only decode ignores it.
+    prefill_widths: tuple[int, ...] = ()
     deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
     # SGLang's runtime state for this model (sglang.srt.kernel_plugins.nvidia.binding)
     binding: Any = None
@@ -90,7 +98,7 @@ class BuildContext(msgspec.Struct, frozen=True):
 class Step(msgspec.Struct, frozen=True):
     """A covered step, decided from host state alike on every rank."""
 
-    mode: str  # "decode" or "target_verify"
+    mode: str  # "decode", "target_verify", or "extend" (a prefill/extend step)
     rows: int
     # the running forward's ForwardView, set by SGLang before forward runs the step
     view: Any = None

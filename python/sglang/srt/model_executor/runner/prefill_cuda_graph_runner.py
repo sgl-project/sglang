@@ -1923,6 +1923,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
             post_warmup_hook=post_warmup_hook,
         )
+        # Same contract as the decode runner's capture_tail_hooks, on its own
+        # list: a kernel plugin that covers prefill steps needs to see which
+        # prefill graphs ended up running it, and this is the only point where
+        # that is known. `out` is None here because capture_one does not return
+        # the captured output; no hook on this list reads it.
+        for capture_hook in self.model_runner.prefill_capture_tail_hooks:
+            capture_hook(self, None, forward_batch, num_tokens)
 
     def load_batch(
         self, forward_batch: ForwardBatch, **kwargs
