@@ -76,6 +76,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
+    pre_alloc_fill_len,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -564,7 +565,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ) -> int:
         return max(
             allocated_tokens + self.num_reserved_decode_tokens,
-            self._pre_alloc_fill_len(req)
+            pre_alloc_fill_len(req)
             - prefix_len
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
             - retractable_tokens,
@@ -639,7 +640,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return self._swa_tail_len(len(req.origin_input_ids)) + len(req.output_ids)
 
     def _prealloc_kv_lens(self, req: Req) -> Tuple[int, int]:
-        allocated_kv_len = self._pre_alloc_fill_len(req)
+        allocated_kv_len = pre_alloc_fill_len(req)
         if self._uses_swa_tail_prealloc():
             return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
         return allocated_kv_len, allocated_kv_len
@@ -937,7 +938,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         max_prefix_len = None
         if self._uses_swa_tail_prealloc():
-            fill_len = self._pre_alloc_fill_len(req)
+            fill_len = pre_alloc_fill_len(req)
             max_prefix_len = fill_len - self._swa_tail_len(fill_len)
         # Match and lock only reusable FULL KV. The entire SWA tail must be
         # freshly allocated, including when the prefix comes from L2/L3.
@@ -1014,11 +1015,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for req in held:
             self.add(req, is_rebootstrap=True)
 
-    @staticmethod
-    def _pre_alloc_fill_len(req: Req) -> int:
-        # The last output id is the pending decode input; its KV is not written yet.
-        return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         message = None
         allocator = self.token_to_kv_pool_allocator
@@ -1038,7 +1034,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if self.scheduler.enable_hisparse
                 else self.max_total_num_tokens
             )
-            input_len = self._pre_alloc_fill_len(req)
+            input_len = pre_alloc_fill_len(req)
             if input_len > capacity:
                 message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {capacity}"
             elif self._uses_swa_tail_prealloc():
@@ -1560,7 +1556,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
-            fill_len = self._pre_alloc_fill_len(decode_req.req)
+            fill_len = pre_alloc_fill_len(decode_req.req)
             prefix_match: Optional[DecodePrefixMatch] = None
             use_decode_radix_cache = (
                 get_disagg().disaggregation_decode_enable_radix_cache
@@ -2470,7 +2466,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             "req_pool_indices is full! There is a bug in memory estimation."
         )
 
-        fill_len = self._pre_alloc_fill_len(req)
+        fill_len = pre_alloc_fill_len(req)
         req.kv.commit_prealloc(fill_len)
 
         if prefix_len > 0:
@@ -2921,13 +2917,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._commit_hicache_local_restore_to_req(decode_req)
 
         # Case 3: Success - commit the transfer
-        # A rebootstrap that already emitted output keeps its last output id as
-        # the pending decode input and ignores the token the prefill sampled;
-        # that id already carries its logprob, sampling mask, and reasoning count.
-        resumes_output = (
-            decode_req.is_rebootstrap and len(decode_req.req.output_ids) > 0
-        )
-        if not resumes_output:
+        # A rebootstrap resumes from its last output id, already committed; the
+        # prefill's sampled token is dropped.
+        resumes_output = decode_req.is_rebootstrap
+        if resumes_output:
+            assert len(decode_req.req.output_ids) > 0, decode_req.req.rid
+        else:
             if _is_fake_transfer(decode_req.req):
                 committed_output_id = _generate_fake_prefill_handoff_output_id(
                     decode_req.req

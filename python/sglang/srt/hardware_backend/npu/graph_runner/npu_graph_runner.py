@@ -365,7 +365,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     capture_forward_mode=self.capture_forward_mode,
                     is_encoder_decoder=self.is_encoder_decoder,
                 )
-                self._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
+                self.attn_backend.init_forward_metadata_out_graph(fb_view)
 
         graph_key = self._make_graph_key(self.bs)
 
@@ -379,7 +379,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 # recompute from the live batch as before — reading the
                 # backend list there would replay stale capture-time lengths.
                 if self.model_runner.spec_algorithm.is_dflash():
-                    _attn = self._replay_attn_backend()
+                    _attn = self.attn_backend
                     _meta = getattr(_attn, "forward_metadata", None)
                     _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
                 else:
