@@ -186,6 +186,7 @@ def build_rust_frame_metadata_fixture() -> dict:
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
                 disaggregation_mode=DisaggregationMode.NULL,
+                skip_tokenizer_init=False,
                 enable_hicache_storage=lambda: storage_attached,
             )
         reqs = {

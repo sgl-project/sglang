@@ -785,6 +785,7 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=disaggregation_mode,
+            skip_tokenizer_init=False,
             enable_hicache_storage=lambda: storage_backend is not None,
             rust_server=rust_server,
         )
