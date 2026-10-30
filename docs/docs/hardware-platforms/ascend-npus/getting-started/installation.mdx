@@ -541,6 +541,11 @@ python3 -m sglang.launch_server \
 
 #### PD Disaggregation Scene
 
+PD disaggregation requires the prefill server, the decode server, and the router to communicate with one another.
+Make sure the hosts can reach one another over the network and that the `PREFILL_IP:FREE_PORT` store address is
+accessible from every node. The example below runs all three on a single machine, each using its own port and NPU
+(via `--base-gpu-id`); the same steps apply to a multi-node cluster, provided the hosts can reach one another.
+
 1. Launch Prefill Server
 
 Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
