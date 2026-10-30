@@ -11,7 +11,9 @@ use sglang_api_types::api::v1 as api;
 
 use super::CoreError;
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
-use crate::message::response::{ChunkEvent, ChunkExtras, CustomizedInfo, WeightVersionSpan};
+use crate::message::response::{
+    CachedTokensDetails, ChunkEvent, ChunkExtras, CustomizedInfo, WeightVersionSpan,
+};
 use crate::message::types::TokenIds;
 
 /// Canonical transport-neutral output payload for generation events.
@@ -176,6 +178,28 @@ impl CoreOutput {
                 *count = delta_count;
             }
         }
+        // Nor does its split by cache tier once its prompt is cached.
+        if delta_extras.cached_tokens_details.is_some() {
+            extras.cached_tokens_details = delta_extras.cached_tokens_details.clone();
+        }
+    }
+
+    /// This delta as an incremental stream frame reports it, once folded into
+    /// `accumulated`: with the cumulative completion-token count, as Python's
+    /// incremental stream reports it, and the cached tokens by tier the
+    /// stream already reported, which a scheduler abort does not carry.
+    pub(crate) fn with_cumulative_counts(mut self, accumulated: &Self) -> Self {
+        self.completion_tokens = accumulated.completion_tokens;
+        if let Some(details) = accumulated
+            .extras
+            .as_deref()
+            .and_then(|extras| extras.cached_tokens_details.as_ref())
+        {
+            self.extras
+                .get_or_insert_with(Default::default)
+                .cached_tokens_details = Some(details.clone());
+        }
+        self
     }
 }
 
@@ -263,6 +287,13 @@ impl CoreOutput {
             cached_tokens: self.cached_tokens,
             reasoning_tokens: self.reasoning_tokens,
             weight_version: self.weight_version.as_deref().map(str::to_owned),
+            // On device unless a chunk said otherwise.
+            cached_tokens_details: self
+                .extras
+                .as_deref()
+                .and_then(|extras| extras.cached_tokens_details.clone())
+                .or_else(|| CachedTokensDetails::on_device(self.cached_tokens))
+                .map(cached_tokens_details),
             ..Default::default()
         };
         let Some(extras) = self.extras.as_deref() else {
@@ -329,6 +360,15 @@ impl CoreOutput {
             meta.hidden_states = hidden_state_rows(&extras.hidden_val, &extras.hidden_lens);
         }
         meta
+    }
+}
+
+fn cached_tokens_details(details: CachedTokensDetails) -> api::CachedTokensDetails {
+    api::CachedTokensDetails {
+        device: details.device,
+        host: details.host,
+        storage: details.storage,
+        storage_backend: details.storage_backend.as_deref().map(str::to_owned),
     }
 }
 
@@ -527,6 +567,45 @@ mod tests {
         assert!(meta.input_top_logprobs.is_empty());
     }
 
+    /// A request's cached tokens by tier survive the fold of a frame that
+    /// carries none (a scheduler abort); before any, its hits are on device.
+    #[test]
+    fn cached_tokens_details_survive_an_abort() {
+        let details = CachedTokensDetails {
+            device: 1,
+            host: 2,
+            storage: Some(3),
+            storage_backend: Some(Arc::from("HiCacheFile")),
+        };
+        let streamed = CoreOutput {
+            cached_tokens: 6,
+            extras: Some(Box::new(ChunkExtras {
+                cached_tokens_details: Some(details),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let aborted = CoreOutput {
+            cached_tokens: 6,
+            extras: Some(Box::new(ChunkExtras {
+                abort_output: true,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            json(&aborted.meta_info("rid", None))["cached_tokens_details"],
+            serde_json::json!({"device": 6, "host": 0})
+        );
+        let mut output = CoreOutput::default();
+        output.append_delta(&streamed);
+        output.append_delta(&aborted);
+        assert_eq!(
+            json(&output.meta_info("rid", None))["cached_tokens_details"],
+            serde_json::json!({"device": 1, "host": 2, "storage": 3, "storage_backend": "HiCacheFile"})
+        );
+    }
+
     /// The JSON the schema renders is SGLang's `[logprob, token_id, text]`
     /// tuple list, with the text slot null unless `return_text_in_logprobs`
     /// supplied a text column, and null positions in the ragged families.
@@ -555,15 +634,16 @@ mod tests {
         assert_eq!(opt_texts(&texts), Some(texts.as_slice()));
     }
 
-    /// The weight-version and media-count columns, as Python's
-    /// `push_generation` and `push_abort` send them, render the `meta_info`
-    /// keys Python's TokenizerManager derives from the same values
+    /// The weight-version, media-count and cached-token-split columns, as
+    /// Python's `push_generation` and `push_abort` send them, render the
+    /// `meta_info` keys Python's TokenizerManager derives from the same values
     /// (`testdata/frame_metadata.json`, built by
     /// `build_rust_frame_metadata_fixture`): spans on a terminal frame, clipped
     /// to the completion the client received, the launch version before one,
     /// and only nonzero media counts, also behind a frame's logprob columns;
-    /// the scheduler's decode latency reaches its row, and only the abort is
-    /// marked as ended outside the output stream.
+    /// the cached tokens by tier, with and without a storage tier attached,
+    /// on device without a split; the scheduler's decode latency reaches its
+    /// row, and only the abort is marked as ended outside the output stream.
     #[test]
     fn frame_metadata_matches_python() {
         let keys = |output: &CoreOutput| {
@@ -575,6 +655,7 @@ mod tests {
                 "image_tokens",
                 "audio_tokens",
                 "video_tokens",
+                "cached_tokens_details",
             ] {
                 if let Some(value) = meta.get(key) {
                     keys.insert(key.into(), value.clone());
@@ -584,9 +665,9 @@ mod tests {
         };
         let launch = Some(Arc::<str>::from("launch"));
 
-        for name in ["batch", "logprob_batch"] {
+        for name in ["batch", "logprob_batch", "host_tier", "storage_tier"] {
             let (batch, events) = super::frame_metadata_case(name);
-            assert_eq!(events.len(), 2);
+            assert_eq!(events.len(), batch["meta_info"].as_object().unwrap().len());
             for event in events {
                 let rid = event.rid.as_str().to_owned();
                 assert!(!event.extras.as_deref().is_some_and(|e| e.abort_output));
@@ -613,7 +694,8 @@ mod tests {
         }
 
         // A scheduler abort folds into what the stream already sent, and its
-        // spans are clipped to those tokens.
+        // spans are clipped to those tokens. Python reports no cached-token
+        // details for it.
         let (abort, mut events) = super::frame_metadata_case("abort");
         let mut aborted = CoreOutput {
             weight_version: launch.clone(),
@@ -625,7 +707,12 @@ mod tests {
         let mut delta = CoreOutput::from(event);
         delta.weight_version = launch;
         aborted.append_delta(&delta);
-        assert_eq!(keys(&aborted), abort["meta_info"]);
+        let mut aborted_keys = keys(&aborted);
+        aborted_keys
+            .as_object_mut()
+            .unwrap()
+            .remove("cached_tokens_details");
+        assert_eq!(aborted_keys, abort["meta_info"]);
     }
 
     /// A trimmed stop token stays in the accumulated `token_ids` but out of the

@@ -296,7 +296,7 @@ def match_kv_cache(
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
-        req.kv.cache_protected_len = match_result.cache_protected_len
+        req.kv.protect_prefix(match_result.cache_protected_len)
     return match_result
 
 

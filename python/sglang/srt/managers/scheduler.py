@@ -2291,6 +2291,7 @@ class Scheduler(
             # The zmq tokenizer socket is not consumed in Rust mode.
             self.rust_server.push_abort(abort_req, req)
         else:
+            self.output_streamer.release_detokenize_state(req)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
     def send_control_output(self, output, recv_req) -> None:
@@ -2668,6 +2669,7 @@ class Scheduler(
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
+            skip_tokenizer_init=self.skip_tokenizer_init,
             enable_hicache_storage=lambda: (
                 self.enable_hicache_storage or self.enable_lmcache
             ),
@@ -3904,7 +3906,7 @@ class Scheduler(
         reason = req.discard_output_reason or FINISH_ABORT("Aborted")
         prepare_abort(req, reason.message, reason.status_code)
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
-        req.to_finish = None
+        req.clear_requested_finish()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
@@ -4295,9 +4297,19 @@ class Scheduler(
             running_loras.update(req.lora_id for req in adder.can_run_list)
 
             if self.lora_drainer:
+                lora_manager = self.tp_worker.model_runner.lora_manager
                 self.lora_drainer.update_draining_state(
                     self.waiting_queue,
-                    running_reqs,
+                    [*running_reqs, *adder.can_run_list],
+                    pinned_loras=(
+                        {
+                            uid
+                            for uid, ref in lora_manager.lora_refs.items()
+                            if ref.pinned
+                        }
+                        if lora_manager.num_pinned_loras
+                        else None
+                    ),
                 )
 
         mamba_allocator = self.token_to_kv_pool_allocator.state_slots
@@ -4461,7 +4473,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.kv.swa_evict_floor = req.extend_end
+                req.kv.shield_swa_prefill(req.extend_end)
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -5842,7 +5854,7 @@ class Scheduler(
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 if req.finished_reason is None:
-                    req.finished_reason = FINISH_ABORT()
+                    req.finish_outside_step(FINISH_ABORT())
                 release_kv_cache(req, self.tree_cache, checkpoint=True)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
@@ -5933,17 +5945,19 @@ class Scheduler(
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
-                # Abort method 3: set `to_finish`
+                # Abort method 3: `request_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 if recv_req.abort_message:
                     # Timeout aborts carry an SLA message + 503 for the client.
-                    req.to_finish = FINISH_ABORT(
-                        recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                    req.request_finish(
+                        FINISH_ABORT(
+                            recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                        )
                     )
                 else:
-                    req.to_finish = FINISH_ABORT()
+                    req.request_finish(FINISH_ABORT())
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -6035,9 +6049,6 @@ class Scheduler(
         self.running_batch.reqs = []
         for req in retract_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if req.output_ids:
-                    req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
-                req.pd_rebootstrap_in_progress = True
                 req.time_stats.set_retract_time()
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:

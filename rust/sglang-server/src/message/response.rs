@@ -218,6 +218,16 @@ pub struct BatchHeader {
     /// any.
     #[serde(default)]
     pub customized_info: CustomizedInfoJson,
+    /// Each row's `cached_tokens` by cache tier, sent by a scheduler whose
+    /// cache has a host or storage tier, or by a PD decode server, which
+    /// takes the split from prefill. Empty otherwise: every cached token is
+    /// on device.
+    #[serde(default)]
+    pub cached_tokens_split: Vec<CachedTokensSplit>,
+    /// The attached storage tier's backend, on a frame that carries
+    /// `cached_tokens_split`: one value for the frame, not a column.
+    #[serde(default)]
+    pub storage_backend: Option<String>,
 }
 
 /// The completion tokens `[start, end)` one weight version produced, as the
@@ -352,6 +362,67 @@ impl IntoIterator for CustomizedInfo {
     }
 }
 
+/// One row of [`BatchHeader::cached_tokens_split`], encoded
+/// `[device, host, storage]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedTokensSplit {
+    pub device: u32,
+    pub host: u32,
+    pub storage: u32,
+}
+
+/// A request's cached prompt tokens by the cache tier that served them, as
+/// `meta_info.cached_tokens_details` reports them. A chunk carries one only
+/// when it says more than `cached_tokens` does (see [`Self::from_split`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedTokensDetails {
+    pub device: u32,
+    pub host: u32,
+    /// Reported when nonzero or while a storage tier is attached.
+    pub storage: Option<u32>,
+    /// The attached storage tier's backend.
+    pub storage_backend: Option<Arc<str>>,
+}
+
+impl CachedTokensDetails {
+    /// The details a row's split reports, or `None` when they are what
+    /// [`Self::on_device`] makes of `cached_tokens` alone: a split without
+    /// hits falls back to the total, and one with every hit on device and no
+    /// storage tier attached reports just the device count.
+    pub fn from_split(
+        split: CachedTokensSplit,
+        cached_tokens: u32,
+        storage_backend: Option<&Arc<str>>,
+    ) -> Option<Self> {
+        let CachedTokensSplit {
+            device,
+            host,
+            storage,
+        } = split;
+        let device_only = host == 0 && storage == 0 && storage_backend.is_none();
+        if (device == 0 && host == 0 && storage == 0) || (device_only && device == cached_tokens) {
+            return None;
+        }
+        Some(Self {
+            device,
+            host,
+            storage: (storage > 0 || storage_backend.is_some()).then_some(storage),
+            storage_backend: storage_backend.cloned(),
+        })
+    }
+
+    /// The details of a chunk that carries none: every cached token on
+    /// device, or `None` without cached tokens.
+    pub fn on_device(cached_tokens: u32) -> Option<Self> {
+        (cached_tokens > 0).then_some(Self {
+            device: cached_tokens,
+            host: 0,
+            storage: None,
+            storage_backend: None,
+        })
+    }
+}
+
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
 /// `cv`/`ci`, advancing them. Only this request is copied — no whole-column buffer.
 /// `None` if either read runs past the buffer (see [`take_f32`]).
@@ -472,6 +543,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || !per_req_ok(&h.video_tokens)
         || !(h.decode_latencies.is_empty() || h.decode_latencies.len() == n)
         || !(h.abort_outputs.is_empty() || h.abort_outputs.len() == n)
+        || !(h.cached_tokens_split.is_empty() || h.cached_tokens_split.len() == n)
     {
         reject!()
     }
@@ -550,6 +622,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     let lens_i = |v: &[u32], i: usize| v.get(i).copied().unwrap_or(0) as usize;
     // Each key once per frame, shared by the rows.
     let mut customized_columns = h.customized_info.columns(n);
+    // Shared by every row whose cached-token details name it.
+    let storage_backend: Option<Arc<str>> = h.storage_backend.take().map(Arc::from);
 
     // Decode one request's slice of every column, advancing the cursors. `None` if a
     // read overruns `data` (belt-and-suspenders past the upfront check, which already
@@ -577,6 +651,10 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 .map(|(key, rows)| (key.clone(), std::mem::take(&mut rows[i])))
                 .collect(),
         );
+        let cached_tokens = h.cached_tokens.get(i).copied().unwrap_or(0);
+        let cached_tokens_details = h.cached_tokens_split.get(i).and_then(|&split| {
+            CachedTokensDetails::from_split(split, cached_tokens, storage_backend.as_ref())
+        });
 
         // Plain decode frame (no request in the batch asked for logprobs/hidden):
         // the extras columns are all zero-width, so skip reading them entirely,
@@ -588,7 +666,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 || video_tokens != 0
                 || decode_latency.is_some()
                 || abort_output
-                || !customized_info.is_empty();
+                || !customized_info.is_empty()
+                || cached_tokens_details.is_some();
             has_metadata.then(|| {
                 Box::new(ChunkExtras {
                     weight_versions,
@@ -598,6 +677,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                     decode_latency,
                     abort_output,
                     customized_info,
+                    cached_tokens_details,
                     ..Default::default()
                 })
             })
@@ -674,6 +754,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 decode_latency,
                 abort_output,
                 customized_info,
+                cached_tokens_details,
                 // Explicit, NOT `..Default::default()` — same reason as `ChunkEvent`
                 // below: a new column must fail to compile here until it is decoded.
                 out_lp_txt: Vec::new(),
@@ -693,7 +774,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             token_ids,
             finish_reason: h.finish_reasons.get(i).cloned().flatten(),
             prompt_tokens: h.prompt_tokens.get(i).copied().unwrap_or(0),
-            cached_tokens: h.cached_tokens.get(i).copied().unwrap_or(0),
+            cached_tokens,
             reasoning_tokens: h.reasoning_tokens.get(i).copied().unwrap_or(0),
             extras,
             // Listed explicitly, NOT `..Default::default()`: a new column added to
@@ -825,9 +906,10 @@ pub struct ChunkEvent {
 
 /// Logprob + hidden-state columns for a [`ChunkEvent`], allocated only when the
 /// request enabled logprobs / hidden states, finished (its weight-version spans),
-/// has media prompt tokens or its batch carried `customized_info`. Columnar
-/// `val`/`idx` (+ ragged `lens`) buffers arrive pre-decode; the detok shard fills
-/// the parallel `*_txt` columns when `return_text_in_logprobs` is set. In-process only — no serde (see
+/// has media prompt tokens, its batch carried `customized_info` or it reports
+/// its cached tokens by tier. Columnar `val`/`idx` (+ ragged `lens`) buffers
+/// arrive pre-decode; the detok shard fills the parallel `*_txt` columns when
+/// `return_text_in_logprobs` is set. In-process only — no serde (see
 /// [`ChunkEvent`]).
 #[derive(Debug, Clone, Default)]
 pub struct ChunkExtras {
@@ -871,6 +953,9 @@ pub struct ChunkExtras {
     pub abort_output: bool,
     /// The scheduler's `customized_info` for this frame's new output tokens.
     pub customized_info: CustomizedInfo,
+    /// This request's cached tokens by cache tier, when they say more than
+    /// `cached_tokens` does.
+    pub cached_tokens_details: Option<CachedTokensDetails>,
     /// Decoded logprob token text (`return_text_in_logprobs`), parallel to the
     /// `*_idx` buffers; empty when not requested (the tuple's text slot stays null).
     pub out_lp_txt: Vec<String>,
@@ -899,6 +984,7 @@ impl ChunkExtras {
             && self.decode_latency.is_none()
             && !self.abort_output
             && self.customized_info.is_empty()
+            && self.cached_tokens_details.is_none()
     }
 }
 

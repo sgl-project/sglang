@@ -1290,7 +1290,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     req, is_finished=is_finished, insert_params=insert_params
                 )
             return
-        req.kv.cache_inserted_len = max(req.kv.cache_inserted_len, page_aligned_len)
+        req.kv.record_insert(page_aligned_len)
 
         # Split the leaf at the prompt boundary so eviction can drop the output
         # KV without the prompt. prev_prefix_len keeps the overlapping indices
@@ -1353,7 +1353,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Update req fields
-        req.kv.cache_protected_len = len(new_indices)
+        req.kv.protect_prefix(len(new_indices))
         req.last_node = new_last_node
 
         # cleanup
@@ -3757,8 +3757,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
             for req in failed:
                 req.skip_radix_cache_insert = True
-                req.discard_output_reason = FINISH_ABORT(
-                    "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                req.request_discard(
+                    FINISH_ABORT(
+                        "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                    )
                 )
         return failed
 

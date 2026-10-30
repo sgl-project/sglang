@@ -122,7 +122,7 @@ def _commit_disagg_handoff(
     processor: SchedulerBatchResultProcessor,
     token_id: int,
     *,
-    replayed_boundary: bool = False,
+    is_rebootstrap: bool = False,
 ) -> None:
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
     queue.scheduler = SimpleNamespace(
@@ -149,13 +149,11 @@ def _commit_disagg_handoff(
     )
     req.bootstrap_host = "127.0.0.1"
     req.bootstrap_room = 1
-    if replayed_boundary:
-        req.pd_rebootstrap_forced_output_id = token_id
     decode_req = DecodeRequest(
         req=req,
         kv_receiver=SimpleNamespace(clear=lambda: None),
         metadata_buffer_index=0,
-        is_rebootstrap=replayed_boundary,
+        is_rebootstrap=is_rebootstrap,
     )
 
     queue._commit_transfer_to_req(decode_req)
@@ -290,8 +288,11 @@ class TestReasoningTokenAccounting(CustomTestCase):
             [17],
         ]
 
-        _commit_disagg_handoff(req, processor, 17, replayed_boundary=True)
+        # The kept output id 17 was counted before the retract.
+        req.output_ids = [17]
+        _commit_disagg_handoff(req, processor, 17, is_rebootstrap=True)
 
+        self.assertEqual(req.output_ids, [17])
         self.assertEqual(req.reasoning_tokens, 0)
         self.assertFalse(req._is_reasoning_over)
 
