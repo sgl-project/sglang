@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.managers.utils import allocate_distinct_stream
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -35,6 +36,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -47,8 +49,9 @@ from sglang.srt.speculative.base_spec_worker import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestDecodeRetractionBackup(CustomTestCase):
@@ -203,10 +206,13 @@ class TestDecodeRetractionBackup(CustomTestCase):
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             is_eagle=draft_pool is not None,
-            tree_components=(
-                (ComponentType.FULL, ComponentType.SWA)
-                if hybrid_swa
-                else (ComponentType.FULL,)
+            tree_slots=tree_slots_of(
+                (
+                    (ComponentType.FULL, ComponentType.SWA)
+                    if hybrid_swa
+                    else (ComponentType.FULL,)
+                ),
+                window=8 if hybrid_swa else None,
             ),
             sliding_window_size=8 if hybrid_swa else None,
             mtp_draft_device_pools=(
@@ -273,6 +279,11 @@ class TestDecodeRetractionBackup(CustomTestCase):
         env.allocator.free(source_indices)
         env.req_to_token_pool.free(req)
 
+    @staticmethod
+    def _finish_restores(cache):
+        # A restore returns its host slots once its host-to-device copy has finished.
+        cache._discard_restore_backups()
+
     def test_restores_target_and_draft_kv(self):
         env = self._build_cache(hicache_ratio=1.0)
         req_to_token_pool = env.req_to_token_pool
@@ -286,10 +297,15 @@ class TestDecodeRetractionBackup(CustomTestCase):
             torch.arange(self.pool_size, device=self.device),
             shifts=self.pool_size // 2,
         )
-        target_pool.host_transfer_translate = lambda indices: virtual_to_physical[
-            indices
-        ]
-        source_physical_indices = target_pool.host_transfer_translate(source_indices)
+
+        def translate(indices):
+            return virtual_to_physical[indices]
+
+        # The host stack maps the controller's ids to the target pool's rows.
+        anchor = cache.host_pool_group.anchor_entry
+        self.assertIs(anchor.device_pool, target_pool)
+        anchor.device_translate = translate
+        source_physical_indices = translate(source_indices)
         self.assertFalse(torch.equal(source_indices, source_physical_indices))
 
         self._seed_pool(target_pool, source_physical_indices, base=1000)
@@ -319,11 +335,10 @@ class TestDecodeRetractionBackup(CustomTestCase):
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, self.num_tokens)), destination_indices
         )
-        destination_physical_indices = target_pool.host_transfer_translate(
-            destination_indices
-        )
+        destination_physical_indices = translate(destination_indices)
 
         cache.restore_kv_cache(req, backup)
+        self._finish_restores(cache)
 
         self._assert_pool_equal(
             target_pool, destination_physical_indices, target_expected
@@ -390,16 +405,21 @@ class TestDecodeRetractionBackup(CustomTestCase):
             queue.kv_manager = queue._init_kv_manager()
         queue.scheduler.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=env.cache,
+            storage=kv_storage_of(
+                env.req_to_token_pool,
+                env.allocator,
+                shape=StaticPoolShape(
+                    has_window=hybrid_swa,
+                    has_state=False,
+                    token_capacity=self.pool_size,
+                    full_tokens_per_layer=self.pool_size,
+                    swa_tokens_per_layer=self.pool_size if hybrid_swa else None,
+                ),
+            ),
             token_to_kv_pool_allocator=env.allocator,
-            req_to_token_pool=env.req_to_token_pool,
             session_controller=None,
             hisparse_coordinator=None,
-            is_hybrid_swa=hybrid_swa,
-            is_hybrid_ssm=False,
             enable_hisparse=False,
-            full_tokens_per_layer=self.pool_size,
-            swa_tokens_per_layer=self.pool_size if hybrid_swa else None,
-            max_total_num_tokens=self.pool_size,
         )
         return queue, queue.kv_manager.kv_args
 
@@ -471,6 +491,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         self.assertTrue(queue.allocate_host_staged(decode_req))
         req.output_ids.append(99)
         env.cache.restore_kv_cache(req, backup)
+        self._finish_restores(env.cache)
         full_indices = env.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :23
         ].long()
@@ -666,6 +687,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 for buffer in device_buffers:
                     buffer[source_indices] = -1
                 cache.restore_kv_cache(retracted, retraction)
+                self._finish_restores(cache)
                 for index, buffer in enumerate(device_buffers):
                     self.assertTrue(torch.all(buffer[source_indices] == index + 100))
                 group.free(blockers)
@@ -685,6 +707,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 ].to(torch.int64)
                 req.output_ids.append(99)
                 cache.restore_kv_cache(req, backup)
+                self._finish_restores(cache)
                 for buffer, values in zip(device_buffers, expected, strict=True):
                     self.assertTrue(
                         torch.equal(buffer[received_indices[:num_tokens]].cpu(), values)
@@ -701,6 +724,71 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 env.allocator.free(received_indices)
                 env.req_to_token_pool.free(req)
                 env.allocator.free(pressure)
+
+    @patch("torch.distributed.get_world_size", return_value=1)
+    def test_resumed_restore_lands_after_the_inflight_forward(self, _world_size):
+        """A request that finished last step can still have its forward in flight,
+        writing slots that a resumed request is given; the restore must land after
+        that write, or the stale write replaces the restored KV."""
+        env = self._build_cache(
+            hicache_ratio=2.0, shared_receive=True, draft_mode=HiCacheDraftMode.NONE
+        )
+        queue, _ = self._receive_queue(env)
+        engine = env.cache.cache_controller.l2_transfer_engine
+        # Pool streams can alias; an alias of the copy streams would order the race.
+        avoid = (engine.host_to_device_stream, engine.device_to_host_stream)
+        forward_stream = allocate_distinct_stream(torch.cuda, avoid)
+        queue.scheduler.enable_overlap = True
+        queue.scheduler.forward_stream = forward_stream
+        queue.scheduler.schedule_stream = allocate_distinct_stream(
+            torch.cuda, (*avoid, forward_stream)
+        )
+        buffers = (*env.target_pool.k_buffer, *env.target_pool.v_buffer)
+
+        def resume_behind_forward(forward_cycles):
+            req, source_indices = self._admit_req(env, self.num_tokens)
+            for buffer in buffers:
+                buffer[source_indices] = 7
+            req.kv.retraction_backup = env.cache.backup_kv_cache(req)
+            req.is_retracted = True
+            env.allocator.free(source_indices)
+            # Slots a finished request held, which its in-flight forward still writes.
+            reused = env.allocator.alloc(self.num_tokens)
+            for buffer in buffers:
+                buffer[reused] = 0
+            torch.cuda.synchronize()
+            with torch.cuda.stream(queue.scheduler.forward_stream):
+                torch.cuda._sleep(forward_cycles)
+                # index_fill_ keeps the host free; a scalar setitem would sync on it.
+                for buffer in buffers:
+                    buffer.index_fill_(0, reused, -1)
+
+            def pre_alloc(resumed):
+                env.req_to_token_pool.write(
+                    (resumed.kv.req_pool_idx, slice(0, self.num_tokens)), reused
+                )
+
+            queue.retracted_queue = [req]
+            with (
+                patch.object(queue, "_uses_swa_reservation", return_value=False),
+                patch.object(queue, "_allocatable_token_budgets", return_value=1 << 20),
+                patch.object(queue, "_prealloc_required_tokens", return_value=(0, 0)),
+                patch.object(queue, "_prealloc_reservation_fits", return_value=True),
+                patch.object(queue, "_pre_alloc", side_effect=pre_alloc),
+                torch.cuda.stream(queue.scheduler.schedule_stream),
+            ):
+                self.assertEqual(queue.resume_retracted_reqs(), [req])
+            torch.cuda.synchronize()
+            restored = [buffer[reused].clone() for buffer in buffers]
+            env.allocator.free(reused)
+            env.req_to_token_pool.free(req)
+            return restored
+
+        # CUDA lazy loading syncs the device on a kernel's first launch, which
+        # would order the race by accident; a first pass loads every kernel.
+        resume_behind_forward(forward_cycles=1)
+        for values in resume_behind_forward(forward_cycles=1 << 30):
+            self.assertTrue(torch.all(values == 7))
 
     @patch("torch.distributed.get_world_size", return_value=1)
     def test_host_receive_merges_existing_radix_prefix_after_restore(self, _world_size):
@@ -753,6 +841,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         req.init_next_round_input(None)
         req.extend_end = 8
         restore_kv_cache(req, cache, env.req_to_token_pool, env.allocator, "host_pool")
+        self._finish_restores(cache)
         self.assertEqual(cache.host_pool_group.available_size(), host_free_before)
         free_before_insert = env.allocator.available_size()
         cache.checkpoint(req, up_to=req.extend_end)
