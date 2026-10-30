@@ -148,6 +148,16 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>false</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable MIOpen auto-tuning for VAE conv layers on ROCm</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_ROCM_VAE_CONV2D</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Replace 3x3x3 causal Conv3d in the VAE with a temporal-unfolded Conv2d in the activation dtype. Faster on MIOpen builds that have no tuned Conv3d solver; enabling it also sets <code>MIOPEN_FIND_MODE=FAST</code> because MIOpen's full find costs minutes per new Conv2d shape on the first decode</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_ROCM_VAE_CONV2D_BF16</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Same as <code>SGLANG_USE_ROCM_VAE_CONV2D</code>, but computes the Conv2d in BF16 and casts the result back to the VAE precision</td>
+    </tr>
   </tbody>
 </table>
 
