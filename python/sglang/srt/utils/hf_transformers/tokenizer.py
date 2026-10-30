@@ -546,9 +546,22 @@ def get_tokenizer(
                 type(tokenizer).__name__ == _TOKENIZERS_BACKEND
                 and tokenizer_backend != "fastokens"
             ):
-                tokenizer = _resolve_tokenizers_backend(
-                    tokenizer_name, *args, **common_kwargs
-                )
+                try:
+                    tokenizer = _resolve_tokenizers_backend(
+                        tokenizer_name, *args, **common_kwargs
+                    )
+                except Exception as e:
+                    # Some checkpoints (e.g. GLM-5.3) declare
+                    # tokenizer_class=TokenizersBackend with no auto_map, so the
+                    # slow-class retry inside _resolve_tokenizers_backend cannot
+                    # find a concrete class and raises. The generic fast
+                    # TokenizersBackend instance is fully functional (vocab +
+                    # added tokens); keep it as-is instead of failing to load
+                    # the tokenizer entirely.
+                    logger.warning(
+                        "TokenizersBackend re-resolve failed (%s); "
+                        "keeping the generic fast TokenizersBackend", e
+                    )
 
         return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
     except Exception as e:
