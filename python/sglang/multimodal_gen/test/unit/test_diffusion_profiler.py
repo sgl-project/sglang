@@ -67,12 +67,14 @@ def _request(requested, total, full_profile=False):
     )
 
 
-def _run_stage(executor, role, callback):
-    stage = SimpleNamespace(
-        role_affinity=role,
-        _active_component_stage_name=lambda: role.value,
-        component_uses=lambda *_: (),
-    )
+def _run_stage(executor, role, callback, stage=None):
+    if stage is None:
+        stage = SimpleNamespace(
+            role_affinity=role,
+            supports_denoising_step_profiling=role == RoleType.DENOISER,
+            _active_component_stage_name=lambda: role.value,
+            component_uses=lambda *_: (),
+        )
     server_args = SimpleNamespace(use_fsdp_inference=False)
     executor.run_stage_with_context(stage, None, server_args, lambda *_: callback())
     executor._step_stage_profiler()
@@ -112,6 +114,31 @@ def test_requested_steps_match_exported_trace(tmp_path, requested, total, expect
     assert _recorded_payloads(tmp_path) == expected
     assert stopped_on_last_step
     assert profiler_module.SGLDiffusionProfiler.get_instance() is None
+
+
+def test_step_profiling_is_independent_of_deployment_role(tmp_path):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
+        Cosmos3DenoisingStage,
+    )
+
+    # No weights or model forward are needed to exercise this existing consumer.
+    stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+    stage._active_component_stage_name = lambda: "cosmos3"
+    stage.component_uses = lambda *_: ()
+    assert stage.role_affinity == RoleType.ENCODER
+    executor = _ProfilerTestExecutor()
+    with executor.profile_execution(_request(-1, 2)):
+        _run_stage(executor, RoleType.ENCODER, lambda: _payload("preprocess"))
+
+        def denoise():
+            for step in range(2):
+                _payload(step)
+                stage.step_profile()
+
+        _run_stage(executor, RoleType.ENCODER, denoise, stage=stage)
+        _run_stage(executor, RoleType.DECODER, lambda: _payload("decode"))
+    assert _recorded_payloads(tmp_path) == ["0", "1"]
+    assert stage.role_affinity == RoleType.ENCODER
 
 
 def test_early_request_end_exports_only_completed_active_steps(tmp_path):
