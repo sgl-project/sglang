@@ -244,9 +244,13 @@ def build_replay_fb_view(
     )
 
 
-def _lora_backend_skips_inactive(model_runner) -> bool:
+def _should_record_nolora_graph(model_runner, explicitly_requested=False) -> bool:
     manager = model_runner.lora_manager
-    return manager is not None and manager.lora_backend.skip_inactive_dense_lora
+    return explicitly_requested or (
+        manager is not None
+        and manager.lora_backend.skip_inactive_dense_lora
+        and envs.SGLANG_ENABLE_LORA_DUAL_GRAPH.get()
+    )
 
 
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
@@ -289,9 +293,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         record_nolora_graph: bool = False,
     ):
         super().__init__(model_runner)
-        # Inactive dense LoRA batches replay a separate base-only graph.
-        self.record_nolora_graph = record_nolora_graph or _lora_backend_skips_inactive(
-            model_runner
+        # The env only opts in to the automatic LoRA variant pair; explicit
+        # requests (the UNO runner) are honoured regardless.
+        self.record_nolora_graph = _should_record_nolora_graph(
+            model_runner, record_nolora_graph
         )
 
         # In-graph metadata prep: shared buffers -> in-graph private data

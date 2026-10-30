@@ -1103,6 +1103,11 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
         window_kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        # Recapture replaces buffers; wrappers must bind to the new ones.
+        self.decode_cuda_graph_metadata = {}
+        self.prefill_cuda_graph_metadata = {}
+        self.draft_extend_cuda_graph_metadata = {}
+
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
                 (max_num_tokens * self.max_context_len,),
@@ -1326,9 +1331,13 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ) -> None:
+        # Variants share the wrappers replay replans; replacing them leaves
+        # earlier graphs with stale or freed workspaces.
         if forward_mode.is_decode_or_idle():
-            decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
-            self.decode_cuda_graph_metadata[bs] = decode_wrappers
+            decode_wrappers = self.decode_cuda_graph_metadata.get(bs)
+            if decode_wrappers is None:
+                decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
+                self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
             use_custom_mask = (
@@ -1336,15 +1345,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
             )
-            prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            prefill_wrappers = self.prefill_cuda_graph_metadata.get(bs)
+            if prefill_wrappers is None:
+                prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
+                self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )
         elif forward_mode.is_draft_extend_v2():
             # Draft-extend: causal paged prefill over the full sequence (no mask).
-            prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask=False)
-            self.draft_extend_cuda_graph_metadata[bs] = prefill_wrappers
+            prefill_wrappers = self.draft_extend_cuda_graph_metadata.get(bs)
+            if prefill_wrappers is None:
+                prefill_wrappers = self._create_prefill_wrappers(
+                    bs, use_custom_mask=False
+                )
+                self.draft_extend_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_extend():
             if self.full_cg_prefill_wrappers is None:
