@@ -8,11 +8,13 @@ the router can subscribe per replica (the `dp_size` it reads from
 """
 
 import atexit
+import hashlib
 import json
 import tempfile
 import time
 import unittest
 import uuid
+from types import SimpleNamespace
 
 import msgspec
 import zmq
@@ -127,6 +129,60 @@ class TestLocalKvEventSource(CustomTestCase):
         )
         self.assertNotEqual(source["endpoint"], source["replay_endpoint"])
         self.assertFalse(source["endpoint"].endswith(":0"))
+
+    def test_wildcard_source_uses_explicit_advertise_host(self):
+        publisher = self._publisher(endpoint="tcp://0.0.0.0:0")
+        source = publisher.describe_local_source(64, advertise_host="192.0.2.1")
+        self.assertTrue(source["endpoint"].startswith("tcp://192.0.2.1:"))
+
+    def test_linker_publisher_exposes_owner_scoped_stream(self):
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+            SchedulerKvEventsPublisher,
+        )
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        owner = "owner-unique-to-this-engine"
+        hint = {
+            "cache_owner_id": owner,
+            "source_control_endpoint": "tcp://127.0.0.1:19500",
+        }
+        backend = SimpleNamespace(get_kv_hint_sources=lambda: [hint])
+        tree = SimpleNamespace(linker=SimpleNamespace(cache_linker=backend))
+        config = json.dumps(
+            {"publisher": "zmq", "format": "dynamo", "endpoint": "tcp://*:0"}
+        )
+        with (
+            get_context().override_server_args(model_path="dummy"),
+            get_parallel().override(
+                pp_rank=0, attn_tp_rank=0, attn_cp_rank=0, attn_dp_rank=0, dp_rank=None
+            ),
+        ):
+            component = SchedulerKvEventsPublisher(
+                kv_events_config=config,
+                tree_cache=tree,
+                send_metrics_from_scheduler=None,
+                max_running_requests=1,
+                max_total_num_tokens=1,
+                get_stats=lambda: None,
+            )
+            publisher = component.kv_event_publisher
+            self.addCleanup(publisher.shutdown)
+            source = component.local_kv_event_sources(64)[0]
+            self.assertEqual(
+                source["topic"], hashlib.sha256(owner.encode()).hexdigest()[:16]
+            )
+            self.assertEqual(source["format"], "dynamo")
+            scheduler = Scheduler.__new__(Scheduler)
+            scheduler.max_total_num_tokens = 64
+            scheduler.max_req_input_len = 32
+            scheduler.startup_time = {}
+            scheduler.page_size = 64
+            scheduler.kv_events_publisher = component
+            info = scheduler.get_init_info()
+            self.assertEqual(info["kv_hint_sources"], [hint])
+            self.assertEqual(info["kv_event_sources"], [source])
+            self._assert_event_received(publisher, source)
 
     def test_non_subscribable_publishers_are_not_advertised(self):
         for endpoint in (

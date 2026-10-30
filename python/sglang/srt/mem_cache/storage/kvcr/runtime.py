@@ -154,6 +154,7 @@ class KVCRRuntime:
         self._pin_results = {}
         self._next_pin = 0
         self.client = None
+        self.process_local = False
 
         def inventory(event):
             if event.tier is CacheTier.LOCAL_G2:
@@ -175,16 +176,16 @@ class KVCRRuntime:
                 startup_timeout_seconds=config["startup_timeout_seconds"],
                 enable_telemetry=self._telemetry_enabled,
             )
+            control = ZmqPeerControlChannel(
+                config["control_host"], config["control_port"], config["advertise_host"]
+            )
+            self.control_endpoint = control.endpoint
             bindings = KVCRBindings(
                 request_pin=self._decline_pin,
                 poll_pin_results=self._poll_pin_results,
                 release_pin=lambda _: True,
                 cancel_pin_request=lambda request: self._pin_results.pop(request, None),
-                framework_control=ZmqPeerControlChannel(
-                    config["control_host"],
-                    config["control_port"],
-                    config["advertise_host"],
-                ),
+                framework_control=control,
                 key_adapter=self,
                 inventory_sink=inventory,
                 on_resilience_event=self.events.append,
@@ -240,6 +241,7 @@ class KVCRRuntime:
                     remote_fw_dram=RemoteFWDramOptions(opportunistic_query=False),
                 ),
             )
+            self.process_local = True
         except BaseException as error:
             if isinstance(error, KVCRStartupError) or not isinstance(error, Exception):
                 # The owner retains this error until process exit; native work may survive.

@@ -21,7 +21,11 @@ from typing import (
 import msgspec
 import torch
 
-from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+)
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -3895,12 +3899,23 @@ class UnifiedRadixCache(BasePrefixCache):
             backend = self.linker.cache_linker
             if backend.local_storage_ownership is not None:
                 # Linker and HiCache are exclusive, so only the Linker owns this tier.
+                owned_events = []
                 for event in events:
                     if (
                         isinstance(event, (BlockStored, BlockRemoved))
                         and event.medium == backend.local_storage_medium
                     ):
                         event.ownership = backend.local_storage_ownership
+                    owned_events.append(event)
+                    if (
+                        isinstance(event, AllBlocksCleared)
+                        and event.ownership is None
+                        and getattr(backend, "get_kv_hint_sources", lambda: [])()
+                    ):
+                        owned_events.append(
+                            AllBlocksCleared(ownership=backend.local_storage_ownership)
+                        )
+                events = owned_events
         return events
 
     def resolve_node_handle(self, node_handle):

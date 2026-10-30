@@ -1277,6 +1277,27 @@ def test_take_events_tags_only_linker_local_storage(
     ]
 
 
+@pytest.mark.parametrize("tree_core_backend", ["python", "rust"])
+def test_linker_inventory_clear_is_distinct_and_ordered(tree_core_backend, monkeypatch):
+    monkeypatch.setattr(shared_cache_suite, "get_device", lambda: "cpu")
+    cache, _, _ = build_fixture(
+        CacheConfig(page_size=1, kv_size=8, max_context_len=8),
+        enable_kv_cache_events=True,
+        tree_core_backend=tree_core_backend,
+    )
+    cache.take_events()
+    backend = _FakeLinker()
+    backend.local_storage_medium = StorageMedium.CPU
+    backend.local_storage_ownership = "kvcr"
+    backend.get_kv_hint_sources = lambda: [{"cache_owner_id": "owner"}]
+    cache.init_cache_linker(backend)
+    cache.reset()
+    assert cache.take_events() == [
+        AllBlocksCleared(),
+        AllBlocksCleared(ownership="kvcr"),
+    ]
+
+
 @pytest.mark.parametrize("event_type", [BlockStored, BlockRemoved])
 def test_kv_event_coalescing_preserves_ownership(event_type):
     recorder = KVCacheEventRecorder(enabled=True, page_size=1)

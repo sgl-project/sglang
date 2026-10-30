@@ -1899,7 +1899,16 @@ class Scheduler(
             "startup_time": self.startup_time,
         }
 
-        if get_serving().grpc_port is not None and not (
+        hint_sources = self.kv_events_publisher.kv_hint_sources()
+        if hint_sources:
+            result_dict["kv_hint_sources"] = hint_sources
+            result_dict["kv_event_sources"] = (
+                self.kv_events_publisher.local_kv_event_sources(
+                    self.page_size * get_parallel().dcp_size
+                )
+            )
+
+        elif get_serving().grpc_port is not None and not (
             get_serving().smg_grpc_mode or get_serving().grpc_mode
         ):
             result_dict["kv_event_sources"] = (

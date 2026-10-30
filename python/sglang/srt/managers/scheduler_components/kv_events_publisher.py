@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass
 from typing import (
@@ -8,6 +9,7 @@ from typing import (
     Callable,
     Optional,
 )
+from urllib.parse import urlsplit
 
 import msgspec
 import zmq
@@ -15,6 +17,7 @@ import zmq
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
+    KVEventsConfig,
     is_kv_publisher_rank,
     select_kv_publisher_dp_rank,
 )
@@ -61,6 +64,17 @@ class SchedulerKvEventsPublisher:
 
         if self.enable_kv_cache_events:
             parallel = get_parallel()
+            sources = self.kv_hint_sources()
+            if sources:
+                config = KVEventsConfig.from_cli(kv_events_config)
+                if config.format != "dynamo" or config.publisher != "zmq":
+                    raise ValueError(
+                        "KVCR linker inventory requires Dynamo-format ZMQ events"
+                    )
+                config.topic = hashlib.sha256(
+                    sources[0]["cache_owner_id"].encode()
+                ).hexdigest()[:16]
+                kv_events_config = config.model_dump_json()
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config,
                 select_kv_publisher_dp_rank(
@@ -89,10 +103,22 @@ class SchedulerKvEventsPublisher:
         if not self.send_metrics_from_scheduler.closed:
             sock_send(self.send_metrics_from_scheduler, kv_metrics)
 
+    def kv_hint_sources(self) -> list[dict[str, Any]]:
+        linker = getattr(getattr(self, "tree_cache", None), "linker", None)
+        backend = getattr(linker, "cache_linker", None)
+        return getattr(backend, "get_kv_hint_sources", lambda: [])()
+
     def local_kv_event_sources(self, block_size: int) -> list[dict[str, Any]]:
         if self.kv_event_publisher is None:
             return []
-        source = self.kv_event_publisher.describe_local_source(block_size)
+        hints = self.kv_hint_sources()
+        if hints:
+            host = urlsplit(hints[0]["source_control_endpoint"]).hostname
+            source = self.kv_event_publisher.describe_local_source(block_size, host)
+            if source is not None:
+                source["format"] = KVEventsConfig.from_cli(self.kv_events_config).format
+        else:
+            source = self.kv_event_publisher.describe_local_source(block_size)
         return [source] if source is not None else []
 
     def publish_kv_events(self):

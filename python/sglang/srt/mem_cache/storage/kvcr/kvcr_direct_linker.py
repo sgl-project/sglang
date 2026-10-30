@@ -261,6 +261,24 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             get_memory().hicache_storage_backend_extra_config
         )
         options = dict(options)
+        self._publish_inventory = options.pop("publish_inventory", False)
+        if type(self._publish_inventory) is not bool:
+            raise ValueError("KVCR publish_inventory must be a boolean")
+        if (
+            self._publish_inventory
+            and options.get("kvcr_service_socket_path", "/run/kvcr/memory.sock")
+            is not None
+        ):
+            raise ValueError(
+                "KVCR linker inventory requires kvcr_service_socket_path=null"
+            )
+        if self._publish_inventory and (
+            tp_size != 1
+            or params.attn_cp_size != 1
+            or params.pp_size != 1
+            or get_parallel().nnodes != 1
+        ):
+            raise ValueError("KVCR linker inventory requires single-node TP1/CP1/PP1")
         shard = options.pop("shard_replicated", False)
         if type(shard) is not bool:
             raise ValueError("KVCR shard_replicated must be a boolean")
@@ -351,6 +369,28 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         )
         self._thread.start()
         self._started.result()
+        if self._publish_inventory and not self._runtime.process_local:
+            self.close()
+            raise ValueError("KVCR linker inventory requires process-local storage")
+
+    def get_kv_hint_sources(self):
+        if not self._publish_inventory:
+            return []
+        parallel = get_parallel()
+        rank = parallel.dp_rank or 0
+        incarnation = self.layout.endpoint_name.rsplit("-", 1)[-1]
+        namespace = self.layout.namespace
+        return [
+            {
+                "dp_rank": rank,
+                "capabilities": ["router_hint", "kvcr_inventory"],
+                "source_control_endpoint": self._runtime.control_endpoint,
+                "cache_owner_id": f"{namespace[:32]}:{namespace[32:]}/{rank:016x}/{incarnation}",
+                "inventory_lifetime": "process_local",
+                "reset_clears_owner_inventory": True,
+                "owner_incarnation_scoped": True,
+            }
+        ]
 
     def _call(self, function, *args):
         future = Future()
@@ -843,7 +883,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             batch, size, descriptors = {}, 0, 0
             for key, refs in blocks.items():
                 key_bytes = sum(sizes[ref.label] for ref in refs)
-                if key_bytes > _MAX_DEPOSIT_BYTES or len(refs) > _MAX_DEPOSIT_DESCRIPTORS:
+                if (
+                    key_bytes > _MAX_DEPOSIT_BYTES
+                    or len(refs) > _MAX_DEPOSIT_DESCRIPTORS
+                ):
                     raise ValueError("KVCR page exceeds native deposit limits")
                 if batch and (
                     size + key_bytes > _MAX_DEPOSIT_BYTES

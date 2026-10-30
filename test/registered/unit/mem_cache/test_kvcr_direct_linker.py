@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -200,6 +200,62 @@ class TestKVCRDirectLinker(CustomTestCase):
                 device_indices=torch.arange(start, start + len(keys)),
             )
         ]
+
+    def test_inventory_metadata_uses_runtime_endpoint_and_unique_owner(self):
+        self.assertEqual(self.linker.get_kv_hint_sources(), [])
+        self.linker._publish_inventory = True
+        self.runtime.control_endpoint = "tcp://192.0.2.7:19500"
+        with get_parallel().override(dp_rank=None):
+            source = self.linker.get_kv_hint_sources()[0]
+        self.assertEqual(
+            source["source_control_endpoint"], self.runtime.control_endpoint
+        )
+        self.assertEqual(source["capabilities"], ["router_hint", "kvcr_inventory"])
+        self.assertTrue(source["reset_clears_owner_inventory"])
+        self.assertEqual(len(source["cache_owner_id"].split("/")[-1]), 32)
+
+    def test_inventory_opt_in_requires_process_local_and_fresh_incarnations(self):
+        from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import (
+            KVCRDirectLinker,
+        )
+
+        def make_runtime(*args, **kwargs):
+            runtime = Runtime()
+            runtime.process_local = True
+            runtime.control_endpoint = "tcp://192.0.2.7:19500"
+            return runtime
+
+        config = json.dumps(
+            {"publish_inventory": True, "kvcr_service_socket_path": None}
+        )
+        with (
+            get_context().override_server_args(
+                model_path="dummy", hicache_storage_backend_extra_config=config
+            ),
+            get_parallel().override(dp_rank=None),
+        ):
+            first = KVCRDirectLinker(
+                None, self.params, components=set(), runtime_factory=make_runtime
+            )
+            second = KVCRDirectLinker(
+                None, self.params, components=set(), runtime_factory=make_runtime
+            )
+            self.addCleanup(first.close)
+            self.addCleanup(second.close)
+            self.assertNotEqual(
+                first.get_kv_hint_sources()[0]["cache_owner_id"],
+                second.get_kv_hint_sources()[0]["cache_owner_id"],
+            )
+        with get_context().override_server_args(
+            model_path="dummy",
+            hicache_storage_backend_extra_config=json.dumps(
+                {"publish_inventory": True}
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "kvcr_service_socket_path=null"):
+                KVCRDirectLinker(
+                    None, self.params, components=set(), runtime_factory=make_runtime
+                )
 
     def test_layer_first_window_and_no_implicit_deposit(self):
         self.linker.load("a", self.transfer(["same"], 0))
@@ -389,11 +445,14 @@ class TestKVCRDirectLinker(CustomTestCase):
         """A restored prefix must not become one deadline-sized native copy."""
         module = "sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker"
         for limit in ("bytes", "descriptors"):
-            with self.subTest(limit=limit), patch.multiple(
-                module,
-                _MAX_DEPOSIT_BYTES=96 if limit == "bytes" else 512 << 20,
-                _MAX_DEPOSIT_DESCRIPTORS=6 if limit == "descriptors" else 4096,
-                create=True,
+            with (
+                self.subTest(limit=limit),
+                patch.multiple(
+                    module,
+                    _MAX_DEPOSIT_BYTES=96 if limit == "bytes" else 512 << 20,
+                    _MAX_DEPOSIT_DESCRIPTORS=6 if limit == "descriptors" else 4096,
+                    create=True,
+                ),
             ):
                 # Each real fixture page has three 16-byte registered pieces.
                 first = len(self.client.calls)
@@ -1068,7 +1127,10 @@ class TestKVCRRuntime(CustomTestCase):
         config_module.RemoteFWDramOptions = SimpleNamespace
         modules["kvcr.control_channels"].ZmqPeerControlChannel = (
             lambda host, port, advertise: SimpleNamespace(
-                host=host, port=port, advertise=advertise
+                host=host,
+                port=port,
+                advertise=advertise,
+                endpoint=f"tcp://{advertise}:{port}",
             )
         )
         modules["kvcr.types"].KVCRStartupError = self.startup_error
@@ -1105,6 +1167,7 @@ class TestKVCRRuntime(CustomTestCase):
         self.assertEqual(guard.compatibility_digest, self.layout.namespace)
         self.assertIsNone(runtime.client.backends.local_dram)
         self.assertFalse(runtime._buffers)
+        self.assertFalse(runtime.process_local)
         self.assertFalse(runtime.client.config.enable_telemetry)
         self.assertIsNone(runtime.client.config.startup_timeout_seconds)
         self.assertEqual(
@@ -1132,6 +1195,8 @@ class TestKVCRRuntime(CustomTestCase):
                 self.attempts.clear()
                 options = {} if cause else {"kvcr_service_socket_path": None}
                 runtime = self.make_runtime(**options)
+                self.assertTrue(runtime.process_local)
+                self.assertEqual(runtime.control_endpoint, "tcp://127.0.0.1:19502")
                 self.assertEqual(len(runtime._buffers), 2)
                 self.assertEqual(
                     [size for _, _, size in runtime.client.backends.local_dram.pools],
