@@ -1713,6 +1713,13 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Per-token activation metadata requires serialized W4A4 NVFP4"
                 )
             quant_config.use_per_token_activation = metadata["use_per_token_activation"]
+            if (
+                quant_config.use_per_token_activation
+                and get_moe_runner_backend().is_flashinfer_cutlass()
+            ):
+                raise ValueError(
+                    "flashinfer_cutlass does not support per-token NVFP4 activation."
+                )
             # The MoE hook only sees the environment switch, so metadata that
             # turns per-token scaling on must repeat the DeepEP check here.
             if (

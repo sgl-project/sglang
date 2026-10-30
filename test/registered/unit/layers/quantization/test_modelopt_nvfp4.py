@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
+from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.parameter import PerTensorScaleParameter
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -174,8 +175,22 @@ class TestModelOptNvfp4(CustomTestCase):
         self.assertTrue(config.quantized_mtp)
         self.assertTrue(config.use_per_token_activation)
 
+    def test_per_token_metadata_rejects_flashinfer_cutlass(self):
+        with patch(
+            "sglang.srt.layers.quantization.modelopt_quant.get_moe_runner_backend",
+            return_value=MoeRunnerBackend.FLASHINFER_CUTLASS,
+        ):
+            with self.assertRaisesRegex(ValueError, "flashinfer_cutlass.*per-token"):
+                ModelOptFp4Config.from_config(
+                    {"quant_algo": "NVFP4", "use_per_token_activation": True}
+                )
+            config = ModelOptFp4Config.from_config(
+                {"quant_algo": "NVFP4", "use_per_token_activation": False}
+            )
+            self.assertFalse(config.use_per_token_activation)
+
     def test_per_token_metadata_rejects_cutedsl_deepep(self):
-        runner = SimpleNamespace(is_flashinfer_cutedsl=lambda: True)
+        runner = MoeRunnerBackend.FLASHINFER_CUTEDSL
         a2a = SimpleNamespace(is_deepep=lambda: True)
         with (
             patch(
