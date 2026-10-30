@@ -113,6 +113,42 @@ class TestNorm:
         torch.testing.assert_close(x, ref_x, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize("hidden_size", [2048, 256, 33])
+    @pytest.mark.parametrize("batch_size", [32, 121])
+    def test_dual_residual_rmsnorm(self, batch_size, hidden_size, dtype):
+        generator = torch.Generator().manual_seed(batch_size + hidden_size)
+        x = make_non_contiguous(
+            torch.randn(batch_size, hidden_size, dtype=dtype, generator=generator)
+        )
+        residual = make_non_contiguous(
+            torch.randn(x.shape, dtype=dtype, generator=generator)
+        )
+        weight1 = torch.randn(hidden_size, dtype=dtype, generator=generator)
+        weight2 = torch.randn(hidden_size, dtype=dtype, generator=generator)
+        original_x, original_residual = x.clone(), residual.clone()
+
+        expected_mid = residual + torch.nn.functional.rms_norm(
+            x.float(), (hidden_size,), weight1.float(), eps
+        ).to(dtype)
+        expected_output = torch.nn.functional.rms_norm(
+            expected_mid.float(), (hidden_size,), weight2.float(), eps
+        ).to(dtype)
+        output, mid = torch.ops.sgl_kernel.fused_dual_residual_rmsnorm_cpu(
+            x, residual, weight1, weight2, eps
+        )
+
+        torch.testing.assert_close(
+            mid, expected_mid, atol=precision[dtype], rtol=precision[dtype]
+        )
+        torch.testing.assert_close(
+            output, expected_output, atol=precision[dtype], rtol=precision[dtype]
+        )
+        torch.testing.assert_close(x, original_x, atol=0, rtol=0)
+        torch.testing.assert_close(residual, original_residual, atol=0, rtol=0)
+        assert mid.data_ptr() != residual.data_ptr()
+        assert output.data_ptr() != x.data_ptr()
+
     @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
     @pytest.mark.parametrize("hidden_size", [2048, 256, 33])
     @pytest.mark.parametrize("batch_size", [32, 121])

@@ -8,12 +8,12 @@ import torch
 from torch import nn
 
 import sglang.srt.models.deepseek_v4 as deepseek_v4
-from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
+from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _ModuleStub(nn.Module):

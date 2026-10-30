@@ -1,21 +1,28 @@
 """Unit tests for srt/model_loader/weight_utils.py shard-index consistency."""
 
+import io
 import json
 import os
+import pickle
+import tarfile
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.model_loader.weight_utils import (
+    _load_pt_file,
     filter_duplicate_safetensors_files,
+    initialize_dummy_weights,
     maybe_add_mtp_safetensors,
 )
 from sglang.srt.utils import runai_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 INDEX_NAME = "model.safetensors.index.json"
 
@@ -197,6 +204,68 @@ class TestMaybeAddMtpSafetensors(CustomTestCase):
                     [model, mtp],
                 )
                 listing.assert_not_called()
+
+
+class _OpenOnUnpickle:
+    def __init__(self, marker):
+        self.marker = marker
+
+    def __reduce__(self):
+        return (open, (self.marker, "w"))
+
+
+def _write_legacy_tar_checkpoint(path, payload):
+    members = {
+        "storages": pickle.dumps(0) + pickle.dumps([]),
+        "tensors": pickle.dumps(0),
+        "pickle": pickle.dumps(payload),
+    }
+    with tarfile.open(path, "w") as tar:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+
+class TestLoadPtFile(CustomTestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.folder = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_tensor_state_dict_loads(self):
+        path = os.path.join(self.folder, "pytorch_model.bin")
+        torch.save({"w": torch.arange(4)}, path)
+        loaded = _load_pt_file(path)
+        self.assertTrue(torch.equal(loaded["w"], torch.arange(4)))
+
+    def test_legacy_tar_pickle_payload_is_not_executed(self):
+        marker = os.path.join(self.folder, "pwned")
+        path = os.path.join(self.folder, "pytorch_model.bin")
+        _write_legacy_tar_checkpoint(path, _OpenOnUnpickle(marker))
+        with self.assertRaises(RuntimeError):
+            _load_pt_file(path)
+        self.assertFalse(os.path.exists(marker))
+
+
+class TestInitializeDummyWeights(CustomTestCase):
+    def test_nvfp4_dummy_scales_are_neutral(self):
+        model = torch.nn.Linear(8, 4, bias=False)
+        for name, shape in (
+            ("w13_weight_scale_2", (4, 2)),
+            ("w2_weight_scale_2", (4,)),
+        ):
+            model.register_parameter(
+                name, torch.nn.Parameter(torch.empty(shape), requires_grad=False)
+            )
+
+        initialize_dummy_weights(model, low=0.25, high=0.75)
+
+        self.assertTrue(torch.equal(model.w13_weight_scale_2, torch.ones(4, 2)))
+        self.assertTrue(torch.equal(model.w2_weight_scale_2, torch.ones(4)))
+        self.assertTrue(torch.all((model.weight >= 0.25) & (model.weight <= 0.75)))
 
 
 if __name__ == "__main__":
