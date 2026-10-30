@@ -728,14 +728,15 @@ void FMHACutlassSM100FwdRun(
     int64_t max_seqlen_kv,
     bool is_varlen);
 
-std::vector<at::Tensor> sparse_prefill_fwd(
+std::vector<std::optional<at::Tensor>> sparse_prefill_fwd(
     const at::Tensor& q,
     const at::Tensor& kv,
     const at::Tensor& indices,
     double sm_scale,
     int64_t d_v,
     const std::optional<at::Tensor>& attn_sink,
-    const std::optional<at::Tensor>& topk_length);
+    const std::optional<at::Tensor>& topk_length,
+    bool return_log2_lse);
 
 std::vector<at::Tensor> fwd_kvcache_mla_fp8(
     at::Tensor& q,             // batch_size x seqlen_q x num_heads x head_size
