@@ -661,6 +661,9 @@ python3 -m sglang.launch_server \
 
 3. Launch Router
 
+The router command requires the `sglang-router` package. It is pre-installed in the Docker image; if you installed
+SGLang from source and do not have it yet, run `pip install sglang-router` first.
+
 ```bash Command
 python3 -m sglang_router.launch_router \
     --pd-disaggregation \
