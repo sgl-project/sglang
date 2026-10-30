@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConf
 from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
     Pi05CoreModel,
     Pi05SiglipVisionModel,
+    PiGemmaRMSNorm,
     create_sinusoidal_pos_embedding,
     make_att_2d_masks,
 )
@@ -28,6 +29,7 @@ from sglang.multimodal_gen.runtime.vla.cuda_graph import (
     VLADenoiseGraphRunner,
     VLADenoiseGraphSignature,
     VLAPrefixGraphRunner,
+    VLATensorGraphRunner,
     _BoundedCaptureCache,
     _CapturedDenoiseGraph,
 )
@@ -719,6 +721,7 @@ def test_sample_actions_only_hoists_denoise_layout_for_eager():
     model.config = SimpleNamespace(action_horizon=2, action_dim=3)
     model.device = torch.device("cpu")
     model.graph_runner = SimpleNamespace(enabled=True)
+    model.loop_graph_runner = SimpleNamespace(enabled=False)
     model._offload_action_expert_between_requests = lambda: False
     model._can_use_action_sequence_parallel = lambda *_args: False
     model.denoise_step = lambda _ctx, x_t, _t, **_kwargs: torch.zeros_like(x_t)
@@ -773,6 +776,94 @@ def test_sample_actions_only_hoists_denoise_layout_for_eager():
         use_cuda_graph=False,
     )
     assert len(layout_calls) == 1
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_action_loop_graph_refreshes_inputs_and_owns_output(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    num_steps = 7
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    nn.Module.__init__(model)
+    model.config = Pi05PipelineConfig()
+    model.loop_graph_runner = VLATensorGraphRunner(
+        "test_action_loop", enabled=True, max_entries=2, evict_on_miss=False
+    )
+    model.core_model = SimpleNamespace(prepare_denoise_layout=lambda *_: None)
+
+    def velocity(context, x_t, timestep, **kwargs):
+        keys, values, _ = context.past_key_values[0]
+        return (
+            x_t * timestep[:, None, None]
+            + keys.sum()
+            + values.sum()
+            + context.prefix_pad_masks.sum()
+        )
+
+    model.action_expert = velocity
+    context = _prefix_context(0.01, None)
+    context.prefix_pad_masks = context.prefix_pad_masks.to(device)
+    context.past_key_values = VLADensePrefixCache(
+        (k.to(device), v.to(device), w) for k, v, w in context.past_key_values
+    )
+    context.layout["mutable_graph_output"] = True
+    noise = torch.ones(1, 2, 4, device=device)
+    original_noise = noise.clone()
+    previous_output = previous_copy = None
+    for _ in range(3):
+        expected = noise.clone()
+        for value in torch.linspace(1.0, 1.0 / num_steps, num_steps, device=device):
+            expected.add_(
+                velocity(context, expected, value.expand(1)), alpha=-1.0 / num_steps
+            )
+        actual = model._sample_actions_loop_graph(context, noise, num_steps)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(noise, original_noise, rtol=0, atol=0)
+        if previous_output is not None:
+            torch.testing.assert_close(previous_output, previous_copy, rtol=0, atol=0)
+        previous_output, previous_copy = actual, actual.clone()
+        context.past_key_values[0][0].add_(0.02)
+        context.past_key_values[0][1].sub_(0.01)
+        context.prefix_pad_masks.logical_not_()
+    if device == "cuda":
+        assert model.loop_graph_runner.cache_info().captures == 1
+        assert model.loop_graph_runner.cache_info().failures == 0
+
+
+def test_adaptive_norm_precomputed_modulation_is_exact():
+    torch.manual_seed(12)
+    dtype = torch.bfloat16
+    norm = PiGemmaRMSNorm(16, cond_dim=16).to(dtype=dtype)
+    nn.init.normal_(norm.dense.weight)
+    x = torch.randn(2, 5, 16, dtype=dtype)
+    cond = torch.randn(2, 16, dtype=dtype)
+    expected = norm(x, cond)
+    actual = norm(x, modulation=norm.dense(cond))
+    for before, after in zip(expected, actual, strict=True):
+        torch.testing.assert_close(before, after, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("operation", ["train", "apply", "load_state_dict"])
+def test_action_time_cache_is_invalidated_before_weight_changes(operation):
+    model = Pi05PolicyModel.__new__(Pi05PolicyModel)
+    nn.Module.__init__(model)
+    model.register_parameter("weight", nn.Parameter(torch.ones(2)))
+    cleared = []
+    for name in ("prefix_graph_runner", "graph_runner", "loop_graph_runner"):
+        setattr(
+            model, name, SimpleNamespace(clear=lambda name=name: cleared.append(name))
+        )
+    model._action_loop_schedule_key = (10, 1)
+    model._action_loop_schedule = (torch.ones(2),)
+    if operation == "train":
+        model.train()
+    elif operation == "apply":
+        model.to(dtype=torch.float64)
+    else:
+        model.load_state_dict({"weight": torch.zeros(2)})
+    assert len(cleared) == 3
+    assert model._action_loop_schedule_key is None
+    assert model._action_loop_schedule is None
 
 
 def test_uint8_resize_rounds_before_normalization():

@@ -492,17 +492,23 @@ class _CapturedTensorGraph(msgspec.Struct):
 
 
 class VLATensorGraphRunner:
-    """CUDA graphs of a function of tensors, keyed by the input shapes and ``key``.
-
-    Every call copies ``inputs`` into the graph's static buffers, so ``fn`` must
-    read its tensors only from its arguments (anything else is baked in by
-    address). The returned tensors are overwritten by the next replay.
+    """Capture tensor functions; pass request-varying tensors as inputs.
+    Keep constants alive and unchanged until clear(); replay overwrites outputs.
     """
 
-    def __init__(self, name: str, *, enabled: bool, max_entries: int):
+    def __init__(
+        self,
+        name: str,
+        *,
+        enabled: bool,
+        max_entries: int,
+        evict_on_miss: bool = True,
+    ):
         self.name = name
         self.enabled = enabled and max_entries > 0
-        self._cache = _BoundedCaptureCache(name, max_entries, evict_on_miss=True)
+        self._cache = _BoundedCaptureCache(
+            name, max_entries, evict_on_miss=evict_on_miss
+        )
         self._disabled_signatures: set[Any] = set()
         self._capture_stream: torch.cuda.Stream | None = None
         self._graph_pool: Any = None
@@ -512,6 +518,7 @@ class VLATensorGraphRunner:
 
     def clear(self) -> None:
         self._cache.clear()
+        self._disabled_signatures.clear()
 
     def _capture(
         self,
@@ -555,8 +562,10 @@ class VLATensorGraphRunner:
     ) -> tuple[torch.Tensor, ...]:
         if not self.enabled or not inputs or inputs[0].device.type != "cuda":
             return tuple(fn(*inputs))
-        signature = (key, tuple((tuple(t.shape), t.dtype) for t in inputs))
+        signature = (key, tuple((tuple(t.shape), t.dtype, t.device) for t in inputs))
         if signature in self._disabled_signatures:
+            return tuple(fn(*inputs))
+        if not self._cache.can_admit(signature):
             return tuple(fn(*inputs))
         try:
             captured = self._cache.get(signature)

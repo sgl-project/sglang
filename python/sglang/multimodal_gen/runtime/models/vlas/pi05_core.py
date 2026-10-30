@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal
 
+import msgspec
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -64,6 +65,11 @@ class PiGemmaModelOutput:
     past_key_values: object | None = None
     hidden_states: tuple[torch.Tensor, ...] | None = None
     attentions: tuple[torch.Tensor, ...] | None = None
+
+
+class Pi05DenoiseCondition(msgspec.Struct, frozen=True):
+    time_embedding: torch.Tensor
+    modulations: tuple[torch.Tensor, ...]
 
 
 def gated_residual(
@@ -136,11 +142,12 @@ class PiGemmaRMSNorm(nn.Module):
         self,
         x: torch.Tensor,
         cond: torch.Tensor | None = None,
+        modulation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         dtype = x.dtype
         variance = torch.mean(torch.square(x.float()), dim=-1, keepdim=True)
         normed = x * torch.rsqrt(variance + self.eps)
-        if cond is None:
+        if cond is None and modulation is None:
             if self.dense is not None:
                 return normed.type_as(x), None
             normed = normed * (1.0 + self.weight.float())
@@ -149,7 +156,8 @@ class PiGemmaRMSNorm(nn.Module):
             normed = normed * (1.0 + self.weight.float())
             return normed.type_as(x), None
 
-        modulation = self.dense(cond.to(dtype=self.dense.weight.dtype))
+        if modulation is None:
+            modulation = self.dense(cond.to(dtype=self.dense.weight.dtype))
         if x.ndim == 3:
             modulation = modulation.unsqueeze(1)
         scale, shift, gate = modulation.chunk(3, dim=-1)
@@ -475,10 +483,15 @@ class PiGemmaDecoderLayer(nn.Module):
         past_key_values=None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         adarms_cond: torch.Tensor | None = None,
+        adarms_modulations: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states, gate = self.input_layernorm(hidden_states, cond=adarms_cond)
+        hidden_states, gate = self.input_layernorm(
+            hidden_states,
+            cond=adarms_cond,
+            modulation=None if adarms_modulations is None else adarms_modulations[0],
+        )
         hidden_states, _ = self.self_attn(
             hidden_states,
             attention_mask=attention_mask,
@@ -490,7 +503,9 @@ class PiGemmaDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states, gate = self.post_attention_layernorm(
-            hidden_states, cond=adarms_cond
+            hidden_states,
+            cond=adarms_cond,
+            modulation=None if adarms_modulations is None else adarms_modulations[1],
         )
         hidden_states = self.mlp(hidden_states)
         hidden_states = gated_residual(residual, hidden_states, gate)
@@ -615,6 +630,7 @@ class PiGemmaModel(nn.Module):
         output_hidden_states: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         adarms_cond: torch.Tensor | None = None,
+        adarms_modulations: tuple[torch.Tensor, ...] | None = None,
         prefix_kv_only: bool = False,
         **kwargs,
     ) -> PiGemmaModelOutput:
@@ -691,7 +707,13 @@ class PiGemmaModel(nn.Module):
             if prefix_kv_only and layer_index == self.config.num_hidden_layers - 1:
                 # Only final-layer K/V is consumed; preserve QKV/RoPE and skip attention/MLP.
                 normalized, _ = decoder_layer.input_layernorm(
-                    hidden_states, adarms_cond
+                    hidden_states,
+                    adarms_cond,
+                    modulation=(
+                        None
+                        if adarms_modulations is None
+                        else adarms_modulations[2 * layer_index]
+                    ),
                 )
                 query, key, value = decoder_layer.self_attn.project_qkv(normalized)
                 _, key = native_apply_rotary_pos_emb(
@@ -707,6 +729,11 @@ class PiGemmaModel(nn.Module):
                 output_attentions=output_attentions,
                 position_embeddings=position_embeddings,
                 adarms_cond=adarms_cond,
+                adarms_modulations=(
+                    None
+                    if adarms_modulations is None
+                    else adarms_modulations[2 * layer_index : 2 * layer_index + 2]
+                ),
                 **kwargs,
             )
             hidden_states = layer_outputs
@@ -714,7 +741,11 @@ class PiGemmaModel(nn.Module):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-        hidden_states, _ = self.norm(hidden_states, adarms_cond)
+        hidden_states, _ = self.norm(
+            hidden_states,
+            adarms_cond,
+            modulation=None if adarms_modulations is None else adarms_modulations[-1],
+        )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -1141,6 +1172,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor | None],
         use_cache: bool | None,
         adarms_cond: list[torch.Tensor | None] | None = None,
+        expert_adarms_modulations: tuple[torch.Tensor, ...] | None = None,
         prefix_kv_only: bool = False,
     ):
         if adarms_cond is None:
@@ -1168,6 +1200,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[1],
+                adarms_modulations=expert_adarms_modulations,
             )
             return [None, suffix_output.last_hidden_state], None
 
@@ -1288,7 +1321,17 @@ class Pi05CoreModel(nn.Module):
         self,
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
+        condition: Pi05DenoiseCondition | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        action_emb = self.action_in_proj(
+            noisy_actions.to(dtype=linear_compute_dtype(self.action_in_proj))
+        )
+        adarms_cond = (
+            self.embed_time(timestep) if condition is None else condition.time_embedding
+        )
+        return action_emb, adarms_cond
+
+    def embed_time(self, timestep: torch.Tensor) -> torch.Tensor:
         if (
             self._time_embedding_scaling.numel()
             != self.action_in_proj.out_features // 2
@@ -1317,16 +1360,26 @@ class Pi05CoreModel(nn.Module):
             max_period=self.config.time_embedding_max_period,
             scaling=self._time_embedding_scaling,
         )
-        action_emb = self.action_in_proj(
-            noisy_actions.to(dtype=linear_compute_dtype(self.action_in_proj))
-        )
         time_emb = time_emb.to(dtype=self.time_mlp_in.weight.dtype)
         time_emb = self.time_mlp_in(time_emb)
         time_emb = F.silu(time_emb)
         time_emb = self.time_mlp_out(time_emb)
-        adarms_cond = F.silu(time_emb)
+        return F.silu(time_emb)
 
-        return action_emb, adarms_cond
+    def prepare_denoise_condition(self, timestep: torch.Tensor) -> Pi05DenoiseCondition:
+        cond = self.embed_time(timestep)
+        expert = self.paligemma_with_expert.gemma_expert.model
+        norms = [
+            norm
+            for layer in expert.layers[: expert.config.num_hidden_layers]
+            for norm in (layer.input_layernorm, layer.post_attention_layernorm)
+        ] + [expert.norm]
+        return Pi05DenoiseCondition(
+            time_embedding=cond,
+            modulations=tuple(
+                norm.dense(cond.to(dtype=norm.dense.weight.dtype)) for norm in norms
+            ),
+        )
 
     def prepare_denoise_layout(
         self,
@@ -1489,8 +1542,9 @@ class Pi05CoreModel(nn.Module):
         *,
         action_position_offset: int = 0,
         denoise_layout: tuple[torch.Tensor | None, torch.Tensor] | None = None,
+        condition: Pi05DenoiseCondition | None = None,
     ) -> torch.Tensor:
-        suffix_embs, adarms_cond = self.embed_suffix(x_t, timestep)
+        suffix_embs, adarms_cond = self.embed_suffix(x_t, timestep, condition)
         if denoise_layout is None:
             denoise_layout = self.prepare_denoise_layout(
                 prefix_pad_masks,
@@ -1510,6 +1564,9 @@ class Pi05CoreModel(nn.Module):
                 inputs_embeds=[None, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                expert_adarms_modulations=None
+                if condition is None
+                else condition.modulations,
             )
         suffix_out = outputs_embeds[1][:, -x_t.shape[1] :]
         return self.action_out_proj(

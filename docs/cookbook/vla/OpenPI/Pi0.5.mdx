@@ -281,6 +281,13 @@ An opt-in four-bucket serving config is:
 - The split path uses the SP group as the action group: prefix root computes/broadcasts `PrefixContext`, all action ranks broadcast the initial action noise once, shard the action horizon, and run the action expert through Ulysses attention when the prefix is full-attention, ring degree is one, heads are divisible by SP size, and the horizon is evenly shardable. Otherwise it falls back to action-root execution.
 - `lerobot/pi05_libero_base` returns 7 action dimensions even though the internal padded action tensor uses 32 dimensions.
 
+For resident single-GPU NVIDIA CUDA inference, set these options in the JSON passed to `--pipeline-config-path`:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `enable_action_loop_cuda_graph` | `false` | Capture the full denoising loop; requires `enable_action_cuda_graph=true`. |
+| `enable_action_time_cache` | `false` | Cache timestep conditioning; requires `enable_action_loop_cuda_graph=true`. |
+
 ## 6. VRAM Tuning
 
 For current public Pi0.5 checkpoints, a stable 16GB discrete GPU target is a reasonable v1 deployment bar for robot workstations. In practice, leave headroom for the driver, camera middleware, robot process, and allocator fragmentation. Jetson/Orin unified-memory devices need extra caution because system RAM and GPU memory share the same pool.
