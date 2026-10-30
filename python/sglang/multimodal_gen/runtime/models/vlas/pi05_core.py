@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.attention.layer import prepare_sdpa_mask
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     MergedReplicatedLinear,
@@ -41,6 +42,7 @@ from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.rotary_embedding import (
     apply_rotary_pos_emb as native_apply_rotary_pos_emb,
 )
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb_native_eager
 from sglang.srt.models.siglip import SiglipVisionModel
 
 
@@ -191,6 +193,7 @@ class PiGemmaMLP(nn.Module):
         if config.hidden_act != "gelu_pytorch_tanh":
             raise ValueError(f"Unsupported PiGemma activation: {config.hidden_act}")
         self.act_fn = GeluAndMul(approximate="tanh")
+        self.use_training_ops = getattr(config, "use_training_ops", False)
 
     @property
     def projection_dtype(self) -> torch.dtype:
@@ -201,7 +204,12 @@ class PiGemmaMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = linear_forward(self.gate_up_proj, x)
-        return linear_forward(self.down_proj, self.act_fn(gate_up))
+        if self.use_training_ops:
+            gate, up = gate_up.chunk(2, dim=-1)
+            activated = F.gelu(gate, approximate="tanh") * up
+        else:
+            activated = self.act_fn(gate_up)
+        return linear_forward(self.down_proj, activated)
 
 
 class PiGemmaRotaryEmbedding(nn.Module):
@@ -264,6 +272,7 @@ class PiGemmaAttention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.tensor_parallel = tensor_parallel
+        self.use_training_ops = getattr(config, "use_training_ops", False)
         self.head_dim = getattr(
             config,
             "head_dim",
@@ -320,6 +329,9 @@ class PiGemmaAttention(nn.Module):
             num_kv_heads=self.num_key_value_heads,
             softmax_scale=self.scaling,
             causal=self.is_causal,
+            required_attention_backend=(
+                AttentionBackendEnum.TORCH_SDPA if self.use_training_ops else None
+            ),
             supported_attention_backends={
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.FA2,
@@ -393,7 +405,12 @@ class PiGemmaAttention(nn.Module):
         query_states, key_states, value_states = self.project_qkv(hidden_states)
 
         cos, sin = position_embeddings
-        query_states, key_states = native_apply_rotary_pos_emb(
+        rotary_fn = (
+            apply_rotary_pos_emb_native_eager
+            if self.use_training_ops
+            else native_apply_rotary_pos_emb
+        )
+        query_states, key_states = rotary_fn(
             query_states,
             key_states,
             cos,
@@ -430,12 +447,31 @@ class PiGemmaAttention(nn.Module):
                 self.layer_idx,
             )
 
-        attn_output = self.attn(
-            query_states.transpose(1, 2),
-            key_states.transpose(1, 2),
-            value_states.transpose(1, 2),
-            attn_mask=attention_mask,
-        )
+        if self.use_training_ops:
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states.repeat_interleave(self.num_key_value_groups, dim=1),
+                value_states.repeat_interleave(self.num_key_value_groups, dim=1),
+                attn_mask=(
+                    None
+                    if attention_mask is None
+                    else prepare_sdpa_mask(
+                        attention_mask,
+                        dtype=query_states.dtype,
+                        device=query_states.device,
+                    )
+                ),
+                dropout_p=0.0,
+                is_causal=self.is_causal,
+                scale=self.scaling,
+            ).transpose(1, 2)
+        else:
+            attn_output = self.attn(
+                query_states.transpose(1, 2),
+                key_states.transpose(1, 2),
+                value_states.transpose(1, 2),
+                attn_mask=attention_mask,
+            )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         return linear_forward(self.o_proj, attn_output), None
 
@@ -968,6 +1004,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         image_size: int,
         runtime_role: Literal["all", "prefix", "action", "idle"] = "all",
         prefix_tensor_parallel: bool = False,
+        action_training: bool = False,
     ):
         super().__init__()
         self.paligemma = None
@@ -988,6 +1025,7 @@ class PaliGemmaWithExpertModel(nn.Module):
             vlm_config_hf.text_config.dtype = precision
             vlm_config_hf.text_config.vocab_size = PALIGEMMA_VOCAB_SIZE
             vlm_config_hf.text_config.use_adarms = use_adarms[0]
+            vlm_config_hf.text_config.use_training_ops = action_training
             vlm_config_hf.text_config.is_causal = False
             vlm_config_hf.text_config.use_bidirectional_attention = True
             vlm_config_hf.text_config.adarms_cond_dim = (
@@ -1016,6 +1054,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 hidden_activation="gelu_pytorch_tanh",
                 dtype=precision,
                 use_adarms=use_adarms[1],
+                use_training_ops=action_training,
                 is_causal=False,
                 use_bidirectional_attention=True,
                 adarms_cond_dim=(action_expert_config.width if use_adarms[1] else None),
@@ -1183,9 +1222,14 @@ class Pi05CoreModel(nn.Module):
         runtime_role: Literal["all", "prefix", "action", "idle"] = "all",
         *,
         prefix_tensor_parallel: bool = False,
+        action_training: bool = False,
     ):
         super().__init__()
         self.config = config
+        if action_training and (runtime_role != "all" or prefix_tensor_parallel):
+            raise ValueError(
+                "Action training requires a resident, unsharded Pi0.5 model"
+            )
         vlm_config = get_gemma_variant_config(config.paligemma_variant)
         action_config = get_gemma_variant_config(config.action_expert_variant)
         precision = (
@@ -1201,6 +1245,7 @@ class Pi05CoreModel(nn.Module):
             image_size=config.image_size[0],
             runtime_role=runtime_role,
             prefix_tensor_parallel=prefix_tensor_parallel,
+            action_training=action_training,
         )
         if runtime_role in ("all", "action"):
             self.action_in_proj = nn.Linear(config.action_dim, action_config.width)
@@ -1225,6 +1270,30 @@ class Pi05CoreModel(nn.Module):
             torch.empty(0, dtype=torch.float64),
             persistent=False,
         )
+        if action_training:
+            self.enable_action_training()
+
+    def enable_action_training(self) -> None:
+        """Use differentiable action-expert ops for training and policy replay.
+
+        Keep the same ops in no-grad rollouts so PPO does not compare probabilities
+        from different activation/attention implementations. The vision-language
+        prefix remains frozen; tensor/sequence-parallel training is not supported.
+        """
+        expert = self.paligemma_with_expert.gemma_expert
+        if expert is None:
+            raise ValueError("Action training requires an action expert")
+        # Inference linear layers allocate parameters with requires_grad=False.
+        expert.requires_grad_(True)
+        prefix = self.paligemma_with_expert.paligemma
+        if prefix is not None:
+            prefix.requires_grad_(False)
+        for module in expert.modules():
+            if isinstance(module, PiGemmaAttention):
+                if module.tensor_parallel or module.sp_attn is not None:
+                    raise ValueError("Action training requires unsharded attention")
+            if isinstance(module, (PiGemmaAttention, PiGemmaMLP)):
+                module.use_training_ops = True
 
     def prepare_attention_masks_4d(
         self,
@@ -1417,6 +1486,7 @@ class Pi05CoreModel(nn.Module):
         token_masks: torch.Tensor,
         prefix_full_attention_hint: bool | None = None,
         tokens_trimmed: bool = False,
+        return_hidden_states: bool = False,
     ):
         if not tokens_trimmed:
             tokens, token_masks = trim_trailing_padding_tokens(tokens, token_masks)
@@ -1442,7 +1512,7 @@ class Pi05CoreModel(nn.Module):
             )
         self._prepare_prefix_language_layers_for_forward()
         with set_forward_context(current_timestep=0, attn_metadata=None):
-            _, past_key_values = self.paligemma_with_expert.forward(
+            outputs, past_key_values = self.paligemma_with_expert.forward(
                 attention_mask=attention_mask,
                 position_ids=prefix_position_ids,
                 past_key_values=None,
@@ -1450,6 +1520,8 @@ class Pi05CoreModel(nn.Module):
                 use_cache=True,
             )
         self._offload_prefix_language_layers_after_prefix()
+        if return_hidden_states:
+            return past_key_values, prefix_pad_masks, prefix_full_attention, outputs[0]
         return (
             past_key_values,
             prefix_pad_masks,
@@ -1468,6 +1540,31 @@ class Pi05CoreModel(nn.Module):
         action_position_offset: int = 0,
         denoise_layout: tuple[torch.Tensor | None, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        suffix_out = self.forward_suffix(
+            prefix_pad_masks,
+            past_key_values,
+            x_t,
+            timestep,
+            prefix_full_attention,
+            action_position_offset=action_position_offset,
+            denoise_layout=denoise_layout,
+        )
+        return self.action_out_proj(
+            suffix_out.to(dtype=linear_compute_dtype(self.action_out_proj))
+        ).to(dtype=torch.float32)
+
+    def forward_suffix(
+        self,
+        prefix_pad_masks: torch.Tensor,
+        past_key_values,
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+        prefix_full_attention: bool = False,
+        *,
+        action_position_offset: int = 0,
+        denoise_layout: tuple[torch.Tensor | None, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Return action-expert hidden states, retaining the autograd graph."""
         suffix_embs, adarms_cond = self.embed_suffix(x_t, timestep)
         if denoise_layout is None:
             denoise_layout = self.prepare_denoise_layout(
@@ -1489,7 +1586,4 @@ class Pi05CoreModel(nn.Module):
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-        suffix_out = outputs_embeds[1][:, -x_t.shape[1] :]
-        return self.action_out_proj(
-            suffix_out.to(dtype=linear_compute_dtype(self.action_out_proj))
-        ).to(dtype=torch.float32)
+        return outputs_embeds[1][:, -x_t.shape[1] :]
