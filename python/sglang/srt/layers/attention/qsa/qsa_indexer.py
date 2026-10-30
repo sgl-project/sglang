@@ -132,7 +132,7 @@ class QSAIndexer(MultiPlatformOp):
     def _use_fused_prep(self, tensor: torch.Tensor) -> bool:
         """Whether the fused indexer-prep kernels support this configuration."""
         return (
-            tensor.is_cuda
+            tensor.device.type == "cuda"
             and tensor.dtype in (torch.bfloat16, torch.float16)
             and self.index_head_dim in (64, 128, 256)
             and self.rotary_emb.rotary_dim % 2 == 0
@@ -477,7 +477,10 @@ class QSAIndexer(MultiPlatformOp):
             return output
 
         relative = (
-            max_row_keys is not None and max_row_keys > 0 and q.is_cuda and HAS_TILELANG
+            max_row_keys is not None
+            and max_row_keys > 0
+            and q.device.type == "cuda"
+            and HAS_TILELANG
         )
         row_chunk_size = _qsa_prefill_row_chunk_size(
             rows,
@@ -549,7 +552,7 @@ class QSAIndexer(MultiPlatformOp):
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
         use_fast_topk = (
-            q.is_cuda
+            q.device.type == "cuda"
             and self.block_topk == 512
             and not is_batch_invariant_mode_enabled()
         )
@@ -784,7 +787,8 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
-                defer_expansion=q.is_cuda and indexer_metadata.defer_block_expansion,
+                defer_expansion=q.device.type == "cuda"
+                and indexer_metadata.defer_block_expansion,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
@@ -831,6 +835,22 @@ class QSAIndexer(MultiPlatformOp):
     ) -> torch.Tensor:
         return self._forward_impl(
             hidden_states, positions, forward_batch, indexer_metadata
+        )
+
+    def forward_npu(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+        cp_global_rope_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self._forward_impl(
+            hidden_states,
+            positions,
+            forward_batch,
+            indexer_metadata,
+            cp_global_rope_positions,
         )
 
 

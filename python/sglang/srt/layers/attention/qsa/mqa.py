@@ -636,6 +636,12 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    if q.device.type == "npu":
+        if score_scale is not None:
+            raise ValueError("Custom MQA scale is outside the NPU QSA kernel contract")
+        from sgl_kernel_npu.qwen3_8_flash_next import qsa_mqa
+
+        return qsa_mqa.packed(q, k, row_starts, row_ends)
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
@@ -669,6 +675,12 @@ def qsa_mqa_decode(
     *,
     min_scored_len: int = 0,
 ) -> torch.Tensor:
+    if q.device.type == "npu":
+        if score_scale is not None:
+            raise ValueError("Custom MQA scale is outside the NPU QSA kernel contract")
+        from sgl_kernel_npu.qwen3_8_flash_next import qsa_mqa
+
+        return qsa_mqa.paged(q, k_cache, page_table, context_lens, max_model_len)
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q,

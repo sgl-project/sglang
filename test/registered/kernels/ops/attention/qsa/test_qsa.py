@@ -640,6 +640,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
 
 def _make_paged_extend_backend():
     metadata = SimpleNamespace(
+        is_cuda_graph=False,
         token_to_batch_idx=torch.zeros(3, dtype=torch.int32),
         sequence_lengths=torch.tensor([8], dtype=torch.int32),
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),

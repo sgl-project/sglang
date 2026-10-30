@@ -302,6 +302,8 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Diagnostic short-context fallback; model configuration enforces the budget.
+    SGLANG_ENABLE_QWEN4_NPU_DENSE_FALLBACK = EnvBool(False)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device
@@ -1159,6 +1161,8 @@ class Envs:
     # ===================================================================
     # Ascend NPU
     # ===================================================================
+    # Disable for operators whose internal-format path cannot be graph captured.
+    SGLANG_NPU_ALLOW_INTERNAL_FORMAT = EnvBool(True)
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
     # time for arch35 (Atlas A5) Linear and MoE MXFP8 GEMMs. Disabled keeps

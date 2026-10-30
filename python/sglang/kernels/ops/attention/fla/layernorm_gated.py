@@ -49,7 +49,6 @@ def rms_norm_ref(
     upcast=True,
 ):
     dtype = x.dtype
-    N = x.shape[-1]
     weight = weight.float()
     bias = bias.float() if bias is not None else None
     if upcast:
@@ -364,8 +363,9 @@ def rms_norm_gated(
     is_rms_norm=False,
     activation: str = "swish",
 ):
-    """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+    """Normalize each group, applying the configured gate before or after normalization."""
 
+    npu_sigmoid = _is_npu and activation == "sigmoid"
     x_shape_og = x.shape
     # reshape input data into 2D tensor
     x = x.reshape(-1, x.shape[-1])
@@ -374,19 +374,48 @@ def rms_norm_gated(
     if z is not None:
         if z.shape == x_shape_og:
             z = z.reshape(-1, z.shape[-1])
-            if z.stride(-1) != 1:
+            if not npu_sigmoid and z.stride(-1) != 1:
                 z = z.contiguous()
         else:
             assert len(x_shape_og) == 2
             assert z.ndim == 3
             assert z.shape[0] * z.shape[1] == x.shape[0]
             assert z.shape[2] == x.shape[1]
-            assert z.stride(-1) == 1
+            if _is_npu:
+                # The external NPU kernel accepts only a contiguous 2D gate.
+                z = z.reshape(x.shape)
+                if not npu_sigmoid:
+                    z = z.contiguous()
+            else:
+                assert z.stride(-1) == 1
     weight = weight.contiguous()
     if bias is not None:
         bias = bias.contiguous()
     if _is_npu:
-        assert activation == "swish", "NPU only supports swish activation"
+        if activation == "sigmoid":
+            # The external NPU kernel computes swish even when passed sigmoid;
+            # keep this fallback until supported kernel builds honor activation.
+            group_size = x.shape[-1] if group_size is None else group_size
+            assert group_size > 0 and x.shape[-1] % group_size == 0
+            values = x.float()
+            gate = torch.sigmoid(z.float()) if z is not None else None
+            if gate is not None and not norm_before_gate:
+                values = values * gate
+            grouped = values.reshape(x.shape[0], x.shape[-1] // group_size, group_size)
+            if not is_rms_norm:
+                grouped = grouped - grouped.mean(dim=-1, keepdim=True)
+            normalized = grouped * torch.rsqrt(
+                grouped.square().mean(dim=-1, keepdim=True) + eps
+            )
+            y = normalized.reshape_as(x) * weight.float()
+            if bias is not None:
+                y = y + bias.float()
+            if gate is not None and norm_before_gate:
+                y = y * gate
+            return y.to(x.dtype).reshape(x_shape_og)
+        if activation not in ("swish", "silu"):
+            raise ValueError(f"Unsupported NPU gated norm activation: {activation}")
+        activation = "swish"
     y, mean, rstd = _layer_norm_fwd(
         x,
         weight,
@@ -472,7 +501,7 @@ class LayerNorm(torch.nn.Module):
         torch.nn.init.zeros_(self.bias)
 
     def forward(self, x, z=None):
-        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+        """Normalize each group, applying the configured gate before or after normalization."""
         return layernorm_fn(
             x,
             self.weight,
@@ -513,7 +542,7 @@ class RMSNorm(torch.nn.Module):
         torch.nn.init.ones_(self.weight)
 
     def forward(self, x, z=None):
-        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+        """Normalize each group, applying the configured gate before or after normalization."""
         if _use_cpu:
             assert (
                 self.norm_before_gate

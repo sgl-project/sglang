@@ -18,6 +18,11 @@ This document provides a list of commonly used environment variables and aims to
   </thead>
   <tbody>
     <tr>
+      <td><code>SGLANG_ENABLE_QWEN4_NPU_DENSE_FALLBACK</code></td>
+      <td>Opt into the experimental Qwen4-Exp dense attention fallback on NPU. Set <code>--context-length</code> no higher than the checkpoint's <code>indexer_budget</code>; larger contexts are rejected at startup. This disables the QSA indexer and its cache allocation. It does not implement long-context sparse attention. Use eager execution (<code>--disable-cuda-graph</code>) for this bring-up path.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
       <td><code>SGLANG_NPU_USE_MLAPO</code></td>
       <td>Adopts the <code>MLAPO</code> fusion operator in the attention <br/> preprocessing stage of the MLA model.</td>
       <td><code>false</code></td>
@@ -31,6 +36,11 @@ This document provides a list of commonly used environment variables and aims to
       <td><code>SGLANG_NPU_USE_MULTI_STREAM</code></td>
       <td>Enable dual-stream computation of shared experts <br/> and routing experts in DeepSeek models.<br/> Enable dual-stream computation in DeepSeek DSA Indexer.</td>
       <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_NPU_ALLOW_INTERNAL_FORMAT</code></td>
+      <td>Allow torch-npu internal tensor formats during SRT NPU initialization. Set to <code>0</code> before launching workers when an operator's internal-format path cannot be graph captured (for example, Qwen4-Exp Conv2D on Ascend A2). This does not control explicit ACL weight-format conversion.</td>
+      <td><code>true</code></td>
     </tr>
     <tr>
       <td><code>SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT</code></td>
