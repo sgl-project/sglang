@@ -137,10 +137,11 @@ def update_expert_weights_npu(
             # Any outgoing expert must appear in a changed destination slot.
             # Keep possible senders; only skip ranks with provably no work.
             local_experts = set(old_placement[start:end])
-            if not any(
+            may_send = any(
                 old != new and new in local_experts
                 for old, new in zip(old_placement, new_placement, strict=True)
-            ):
+            )
+            if not may_send:
                 continue
         weights = weights_by_layer[layer]
         # Allocate only when this rank participates, then reuse across layers.
@@ -225,7 +226,9 @@ class _ExpertWeightStaging:
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         # Bound queued work before allocating this layer's ND tensors.
-        # The event recorded here covers the preceding layer's P2P and writeback.
+        # Each event follows the preceding layer's P2P waits and writeback.
+        # With two saved events, the fourth load waits for the first layer.
+        # The allocator can then reuse that layer's released ND storage.
         if len(self._completion_events) == self._completion_events.maxlen:
             self._completion_events.popleft().synchronize()
         previous_layer_done = torch.npu.Event()
