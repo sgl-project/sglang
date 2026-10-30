@@ -51,6 +51,41 @@ class TestIpcInputA2AQkvGuard(unittest.TestCase):
             self.assertIsNone(usp._ipc_input_a2a_qkv(q, q.clone(), q.clone()))
 
 
+class TestReplicatedKvPrefixUsesIpcExchange(unittest.TestCase):
+    """The replicated-KV-prefix Ulysses path exchanges q/k/v like the others: one
+    IPC exchange when available, not three NCCL all-to-alls."""
+
+    def test_split_path_takes_the_ipc_exchange(self):
+        from sglang.multimodal_gen.runtime.layers.attention import layer
+
+        heads, dim = 4, 8
+        attn = layer.USPAttention.__new__(layer.USPAttention)
+        attn.attn_impl = mock.MagicMock()
+        attn.attn_impl.forward.side_effect = lambda q, k, v, _: q
+        q, k_shard, v_shard = (torch.randn(1, 3, heads, dim) for _ in range(3))
+        k_rep = v_rep = torch.randn(1, 2, heads, dim)
+        gathered = tuple(torch.randn(1, 6, heads // 2, dim) for _ in range(3))
+        ipc = mock.MagicMock(return_value=gathered)
+        nccl = mock.MagicMock(side_effect=AssertionError("NCCL exchange"))
+        with (
+            mock.patch.object(layer, "_ipc_input_a2a_qkv", ipc),
+            mock.patch.object(layer, "async_a2a_communicate", nccl),
+            mock.patch.object(layer, "_usp_input_all_to_all", nccl),
+            mock.patch.object(layer, "_usp_output_all_to_all", lambda x, head_dim: x),
+            mock.patch.object(layer, "get_ulysses_parallel_rank", lambda: 0),
+            mock.patch.object(layer, "get_ulysses_parallel_world_size", lambda: 2),
+            mock.patch.object(layer, "get_ring_parallel_world_size", lambda: 1),
+            mock.patch.object(
+                layer.USPAttention, "_pipelined_ulysses", lambda *a, **k: None
+            ),
+        ):
+            out = attn._forward_with_replicated_kv_prefix_split(
+                q, k_rep, v_rep, k_shard, v_shard, None
+            )
+        ipc.assert_called_once_with(q, k_shard, v_shard)
+        self.assertIs(out, gathered[0])
+
+
 class TestIpcSkippedUnderCompile(unittest.TestCase):
     """The transport's custom-class handles cannot be traced: a compiled graph
     keeps the NCCL all-to-all instead of breaking at every exchange."""

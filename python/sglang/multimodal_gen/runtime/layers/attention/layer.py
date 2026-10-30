@@ -2308,7 +2308,11 @@ class USPAttention(nn.Module):
             return self.attn_impl.forward(q_group, k_group, v_group, ctx_attn_metadata)
 
         def sequential():
-            if (
+            # the same bytes as the NCCL exchange below, in one IPC exchange
+            gathered = _ipc_input_a2a_qkv(q, k_shard, v_shard)
+            if gathered is not None:
+                q_gathered, k_gathered, v_gathered = gathered
+            elif (
                 q.device.type == "cuda"
                 and get_ulysses_parallel_world_size() > 1
                 and not torch.compiler.is_compiling()
