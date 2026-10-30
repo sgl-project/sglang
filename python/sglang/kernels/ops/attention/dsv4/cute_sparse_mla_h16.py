@@ -1,4 +1,4 @@
-"""SM90 CuTe sparse-MLA kernel for SGLang DSV4 TP=8 prefill.
+"""SM90 CuTe sparse-MLA kernel for SGLang DSV4 prefill with 16 local heads.
 
 This kernel is specialized for SGLang's DSV4 sparse-prefill contract:
 
@@ -6,17 +6,6 @@ This kernel is specialized for SGLang's DSV4 sparse-prefill contract:
 * Q/K/V width is 512 (448 NoPE + 64 RoPE; V uses the same 512-wide row).
 * indices address a per-call, rebased BF16 workspace and are already causal.
 * topk_length is per query and attn_sink is a per-head virtual zero-value key.
-
-The kernel below preserves the useful H=16 ``m64n16`` WGMMA decomposition,
-uses a single-pass numerically stable online softmax, rescales FP32 PV state
-when the running maximum changes, and overlaps the next sparse gather with the
-current tile's PV WGMMA retirement.  This tuning variant also reduces the
-transposed KQ fragment in registers: lane-XOR 4/8/16 covers the 16 rows owned
-by each warp and only four per-warp partials per head cross shared memory.
-To match FlashMLA's BF16 probability path, the online maximum covers real KV
-rows only; the virtual attention sink is merged in the final denominator.
-Its four 128-channel QK stages match the DSV4-512 layout, and the reduced
-shared-memory footprint is launched with a two-CTA-per-SM occupancy request.
 
 The public entry point returns only the 16 logical heads, with shape
 ``[TQ, 16, 512]``.  Callers must keep other architectures and DSV4 shapes on
@@ -39,7 +28,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from sglang.srt.utils.custom_op import register_custom_op
 
-# SGLang DSV4 TP=8 contract.
+# SGLang DSV4 sparse-prefill contract.
 H = 16
 TOPK_ALIGNMENT = 128
 MAX_TOPK = 8192
@@ -98,12 +87,7 @@ def _resolve_rows(
     topk_length,
     s_kv,
 ):
-    """Resolve four gathered rows per 8-thread group and emit validity masks.
-
-    SGLang has already applied causal/request masking before rebasing indices
-    into its flat workspace.  Validity is therefore only:
-      slot < topk_length and 0 <= index < s_kv.
-    """
+    # Indices arrive causal, so validity is slot < topk_length and 0 <= index < s_kv.
 
     ga = []
     sa = []
@@ -113,9 +97,6 @@ def _resolve_rows(
         slot = base + n
         row_raw = idx_ptr[slot]
 
-        # Keep the helper branch-free and redirect every invalid address to
-        # row zero. The copy predicate below zero-fills shared memory, while
-        # the emitted score mask removes the row from attention.
         prefix_ok = cutlass.max(
             cutlass.min(topk_length - slot, cutlass.Int32(1)), cutlass.Int32(0)
         )
@@ -129,10 +110,7 @@ def _resolve_rows(
         row = cutlass.Int64(row_raw * ok)
         smask_ptr[n] = ok.to(cutlass.Float32)
 
-        # cp.async predication zero-fills the shared-memory destination for an
-        # invalid row.  Merely redirecting the address to row zero is not
-        # sufficient: a later BF16 ``0 * NaN`` in PV would still propagate a
-        # poisoned value from kv[0].
+        # Invalid rows read kv[0], so zero-fill them to keep 0 * NaN out of PV.
         predicate = cute.make_rmem_tensor((1,), cute.Boolean)
         predicate.fill(ok != cutlass.Int32(0))
         predicates.append(predicate)
@@ -145,8 +123,6 @@ def _resolve_rows(
 
 
 def _prefetch_chunk(ga, sa, predicates, chunk):
-    """Gather one 64-channel chunk for all 64 selected KV rows."""
-
     g2s = cute.make_copy_atom(
         cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=128
     )
@@ -178,8 +154,6 @@ def _prefetch_tile(ga, sa, predicates):
 
 
 def _make_qk_fragments(mma_qk, thr_qk, skv_ptr, sq_ptr):
-    """Build four K/Q fragments, each covering 128 of the 512 channels."""
-
     kv_frags = []
     q_frags = []
     channels = DQK // NG_QK
@@ -205,8 +179,6 @@ def _make_qk_fragments(mma_qk, thr_qk, skv_ptr, sq_ptr):
 
 
 def _make_pv_fragments(mma_pv, thr_pv, skv_ptr):
-    """Build eight 64-channel V fragments and FP32 output accumulators."""
-
     v_frags = []
     out_acc = []
     id_o = cute.make_identity_tensor((64, H))
@@ -226,8 +198,6 @@ def _make_pv_fragments(mma_pv, thr_pv, skv_ptr):
 
 
 def _issue_qk_staged(mma_qk, score_acc, k_frags, q_frags):
-    """Consume four cp.async groups and enqueue four 128-channel QK MMAs."""
-
     cute.nvgpu.warpgroup.fence()
     mma_qk.set(warpgroup.Field.ACCUMULATE, False)
     for group in range(NG_QK):
@@ -286,18 +256,8 @@ def _run_pv_rolling(
 
 
 def _reduce_kq_fragment_heads(fragment, op):
-    """Reduce the two rows/thread then the 16 rows/warp for four heads.
-
-    The ``m64n16`` accumulator TV layout expected by this reduction is::
-
-      Shape ((4, 8, 4), (2, 2, 2))
-      Stride((128,1,16), (64,8,512))
-
-    The value coordinates therefore flatten as ``v0 + 2*v1 + 4*v2``.
-    ``v1`` selects the two M rows held by a thread while ``(v0,v2)``
-    selects its four N/head values.  For a fixed head, lanes with the same
-    ``lane % 4`` own all 16 rows in a warp, hence XOR 4, 8 and 16.
-    """
+    """Reduce 2 rows per thread, then 16 rows per warp by XOR 4, 8, 16, for 4 heads.
+    Expects the m64n16 TV layout ((4,8,4),(2,2,2)):((128,1,16),(64,8,512))."""
 
     r0 = op(fragment[0], fragment[2])
     r1 = op(fragment[1], fragment[3])
@@ -341,8 +301,6 @@ def _kernel(
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
-    # Reverse query order to retain the benchmark kernel's launch behaviour;
-    # unlike the old kernel, this value is not used as a causal KV position.
     # Widen before multiplying Q, index, and output row strides.
     qpos = cutlass.Int64(tq - 1) - cutlass.Int64(bidx)
     g8 = tidx // 8
@@ -356,8 +314,7 @@ def _kernel(
     )
     sq_ptr = cute.recast_ptr(sq_raw, q_atom.inner)
     sp_ptr = smem.allocate_array(cutlass.BFloat16, P_ELEMS, byte_alignment=1024)
-    # Four warp-local partials per head replace the old full 64x16 FP32
-    # score spill.  The same allocation is reused for max and denominator.
+    # The same allocation is reused for max and denominator.
     spartial_ptr = smem.allocate_array(cutlass.Float32, 4 * H, byte_alignment=128)
     smask_ptr = smem.allocate_array(cutlass.Float32, 2 * BN, byte_alignment=128)
     smax_ptr = smem.allocate_array(cutlass.Float32, H, byte_alignment=128)
@@ -374,9 +331,7 @@ def _kernel(
     kv_ptr = m_kv.iterator
     idx_ptr = m_indices.iterator + qpos * topk
     out_ptr = m_out.iterator + qpos * (H * DV)
-    # Keep malformed metadata from repeating the final tile.  This scalar
-    # clamp lives in the CTA, so it adds no host-side tensor allocation or
-    # auxiliary CUDA launch on the production path.
+    # Keep malformed metadata from repeating the final tile.
     topk_length = cutlass.max(
         cutlass.min(m_topk_length.iterator[qpos], cutlass.Int32(topk)),
         cutlass.Int32(0),
@@ -476,9 +431,6 @@ def _kernel(
 
     mma_pv.set(warpgroup.Field.ACCUMULATE, True)
 
-    # Single-pass stable online softmax.  Each tile updates the per-head max,
-    # rescales the FP32 denominator and PV accumulators by exp(old_max-new_max),
-    # then accumulates probabilities relative to the new max.
     for tile in cutlass.range(n_tiles, unroll=1):
         buf = tile % 2
         next_buf = cutlass.Int32(1) - buf
@@ -580,9 +532,6 @@ def _kernel(
         else:
             _queue_pv_final(mma_pv, out_acc, v_frags, prob_mma_frag)
 
-    # Reduce the real-key denominator directly from its distributed register
-    # fragment and add the zero-value sink term.  This avoids a second 64x16
-    # FP32 spill plus the old 16-thread serial scan of 64 rows.
     warp_sum = _reduce_kq_fragment_heads(sum_acc, lambda x, y: x + y)
     lane_partial = tidx % 32
     if lane_partial < 4:
@@ -691,8 +640,6 @@ def _validate_inputs(
     attn_sink: torch.Tensor,
     sm_scale: float,
 ) -> None:
-    """Validate the allocation-free DSV4 H16 launch contract."""
-
     if q.ndim != 3 or q.shape[1] not in (H, 64) or q.shape[2] != DQK:
         raise ValueError(f"q must have shape [TQ, 16|64, 512], got {tuple(q.shape)}")
     if kv.ndim != 2 or kv.shape[1] != DQK:

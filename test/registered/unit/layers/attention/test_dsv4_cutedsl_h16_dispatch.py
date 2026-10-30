@@ -53,13 +53,13 @@ class TestDSV4CutedslH16Dispatch(CustomTestCase):
                 (batch, "forward_mode", ForwardMode.DRAFT_EXTEND_V2),
                 (batch, "_original_forward_mode", ForwardMode.TARGET_VERIFY),
                 (batch, "tbo_parent_token_range", (0, 1)),
-                (mod.is_cp_active, "return_value", True),
-                (mod.is_in_breakable_cuda_graph, "return_value", True),
-                (mod.is_in_tc_piecewise_cuda_graph, "return_value", True),
+                (mod, "is_cp_active", mock.Mock(return_value=True)),
+                (mod, "is_in_breakable_cuda_graph", mock.Mock(return_value=True)),
+                (mod, "is_in_tc_piecewise_cuda_graph", mock.Mock(return_value=True)),
                 (
-                    mod.get_tc_piecewise_forward_context,
-                    "return_value",
-                    SimpleNamespace(full_graph=True),
+                    mod,
+                    "get_tc_piecewise_forward_context",
+                    mock.Mock(return_value=SimpleNamespace(full_graph=True)),
                 ),
             ):
                 with self.subTest(field=field), mock.patch.object(target, field, value):

@@ -171,7 +171,6 @@ DSV4_CUTEDSL_H16_PREFILL_BACKEND = "cutedsl_h16"
 def _use_dsv4_cutedsl_h16_forward(
     dsv4_prefill_backend: str, forward_batch: ForwardBatch
 ) -> bool:
-    """Whether this forward can use the eager-only native-H16 path."""
     if dsv4_prefill_backend != DSV4_CUTEDSL_H16_PREFILL_BACKEND:
         return False
     if (
@@ -4576,9 +4575,7 @@ class DeepseekV4AttnBackend(
                     combined_indices.shape[1],
                 )
                 self._cutedsl_h16_prefill_log_emitted = True
-            # The model normally supplies an H64 padded Q whose first 16 heads
-            # are live. The kernel returns compact H16; the model's subsequent
-            # ``o[:, :logical_heads, :]`` slice therefore remains valid.
+            # H64-padded Q returns compact H16, so o[:, :logical_heads] stays valid.
             return cute_sparse_mla_h16_fwd(
                 q=q_flat,
                 kv=kv.squeeze(1),
