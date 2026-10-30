@@ -556,6 +556,7 @@ class AnthropicServing:
             "model": anthropic_request.model,
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
+            "cache_salt": anthropic_request.cache_salt,
             **anthropic_request.pd_routing_kwargs(),
         }
 

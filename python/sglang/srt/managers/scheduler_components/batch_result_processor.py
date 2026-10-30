@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 
@@ -140,6 +141,7 @@ class SchedulerBatchResultProcessor:
     tree_cache: BasePrefixCache
     hisparse_coordinator: Optional[HiSparseCoordinator]
     req_to_token_pool: ReqToTokenPool
+    kv_weight_version_tracker: Optional[KvWeightVersionTracker]
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
     metrics_collector: SchedulerMetricsCollector
     metrics_reporter: SchedulerMetricsReporter
@@ -328,6 +330,9 @@ class SchedulerBatchResultProcessor:
             if result.indexer_topk_output is not None:
                 result.indexer_topk_output.finalize()
                 result.indexer_topk_output = None
+            if (record := result.kv_weight_version_record) is not None:
+                record.finalize(tracker=self.kv_weight_version_tracker)
+                result.kv_weight_version_record = None
 
             (
                 logits_output,
@@ -403,6 +408,8 @@ class SchedulerBatchResultProcessor:
 
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
+                    if (x := self.kv_weight_version_tracker) is not None:
+                        x.fill_req_prefill_weight_versions(req)
 
                     if discard_finish_reason is not None:
                         req.request_finish(discard_finish_reason)
@@ -508,7 +515,7 @@ class SchedulerBatchResultProcessor:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
 
-            embeddings = self._convert_embeddings(result=result)
+            embeddings = self._convert_embeddings(result=result, batch=batch)
             phs = result.pooled_hidden_states
 
             if phs is not None:
@@ -532,11 +539,15 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_completion_time()
                     continue
 
-                req.embedding = embeddings[i]
+                req.embedding = self._convert_embedding_for_response(
+                    embeddings[i], req.encoding_format
+                )
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
+                    if (x := self.kv_weight_version_tracker) is not None:
+                        x.fill_req_prefill_weight_versions(req)
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
                     req.update_finish_state()
@@ -567,7 +578,9 @@ class SchedulerBatchResultProcessor:
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
 
-    def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
+    def _convert_embeddings(
+        self, *, result: EmbeddingBatchResult, batch: ScheduleBatch
+    ) -> list:
         is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
         embeddings = result.embeddings
@@ -580,11 +593,28 @@ class SchedulerBatchResultProcessor:
             for i in range(batch_ids.shape[0]):
                 embeddings[batch_ids[i].item()][token_ids[i].item()] = values[i].item()
         else:
-            if isinstance(embeddings, torch.Tensor):
+            keep_tensors = any(
+                not req.is_retracted
+                and req.encoding_format is not None
+                and req.encoding_format.lower() != "float"
+                for req in batch.reqs
+            )
+            if keep_tensors:
+                embeddings = [tensor.detach().cpu() for tensor in embeddings]
+            elif isinstance(embeddings, torch.Tensor):
                 embeddings = embeddings.tolist()
             else:
                 embeddings = [tensor.tolist() for tensor in embeddings]
         return embeddings
+
+    @staticmethod
+    def _convert_embedding_for_response(
+        embedding: Union[torch.Tensor, List[float]],
+        encoding_format: Optional[str],
+    ) -> Union[torch.Tensor, List[float]]:
+        if encoding_format is not None and encoding_format.lower() != "float":
+            return embedding
+        return embedding.tolist() if isinstance(embedding, torch.Tensor) else embedding
 
     def move_logprobs_to_cpu(
         self,
@@ -1021,6 +1051,9 @@ class SchedulerBatchResultProcessor:
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
+        if (record := result.kv_weight_version_record) is not None:
+            record.finalize(tracker=self.kv_weight_version_tracker)
+            result.kv_weight_version_record = None
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,

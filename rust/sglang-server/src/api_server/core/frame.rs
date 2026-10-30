@@ -12,7 +12,7 @@ use sglang_api_types::api::v1 as api;
 use super::CoreError;
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
 use crate::message::response::{
-    CachedTokensDetails, ChunkEvent, ChunkExtras, CustomizedInfo, WeightVersionSpan,
+    CachedTokensDetails, ChunkEvent, ChunkExtras, CustomizedInfo, RequestStats, WeightVersionSpan,
 };
 use crate::message::types::TokenIds;
 
@@ -182,6 +182,10 @@ impl CoreOutput {
         if delta_extras.cached_tokens_details.is_some() {
             extras.cached_tokens_details = delta_extras.cached_tokens_details.clone();
         }
+        // A finished request's stats ride its terminal output.
+        if delta_extras.request_stats.is_some() {
+            extras.request_stats = delta_extras.request_stats.clone();
+        }
     }
 
     /// This delta as an incremental stream frame reports it, once folded into
@@ -249,6 +253,12 @@ impl CoreOutput {
     pub(crate) fn scheduler_decode_latency(&self) -> Option<std::time::Duration> {
         let seconds = self.extras.as_deref()?.decode_latency?;
         std::time::Duration::try_from_secs_f64(seconds).ok()
+    }
+
+    /// Move a finished request's stats out, for native `/generate`, which
+    /// reports them in `meta_info` (the schema does not model them).
+    pub(crate) fn take_request_stats(&mut self) -> Option<RequestStats> {
+        self.extras.as_deref_mut()?.request_stats.take()
     }
 
     /// One `/generate` frame. `index` is the batch position (batch form only);
@@ -634,16 +644,18 @@ mod tests {
         assert_eq!(opt_texts(&texts), Some(texts.as_slice()));
     }
 
-    /// The weight-version, media-count and cached-token-split columns, as
-    /// Python's `push_generation` and `push_abort` send them, render the
-    /// `meta_info` keys Python's TokenizerManager derives from the same values
-    /// (`testdata/frame_metadata.json`, built by
+    /// The weight-version, media-count, cached-token-split and request-stats
+    /// columns, as Python's `push_generation` and `push_abort` send them,
+    /// render the `meta_info` keys Python's TokenizerManager derives from the
+    /// same values (`testdata/frame_metadata.json`, built by
     /// `build_rust_frame_metadata_fixture`): spans on a terminal frame, clipped
     /// to the completion the client received, the launch version before one,
     /// and only nonzero media counts, also behind a frame's logprob columns;
     /// the cached tokens by tier, with and without a storage tier attached,
-    /// on device without a split; the scheduler's decode latency reaches its
-    /// row, and only the abort is marked as ended outside the output stream.
+    /// on device without a split; a finished request's stats, keys in
+    /// Python's order, and none for a running request, a frame without the
+    /// column, or the abort; the scheduler's decode latency reaches its row,
+    /// and only the abort is marked as ended outside the output stream.
     #[test]
     fn frame_metadata_matches_python() {
         let keys = |output: &CoreOutput| {
@@ -665,7 +677,13 @@ mod tests {
         };
         let launch = Some(Arc::<str>::from("launch"));
 
-        for name in ["batch", "logprob_batch", "host_tier", "storage_tier"] {
+        for name in [
+            "batch",
+            "logprob_batch",
+            "host_tier",
+            "storage_tier",
+            "request_stats",
+        ] {
             let (batch, events) = super::frame_metadata_case(name);
             assert_eq!(events.len(), batch["meta_info"].as_object().unwrap().len());
             for event in events {
@@ -673,6 +691,24 @@ mod tests {
                 assert!(!event.extras.as_deref().is_some_and(|e| e.abort_output));
                 let completion_tokens = event.token_ids.len() as u64;
                 let mut output = CoreOutput::from(event);
+                let request_stats = output.take_request_stats();
+                let expected = &batch["request_stats"][&rid];
+                assert_eq!(
+                    request_stats
+                        .as_ref()
+                        .map(|RequestStats(stats)| stats.keys().collect()),
+                    expected
+                        .as_object()
+                        .map(|stats| stats.keys().collect::<Vec<_>>()),
+                    "{name} {rid}"
+                );
+                assert_eq!(
+                    request_stats.map_or(serde_json::Value::Null, |RequestStats(stats)| {
+                        serde_json::Value::Object(stats)
+                    }),
+                    *expected,
+                    "{name} {rid}"
+                );
                 output.weight_version = launch.clone();
                 output.completion_tokens = completion_tokens;
                 assert_eq!(keys(&output), batch["meta_info"][&rid], "{name} {rid}");
@@ -703,7 +739,12 @@ mod tests {
             ..Default::default()
         };
         let event = events.pop().unwrap();
-        assert!(event.extras.as_deref().is_some_and(|e| e.abort_output));
+        assert!(
+            event
+                .extras
+                .as_deref()
+                .is_some_and(|e| e.abort_output && e.request_stats.is_none())
+        );
         let mut delta = CoreOutput::from(event);
         delta.weight_version = launch;
         aborted.append_delta(&delta);
