@@ -1,12 +1,9 @@
 """Gate-routing tests for EAGLE verify: sampling vs. greedy (argmax).
 
-Guards the correctness contract of the ROCm fix in
-``eagle_utils._verify_uses_greedy``: on every non-HIP platform the gate must
-reduce byte-for-byte to the pre-patch predicate
-(``is_all_greedy or is_cpu or is_hip or is_xpu``), and HIP may take the
-sampling path only when rejection sampling is on and the batch isn't all-greedy.
-A regression that forced greedy on CUDA, or that let HIP sample without rejection
-sampling, would turn a case here red. Pure-boolean logic, so it runs on CPU CI.
+Guards the correctness contract of the ROCm target-only verifier in
+``eagle_utils._verify_uses_greedy``: HIP non-greedy requests use the sampling
+path with or without rejection sampling, while CPU/XPU remain greedy.
+Pure-boolean logic, so it runs on CPU CI.
 """
 
 import itertools
@@ -64,13 +61,11 @@ class TestEagleGateRouting(CustomTestCase):
                 f"from pre-patch ({got} != {expected})",
             )
 
-    def test_hip_samples_only_with_rejection_and_non_greedy(self):
-        # The single new sampling entry: HIP + rejection sampling + not all-greedy.
+    def test_hip_samples_for_any_non_greedy_request(self):
         self.assertFalse(self._gate(False, "hip", True))
-        # Every other HIP combination still commits greedy (argmax).
+        self.assertFalse(self._gate(False, "hip", False))
         self.assertTrue(self._gate(True, "hip", True))
         self.assertTrue(self._gate(True, "hip", False))
-        self.assertTrue(self._gate(False, "hip", False))
 
     def test_cuda_and_npu_keyed_on_all_greedy_only(self):
         # Both sample whenever the batch isn't all-greedy, regardless of the flag.
