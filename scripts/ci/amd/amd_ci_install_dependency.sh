@@ -408,8 +408,19 @@ elif [[ "${IMAGE_AITER_VERSION}" == "vnone" || "${IMAGE_AITER_VERSION}" == "v" ]
     NEED_REBUILD="true"
 elif [[ "${IMAGE_AITER_VERSION}" == "${REPO_AITER_COMMIT}" ]]; then
     echo "[CI-AITER-CHECK] AITER version matches"
-elif [[ "${IMAGE_AITER_VERSION}" =~ (dev|\+g[0-9a-f]+) ]]; then
-    # Dev/patched version (contains 'dev' or git hash) → preserve it
+elif [[ "${IMAGE_AITER_VERSION}" =~ \+g([0-9a-f]+) ]]; then
+    # Version carries the short commit it was built from (e.g. v0.1.26.dev144+g285579b62.d20261027).
+    # Compare it with the Dockerfile pin, so an image older than a pin bump gets the pinned AITER.
+    IMAGE_AITER_HASH="${BASH_REMATCH[1]}"
+    if [[ "${REPO_AITER_COMMIT}" == "${IMAGE_AITER_HASH}"* ]]; then
+        echo "[CI-AITER-CHECK] AITER commit matches: image=${IMAGE_AITER_HASH}, repo=${REPO_AITER_COMMIT} → skipping rebuild"
+    else
+        echo "[CI-AITER-CHECK] AITER commit mismatch: image=${IMAGE_AITER_HASH} (${IMAGE_AITER_VERSION}), repo=${REPO_AITER_COMMIT}"
+        echo "[CI-AITER-CHECK] The CI image was likely built before the Dockerfile AITER pin changed → rebuilding AITER at ${REPO_AITER_COMMIT} (this adds significant job time)"
+        NEED_REBUILD="true"
+    fi
+elif [[ "${IMAGE_AITER_VERSION}" =~ dev ]]; then
+    # Dev/patched version without a commit hash → preserve it
     echo "[CI-AITER-CHECK] Dev/patched version detected: ${IMAGE_AITER_VERSION} → skipping rebuild"
 else
     echo "[CI-AITER-CHECK] Version mismatch: image=${IMAGE_AITER_VERSION}, repo=${REPO_AITER_COMMIT}"
