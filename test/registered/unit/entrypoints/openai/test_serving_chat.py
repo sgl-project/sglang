@@ -14,6 +14,7 @@ import asyncio
 import copy
 import gc
 import json
+import sys
 import unittest
 import uuid
 from http import HTTPStatus
@@ -26,7 +27,7 @@ from tokenizers import models as tokenizer_models
 from tokenizers import pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 from transformers.utils.chat_template_utils import _compile_jinja_template
-from xgrammar import Grammar
+from xgrammar import Grammar, StructuralTag
 from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
@@ -42,6 +43,9 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
+)
+from sglang.srt.entrypoints.openai.tool_call_constraint_cache import (
+    ToolCallConstraintCache,
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -330,6 +334,34 @@ class TestChatTemplateCache(CustomTestCase):
         )
         self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 2)
         self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
+
+class TestToolCallConstraintCache(CustomTestCase):
+    def test_retained_bytes_stay_bounded_evicting_least_recently_used(self):
+        def tag(text):
+            return (
+                "structural_tag",
+                StructuralTag.model_validate(
+                    {"format": {"type": "const_string", "value": text}}
+                ),
+            )
+
+        entry = ToolCallConstraintCache(max_entries=8, max_bytes=1 << 20).put(
+            b"k", tag("x" * 1000)
+        )
+        size = sys.getsizeof(b"k") + sys.getsizeof(entry[1])
+        cache = ToolCallConstraintCache(max_entries=8, max_bytes=2 * size)
+        for key in (b"a", b"b"):
+            cache.put(key, tag("x" * 1000))
+        cache.get(b"a")
+        cache.put(b"c", tag("x" * 1000))
+
+        self.assertIsNotNone(cache.get(b"a"))
+        self.assertIsNone(cache.get(b"b"))
+        self.assertIsNotNone(cache.get(b"c"))
+        oversized = cache.put(b"d", tag("x" * 4000))
+        self.assertIsInstance(oversized[1], str)
+        self.assertIsNone(cache.get(b"d"))
 
 
 class TestPythonChatTemplateSegments(CustomTestCase):
@@ -2636,6 +2668,118 @@ class ServingChatTestCase(CustomTestCase):
                             )
                             self.assertEqual(accepted, allowed, name)
 
+    def test_cached_tool_call_constraint_rebuilds_on_any_build_input_change(self):
+        """A cached tool-call constraint equals a cold build, and changing any
+        tool field or request setting the build reads must rebuild it."""
+        self.chat.tool_call_parser = "qwen3_coder"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Weather lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string", "maxLength": 32}},
+                    "required": ["city"],
+                },
+                "strict": True,
+            },
+        }
+
+        def body(tool=tool, **fields):
+            return {
+                "model": "x",
+                "messages": [{"role": "user", "content": "hi"}],
+                "input_ids": [1, 2, 3],
+                "tools": [tool],
+                **fields,
+            }
+
+        def changed(path, value):
+            changed_tool = copy.deepcopy(tool)
+            *parents, leaf = path
+            node = changed_tool
+            for key in parents:
+                node = node[key]
+            node[leaf] = value
+            return changed_tool
+
+        def constraint(chat, request_body):
+            request = ChatCompletionRequest(**copy.deepcopy(request_body))
+            result = chat._process_messages(request, is_multimodal=False)
+            return request.to_sampling_params(
+                stop=[],
+                model_generation_config={},
+                tool_call_constraint=result.tool_call_constraint,
+            ).get("structural_tag")
+
+        def cold(request_body):
+            chat = OpenAIServingChat(self.tm, self.template_manager)
+            chat.tool_call_parser = self.chat.tool_call_parser
+            chat.reasoning_parser = self.chat.reasoning_parser
+            chat._reasoning_detector = self.chat._reasoning_detector
+            return constraint(chat, request_body)
+
+        tool_changes = {
+            "type": changed(("type",), "custom"),
+            "defer_loading": changed(("defer_loading",), True),
+            "function.name": changed(("function", "name"), "get_time"),
+            "function.description": changed(("function", "description"), "Other"),
+            "function.parameters": changed(
+                ("function", "parameters", "properties", "city", "maxLength"), 8
+            ),
+            "function.strict": changed(("function", "strict"), False),
+            "function.defer_loading": changed(("function", "defer_loading"), True),
+            "function.key_order": {
+                "type": "function",
+                "function": dict(reversed(list(tool["function"].items()))),
+            },
+        }
+        self.assertEqual(
+            set(tool_changes),
+            {name for name in Tool.model_fields if name != "function"}
+            | {f"function.{name}" for name in Function.model_fields},
+        )
+        variants = {
+            name: body(changed_tool) for name, changed_tool in tool_changes.items()
+        }
+        variants["tool_choice"] = body(
+            tool_choice={"type": "function", "function": {"name": "get_weather"}}
+        )
+        variants["parallel_tool_calls"] = body(parallel_tool_calls=False)
+
+        with patch.object(
+            FunctionCallParser,
+            "get_structure_constraint",
+            autospec=True,
+            side_effect=FunctionCallParser.get_structure_constraint,
+        ) as build:
+            first = constraint(self.chat, body())
+            self.assertEqual(constraint(self.chat, body()), first)
+            self.assertEqual(build.call_count, 1)
+            self.assertEqual(first, cold(body()))
+
+            for name, request_body in variants.items():
+                with self.subTest(changed=name):
+                    calls = build.call_count
+                    self.assertEqual(
+                        constraint(self.chat, request_body), cold(request_body)
+                    )
+                    self.assertEqual(build.call_count, calls + 2)
+            with self.subTest(changed="tool strict level"):
+                with envs.SGLANG_TOOL_STRICT_LEVEL.override(2):
+                    calls = build.call_count
+                    constraint(self.chat, body())
+                    self.assertEqual(build.call_count, calls + 1)
+            with self.subTest(changed="reasoning detector"):
+                self.chat.reasoning_parser = "qwen3"
+                self.chat._reasoning_detector = ReasoningParser(
+                    model_type="qwen3", stream_reasoning=True
+                ).detector
+                stripped = constraint(self.chat, body())
+                self.assertNotEqual(stripped, first)
+                self.assertEqual(stripped, cold(body()))
+
     def test_xgrammar_tag_omits_reasoning_when_parser_owns_it(self):
         """ReasonerGrammarBackend owns the thinking prefix when a parser is set."""
         self.template_manager.chat_template_name = None
@@ -3557,7 +3701,7 @@ class ServingChatTestCase(CustomTestCase):
                             else:
                                 self.assertEqual(constraint[0], "json_schema")
                                 self.assertEqual(
-                                    constraint[1]["type"],
+                                    json.loads(constraint[1])["type"],
                                     "object" if choice == named else "array",
                                 )
 
