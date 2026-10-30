@@ -31,11 +31,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
 )
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeReq:
     release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
+    request_finish = Req.request_finish
 
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
@@ -76,6 +77,7 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.enable_hicache_storage = False
     s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
+    s.rust_server = None
     s.beam_coordinator = MagicMock()
     s.running_batch = _batch(list(running_reqs))
     s.last_batch = _batch(list(last_batch_reqs)) if last_batch_reqs else None
