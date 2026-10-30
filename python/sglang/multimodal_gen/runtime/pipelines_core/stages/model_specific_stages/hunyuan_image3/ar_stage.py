@@ -1357,9 +1357,7 @@ class HunyuanImage3AR(PipelineStage):
                     ),
                 ):
                     # Re-embed the full input_ids every step; shortening produces garbage.
-                    hidden_states = self.ar_model.model.get_input_embeddings(
-                        input_ids
-                    )
+                    hidden_states = self.ar_model.model.get_input_embeddings(input_ids)
                     hidden_states = self._instantiate_vae_tokens_first_step(
                         hidden_states,
                         latent_model_input,

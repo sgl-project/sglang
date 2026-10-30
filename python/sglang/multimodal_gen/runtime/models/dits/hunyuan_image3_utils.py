@@ -366,7 +366,7 @@ def _masked_sdpa(query, key, value, attention_mask):
         is_causal=False,
         scale=1.0 / (query.shape[-1] ** 0.5),
     )
-    return attn_output.transpose(1, 2)
+    return attn_output.transpose(1, 2).contiguous()
 
 
 class ImageKVCacheManager:
