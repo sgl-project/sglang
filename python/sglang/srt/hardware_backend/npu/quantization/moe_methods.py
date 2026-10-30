@@ -299,7 +299,12 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         "low_latency_dispatcher_output_dtype": "mxfp8",
     }
 
-    def __init__(self, dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT):
+    def __init__(
+        self,
+        dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT,
+        *,
+        weight_prefix: Optional[str] = None,
+    ):
         super().__init__(quant_config=None)
         self.dynamic_quant_kwargs = dynamic_quant_kwargs
         # Fused gmm1 (matmul + swiglu + requant in one aclnn kernel). The v2 op
@@ -307,8 +312,8 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         # (llm/probe_mxfp4_gmm_swiglu_quant.py: same numerics as the unfused
         # chain modulo the output fp8 requant, which the unfused chain also
         # applies before gmm2).
-        self.use_fused_gmm1 = True
-        self.fused_matmul = GroupedMatmulSwigluQuant()
+        self.use_fused_gmm1 = weight_prefix != "w2"
+        self.fused_matmul = GroupedMatmulSwigluQuant() if self.use_fused_gmm1 else None
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(
             quant_dtype=torch.float8_e4m3fn
         )

@@ -129,8 +129,8 @@ class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
                 f"'ascend', got {backend.value!r}."
             )
 
-        layer.w13_kernel = NPUW4A8MXFP4MoEMethod()
-        layer.w2_kernel = NPUW4A8MXFP4MoEMethod()
+        layer.w13_kernel = NPUW4A8MXFP4MoEMethod(weight_prefix="w13")
+        layer.w2_kernel = NPUW4A8MXFP4MoEMethod(weight_prefix="w2")
         moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)

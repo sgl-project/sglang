@@ -13,9 +13,15 @@ from sglang.srt.hardware_backend.npu.quantization import (
     moe_methods,
     online_moe_methods,
 )
-from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    LinearBase,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.moe_runner import ascend as ascend_runner
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
@@ -69,6 +75,47 @@ class TestW4A8Linear(unittest.TestCase):
                         config.get_quant_method(
                             layer, "model.layers.0.self_attn.o_proj"
                         )
+
+    def test_alignment_uses_the_bound_group_local_k(self):
+        prefix = "model.layers.0.self_attn.o_proj"
+        for cls, size, tp, aligned in (
+            (RowParallelLinear, 4352, 16, False),
+            (RowParallelLinear, 4096, 16, True),
+            (RowParallelLinear, 4352, 1, True),
+            (RowParallelLinear, 4304, 1, False),
+            (ColumnParallelLinear, 4352, 16, True),
+            (ReplicatedLinear, 4352, 16, True),
+        ):
+            layer = cls.__new__(cls)
+            torch.nn.Module.__init__(layer)
+            layer.input_size = size
+            layer.tp_group = SimpleNamespace(rank=0, size=tp)
+            self.assertFalse(hasattr(layer, "input_size_per_partition"))
+            with (
+                self.subTest(layer=cls, size=size, tp=tp),
+                patch(
+                    "sglang.srt.layers.quantization.npu_mxfp4.is_npu", return_value=True
+                ),
+                patch(
+                    "sglang.srt.distributed.utils.get_group_rank_size",
+                    return_value=(0, tp),
+                ) as group,
+            ):
+                method = Mxfp4W4A8Config().get_quant_method(layer, prefix)
+                expected = (
+                    linear_method_npu.NPUMXFP4W4A8LinearMethod
+                    if aligned
+                    else UnquantizedLinearMethod
+                )
+                self.assertIsInstance(method, expected)
+                if cls is RowParallelLinear:
+                    group.assert_called_once_with(layer.tp_group)
+                else:
+                    group.assert_not_called()
+                ignored = Mxfp4W4A8Config(ignored_layers=[prefix]).get_quant_method(
+                    layer, prefix
+                )
+                self.assertIsInstance(ignored, UnquantizedLinearMethod)
 
     def test_weight_policy_and_packed_layout(self):
         for dtype in (torch.bfloat16, torch.float16):
@@ -208,6 +255,10 @@ class TestW4A8MoE(unittest.TestCase):
                         getattr(layer, f"{prefix}_kernel"),
                         moe_methods.NPUW4A8MXFP4MoEMethod,
                     )
+                self.assertTrue(layer.w13_kernel.use_fused_gmm1)
+                self.assertIsNotNone(layer.w13_kernel.fused_matmul)
+                self.assertFalse(layer.w2_kernel.use_fused_gmm1)
+                self.assertIsNone(layer.w2_kernel.fused_matmul)
                 self.assertIs(config.layer, layer)
                 runner.assert_called_once_with(MoeRunnerBackend.ASCEND, config)
                 self.assertIsNone(method._aiter_runner)
@@ -221,6 +272,143 @@ class TestW4A8MoE(unittest.TestCase):
                     self.assertEqual(weight.shape, shape)
                     self.assertEqual(weight.dtype, torch.bfloat16)
                     self.assertFalse(hasattr(layer, f"{prefix}_weight_scale"))
+
+    def test_prefix_constructor_preserves_positional_quant_kwargs(self):
+        # The existing first positional argument must remain the quant policy.
+        legacy = moe_methods.NPUW4A8MXFP4MoEMethod(None)
+        self.assertIsNone(legacy.dynamic_quant_kwargs)
+        self.assertTrue(legacy.use_fused_gmm1)
+        policy = {"dst_type": torch.float8_e4m3fn}
+        down = moe_methods.NPUW4A8MXFP4MoEMethod(policy, weight_prefix="w2")
+        self.assertIs(down.dynamic_quant_kwargs, policy)
+        self.assertFalse(down.use_fused_gmm1)
+        self.assertIsNone(down.fused_matmul)
+
+    def test_offline_entries_bind_per_matmul_kernels(self):
+        from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
+            NPUW4A8MXFP4FusedMoEMethod,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a8_mxfp4_moe import (
+            NPUCompressedTensorsW4A8mxfp4MoE,
+        )
+        from sglang.srt.layers.quantization.modelslim.schemes.modelslim_w4a8_mxfp4_moe import (
+            ModelSlimW4A8MXFP4MoE,
+        )
+
+        deepseek = NPUW4A8MXFP4FusedMoEMethod()
+        entries = (
+            SimpleNamespace(
+                w13_kernel=ModelSlimW4A8MXFP4MoE({}, "w13").kernel,
+                w2_kernel=ModelSlimW4A8MXFP4MoE({}, "w2").kernel,
+            ),
+            deepseek,
+            NPUCompressedTensorsW4A8mxfp4MoE(),
+        )
+        for entry in entries:
+            with self.subTest(entry=type(entry)):
+                self.assertTrue(entry.w13_kernel.use_fused_gmm1)
+                self.assertIsNotNone(entry.w13_kernel.fused_matmul)
+                self.assertFalse(entry.w2_kernel.use_fused_gmm1)
+                self.assertIsNone(entry.w2_kernel.fused_matmul)
+        self.assertIsNone(deepseek.w13_kernel.dynamic_quant_kwargs)
+        self.assertIsNone(deepseek.w2_kernel.dynamic_quant_kwargs)
+
+    def test_fp8_config_fp4_expert_entry_binds_per_matmul_kernels(self):
+        from sglang.srt.layers.quantization import fp8
+
+        method = fp8.Fp8MoEMethod.__new__(fp8.Fp8MoEMethod)
+        method.is_fp4_expert = True
+        layer = torch.nn.Module()
+        config = SimpleNamespace(layer=None)
+        with (
+            patch.object(fp8, "_is_npu", True),
+            patch.object(fp8, "MoeRunner") as runner,
+        ):
+            method.create_moe_runner(layer, config)
+            runner.assert_called_once_with(MoeRunnerBackend.ASCEND, config)
+        self.assertTrue(layer.w13_kernel.use_fused_gmm1)
+        self.assertIsNotNone(layer.w13_kernel.fused_matmul)
+        self.assertFalse(layer.w2_kernel.use_fused_gmm1)
+        self.assertIsNone(layer.w2_kernel.fused_matmul)
+
+    @staticmethod
+    def _runner_config(layer, **kwargs):
+        return SimpleNamespace(
+            **{
+                "layer": layer,
+                "activation": "silu",
+                "swiglu_limit": None,
+                "gemm1_alpha": None,
+                "gemm1_clamp_limit": None,
+                **kwargs,
+            }
+        )
+
+    def test_runner_construction_and_execution_both_consult_w13(self):
+        x = torch.zeros(3, 64, dtype=torch.bfloat16)
+        scale = torch.zeros(3, 1, 2, dtype=torch.uint8)
+        for fused in (False, True):
+            layer = SimpleNamespace(
+                w13_kernel=moe_methods.NPUW4A8MXFP4MoEMethod(weight_prefix="w13"),
+                w2_kernel=moe_methods.NPUW4A8MXFP4MoEMethod(weight_prefix="w2"),
+            )
+            self.assertIsNone(layer.w2_kernel.fused_matmul)
+            layer.w13_kernel.use_fused_gmm1 = fused
+            # Deliberately disagree: gmm2 must not select the gmm1 activation path.
+            layer.w2_kernel.use_fused_gmm1 = not fused
+            with (
+                self.subTest(fused=fused),
+                patch.object(
+                    ascend_runner,
+                    "get_moe_a2a_backend",
+                    return_value=MoeA2ABackend.NONE,
+                ),
+            ):
+                runner = ascend_runner.AscendRunnerCore(self._runner_config(layer))
+                self.assertEqual(runner.activation is None, fused)
+                if not fused:
+                    runner.activation._apply_activation = Mock(return_value=(x, None))
+                with (
+                    patch.object(layer.w13_kernel, "apply", return_value=x) as plain,
+                    patch.object(
+                        layer.w13_kernel,
+                        "apply_fused_gmm1_swiglu",
+                        return_value=(x, scale),
+                    ) as fusion,
+                    patch.object(layer.w2_kernel, "apply", return_value=x) as down,
+                ):
+                    result = runner.run(
+                        SimpleNamespace(
+                            hidden_states=x,
+                            hidden_states_scale=None,
+                            expert_tokens=torch.tensor([1, 2]),
+                            group_list_type=1,
+                        ),
+                        SimpleNamespace(),
+                        {},
+                    )
+                    self.assertIs(result.hidden_states, x)
+                    self.assertEqual(fusion.call_count, int(fused))
+                    self.assertEqual(plain.call_count, int(not fused))
+                    self.assertIs(
+                        down.call_args.kwargs["pertoken_scale"],
+                        scale if fused else None,
+                    )
+
+    def test_clamp_and_situ_still_disable_w4a8_fusion(self):
+        layer = SimpleNamespace(
+            w13_kernel=moe_methods.NPUW4A8MXFP4MoEMethod(weight_prefix="w13"),
+            w2_kernel=moe_methods.NPUW4A8MXFP4MoEMethod(weight_prefix="w2"),
+        )
+        config = self._runner_config(layer, swiglu_limit=7.0)
+        self.assertFalse(ascend_runner._uses_fused_gmm1(layer.w13_kernel, config))
+        runner = ascend_runner.AscendRunnerCore(config)
+        self.assertIsInstance(runner.activation, ascend_runner.NPUSwigluMxfp8Quant)
+        self.assertFalse(
+            ascend_runner._uses_fused_gmm1(
+                layer.w13_kernel, self._runner_config(layer, activation="situ")
+            )
+        )
 
     def test_online_policy_and_offline_layout_without_requantization(self):
         packed = torch.arange(2 * 96 * 64).to(torch.uint8).reshape(2, 96, 64)
