@@ -33,10 +33,14 @@ def tuner_dir(explicit: str | None) -> Path:
         return path if path.is_dir() else path.parent
     import sglang
 
-    repo = Path(sglang.__file__).resolve().parents[2]  # <repo>/python/sglang/__init__.py
+    repo = (
+        Path(sglang.__file__).resolve().parents[2]
+    )  # <repo>/python/sglang/__init__.py
     path = repo / "benchmark" / "kernels" / "fused_moe_triton"
     if not (path / "tuning_fused_moe_triton.py").is_file():
-        sys.exit(f"tuner not found at {path}; pass --tuner (needs an sglang source checkout)")
+        sys.exit(
+            f"tuner not found at {path}; pass --tuner (needs an sglang source checkout)"
+        )
     return path
 
 
@@ -50,40 +54,65 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--draft", required=True, help="DFlash/DSpark draft export (config.json + weights)")
     parser.add_argument(
-        "--block-size", type=int, default=8,
+        "--draft",
+        required=True,
+        help="DFlash/DSpark draft export (config.json + weights)",
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=8,
         help="the server's --speculative-dspark-block-size: draft tokens per request per step",
     )
     parser.add_argument(
-        "--concurrency", type=int, nargs="+", default=DEFAULT_CONCURRENCY,
+        "--concurrency",
+        type=int,
+        nargs="+",
+        default=DEFAULT_CONCURRENCY,
         help="concurrent requests to cover; tokens per step = block size x concurrency",
     )
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument(
-        "--dtype", default="auto", choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int4_w4a16"]
+        "--dtype",
+        default="auto",
+        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int4_w4a16"],
     )
     parser.add_argument(
-        "--output-dir", default=None,
+        "--output-dir",
+        default=None,
         help="config root; default is sglang's in-tree one (picked up automatically), "
         "anything else needs SGLANG_MOE_CONFIG_DIR=<dir> on the server",
     )
-    parser.add_argument("--tuner", default=None, help="tuning_fused_moe_triton.py or its directory")
-    parser.add_argument("--dry-run", action="store_true", help="print the plan and the tuner command only")
+    parser.add_argument(
+        "--tuner", default=None, help="tuning_fused_moe_triton.py or its directory"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the plan and the tuner command only",
+    )
     args = parser.parse_args()
 
     import triton
+
     from sglang.srt.models.dflash import parse_dflash_moe_spec
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     config = get_config(args.draft, trust_remote_code=True)
     spec = parse_dflash_moe_spec(config)
     if spec is None:
-        sys.exit(f"{args.draft}: the config has no routed experts (dense draft), nothing to tune")
+        sys.exit(
+            f"{args.draft}: the config has no routed experts (dense draft), nothing to tune"
+        )
     hidden_size = int(config.hidden_size)
     batch_sizes = sorted({args.block_size * c for c in args.concurrency})
     version_dir = f"triton_{triton.__version__.replace('.', '_')}"
-    root = Path(args.output_dir).expanduser().resolve() if args.output_dir else in_tree_config_root()
+    root = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else in_tree_config_root()
+    )
     dest_dir = root / "configs" / version_dir
     tdir = tuner_dir(args.tuner)
 
@@ -104,9 +133,17 @@ def main() -> int:
         "torch_dtype": "bfloat16",
     }
     cmd = [
-        sys.executable, "tuning_fused_moe_triton.py", "--model", "<stub>",
-        "--tp-size", str(args.tp_size), "--dtype", args.dtype, "--tune",
-        "--batch-sizes", *map(str, batch_sizes),
+        sys.executable,
+        "tuning_fused_moe_triton.py",
+        "--model",
+        "<stub>",
+        "--tp-size",
+        str(args.tp_size),
+        "--dtype",
+        args.dtype,
+        "--tune",
+        "--batch-sizes",
+        *map(str, batch_sizes),
     ]
     print(
         f"draft {args.draft}: E={spec.num_experts} top-k={spec.top_k} N={spec.intermediate_size} "
@@ -114,7 +151,9 @@ def main() -> int:
     )
     print(f"tokens per step to tune: {batch_sizes}")
     print(f"tuner: {tdir}")
-    print(f"destination: {dest_dir}/E={spec.num_experts},N={spec.intermediate_size},device_name=<gpu>.json")
+    print(
+        f"destination: {dest_dir}/E={spec.num_experts},N={spec.intermediate_size},device_name=<gpu>.json"
+    )
     print("command (cwd = tuner dir):", " ".join(cmd))
     if args.dry_run:
         return 0
@@ -125,7 +164,10 @@ def main() -> int:
         before = {p: p.stat().st_mtime for p in tdir.glob("E=*.json")}
         subprocess.run(cmd, cwd=tdir, check=True)
         produced = [
-            p for p in tdir.glob(f"E={spec.num_experts},N={spec.intermediate_size},*.json")
+            p
+            for p in tdir.glob(
+                f"E={spec.num_experts},N={spec.intermediate_size},*.json"
+            )
             if p not in before or p.stat().st_mtime > before[p]
         ]
         if not produced:
@@ -138,7 +180,9 @@ def main() -> int:
     if args.output_dir:
         print(f"start the server with SGLANG_MOE_CONFIG_DIR={root}")
     else:
-        print("in-tree: the next server start uses it (the 'Using default MoE kernel config' warning goes away)")
+        print(
+            "in-tree: the next server start uses it (the 'Using default MoE kernel config' warning goes away)"
+        )
     return 0
 
 
