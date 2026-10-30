@@ -113,7 +113,9 @@ class NonCudaDecoderMixin:
             return
         self._next_layer = None
         if isinstance(next_layer, NonCudaDecoderMixin) and next_layer.engram is None:
-            self._next_layer = next_layer
+            # A plain reference, not a submodule: registering it renames the next layer's
+            # parameters to `layers.{i}._next_layer.*`, which later weight loads miss.
+            object.__setattr__(self, "_next_layer", next_layer)
 
     def refresh_mhc_norm_weight_cache(self):
         super().refresh_mhc_norm_weight_cache()
