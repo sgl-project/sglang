@@ -778,7 +778,7 @@ class TestNixlEarlySendWaitEvent(CustomTestCase):
         sender.conclude_state = None
         sender._transfer_start_time = None
         sender.trace_ctx = MagicMock()
-        sender._prepare_send_indices = lambda kv_indices, state_indices: (
+        sender._prepare_send_indices = lambda kv_indices, state_indices, event: (
             kv_indices,
             slice(0, len(kv_indices)),
             False,

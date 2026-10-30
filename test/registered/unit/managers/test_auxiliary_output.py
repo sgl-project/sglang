@@ -612,6 +612,9 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
         maybe_send_health_check_signal=Mock(),
     )
+    scheduler._send_last_kv_chunks = lambda reqs: (
+        SchedulerDisaggregationPrefillMixin._send_last_kv_chunks(scheduler, reqs)
+    )
 
     SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
         scheduler,

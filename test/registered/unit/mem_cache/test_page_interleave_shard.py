@@ -1888,6 +1888,8 @@ class TestShardSendFilter(CustomTestCase):
                 kv_mgr=SimpleNamespace(kv_shard_rank=rank, kv_shard_size=N),
                 curr_idx=0,
                 num_kv_indices=len(pages),
+                # Indices already on the host: send() filters them itself.
+                _defers_shard_filter=lambda indices_event: False,
             )
             skips = [
                 CommonKVSender._prepare_send_indices(sender, chunk)[3]

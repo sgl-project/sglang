@@ -4780,8 +4780,7 @@ class Scheduler(
             # A load-back submitted in this build may still be writing pages that a
             # later request matched as device prefix; don't early-send them (#44070).
             load_pending = batch.hicache_consumer_index >= 0
-            for req in batch.reqs:
-                self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
+            self.send_cached_prefix_chunks(batch.reqs, allow_send=not load_pending)
 
         # Run forward
         if self.is_generation:

@@ -65,6 +65,7 @@ def _make_sender(kv_mgr):
     sender._transfer_metric = KVTransferMetric()
     sender._transfer_num_kv_indices = 0
     sender._transfer_num_state_indices = 0
+    sender._unfiltered_shard_indices = []
     sender.kv_mgr = kv_mgr
     return sender
 

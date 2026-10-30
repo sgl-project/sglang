@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
+    wait_ready_event,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
@@ -2107,6 +2108,10 @@ class CommonKVManager(BaseKVManager):
 
 
 class CommonKVSender(BaseKVSender):
+    # Whether the backend's transfer worker applies the KV-shard page filter
+    # (TransferKVChunk.shard_filter) after waiting for the index copy.
+    defers_shard_filter = False
+
     def __init__(
         self,
         mgr: CommonKVManager,
@@ -2122,6 +2127,9 @@ class CommonKVSender(BaseKVSender):
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
         self._transfer_num_state_indices = 0
+        # Unfiltered deferred-shard pages with their copy events; counted once
+        # the metric is read.
+        self._unfiltered_shard_indices: List[Tuple[npt.NDArray, object]] = []
         self._transfer_start_time: Optional[float] = None
         self._early_send_wait_event: Optional[object] = None
         self.trace_ctx = TraceNullContext()
@@ -2236,6 +2244,15 @@ class CommonKVSender(BaseKVSender):
         return num_pages > 0 or last_chunk
 
     def get_transfer_metric(self) -> KVTransferMetric:
+        for pages, indices_event in self._unfiltered_shard_indices:
+            # Normally landed by now: the transfer worker read them first.
+            wait_ready_event(indices_event)
+            self._transfer_num_kv_indices += int(
+                np.count_nonzero(
+                    pages % self.kv_mgr.kv_shard_size == self.kv_mgr.kv_shard_rank
+                )
+            )
+        self._unfiltered_shard_indices = []
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
         total_bytes += (
             self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
@@ -2249,29 +2266,51 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List],
+        indices_event: Optional[object] = None,
     ):
-        self._transfer_num_kv_indices += len(kv_indices)
+        if self._defers_shard_filter(indices_event):
+            self._unfiltered_shard_indices.append((kv_indices, indices_event))
+        else:
+            self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
             for component_indices in state_indices:
                 if component_indices is not None:
                     self._transfer_num_state_indices += len(component_indices)
 
+    def _defers_shard_filter(self, indices_event: Optional[object]) -> bool:
+        return (
+            self.defers_shard_filter
+            and indices_event is not None
+            and self.kv_mgr.kv_shard_size > 1
+        )
+
     def _prepare_send_indices(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        indices_event: Optional[object] = None,
     ) -> Tuple[npt.NDArray[np.int32], slice, bool, bool]:
         """Common pre-processing for send(): index tracking and CP-rank handling.
 
         Returns:
             (kv_indices, index_slice, is_last_chunk, should_skip)
             If should_skip is True, the caller should return immediately.
+
+        ``indices_event`` guards index values still being copied to the host;
+        a branch that reads values must wait on it first. The CP filter is
+        positional and reads none.
         """
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if self.kv_mgr.kv_shard_size > 1:
+        if self._defers_shard_filter(indices_event):
+            # The transfer worker filters once the copy lands; waiting here
+            # would hold the scheduler until the in-flight forward completes.
+            pass
+        elif self.kv_mgr.kv_shard_size > 1:
+            if indices_event is not None:
+                wait_ready_event(indices_event)
             kv_indices, index_slice = filter_kv_indices_for_shard_rank(
                 kv_indices=kv_indices,
                 index_slice=index_slice,
@@ -2311,7 +2350,7 @@ class CommonKVSender(BaseKVSender):
             return
 
         kv_indices, index_slice, is_last_chunk, should_skip = (
-            self._prepare_send_indices(kv_indices, state_indices)
+            self._prepare_send_indices(kv_indices, state_indices, indices_event)
         )
         if should_skip:
             return
@@ -2326,6 +2365,10 @@ class CommonKVSender(BaseKVSender):
         # and NIXL workers synchronize on it before reading source KV.
         wait_event = self._early_send_wait_event
         self._early_send_wait_event = None
+        # Only backends that defer the shard filter take the flag.
+        deferred_filter = (
+            {"shard_filter": True} if self._defers_shard_filter(indices_event) else {}
+        )
         self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
@@ -2337,8 +2380,9 @@ class CommonKVSender(BaseKVSender):
             wait_event=wait_event,
             indices_event=indices_event,
             trace_ctx=self.trace_ctx.copy_for_thread(),
+            **deferred_filter,
         )
-        self._record_transfer_indices(kv_indices, state_indices)
+        self._record_transfer_indices(kv_indices, state_indices, indices_event)
 
     def poll(self) -> KVPoll:
         return self._poll_with_status(self.kv_mgr.check_status)

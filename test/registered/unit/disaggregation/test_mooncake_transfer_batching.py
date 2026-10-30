@@ -8,9 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import numpy as np
-import torch
 
-from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -417,7 +416,7 @@ class TestMooncakeEarlySend(CustomTestCase):
         for last in (False, True):
             with self.subTest(last=last):
                 ready = MagicMock()
-                manager = MagicMock()
+                manager = MagicMock(kv_shard_size=1)
                 sender = object.__new__(MooncakeKVSender)
                 vars(sender).update(
                     kv_mgr=manager,
@@ -427,7 +426,7 @@ class TestMooncakeEarlySend(CustomTestCase):
                     conclude_state=None,
                     _transfer_start_time=None,
                     _early_send_wait_event=ready,
-                    _prepare_send_indices=lambda ids, state: (
+                    _prepare_send_indices=lambda ids, state, event: (
                         ids,
                         slice(0, 1),
                         last,
@@ -516,7 +515,34 @@ class TestMooncakeEarlySend(CustomTestCase):
             bootstrap_port=8998,
         )
         manager.check_status = lambda room: manager.request_status[room]
+        manager._land_chunk_indices = lambda chunk: (
+            MooncakeKVManager._land_chunk_indices(manager, chunk)
+        )
         return manager, queue
+
+    @staticmethod
+    def _requeue(queue, **fields):
+        chunk = queue.get_nowait()
+        queue.get_nowait()  # Replace the stop sentinel after the updated chunk.
+        vars(chunk).update(fields)
+        queue.put(chunk)
+        queue.put(None)
+
+    @staticmethod
+    def _copy_event(land):
+        """An index-copy event that completes, landing the copy, on its second
+        poll; synchronize() would spin the worker's core and is never called."""
+        polls = iter((False, True))
+        event = MagicMock()
+
+        def query():
+            done = next(polls)
+            if done:
+                land()
+            return done
+
+        event.query.side_effect = query
+        return event
 
     def test_worker_waits_before_reading_kv(self):
         ready = MagicMock()
@@ -532,18 +558,12 @@ class TestMooncakeEarlySend(CustomTestCase):
 
     def test_worker_sends_indices_after_copy_completes(self):
         manager, queue = self._worker(None)
-        chunk = queue.get_nowait()
-        host_indices = torch.full((1,), -1, dtype=torch.int32)
-        chunk.prefill_kv_indices = host_indices
-        chunk.indices_event = MagicMock()
-        chunk.indices_event.synchronize.side_effect = lambda: host_indices.fill_(7)
-        queue.get_nowait()  # Replace the stop sentinel after the updated chunk.
-        queue.put(chunk)
-        queue.put(None)
+        host_indices = np.full(1, -1, dtype=np.int32)
+        event = self._copy_event(lambda: host_indices.fill(7))
+        self._requeue(queue, prefill_kv_indices=host_indices, indices_event=event)
         sent_indices = []
 
         def transfer(session, indices, *args, **kwargs):
-            self.assertIsInstance(indices, np.ndarray)
             sent_indices.extend(indices.tolist())
             return 0
 
@@ -551,6 +571,81 @@ class TestMooncakeEarlySend(CustomTestCase):
         MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
 
         self.assertEqual(sent_indices, [7])
+        event.synchronize.assert_not_called()
+
+    def test_worker_filters_shard_pages_after_copy_lands(self):
+        """Under KV sharding the worker narrows the chunk to its own pages only
+        once the copy lands; filtering in-flight values ships the wrong pages."""
+        manager, queue = self._worker(None)
+        manager.kv_shard_rank, manager.kv_shard_size = 1, 2
+        manager.transfer_infos[1]["peer"].dst_kv_indices = np.array([10, 11, 12, 13])
+        # -1 is owned by rank 1 (-1 % 2 == 1), so filtering early sends page -1.
+        host_indices = np.full(4, -1, dtype=np.int64)
+        event = self._copy_event(lambda: host_indices.__setitem__(..., [4, 5, 6, 7]))
+        self._requeue(
+            queue,
+            prefill_kv_indices=host_indices,
+            index_slice=slice(0, 4),
+            indices_event=event,
+            shard_filter=True,
+        )
+        sent = []
+
+        def transfer(session, indices, dst_ptrs, dst_indices, *args, **kwargs):
+            sent.append((indices.tolist(), dst_indices.tolist()))
+            return 0
+
+        manager.send_kvcache.side_effect = transfer
+        MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
+
+        # Logical pages 5 and 7 are rank 1's local pages 2 and 3, at send
+        # positions 1 and 3.
+        self.assertEqual(sent, [([2, 3], [11, 13])])
+
+    def test_sender_leaves_shard_filter_to_the_worker(self):
+        """send() must not read indices still being copied: under KV sharding
+        it queues the whole chunk for the worker to filter, and the transfer
+        metric counts only this rank's pages once the copy has landed."""
+        manager = MagicMock(
+            kv_shard_rank=1,
+            kv_shard_size=2,
+            kv_item_lens_sum=8,
+            state_item_lens_sum=0,
+        )
+        manager.prepare_send_state_indices = lambda state: state
+        manager.get_kv_replica_factor.return_value = 1
+        sender = object.__new__(MooncakeKVSender)
+        vars(sender).update(
+            kv_mgr=manager,
+            bootstrap_room=1,
+            aux_index=0,
+            trace_ctx=MagicMock(),
+            conclude_state=None,
+            curr_idx=0,
+            num_kv_indices=4,
+            _transfer_start_time=None,
+            _early_send_wait_event=None,
+            _transfer_metric=KVTransferMetric(),
+            _transfer_num_kv_indices=0,
+            _transfer_num_state_indices=0,
+            _unfiltered_shard_indices=[],
+        )
+        host_indices = np.full(4, -1, dtype=np.int64)
+        landed = []
+        event = MagicMock()
+        event.query.side_effect = lambda: bool(landed)
+
+        sender.send(host_indices, indices_event=event)
+
+        event.query.assert_not_called()
+        args = manager.add_transfer_request.call_args
+        self.assertIs(args.args[1], host_indices)
+        self.assertEqual(args.args[2], slice(0, 4))
+        self.assertTrue(args.kwargs["shard_filter"])
+
+        host_indices[:] = [4, 5, 6, 7]
+        landed.append(True)
+        self.assertEqual(sender.get_transfer_metric().transfer_total_bytes, 2 * 8)
 
     def test_abort_during_wait_prevents_transfer_and_releases_ack(self):
         ready = MagicMock()
