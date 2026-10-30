@@ -5240,6 +5240,7 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
         batch.mark_processed()
+        self.batch_result_processor.release_deferred(batch)
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
@@ -5450,6 +5451,11 @@ class Scheduler(
 
             # tree cache sanity check
             self.invariant_checker._check_tree_cache()
+            # Only a launched step defers a release, and none is left when idle.
+            deferred = self.batch_result_processor.deferred_releases
+            assert not deferred, (
+                f"deferred releases when idle: {[req.rid for req in deferred]}"
+            )
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()

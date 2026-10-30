@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -149,6 +150,10 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
     abort_request: Callable
+    # The requests finished outside a step commit whose memory waits for the
+    # processing of the last launched step carrying them, with the
+    # checkpoint flag of their release.
+    deferred_releases: Dict[Req, bool] = field(default_factory=dict)
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -1509,6 +1514,31 @@ class SchedulerBatchResultProcessor:
 
     def retire_finished_req(self, req: Req, *, checkpoint: bool) -> None:
         """Release a request a commit finished."""
+        self._close_finished_req(req)
+        self._release_memory(req, checkpoint=checkpoint)
+        req.time_stats.set_completion_time()
+
+    def retire_outside_step(self, req: Req, *, checkpoint: bool) -> None:
+        """Release a request finished outside a step commit. While a launched
+        step carries it, its forward may still write the request's memory, so
+        the memory waits for the processing of the last such step."""
+        self._close_finished_req(req)
+        if req.inflight_steps == 0:
+            self._release_memory(req, checkpoint=checkpoint)
+        else:
+            self.deferred_releases[req] = checkpoint
+        req.time_stats.set_completion_time()
+
+    def release_deferred(self, batch: ScheduleBatch) -> None:
+        """Release the memory deferred for the requests of a processed step
+        that no launched step carries any more."""
+        if not self.deferred_releases:
+            return
+        for req in batch.reqs:
+            if req.inflight_steps == 0 and req in self.deferred_releases:
+                self._release_memory(req, checkpoint=self.deferred_releases.pop(req))
+
+    def _close_finished_req(self, req: Req) -> None:
         # isinstance narrowing: create_worker may also return plain
         # TpModelWorker-based drafts, which carry no spec-worker hooks.
         if isinstance(self.draft_worker, BaseSpecWorker):
@@ -1523,6 +1553,7 @@ class SchedulerBatchResultProcessor:
         self._maybe_collect_routed_experts(req)
         self._maybe_collect_indexer_topk(req)
 
+    def _release_memory(self, req: Req, *, checkpoint: bool) -> None:
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
             if not self.decode_offload_manager.offload_kv_cache(req):
@@ -1532,8 +1563,6 @@ class SchedulerBatchResultProcessor:
                 self.hisparse_coordinator.request_finished(req)
             self._prepare_kv_cache_release(req)
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
-
-        req.time_stats.set_completion_time()
 
     def _mamba_can_cache_finished_req(
         self, req: Req, result: GenerationBatchResult, i: int

@@ -299,9 +299,12 @@ class TestLazyFinishBeforeMixedBoundary(unittest.TestCase):
             _maybe_collect_indexer_topk=lambda req: None,
             _maybe_collect_customized_info=lambda i, req, out, n: None,
         )
-        processor.retire_finished_req = partial(
-            brp.SchedulerBatchResultProcessor.retire_finished_req, processor
-        )
+        for name in ("retire_finished_req", "_close_finished_req", "_release_memory"):
+            setattr(
+                processor,
+                name,
+                partial(getattr(brp.SchedulerBatchResultProcessor, name), processor),
+            )
         released = []
         with (
             patch.object(brp, "get_exec", return_value=_settings(lazy=True)),
