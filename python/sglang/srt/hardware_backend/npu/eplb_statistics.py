@@ -17,13 +17,21 @@
 from contextlib import contextmanager
 from functools import wraps
 
-import torch.distributed as dist
+from torch.distributed import ProcessGroup
 
-from sglang.srt.eplb import expert_distribution as distribution
+from sglang.srt.eplb.expert_distribution import (
+    _Accumulator,
+    _DetailAccumulator,
+    _ExpertDistributionRecorderReal,
+    _SelectExpertsSinglePassGatherer,
+    _StatAccumulator,
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.hardware_backend.npu.eplb import (
     get_eplb_device_group,
     warmup_eplb_communication,
 )
+from sglang.srt.runtime_context import get_exec
 
 
 def isolate_npu_draft_recording(forward):
@@ -32,7 +40,7 @@ def isolate_npu_draft_recording(forward):
     @wraps(forward)
     def wrapped(runner, *args, **kwargs):
         if runner.is_draft_worker:
-            recorder = distribution.get_global_expert_distribution_recorder()
+            recorder = get_global_expert_distribution_recorder()
             with recorder.disable_this_region():
                 return forward(runner, *args, **kwargs)
         return forward(runner, *args, **kwargs)
@@ -44,8 +52,6 @@ class NpuEplbAccumulatorMixin:
     """Share TP communication and initialize migration channels before recording."""
 
     def __init__(self, *args, **kwargs):
-        from sglang.srt.runtime_context import get_exec
-
         moe = get_exec().moe
         if moe.enable_eplb and not moe.elastic_ep_backend:
             # Join/scale paths need their own collective initialization order.
@@ -53,33 +59,31 @@ class NpuEplbAccumulatorMixin:
         super().__init__(*args, **kwargs)
 
     @property
-    def _communication_group(self) -> dist.ProcessGroup:
+    def _communication_group(self) -> ProcessGroup:
         # Resolve lazily so a replaced TP group is used by subsequent dumps.
         return get_eplb_device_group()
 
 
-class _NpuDetailAccumulator(NpuEplbAccumulatorMixin, distribution._DetailAccumulator):
+class _NpuDetailAccumulator(NpuEplbAccumulatorMixin, _DetailAccumulator):
     pass
 
 
-class NpuExpertDistributionAccumulator(
-    NpuEplbAccumulatorMixin, distribution._StatAccumulator
-):
+class NpuExpertDistributionAccumulator(NpuEplbAccumulatorMixin, _StatAccumulator):
     pass
 
 
-class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal):
+class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
     """Reuse upstream recording with Ascend counters and communication."""
 
     def _create_accumulator(self, expert_location_metadata, rank):
         accumulator_class = {
-            distribution._StatAccumulator: NpuExpertDistributionAccumulator,
-            distribution._DetailAccumulator: _NpuDetailAccumulator,
-        }[distribution._Accumulator.get_class()]
+            _StatAccumulator: NpuExpertDistributionAccumulator,
+            _DetailAccumulator: _NpuDetailAccumulator,
+        }[_Accumulator.get_class()]
         return accumulator_class(expert_location_metadata, rank)
 
     def _create_gatherer(self, expert_location_metadata, rank):
-        moe = distribution.get_exec().moe
+        moe = get_exec().moe
         # Preserve the upstream per-token and approximate recording modes.
         if (
             moe.moe_a2a_backend == "deepep"
@@ -87,9 +91,7 @@ class NpuExpertDistributionRecorder(distribution._ExpertDistributionRecorderReal
             not in ("per_token", "stat_approx")
         ):
             # Ascend receiver counts include graph padding; count valid routes.
-            return distribution._SelectExpertsSinglePassGatherer(
-                expert_location_metadata, rank
-            )
+            return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
         return super()._create_gatherer(expert_location_metadata, rank)
 
     @contextmanager

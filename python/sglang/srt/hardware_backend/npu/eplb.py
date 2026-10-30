@@ -34,10 +34,7 @@ def get_eplb_device_group() -> dist.ProcessGroup:
     """Reuse TP's device group and its existing communication configuration."""
     from sglang.srt.runtime_context import get_parallel
 
-    parallel = get_parallel()
-    if parallel.tp_size != parallel.moe_ep_size:
-        raise ValueError("NPU EPLB requires TP size to equal EP size.")
-    tp_group = parallel.tp_group
+    tp_group = get_parallel().tp_group
     # Shared statistics and migration use WORLD ranks, including root rank 0.
     if tp_group.ranks != list(range(dist.get_world_size())):
         raise ValueError(
@@ -47,10 +44,20 @@ def get_eplb_device_group() -> dist.ProcessGroup:
     return tp_group.device_group
 
 
+def _get_migration_group() -> dist.ProcessGroup:
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    # Migration indexes each rank's expert slots; statistics only sum counts.
+    if parallel.tp_size != parallel.moe_ep_size:
+        raise ValueError("NPU EPLB migration requires TP size to equal EP size.")
+    return get_eplb_device_group()
+
+
 def warmup_eplb_communication() -> None:
     """Initialize statistics and all-peer migration channels before serving."""
     global _warmed_device_group
-    group = get_eplb_device_group()
+    group = _get_migration_group()
     if group is _warmed_device_group:
         return
 
@@ -91,7 +98,8 @@ def prepare_expert_weight_update(
     Validate the entire chunk before allocating workspaces or moving weights.
     The callable loads internal-format weights into ND storage, invokes the
     shared migration algorithm, and writes changed local slots back in place.
-    Receive buffers live only for this chunk and are reused across compatible layers.
+    The caller owns the receive buffers and passes them to each layer update.
+    They are allocated lazily and reused across compatible layers in this chunk.
     ND staging keeps only the current layer's conversion results.
     """
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -110,14 +118,22 @@ def prepare_expert_weight_update(
     rank = dist.get_rank()
     needs_staging = _validate_migration_weights(weights_by_layer, layer_ids, rank)
     staging = ExpertWeightStaging(needs_staging)
-    temp_buffers: list[torch.Tensor] = []
-    group = get_eplb_device_group()
+    group = _get_migration_group()
 
-    def update_layer(*, routed_experts_weights: list[torch.Tensor], **kwargs) -> None:
-        start = kwargs["rank"] * kwargs["num_local_physical_experts"]
-        end = start + kwargs["num_local_physical_experts"]
-        old_placement = kwargs["old_physical_to_logical_map"]
-        new_placement = kwargs["new_physical_to_logical_map"]
+    def update_layer(
+        *,
+        routed_experts_weights: list[torch.Tensor],
+        temp_buffers: list[torch.Tensor],
+        old_physical_to_logical_map: list[int],
+        new_physical_to_logical_map: list[int],
+        num_local_physical_experts: int,
+        rank: int,
+        **kwargs,
+    ) -> None:
+        start = rank * num_local_physical_experts
+        end = start + num_local_physical_experts
+        old_placement = old_physical_to_logical_map
+        new_placement = new_physical_to_logical_map
         local_changed = old_placement[start:end] != new_placement[start:end]
         if not local_changed and not elastic_ep_enabled:
             # Any outgoing expert must appear in a changed destination slot.
@@ -134,6 +150,11 @@ def prepare_expert_weight_update(
         migration_weights = staging.load(routed_experts_weights)
         update_layer_fn(
             routed_experts_weights=migration_weights,
+            temp_buffers=temp_buffers,
+            old_physical_to_logical_map=old_placement,
+            new_physical_to_logical_map=new_placement,
+            num_local_physical_experts=num_local_physical_experts,
+            rank=rank,
             group=group,
             **kwargs,
         )
@@ -141,7 +162,7 @@ def prepare_expert_weight_update(
         if local_changed:
             staging.store(routed_experts_weights, migration_weights)
 
-    return layer_ids, temp_buffers, update_layer
+    return layer_ids, [], update_layer
 
 
 def _validate_migration_weights(
@@ -187,7 +208,7 @@ class ExpertWeightStaging:
     def __init__(self, needs_staging: list[bool]):
         # Convert internal formats and pack strided ND before migrating slices.
         self._needs_staging = needs_staging
-        self._pending_layers = deque(maxlen=2)
+        self._completion_events = deque(maxlen=2)
 
     def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         return [
@@ -196,13 +217,13 @@ class ExpertWeightStaging:
         ]
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
-        # Each fence covers the previous layer's P2P waits and writeback.
-        # Bound queued migration work so freed ND tensors can be reused.
-        if len(self._pending_layers) == self._pending_layers.maxlen:
-            self._pending_layers.popleft().synchronize()
-        done = torch.npu.Event()
-        done.record()
-        self._pending_layers.append(done)
+        # Bound queued work before allocating this layer's ND tensors.
+        # The event recorded here covers the preceding layer's P2P and writeback.
+        if len(self._completion_events) == self._completion_events.maxlen:
+            self._completion_events.popleft().synchronize()
+        previous_layer_done = torch.npu.Event()
+        previous_layer_done.record()
+        self._completion_events.append(previous_layer_done)
         # Keep the conversion result; copy_ would add another ND-to-ND copy.
         return [
             torch.ops.npu.npu_format_cast(weight, 2).contiguous() if needed else weight
