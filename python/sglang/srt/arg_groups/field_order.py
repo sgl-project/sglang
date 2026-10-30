@@ -101,6 +101,7 @@ POSITIONAL_FIELD_ORDER = (
     "shared_experts_tp_size",
     "enable_dense_mlp_attn_tp",
     "enable_layernorm_sp",
+    "layernorm_sp_min_tokens",
     "disable_attn_tp_gather",
     "enable_p2p_check",
     "device",

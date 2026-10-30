@@ -261,6 +261,18 @@ class Parallel(msgspec.Struct):
         "Muse Spark requires the FlashInfer TRT-LLM MoE runner and "
         "NVLink/NVSwitch.",
     ] = False
+    layernorm_sp_min_tokens: A[
+        int,
+        "With --enable-layernorm-sp, run a pass sequence-parallel only above this "
+        "token count; smaller passes take the replicated path. 0 (the default) "
+        "runs every extend sequence-parallel, as today. The SP collectives cost "
+        "the same per layer whatever the pass size, so small extends -- short "
+        "follow-up turns, small chunks, prefix-cache hits -- can be slower "
+        "sequence-parallel than replicated while large chunks are faster. The "
+        "crossover is deployment-specific: measure extend passes of a few sizes "
+        "on both paths. Must be a captured prefill CUDA graph bucket, or at or "
+        "above the largest one.",
+    ] = 0
     enable_megamoe_for_layernorm_sp: A[
         Optional[bool],
         Arg(
