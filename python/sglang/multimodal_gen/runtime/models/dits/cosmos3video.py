@@ -23,6 +23,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoC
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
     get_sp_group,
     get_sp_world_size,
     get_tp_world_size,
@@ -2019,16 +2020,14 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         # Get the actual device from a loaded parameter
         device = next(self.parameters()).device
 
-        # Recompute RoPE inv_freq buffer on the correct device
-        # This is needed because model is created in meta device context
+        # Compute RoPE on the runtime device so offload preserves resident values
         rotary_emb = self.language_model.rotary_emb
-        if rotary_emb.inv_freq.is_meta:
-            dim = rotary_emb.head_dim
-            inv_freq = 1.0 / (
-                self.rope_theta
-                ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
-            )
-            rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
+        dim = rotary_emb.head_dim
+        exponents = torch.arange(
+            0, dim, 2, dtype=torch.float32, device=get_local_torch_device()
+        )
+        inv_freq = 1.0 / (self.rope_theta ** (exponents / dim))
+        rotary_emb.register_buffer("inv_freq", inv_freq.to(device), persistent=False)
 
         # Collect all quantized submodules so we can skip them during
         # dtype casts.  Calling .to(dtype) on a quantized layer would
