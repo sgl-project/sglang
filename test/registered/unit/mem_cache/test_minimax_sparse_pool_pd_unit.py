@@ -1,18 +1,23 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.disaggregation.utils import get_kv_transfer_buf_infos
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
-from sglang.srt.mem_cache.pool_host.mha import (
-    HiSparseMHATokenToKVPoolHost,
-    MHATokenToKVPoolHost,
-)
+from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _static_storage(pool) -> StaticKVStorage:
+    """The storage a static pool registers with PD peers through."""
+    allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+    return StaticKVStorage(None, allocator)
 
 
 def _make_k_only_pool(
@@ -64,37 +69,45 @@ class TestMiniMaxSparsePoolPD(CustomTestCase):
             self.assertEqual(item_lens[i], buf[0].nbytes * pool.page_size)
 
     def test_hisparse_host_registration(self):
-        """PD startup must register every sparse host K/V buffer with page strides."""
-        pool = _make_k_only_pool(enable_hisparse=True)
-        host = HiSparseMHATokenToKVPoolHost.__new__(HiSparseMHATokenToKVPoolHost)
-        with patch(
-            "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
-            return_value=1 << 30,
+        """PD registers host capacity and sparse PP layers, not resident device KV."""
+        pool = _make_k_only_pool(start_layer=4, enable_hisparse=True)
+        with (
+            patch(
+                "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
+                return_value=1 << 30,
+            ),
+            patch("sglang.srt.mem_cache.pool_host.common._cuda_host_register"),
+            patch("sglang.srt.mem_cache.pool_host.base._cuda_host_unregister"),
         ):
-            MHATokenToKVPoolHost.__init__(
-                host,
-                device_pool=pool.main_pool,
+            host = HiSparseMHATokenToKVPoolHost(
+                buffer_info=pool.main_pool.get_device_pool_infos()[0].buffer_info,
+                device_capacity_tokens=16,
+                start_layer=pool.main_pool.start_layer,
+                end_layer=pool.main_pool.end_layer,
                 host_to_device_ratio=2,
-                host_size=0,
                 page_size=pool.page_size,
-                layout="layer_first",
-                pin_memory=False,
             )
-        ptrs, lens, item_lens = get_kv_transfer_buf_infos(host)
-        buffers = list(host.k_buffer.unbind()) + list(host.v_buffer.unbind())
-        self.assertEqual(len(buffers), 8)
-        self.assertEqual(ptrs, [buffer.data_ptr() for buffer in buffers])
-        self.assertEqual(lens, [buffer.nbytes for buffer in buffers])
-        self.assertEqual(
-            item_lens, [buffer[0].nbytes * pool.page_size for buffer in buffers]
-        )
+            try:
+                self.assertEqual((host.start_layer, host.end_layer), (7, 11))
+                self.assertEqual(host.size, 36)
+                # A HiSparse decode peer registers its host pool as the KV entries.
+                ptrs, lens, item_lens = host.get_contiguous_buf_infos()
+                buffers = list(host.k_buffer.unbind()) + list(host.v_buffer.unbind())
+                self.assertEqual(len(buffers), 8)
+                self.assertEqual(ptrs, [buffer.data_ptr() for buffer in buffers])
+                self.assertEqual(lens, [36 * 2 * 8 * 4] * 8)
+                self.assertEqual(item_lens, [4 * 2 * 8 * 4] * 8)
+                device_ptrs = pool.main_pool.get_contiguous_buf_infos()[0]
+                self.assertTrue(set(ptrs).isdisjoint(device_ptrs))
+            finally:
+                host.destroy()
 
     def test_pd_registration_separates_dense_and_sparse_layers(self):
         """Both PD peers must keep dense device KV out of the sparse transfer list."""
         for hisparse in (False, True):
             pool = _make_k_only_pool(enable_hisparse=hisparse)
             for layers, infos in (
-                (range(3, 7), get_kv_transfer_buf_infos(pool)),
+                (range(3, 7), get_kv_transfer_buf_infos(_static_storage(pool))),
                 (range(3), pool.get_dense_kv_state_buf_infos()),
             ):
                 with self.subTest(hisparse=hisparse, layers=layers):

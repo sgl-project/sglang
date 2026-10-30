@@ -35,9 +35,11 @@ from typing import (
     Annotated,
     Any,
     Dict,
+    Iterable,
     List,
     Literal,
     Optional,
+    Sequence,
     Tuple,
     Type,
     Union,
@@ -54,6 +56,7 @@ from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -63,6 +66,7 @@ from sglang.srt.managers.schedule_batch import (
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
@@ -355,6 +359,7 @@ class GenerateReqInput:
 
     # For Unlimited-OCR
     images_config: Optional[dict] = None
+    mm_processor_kwargs: Optional[dict] = None
 
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
@@ -1009,6 +1014,7 @@ class GenerateReqInput:
                 if self.custom_logit_processor is not None
                 else None
             ),
+            mm_processor_kwargs=self.mm_processor_kwargs,
             positional_embed_overrides=self._get_positional_embed_overrides_item(i),
             # If `__getitem__` is called, these bootstrap fields must be lists.
             bootstrap_host=(
@@ -1577,6 +1583,24 @@ CachedTokensDetails = Dict[str, Union[int, str]]
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
 
+class RequestOutputStats(
+    msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
+):
+    """A request's output values that change only at a few points. Sent on its
+    first output, its first after each retraction, and its finished row; a value
+    that changes at any other time shows only on the finished output."""
+
+    prompt_tokens: int
+    cached_tokens: int
+    cached_tokens_details: Optional[CachedTokensDetails]
+    retraction_count: int
+    image_tokens: int
+    audio_tokens: int
+    video_tokens: int
+    # None when metrics are off, for embedding, or when the request's own are off.
+    time_stats: Optional[SchedulerOutputTimeStats]
+
+
 def flat_top_logprobs_layout(
     top_logprobs_val: List[Optional[List[float]]], top_logprobs_num: int
 ) -> Tuple[int, int]:
@@ -1623,24 +1647,25 @@ def build_flat_top_logprobs_arrays(
 
 
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
+    # http_worker_ipcs: by row, the route the row carries, else None to use its
+    # stored DetokenizeHeader's. Every row carries one under OutputSink.TOKENIZER,
+    # finished rows under DETOKENIZER, none under RUST; the field is None when no
+    # row carries one, except on an idle TOKENIZER batch, which sends [].
+
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
-    # For incremental decoding
-    decoded_texts: List[str]
-    decode_ids: List[array]  # List[array[int]]
-    read_offsets: List[int]
-    # Only used when `--skip-tokenizer-init` is on
-    output_ids: Optional[List[array]]  # Optional[List[array[int]]]
-    # Detokenization configs
-    skip_special_tokens: List[bool]
-    spaces_between_special_tokens: List[bool]
-    no_stop_trim: List[bool]
+    # All rows' new output ids in row order; row i's are
+    # output_ids_flat[output_ids_offsets[i] : output_ids_offsets[i + 1]]
+    # (see row_output_ids).
+    output_ids_flat: array  # array[int]
+    output_ids_offsets: List[int]
+    # By row, the request's DetokenizeHeader on its first output, else None;
+    # the whole field is None when no row carries one.
+    detokenize_headers: Optional[List[Optional[DetokenizeHeader]]] = None
 
     # Token counts
-    prompt_tokens: List[int]
     reasoning_tokens: List[int]
     completion_tokens: List[int]
-    cached_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: TokenLogprobValues
@@ -1675,9 +1700,6 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
     placeholder_tokens_val: Optional[List[Optional[List[int]]]]
 
-    # Number of times each request was retracted.
-    retraction_counts: Optional[List[int]] = None
-
     # Per-item beam carrier; None entries are non-beam items in a mixed
     # batch (the whole field is None when the batch has no beam item).
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
@@ -1689,16 +1711,17 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Customized info
     customized_info: Optional[PickleWrapper] = None
-    # Detailed breakdown of cached tokens by source (device/host/storage)
-    cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
-    # For observability
-    # Pickled Optional[List[SchedulerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
+    # Per row: the request's stats when due (see RequestOutputStats), else
+    # None; None when no row carries any.
+    request_stats: Optional[List[Optional[RequestOutputStats]]] = None
 
-    # Multimodal prompt token counts (image/audio/video). None when not applicable.
+    # Rust server mode only: per-step header columns of
+    # `RustServer.push_generation`; None otherwise.
+    prompt_tokens: Optional[List[int]] = None
+    cached_tokens: Optional[List[int]] = None
     image_tokens: Optional[List[int]] = None
     audio_tokens: Optional[List[int]] = None
     video_tokens: Optional[List[int]] = None
@@ -1723,19 +1746,23 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
 
+class DetokenizeReleaseReq(BaseReq, kw_only=True):
+    """Drops the detokenizer's state of a request that ended outside the output
+    stream; sent on the output socket, so it follows the request's last row."""
+
+
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output decoded strings
     output_strs: List[str]
-    # The token ids
-    output_ids: Optional[List[array]]
+    # See BatchTokenIDOutput.output_ids_flat.
+    output_ids_flat: array  # array[int]
+    output_ids_offsets: List[int]
 
     # Token counts
-    prompt_tokens: List[int]
     completion_tokens: List[int]
     reasoning_tokens: List[int]
-    cached_tokens: List[int]
 
     # Logprobs
     input_token_logprobs_val: TokenLogprobValues
@@ -1769,9 +1796,6 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
     placeholder_tokens_val: Optional[List[Optional[List[int]]]]
 
-    # Number of times each request was retracted.
-    retraction_counts: Optional[List[int]] = None
-
     # Per-item beam carrier; None entries are non-beam items in a mixed
     # batch (the whole field is None when the batch has no beam item).
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
@@ -1783,19 +1807,11 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Customized info
     customized_info: Optional[PickleWrapper] = None
-    # Detailed breakdown of cached tokens by source (device/host/storage)
-    cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
 
-    # For observability
-    # Pickled Optional[List[SchedulerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
-
-    # Multimodal prompt token counts (image/audio/video). None when not applicable.
-    image_tokens: Optional[List[int]] = None
-    audio_tokens: Optional[List[int]] = None
-    video_tokens: Optional[List[int]] = None
+    # See BatchTokenIDOutput.request_stats.
+    request_stats: Optional[List[Optional[RequestOutputStats]]] = None
 
     # Verify count: number of verification forward passes
     spec_verify_ct: Optional[List[int]] = None
@@ -1814,26 +1830,32 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
 
+def row_output_ids(output: Union[BatchTokenIDOutput, BatchStrOutput], i: int) -> array:
+    """Row i's new output ids, sliced from the batch's flat column."""
+    offsets = output.output_ids_offsets
+    return output.output_ids_flat[offsets[i] : offsets[i + 1]]
+
+
+def flatten_output_ids(rows: Iterable[Sequence[int]]) -> Tuple[array, List[int]]:
+    """The (output_ids_flat, output_ids_offsets) columns of rows of output ids."""
+    flat = array("q")
+    offsets = [0]
+    for ids in rows:
+        flat.extend(ids)
+        offsets.append(len(flat))
+    return flat, offsets
+
+
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output embedding
     embeddings: List[Union[List[Union[float, List[float]]], Dict[int, float], float]]
-    # Token counts
-    prompt_tokens: List[int]
-    cached_tokens: List[int]
+    # Each request is output once, so every row carries its stats.
+    request_stats: List[RequestOutputStats]
     # Placeholder token info
     placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
     placeholder_tokens_val: Optional[List[Optional[List[int]]]]
-
-    # Number of times each request was retracted.
-    retraction_counts: Optional[List[int]] = None
-    # Detailed breakdown of cached tokens by source (device/host/storage)
-    cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
-
-    # For observability
-    # Pickled Optional[List[SchedulerReqTimeStats]]
-    time_stats: Optional[PickleWrapper] = None
 
     # Optional pooled hidden states (pre-head transformer output).
     # Two IPC formats, disambiguated by len vs len(rids):
@@ -2268,6 +2290,8 @@ class PdRoleSwitchReqInput(BaseReq, kw_only=True):
     decode_cuda_graph_bs: Optional[List[int]] = None
     # Measured graph footprint from a matching decode peer.
     decode_cuda_graph_memory_gb: Optional[float] = None
+    # Internal preflight across DP workers; does not change roles.
+    prepare_only: bool = False
 
 
 class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
@@ -2350,6 +2374,18 @@ class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
 
 
+class GetHiCacheL3LayoutReq(BaseReq, kw_only=True):
+    pass
+
+
+class GetHiCacheL3LayoutReqOutput(BaseReq, kw_only=True):
+    """Carry the L3 availability envelope, including explicit disabled replies."""
+
+    # Untyped on purpose, like GetInternalStateReqOutput: the layout dict is
+    # sanitized with msgspec_to_builtins and can evolve without a migration.
+    layout: Dict[str, Any]
+
+
 class ProfileReqType(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2
@@ -2390,7 +2426,7 @@ class ProfileReqOutput(BaseReq, kw_only=True):
 
 
 class FreezeGCReq(BaseReq, kw_only=True):
-    pass
+    gc_threshold: Optional[List[int]] = None
 
 
 class ShutdownReq(BaseReq, kw_only=True):
