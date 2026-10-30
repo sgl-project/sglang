@@ -602,10 +602,7 @@ class DeepseekMHAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if _is_cuda or (
-            current_platform.is_out_of_tree()
-            and current_platform.capabilities.supports_triton
-        ):
+        if _is_cuda or current_platform.is_out_of_tree():
             # Save latent cache
             get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
                 self.attn_mha,
