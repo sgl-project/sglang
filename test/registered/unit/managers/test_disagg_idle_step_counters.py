@@ -326,7 +326,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         )
         scheduler.result_queue = deque([pending])
 
-        self.assertEqual(scheduler.collect_inflight_reqs(), {req})
+        self.assertEqual(scheduler.collect_admitted_reqs(), {req})
 
     def test_split_prefill_is_charged_once_from_its_first_chunk(self):
         # A split prefill spans several run_batch calls but yields one result,

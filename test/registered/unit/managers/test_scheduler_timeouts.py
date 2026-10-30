@@ -250,7 +250,7 @@ class TestRunningTimeout(CustomTestCase):
                 with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
                     aborts = s._poll_timeout_aborts()
                     # Abort and weight-version updates share this request inventory.
-                    self.assertEqual(s.collect_inflight_reqs(), {older, newer})
+                    self.assertEqual(s.collect_admitted_reqs(), {older, newer})
 
                 self.assertEqual(
                     [a.rid for a in aborts],

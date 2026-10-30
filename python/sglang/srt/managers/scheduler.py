@@ -3724,9 +3724,9 @@ class Scheduler(
 
         if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
             deadline = time.perf_counter() - timeout_s
-            inflight_batches = self._collect_inflight_batches()
+            admitted_batches = self._collect_admitted_batches()
             seen_rids = set()
-            for batch in inflight_batches:
+            for batch in admitted_batches:
                 if batch is None:
                     continue
                 for req in batch.reqs:
@@ -5790,7 +5790,7 @@ class Scheduler(
         get_context().override("scheduler.weight_version", weight_version=new_version)
 
         live_reqs = {
-            *self.collect_inflight_reqs(),
+            *self.collect_admitted_reqs(),
             *self.waiting_queue,
             *([self.chunked_req] if self.chunked_req is not None else []),
             *(req for req, _ in (self._deferred_responses or {}).values()),
@@ -5804,23 +5804,24 @@ class Scheduler(
             f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
         )
 
-    def collect_inflight_reqs(self) -> Set[Req]:
+    def collect_admitted_reqs(self) -> Set[Req]:
+        """The requests past prefill admission that a step may still run."""
         return {
             req
-            for batch in self._collect_inflight_batches()
+            for batch in self._collect_admitted_batches()
             if batch is not None
             for req in batch.reqs
         }
 
-    def _collect_inflight_batches(self) -> list[ScheduleBatch | None]:
+    def _collect_admitted_batches(self) -> list[ScheduleBatch | None]:
         if get_parallel().pp_size == 1:
-            inflight_batches = [self.running_batch, self.last_batch]
+            admitted_batches = [self.running_batch, self.last_batch]
         else:
-            inflight_batches = [*self.running_mbs, *self.mbs]
+            admitted_batches = [*self.running_mbs, *self.mbs]
         if self.enable_continuous_input_polling and self.result_queue:
             # Polling can run intake before the newest queued batch becomes last_batch.
-            inflight_batches.extend(batch for batch, _ in self.result_queue)
-        return inflight_batches
+            admitted_batches.extend(batch for batch, _ in self.result_queue)
+        return admitted_batches
 
     def abort_request(self, recv_req: AbortReq):
         if self._deferred_responses:
@@ -5951,7 +5952,7 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
         # Delete requests in the running batch
-        for req in self.collect_inflight_reqs():
+        for req in self.collect_admitted_reqs():
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):

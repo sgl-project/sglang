@@ -46,7 +46,7 @@ def _scheduler():
     scheduler.waiting_queue = []
     scheduler.chunked_req = None
     scheduler.hisparse_coordinator = None
-    scheduler.collect_inflight_reqs = lambda: set()
+    scheduler.collect_admitted_reqs = lambda: set()
     scheduler.ipc_channels = Mock()
     scheduler.rust_server = None
     streamer = object.__new__(SchedulerOutputStreamer)
