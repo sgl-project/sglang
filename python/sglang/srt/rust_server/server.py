@@ -14,6 +14,7 @@ import ipaddress
 import logging
 import operator
 import os
+import socket
 import time
 from array import array
 from itertools import chain
@@ -106,8 +107,9 @@ def _refuse_loopback_endpoints(
         raise ValueError(
             f"SGLANG_RUST_SERVER: loopback control endpoints ({listed}) are "
             f"unreachable from the other nodes, which rendezvous at "
-            f"{dist_init_addr!r}; bind --host to an address they reach, "
-            "or set SGLANG_HOST_IP"
+            f"{dist_init_addr!r}; bind --host to an address they reach, or "
+            "bind --host 0.0.0.0 (SGLANG_HOST_IP then sets the advertised "
+            "address)"
         )
 
 
@@ -232,11 +234,15 @@ class RustServer:
         if host in ("", "0.0.0.0", "::"):
             # An unspecified bind address is not reachable from another node;
             # advertise the interface that reaches the rendezvous, which the
-            # other nodes share.
+            # other nodes share, in a family the listener accepts (0.0.0.0
+            # binds IPv4 only).
             host = get_local_ip_auto(
                 fallback="127.0.0.1",
                 towards=(
                     get_parallel().dist_init_addr if get_parallel().nnodes > 1 else None
+                ),
+                towards_family=(
+                    socket.AF_INET if host == "0.0.0.0" else socket.AF_UNSPEC
                 ),
             )
         config = None

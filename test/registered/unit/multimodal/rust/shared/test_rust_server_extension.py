@@ -3,6 +3,7 @@
 import json
 import os
 import pickle
+import socket
 import threading
 import unittest
 from array import array
@@ -847,11 +848,12 @@ class TestRustServerExtension(CustomTestCase):
 
     def test_gather_server_endpoints_advertises_the_rendezvous_facing_address(self):
         """A wildcard-bound listener on a multi-node launch advertises the local
-        address that routes to the rendezvous, not whichever interface address
-        enumeration finds first. A loopback answer (the rendezvous name
-        resolves to this machine, as a hostname /etc/hosts maps to 127.0.1.1
-        does on the rendezvous node) falls through to enumeration, and
-        SGLANG_HOST_IP still overrides both."""
+        address that routes to the rendezvous, probed in a family the bind
+        accepts (IPv4 for 0.0.0.0), rather than the default-route guess. A
+        loopback answer (the rendezvous name resolves to this machine, as a
+        hostname /etc/hosts maps to 127.0.1.1 does on the rendezvous node)
+        falls through to that guess. An explicit SGLANG_LOCAL_IP_NIC or
+        SGLANG_HOST_IP still wins over the probe."""
         gathered = []
 
         def all_gather_object(obj):
@@ -879,6 +881,7 @@ class TestRustServerExtension(CustomTestCase):
             for key, value in os.environ.items()
             if key not in ("SGLANG_HOST_IP", "HOST_IP")
         }
+        nic = Mock(return_value=None)  # SGLANG_LOCAL_IP_NIC unset
         with (
             patch.object(
                 server_module,
@@ -893,10 +896,11 @@ class TestRustServerExtension(CustomTestCase):
                 "get_serving",
                 return_value=SimpleNamespace(host="0.0.0.0", port=30000),
             ),
-            # A container bridge listed before the interface the nodes share.
+            patch("sglang.srt.utils.network.get_local_ip_by_nic", nic),
+            # The default-route guess, e.g. a management interface.
             patch(
-                "sglang.srt.utils.network.get_local_ip_by_nic",
-                return_value="172.17.0.1",
+                "sglang.srt.utils.network.get_local_ip_by_remote",
+                return_value="192.168.0.5",
             ),
             patch.dict(os.environ, env, clear=True),
         ):
@@ -905,19 +909,25 @@ class TestRustServerExtension(CustomTestCase):
                 return_value="10.0.0.2",
             ) as towards:
                 RustServer.gather_server_endpoints(hosts_listener=True)
-            towards.assert_called_once_with("10.0.0.1:5000")
+                towards.assert_called_once_with("10.0.0.1:5000", socket.AF_INET)
+                nic.return_value = "10.1.0.7"
+                RustServer.gather_server_endpoints(hosts_listener=True)
+                nic.return_value = None
+                os.environ["SGLANG_HOST_IP"] = "10.0.0.9"
+                RustServer.gather_server_endpoints(hosts_listener=True)
+                del os.environ["SGLANG_HOST_IP"]
+                towards.assert_called_once()  # neither override probed
             # The real probe: a loopback rendezvous answers with loopback.
             parallel.dist_init_addr = "127.0.0.1:5000"
-            RustServer.gather_server_endpoints(hosts_listener=True)
-            os.environ["SGLANG_HOST_IP"] = "10.0.0.9"
             RustServer.gather_server_endpoints(hosts_listener=True)
 
         self.assertEqual(
             [entry["endpoint"] for entry in gathered],
             [
                 "http://10.0.0.2:30000",
-                "http://172.17.0.1:30000",
+                "http://10.1.0.7:30000",
                 "http://10.0.0.9:30000",
+                "http://192.168.0.5:30000",
             ],
         )
 

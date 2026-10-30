@@ -388,19 +388,29 @@ def get_local_ip_by_remote() -> Optional[str]:
     return None
 
 
-def get_local_ip_towards(addr: str) -> Optional[str]:
-    """The local address of the interface that routes to ``host:port`` *addr*."""
+def get_local_ip_towards(
+    addr: str, family: socket.AddressFamily = socket.AF_UNSPEC
+) -> Optional[str]:
+    """The local address of the interface that routes to ``host:port`` *addr*,
+    in *family* (any family by default)."""
     # UDP connect sends no packets; it only selects the source address.
     try:
-        target = NetworkAddress.parse(addr).resolved()
-        with socket.socket(target.family, socket.SOCK_DGRAM) as s:
-            s.connect(target.to_bind_tuple())
+        target = NetworkAddress.parse(addr)
+        family, _, _, _, sockaddr = socket.getaddrinfo(
+            target.host, target.port, family, socket.SOCK_DGRAM
+        )[0]
+        with socket.socket(family, socket.SOCK_DGRAM) as s:
+            s.connect(sockaddr)
             return s.getsockname()[0]
     except (ValueError, OSError):
         return None
 
 
-def get_local_ip_auto(fallback: str = None, towards: Optional[str] = None) -> str:
+def get_local_ip_auto(
+    fallback: str = None,
+    towards: Optional[str] = None,
+    towards_family: socket.AddressFamily = socket.AF_UNSPEC,
+) -> str:
     """
     Automatically detect the local IP address using multiple fallback strategies.
 
@@ -414,9 +424,12 @@ def get_local_ip_auto(fallback: str = None, towards: Optional[str] = None) -> st
             Defaults to None.
         towards (str, optional): A ``host:port`` peers are known to reach; when
             given, the address of the interface that routes to it is preferred
-            over interface enumeration, unless that address is loopback (the
-            name resolves to this machine, e.g. a hostname /etc/hosts maps to
-            127.0.1.1). Defaults to None.
+            over the remote-connection guess, unless that address is loopback
+            (the name resolves to this machine, e.g. a hostname /etc/hosts maps
+            to 127.0.1.1). Defaults to None.
+        towards_family (socket.AddressFamily, optional): The address family
+            the probe towards *towards* is limited to, e.g. ``AF_INET`` for a
+            listener bound to ``0.0.0.0``. Defaults to any family.
 
     Returns:
         str: The detected local IP address, or the fallback value if detection fails.
@@ -427,21 +440,22 @@ def get_local_ip_auto(fallback: str = None, towards: Optional[str] = None) -> st
     Note:
         The function tries detection methods in the following order:
         1. Direct IP detection via get_ip()
-        2. Network interface enumeration via get_local_ip_by_nic()
-        3. Remote connection method via get_local_ip_by_remote()
+        2. The interface named by SGLANG_LOCAL_IP_NIC via get_local_ip_by_nic()
+        3. The interface that routes to *towards* via get_local_ip_towards()
+        4. Remote connection method via get_local_ip_by_remote()
     """
     # Try environment variable
     host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
     if host_ip:
         return host_ip
     logger.debug("get_ip failed")
-    if towards and (ip := get_local_ip_towards(towards)):
-        if not ipaddress.ip_address(ip).is_loopback:
-            return ip
     # Fallback
     if ip := get_local_ip_by_nic():
         return ip
     logger.debug("get_local_ip_by_nic failed")
+    if towards and (ip := get_local_ip_towards(towards, towards_family)):
+        if not ipaddress.ip_address(ip).is_loopback:
+            return ip
     # Fallback
     if ip := get_local_ip_by_remote():
         return ip
