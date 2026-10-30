@@ -81,6 +81,8 @@ if _is_xpu:
             "XPU rotary embedding will use the generic rotary_embedding kernel. "
             "Upgrade sgl_kernel to enable the fused XPU kernel."
         )
+# Head sizes sgl_kernel.rotary_embedding accepts on XPU; it raises on any other.
+_XPU_ROTARY_EMBEDDING_HEAD_SIZES = (32, 64, 96, 128, 256)
 
 
 class RotaryEmbedding(BaseFusedOp):
@@ -570,7 +572,10 @@ class RotaryEmbedding(BaseFusedOp):
                 self.is_neox_style,
             )
             return query, key
-        elif self.head_size != self.rotary_dim:
+        elif (
+            self.head_size != self.rotary_dim
+            or self.head_size not in _XPU_ROTARY_EMBEDDING_HEAD_SIZES
+        ):
             return self.forward_native(positions, query, key)
         else:
             self._match_cos_sin_cache_dtype(query)
