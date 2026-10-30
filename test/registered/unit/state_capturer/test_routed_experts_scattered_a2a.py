@@ -84,6 +84,7 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
             device="cpu",
             name="routed_experts",
         )
+        cap.device_topk_size = self.TOPK_SIZE + 1
         cap.gather_buffer = torch.empty((8, self.TOPK_SIZE + 1), dtype=torch.int32)
         return cap
 
@@ -156,9 +157,13 @@ class TestOutputRankHostCache(CustomTestCase):
     NUM_TOKENS = 16
     OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5])
 
-    def _capturer(self, attn_tp_rank):
+    def _capturer(self, attn_tp_rank, backend="none"):
         parallel = SimpleNamespace(
-            num_dp_ranks=1, pp_rank=0, attn_tp_rank=attn_tp_rank, attn_cp_rank=0
+            num_dp_ranks=1,
+            pp_rank=0,
+            attn_tp_rank=attn_tp_rank,
+            attn_tp_size=2,
+            attn_cp_rank=0,
         )
         hf_text_config = SimpleNamespace(
             num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=self.K
@@ -171,8 +176,9 @@ class TestOutputRankHostCache(CustomTestCase):
                 return_value=SimpleNamespace(chunked_prefill_size=8),
             ),
             mock.patch.object(
-                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend(backend)
             ),
+            mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=True),
             mock.patch.dict(
                 base_mod.ALLOC_MEMORY_FUNCS,
                 {"cpu": lambda dims, dtype, **_: torch.empty(dims, dtype=dtype)},
@@ -209,9 +215,10 @@ class TestOutputRankHostCache(CustomTestCase):
             req_pool_idx=0, seqlen=5, req_to_token_pool=pool, start_len=1
         )
 
-    def test_only_output_rank_keeps_host_cache(self):
-        """Only the rank that sends outputs to the detokenizer stores routed
-        experts on the host; every other rank pinned a full copy no one read."""
+    def test_only_output_rank_keeps_rows(self):
+        """Only the rank that sends outputs to the detokenizer keeps routed
+        experts; every other rank kept a device buffer and pinned a host copy
+        that no one read."""
         topk = torch.randint(
             0,
             64,
@@ -226,9 +233,36 @@ class TestOutputRankHostCache(CustomTestCase):
 
         other_rank = self._capturer(attn_tp_rank=1)
         self.assertFalse(other_rank.has_host_cache)
+        self.assertIsNone(other_rank.device_cache)
         self.assertIsNone(self._run_forward(other_rank, topk))
         with self.assertRaises(RuntimeError):
             self._read(other_rank)
+
+    def test_scattered_other_rank_only_joins_the_all_gather(self):
+        """Under DeepEP every rank must join each layer's all-gather, or the
+        output rank hangs; the other ranks still keep no rows."""
+        other_rank = self._capturer(attn_tp_rank=1, backend="deepep")
+        self.assertIsNone(other_rank.device_cache)
+        gathered_shapes = []
+        with (
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep")
+            ),
+            mock.patch.object(
+                re_mod, "get_parallel", return_value=SimpleNamespace(attn_tp_size=2)
+            ),
+            mock.patch.object(
+                re_mod,
+                "attn_tp_all_gather_into_tensor",
+                side_effect=lambda out, inp: gathered_shapes.append(tuple(out.shape)),
+            ),
+        ):
+            for layer_id in range(self.NUM_LAYERS):
+                other_rank.capture(
+                    layer_id=layer_id,
+                    topk_indices=torch.zeros((3, self.K), dtype=torch.int32),
+                )
+        self.assertEqual(gathered_shapes, [(6, self.K)] * self.NUM_LAYERS)
 
 
 if __name__ == "__main__":
