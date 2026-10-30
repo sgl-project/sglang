@@ -84,10 +84,9 @@ fn sampling_denies_unknown_keys() {
 /// pinned in message/request.rs).
 #[test]
 fn generate_request_ignores_unknown_keys() {
-    let req: GenerateRequest = serde_json::from_str(
-        r#"{"text": "hi", "priority": 3, "session_id": "s", "custom_logit_processor": "x"}"#,
-    )
-    .unwrap();
+    let req: GenerateRequest =
+        serde_json::from_str(r#"{"text": "hi", "priority": 3, "conversation_id": "ignored"}"#)
+            .unwrap();
     assert!(matches!(
         req.text,
         Some(StringOrList {
@@ -124,6 +123,22 @@ fn token_ids_or_list_shape_dispatch() {
         empty.value,
         Some(token_ids_or_list::Value::One(ref t)) if t.ids.is_empty()
     ));
+    // `/generate` decodes its body through a `Value`, where a flat list
+    // streams the same way; a list whose later elements break the first
+    // element's shape is refused on either path.
+    let via_value =
+        |json: &str| serde_json::from_value::<TokenIdsOrList>(serde_json::from_str(json).unwrap());
+    assert!(matches!(
+        via_value("[1, 2]").unwrap().value,
+        Some(token_ids_or_list::Value::One(ref t)) if t.ids == vec![1, 2]
+    ));
+    for mixed in ["[1, [2]]", r#"[1, "2"]"#, "[1, 2.5]", "[[1], 2]"] {
+        assert!(
+            serde_json::from_str::<TokenIdsOrList>(mixed).is_err(),
+            "{mixed}"
+        );
+        assert!(via_value(mixed).is_err(), "{mixed}");
+    }
 }
 
 /// Nullable list elements (PD bootstrap columns): [null, "h"] keeps per-item
@@ -247,13 +262,15 @@ fn generate_response_matches_frame_value_shape() {
             prompt_tokens: 5,
             completion_tokens: 2,
             finish_reason: None,
+            cached_tokens: 3,
             ..Default::default()
         }),
         index: None,
+        prompt_token_ids: None,
     };
     assert_eq!(
         serde_json::to_string(&frame).unwrap(),
-        r#"{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null},"output_ids":[7,8]}"#
+        r#"{"text":"ok","meta_info":{"id":"client-rid","prompt_tokens":5,"completion_tokens":2,"finish_reason":null,"cached_tokens":3,"reasoning_tokens":0},"output_ids":[7,8]}"#
     );
 }
 

@@ -28,15 +28,18 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
+    get_draft_swa_ring_size,
     get_dsv4_indexer_bytes_per_token,
     get_swa_ring_size,
     resolve_compress_state_ring_size,
+    uses_draft_swa_ring,
 )
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -107,7 +110,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     ranks because the draft pool spans the widened virtual location space."""
     if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
         return 0
-    cell_size = kvc.spec_aux_config.dflash_draft_cell_size_per_token
+    cell_size = kvc.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * get_parallel().attn_dcp_size
@@ -248,7 +251,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # Logical-page KV sharding reserves a fixed double-buffered assembly
         # scratch next to the pool; charge it before token sizing.
-        self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc)
+        self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(
+            kvc,
+            include_mtp=not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle(),
+        )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -392,6 +398,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
+                # The index-K buffer is replicated under DCP while the latent KV
+                # shards, so this term is short by dcp_size without the scale.
                 indexer_cell_size = self._compute_dsa_indexer_cell_size(
                     kvc=kvc,
                     num_layers=num_layers,
@@ -445,6 +453,25 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 full_pool_ratio = parse_hisparse_config().host_to_device_ratio
+
+            # Must match the pool class picked in _build_minimax_sparse_kv_pool;
+            # the packed layout is about four times smaller per token.
+            if uses_minimax_m3_nvfp4_native_stack(model_config.quantization):
+                from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
+                    MSA_V1_PAGE_SIZE,
+                    msa_v1_page_row_bytes,
+                )
+
+                # Each sparse layer stores one aligned main row and one index row per page.
+                return (
+                    num_sparse
+                    * sum(
+                        msa_v1_page_row_bytes(
+                            kv_heads, head_dim, indexer_head_dim, MSA_V1_PAGE_SIZE
+                        )
+                    )
+                    // MSA_V1_PAGE_SIZE
+                )
 
             main_pool_bytes = (
                 (num_dense * full_pool_ratio + num_sparse)
@@ -546,15 +573,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
-            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
             dtype = kvc.kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
                 element_size = torch._utils._element_size(dtype)
-            if not is_npu_arch35():
-                allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
@@ -737,7 +760,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
         self._fused_full_entry = kvc.fused_entry_bytes("full")
-        if self._fused_full_entry is not None:
+        self._fused_swa_entry = kvc.fused_entry_bytes("swa")
+        if self._fused_full_entry is not None or self._fused_swa_entry is not None:
             self._draft_full_layers_num = 0
             self._draft_swa_layers_num = 0
             self._draft_swa_full_layers_num = 0
@@ -755,6 +779,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         )
 
     def _swa_cell_bytes(self) -> int:
+        if self._fused_swa_entry is not None:
+            return self._fused_swa_entry
         return self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
 
     def _recompute_cell_size(self) -> None:
@@ -927,7 +953,7 @@ def compute_swa_request_cap(
 
     if max_running_requests is None:
         max_running_requests = get_schedule().max_running_requests
-    num_reqs = max_running_requests // attn_dp_size
+    num_reqs = max(1, max_running_requests // attn_dp_size)
     if get_disagg().disaggregation_mode == "decode":
         return (
             per_request * num_reqs
@@ -990,6 +1016,7 @@ class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):
             full_cell_size = (
                 self._full_cell_bytes()
                 + self._swa_per_token * self._draft_swa_full_layers_num
+                + self._draft_cell_size
             )
             full_tokens = (
                 int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
@@ -1051,7 +1078,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
         )
@@ -1112,7 +1139,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
         self.attn_dp_size = kvc.attn_dp_size
         self.requested_max_running_requests_per_worker = (
-            get_schedule().max_running_requests // kvc.attn_dp_size
+            max(1, get_schedule().max_running_requests // kvc.attn_dp_size)
             if get_schedule().max_running_requests is not None
             else None
         )
@@ -1171,13 +1198,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
         self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
-        self.paged_draft_layers = 0
+        draft_layers = 0
         if self.encoder_replay and kvc.spec_algorithm.is_dspark():
             aux = kvc.spec_aux_config
-            self.paged_draft_layers = int(
+            draft_layers = int(
                 aux.dspark_num_stages or aux.dflash_draft_num_layers or 0
             )
-            assert self.paged_draft_layers > 0, "DSpark draft layer count is required"
+            assert draft_layers > 0, "DSpark draft layer count is required"
+        # A draft SWA ring is budgeted with the request windows, not per SWA token.
+        draft_ring_layers = draft_layers if uses_draft_swa_ring() else 0
+        self.paged_draft_layers = draft_layers - draft_ring_layers
         self.request_window_bytes = 0
         if self.encoder_replay:
             slots = self.requested_max_running_requests_per_worker + 1
@@ -1194,10 +1224,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 + slots * 128
                 + self.page_size
             )
+            draft_ring_size = get_draft_swa_ring_size(
+                self.sliding_window_size,
+                self.online_c128_mtp_max_draft_tokens,
+                self.page_size,
+            )
             self.request_window_bytes = (
                 (slots * capacity + self.page_size) * layers * (self.kv_bytes + 16)
                 + 4 * scratch * (self.kv_bytes + 16)
                 + slots * 3 * 16 * self.attn_head_dim * 8
+                + (slots * draft_ring_size + self.page_size)
+                * draft_ring_layers
+                * self.kv_bytes
             )
             if not self.paged_draft_layers:
                 self.swa_ratio = 0
@@ -1353,7 +1391,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         """Compressed KV (+ indexer) bytes one full token adds per layer of `ratio`;
         compress state is priced per SWA slot (c4) or as fixed bytes (c128, ratio 2)."""
         if ratio in (1, 2):
-            return (self.kv_bytes + self.low_ratio_index_bytes) / ratio
+            return (
+                self._get_paged_kv_bytes_per_token(ratio) + self.low_ratio_index_bytes
+            ) / ratio
         if ratio == 4:
             c4_frac = 1 / (4 * self.c4_shrink_factor)
             return (
@@ -1362,6 +1402,37 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
         assert ratio == 128, f"unsupported compression ratio: {ratio}"
         return 1 / 128 * self._get_paged_kv_bytes_per_token(128)
+
+    def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
+        """Reserved main/indexer pages beyond the token-scaled low-ratio bytes."""
+        if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
+            return 0
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DSV41_INDEX_PAGE_SIZE,
+            _num_dsv4_physical_kv_pages,
+        )
+
+        padding_bytes = 0
+        for ratio in (1, 2):
+            num_layers = self.num_layers(ratio)
+            if not num_layers:
+                continue
+            # Main KV reserves a full logical page of compressed slots. Indexer
+            # size includes the compressed logical page, then the indexer pool
+            # reserves its own page on top (same page count as the pool).
+            main_padding = self.page_size * self._get_paged_kv_bytes_per_token(ratio)
+            index_size = (full_tokens + self.page_size) // ratio
+            index_slots = (
+                _num_dsv4_physical_kv_pages(
+                    index_size, DSV41_INDEX_PAGE_SIZE, DSV41_INDEX_PAGE_SIZE
+                )
+                * DSV41_INDEX_PAGE_SIZE
+            )
+            index_padding = (
+                index_slots - full_tokens // ratio
+            ) * self.low_ratio_index_bytes
+            padding_bytes += (main_padding + index_padding) * num_layers
+        return padding_bytes
 
     def _get_bytes_per_full_token(self) -> float:
         # Cap mode and ring mode both move the SWA pool and the c4 state that
@@ -1595,6 +1666,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
+        full_token = full_token // page_size * page_size
+        # The coefficient excludes reserved pages. Remove the few full pages
+        # needed to cover them, including indexer rounding at this capacity.
+        while full_token > 0 and (
+            full_token * self.bytes_per_full_token
+            + self._get_low_ratio_kv_padding_bytes(full_token)
+            > available_bytes_for_tokens
+        ):
+            full_token -= page_size
         if full_token <= 0 and self.swa_cap_tokens is not None:
             raise RuntimeError(
                 f"The DSV4 SWA pool cap ({self.swa_cap_tokens} tokens, "

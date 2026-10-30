@@ -39,7 +39,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=17, stage="base-b", runner_config="1-gpu-large")
 
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {
@@ -953,7 +953,7 @@ class TestDSAIndexer(CustomTestCase):
     @patch(
         "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn"
     )
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
     def test_forward_extend_mode(
         self,
         mock_act_quant,
@@ -1048,7 +1048,7 @@ class TestDSAIndexer(CustomTestCase):
     @patch(
         "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn"
     )
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
     def test_forward_decode_mode(
         self,
         mock_act_quant,

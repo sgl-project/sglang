@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import pickle
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -32,6 +33,10 @@ from sglang.srt.managers.mm_utils import (
     discard_shm_features,
     has_shm_features,
     unwrap_shm_features,
+)
+from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
+    ShmTagExchange,
+    get_shm_exchange,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
@@ -203,12 +208,18 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
-                recv_reqs = broadcast_pyobj(
-                    recv_reqs,
-                    tp_group.rank,
-                    tp_group.cpu_group,
-                    src=tp_group.ranks[0],
-                )
+                exchange = get_shm_exchange(tp_group.cpu_group, "recv")
+                if exchange is not None:
+                    recv_reqs = _broadcast_via_exchange(
+                        recv_reqs, exchange=exchange, tp_group=tp_group
+                    )
+                else:
+                    recv_reqs = broadcast_pyobj(
+                        recv_reqs,
+                        tp_group.rank,
+                        tp_group.cpu_group,
+                        src=tp_group.ranks[0],
+                    )
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
@@ -335,3 +346,24 @@ class SchedulerRequestReceiver:
             )
         ]
         return work_reqs, control_reqs
+
+
+def _broadcast_via_exchange(
+    recv_reqs: Optional[List], *, exchange: ShmTagExchange, tp_group
+) -> List:
+    """Same result as broadcast_pyobj; the size travels through shared memory and
+    only a non-empty payload goes over the cpu group."""
+    is_src = tp_group.rank == tp_group.ranks[0]
+    payload = pickle.dumps(recv_reqs) if is_src and recv_reqs else b""
+    size = exchange.allgather([len(payload)])[0][0]
+    if size == 0:
+        return recv_reqs if is_src else []
+    if is_src:
+        data = torch.frombuffer(bytearray(payload), dtype=torch.uint8)
+        torch.distributed.broadcast(
+            data, src=tp_group.ranks[0], group=tp_group.cpu_group
+        )
+        return recv_reqs
+    data = torch.empty(size, dtype=torch.uint8)
+    torch.distributed.broadcast(data, src=tp_group.ranks[0], group=tp_group.cpu_group)
+    return pickle.loads(data.numpy().tobytes())

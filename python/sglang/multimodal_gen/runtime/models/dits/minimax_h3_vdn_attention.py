@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
+    is_in_breakable_cuda_graph,
 )
 
 if TYPE_CHECKING:
@@ -139,26 +140,22 @@ class MiniMaxH3VDNHybridAttention(nn.Module):
         softmax_gate = self.softmax_gate(x) if self.softmax_gate is not None else None
         beta = self.linear_attention.beta(x)
         gate_hidden, _ = self.linear_attention.output_gate.down(x)
-        attention_core = (
-            _hybrid_attention_core_bcg
-            if attention.bcg_breakpoint
-            else _minimax_h3_hybrid_attention_core_impl
-        )
-        softmax_out, linear_out = attention_core(
-            attention,
-            x,
-            q,
-            k,
-            v,
-            softmax_gate,
-            beta,
-            gate_hidden,
+        core_args = (attention, x, q, k, v, softmax_gate, beta, gate_hidden)
+        core_kwargs = dict(
             rope_cache=rope_cache,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
         )
+        if attention.bcg_breakpoint and is_in_breakable_cuda_graph():
+            softmax_out, linear_out = _hybrid_attention_core_bcg(
+                *core_args, **core_kwargs
+            )
+        else:
+            softmax_out, linear_out = _minimax_h3_hybrid_attention_core_impl(
+                *core_args, **core_kwargs
+            )
         out, _ = attention.out_proj(softmax_out.reshape(total, -1))
         if linear_out is not None:
             linear_proj, _ = self.to_out_linear(linear_out)
@@ -364,13 +361,7 @@ def _minimax_h3_hybrid_attention_core_impl(
     max_seqlen: int,
     ulysses_active: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    meta = get_forward_context().attn_metadata
-    if not isinstance(meta, HybridWindowAttentionH3Metadata):
-        raise RuntimeError(
-            "VDN-H3 hybrid attention needs HybridWindowAttentionH3Metadata in the "
-            "forward context; the MiniMax-H3 denoising stage installs it per request "
-            f"(got {type(meta).__name__})."
-        )
+    meta = _hybrid_attention_metadata()
     layout = meta.layout
     softmax = functools.partial(
         _vdn_window_softmax,
@@ -563,8 +554,32 @@ def _vdn_return_to_rows(
     return merged[0], linear_rows
 
 
-_hybrid_attention_core_bcg = eager_on_graph(True)(
-    _minimax_h3_hybrid_attention_core_impl
+def _hybrid_attention_metadata() -> HybridWindowAttentionH3Metadata:
+    meta = get_forward_context().attn_metadata
+    if not isinstance(meta, HybridWindowAttentionH3Metadata):
+        raise RuntimeError(
+            "VDN-H3 hybrid attention needs HybridWindowAttentionH3Metadata in the "
+            "forward context; the MiniMax-H3 denoising stage installs it per request "
+            f"(got {type(meta).__name__})."
+        )
+    return meta
+
+
+def _new_hybrid_core_outputs(
+    attention, x, q, k, v, softmax_gate, beta, gate_hidden, *, ulysses_active, **kwargs
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """The core's softmax and linear outputs, allocated before its graph break."""
+    meta = _hybrid_attention_metadata()
+    if meta.full_cover:
+        return q.new_empty(q.shape), None
+    # the single-rank readout covers the video rows only
+    layout = meta.layout
+    rows = x.shape[0] if ulysses_active else layout.video_end - layout.video_start
+    return q.new_empty(q.shape), q.new_empty((rows, q.shape[1] * q.shape[2]))
+
+
+_hybrid_attention_core_bcg = eager_on_graph(
+    _minimax_h3_hybrid_attention_core_impl, output_factory=_new_hybrid_core_outputs
 )
 
 
