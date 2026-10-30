@@ -87,10 +87,10 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with diffusion LLM")
     if cfg.disaggregation_mode != "null":
         raise ValueError("--enable-watermark is not supported with PD disaggregation")
-    if cfg.speculative_algorithm not in {None, "NGRAM", "EAGLE", "EAGLE3"}:
+    if cfg.speculative_algorithm not in {None, "NGRAM", "EAGLE", "EAGLE3", "DSPARK"}:
         raise ValueError(
             "--enable-watermark supports speculative algorithms NGRAM, EAGLE, "
-            f"and EAGLE3, got {cfg.speculative_algorithm!r}"
+            f"EAGLE3, and DSPARK, got {cfg.speculative_algorithm!r}"
         )
     if cfg.pp_size > 1 and cfg.speculative_algorithm is not None:
         raise ValueError(

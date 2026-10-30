@@ -753,7 +753,7 @@ void minimax_decode_topk(
   SymbolicSize S = {"max_seqblock"};
   SymbolicSize T = {"topk"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({H, B, S}).with_dtype<fp32_t>().with_device(device_).verify(score);
   TensorMatcher({B}).with_dtype<SeqLenT>().with_device(device_).verify(seq_lens);
@@ -861,7 +861,7 @@ void minimax_decode_topk_page_table(
   SymbolicSize BH = {"batch_heads"};
   SymbolicSize P = {"max_sparse_pages"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({H, B, S}).with_dtype<fp32_t>().with_device(device_).verify(score);
   TensorMatcher({B}).with_dtype<SeqLenT>().with_device(device_).verify(seq_lens);

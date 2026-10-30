@@ -60,6 +60,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                     enable_attn_tp_input_scattered=False,
                     moe_dp_size=1,
                     cp_strategy=None,
+                    cp_kv_layout=None,
                     tp_size=4,
                     dp_size=1,
                     attn_dp_size=1,
@@ -141,6 +142,7 @@ class TestBoundaryParallelismResolution(CustomTestCase):
                             enable_prefill_cp=prefill,
                             cp_size=cp_size,
                             cp_strategy=cfg.cp_strategy,
+                            cp_kv_layout=None,
                         )
 
 
@@ -217,6 +219,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
                     "speculative_draft_kv_cache_dtype",
+                    "speculative_draft_model_quantization",
                     "aux_hidden_state_capture",
                     "watermark_context_window",
                     "watermark_default_enabled",
@@ -4157,6 +4160,42 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(updates, {})
         self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 512)
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
+
+
+class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
+    """The deterministic fallback must not hand XPU a CUDA-only backend.
+
+    fa3 asserts on the device's SM version, so an XPU server that only asked
+    for --enable-deterministic-inference dies at launch rather than falling
+    back. The explicit-backend case guards the other direction: the platform
+    branch must not override a backend the user named.
+    """
+
+    @staticmethod
+    def _view(attention_backend):
+        return SimpleNamespace(
+            enable_deterministic_inference=True,
+            attention_backend=attention_backend,
+            model_path="Qwen/Qwen3-4B",
+        )
+
+    def test_xpu_fallback_is_an_xpu_backend(self):
+        with patch.object(
+            overrides_module, "get_platform", return_value=SimpleNamespace(is_xpu=True)
+        ):
+            updates = overrides_module._deterministic_attention_backend(
+                self._view(None)
+            )
+        self.assertEqual(updates, {"attention_backend": "intel_xpu"})
+
+    def test_xpu_keeps_explicit_backend(self):
+        with patch.object(
+            overrides_module, "get_platform", return_value=SimpleNamespace(is_xpu=True)
+        ):
+            updates = overrides_module._deterministic_attention_backend(
+                self._view("triton")
+            )
+        self.assertEqual(updates, {})
 
 
 if __name__ == "__main__":
