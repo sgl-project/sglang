@@ -83,5 +83,63 @@ class TestMetricsUtils(unittest.TestCase):
             self.assertIsInstance(value, float)
 
 
+class TestSchedulerMetricsLabels(unittest.TestCase):
+    def test_attention_dp_populates_dp_rank_label(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang.srt.observability.metrics_collector import (
+            SchedulerMetricsCollector,
+        )
+
+        with (
+            patch(
+                "sglang.srt.observability.metrics_collector.get_parallel",
+                return_value=SimpleNamespace(
+                    tp_rank=0,
+                    pp_rank=0,
+                    moe_ep_rank=0,
+                    dp_rank=None,
+                    attn_tp_rank=0,
+                    attn_cp_rank=0,
+                    attn_dp_size=4,
+                    attn_dp_rank=2,
+                ),
+            ),
+            patch(
+                "sglang.srt.observability.metrics_collector.get_serving",
+                return_value=SimpleNamespace(
+                    served_model_name="model", enable_streaming_session=False
+                ),
+            ),
+            patch(
+                "sglang.srt.observability.metrics_collector.get_disagg",
+                return_value=SimpleNamespace(
+                    enable_pd_role_switch=False, disaggregation_mode=None
+                ),
+            ),
+            patch(
+                "sglang.srt.observability.metrics_collector.get_observability",
+                return_value=SimpleNamespace(
+                    enable_metrics=True,
+                    enable_metrics_for_all_schedulers=False,
+                    kv_events_config=None,
+                    extra_metric_labels=None,
+                ),
+            ),
+            patch(
+                "sglang.srt.observability.metrics_collector.resolve_collector_class",
+                return_value=lambda labels, **kwargs: SimpleNamespace(labels=labels),
+            ),
+        ):
+            ctx = SchedulerMetricsCollector.init_new(
+                server_args=None,
+                enable_priority_scheduling=False,
+                enable_lora=False,
+                enable_hierarchical_cache=False,
+            )
+            self.assertEqual(ctx.collector.labels["dp_rank"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
