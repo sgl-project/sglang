@@ -299,6 +299,8 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
+    cp_encoder_replay = False
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -332,6 +334,11 @@ class HiCacheController:
         if inner is not None:
             mem_pool_device = inner
         self.mem_pool_device = mem_pool_device
+        self.cp_encoder_replay = (
+            getattr(mem_pool_device, "request_window", None) is not None
+            and attn_cp_group is not None
+            and torch.distributed.get_world_size(group=attn_cp_group) > 1
+        )
         self.mem_pool_host = mem_pool_host
         self.storage_host_pool = mem_pool_host
         self.write_policy = write_policy

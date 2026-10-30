@@ -20,6 +20,12 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DSV4AttnMetadata,
     late_layer_whole_extend,
 )
+from sglang.srt.layers.cp import base as cp_base
+from sglang.srt.layers.cp.interleave import (
+    InterleaveCPStrategy,
+    cp_interleave_to_sequence_order,
+)
+from sglang.srt.layers.cp.utils import cp_interleave_input_ids
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.mm_utils import pad_mm_tokens
 from sglang.srt.managers.schedule_batch import (
@@ -786,6 +792,47 @@ class TestEncoderReplayDpStartupCheck(CustomTestCase):
             with self.subTest(is_hip=is_hip, attn_dp_size=attn_dp_size):
                 with self.assertRaises(_PastEncoderReplayChecks):
                     self._validate(is_hip=is_hip, attn_dp_size=attn_dp_size)
+
+
+class TestCpReplayRows(CustomTestCase):
+    def test_compact_tail_roundtrip_retains_global_owners_including_empty_ranks(self):
+        indices = torch.tensor([5, 6, 12, 20, 31])
+        fb = SimpleNamespace(
+            positions=torch.arange(40),
+            batch_size=2,
+            input_ids=torch.arange(40),
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[24, 16],
+        )
+        for rank in range(8):
+            with get_parallel().override(attn_cp_rank=rank, attn_cp_size=8):
+                layout = _backend(_Fixture())._late_layer_tail_cp_layout(
+                    fb, indices, torch.tensor([3, 2])
+                )
+                owned = indices[indices % 8 == rank]
+                self.assertEqual(
+                    layout["local_token_indices"].tolist(),
+                    ((owned - rank) // 8).tolist(),
+                )
+                self.assertEqual(
+                    layout["local_positions"][: len(owned)].tolist(), owned.tolist()
+                )
+                self.assertEqual(sum(layout["local_lens_cpu"]), len(owned))
+                fb.attn_cp_metadata = layout["cp_metadata"]
+                # The production reorder must honor the compact gather map,
+                # including physical slots belonging to ranks with no tail rows.
+                with patch.object(cp_base, "_STRATEGY", InterleaveCPStrategy(8)):
+                    packed = cp_interleave_input_ids(indices + 100, fb)
+                torch.testing.assert_close(
+                    cp_interleave_to_sequence_order(packed, fb), indices + 100
+                )
+                width = fb.attn_cp_metadata.per_rank_actual_token[rank]
+                torch.testing.assert_close(
+                    packed[rank * width : rank * width + len(owned)], owned + 100
+                )
+                self.assertTrue(
+                    packed[rank * width + len(owned) : (rank + 1) * width].eq(0).all()
+                )
 
 
 if __name__ == "__main__":
