@@ -134,8 +134,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
-        warmup_out = None
-        for _ in range(1):
+        # Pre-carving measures scratch after persistent first-run allocations.
+        for _ in range(2 if envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.get() else 1):
+            warmup_out = None
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():
