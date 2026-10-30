@@ -124,9 +124,14 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
         # softcap run in fp32; the released checkpoints carry no use_fp32_for_output flag.
         self.use_fp32_output = True
 
-    def _compute_lm_head(self, hidden_states, lm_head, embedding_bias=None):
+    def _compute_lm_head(
+        self, hidden_states, lm_head, embedding_bias=None, *, out=None
+    ):
+        # ``out`` (a reusable logits buffer) is only a hint: callers use the returned tensor.
         if not hasattr(lm_head, "weight"):
-            return super()._compute_lm_head(hidden_states, lm_head, embedding_bias)
+            return super()._compute_lm_head(
+                hidden_states, lm_head, embedding_bias, out=out
+            )
         output_dtype = torch.float32 if self.use_fp32_output else lm_head.weight.dtype
         logits = torch.mm(
             hidden_states.to(lm_head.weight.dtype),

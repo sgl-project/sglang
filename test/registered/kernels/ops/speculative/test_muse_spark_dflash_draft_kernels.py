@@ -1,6 +1,8 @@
 """DFlash grouped conv kernels (gfx950): the input conv fed by the projection's split-K partials and the output
 conv fused with the residual add + RMSNorm, against the eager formula."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -204,6 +206,7 @@ def test_fused_conv_layer_stack_matches_unfused(hidden, rows):
         model.layers = nn.ModuleList(layers)
         model.norm = RMSNorm(hidden, eps=1e-5)
         model.embed_tokens = None
+        model.draft_config = SimpleNamespace(is_mla=False)  # read by forward
         return model.to(device="cuda", dtype=torch.bfloat16)
 
     x = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
