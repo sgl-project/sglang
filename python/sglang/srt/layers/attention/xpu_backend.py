@@ -126,6 +126,18 @@ def _bidirectional_image_attn_args(
     return block_ids, (-1, -1)
 
 
+def _check_page_size_1_graph_compat(*, use_mla: bool, graphs_disabled: bool) -> None:
+    # sgl_kernel serves MHA page_size 1 by compacting the page table with a boolean
+    # mask and reading seqlens.max().item() on every call; neither can be recorded
+    # into a graph. MLA never takes that path (mla_decode rejects page_size 1).
+    if not use_mla and not graphs_disabled:
+        raise ValueError(
+            "page_size 1 on the intel_xpu attention backend requires CUDA graph "
+            "disabled (it is off by default on XPU): the page_size 1 kernel path "
+            "cannot be captured."
+        )
+
+
 class XPUAttentionBackend(AttentionBackend):
     """XPU FlashAttention backend, currently based on FlashAttentionBackend, will be refactored later.
 
@@ -223,6 +235,14 @@ class XPUAttentionBackend(AttentionBackend):
                 "backend require CUDA graph disabled (off by default on XPU); the "
                 "graph decode path cannot run the varlen KV gather."
             )
+        if self.page_size == 1:
+            from sglang.srt.model_executor.cuda_graph_config import (
+                cuda_graph_fully_disabled,
+            )
+
+            _check_page_size_1_graph_compat(
+                use_mla=self.use_mla, graphs_disabled=cuda_graph_fully_disabled()
+            )
 
         is_draft = model_runner.is_draft_worker
         self.dcp_size = 1 if is_draft else get_parallel().attn_dcp_size
@@ -233,6 +253,13 @@ class XPUAttentionBackend(AttentionBackend):
             self.dcp_group = get_parallel().dcp_group
             self.dcp_comm_backend = get_parallel().dcp_comm_backend
             self._assert_dcp_supported()
+        # Paged KV kernels are exact only at page 1/64/128; index per token otherwise.
+        if (
+            not self.use_mla
+            and self.dcp_size == 1
+            and self.page_size not in (1, 64, 128)
+        ):
+            self.page_size = 1
 
         # Gemma-3 multimodal: per-token image-block id over whole sequences, set by
         # prepare_attn_masks each image EXTEND forward, consumed by forward_extend.
@@ -576,8 +603,13 @@ class XPUAttentionBackend(AttentionBackend):
                         metadata, metadata_expand
                     )
 
-        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
-            include_draft_extend_v2=True
+        # DLLM_EXTEND is excluded from is_extend_or_..._mixed(); on XPU it runs
+        # eager (not via CUDA graph), so build extend metadata for it here too.
+        elif (
+            forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+                include_draft_extend_v2=True
+            )
+            or forward_batch.forward_mode.is_dllm_extend()
         ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
