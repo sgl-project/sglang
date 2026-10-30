@@ -180,8 +180,7 @@ class TestDecodeBeamSearchOutput(CustomTestCase):
         self.assertTrue(all(s.text is not None for s in packed.sequences))
 
     def test_beam_row_without_detokenize_state_is_skipped(self):
-        """A row whose detokenize state is gone has no header; its beams get no
-        text instead of failing the whole batch."""
+        """A row with no header gets no beam text instead of failing the whole batch."""
         for disable_batch_decode in (True, False):
             with self.subTest(disable_batch_decode=disable_batch_decode):
                 group = _mixed_group(stop_wins=True)

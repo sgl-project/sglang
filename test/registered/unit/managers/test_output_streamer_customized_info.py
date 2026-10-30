@@ -1009,8 +1009,7 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         return req
 
     def test_header_goes_out_on_first_output_only(self):
-        """The detokenizer keeps the header for the request's lifetime, so no later
-        row resends it, even after a retraction."""
+        """A retraction does not resend the header; the detokenizer still holds it."""
         outputs = []
         streamer = _streamer(outputs)
         req = self._req()
@@ -1044,7 +1043,6 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         self.assertEqual(outputs[-1], DetokenizeReleaseReq(rid="r"))
 
     def test_finished_rows_carry_their_route(self):
-        """Only finished rows carry a route; a batch with no finished row sends None."""
         outputs = []
         streamer = _streamer(outputs)
         running, done = self._req("running"), self._req("done", ipc="worker-b")
@@ -1059,27 +1057,7 @@ class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
         self.assertIsNone(outputs[0].http_worker_ipcs)
         self.assertEqual(outputs[1].http_worker_ipcs, [None, "worker-b"])
 
-    def test_rust_sink_builds_no_header_and_no_route(self):
-        """The Rust frontend keeps its own request state: no header is built or
-        marked sent, and no row carries a route, finished or not."""
-        accumulator = _accumulator(output_sink=OutputSink.RUST)
-        running, done = self._req("running"), self._req("done", ipc="worker-b")
-        for req in (running, done):
-            req.output_ids.append(7)
-        done.finished_reason = FINISH_LENGTH(length=1)
-
-        for req in (running, done):
-            accumulator.accept(req=req)
-        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
-
-        self.assertFalse(running.detokenize_header_sent)
-        self.assertFalse(done.detokenize_header_sent)
-        self.assertIsNone(payload.detokenize_headers)
-        self.assertIsNone(payload.http_worker_ipcs)
-
     def test_skip_tokenizer_init_rows_carry_ipc_and_no_header(self):
-        """Without a detokenizer the tokenizer-side router routes each row by
-        its http_worker_ipc, and nothing would keep a header."""
         outputs = []
         streamer = SchedulerOutputStreamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),

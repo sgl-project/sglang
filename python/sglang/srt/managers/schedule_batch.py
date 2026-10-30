@@ -1357,8 +1357,7 @@ class Req(ReqDllmMixin):
 
         # Incremental streamining
         self.send_token_offset: int = 0
-        # Whether the DetokenizeHeader went out; the detokenizer keeps it until the
-        # finished row or a DetokenizeReleaseReq.
+        # Whether the DetokenizeHeader went out, so the detokenizer holds its state.
         self.detokenize_header_sent = False
         # TODO (Byron): send_output_token_logprobs_offset and send_token_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs

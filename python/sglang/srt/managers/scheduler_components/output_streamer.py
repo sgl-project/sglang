@@ -54,8 +54,6 @@ DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
 
 
 class OutputSink(Enum):
-    """Where a generation batch goes."""
-
     DETOKENIZER = auto()  # Python detokenizer: header once, then deltas
     TOKENIZER = auto()  # --skip-tokenizer-init: per-row route, no decoding
     RUST = auto()  # Rust frontend decodes with its own request state
@@ -596,9 +594,8 @@ class _GenerationStreamAccumulator:
                     )
                 )
         else:
-            # Read by the Python DetokenizerManager (continuity check) and
-            # TokenizerManager (meta_info, per-request metrics); `push_generation`
-            # never reads them, so under OutputSink.RUST these lists stay empty.
+            # Read by the DetokenizerManager (continuity check) and TokenizerManager
+            # (meta_info, per-request metrics), never by `push_generation`.
             self.completion_tokens.append(
                 beam_completion_tokens(beam_output)
                 if beam_output is not None

@@ -266,8 +266,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def _update_detokenize_states(
         self, recv_obj: BatchTokenIDOutput
     ) -> List[Optional[DetokenizeState]]:
-        """By row, the request's DetokenizeState with the row's output ids appended;
-        None for a row whose request has no state."""
         vocab_size = self.vocab_size
         headers = recv_obj.detokenize_headers
         beam_outputs = recv_obj.beam_search_output

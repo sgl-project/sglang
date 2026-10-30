@@ -84,7 +84,7 @@ def decode_beam_search_output(
     disable_batch_decode: bool,
     trim_matched_stop: Callable,
 ) -> None:
-    """Fill each candidate sequence's `text` in place, decoded with its row's header flags."""
+    """Fill each candidate sequence's `text` in place."""
     if disable_batch_decode:
         for i, beam_output in enumerate(recv_obj.beam_search_output):
             header = headers[i]

@@ -112,8 +112,6 @@ class DetokenizeState(msgspec.Struct):
         is_beam: bool,
         vocab_size: Optional[int],
     ) -> None:
-        """Extend decode_ids by one row's output ids, after checking they continue
-        the ids received so far."""
         if not is_beam:
             self._check_continuity(
                 rid=rid,

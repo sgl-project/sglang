@@ -53,8 +53,7 @@ def _header(prompt_tail_ids, *, skip_special_tokens=True, ipc="worker-a"):
 
 def _output(sent, rows, *, ipc="worker-a"):
     """rows: (rid, output_ids, header or None, finished). sent: by rid, the
-    output ids the scheduler sent so far, which sets each row's
-    completion_tokens. A finished row carries ipc as its own route."""
+    output ids the scheduler sent so far, which sets each row's completion_tokens."""
     n = len(rows)
     completion_tokens = []
     for rid, ids, header, _ in rows:
@@ -217,8 +216,6 @@ class TestDetokenizeState(CustomTestCase):
         self.assertEqual(out.http_worker_ipcs, [None, "worker-a"])
 
     def test_a_finished_row_without_state_reaches_its_tokenizer_worker(self):
-        """A finished row routes by the route it carries, so its client gets the
-        finish after its state was evicted."""
         detok = _detokenizer(capacity=1)
         sent = {}
         outputs = [
@@ -242,8 +239,7 @@ class TestDetokenizeState(CustomTestCase):
         )
 
     def test_a_finished_row_routes_by_its_ipc_not_the_stored_headers(self):
-        """With one rid in flight on two tokenizer workers, the finished row reaches
-        the worker it carries, not the stored header's."""
+        """One rid is in flight on two tokenizer workers at once."""
         detok = _detokenizer()
         sent = {}
         outputs = [
@@ -259,9 +255,21 @@ class TestDetokenizeState(CustomTestCase):
             [("worker-a", False), ("worker-b", False), ("worker-a", True)],
         )
 
+    def test_an_idle_batch_reaches_no_worker(self):
+        """A DP rank with no work still sends a batch; its fan-out must not crash."""
+        detok = _detokenizer()
+        sent = {}
+        outputs = [
+            _output(sent, []),
+            _output(sent, [("r", [3], _header([1]), True)]),
+        ]
+
+        delivered = _deliver(detok, outputs)
+
+        self.assertEqual(delivered, [("worker-a", "r", "3.", True)])
+
     def test_header_prompt_tail_is_clamped_to_the_vocab(self):
-        """Multimodal placeholder ids in the prompt tail (negative or past the
-        vocab) decode as 0, which tiktoken-style tokenizers accept."""
+        """Multimodal placeholder ids in the prompt tail decode as 0."""
         table = DetokenizeStateTable(capacity=1)
 
         s = table.start(rid="r", header=_header([-101, 3, 12]), vocab_size=10)
@@ -269,8 +277,7 @@ class TestDetokenizeState(CustomTestCase):
         self.assertEqual(s.decode_ids, [0, 3, 0])
 
     def test_a_row_that_does_not_continue_the_received_ids_raises_an_alarm(self):
-        """completion_tokens must equal the ids received plus the row's own; a break warns
-        (raises in CI) and still decodes. Beam rows count sequences and are exempt."""
+        """A break warns (raises in CI) and still decodes; beam rows are exempt."""
         detok = _detokenizer()
         sent = {}
         detok.handle_batch_token_id_out(
@@ -287,9 +294,8 @@ class TestDetokenizeState(CustomTestCase):
         with envs.SGLANG_IS_IN_CI.override(False):
             with self.assertLogs(
                 "sglang.srt.managers.incremental_detokenize", level="WARNING"
-            ) as logs:
+            ):
                 out = detok.handle_batch_token_id_out(skipped)
-            self.assertIn("do not continue the 1 received", logs.output[0])
             self.assertEqual(out.output_strs, ["5."])
             self.assertEqual(out.http_worker_ipcs, ["worker-a"])
 

@@ -623,8 +623,7 @@ class TestRustServerExtension(CustomTestCase):
         """An abort the scheduler sends outside the output stream becomes a
         one-request terminal batch in Rust mode, keeping the request's counts
         and marked as outside the stream; without the Rust server it still
-        goes to the tokenizer socket, and the detokenizer's state of the
-        request, which no finished row will free, is released."""
+        goes to the tokenizer socket, with the request's detokenizer state released."""
         import msgspec
 
         from sglang.srt.managers.io_struct import AbortReq
