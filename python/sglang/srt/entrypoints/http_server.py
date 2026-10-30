@@ -254,11 +254,6 @@ async def init_multi_tokenizer() -> ServerArgs:
 
     publish(server_args, role="tokenizer")
 
-    # API key authentication is not supported in multi-tokenizer mode
-    assert get_serving().api_key is None, (
-        "API key is not supported in multi-tokenizer mode"
-    )
-
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -2881,6 +2876,9 @@ def _setup_and_run_http_server(
         ):
             from sglang.srt.utils.auth import add_api_key_middleware
 
+            # The ASGI lifespan call already built the middleware stack, and Starlette
+            # rejects add_middleware after that; drop it so the first request rebuilds it.
+            app.middleware_stack = None
             add_api_key_middleware(
                 app,
                 api_key=get_serving().api_key,
