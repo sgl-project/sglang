@@ -1,0 +1,190 @@
+---
+title: LLaDA-Image
+tag: NEW
+description: "Deploy LLaDA-Image Base and Turbo with SGLang Diffusion for text-to-image generation and single-image editing with English and Chinese text rendering."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx'
+import { Deployment } from '/src/snippets/_deployment.jsx'
+import { config } from '/src/snippets/configs/inclusionAI/llada-image.jsx'
+
+<DiffusionModelTags tags={["image", "text-to-image + editing", "English + Chinese text", "Base 50-step + Turbo 4-step"]} />
+
+## 1. Quick start
+
+Use a nightly Docker image containing this integration, or install from source, following the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Run the commands below inside that environment, then pick a checkpoint and request mode.
+
+<Deployment config={config} />
+
+<Warning>
+Both checkpoints load configuration code from their Hugging Face repositories. Keep `--trust-remote-code` together with the commit-pinned `--revision` that the builder emits, and review the remote code before moving to another revision.
+</Warning>
+
+## 2. Model capabilities
+
+[LLaDA-Image](https://huggingface.co/inclusionAI/LLaDA-Image) is a 6B-parameter image generation and editing family. It generates images from text and edits one reference image from an instruction. Prompts are encoded by an embedded LLaDA 2.0 mixture-of-experts language model, and the model is designed for rendering English and Chinese text inside the image.
+
+Choose Base for the highest fidelity and Turbo, distilled to four steps without CFG, for interactive serving. SGLang serves both checkpoints in BF16 on one GPU. Multi-GPU sequence parallelism, FP8 checkpoints, and the model card's VQ-conditioned generation mode are not served by this integration.
+
+## 3. Deployment details
+
+### Checkpoint selection
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "30%"}} />
+    <col style={{width: "22%"}} />
+    <col style={{width: "22%"}} />
+    <col style={{width: "26%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Checkpoint</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Best fit</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Default sampling</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Validated revision</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>inclusionAI/LLaDA-Image</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Maximum fidelity</td>
+      <td style={{padding: "9px 12px"}}>50 steps, CFG 5</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}><code>e4e2703f</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><code>inclusionAI/LLaDA-Image-Turbo</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>Lowest latency</td>
+      <td style={{padding: "9px 12px"}}>4 steps, CFG 1</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}><code>f4afc52d</code></td>
+    </tr>
+  </tbody>
+</table>
+
+Each checkpoint applies its own sampling defaults, so requests may omit `num_inference_steps` and `guidance_scale`. Values a request sets explicitly take precedence.
+
+### Serving topology
+
+One server handles both `/v1/images/generations` and `/v1/images/edits`, so editing needs no second deployment. The verified recipe runs on one GPU with TP 1 and no sequence parallelism. The embedded text encoder stays resident on the GPU next to the DiT, and the server used about 51 GiB of GPU memory throughout the 1024 by 1024 measurements below, for either checkpoint. The server refuses multi-GPU launches, text encoder offload, quantized checkpoints, and Cache-DiT at startup with an explicit error.
+
+## 4. Request examples
+
+The Request tab of the builder emits the matching cURL command for generation or editing. The Python examples below use the OpenAI client with Turbo. Switch the model to `inclusionAI/LLaDA-Image` and restart the server with the Base command to use Base, and the server applies the Base sampling defaults.
+
+<CodeGroup>
+```python Text-to-image
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://127.0.0.1:30000/v1")
+response = client.images.generate(
+    model="inclusionAI/LLaDA-Image-Turbo",
+    prompt="A bilingual bookstore poster reading '星河书店' and 'Starlight Books'",
+    size="1024x1024",
+    n=1,
+    response_format="b64_json",
+    extra_body={"seed": 42},
+)
+
+with open("llada-image.png", "wb") as output:
+    output.write(base64.b64decode(response.data[0].b64_json))
+```
+
+```python Single-image editing
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://127.0.0.1:30000/v1")
+with open("input.png", "rb") as source:
+    response = client.images.edit(
+        model="inclusionAI/LLaDA-Image-Turbo",
+        image=source,
+        prompt="Place the subject on a beach at golden hour.",
+        size="1024x1024",
+        n=1,
+        response_format="b64_json",
+        extra_body={"seed": 42},
+    )
+
+with open("llada-image-edit.png", "wb") as output:
+    output.write(base64.b64decode(response.data[0].b64_json))
+```
+</CodeGroup>
+
+## 5. Feature details
+
+### Request limits
+
+Generation width and height must be multiples of 16, and editing width and height must be multiples of 32. Editing takes exactly one uploaded image or image URL. An edit also has to fit the model's limit of 32,768 sequence positions for the source image, the output, and the prompt, so with a short prompt the largest square edit is 1888 by 1888, and larger edits fail. A request may ask for up to 10 outputs, which are generated one after another. Invalid sizes are rejected with HTTP 400 before inference.
+
+### H200 performance
+
+These measurements use one H200 with BF16 weights, 1024 by 1024 output, and the Serve command and requests that the builder generates. Each cell is the median client wall time of 40 sequential requests, ten in each of four fresh server processes after two warmup requests. Turbo uses 4 steps with CFG 1, and Base uses 50 steps with CFG 5.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Task</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Turbo SP1</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Base SP1</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}>Text to image</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>0.5783 s</td>
+      <td style={{padding: "9px 12px"}}>13.0801 s</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>Image editing</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>1.4240 s</td>
+      <td style={{padding: "9px 12px"}}>31.3271 s</td>
+    </tr>
+  </tbody>
+</table>
+
+### Quality validation
+
+These scores use the same one-GPU BF16 servers and 1024 by 1024 output. GenEval scores 2212 images per checkpoint (553 prompts, seeds 42 to 45) with its Mask2Former object detector. LongText-Bench scores 1280 images per checkpoint (160 English and 160 Chinese prompts, seeds 42 to 45) by OCR with Qwen2.5-VL-7B. CVTG-2K scores 2000 images per checkpoint (seed 42) by OCR word accuracy. Turbo uses 4 steps with CFG 1. Base uses CFG 5 with 50 steps for LongText-Bench and 20 steps for GenEval and CVTG-2K. The LongText-Bench OCR model samples, so its scores move by about 0.001 between evaluator runs.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Benchmark</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Turbo SP1</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Base SP1</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}>GenEval</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>0.8250</td>
+      <td style={{padding: "9px 12px"}}>0.8361</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>LongText English</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>0.8974</td>
+      <td style={{padding: "9px 12px"}}>0.9189</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>LongText Chinese</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>0.9228</td>
+      <td style={{padding: "9px 12px"}}>0.9103</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>CVTG-2K word accuracy</td>
+      <td style={{padding: "9px 12px", background: "rgba(255,255,255,0.02)"}}>0.8236</td>
+      <td style={{padding: "9px 12px"}}>0.7805</td>
+    </tr>
+  </tbody>
+</table>
+
+### Unsupported controls
+
+Cache-DiT is rejected at server startup and per request. Text encoder offload, multi-GPU launches, and quantized checkpoints are rejected at server startup. The default eager path does not use approximate caching, quantized attention, or CUDA graphs. Other attention backends and GPU families were not measured end to end, so this page keeps the platform default.
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx'
+
+<ComfyUISupport model="image" />

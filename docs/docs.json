@@ -1628,6 +1628,12 @@
                     ]
                   },
                   {
+                    "group": "LLaDA-Image",
+                    "pages": [
+                      "cookbook/diffusion/inclusionAI/LLaDA-Image"
+                    ]
+                  },
+                  {
                     "group": "Z-Image",
                     "pages": [
                       "cookbook/diffusion/Z-Image/Z-Image-Turbo"

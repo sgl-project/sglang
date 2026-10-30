@@ -25,6 +25,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/inclusionAI/Ming-Image",
     },
     {
+      name: "LLaDA-Image",
+      modelIds: ["inclusionAI/LLaDA-Image", "inclusionAI/LLaDA-Image-Turbo"],
+      cookbook: "/cookbook/diffusion/inclusionAI/LLaDA-Image",
+    },
+    {
       name: "FLUX",
       modelIds: [
         "black-forest-labs/FLUX.1-dev",
