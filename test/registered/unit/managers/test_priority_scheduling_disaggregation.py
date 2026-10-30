@@ -471,7 +471,6 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
             priority=priority,
             origin_input_ids=[1, 2, 3],
             output_ids=[],
-            pd_rebootstrap_in_progress=False,
             finished_reason=FINISH_ABORT("failed") if failed else None,
             return_logprob=False,
             sampling_params=SimpleNamespace(max_new_tokens=8),
@@ -790,12 +789,10 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
             with self.subTest(num_output_ids=len(output_ids)):
                 req = self._new_req()
                 req.output_ids = output_ids
-                req.pd_rebootstrap_in_progress = True
 
                 prefill_len = len(Req.build_rebootstrap_payload(req)["input_ids"])
 
                 self.assertEqual(queue._pre_alloc_fill_len(req), prefill_len)
-                self.assertEqual(queue._rebootstrap_prefill_len(req), prefill_len)
                 self.assertEqual(req.output_ids, output_ids)
 
 

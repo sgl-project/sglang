@@ -659,7 +659,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         # Already-streamed output must not shrink while the prefill recomputes.
         self.assertEqual(req.output_ids, [10, 11, 12])
-        self.assertTrue(req.pd_rebootstrap_in_progress)
         # Rebootstrap recomputes the KV from the prefill, so the retract must skip
         # the device->host KV offload rather than offload-then-delete it.
         mock_retract_all.assert_called_once()

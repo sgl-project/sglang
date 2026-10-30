@@ -528,7 +528,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ) -> int:
         return max(
             allocated_tokens + self.num_reserved_decode_tokens,
-            self._rebootstrap_prefill_len(req)
+            self._pre_alloc_fill_len(req)
             - prefix_len
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
             - retractable_tokens,
@@ -869,7 +869,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.retire_unadmitted_request(req)
             return
         if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
-            req.pd_rebootstrap_in_progress = True
             req.time_stats.set_retract_time()
             is_retracted = False
             is_rebootstrap = True
@@ -979,11 +978,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for req in held:
             self.add(req, is_rebootstrap=True)
 
-    def _rebootstrap_prefill_len(self, req: Req) -> int:
-        if req.pd_rebootstrap_in_progress:
-            return self._pre_alloc_fill_len(req)
-        return len(req.origin_input_ids)
-
     @staticmethod
     def _pre_alloc_fill_len(req: Req) -> int:
         # The last output id is the pending decode input; its KV is not written yet.
@@ -1008,7 +1002,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if self.scheduler.enable_hisparse
                 else self.max_total_num_tokens
             )
-            input_len = self._rebootstrap_prefill_len(req)
+            input_len = self._pre_alloc_fill_len(req)
             if input_len > capacity:
                 message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {capacity}"
             elif self._uses_swa_tail_prealloc():
@@ -1529,7 +1523,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
-            origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
+            fill_len = self._pre_alloc_fill_len(decode_req.req)
             prefix_match: Optional[DecodePrefixMatch] = None
             use_decode_radix_cache = (
                 get_disagg().disaggregation_decode_enable_radix_cache
@@ -1546,8 +1540,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # gap is filled by HiCache loadback later.
                 prefix_len = prefix_match.l1_prefix_len
                 total_prefix_len = prefix_match.decode_prefix_len
-
-                fill_len = self._pre_alloc_fill_len(decode_req.req)
 
                 # Decode transfers the SWA tail fresh, so retain only the
                 # full-attention prefix lock needed for reuse.
@@ -1582,7 +1574,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len = 0
                 total_prefix_len = 0
                 required_alloc_tokens = self._required_alloc_tokens(
-                    fill_len=self._pre_alloc_fill_len(decode_req.req), prefix_len=0
+                    fill_len=fill_len, prefix_len=0
                 )
 
             full_required_for_admission = self._required_admission_tokens(
@@ -1675,7 +1667,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_transfer_page_size = page_size
             raw_kv_indices = self.req_to_token_pool.req_to_token[
                 decode_req.req.kv.req_pool_idx
-            ][total_prefix_len:origin_input_len]
+            ][total_prefix_len:fill_len]
             if self.scheduler.enable_hisparse:
                 # Direct-to-host sends host/C4 rows; keep allocator.page_size
                 # logical and use the compressed page size only for these indices.
@@ -1684,7 +1676,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "hisparse_page_size",
                     page_size,
                 )
-                kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
+                kv_indices = dst_kv_indices[: fill_len - prefix_len]
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = (
@@ -1693,7 +1685,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 )
 
-            seq_len = origin_input_len
+            seq_len = fill_len
 
             def _mamba_payload():
                 state_ids = self.token_to_kv_pool_allocator.state_ids(
@@ -1838,7 +1830,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # the independently allocated target host page IDs.
                 full_kv_indices = self.req_to_token_pool.req_to_token[
                     decode_req.req.kv.req_pool_idx,
-                    prefix_len:origin_input_len,
+                    prefix_len:fill_len,
                 ]
                 device_page_indices = kv_to_page_indices(
                     full_kv_indices,

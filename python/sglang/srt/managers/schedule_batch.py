@@ -1494,9 +1494,6 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
-        # Decode-local: set while a retracted request waits for its prefill
-        # recompute; cleared once it re-enters the running batch.
-        self.pd_rebootstrap_in_progress: bool = False
         # Override embeds give KV that the token ids alone do not determine.
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST

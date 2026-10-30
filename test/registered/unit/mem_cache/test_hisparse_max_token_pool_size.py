@@ -133,7 +133,6 @@ def _make_req(rid: str, prompt_len: int):
         origin_input_ids=[0] * prompt_len,
         output_ids=[],
         return_logprob=False,
-        pd_rebootstrap_in_progress=False,
         finished_reason=None,
     )
 
@@ -202,7 +201,6 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
             origin_input_ids=[0] * 60,
             output_ids=[0] * 60,  # 60 + 59 = 119 > 100
             return_logprob=False,
-            pd_rebootstrap_in_progress=True,
             finished_reason=None,
         )
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
