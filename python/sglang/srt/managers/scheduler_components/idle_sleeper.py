@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import zmq
 
@@ -72,3 +72,17 @@ class RustServerIdleSleeper:
             self.last_empty_time = real_time()
             if self.can_empty_cache is None or self.can_empty_cache():
                 current_platform.empty_cache()
+
+
+def create_rust_server_idle_sleeper(
+    *,
+    rust_server: RustServer,
+    attn_dp_enabled: bool,
+    sleep_on_idle: bool,
+    can_empty_cache=None,
+) -> Optional[RustServerIdleSleeper]:
+    # Every attention-DP step gathers all DP ranks, but a push wakes only its own
+    # rank's ring; a parked idle rank would hold a busy peer for up to the timeout.
+    if attn_dp_enabled and not sleep_on_idle:
+        return None
+    return RustServerIdleSleeper(rust_server, can_empty_cache=can_empty_cache)
