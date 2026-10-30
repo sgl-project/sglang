@@ -161,6 +161,10 @@ def test_dflash_preparation_refreshes_lengths_and_cache_slots():
         mrope_positions=None,
     )
     with (
+        mock.patch(
+            "sglang.srt.model_executor.forward_batch_info.enable_num_token_non_padded",
+            return_value=False,
+        ),
         mock.patch.object(runner_mod, "build_replay_fb_view", return_value=object()),
         mock.patch.object(
             mod.envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM, "get", return_value=False
