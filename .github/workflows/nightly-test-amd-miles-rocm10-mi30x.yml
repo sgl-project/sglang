@@ -2,9 +2,9 @@ name: Nightly Test Miles (AMD ROCm 10 MI30X)
 
 on:
   schedule:
-    # Runs after the 12:00 UTC miles image build has pushed the dated image,
-    # and after the 17:30 UTC sglang MI300 nightly has claimed its runners.
-    - cron: "0 21 * * *"
+    # Runs after the 11:00 UTC miles image build has pushed the dated image,
+    # and after the 16:00/21:00 UTC sglang nightlies have claimed their runners.
+    - cron: "0 22 * * *"
   workflow_dispatch:
     inputs:
       image_tag:
@@ -79,7 +79,7 @@ jobs:
           base="miles-rocm10-mi30x"
           tag="${{ inputs.image_tag }}"
           if [ -z "${tag}" ]; then
-            # Walk back from today; the build job pushes a dated tag at 12:00 UTC.
+            # Walk back from today; the build job pushes a dated tag at 11:00 UTC.
             # Probe with `manifest inspect` so we don't pull a multi-GB image just
             # to test existence; the real pull happens in amd_ci_start_container.sh.
             for i in $(seq 0 6); do

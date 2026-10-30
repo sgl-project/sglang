@@ -143,9 +143,10 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
 
 
 class VocabShard(msgspec.Struct, frozen=True):
-    """Where a rank's vocab slice starts, and the gather over its group."""
+    """A rank's vocab slice [start, start + width), and the gather over its group."""
 
     start: int
+    width: int
     gather: VocabGather
 
 
@@ -233,7 +234,7 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         )
         if group.rank_in_group == 0:
             logger.info(f"DSpark markov_w2 vocab gather: {type(gather).__name__}")
-        self.vocab_shard = VocabShard(start=start, gather=gather)
+        self.vocab_shard = VocabShard(start=start, width=end - start, gather=gather)
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
