@@ -440,8 +440,6 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     the configured linear-attention backend (pure read)."""
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
-    if get_platform().is_xpu:
-        return False
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
@@ -1106,7 +1104,10 @@ def _deterministic_attention_backend(view: Any) -> dict:
 
     if view.attention_backend is None:
         # User didn't specify attention backend, fallback based on GPU architecture
-        if get_platform().is_sm100 or get_platform().is_sm120:
+        if get_platform().is_xpu:
+            # fa3 and flashinfer have no XPU kernels.
+            backend = "intel_xpu"
+        elif get_platform().is_sm100 or get_platform().is_sm120:
             # Blackwell and newer architectures
             if _deterministic_is_deepseek_model(view):
                 # fallback to triton for DeepSeek models because flashinfer
@@ -1327,6 +1328,33 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
         )
         return {"attention_backend": "triton"}
     return {}
+
+
+@register_post_process
+def _hybrid_swa_memory_backend_disable(view: Any) -> dict:
+    if view.disable_hybrid_swa_memory:
+        return {}
+    from sglang.srt.configs.model_config import is_layer_types_hybrid_swa_model
+
+    model_config = model_config_of(view)
+    architectures = model_config.hf_config.architectures
+    if not is_layer_types_hybrid_swa_model(architectures, model_config.hf_text_config):
+        return {}
+    # aiter: with the SWA pool it serves these models through unified_attention,
+    # which loses a passkey 32K tokens back on Gemma 3 that triton retrieves;
+    # drop it here once unified_attention retrieves it too.
+    # wave, flex_attention: they never translate full-pool slots into SWA ones.
+    backends = [
+        backend
+        for backend in attention_backends_of(view)
+        if backend in ("aiter", "wave", "flex_attention")
+    ]
+    if not backends:
+        return {}
+    logger.warning(
+        f"Disable hybrid SWA memory for {architectures[0]} on the {backends[0]} attention backend."
+    )
+    return {"disable_hybrid_swa_memory": True}
 
 
 @register_post_process
@@ -1835,10 +1863,11 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     # Only the hybrid-SWA byte pool has a matching post-capture resize path.
     model_config = model_config_of(server_args)
     if cfg.enable_unified_memory:
-        from sglang.srt.configs.hybrid_arch import mambaish_config
+        from sglang.srt.mem_cache.kv.decl import declared_lifetime_types
+        from sglang.srt.mem_cache.kv.plan import resized_after_capture
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        if not model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
+        if not resized_after_capture(declared_lifetime_types(model_config)):
             return False
         # The solver budgets these independent draft pools again after capture.
         spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)

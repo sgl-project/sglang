@@ -35,6 +35,8 @@ from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache_ratio_default,
 )
 from sglang.srt.arg_groups.hisparse_hook import (
+    _hisparse_allowed_backends,
+    _hisparse_default_backend,
     validate_hisparse,
     validate_hisparse_dsa_backend,
     validate_hisparse_kv_cache_dtype,
@@ -50,7 +52,10 @@ from sglang.srt.arg_groups.kv_shard_hook import (
     validate_kv_shard_attention_backend,
 )
 from sglang.srt.arg_groups.lora_hook import check_lora_server_args
-from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
+from sglang.srt.arg_groups.mamba_hook import (
+    handle_int8_mamba_checkpoint,
+    handle_mamba_backend,
+)
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
@@ -226,15 +231,19 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertTrue(joined._radix_eviction_policy_explicitly_set)
         self.assertTrue(configured._radix_eviction_policy_explicitly_set)
 
-    def test_amd_monokernel_flag_spellings_in_config_and_cli(self):
-        """The deprecated --monokernel-backend amd and --enable-amd-monokernel share a
-        dest; a config file must accept either key, true or false, not reject both."""
+    def test_monokernel_flag_spellings_in_config_and_cli(self):
+        """The deprecated --monokernel-backend amd|msa sets --enable-amd-monokernel or
+        --enable-nvidia-megakernel; a config file accepts every spelling."""
         cases = (
-            ("monokernel-backend: amd\n", [], True),
-            ("enable-amd-monokernel: true\n", [], True),
-            ("enable-amd-monokernel: false\n", [], False),
-            (None, ["--enable-amd-monokernel"], True),
-            (None, ["--monokernel-backend", "amd"], True),
+            ("monokernel-backend: amd\n", [], (True, False)),
+            ("monokernel-backend: msa\n", [], (False, True)),
+            ("enable-amd-monokernel: true\n", [], (True, False)),
+            ("enable-amd-monokernel: false\n", [], (False, False)),
+            ("enable-nvidia-megakernel: true\n", [], (False, True)),
+            (None, ["--enable-amd-monokernel"], (True, False)),
+            (None, ["--enable-nvidia-megakernel"], (False, True)),
+            (None, ["--monokernel-backend", "amd"], (True, False)),
+            (None, ["--monokernel-backend", "msa"], (False, True)),
         )
         for config, cli, expected in cases:
             with self.subTest(config=config, cli=cli):
@@ -246,7 +255,11 @@ class TestPrepareServerArgs(CustomTestCase):
                         f.write(config)
                     self.addCleanup(os.unlink, f.name)
                     argv += ["--config", f.name]
-                self.assertIs(prepare_server_args(argv).enable_amd_monokernel, expected)
+                args = prepare_server_args(argv)
+                self.assertEqual(
+                    (args.enable_amd_monokernel, args.enable_nvidia_megakernel),
+                    expected,
+                )
 
     def test_ple_embedding_offload_rejects_generic_weight_offload(self):
         for generic_offload in (
@@ -1143,6 +1156,26 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
             handle_mamba_backend(server_args)
 
 
+class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
+    def test_rejects_unified_memory(self):
+        """The unified pool has no int8 checkpoint pool; the flag used to be
+        accepted and then silently ignored."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_int8_mamba_checkpoint=True,
+            enable_unified_memory=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--enable-unified-memory"):
+            handle_int8_mamba_checkpoint(server_args)
+
+    def test_unified_memory_alone_is_accepted(self):
+        """An inverted condition here would reject every unified launch."""
+        handle_int8_mamba_checkpoint(
+            ServerArgs(model_path="dummy", enable_unified_memory=True)
+        )
+
+
 class TestKV4Compatibility(unittest.TestCase):
     def setUp(self):
         self._use_mla_backend_patcher = patch(
@@ -1585,21 +1618,21 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             ),
         }
 
-    @override_platform(is_hip=False)
+    @override_platform(is_hip=False, is_xpu=False)
     def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self):
         resolved = self._resolve("bfloat16")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_sparse")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_sparse")
 
-    @override_platform(is_hip=False)
+    @override_platform(is_hip=False, is_xpu=False)
     def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self):
         resolved = self._resolve("fp8_e4m3")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
 
-    @override_platform(is_hip=False)
+    @override_platform(is_hip=False, is_xpu=False)
     def test_hisparse_accepts_flashinfer_sparse_mla_on_cuda_fp8(self):
         """SM120 GLM DSA resolves both DSA backends to flashinfer_sparse_mla, so
         the fp8 hisparse allow-set must admit it or --enable-hisparse cannot
@@ -1655,7 +1688,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tilelang"):
             validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
 
-    @override_platform(is_hip=False)
+    @override_platform(is_hip=False, is_xpu=False)
     def test_hisparse_rejects_rocm_backend_on_cuda(self):
         server_args = ServerArgs(
             model_path="dummy",
@@ -1666,6 +1699,66 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "flashmla_sparse"):
             validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    @override_platform(is_hip=False, is_xpu=True)
+    def test_hisparse_accepts_intel_xpu_backend_on_xpu(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend="intel_xpu",
+            dsa_decode_backend="intel_xpu",
+        )
+
+        validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
+        validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    @override_platform(is_hip=False, is_xpu=True)
+    def test_hisparse_default_backend_is_allowed_on_xpu(self):
+        self.assertIn(
+            _hisparse_default_backend("bfloat16"),
+            _hisparse_allowed_backends("bfloat16"),
+        )
+
+    @override_platform(is_hip=False, is_xpu=True)
+    def test_hisparse_rejects_fp8_kv_cache_on_xpu(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+            dsa_decode_backend="intel_xpu",
+        )
+        # The message must name the dtype to switch to: the allow-set is empty
+        # here, so "use one of []" and "omit the option" are both dead ends.
+        with self.assertRaisesRegex(ValueError, r"fp8_e4m3.*--kv-cache-dtype=bfloat16"):
+            validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    @override_platform(is_hip=False, is_xpu=True)
+    def test_hisparse_rejects_cuda_backend_on_xpu(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_decode_backend="flashmla_sparse",
+        )
+        with self.assertRaisesRegex(ValueError, "intel_xpu"):
+            validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    def test_intel_xpu_is_a_dsa_backend_cli_choice(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--dsa-prefill-backend",
+                "intel_xpu",
+                "--dsa-decode-backend",
+                "intel_xpu",
+            ]
+        )
+        self.assertEqual(args.dsa_prefill_backend, "intel_xpu")
+        self.assertEqual(args.dsa_decode_backend, "intel_xpu")
 
     def test_hisparse_accepts_bfloat16_kv_cache_dtype(self):
         server_args = ServerArgs(
@@ -4819,6 +4912,37 @@ class TestRustServerDpAttentionControlBroadcast(unittest.TestCase):
                 server_args, "enable_dp_attention_local_control_broadcast", False
             )
         )
+
+
+class TestRustServerPrefillReplicaDp(CustomTestCase):
+    def test_prefill_rejects_replica_dp(self):
+        """A plain-DP prefill replica's listener must not advertise a KV
+        bootstrap registry its ranks never register with."""
+
+        def args(**kwargs):
+            return ServerArgs(
+                model_path="dummy",
+                served_model_name="dummy",
+                chunked_prefill_size=-1,
+                **kwargs,
+            )
+
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            self.assertRaisesRegex(ValueError, "prefill does not support"),
+        ):
+            args(disaggregation_mode="prefill", dp_size=2).check_server_args()
+
+        for rust_server, kwargs in (
+            (True, dict(disaggregation_mode="prefill", tp_size=2, attn_dp_size=2)),
+            (True, dict(disaggregation_mode="decode", dp_size=2)),
+            (False, dict(disaggregation_mode="prefill", dp_size=2)),
+        ):
+            with (
+                self.subTest(rust_server=rust_server, **kwargs),
+                envs.SGLANG_RUST_SERVER.override(rust_server),
+            ):
+                args(**kwargs).check_server_args()
 
 
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):

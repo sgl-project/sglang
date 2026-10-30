@@ -91,6 +91,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.available_size.return_value = 1000
+        # Static pools: no unified KV storage behind the allocator.
+        scheduler.token_to_kv_pool_allocator.storage = None
         scheduler.max_total_num_tokens = 1000
         scheduler._get_token_info = MagicMock(
             return_value=PoolStats(
@@ -186,8 +188,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         controller.write.side_effect = write
 
         manager = object.__new__(DecodeKVCacheOffloadManager)
-        # Not a UnifiedSWAKVPool, so offloads carry no extra SWA pool transfers.
+        # No unified window sub-pool, so offloads carry no extra SWA pool transfers.
         manager.kv_cache = None
+        manager._unified_window = False
         manager.req_to_token_pool = SimpleNamespace(
             req_to_token=torch.arange(8).unsqueeze(0)
         )
@@ -219,6 +222,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.tree_cache.token_to_kv_pool_allocator = (
             scheduler.token_to_kv_pool_allocator
         )
+        scheduler.tree_cache.logical_page_size = 1
         scheduler.tree_cache.req_to_token_pool.free.side_effect = lambda released_req: (
             setattr(released_req.kv, "req_pool_idx", None)
         )
