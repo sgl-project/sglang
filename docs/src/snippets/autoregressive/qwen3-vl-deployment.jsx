@@ -12,7 +12,8 @@ export const Qwen3VLDeployment = () => {
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
-        { id: 'xeon', label: 'XEON', default: false }
+        { id: 'xeon', label: 'XEON', default: false },
+        { id: 'arc_b', label: 'BMG', default: false }
       ]
     },
     modelsize: {
@@ -101,7 +102,8 @@ export const Qwen3VLDeployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true },
+      arc_b: { tp: 1, ep: 0, bf16: true, fp8: true }
     },
     '4b': {
       baseName: '4B',
@@ -113,7 +115,8 @@ export const Qwen3VLDeployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true },
+      arc_b: { tp: 1, ep: 0, bf16: true, fp8: true }
     },
     '2b': {
       baseName: '2B',
@@ -125,8 +128,44 @@ export const Qwen3VLDeployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true },
+      arc_b: { tp: 1, ep: 0, bf16: true, fp8: false }
     }
+  };
+
+  const arcBModels = {
+    '8b': { bf16: true, fp8: true, thinking: ['thinking'] },
+    '4b': { bf16: true, fp8: true, thinking: ['instruct', 'thinking'] },
+    '2b': { bf16: true, fp8: false, thinking: ['thinking'] }
+  };
+
+  const getDisplayOptions = (values) => {
+    const displayOptions = { ...options };
+    if (values.hardware === 'arc_b') {
+      const selectedModel = arcBModels[values.modelsize];
+      displayOptions.modelsize = {
+        ...options.modelsize,
+        items: options.modelsize.items.map(item => ({
+          ...item,
+          disabled: !arcBModels[item.id]
+        }))
+      };
+      displayOptions.quantization = {
+        ...options.quantization,
+        items: options.quantization.items.map(item => ({
+          ...item,
+          disabled: !selectedModel || !selectedModel[item.id]
+        }))
+      };
+      displayOptions.thinking = {
+        ...options.thinking,
+        items: options.thinking.items.map(item => ({
+          ...item,
+          disabled: !selectedModel || !selectedModel.thinking.includes(item.id)
+        }))
+      };
+    }
+    return displayOptions;
   };
 
 
@@ -159,7 +198,25 @@ export const Qwen3VLDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      if (prev.hardware === 'arc_b' && optionName === 'modelsize' && !arcBModels[value]) return prev;
+      if (prev.hardware === 'arc_b' && optionName === 'quantization' && !arcBModels[prev.modelsize][value]) return prev;
+      if (prev.hardware === 'arc_b' && optionName === 'thinking' && !arcBModels[prev.modelsize].thinking.includes(value)) return prev;
+
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'arc_b') {
+        next.modelsize = arcBModels[prev.modelsize] ? prev.modelsize : '4b';
+        const supportedModel = arcBModels[next.modelsize];
+        if (!supportedModel[next.quantization]) next.quantization = supportedModel.bf16 ? 'bf16' : 'fp8';
+        if (!supportedModel.thinking.includes(next.thinking)) next.thinking = supportedModel.thinking[0];
+      }
+      if (next.hardware === 'arc_b' && optionName === 'modelsize') {
+        const supportedModel = arcBModels[value];
+        if (!supportedModel[next.quantization]) next.quantization = supportedModel.bf16 ? 'bf16' : 'fp8';
+        if (!supportedModel.thinking.includes(next.thinking)) next.thinking = supportedModel.thinking[0];
+      }
+      return next;
+    });
   };
 
   // Generate command
@@ -186,11 +243,14 @@ export const Qwen3VLDeployment = () => {
     const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
     const thinkingSuffix = thinking === 'thinking' ? '-Thinking' : '-Instruct';
     const modelName = `Qwen/Qwen3-VL-${config.baseName}${thinkingSuffix}${quantSuffix}`;
+    const isArcB = hardware === 'arc_b';
 
     let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
     if (isXeon) {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    } else if (isArcB) {
+      cmd += ` \\\n  --device xpu \\\n  --attention-backend intel_xpu`;
     }
 
     if (hwConfig.tp > 1) {
@@ -212,12 +272,16 @@ export const Qwen3VLDeployment = () => {
       }
     }
 
-    if (thinking === 'thinking') {
+    if (thinking === 'thinking' && !isArcB) {
       cmd += ' \\\n  --reasoning-parser qwen3';
     }
 
     if (toolcall === 'enabled') {
       cmd += ' \\\n  --tool-call-parser qwen';
+    }
+
+    if (isArcB && modelsize === '8b' && quantization === 'bf16') {
+      cmd += ' \\\n  --mem-fraction-static 0.8';
     }
 
     if (hardware === 'b300') {
@@ -241,7 +305,7 @@ export const Qwen3VLDeployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(options).map(([key, option]) => (
+      {Object.entries(getDisplayOptions(values)).map(([key, option]) => (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>
           <div style={itemsStyle}>

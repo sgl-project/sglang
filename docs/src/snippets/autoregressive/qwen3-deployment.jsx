@@ -332,9 +332,7 @@ export const Qwen3Deployment = () => {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
     } else if (hardware === 'arc_b') {
       cmd += ` \\\n  --device xpu`;
-      if (isArcBNewModel) {
-        cmd += ` \\\n  --attention-backend intel_xpu`;
-      }
+      cmd += ` \\\n  --attention-backend intel_xpu`;
     }
 
     if (hwConfig.tp > 1) {

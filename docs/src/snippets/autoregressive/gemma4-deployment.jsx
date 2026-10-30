@@ -165,6 +165,7 @@ export const Gemma4Deployment = () => {
 
     if (hardware === 'arc_b') {
       cmd += ` \\\n  --device xpu`;
+      cmd += ` \\\n  --attention-backend intel_xpu`;
     }
 
     cmd += ` \\\n  --mem-fraction-static ${mem}`;
