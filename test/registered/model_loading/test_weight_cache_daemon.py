@@ -130,6 +130,12 @@ def _still_running(procs) -> list:
     return running
 
 
+def _process_tree(pid: int) -> list:
+    """The process ``pid`` and its descendants."""
+    proc = psutil.Process(pid)
+    return [proc, *proc.children(recursive=True)]
+
+
 @unittest.skipIf(
     torch.cuda.device_count() < 2,
     "TP=2 weight cache daemon test requires >=2 GPUs (skipped on the 1-gpu runner)",
@@ -515,8 +521,8 @@ class _VmmFdVariant:
     configuration. When that fixture has not come up in this process (the
     parent class did not run first, or ``extra_args()`` adds arguments), it is
     launched here first to record them. The last test kills the daemon: the
-    engine's own vmm_fd mappings keep its weights valid, so it keeps serving the
-    same outputs.
+    engine's own vmm_fd mappings keep its weights valid, so its greedy outputs
+    stay what they were right before the kill.
     """
 
     @classmethod
@@ -552,7 +558,33 @@ class _VmmFdVariant:
 
     def test_serves_after_daemon_exit(self):
         # Runs after the other tests of the class (tests run in name order).
-        kill_process_tree(self.daemon_process.pid)
+        # Compare with a round taken right before the kill, not with the first
+        # round: a repeated prompt hits the prefix cache, which can change where
+        # its last token sits in the batch, and with redundant experts that
+        # changes the replica it is dispatched to and so the rounding. A retry
+        # of this method must reuse the first attempt's round, since the daemon
+        # is gone by then.
+        before = getattr(self, "_outputs_before_daemon_exit", None)
+        if before is None:
+            # The round must be taken while every daemon runs: after an exit,
+            # it would already include what the exit changed, and the exit's
+            # log lines would pass the check below. Otherwise fail without
+            # keeping the round, so that a retry fails as well.
+            daemons = [psutil.Process(_daemon_pid(uuid)) for uuid in self.gpu_uuids]
+            self.assertEqual(
+                _still_running(daemons), daemons, "A daemon exited before the kill."
+            )
+            self.assertNotIn(
+                "serving continues",
+                _read_logs(self.log_files),
+                "An engine rank logged a daemon exit before the kill.",
+            )
+            before = _greedy_completions(self.base_url, self.model)
+            self.assertEqual(
+                _still_running(daemons), daemons, "A daemon exited before the kill."
+            )
+            self._outputs_before_daemon_exit = before
+            kill_process_tree(self.daemon_process.pid)
         deadline = time.time() + 60
         logs = ""
         while time.time() < deadline:
@@ -566,9 +598,7 @@ class _VmmFdVariant:
             "Expected every engine rank to log that it keeps serving after the "
             "daemon exited.",
         )
-        self.assertEqual(
-            _greedy_completions(self.base_url, self.model), self.greedy_outputs
-        )
+        self.assertEqual(_greedy_completions(self.base_url, self.model), before)
 
 
 class TestWeightCacheDaemonTP1SmokeVmmFd(_VmmFdVariant, TestWeightCacheDaemonTP1Smoke):
@@ -614,11 +644,12 @@ class TestWeightCacheDaemonQwen3MoeAttnCPVmmFd(
 class TestWeightCacheDaemonVmmFdTwoClients(TestWeightCacheDaemonTP1Smoke):
     """Two engines on one GPU map the same vmm_fd allocations of one daemon.
 
-    The fixture's server (A) and a second one (B) attach. A is stopped with
-    SIGTERM, and B keeps serving A's greedy completions. A third server (C)
-    attaches next to B, B is killed with SIGKILL, and C keeps serving them.
-    The daemon's open file descriptors stay the same throughout: it closed
-    the fds it exported for every fetch.
+    The fixture's server (A) and a second one (B) attach, and B's first greedy
+    completions equal A's. A is stopped with SIGTERM, and B keeps serving what
+    it served right before. A third server (C) attaches next to B, with the same
+    first completions; B is killed with SIGKILL, and C keeps serving what it
+    served right before. The daemon's open file descriptors stay the same
+    throughout: it closed the fds it exported for every fetch.
     """
 
     # The test stops the fixture's server itself; a retry would reuse it.
@@ -692,18 +723,25 @@ class TestWeightCacheDaemonVmmFdTwoClients(TestWeightCacheDaemonTP1Smoke):
         return process, base_url
 
     def test_two_clients_one_exits(self):
-        # Last in name order: it stops the fixture's server, A.
+        # Last in name order: it stops the fixture's server, A. A server's first
+        # round is compared with A's first round, and a later one with the same
+        # server's round right before the change, since a repeated prompt hits
+        # the prefix cache (see _VmmFdVariant.test_serves_after_daemon_exit).
+        # The server about to stop must run before and after that round, or
+        # the round would already include its exit.
         reference = self.greedy_outputs
         daemon_pid = _daemon_pid(self.gpu_uuids[0])
         b, b_url = self._launch_server("B")
         self.assertEqual(_greedy_completions(b_url, self.model), reference)
+        a_procs = _process_tree(self.process.pid)
+        self.assertEqual(_still_running(a_procs), a_procs, "Server A exited early.")
+        b_before = _greedy_completions(b_url, self.model)
+        self.assertEqual(_still_running(a_procs), a_procs, "Server A exited early.")
         # A and B have both fetched from the daemon by now.
         daemon_fds = _open_fd_count(daemon_pid)
 
         # SIGTERM to A's launcher, as an operator would send it; then wait
         # until every process of A has exited, and its mappings with it.
-        a_procs = [psutil.Process(self.process.pid)]
-        a_procs += a_procs[0].children(recursive=True)
         self.process.terminate()
         self.process.wait(timeout=120)
         deadline = time.time() + 60
@@ -712,14 +750,18 @@ class TestWeightCacheDaemonVmmFdTwoClients(TestWeightCacheDaemonTP1Smoke):
         self.assertEqual(
             _still_running(a_procs), [], "Server A did not exit after SIGTERM."
         )
-        self.assertEqual(_greedy_completions(b_url, self.model), reference)
+        self.assertEqual(_greedy_completions(b_url, self.model), b_before)
         self.assertEqual(_open_fd_count(daemon_pid), daemon_fds)
 
         _, c_url = self._launch_server("C")
         self.assertEqual(_greedy_completions(c_url, self.model), reference)
+        b_procs = _process_tree(b.pid)
+        self.assertEqual(_still_running(b_procs), b_procs, "Server B exited early.")
+        c_before = _greedy_completions(c_url, self.model)
+        self.assertEqual(_still_running(b_procs), b_procs, "Server B exited early.")
         # SIGKILL to every process of B; returns once they have exited.
         kill_process_tree(b.pid)
-        self.assertEqual(_greedy_completions(c_url, self.model), reference)
+        self.assertEqual(_greedy_completions(c_url, self.model), c_before)
         self.assertEqual(_open_fd_count(daemon_pid), daemon_fds)
 
 
