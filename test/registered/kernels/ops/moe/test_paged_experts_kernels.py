@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 import torch
@@ -146,6 +147,70 @@ class TestPagedExpertsKernels(CustomTestCase):
             for e, s in ((5, 2), (63, 0), (17, 15)):
                 self.assertTrue(torch.equal(gpu[s].cpu(), host[e]))
             self.assertFalse(gpu[1].any())  # untouched
+
+    def test_store_pins_its_exact_size_and_the_gather_reads_it(self):
+        """The host store pins exactly its size (torch's pinned allocator rounds up to a power
+        of two), and the gather kernel reads it through the GPU."""
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
+        host = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E).host["w"]
+        host.copy_(torch.randn(E, 3, 1000, dtype=torch.bfloat16))
+        self.assertTrue(host.is_pinned())
+        self.assertEqual(host.untyped_storage().nbytes(), E * 3 * 1000 * 2)
+        src = torch.tensor([5, 63] + [0] * (K - 2), dtype=torch.int32).cuda()
+        dst = torch.tensor([2, 0] + [0] * (K - 2), dtype=torch.int32).cuda()
+        count = torch.tensor([2], dtype=torch.int32, device="cuda")
+
+        paged_experts_gather(*_gather_args([host], [gpu]), src, dst, count)
+
+        self.assertTrue(torch.equal(gpu[2].cpu(), host[5]))
+        self.assertTrue(torch.equal(gpu[0].cpu(), host[63]))
+
+    def test_store_is_on_the_host_under_a_default_cuda_device(self):
+        """Models are constructed under ``torch.device("cuda")``; a store created there (by
+        a format that pages its loaded rows as they are) is still pinned host memory."""
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
+        with torch.device("cuda"):
+            host = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E).host[
+                "w"
+            ]
+        self.assertEqual(host.device.type, "cpu")
+        self.assertTrue(host.is_pinned())
+
+    def test_store_unregisters_its_pages_once_the_last_tensor_is_freed(self):
+        """The pinned pages stay registered while any tensor on them lives (here a slice that
+        outlives the store and its tensor), and are unregistered once the last one is freed."""
+        import gc
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
+        store = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E)
+        ptr = store.host["w"].data_ptr()
+        expert = store.host["w"][5]
+        gpu[0].copy_(expert, non_blocking=True)  # a read still queued when it is freed
+        del store
+        gc.collect()
+        self.assertTrue(expert.is_pinned())
+
+        del expert
+        gc.collect()
+        # Unregistering again must fail: the pages are no longer registered. In a thread of its
+        # own, as CUDA keeps the error as the thread's last error for a later call to report.
+        rc = []
+        unregister = lambda: rc.append(int(torch.cuda.cudart().cudaHostUnregister(ptr)))
+        thread = threading.Thread(target=unregister)
+        thread.start()
+        thread.join()
+        self.assertNotEqual(rc[0], 0)
 
     def test_graph_replays_decide_on_new_routing(self):
         """A captured decide + gather plans and pages each replay's routing, not the routing

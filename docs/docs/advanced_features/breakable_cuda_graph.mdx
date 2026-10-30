@@ -46,6 +46,32 @@ def forward(self, x):
     return out
 ```
 
+#### Pool-owned outputs
+
+When you can determine the output layout before a break, supply an
+`output_factory`. It runs during capture, before the segment ends, so output
+storage belongs to the graph pool and can be reused after its consumers:
+
+```python
+import torch
+
+@eager_on_graph(output_factory=torch.empty_like)
+def dynamic_scale(x):
+    return x * 2
+```
+
+The factory receives the function's arguments and returns a tensor, or nested
+tuples/lists of tensors and `None`. Output shapes, dtypes, devices, and structure
+must match on every replay. The wrapper copies the results into those buffers;
+this does not automatically eliminate the computation's temporary outputs.
+
+For a function that can fill buffers directly, set `pass_output=True`, accept an
+optional `out=None` keyword argument, and return the supplied buffers for the
+leaves you filled. Those leaves are not copied. Outside capture, the factory
+and output copies are bypassed, and the function receives its original arguments.
+Use `.run_eager(...)` for an already-decorated operation inside another eager
+break to avoid nested graph segmentation.
+
 You can also insert a bare graph break (no computation) using the `break_graph()` helper:
 
 ```python
@@ -132,7 +158,7 @@ The non-graph functions are invoked with the same tensor references as capture t
 
 ### Outputs
 
-A non-graph function writes its results into buffers its caller allocated before the break, so the downstream graph segments read the same addresses at every replay. Host-side results go into a holder object the caller owns. A function that returns a value fails with an assertion. Every captured shape is warmed up before capture, so lazy setup (JIT compilation, buffers sized by the first run) happens outside capture.
+A non-graph function writes its results into buffers its caller allocated before the break, so the downstream graph segments read the same addresses at every replay. Host-side results go into a holder object the caller owns. Without an `output_factory`, a function that returns a value fails with an assertion. Every captured shape is warmed up before capture, so lazy setup (JIT compilation, buffers sized by the first run) happens outside capture.
 
 ### Stream Fork/Join Tracking
 
