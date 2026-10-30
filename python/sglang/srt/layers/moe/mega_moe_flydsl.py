@@ -168,10 +168,6 @@ def build_mega_moe_experts_weights(layer) -> None:
 
     w13_scale = scale_param("w13_weight_scale")
     w2_scale = scale_param("w2_weight_scale")
-    w13_shape, w13_dtype = layer.w13_weight.shape, layer.w13_weight.dtype
-    w2_shape, w2_dtype = layer.w2_weight.shape, layer.w2_weight.dtype
-    w13_scale_shape, w13_scale_dtype = w13_scale.shape, w13_scale.dtype
-    w2_scale_shape, w2_scale_dtype = w2_scale.shape, w2_scale.dtype
     layer._mega_w1, layer._mega_w1_scale = shuffle_existing(
         layer.w13_weight.data, w13_scale.data, gate_up=True
     )
@@ -179,10 +175,6 @@ def build_mega_moe_experts_weights(layer) -> None:
         layer.w2_weight.data, w2_scale.data, gate_up=False
     )
 
-    layer.w13_weight.data = layer._mega_w1.view(w13_dtype).view(w13_shape)
-    w13_scale.data = layer._mega_w1_scale.view(w13_scale_dtype).view(w13_scale_shape)
-    layer.w2_weight.data = layer._mega_w2.view(w2_dtype).view(w2_shape)
-    w2_scale.data = layer._mega_w2_scale.view(w2_scale_dtype).view(w2_scale_shape)
     layer._mega_moe_weights_built = True
 
 
