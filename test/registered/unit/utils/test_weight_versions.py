@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     published_topology,
 )
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ReqStub:
@@ -316,6 +316,7 @@ class _SchedulerStub:
         self.waiting_queue = waiting
         self.chunked_req = chunked
         self.hisparse_coordinator = hisparse
+        self._deferred_responses = None
 
 
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):

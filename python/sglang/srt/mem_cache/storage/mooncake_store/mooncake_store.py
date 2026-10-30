@@ -20,6 +20,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    SidecarPoolSpec,
+    disabled_l3_layout,
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
@@ -802,6 +804,124 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if group_ids is None:
             return None
         return [group_ids[i] for i in indices]
+
+    def describe_l3_object_layout(
+        self,
+        *,
+        sidecar_pool_specs: Sequence[SidecarPoolSpec],
+        swa_trailing_pages: Optional[int],
+        page_size: int,
+    ) -> dict:
+        """Describe physical objects using the same key builders as writes.
+
+        Args:
+            sidecar_pool_specs: Sidecar hit policies and their index-source pools.
+            swa_trailing_pages: The SWA component's full_window_pages, or None
+                when no SWA component exists. Mamba uses one trailing page.
+            page_size: Resolved engine page size in tokens.
+
+        Returns:
+            The availability envelope with backend, page_size and
+            hicache_object_layout (pools, key prefix and parallelism metadata).
+            Unsupported rank-sharded layouts return enabled=False with a reason.
+        """
+        from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+
+        pools = []
+        layout = {
+            "enabled": True,
+            "backend": "mooncake",
+            "page_size": page_size,
+            "hicache_object_layout": {
+                "pools": pools,
+                # _tag_keys() prepends this to every object key.
+                "key_prefix": self.config_prefix,
+                "is_mla_backend": self.is_mla_backend,
+                "pp_rank": self.pp_rank,
+                "pp_size": self.pp_size,
+            },
+        }
+        # MHA keys embed the tp rank, which one scheduler cannot enumerate. MLA keys
+        # only embed the pp stage; merge_l3_layouts joins the stages.
+        if not self.is_mla_backend:
+            layout.update(
+                enabled=False,
+                reason="External L3 lookup requires rank-replicated/MLA pools",
+            )
+            return layout
+
+        if self.mem_pool_host.kv_buffer is not None:
+            suffixes, _, _ = self._batch_preprocess(
+                [""],
+                torch.arange(
+                    self.mem_pool_host.page_size, dtype=torch.int64, device="cpu"
+                ),
+            )
+            pools.append(
+                {
+                    "pool": str(PoolName.KV),
+                    "suffixes": suffixes,
+                    "hit_policy": "all_pages",
+                }
+            )
+
+        specs = {spec.pool_name: spec for spec in sidecar_pool_specs}
+        trailing_pages = {PoolName.MAMBA: 1, PoolName.SWA: swa_trailing_pages}
+        for pool_name in self.registered_pools:
+            if pool_name == PoolName.KV:
+                continue
+            spec = specs.get(pool_name)
+            policy = (
+                spec.hit_policy
+                if spec is not None
+                else (
+                    PoolHitPolicy.TRAILING_PAGES
+                    if pool_name in trailing_pages
+                    else PoolHitPolicy.ALL_PAGES
+                )
+            )
+            suffixes, _ = self._get_hybrid_page_component_keys(
+                [""], PoolTransfer(name=pool_name)
+            )
+            entry = {
+                "pool": str(pool_name),
+                "suffixes": suffixes,
+                "hit_policy": policy.value,
+            }
+            if policy == PoolHitPolicy.TRAILING_PAGES:
+                source = spec.indices_from_pool if spec is not None else pool_name
+                window = trailing_pages.get(source)
+                if window is None or window <= 0:
+                    return disabled_l3_layout(
+                        f"Unknown or non-positive trailing-page window for pool {pool_name}",
+                        backend="mooncake",
+                        page_size=page_size,
+                    )
+                entry["trailing_pages"] = window
+            pools.append(entry)
+        draft_pool = self.registered_pools.get(PoolName.DRAFT)
+        draft_swa_pool = self.registered_pools.get(PoolName.DRAFT_SWA)
+        # These auxiliary pools use TP-rank suffixes even with an MLA primary.
+        if (
+            PoolName.MAMBA in self.registered_pools
+            or (
+                draft_pool is not None
+                and not isinstance(draft_pool, MLATokenToKVPoolHost)
+            )
+            or (
+                draft_swa_pool is not None
+                and not isinstance(
+                    draft_swa_pool, (DeepSeekV4PagedHostPool, MLATokenToKVPoolHost)
+                )
+            )
+        ):
+            layout.update(
+                enabled=False,
+                reason="Auxiliary L3 pools are not rank-replicated/MLA",
+            )
+        elif not pools:
+            layout.update(enabled=False, reason="No physical L3 pools are registered")
+        return layout
 
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer

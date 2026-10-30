@@ -40,9 +40,10 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mem_cache_utils import routed
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ExtendMode:
@@ -642,6 +643,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             encoder_out_cache_loc=torch.arange(3) + 32,
         )
         layer = SimpleNamespace(
+            layer_id=0,
             is_cross_attention=False,
             k_scale="key-scale",
             v_scale="value-scale",
@@ -653,8 +655,8 @@ class TestCPZigzagStrategy(CustomTestCase):
         with (
             patch.object(strategy, "gather_kv_cache", return_value=local_kv) as gather,
             patch(
-                "sglang.srt.layers.cp.zigzag.get_token_to_kv_pool",
-                return_value=pool,
+                "sglang.srt.layers.cp.zigzag.get_kv_layers",
+                return_value=routed(pool).layer_router,
             ),
         ):
             strategy.materialize_full_kv(forward_batch, layer, key, value, swa_loc)

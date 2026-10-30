@@ -278,6 +278,15 @@ for _mod, _fn, _backend, _device in [
         )
     )
 del _mod, _fn, _backend, _device
+# Called through ops.attention.kda_fused_decode_gfx950, which checks for gfx950.
+register_kernel(
+    KernelSpec(
+        op="attention.kda_decode_gfx950",
+        backend=KernelBackend.KDA,
+        target="sglang.kernels.kda_kernels.kda_decode_gfx950:kda_decode_gfx950",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 
 
 # Public entry points inventoried by logical operator group (RFC #29630).
@@ -527,6 +536,15 @@ register_kernel(
             CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
             for sm in ((10, 0), (10, 3))
         ),
+    )
+)
+# Called through ops.attention.linear.kda_gfx950_prefill, which checks for gfx950.
+register_kernel(
+    KernelSpec(
+        op="attention.kda_prefill_gfx950",
+        backend=KernelBackend.KDA,
+        target="sglang.kernels.kda_kernels.kda_prefill_gfx950:kda_prefill_gfx950",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
     )
 )
 register_kernel(

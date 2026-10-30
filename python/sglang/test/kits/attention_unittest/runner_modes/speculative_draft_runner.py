@@ -180,6 +180,7 @@ class _EagleDraftWorkerHarness:
         self.model_config = fixture.runner.model_config
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.hot_token_id = None
+        self.megakernel = None
         self.model_runner.forward = model_forward
         self.draft_forward = MethodType(EagleDraftWorker.draft_forward, self)
         # draft_forward's topk=1 fast path reads these prealloc buffers (built
@@ -515,7 +516,7 @@ def run_eagle_draft_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(eager_fixture, case, draft_inputs, settings)
         eager_batch = adapter.make_forward_batch(case, draft_inputs, settings)
-        eager_fixture.runner.kv_index_translator.bind_own_plan(eager_batch)
+        eager_fixture.runner.runner_ids.bind_own_plan(eager_batch)
         expected = _run_eagle_draft_eager(
             eager_worker,
             eager_batch,
@@ -532,7 +533,7 @@ def run_eagle_draft_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
         graph_batch = adapter.make_forward_batch(case, draft_inputs, settings)
-        graph_fixture.runner.kv_index_translator.bind_own_plan(graph_batch)
+        graph_fixture.runner.runner_ids.bind_own_plan(graph_batch)
         graph_runner = _capture_eagle_draft_graph_runner(
             graph_worker,
             graph_backend,
@@ -572,7 +573,7 @@ def run_frozen_kv_mtp_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(eager_fixture, case, draft_inputs, settings)
         eager_batch = adapter.make_forward_batch(case, draft_inputs, settings)
-        eager_fixture.runner.kv_index_translator.bind_own_plan(eager_batch)
+        eager_fixture.runner.runner_ids.bind_own_plan(eager_batch)
         expected = _run_frozen_kv_mtp_eager(eager_worker, eager_batch)
 
         graph_fixture, graph_worker, _ = _build_frozen_kv_mtp_fixture(
@@ -584,7 +585,7 @@ def run_frozen_kv_mtp_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
         graph_batch = adapter.make_forward_batch(case, draft_inputs, settings)
-        graph_fixture.runner.kv_index_translator.bind_own_plan(graph_batch)
+        graph_fixture.runner.runner_ids.bind_own_plan(graph_batch)
         graph_runner = _capture_frozen_kv_mtp_graph_runner(graph_worker)
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 

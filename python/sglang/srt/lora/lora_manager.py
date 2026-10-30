@@ -456,10 +456,15 @@ class LoRAManager:
         return required_slots <= mem_pool_vacancy
 
     def fetch_new_loras(
-        self, new_loras: set[Optional[str]], running_loras: set[Optional[str]] = set()
+        self,
+        new_loras: set[Optional[str]],
+        running_loras: set[Optional[str]] = set(),
+        pp_loras: Optional[set[Optional[str]]] = None,
     ):
         # Load active loras into lora memory pool
         cur_uids = new_loras | running_loras
+        if pp_loras and self.validate_lora_batch(cur_uids | pp_loras):
+            cur_uids |= pp_loras
 
         assert len(cur_uids) <= self.max_loras_per_batch
         new_uids = {
@@ -1024,6 +1029,13 @@ class LoRAManager:
             base_model=self.base_model,
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
+            lora_layer_ids=[
+                layer_id
+                for layer_id, layer_modules in enumerate(self.lora_modules)
+                if layer_modules
+            ],
+            has_embed_tokens_lora=self.embed_tokens_module is not None,
+            has_lm_head_lora=self.lm_head_module is not None,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,

@@ -578,6 +578,13 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
             None,  # special_case="always"
         ),
         (
+            "beam_channel_with_xml_tool_calls",
+            '<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="',
+            [],
+            "beam",
+            None,  # special_case="always"
+        ),
+        (
             "kimi_k2_with_tool_vocab",
             "{% set thinking = thinking if thinking is defined else true %}\n<think>",
             ["<|tool_calls_section_begin|>", "<|tool_calls_section_end|>"],
@@ -708,6 +715,12 @@ class TestToolCallParserDetection(unittest.TestCase):
                 "qwen",
             ),
             ("gpt_oss", "<|channel|>analysis<|message|>", [], "gpt-oss"),
+            (
+                "beam",
+                '<|channel|>analysis <|constrain|>xml<|message|><rfl:parameter name="',
+                [],
+                "beam",
+            ),
             ("gemma4", "<|channel>content", [], "gemma4"),
             ("minimax_maps_to_m2", "<minimax:tool_call>", [], "minimax-m2"),
             (

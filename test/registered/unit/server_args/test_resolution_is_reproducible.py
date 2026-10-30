@@ -47,13 +47,13 @@ from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=104, suite="base-a-test-cpu")
+register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 # Also on a GPU runner: the resolution branches that matter most (backend
 # defaults, DeepSeek handlers, capability gates) go through `is_cuda()` /
 # `is_hip()` / device capability, which inspect the actual hardware -- passing
 # device="cuda" on a CPU box does not reach them, so a leak confined to a GPU
 # handler would never fail the CPU registration alone.
-register_cuda_ci(est_time=78, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=24, stage="base-b", runner_config="1-gpu-small")
 
 _MINI_CONFIG = {
     "architectures": ["LlamaForCausalLM"],

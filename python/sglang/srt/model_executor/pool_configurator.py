@@ -251,7 +251,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # Logical-page KV sharding reserves a fixed double-buffered assembly
         # scratch next to the pool; charge it before token sizing.
-        self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc)
+        self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(
+            kvc,
+            include_mtp=not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle(),
+        )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -1013,6 +1016,7 @@ class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):
             full_cell_size = (
                 self._full_cell_bytes()
                 + self._swa_per_token * self._draft_swa_full_layers_num
+                + self._draft_cell_size
             )
             full_tokens = (
                 int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
@@ -1387,7 +1391,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         """Compressed KV (+ indexer) bytes one full token adds per layer of `ratio`;
         compress state is priced per SWA slot (c4) or as fixed bytes (c128, ratio 2)."""
         if ratio in (1, 2):
-            return (self.kv_bytes + self.low_ratio_index_bytes) / ratio
+            return (
+                self._get_paged_kv_bytes_per_token(ratio) + self.low_ratio_index_bytes
+            ) / ratio
         if ratio == 4:
             c4_frac = 1 / (4 * self.c4_shrink_factor)
             return (
@@ -1396,6 +1402,37 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
         assert ratio == 128, f"unsupported compression ratio: {ratio}"
         return 1 / 128 * self._get_paged_kv_bytes_per_token(128)
+
+    def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:
+        """Reserved main/indexer pages beyond the token-scaled low-ratio bytes."""
+        if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
+            return 0
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DSV41_INDEX_PAGE_SIZE,
+            _num_dsv4_physical_kv_pages,
+        )
+
+        padding_bytes = 0
+        for ratio in (1, 2):
+            num_layers = self.num_layers(ratio)
+            if not num_layers:
+                continue
+            # Main KV reserves a full logical page of compressed slots. Indexer
+            # size includes the compressed logical page, then the indexer pool
+            # reserves its own page on top (same page count as the pool).
+            main_padding = self.page_size * self._get_paged_kv_bytes_per_token(ratio)
+            index_size = (full_tokens + self.page_size) // ratio
+            index_slots = (
+                _num_dsv4_physical_kv_pages(
+                    index_size, DSV41_INDEX_PAGE_SIZE, DSV41_INDEX_PAGE_SIZE
+                )
+                * DSV41_INDEX_PAGE_SIZE
+            )
+            index_padding = (
+                index_slots - full_tokens // ratio
+            ) * self.low_ratio_index_bytes
+            padding_bytes += (main_padding + index_padding) * num_layers
+        return padding_bytes
 
     def _get_bytes_per_full_token(self) -> float:
         # Cap mode and ring mode both move the SWA pool and the c4 state that
@@ -1629,6 +1666,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
+        full_token = full_token // page_size * page_size
+        # The coefficient excludes reserved pages. Remove the few full pages
+        # needed to cover them, including indexer rounding at this capacity.
+        while full_token > 0 and (
+            full_token * self.bytes_per_full_token
+            + self._get_low_ratio_kv_padding_bytes(full_token)
+            > available_bytes_for_tokens
+        ):
+            full_token -= page_size
         if full_token <= 0 and self.swa_cap_tokens is not None:
             raise RuntimeError(
                 f"The DSV4 SWA pool cap ({self.swa_cap_tokens} tokens, "

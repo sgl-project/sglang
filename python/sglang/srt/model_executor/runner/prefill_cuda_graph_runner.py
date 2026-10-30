@@ -74,6 +74,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
@@ -1666,7 +1667,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.prefill_backend_name == Backend.FULL
                 ),
             )
-            self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
+            self.model_runner.runner_ids.bind_runner_slots(forward_batch)
             ngram_manager = self.model_runner.ngram_embedding_manager
             if ngram_manager.enabled:
                 forward_batch.ngram_embedding_info = NgramEmbeddingInfo.create(
@@ -1817,9 +1818,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(self.backend, BreakableCudaGraphBackend):
             post_warmup_hook = None
             req_pool = self.model_runner.req_to_token_pool
-            mamba_pool = getattr(req_pool, "mamba_pool", None)
+            mamba_pool = self.model_runner.token_to_kv_pool.layer_router.part_view(
+                STATE_PART
+            )
             if mamba_pool is not None and not prefix_num_chunks:
-                capture_state_indices = req_pool.translate_mamba_indices(
+                state_ids = self.model_runner.runner_ids.state_ids(
+                    req_pool.state_sub_pool
+                )
+                capture_state_indices = state_ids.ids(
                     req_pool.get_mamba_indices(forward_batch.req_pool_indices)
                 ).unique()
 
@@ -2044,9 +2050,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             ),
             max_seq_len_override=self.max_context_size,
         )
-        forward_batch.kv_loc_plan.bind_replay(
+        forward_batch.iteration_ids.bind_replay(
             static_forward_batch,
-            self.model_runner.kv_index_translator,
+            self.model_runner.runner_ids,
             slots=out_cache_loc,
         )
         # The n-gram hasher runs outside the graph and reads this at replay.
@@ -2296,6 +2302,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_states=(
                 output.hidden_states[: self.raw_num_tokens]
                 if output.hidden_states is not None
+                else None
+            ),
+            last_hidden_states=(
+                output.last_hidden_states[: self.raw_num_tokens]
+                if output.last_hidden_states is not None
                 else None
             ),
             input_token_logprobs=output.input_token_logprobs,
