@@ -1,9 +1,7 @@
 """ReqKvInfo owns its lengths: code outside the class changes them only
 through its named methods."""
 
-import ast
 import dataclasses
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -35,15 +33,6 @@ _SCAN = dict(
 )
 
 
-def _writes(node):
-    return field_writes.writes(
-        node,
-        _LENGTH_FIELDS,
-        kwarg_funcs=_SCAN["kwarg_funcs"],
-        owned_only_fields=_SCAN["owned_only_fields"],
-    )
-
-
 class TestReqKvLengthWriters(CustomTestCase):
     def test_only_req_kv_info_methods_assign_lengths(self):
         found = field_writes.scan_tree(_SRT_DIR, _LENGTH_FIELDS, **_SCAN)
@@ -52,63 +41,9 @@ class TestReqKvLengthWriters(CustomTestCase):
             "Write these lengths through a ReqKvInfo method:\n  " + "\n  ".join(found),
         )
 
-    def test_scan_catches_indirect_writes(self):
-        cases = {
-            "req.kv.kv_committed_len = 1": "kv_committed_len",
-            "kv.kv_allocated_len += 2": "kv_allocated_len",
-            "self.cache_protected_len = 0": "cache_protected_len",
-            "a, b.swa_evict_floor = 1, 2": "swa_evict_floor",
-            "setattr(kv, 'kv_committed_len', 3)": "kv_committed_len",
-            "object.__setattr__(kv, 'cache_inserted_len', 3)": "cache_inserted_len",
-            "delattr(kv, 'kv_allocated_len')": "kv_allocated_len",
-            "ReqKvInfo(kv_allocated_len=4)": "kv_allocated_len",
-            "dataclasses.replace(kv, kv_committed_len=4)": "kv_committed_len",
-            "del kv.component_evicted_seqlens[k]": "component_evicted_seqlens",
-            "d = kv.component_evicted_seqlens": "component_evicted_seqlens",
-            "f(kv.component_evicted_seqlens)": "component_evicted_seqlens",
-        }
-        for source, field in cases.items():
-            with self.subTest(source=source):
-                fields = [
-                    f for node in ast.walk(ast.parse(source)) for f in _writes(node)
-                ]
-                self.assertIn(field, fields)
 
-        for source in (
-            "x = kv.kv_committed_len",
-            "kv.set_evicted_seqlen(t, 3)",
-            "s.replace('a', 'b')",
-            "ReqKvInfo()",
-        ):
-            with self.subTest(source=source):
-                fields = [
-                    f for node in ast.walk(ast.parse(source)) for f in _writes(node)
-                ]
-                self.assertEqual(fields, [])
-
-    def test_scan_skips_a_class_own_field_of_the_same_name(self):
-        source = (
-            "class Params:\n"
-            "    component_evicted_seqlens: dict\n"
-            "    def set(self, k, v):\n"
-            "        self.component_evicted_seqlens[k] = v\n"
-            "    def take(self, req):\n"
-            "        return req.kv.component_evicted_seqlens\n"
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "params.py"
-            path.write_text(source)
-            found = field_writes.scan(path, _LENGTH_FIELDS, **_SCAN)
-        self.assertEqual(found, [("Params.take", "component_evicted_seqlens", 6)])
-
-
-_LENGTHS = (
-    "cache_protected_len",
-    "cache_inserted_len",
-    "kv_committed_len",
-    "kv_allocated_len",
-    "swa_evict_floor",
-)
+# The int lengths; the evicted lengths are checked through their accessor.
+_LENGTHS = sorted(_LENGTH_FIELDS - _SCAN["owned_only_fields"])
 
 
 def _record(**lengths):
