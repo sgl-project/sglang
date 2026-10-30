@@ -558,6 +558,7 @@ POSITIONAL_FIELD_ORDER = (
     "engram_config",
     "moe_ascend_ops_config",
     "cp_kv_layout",
+    "enable_prefill_weight_versions",
     "dsv4_trtllm_flashinfer_backend",
 )
 # fmt: on

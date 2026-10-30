@@ -35,9 +35,11 @@ from typing import (
     Annotated,
     Any,
     Dict,
+    Iterable,
     List,
     Literal,
     Optional,
+    Sequence,
     Tuple,
     Type,
     Union,
@@ -1652,8 +1654,11 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
-    # Each row's new output ids.
-    output_ids: Optional[List[array]]  # Optional[List[array[int]]]
+    # All rows' new output ids in row order; row i's are
+    # output_ids_flat[output_ids_offsets[i] : output_ids_offsets[i + 1]]
+    # (see row_output_ids).
+    output_ids_flat: array  # array[int]
+    output_ids_offsets: List[int]
     # By row, the request's DetokenizeHeader on its first output, else None;
     # the whole field is None when no row carries one.
     detokenize_headers: Optional[List[Optional[DetokenizeHeader]]] = None
@@ -1700,6 +1705,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
 
     weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+    prefill_weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -1751,8 +1757,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output decoded strings
     output_strs: List[str]
-    # The token ids
-    output_ids: Optional[List[array]]
+    # See BatchTokenIDOutput.output_ids_flat.
+    output_ids_flat: array  # array[int]
+    output_ids_offsets: List[int]
 
     # Token counts
     completion_tokens: List[int]
@@ -1795,6 +1802,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
 
     weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+    prefill_weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -1822,6 +1830,22 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+
+def row_output_ids(output: Union[BatchTokenIDOutput, BatchStrOutput], i: int) -> array:
+    """Row i's new output ids, sliced from the batch's flat column."""
+    offsets = output.output_ids_offsets
+    return output.output_ids_flat[offsets[i] : offsets[i + 1]]
+
+
+def flatten_output_ids(rows: Iterable[Sequence[int]]) -> Tuple[array, List[int]]:
+    """The (output_ids_flat, output_ids_offsets) columns of rows of output ids."""
+    flat = array("q")
+    offsets = [0]
+    for ids in rows:
+        flat.extend(ids)
+        offsets.append(len(flat))
+    return flat, offsets
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
@@ -2219,6 +2243,7 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
     skip_tensor_list: Optional[List[str]] = None
     # which runners the op applies to
     selector: Literal["target", "draft", "all"] = "all"
+    names: Optional[List[str]] = None
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in
@@ -2287,6 +2312,7 @@ class AbortReq(BaseReq, kw_only=True):
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
     weight_versions: Optional[WeightVersionSpans] = None
+    prefill_weight_versions: Optional[WeightVersionSpans] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

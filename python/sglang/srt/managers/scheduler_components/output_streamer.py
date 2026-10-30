@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from array import array
 from dataclasses import InitVar, dataclass, field
 from enum import Enum, auto
 from typing import (
@@ -412,7 +413,9 @@ class _GenerationStreamAccumulator:
     http_worker_ipcs: list = field(default_factory=list)
     has_http_worker_ipc: bool = False
     finished_reasons: list = field(default_factory=list)
-    output_ids: list = field(default_factory=list)
+    # See BatchTokenIDOutput.output_ids_flat.
+    output_ids_flat: array = field(default_factory=lambda: array("q"))
+    output_ids_offsets: list = field(default_factory=lambda: [0])
     # OutputSink.DETOKENIZER only.
     detokenize_headers: list = field(default_factory=list)
     has_detokenize_header: bool = False
@@ -433,6 +436,7 @@ class _GenerationStreamAccumulator:
     spec_correct_drafts_histogram: list = field(default_factory=list)
     spec_cap_lens_histogram: list = field(default_factory=list)
     weight_versions: list = field(default_factory=list)
+    prefill_weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
@@ -551,7 +555,8 @@ class _GenerationStreamAccumulator:
         )
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
-        self.output_ids.append(output_ids_[send_token_offset:])
+        self.output_ids_flat.extend(output_ids_[send_token_offset:])
+        self.output_ids_offsets.append(len(self.output_ids_flat))
         req.send_token_offset = len(output_ids_)
         # A verified token block can extend past the stop position. Report
         # reasoning usage only within the same prefix as completion usage.
@@ -620,8 +625,10 @@ class _GenerationStreamAccumulator:
                 latency = _scheduler_decode_latency(req.time_stats)
                 if latency is not None:
                     self.decode_latencies[len(self.rids) - 1] = latency
+            self.prefill_weight_versions.append(req.prefill_weight_versions)
         else:
             self.weight_versions.append(None)
+            self.prefill_weight_versions.append(None)
 
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
@@ -752,7 +759,8 @@ class _GenerationStreamAccumulator:
                 req.indexer_topk if req.return_indexer_topk else None
             )
 
-        current_output_len = len(self.output_ids[-1])
+        offsets = self.output_ids_offsets
+        current_output_len = offsets[-1] - offsets[-2]
         if req.customized_info is not None:
             for key, req_values in req.customized_info.items():
                 is_request_level = self.is_request_level_customized_info_key(key)
@@ -764,8 +772,8 @@ class _GenerationStreamAccumulator:
                         continue
                 if key not in self.customized_info:
                     self.customized_info[key] = [
-                        [] if is_request_level else [None] * len(prev_output_ids)
-                        for prev_output_ids in self.output_ids[:-1]
+                        [] if is_request_level else [None] * (end - start)
+                        for start, end in zip(offsets[:-2], offsets[1:-1])
                     ]
                 if req_values is None:
                     values = [] if is_request_level else [None] * current_output_len
@@ -776,7 +784,7 @@ class _GenerationStreamAccumulator:
                 self.customized_info[key].append(values)
 
         for key, per_request_values in self.customized_info.items():
-            if len(per_request_values) < len(self.output_ids):
+            if len(per_request_values) < len(self.rids):
                 per_request_values.append(
                     []
                     if self.is_request_level_customized_info_key(key)
@@ -805,7 +813,8 @@ class _GenerationStreamAccumulator:
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
             spec_cap_lens_histogram=self.spec_cap_lens_histogram,
             finished_reasons=self.finished_reasons,
-            output_ids=self.output_ids,
+            output_ids_flat=self.output_ids_flat,
+            output_ids_offsets=self.output_ids_offsets,
             detokenize_headers=(
                 self.detokenize_headers if self.has_detokenize_header else None
             ),
@@ -872,6 +881,11 @@ class _GenerationStreamAccumulator:
             ),
             weight_versions=(
                 self.weight_versions if any(self.weight_versions) else None
+            ),
+            prefill_weight_versions=(
+                self.prefill_weight_versions
+                if any(self.prefill_weight_versions)
+                else None
             ),
             dp_ranks=dp_ranks,
         )

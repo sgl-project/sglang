@@ -30,7 +30,7 @@ import threading
 import zlib
 from functools import lru_cache
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
 
 import msgspec
 import psutil
@@ -55,6 +55,8 @@ from sglang.srt.managers.io_struct import (
     TokenizerWorkerRegistrationReq,
     async_sock_recv,
     async_sock_send,
+    flatten_output_ids,
+    row_output_ids,
     sock_recv,
     sock_send,
     unwrap_from_pickle,
@@ -158,6 +160,14 @@ def _extract_field_by_index(
     return wrap_as_pickle(new_field) if should_wrap_result else new_field
 
 
+def _extract_output_ids_by_indices(
+    output: Union[BatchTokenIDOutput, BatchStrOutput], indices: List[int]
+) -> Dict[str, Any]:
+    """The flat output ids columns of the rows at indices, in that order."""
+    flat, offsets = flatten_output_ids(row_output_ids(output, i) for i in indices)
+    return {"output_ids_flat": flat, "output_ids_offsets": offsets}
+
+
 def _extract_pooled_hidden_states_by_index(output: BatchEmbeddingOutput, i: int):
     states = output.pooled_hidden_states
     if states is None:
@@ -190,7 +200,7 @@ def _handle_output_by_index(output, i):
                 output, "spec_cap_lens_histogram", i
             ),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            output_ids=_extract_field_by_index(output, "output_ids", i),
+            **_extract_output_ids_by_indices(output, [i]),
             detokenize_headers=_extract_field_by_index(output, "detokenize_headers", i),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
@@ -256,6 +266,9 @@ def _handle_output_by_index(output, i):
                 output, "indexer_topk", i, check_length=False
             ),
             weight_versions=_extract_field_by_index(output, "weight_versions", i),
+            prefill_weight_versions=_extract_field_by_index(
+                output, "prefill_weight_versions", i
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             beam_search_output=_extract_field_by_index(
@@ -300,7 +313,7 @@ def _handle_output_by_index(output, i):
             ),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),
-            output_ids=_extract_field_by_index(output, "output_ids", i),
+            **_extract_output_ids_by_indices(output, [i]),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             request_stats=_extract_field_by_index(output, "request_stats", i),
@@ -374,6 +387,9 @@ def _handle_output_by_index(output, i):
                 output, "beam_search_output", i, check_length=True
             ),
             weight_versions=_extract_field_by_index(output, "weight_versions", i),
+            prefill_weight_versions=_extract_field_by_index(
+                output, "prefill_weight_versions", i
+            ),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -455,7 +471,14 @@ _UNCHECKED_LENGTH_FIELDS = frozenset(
     }
 )
 _NOT_SPLIT_FIELDS = frozenset(
-    {"rids", "http_worker_ipcs", "placeholder_tokens_idx", "placeholder_tokens_val"}
+    {
+        "rids",
+        "http_worker_ipcs",
+        "placeholder_tokens_idx",
+        "placeholder_tokens_val",
+        "output_ids_flat",
+        "output_ids_offsets",
+    }
 )
 
 
@@ -479,6 +502,7 @@ def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
         rids=[output.rids[index] for index in indices],
         placeholder_tokens_idx=None,
         placeholder_tokens_val=None,
+        **_extract_output_ids_by_indices(output, indices),
         **split_fields,
     )
 
