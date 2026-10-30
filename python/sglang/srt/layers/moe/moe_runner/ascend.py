@@ -31,6 +31,7 @@ from sglang.srt.hardware_backend.npu.moe.routing import (
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
+    NPUW4A4MXFP4MoEMethod,
     NPUW4A8Int8MoEMethod,
     NPUW4A8MXFP4MoEMethod,
     NPUW8A8Int8MoEMethod,
@@ -45,6 +46,20 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     # (swiglu_limit, e.g. DSV4) must keep the unfused path so the clamp is
     # applied (NPUSwigluMxfp8Quant / NPUSwigluStepAndMul below).
     has_clamp = config.swiglu_limit is not None and config.swiglu_limit > 0
+
+    if isinstance(kernel, NPUW4A4MXFP4MoEMethod):
+        if has_clamp:
+            raise NotImplementedError(
+                "NPUW4A4MXFP4MoEMethod does not support swiglu_limit."
+            )
+        # Fuse only plain SiLU under ascend_tp. Keep the runner's unfused
+        # activation for SiTU, custom alpha/clamp, and unvalidated DeepEP.
+        return (
+            config.activation == "silu"
+            and config.gemm1_alpha is None
+            and config.gemm1_clamp_limit is None
+            and not get_moe_a2a_backend().is_deepep()
+        )
 
     if config.activation == "situ":
         return False
@@ -146,7 +161,7 @@ class AscendRunnerCore(MoeRunnerCore):
         kernel = config.layer.w2_kernel
 
         if _uses_fused_gmm1(kernel, config):
-            # Fused methods (MXFP8; MXFP4 W4A8 via use_fused_gmm1) fold
+            # Fused methods (MXFP8, W4A8, and ascend_tp W4A4) fold
             # gate/up + swiglu + requant into gmm1, so there is no separate
             # activation step — run() skips it. Left None on purpose so that
             # reaching for it fails loudly instead of silently applying an

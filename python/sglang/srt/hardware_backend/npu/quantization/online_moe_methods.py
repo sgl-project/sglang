@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
+    NPUW4A4MXFP4MoEMethod,
     NPUW4A8MXFP4MoEMethod,
 )
 from sglang.srt.hardware_backend.npu.quantization.online_weight_loader import (
@@ -134,3 +135,35 @@ class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
         moe_runner_config.layer = layer
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+
+
+class NPUW4A4MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
+    """Online W4A4 MXFP4 FusedMoE entry point (``--quantization mxfp4``).
+
+    Reuse the unquantized weight-loading lifecycle and Ascend runner, installing
+    W4A4 kernels that prepare packed FP4 experts after loading BF16/FP16 weights.
+    """
+
+    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+        super().__init__()
+        self.quant_config = quant_config
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        backend = get_moe_runner_backend()
+        if not (backend.is_auto() or backend.is_ascend()):
+            # The unquantized base participates in FusedMoE's shard-swap logic.
+            # A flashinfer backend would silently exchange gate/up weights.
+            raise ValueError(
+                "W4A4 MXFP4 MoE on Ascend requires --moe-runner-backend 'auto' "
+                f"or 'ascend', got {backend.value!r}."
+            )
+
+        layer.w13_kernel = NPUW4A4MXFP4MoEMethod()
+        layer.w2_kernel = NPUW4A4MXFP4MoEMethod()
+        moe_runner_config.layer = layer
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+        # Inherited apply() consults this; aiter is CUDA/ROCm-only.
+        self._aiter_runner = None

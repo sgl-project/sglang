@@ -438,7 +438,11 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
 #  NPUW4A4MXFP4MoEMethod
 # ---------------------------------------------------------------------------
 class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
-    """ModelSlim W4A4 MXFP4 MoE with single-level FP4 weights and activations."""
+    """Online and ModelSlim W4A4 MoE with single-level FP4 weights/activations.
+
+    BF16/FP16 expert weights are quantized after loading; packed offline weights
+    retain the existing layout-only preparation path.
+    """
 
     def __init__(self):
         super().__init__(quant_config=None)
@@ -450,6 +454,18 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
             quant_dtype=fp4_dtype,
             use_mx_quant=True,
         )
+        self.fused_gmm1 = GroupedMatmulSwigluQuant()
+
+    @staticmethod
+    def _quantize_weight_online(
+        weight: torch.Tensor, quant_dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return packed FP4 experts and paired [E, N, K/64, 2] block scales."""
+        if not weight.is_npu:
+            weight = weight.to(f"npu:{torch.npu.current_device()}")
+        return torch.ops.npu.npu_dynamic_mx_quant(
+            weight, dst_type=quant_dtype, round_mode="round"
+        )
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -457,21 +473,66 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight = getattr(layer, f"{weight_prefix}_weight")
+        if weight.data.dtype in (torch.float16, torch.bfloat16):
+            # The online loader creates full-precision experts without scales.
+            packed, block_scale = self._quantize_weight_online(
+                weight.data, self.hidden_states_quantizer.quant_dtype
+            )
+            weight = Parameter(packed, requires_grad=False)
+            layer.register_parameter(f"{weight_prefix}_weight", weight)
+            layer.register_parameter(
+                f"{weight_prefix}_weight_scale",
+                Parameter(block_scale, requires_grad=False),
+            )
+
         weight.data = npu_format_cast(weight.data).transpose(-1, -2)
 
         weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
-        scale = weight_scale.data.reshape(
-            weight_scale.shape[0],
-            weight_scale.shape[1],
-            weight_scale.shape[2] // 2,
-            2,
-        ).transpose(1, 2)
-        weight_scale.data = scale
+        scale = weight_scale.data
+        if scale.dim() == 3:
+            # Offline scales are flat; online scales are already pair-split.
+            scale = scale.reshape(
+                scale.shape[0], scale.shape[1], scale.shape[2] // 2, 2
+            )
+        weight_scale.data = scale.transpose(1, 2)
 
-        # The refactored NPU dispatchers currently support BF16 and INT8.
-        # Keep dispatch in BF16 and quantize immediately before each GMM.
+        # There is no FP4 dispatch path, including under DeepEP low latency.
+        # Keep BF16 dispatch and quantize immediately before each GMM.
         if weight_prefix == "w13":
             self._set_moe_dispatch_dtype(layer, "bf16")
+
+    def apply_fused_gmm1_swiglu(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return FP4 activations and paired block scales ready for GMM2."""
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+
+        e8m0_dtype = _require_e8m0_dtype()
+        fp4_dtype = self.hidden_states_quantizer.quant_dtype
+        return self.fused_gmm1.forward(
+            quant_info,
+            "w13",
+            hidden_states,
+            expert_tokens.to(torch.int64),
+            group_list_type=group_list_type,
+            transposed=True,
+            weight_scale=[quant_info.w13_weight_scale],
+            x_scale=pertoken_scale,
+            dequant_mode=2,
+            quant_mode=2,
+            dequant_dtype=torch.float32,
+            quant_dtype=fp4_dtype,
+            x_dtype=fp4_dtype,
+            weight_dtype=fp4_dtype,
+            weight_scale_dtype=e8m0_dtype,
+            x_scale_dtype=e8m0_dtype,
+        )
 
     def apply(
         self,
@@ -488,7 +549,8 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
 
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
-        elif pertoken_scale is not None:
+        elif pertoken_scale.dim() == 2:
+            # Fused GMM1 already returns the paired form; do not reshape it.
             pertoken_scale = pertoken_scale.reshape(
                 hidden_states.shape[0], hidden_states.shape[1] // 32, 2
             )
