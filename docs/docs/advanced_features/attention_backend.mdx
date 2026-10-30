@@ -237,7 +237,7 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**TRTLLM MLA (Blackwell)**</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**TRTLLM MLA (Blackwell; decode only on SM12x)**</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32 or 64</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
@@ -620,6 +620,21 @@ python3 -m sglang.launch_server \
   --model deepseek-ai/DeepSeek-R1 \
   --attention-backend trtllm_mla \
   --kv-cache-dtype fp8_e4m3 \
+  --trust-remote-code
+```
+
+- TRTLLM MLA on SM120/SM121 (e.g., RTX PRO 6000 Blackwell, RTX 50 series, DGX Spark)
+  Decode only: `--attention-backend trtllm_mla` is refused at startup on these GPUs, so pair `--decode-attention-backend trtllm_mla` with a prefill backend such as `flashinfer`. The decode kernel (XQA) needs 128 query heads per rank, so DeepSeek-V3/R1 must run attention data parallelism across the whole TP group (`--attn-dp-size` equal to `--tp`); with plain `--tp 8` each rank holds 16 heads and startup fails at CUDA graph capture. Attention DP keeps a full copy of the attention weights on every GPU, so DeepSeek-R1 in FP8 needs close to 90 GiB of weights per GPU at `--tp 8`, which leaves little room for KV cache on a 96 GB GPU; the example below uses two 8-GPU nodes (run it on each node with its own `--node-rank`). Use BF16 or `fp8_e4m3` KV cache. With speculative decoding, keep the default `--speculative-attention-mode prefill`: in `decode` mode, target verify runs on `trtllm_mla` with several query tokens per request, which XQA doesn't support.
+```bash Command
+python3 -m sglang.launch_server \
+  --tp 16 \
+  --attn-dp-size 16 \
+  --nnodes 2 \
+  --node-rank 0 \
+  --dist-init-addr ${master_ip}:5000 \
+  --model deepseek-ai/DeepSeek-R1 \
+  --prefill-attention-backend flashinfer \
+  --decode-attention-backend trtllm_mla \
   --trust-remote-code
 ```
 
