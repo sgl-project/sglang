@@ -364,6 +364,9 @@ docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile
 
 **Notice:** `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
 
+Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
+weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
+
 <Tabs>
   <Tab title="Ascend A3 Series">
 
@@ -380,7 +383,6 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
-# Add HF_TOKEN env for downloading models by SGLang.
 # The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
 drun --env "HF_TOKEN=<secret>" \
     <image_name> \
@@ -404,7 +406,6 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
-# Add HF_TOKEN env for downloading models by SGLang.
 # The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
 drun --env "HF_TOKEN=<secret>" \
     <image_name> \
@@ -486,6 +487,9 @@ Pick a deployment mode based on your workload:
 
 #### PD Mixed Scene
 
+Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
+weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
+
 <Tabs>
   <Tab title="Ascend A3 Series">
 
@@ -520,6 +524,9 @@ python3 -m sglang.launch_server \
 #### PD Disaggregation Scene
 
 1. Launch Prefill Server
+
+Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
+weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
 
 <Tabs>
   <Tab title="Ascend A3 Series">
@@ -577,6 +584,9 @@ python3 -m sglang.launch_server \
 </Tabs>
 
 2. Launch Decode Server
+
+Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
+weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
 
 <Tabs>
   <Tab title="Ascend A3 Series">
@@ -646,6 +656,9 @@ The `8995` in command script is the disaggregation bootstrap port. It must match
 ### Running Service For Multimodal Language Models
 
 #### PD Mixed Scene
+
+Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
+weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
 
 <Tabs>
   <Tab title="Ascend A3 Series">
@@ -772,3 +785,18 @@ curl http://127.0.0.1:30000/v1/chat/completions \
     }]
   }'
 ```
+
+## FAQ
+
+### How do I provide model weights?
+
+The launch commands in this guide pass a Hugging Face model ID (e.g., `meta-llama/Llama-3.1-8B-Instruct`) to
+`--model-path`. Pick one way to provide the weights:
+
+- **Automatic download**: export `HF_TOKEN` (required for gated models such as Llama) and let SGLang download the
+  weights from Hugging Face on first launch; they are cached under `~/.cache/huggingface` and reused afterwards.
+- **Pre-downloaded weights**: download the weights to the machine yourself, then replace the model ID in the commands
+  with the local weights path, e.g., `--model-path /path/to/Llama-3.1-8B-Instruct`.
+
+When running in Docker, the `drun` alias mounts `~/.cache/` from the host, so weights already in the host's Hugging
+Face cache are visible inside the container.
