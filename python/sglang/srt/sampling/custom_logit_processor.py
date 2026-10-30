@@ -2,7 +2,7 @@ import json
 from abc import ABC, abstractmethod
 from array import array
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set
 
 import dill
 import orjson
@@ -73,7 +73,7 @@ def supports_sampling_mask(serialized_processor: str) -> bool:
         return False
 
 
-def _open_thinking_start(ids: list[int], start_id: int, end_id: int) -> int:
+def _open_thinking_start(ids: Sequence[int], start_id: int, end_id: int) -> int:
     """Return the index of the start token of the currently open thinking block, or -1."""
     for idx in reversed(range(len(ids))):
         if ids[idx] == start_id:
@@ -81,6 +81,25 @@ def _open_thinking_start(ids: list[int], start_id: int, end_id: int) -> int:
         if ids[idx] == end_id:
             return -1
     return -1
+
+
+def _open_thinking_tokens_after_start(
+    origin_input_ids: Sequence[int],
+    output_ids: Sequence[int],
+    start_id: int,
+    end_id: int,
+) -> int:
+    """Return the number of tokens after the currently open thinking start token, or -1."""
+    for idx in reversed(range(len(output_ids))):
+        token_id = output_ids[idx]
+        if token_id == start_id:
+            return len(output_ids) - idx - 1
+        if token_id == end_id:
+            return -1
+    in_idx = _open_thinking_start(origin_input_ids, start_id, end_id)
+    if in_idx < 0:
+        return -1
+    return len(origin_input_ids) + len(output_ids) - in_idx - 1
 
 
 class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
@@ -102,24 +121,22 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
             # Skip if thinking_budget is unset, or not an integer, or negative
             if (
                 thinking_budget is None
+                or isinstance(thinking_budget, bool)
                 or not isinstance(thinking_budget, int)
                 or thinking_budget < 0
             ):
                 continue
             req: Req = param_dict.get("__req__")
-            cur_ids: list[int] = [*req.origin_input_ids, *req.output_ids]
-
-            # Check if out of thinking stage
-            start_index = _open_thinking_start(
-                cur_ids, self.THINKING_START_TOKEN_ID, self.THINKING_END_TOKEN_ID
-            )
-            if start_index < 0:
+            if req is None:
                 continue
 
-            # Count the number of tokens after the thinking start token
-            num_tokens_after_start = len(cur_ids) - start_index - 1
-
-            if num_tokens_after_start < thinking_budget:
+            num_tokens_after_start = _open_thinking_tokens_after_start(
+                req.origin_input_ids,
+                req.output_ids,
+                self.THINKING_START_TOKEN_ID,
+                self.THINKING_END_TOKEN_ID,
+            )
+            if num_tokens_after_start < 0 or num_tokens_after_start < thinking_budget:
                 continue
 
             # Ensure new line token before thinking end token
@@ -196,25 +213,35 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             if ngram_size <= 0 or window_size <= 0:
                 continue
 
-            sequence = req.origin_input_ids + req.output_ids
-            if len(sequence) < ngram_size:
+            in_len = len(req.origin_input_ids)
+            out_len = len(req.output_ids)
+            total_len = in_len + out_len
+            tail_len = min(total_len, window_size)
+            if tail_len < ngram_size:
                 continue
 
-            search_start = max(0, len(sequence) - window_size)
-            search_end = len(sequence) - ngram_size + 1
-            if search_end <= search_start:
-                continue
-
-            if ngram_size > 1:
-                current_prefix = sequence[-(ngram_size - 1) :]
+            if out_len >= tail_len:
+                window = req.output_ids[out_len - tail_len :]
+            elif out_len == 0:
+                window = req.origin_input_ids[in_len - tail_len :]
             else:
-                current_prefix = array("q")
+                prefix_needed = tail_len - out_len
+                window = [
+                    *req.origin_input_ids[in_len - prefix_needed :],
+                    *req.output_ids,
+                ]
 
-            banned_tokens: Set[int] = set()
-            for idx in range(search_start, search_end):
-                ngram = sequence[idx : idx + ngram_size]
-                if ngram_size == 1 or ngram[:-1] == current_prefix:
-                    banned_tokens.add(ngram[-1])
+            if ngram_size == 1:
+                banned_tokens: Set[int] = set(window)
+            else:
+                prefix_len = ngram_size - 1
+                current_prefix = window[-prefix_len:]
+                search_end = len(window) - ngram_size + 1
+                banned_tokens = {
+                    window[idx + prefix_len]
+                    for idx in range(search_end)
+                    if window[idx : idx + prefix_len] == current_prefix
+                }
 
             whitelist_ids = params.get("whitelist_token_ids") or []
             try:
