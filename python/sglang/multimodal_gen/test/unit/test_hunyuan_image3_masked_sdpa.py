@@ -7,6 +7,7 @@ squeezed result, which fails if the transposed output is left non-contiguous.
 import unittest
 
 import torch
+
 from sglang.multimodal_gen.runtime.models.dits.hunyuan_image3_utils import (
     _masked_sdpa,
 )
