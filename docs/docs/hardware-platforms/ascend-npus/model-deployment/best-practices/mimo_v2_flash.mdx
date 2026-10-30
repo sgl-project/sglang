@@ -19,15 +19,15 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 16k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in16k-out1k-tpot-20ms) |
-| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 32k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in32k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | A3 Series Products | 16 | PD Disaggregation | 16k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in16k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | A3 Series Products | 16 | PD Disaggregation | 32k+1k | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in32k-out1k-tpot-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 16k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in16k-out1-ttft-5s) |
-| MiMo-V2-Flash | Ascend A3 Series Products | 16 | PD Disaggregation | 32k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in32k-out1-ttft-5s) |
+| MiMo-V2-Flash | A3 Series Products | 16 | PD Disaggregation | 16k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in16k-out1-ttft-5s) |
+| MiMo-V2-Flash | A3 Series Products | 16 | PD Disaggregation | 32k+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-16p-in32k-out1-ttft-5s) |
 
 ## Optimal Configuration
 
@@ -37,7 +37,7 @@ The optimal configurations on this page are validated with the image `quay.io/as
 
 **Model**: MiMo-V2-Flash
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -220,7 +220,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiMo-V2-Flash
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -403,7 +403,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiMo-V2-Flash
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
@@ -586,7 +586,7 @@ python -m sglang.bench_serving \
 
 **Model**: MiMo-V2-Flash
 
-**Hardware**: Ascend A3 Series Products
+**Hardware**: A3 Series Products
 
 **Cards**: 16
 
