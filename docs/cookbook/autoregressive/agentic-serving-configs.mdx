@@ -1,0 +1,644 @@
+---
+title: Agentic serving configurations
+description: "SGLang configurations for long-context agentic workloads on H200, B200, and GB200, with measured tuning history and validation limits."
+sidebarTitle: Agentic configurations
+---
+
+Use these configurations as starting points for long-context, prefix-reusing
+agentic workloads on NVIDIA GPUs. They cover GLM, Inkling, and DeepSeek models,
+with hardware-specific memory, attention, caching, and speculative-decoding
+settings. The tuning history records earlier measured settings.
+
+<Note>
+The [campaign evidence](/cookbook/autoregressive/agentic-serving-evidence) records
+measured launch configurations, immutable runtime identities, performance curves,
+and available accuracy gates. Those results belong to the recorded runtime and
+checkpoint. Some measurements used custom runtime builds. These public-checkpoint
+commands have not been rerun on the upstream revision below and do not change the
+deployment matrix's verification status.
+</Note>
+
+## Prerequisites and versions
+
+- Use Linux, NVIDIA CUDA, and a single node with the GPU type and count shown in
+  each heading. All configurations use pipeline parallelism 1.
+- Follow [Install SGLang](/docs/get-started/install) for the CUDA build and
+  dependencies appropriate to your hardware. Argument names below target
+  upstream [`f3f23d128cd5`](https://github.com/sgl-project/sglang/tree/f3f23d128cd576352492334534be7e20fdd8fab6).
+  Use that revision when reviewing the commands; changing the runtime requires
+  rechecking the configuration. Do not assume a stock image with the same
+  version number contains every custom-runtime fix.
+- Download the named Hugging Face checkpoint, or replace `--model-path` with its
+  local directory. Supply `HF_TOKEN` if its access policy requires it. Pin a
+  checkpoint revision for your own comparison. Public checkpoint names do not
+  establish identical weight bytes to the artifacts used in the recorded runs.
+- Reserve host memory for HiCache in addition to loading buffers and the OS.
+  Explicit `--hicache-size` values are per tensor-parallel rank: GLM-5.2 uses
+  640 GB across eight H200s or 512 GB across four B200s; GLM-5.3-Flash uses
+  400 GB across four GB200s. Check the actual allocation before applying load.
+
+The evidence groups measurements by the recorded SGLang engine version:
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Recorded SGLang version</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Coverage</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0.5.18</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.2 and Inkling on H200 and B200</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0.5.20</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>GLM-5.2, GLM-5.3, Inkling, DeepSeek-V4-Flash-0731, and DeepSeek-V4-Pro-0813</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>0.5.21</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Updated DeepSeek Flash H200/B200 and Inkling B200 settings; other configurations retained</td>
+    </tr>
+  </tbody>
+</table>
+
+GLM-5.3-Flash NVFP4 on GB200 TP4 is a configured recipe without a recovered
+performance curve. Engine version alone does not identify the tested image;
+use the evidence catalog's exact runtime identities.
+
+Inkling and DeepSeek explicitly retain the measured worker's 1,048,576-token
+context limit. Benchmark-only metrics, logging, and simulated speculative
+acceptance settings are recorded with the evidence rather than added to these
+launch commands. GLM-5.2 and DeepSeek preserve the recorded
+`NCCL_NET_GDR_LEVEL=LOC` setting; assess it for your interconnect.
+
+## GLM-5.2
+
+See the [GLM-5.2 cookbook](/cookbook/autoregressive/GLM/GLM-5.2) for model usage.
+These commands preserve the HiCache configurations tested with SGLang 0.5.20.
+Campaigns using SGLang 0.5.21 did not establish a qualified candidate gain:
+parser-preserving runs produced shortened outputs, with the `glm47` grammar
+path a candidate cause. Check returned token counts and structured tool calls
+before comparing performance.
+
+### H200 TP8 FP8
+
+Checkpoint: [zai-org/GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8).
+The context cap is 250,000 tokens, with five EAGLE steps and six draft tokens.
+
+<Accordion title="Launch GLM-5.2 on H200 TP8">
+
+```bash Launch command
+NCCL_NET_GDR_LEVEL=LOC \
+sglang serve \
+  --model-path zai-org/GLM-5.2-FP8 \
+  --tp-size 8 \
+  --quantization fp8 \
+  --mem-fraction-static 0.92 \
+  --context-length 250000 \
+  --attention-backend dsa \
+  --cp-strategy interleave \
+  --dsa-prefill-backend flashmla_kv \
+  --enable-hierarchical-cache \
+  --enable-prefill-cp \
+  --flashinfer-allreduce-fusion-backend auto \
+  --fp8-gemm-backend flashinfer_deepgemm \
+  --hicache-size 80 \
+  --kv-cache-dtype fp8_e4m3 \
+  --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":32}' \
+  --moe-a2a-backend none \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-num-steps 5 \
+  --tool-call-parser glm47 \
+  --trust-remote-code \
+  --watchdog-timeout 3600
+```
+
+</Accordion>
+
+### B200 TP4 NVFP4
+
+Checkpoint: [nvidia/GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4).
+The context cap is 500,000 tokens, with at most 128 running requests.
+
+<Accordion title="Launch GLM-5.2 on B200 TP4">
+
+```bash Launch command
+NCCL_NET_GDR_LEVEL=LOC \
+sglang serve \
+  --model-path nvidia/GLM-5.2-NVFP4 \
+  --tp-size 4 \
+  --quantization modelopt_fp4 \
+  --mem-fraction-static 0.85 \
+  --context-length 500000 \
+  --max-running-requests 128 \
+  --cuda-graph-max-bs-decode 128 \
+  --enable-hierarchical-cache \
+  --flashinfer-allreduce-fusion-backend auto \
+  --hicache-size 128 \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-attention-mode decode \
+  --speculative-eagle-topk 1 \
+  --speculative-moe-a2a-backend none \
+  --speculative-moe-runner-backend flashinfer_cutlass \
+  --speculative-num-draft-tokens 6 \
+  --speculative-num-steps 5 \
+  --tool-call-parser glm47 \
+  --trust-remote-code
+```
+
+</Accordion>
+
+### Configuration history
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Profile</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>SGLang 0.5.18</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>SGLang 0.5.20 and SGLang 0.5.21</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Memory fraction 0.90; omit <code>--enable-hierarchical-cache</code> and <code>--hicache-size</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Memory fraction 0.92; HiCache 80 GB per rank</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Omit <code>--enable-hierarchical-cache</code> and <code>--hicache-size</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>HiCache 128 GB per rank; memory fraction remains 0.85</td>
+    </tr>
+  </tbody>
+</table>
+
+## GLM-5.3
+
+See the [GLM-5.3 cookbook](/cookbook/autoregressive/GLM/GLM-5.3) for model usage.
+These configurations were retained after SGLang 0.5.20 testing. Later H200
+candidate runs had the same short-output qualification problem as GLM-5.2.
+The B200 TP8 search did not produce a qualified replacement; TP4 has no
+separate SGLang 0.5.21 campaign. HiCache candidates from that search are not
+part of these settings.
+
+### H200 TP8 FP8
+
+Checkpoint: [zai-org/GLM-5.3](https://huggingface.co/zai-org/GLM-5.3).
+This profile uses three EAGLE steps and six draft tokens, with a 250,000-token
+context cap and no explicit HiCache tier.
+
+<Accordion title="Launch GLM-5.3 on H200 TP8">
+
+```bash Launch command
+sglang serve \
+  --model-path zai-org/GLM-5.3 \
+  --tp-size 8 \
+  --quantization fp8 \
+  --mem-fraction-static 0.9 \
+  --context-length 250000 \
+  --attention-backend dsa \
+  --cp-strategy interleave \
+  --dsa-prefill-backend flashmla_kv \
+  --enable-prefill-cp \
+  --flashinfer-allreduce-fusion-backend auto \
+  --fp8-gemm-backend flashinfer_deepgemm \
+  --kv-cache-dtype fp8_e4m3 \
+  --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":32}' \
+  --moe-a2a-backend none \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-num-steps 3 \
+  --tool-call-parser glm47 \
+  --trust-remote-code \
+  --watchdog-timeout 3600
+```
+
+</Accordion>
+
+### B200 TP4 NVFP4
+
+Checkpoint: [nvidia/GLM-5.3-NVFP4](https://huggingface.co/nvidia/GLM-5.3-NVFP4).
+
+<Accordion title="Launch GLM-5.3 on B200 TP4">
+
+```bash Launch command
+sglang serve \
+  --model-path nvidia/GLM-5.3-NVFP4 \
+  --tp-size 4 \
+  --quantization modelopt_fp4 \
+  --mem-fraction-static 0.85 \
+  --context-length 500000 \
+  --max-running-requests 128 \
+  --cuda-graph-max-bs-decode 128 \
+  --flashinfer-allreduce-fusion-backend auto \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-attention-mode decode \
+  --speculative-eagle-topk 1 \
+  --speculative-moe-a2a-backend none \
+  --speculative-moe-runner-backend flashinfer_cutlass \
+  --speculative-num-draft-tokens 6 \
+  --speculative-num-steps 5 \
+  --tool-call-parser glm47 \
+  --trust-remote-code
+```
+
+</Accordion>
+
+### B200 TP8 NVFP4
+
+The separate TP8 profile preserves the same limits and speculative settings.
+It is not a claim of equal throughput or memory behavior between TP4 and TP8.
+
+<Accordion title="Launch GLM-5.3 on B200 TP8">
+
+```bash Launch command
+sglang serve \
+  --model-path nvidia/GLM-5.3-NVFP4 \
+  --tp-size 8 \
+  --quantization modelopt_fp4 \
+  --mem-fraction-static 0.85 \
+  --context-length 500000 \
+  --max-running-requests 128 \
+  --cuda-graph-max-bs-decode 128 \
+  --flashinfer-allreduce-fusion-backend auto \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-attention-mode decode \
+  --speculative-eagle-topk 1 \
+  --speculative-moe-a2a-backend none \
+  --speculative-moe-runner-backend flashinfer_cutlass \
+  --speculative-num-draft-tokens 6 \
+  --speculative-num-steps 5 \
+  --tool-call-parser glm47 \
+  --trust-remote-code
+```
+
+</Accordion>
+
+## Inkling
+
+Checkpoint: [thinkingmachines/Inkling-NVFP4](https://huggingface.co/thinkingmachines/Inkling-NVFP4).
+See the [Inkling cookbook](/cookbook/autoregressive/ThinkingMachines/Inkling)
+for access, multimodal inputs, and model-specific installation guidance.
+
+Both recipes use eight EAGLE steps, nine draft tokens, multi-layer EAGLE, and
+rejection sampling. The commands include the multimodal and parser arguments
+used by the serving worker, in addition to the engine profile itself.
+
+<Note>
+Stock SGLang 0.5.21 startup failed in the recorded comparison on both GPUs
+(a missing MoE scale attribute on B200 and a CUDA-graph replay mode error on
+H200). The custom-runtime runs therefore do not validate these commands on that
+stock image. Recheck startup on the upstream revision you install.
+</Note>
+
+### B200 TP8 NVFP4
+
+The configuration tested with SGLang 0.5.21 raises the static memory fraction from 0.65 to 0.80 and
+caps running requests at 24. It trades more queueing for the selected
+throughput point; it is not a low-TTFT recommendation.
+
+<Accordion title="Launch Inkling on B200 TP8">
+
+```bash Launch command
+sglang serve \
+  --model-path thinkingmachines/Inkling-NVFP4 \
+  --tp-size 8 \
+  --quantization modelopt_fp4 \
+  --mem-fraction-static 0.8 \
+  --context-length 1048576 \
+  --max-running-requests 24 \
+  --attention-backend fa4 \
+  --enable-multi-layer-eagle \
+  --enable-multimodal \
+  --enable-torch-symm-mem \
+  --fp4-gemm-backend flashinfer_trtllm \
+  --mamba-full-memory-ratio 0.1 \
+  --mamba-radix-cache-strategy extra_buffer \
+  --moe-runner-backend flashinfer_trtllm_routed \
+  --page-size 128 \
+  --reasoning-parser inkling \
+  --speculative-algorithm EAGLE \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 9 \
+  --speculative-num-steps 8 \
+  --speculative-use-rejection-sampling \
+  --swa-full-tokens-ratio 0.1 \
+  --tool-call-parser inkling \
+  --trust-remote-code
+```
+
+</Accordion>
+
+### H200 TP8 NVFP4
+
+This configuration runs the NVFP4 checkpoint through Marlin and matches the
+earlier cookbook MTP settings. Its measurements remain part of the tuning
+history; they do not establish a new optimization gain.
+
+<Accordion title="Launch Inkling on H200 TP8">
+
+```bash Launch command
+sglang serve \
+  --model-path thinkingmachines/Inkling-NVFP4 \
+  --tp-size 8 \
+  --quantization modelopt_fp4 \
+  --mem-fraction-static 0.78 \
+  --context-length 1048576 \
+  --attention-backend fa4 \
+  --enable-multi-layer-eagle \
+  --enable-multimodal \
+  --enable-torch-symm-mem \
+  --fp4-gemm-backend marlin \
+  --mamba-full-memory-ratio 0.1 \
+  --mamba-radix-cache-strategy extra_buffer \
+  --moe-runner-backend marlin \
+  --page-size 128 \
+  --reasoning-parser inkling \
+  --speculative-algorithm EAGLE \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 9 \
+  --speculative-num-steps 8 \
+  --speculative-use-rejection-sampling \
+  --swa-full-tokens-ratio 0.1 \
+  --tool-call-parser inkling \
+  --trust-remote-code
+```
+
+</Accordion>
+
+### Configuration history
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Profile</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>SGLang 0.5.18 and SGLang 0.5.20</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>SGLang 0.5.21</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>B200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Memory fraction 0.65; omit <code>--max-running-requests</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Memory fraction 0.80; <code>--max-running-requests 24</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>H200 TP8</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Memory fraction 0.78, Marlin, EAGLE 8/1/9</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Retained unchanged</td>
+    </tr>
+  </tbody>
+</table>
+
+The older cookbook used `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1`. It is not included
+here because that environment switch is absent from the upstream revision
+used for these commands.
+
+## DeepSeek-V4-Flash-0731
+
+See the [DeepSeek-V4 cookbook](/cookbook/autoregressive/DeepSeek/DeepSeek-V4)
+for checkpoint variants and DSpark setup. These are the **0731** checkpoints.
+Both configurations use DSpark block size 5 and cap running requests at 64.
+
+### B200 TP4 NVFP4
+
+Checkpoint: [nvidia/DeepSeek-V4-Flash-0731-NVFP4](https://huggingface.co/nvidia/DeepSeek-V4-Flash-0731-NVFP4).
+The configuration tested with SGLang 0.5.21 changes the prefill/decode interval from 16 to 8.
+
+<Accordion title="Launch DeepSeek-V4-Flash-0731 on B200 TP4">
+
+```bash Launch command
+NCCL_NET_GDR_LEVEL=LOC \
+sglang serve \
+  --model-path nvidia/DeepSeek-V4-Flash-0731-NVFP4 \
+  --tp-size 4 \
+  --mem-fraction-static 0.88 \
+  --context-length 1048576 \
+  --max-running-requests 64 \
+  --cuda-graph-backend-prefill breakable \
+  --cuda-graph-max-bs-prefill 512 \
+  --disable-flashinfer-autotune \
+  --log-level info \
+  --log-level-http info \
+  --moe-runner-backend flashinfer_trtllm_routed \
+  --prefill-decode-interval 8 \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --swa-full-tokens-ratio 0.1 \
+  --tool-call-parser deepseekv4
+```
+
+</Accordion>
+
+### H200 TP4 FP8 with MXFP4 experts
+
+Checkpoint: [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731).
+Keep its MXFP4 expert layout; do not substitute an all-FP8 checkpoint.
+The configuration tested with SGLang 0.5.21 adds the 16,384-token prefill chunk, interval 8, and FP8
+compute mode for the FlashInfer MXFP4 MoE runner. This mode requires
+**FlashInfer 0.6.18 or newer** on H200, as documented in the
+[upstream option declaration](https://github.com/sgl-project/sglang/blob/f3f23d128cd576352492334534be7e20fdd8fab6/python/sglang/srt/arg_groups/fields/exec_.py#L895-L901).
+Its selected custom-runtime point
+had substantially higher TTFT than the incumbent, so measure queueing latency
+as well as inter-token latency.
+
+<Accordion title="Launch DeepSeek-V4-Flash-0731 on H200 TP4">
+
+```bash Launch command
+NCCL_NET_GDR_LEVEL=LOC \
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --tp-size 4 \
+  --mem-fraction-static 0.88 \
+  --context-length 1048576 \
+  --max-running-requests 64 \
+  --chunked-prefill-size 16384 \
+  --flashinfer-mxfp4-moe-precision fp8 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --prefill-decode-interval 8 \
+  --reasoning-parser deepseek-v4 \
+  --schedule-policy lof \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --tool-call-parser deepseekv4
+```
+
+</Accordion>
+
+### Configuration history
+
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>Profile</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>SGLang 0.5.20</th>
+      <th style={{textAlign: "left", padding: "10px 12px"}}>SGLang 0.5.21</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>B200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}><code>--prefill-decode-interval 16</code>; no explicit log-level flags</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Interval 8; info log levels</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>H200 TP4</td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.05)"}}>Omit <code>--chunked-prefill-size</code>, <code>--prefill-decode-interval</code>, and <code>--flashinfer-mxfp4-moe-precision</code></td>
+      <td style={{padding: "9px 12px", background: "rgba(128,128,128,0.02)"}}>Chunk 16384, interval 8, MXFP4 MoE precision <code>fp8</code></td>
+    </tr>
+  </tbody>
+</table>
+
+An omitted flag uses the tested build's default, which may differ on another
+build. Both configurations preserve memory fraction 0.88 and the H200 `lof`
+schedule policy.
+
+## DeepSeek-V4-Pro-0813
+
+These **0813** recipes preserve the engine settings tested with SGLang 0.5.20
+and 0.5.21, including the allocator setting `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` from the
+measured runtime. The H200 recipe uses DSpark block size 3; B200 uses block
+size 5. The commands include the measured worker's 1,048,576-token context cap.
+
+### B200 TP8 NVFP4
+
+Checkpoint: [nvidia/DeepSeek-V4-Pro-0813-NVFP4](https://huggingface.co/nvidia/DeepSeek-V4-Pro-0813-NVFP4).
+
+<Accordion title="Launch DeepSeek-V4-Pro-0813 on B200 TP8">
+
+```bash Launch command
+NCCL_NET_GDR_LEVEL=LOC \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sglang serve \
+  --model-path nvidia/DeepSeek-V4-Pro-0813-NVFP4 \
+  --tp-size 8 \
+  --mem-fraction-static 0.85 \
+  --context-length 1048576 \
+  --max-running-requests 64 \
+  --chunked-prefill-size 8192 \
+  --moe-runner-backend flashinfer_trtllm_routed \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --swa-full-tokens-ratio 0.1 \
+  --tool-call-parser deepseekv4
+```
+
+</Accordion>
+
+### H200 TP8 FP8 with MXFP4 experts
+
+Checkpoint: [deepseek-ai/DeepSeek-V4-Pro-0813](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813).
+This uses a HiCache host tier with ratio 2, kernel I/O, and write-through.
+The recorded setup needed approximately 240 GB of pinnable host memory per
+node; recheck that budget when the device KV pool or runtime changes.
+
+<Accordion title="Launch DeepSeek-V4-Pro-0813 on H200 TP8">
+
+```bash Launch command
+NCCL_NET_GDR_LEVEL=LOC \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --tp-size 8 \
+  --mem-fraction-static 0.88 \
+  --context-length 1048576 \
+  --max-running-requests 64 \
+  --dsv4-prefill-backend flashmla_sparse_q8 \
+  --enable-hierarchical-cache \
+  --hicache-io-backend kernel \
+  --hicache-ratio 2 \
+  --hicache-write-policy write_through \
+  --moe-runner-backend marlin \
+  --reasoning-parser deepseek-v4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 3 \
+  --tool-call-parser deepseekv4
+```
+
+</Accordion>
+
+## GLM-5.3-Flash
+
+### GB200 TP4 NVFP4
+
+Checkpoint: [nvidia/GLM-5.3-Flash-NVFP4](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4).
+See the [GLM-5.3-Flash cookbook](/cookbook/autoregressive/GLM/GLM-5.3-Flash).
+This configuration combines three EAGLE steps and four draft tokens
+with linear ReplaySSM speculation, a 100-GB HiCache tier per rank, and a
+64-request limit. No performance curve was recovered for this configured
+profile, so it is a candidate for reproduction rather than a measured win.
+
+<Accordion title="Launch GLM-5.3-Flash on GB200 TP4">
+
+```bash Launch command
+sglang serve \
+  --model-path nvidia/GLM-5.3-Flash-NVFP4 \
+  --tp-size 4 \
+  --quantization modelopt_fp4 \
+  --mem-fraction-static 0.7 \
+  --max-running-requests 64 \
+  --chunked-prefill-size 16384 \
+  --cuda-graph-backend-prefill breakable \
+  --cuda-graph-max-bs-decode 64 \
+  --dsa-decode-backend trtllm \
+  --dsa-prefill-backend trtllm \
+  --enable-hierarchical-cache \
+  --enable-linear-replayssm-spec \
+  --enable-nccl-nvls \
+  --hicache-size 100 \
+  --kv-cache-dtype fp8_e4m3 \
+  --linear-attn-decode-backend triton \
+  --linear-attn-prefill-backend ptx_kda \
+  --linear-attn-verify-backend triton \
+  --mamba-ssm-dtype float32 \
+  --max-prefill-tokens 16384 \
+  --moe-runner-backend flashinfer_trtllm \
+  --page-size 64 \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-num-steps 3 \
+  --tool-call-parser glm47 \
+  --weight-loader-prefetch-checkpoints
+```
+
+</Accordion>
+
+## Interpret the tuning evidence
+
+Read the [campaign results and reproduction contract](/cookbook/autoregressive/agentic-serving-evidence)
+for per-configuration measurements, source checksums, exact image identities,
+and the distinction between measured configurations and these public-checkpoint commands.
+
+Most campaigns used multi-turn, prefix-sharing agentic traffic near 64K input
+tokens and 400 output tokens. DeepSeek Pro also used a distinct longer trace.
+The optimization objective emphasized output tokens/s/GPU under a mean
+inter-token latency limit, not a universal TTFT or tail-latency target.
+
+Several comparisons used simulated speculative acceptance, incomplete output
+lengths, different best-feasible concurrency points, or retained measurements.
+Those comparisons are not natural-acceptance speedup claims for these public
+commands. Benchmark simulation variables are deliberately absent. No
+percentage speedup or accuracy qualification transfers with the configuration.
+
+For your own comparison, keep the model revision, image, workload, output
+lengths, cache warmup, and client concurrency fixed. Verify complete responses
+and tool calls first, then report output throughput alongside TTFT, inter-token
+latency, errors, and natural speculative acceptance. Client concurrency and
+`--max-running-requests` are different limits: requests above the running cap
+can queue.
+
+The generated deployment panels on the model pages retain their existing
+verification status.
