@@ -834,7 +834,10 @@ class BaseMultimodalProcessor(ABC):
 
             npu_apply_glm46v_image_preprocess_patch()
             return "npu"
-        return None
+        # Glm4v's patchify reshapes exceed Ascend's 8-dimension limit. PIL
+        # inputs previously kept this work on CPU; device-decoded tensors
+        # need the same explicit placement before the HF processor runs.
+        return "cpu"
 
     @contextmanager
     def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):

@@ -89,14 +89,16 @@ class TestFastImageProcessorDevice(CustomTestCase):
         self.assertEqual(self._device(processor, _is_cpu=True), "cpu")
         self.assertEqual(self._device(processor, _is_xpu=True), "xpu")
 
-    def test_npu_glm4v_leaves_the_device_unset(self):
+    def test_npu_glm4v_explicitly_uses_cpu_preprocessing(self):
         class Glm4vProcessor:
             pass
 
         processor = _make(base_gpu_id=3)
         with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True):
             device = processor._fast_image_processor_device(Glm4vProcessor())
-        self.assertIsNone(device)
+        # Leaving placement unset lets an NPU-decoded input select NPU, where
+        # GLM4v's high-dimensional patch extraction is unsupported.
+        self.assertEqual(device, "cpu")
 
     def test_platform_respects_cuda_compatibility(self):
         processor = _make(base_gpu_id=3)
