@@ -237,6 +237,7 @@ class TestResponseParity(CustomTestCase):
                 "completion_tokens": 2,
                 "cached_tokens": 1,
                 "spec_accept_rate": 0.5,
+                "cached_tokens_details": {"device": 1, "host": 0},
                 "e2e_latency": 0.25,
             },
         }
@@ -253,10 +254,14 @@ class TestResponseParity(CustomTestCase):
                 "cached_tokens",
                 "reasoning_tokens",
                 "weight_version",
+                "cached_tokens_details",
             ],
         )
         self.assertEqual(
             back["meta_info"]["finish_reason"], {"type": "stop", "matched": 2}
+        )
+        self.assertEqual(
+            back["meta_info"]["cached_tokens_details"], {"device": 1, "host": 0}
         )
         self.assertNotIn("output_ids", back)
 
@@ -291,6 +296,7 @@ class TestResponseParity(CustomTestCase):
                 "image_tokens",
                 "audio_tokens",
                 "video_tokens",
+                "cached_tokens_details",
             ],
         )
 
