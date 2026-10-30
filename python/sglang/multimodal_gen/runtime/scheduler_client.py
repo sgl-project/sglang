@@ -1,9 +1,10 @@
 import asyncio
 import itertools
+import math
 import pickle
 import time
 import zlib
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import zmq
 import zmq.asyncio
@@ -165,11 +166,28 @@ class SchedulerClient:
         self.request_logger = DiffusionRequestLogger.from_server_args(server_args)
         self.context = zmq.Context()
 
-    def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
-        """Sends a batch or request to the scheduler and waits for the response."""
-        return self._forward_routed(batch, timeout_ms)
+    def forward(
+        self,
+        batch: Any,
+        timeout_ms: int | None = None,
+        *,
+        check_worker_health: Callable[[], None] | None = None,
+    ) -> Any:
+        """Wait for a response, optionally checking worker health while waiting."""
+        if check_worker_health is None:
+            return self._forward_routed(batch, timeout_ms)
+        return self._forward_routed(
+            batch, timeout_ms, check_worker_health=check_worker_health
+        )
 
-    def _forward_one(self, endpoint: str, batch: Any, timeout_ms: int | None) -> Any:
+    def _forward_one(
+        self,
+        endpoint: str,
+        batch: Any,
+        timeout_ms: int | None,
+        *,
+        check_worker_health: Callable[[], None] | None = None,
+    ) -> Any:
         socket = self.context.socket(zmq.REQ)
         try:
             socket.setsockopt(zmq.LINGER, 0)
@@ -180,6 +198,26 @@ class SchedulerClient:
                     socket.setsockopt(zmq.IDENTITY, identity)
                 socket.connect(endpoint)
                 socket.send_pyobj(_prepare_local_payload(endpoint, batch))
+                if check_worker_health is not None:
+                    # Poll so an owned worker's exit can interrupt an otherwise
+                    # unbounded receive. Keep one deadline across all polls.
+                    deadline = (
+                        time.monotonic() + effective_timeout / 1000
+                        if effective_timeout is not None
+                        else None
+                    )
+                    while True:
+                        check_worker_health()
+                        poll_timeout_ms = 1000
+                        if deadline is not None:
+                            remaining_ms = math.ceil(
+                                (deadline - time.monotonic()) * 1000
+                            )
+                            if remaining_ms <= 0:
+                                raise zmq.Again()
+                            poll_timeout_ms = min(poll_timeout_ms, remaining_ms)
+                        if socket.poll(poll_timeout_ms, zmq.POLLIN):
+                            break
                 output_batch = socket.recv_pyobj()
                 _materialize_output_batch_file_refs(output_batch)
                 _materialize_local_cuda_refs(endpoint, output_batch)
@@ -190,15 +228,31 @@ class SchedulerClient:
         finally:
             socket.close()
 
-    def _forward_routed(self, batch: Any, timeout_ms: int | None) -> Any:
+    def _forward_routed(
+        self,
+        batch: Any,
+        timeout_ms: int | None,
+        *,
+        check_worker_health: Callable[[], None] | None = None,
+    ) -> Any:
         self.request_logger.log_received_request(batch)
         endpoints = self.server_args.scheduler_endpoints
+        forward_kwargs = (
+            {"check_worker_health": check_worker_health}
+            if check_worker_health is not None
+            else {}
+        )
         if isinstance(batch, _CONTROL_REQ_TYPES):
-            results = [self._forward_one(ep, batch, timeout_ms) for ep in endpoints]
+            results = [
+                self._forward_one(ep, batch, timeout_ms, **forward_kwargs)
+                for ep in endpoints
+            ]
             output_batch = _merge_fanout_results(results)
         else:
             replica = _select_replica(batch, len(endpoints), self._replica_counter)
-            output_batch = self._forward_one(endpoints[replica], batch, timeout_ms)
+            output_batch = self._forward_one(
+                endpoints[replica], batch, timeout_ms, **forward_kwargs
+            )
         self.request_logger.log_finished_request(batch, output_batch)
         return output_batch
 
