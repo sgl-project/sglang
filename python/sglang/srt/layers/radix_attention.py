@@ -143,7 +143,15 @@ class RadixAttention(nn.Module):
             output, idx_output = allocate_attention_outputs(
                 self, q, v, kwargs.get("idx_q")
             )
-            lse = self._eager_attention(
+            return_lse = not is_sparse and bool(
+                kwargs.get("return_lse") or forward_batch.mha_return_lse
+            )
+            lse = (
+                q.new_empty((q.shape[0], self.tp_q_head_num), dtype=torch.float32)
+                if return_lse
+                else None
+            )
+            self._eager_attention(
                 q,
                 k,
                 v,
@@ -151,11 +159,12 @@ class RadixAttention(nn.Module):
                 save_kv_cache,
                 key_value_num_tokens,
                 idx_output,
+                lse,
                 **kwargs,
             )
             if is_sparse:
                 return idx_output, output
-            if kwargs.get("return_lse") or forward_batch.mha_return_lse:
+            if return_lse:
                 return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
         real_num_tokens = padded_extend_real_tokens(q, forward_batch)
@@ -185,23 +194,25 @@ class RadixAttention(nn.Module):
         save_kv_cache: bool = True,
         key_value_num_tokens: Optional[int] = None,
         idx_output=None,
+        lse_output=None,
         **kwargs,
-    ):
+    ) -> None:
         """Run real tokens, retaining padded outputs for the next graph segment."""
         forward_batch = get_forward_batch()
-        rows = output.shape[0]
         n = forward_batch.global_num_token_non_padded_cpu
         kv_n = n if key_value_num_tokens is None else key_value_num_tokens
         cache_n = n
         n = attention_query_tokens(forward_batch, n)
         return_lse = bool(kwargs.get("return_lse") or forward_batch.mha_return_lse)
-        lse = None
+        if not return_lse:
+            # A buffer from a capture that wanted an LSE keeps what it holds.
+            lse_output = None
         if n == 0:
             output.zero_()
             if idx_output is not None:
                 idx_output.zero_()
-            if return_lse:
-                lse = q.new_zeros((rows, q.shape[1]), dtype=torch.float32)
+            if lse_output is not None:
+                lse_output.zero_()
         else:
             with attention_input_scope(
                 forward_batch, output, n, kv_n, kwargs, cache_tokens=cache_n
@@ -228,8 +239,6 @@ class RadixAttention(nn.Module):
             _zero_padded_tokens(output, raw)
             if idx_output is not None:
                 _zero_padded_tokens(idx_output, raw)
-            if lse is not None and lse.shape[0] != rows:
-                padded = lse.new_zeros((rows, *lse.shape[1:]))
-                padded[:n].copy_(lse)
-                lse = padded
-        return lse
+            if lse_output is not None:
+                lse_output[: lse.shape[0]].copy_(lse)
+                lse_output[lse.shape[0] :].zero_()

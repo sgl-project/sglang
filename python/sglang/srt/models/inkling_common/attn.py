@@ -446,6 +446,7 @@ class InklingAttention(nn.Module):
         )
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
+            get_kv_layers,
             get_token_to_kv_pool,
         )
 
@@ -459,8 +460,8 @@ class InklingAttention(nn.Module):
         )
         v_cache, _, _, vw, v_inter = self.v_sconv.verify_fused_ar_inputs(forward_batch)
         pool = get_token_to_kv_pool()
-        k_buf = pool.get_key_buffer(self.layer_id)
-        v_buf = pool.get_value_buffer(self.layer_id)
+        kv = get_kv_layers().read(self.layer_id)
+        k_buf, v_buf = kv.key(), kv.value()
         do_bf16_store = _fused_kv_store_eligible(
             k_buf, v_buf, self.head_dim, torch.bfloat16
         )
@@ -469,7 +470,7 @@ class InklingAttention(nn.Module):
         if get_model().kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
-            sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
+            sfk, sfv = kv.kv_scales()
             do_mxfp8_store = (
                 _fused_kv_store_eligible(
                     k_buf, v_buf, self.head_dim, torch.float8_e4m3fn
@@ -532,6 +533,7 @@ class InklingAttention(nn.Module):
         )
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
+            get_kv_layers,
             get_token_to_kv_pool,
         )
 
@@ -557,8 +559,8 @@ class InklingAttention(nn.Module):
         v_inputs = self.v_sconv.extend_fused_ar_inputs(forward_batch)
         v_cache, vw = v_inputs[0], v_inputs[5]
         pool = get_token_to_kv_pool()
-        k_buf = pool.get_key_buffer(self.layer_id)
-        v_buf = pool.get_value_buffer(self.layer_id)
+        kv = get_kv_layers().read(self.layer_id)
+        k_buf, v_buf = kv.key(), kv.value()
         do_bf16_store = _fused_kv_store_eligible(
             k_buf, v_buf, self.head_dim, torch.bfloat16
         )
@@ -567,7 +569,7 @@ class InklingAttention(nn.Module):
         if get_model().kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
-            sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
+            sfk, sfv = kv.kv_scales()
             do_mxfp8_store = (
                 _fused_kv_store_eligible(
                     k_buf, v_buf, self.head_dim, torch.float8_e4m3fn
@@ -649,6 +651,7 @@ class InklingAttention(nn.Module):
         )
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
+            get_kv_layers,
             get_token_to_kv_pool,
         )
 
@@ -660,8 +663,8 @@ class InklingAttention(nn.Module):
         k_cache, ci, cm, kw = self.k_sconv.decode_fused_ar_inputs(forward_batch)
         v_cache, _, _, vw = self.v_sconv.decode_fused_ar_inputs(forward_batch)
         pool = get_token_to_kv_pool()
-        k_buf = pool.get_key_buffer(self.layer_id)
-        v_buf = pool.get_value_buffer(self.layer_id)
+        kv = get_kv_layers().read(self.layer_id)
+        k_buf, v_buf = kv.key(), kv.value()
         do_bf16_store = _fused_kv_store_eligible(
             k_buf, v_buf, self.head_dim, torch.bfloat16
         )
@@ -670,7 +673,7 @@ class InklingAttention(nn.Module):
         if get_model().kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
-            sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
+            sfk, sfv = kv.kv_scales()
             do_mxfp8_store = (
                 _fused_kv_store_eligible(
                     k_buf, v_buf, self.head_dim, torch.float8_e4m3fn

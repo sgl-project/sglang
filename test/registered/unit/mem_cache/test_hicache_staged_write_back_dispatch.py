@@ -9,6 +9,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
@@ -218,6 +219,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         op = CacheOperation(_indices(0, 4), _indices(4, 8), 7)
         op.pool_transfers = [transfer]
         controller = mock.Mock(spec=HybridCacheController)
+        controller.is_kv_sharded = False
         controller.load_queue = [op, op]
         controller.layer_done_counter = mock.MagicMock()
         controller.layer_done_counter.update_producer.return_value = 0
@@ -228,8 +230,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
         controller.mem_pool_device_allocator = mock.Mock()
-        controller._l2_transfers.side_effect = lambda *args: (
-            HybridCacheController._l2_transfers(controller, *args)
+        controller._l2_transfers.side_effect = lambda *args, **kwargs: (
+            HybridCacheController._l2_transfers(controller, *args, **kwargs)
         )
         controller._l2_load_transfers.side_effect = lambda *args: (
             HybridCacheController._l2_load_transfers(controller, *args)
@@ -417,7 +419,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                         rid="r",
                         cache_request_handle=handle,
                         prefix_len=0,
-                        kv=SimpleNamespace(cache_protected_len=0),
+                        kv=ReqKvInfo(cache_protected_len=0),
                     )
                     self.assertTrue(pipeline.prepare_staged_prefetch(req))
                     self.assertEqual(req.host_hit_length, 2)

@@ -130,7 +130,7 @@ inline void cutlass_prepare_moe_input(
   TensorMatcher({tokens, topk})
       .with_strides({-1, -1})
       .with_dtype<int32_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(topk_ids);
   const int64_t num_routes = topk_ids.numel();
   // Empty PyTorch dimensions can have noncanonical strides; no ID is read.
