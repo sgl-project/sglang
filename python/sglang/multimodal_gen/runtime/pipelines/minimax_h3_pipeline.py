@@ -133,7 +133,26 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 partition="hybrid",
                 tasks=tuple(MINIMAX_H3_TASK_PARTITIONS),
             )
+        self._apply_release_lora_adapter()
         return model_index
+
+    def _apply_release_lora_adapter(self) -> None:
+        """Load a release's bundled LoRA adapter as the startup adapter."""
+        adapter = self.release_metadata.lora_adapter
+        if adapter is None:
+            return
+        adapter_path = os.path.join(self.model_path, adapter)
+        if not os.path.isfile(adapter_path):
+            raise ValueError(
+                f"{self.pipeline_name} release adapter not found: {adapter_path}"
+            )
+        if self.server_args.lora_path not in (None, adapter_path):
+            raise ValueError(
+                f"{self.pipeline_name} applies its own release adapter "
+                f"({adapter}); --lora-path cannot replace it"
+            )
+        # LoRAPipeline reads server_args.lora_path once the modules are loaded
+        self.server_args.lora_path = adapter_path
 
     def validate_disagg_role(self, role: RoleType) -> None:
         if role != RoleType.MONOLITHIC:
@@ -208,6 +227,10 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             MiniMaxH3DenoisingStage(
                 transformer=self.get_module("transformer"),
                 pipeline=self,
+                stochastic_sampling=(
+                    release_metadata is not None
+                    and release_metadata.stochastic_sampling
+                ),
             )
         )
         self.add_stage(
