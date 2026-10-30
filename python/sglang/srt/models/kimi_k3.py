@@ -1636,7 +1636,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self._qkvgbfa_layer: Optional[SimpleNamespace] = None
                 self._qkvgbfa_sizes: Optional[list[int]] = None
                 self._qkvgbfa_bs_limit = (
-                    envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS.get()
+                    envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS.get()
                 )
         elif self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
@@ -1907,7 +1907,7 @@ class KimiK3DeltaAttention(nn.Module):
         plain unquantized 2-D tensors of one dtype and width -- the checkpoint
         keeps attention in bf16, but a quantized variant would carry scales
         that a raw row-cat would silently drop."""
-        if not (_is_hip and envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ.get()):
+        if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
             return False
         if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
             return False
@@ -2047,7 +2047,7 @@ class KimiK3DeltaAttention(nn.Module):
                 ):
                     # ROCm only. One GEMM for the whole in-proj: the [f_a|b]
                     # tail rides the wide projection's bandwidth (~30% of the
-                    # in-proj at decode on gfx950, SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ).
+                    # in-proj at decode on gfx950, SGLANG_ROCM_K3_FUSE_KDA_INPROJ).
                     fused_states = self.fused_qkvg_proj.quant_method.apply(
                         self._qkvgbfa_layer, hidden_states, None
                     )

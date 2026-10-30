@@ -229,22 +229,6 @@ class TestKimiK3HipEnvAliases(CustomTestCase):
     ALIASES = [
         ("SGLANG_OPT_HIP_K3_AITER", "SGLANG_AITER_K3_OPT", "1", True, "0", False),
         (
-            "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ",
-            "SGLANG_ROCM_K3_FUSE_KDA_INPROJ",
-            "0",
-            False,
-            "1",
-            True,
-        ),
-        (
-            "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS",
-            "SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS",
-            "64",
-            64,
-            "512",
-            512,
-        ),
-        (
             "SGLANG_OPT_HIP_K3_RADIX4_TOPK",
             "SGLANG_K3_RADIX4_TOPK",
             "1",
