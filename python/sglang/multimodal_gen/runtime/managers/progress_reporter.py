@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import zmq
@@ -43,20 +44,26 @@ class ProgressReporter:
 
 
 class ReportingTqdm(tqdm):
-    """tqdm that also sends progress once per integer percent, even when disabled."""
+    """tqdm that also sends progress once per integer percent, even when disabled.
+
+    on_step runs after each step, on every rank, and may raise to stop the
+    loop; see request_cancel.step_cancel_check.
+    """
 
     def __init__(
         self,
         *args: Any,
-        reporter: ProgressReporter,
+        reporter: ProgressReporter | None,
         request_ids: list[str],
         progress_range: tuple[float, float] = (0.0, 1.0),
+        on_step: Callable[[], None] | None = None,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         self._reporter = reporter
         self._request_ids = request_ids
         self._progress_range = progress_range
+        self._on_step = on_step
         self._completed = 0.0
         self._last_percent = 0
         self._iterating = False
@@ -78,8 +85,13 @@ class ReportingTqdm(tqdm):
             self._iterating = False
 
     def _advance(self, n: float) -> None:
+        self._report(n)
+        if self._on_step is not None and n > 0:
+            self._on_step()
+
+    def _report(self, n: float) -> None:
         total = self.total
-        if not total or n <= 0 or self._completed >= total:
+        if self._reporter is None or not total or n <= 0 or self._completed >= total:
             return
         self._completed = min(self._completed + n, total)
         percent = int(self._completed * 100 // total)
