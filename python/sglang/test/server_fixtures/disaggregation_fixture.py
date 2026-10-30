@@ -29,9 +29,8 @@ logger = logging.getLogger(__name__)
 
 def configure_nixl_pd_backend(test_cls):
     test_cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
-    # NIXL backend/network selection is driven by NIXL environment variables
-    # such as SGLANG_DISAGGREGATION_NIXL_BACKEND and backend params, not by the
-    # Mooncake-specific --disaggregation-ib-device argument.
+    # Keep these tests on the configured NIXL/UCX device selection rather than
+    # inheriting the Mooncake fixture's per-side RDMA device lists.
     test_cls.rdma_devices = []
 
 
@@ -119,7 +118,7 @@ class PDDisaggregationServerBase(CustomTestCase):
     @classmethod
     def rdma_devices_for(cls, gpu_indices) -> list:
         """`--disaggregation-ib-device` args for a server pinned to these GPUs."""
-        if not is_in_ci():
+        if not is_in_ci() or not cls.rdma_devices:
             return cls.rdma_devices
         return ["--disaggregation-ib-device", get_rdma_devices_args(gpu_indices)]
 
@@ -532,8 +531,8 @@ def _maybe_set_ucx_net_devices(ib_devices) -> bool:
     # createBackend and tcp is the only transport left that can serve it, so
     # keep loopback here.
     net_devices = ",".join([*(f"{d}:1" for d in devices), "lo"])
-    # NIXL ignores --disaggregation-ib-device; without this UCX opens every RDMA
-    # device on the host, and that full-device init can stall inside the driver.
+    # Limit default UCX device discovery; opening every RDMA device on the host
+    # can stall inside the driver.
     os.environ["UCX_NET_DEVICES"] = net_devices
     logger.warning("Set UCX_NET_DEVICES=%s for NIXL/UCX", net_devices)
     return True

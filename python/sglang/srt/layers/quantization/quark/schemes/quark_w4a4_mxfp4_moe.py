@@ -59,6 +59,42 @@ if _use_aiter:
     from aiter.utility.fp4_utils import e8m0_shuffle
 
 
+def _pad_tp_chunks(
+    loaded_weight: torch.Tensor, *, dim: int, tp_size: int, padded: int
+) -> torch.Tensor:
+    """Zero-pad each of the tp_size equal chunks of loaded_weight along dim to padded."""
+    real = loaded_weight.shape[dim] // tp_size
+    if real == padded:
+        return loaded_weight
+    assert real * tp_size == loaded_weight.shape[dim] and real < padded
+    chunks = loaded_weight.unflatten(dim, (tp_size, real))
+    pad_shape = list(chunks.shape)
+    pad_shape[dim + 1] = padded - real
+    return torch.cat([chunks, chunks.new_zeros(pad_shape)], dim=dim + 1).flatten(
+        dim, dim + 1
+    )
+
+
+def _rank_chunk_padding_loader(weight_loader, *, tp_size: int):
+    """FusedMoE's padded loader slices rank r at r * padded_width, but aiter treats
+    the last intermediate_pad channels of each rank as padding; pad every rank's
+    checkpoint chunk to match aiter's assumption."""
+
+    def loader(param, loaded_weight, weight_name, shard_id, expert_id, *args, **kw):
+        if shard_id in ("w1", "w2", "w3") and loaded_weight.dim() == 2:
+            # Intermediate axis: rows of w1/w3 (into half of w13), cols of w2.
+            dim = 1 if shard_id == "w2" else 0
+            padded = param.shape[dim + 1] // (1 if shard_id == "w2" else 2)
+            loaded_weight = _pad_tp_chunks(
+                loaded_weight, dim=dim, tp_size=tp_size, padded=padded
+            )
+        return weight_loader(
+            param, loaded_weight, weight_name, shard_id, expert_id, *args, **kw
+        )
+
+    return loader
+
+
 # gfx1250's grouped MoE GEMM reads weight scales in the n32k4 layout
 # (moe_shuffle_scale -> shuffle_scale_n32k4), not the e8m0_shuffle layout used by
 # gfx950. Using the wrong layout silently corrupts the dequant scales.
@@ -86,6 +122,19 @@ else:
 
 OCP_MX_BLOCK_SIZE = 32
 
+# HIP GPUs without FP4 hardware or an AITER FP4 MoE kernel (e.g. gfx1151 / Strix
+# Halo) cannot run the AITER path: its scales are laid out for gfx950 and its
+# kernels produce garbage there. Run the MoE as W4A16 instead: keep the packed
+# MXFP4 weights and upcast them inside triton_kernels' matmul, with bf16
+# activations. SGLANG_QUARK_MXFP4_MOE_W4A16=0 opts out.
+_use_triton_w4a16 = (
+    _is_hip
+    and not _is_gfx95
+    and not _is_gfx1250
+    and get_bool_env_var("SGLANG_QUARK_MXFP4_MOE_W4A16", "true")
+)
+_TRITON_W4A16_NUM_WARPS = 8
+
 
 class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
     def __init__(
@@ -94,11 +143,13 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         input_config: dict[str, Any],
         is_checkpoint_mxfp4_serialized: bool = True,
         dequantization_config: QuantizationConfig | None = None,
+        quantize_shared_expert_online: bool = False,
     ):
         self.weight_quant = weight_config
         self.input_quant = input_config
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.dequantization_config = dequantization_config
+        self.quantize_shared_expert_online = quantize_shared_expert_online
 
         weight_qscheme = self.weight_quant.get("qscheme")
         input_qscheme = self.input_quant.get("qscheme")
@@ -122,6 +173,16 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 "Using online MXFP4 quantization for MoE layers from a higher precision checkpoint. "
                 "Beware that this optimization may degrade prediction quality - please validate your model accuracy. "
                 "More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
+            )
+
+        if self.quantize_shared_expert_online:
+            logger.warning_once(
+                "Quantizing the BF16 shared expert to MXFP4 while loading so it can be fused "
+                "into the routed experts. Its weights and its input activations are then both "
+                "quantized to MXFP4 by the shared W4A4 grouped GEMM, where the standalone path "
+                "it replaces ran in BF16. Beware that this optimization may degrade prediction "
+                "quality - please validate your model accuracy. Drop "
+                "--enforce-shared-experts-fusion to keep the shared expert standalone."
             )
 
     @classmethod
@@ -211,7 +272,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         # 512 (256 packed), adding 33% zero work and preventing the native-shape
         # MXMoE tuning table from binding. The K3 FlyDSL path supports 128-wide
         # alignment in the unpacked dimension, so retain the checkpoint shape.
-        pad_for_aiter = _use_aiter and not _aiter_k3_opt
+        pad_for_aiter = _use_aiter and not (_aiter_k3_opt or _use_triton_w4a16)
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=pad_for_aiter,
@@ -220,6 +281,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         )
         layer.hidden_pad = 0
         layer.intermediate_pad = w13_up_dim // 2 - intermediate_size_per_partition
+        if layer.intermediate_pad and not layer.use_presharded_weights:
+            original_weight_loader = _rank_chunk_padding_loader(
+                original_weight_loader, tp_size=layer.moe_tp_size
+            )
 
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
@@ -229,6 +294,27 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 "weight_padded": weight_padded,
             },
         )
+
+        if self.quantize_shared_expert_online and getattr(
+            layer, "_has_fused_shared", False
+        ):
+            if hidden_size % OCP_MX_BLOCK_SIZE:
+                raise ValueError(
+                    f"Quantizing the shared expert at load time needs a hidden "
+                    f"size that is a multiple of the MX block size "
+                    f"{OCP_MX_BLOCK_SIZE}, got {hidden_size}: it is the K "
+                    f"dimension the gate and up projections are block-scaled "
+                    f"along."
+                )
+            if intermediate_size_per_partition % OCP_MX_BLOCK_SIZE:
+                raise ValueError(
+                    f"Quantizing the shared expert at load time needs an "
+                    f"intermediate size per partition that is a multiple of the "
+                    f"MX block size {OCP_MX_BLOCK_SIZE}, got "
+                    f"{intermediate_size_per_partition}. Otherwise a block of the "
+                    f"down projection would straddle a TP rank boundary and the "
+                    f"fused slot would not match an offline-quantized checkpoint."
+                )
 
         if self.is_checkpoint_mxfp4_serialized:
             weight_loader = original_weight_loader
@@ -611,6 +697,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             else:
                 raise ValueError("Expected w13 or w2.")
 
+            if copy_numel_counter.copied_numel == 0:
+                return
+
             assert current_loaded <= target_loaded_numel, (
                 f"target_loaded_numel={target_loaded_numel}, current_loaded={current_loaded}"
             )
@@ -622,6 +711,25 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 self._quantize_w2_online(layer, dynamic_mxfp4_quant)
 
         return online_mxfp4_moe_weight_loader
+
+    def quantize_shared_expert(
+        self, loaded_weight: torch.Tensor, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize an unquantized shared-expert projection to MXFP4.
+
+        The whole tensor is quantized and the caller shards the packed result,
+        so every rank produces the bytes an offline-quantized checkpoint would
+        carry for its own shard.  `device` is the load device create_weights
+        recorded: the loader's `with torch.device(...)` only wraps model
+        construction, so torch's default device is back to CPU by the time
+        weights arrive, and it is thread-local besides.
+        """
+        if dynamic_mxfp4_quant is None:
+            raise NotImplementedError(
+                "Fusing an unquantized shared expert into MXFP4 routed experts "
+                "needs aiter's dynamic_mxfp4_quant, which is AMD ROCm only."
+            )
+        return dynamic_mxfp4_quant(loaded_weight.to(device))
 
     def get_online_fp8_to_mxfp4_weight_loader(self, layer, original_weight_loader):
         """
@@ -867,6 +975,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _use_triton_w4a16:
+            self._process_weights_triton_w4a16(layer)
+            return
         if not getattr(self, "_owns_moe_runner", False):
             raise RuntimeError(
                 "Quark MXFP4 weight preshuffling requires an owned AITER runner."
@@ -959,6 +1070,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         self.moe_runner_config = moe_runner_config
         self._owns_moe_runner = False
+        if _use_triton_w4a16:
+            return
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto() and get_moe_a2a_backend().supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
@@ -977,9 +1090,13 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if _use_triton_w4a16:
+            return self._apply_triton_w4a16(layer, dispatch_output)
+
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
+            aiter_swiglu_oai_limit,
         )
 
         if hasattr(torch, "float4_e2m1fn_x2"):
@@ -1015,7 +1132,98 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             expert_mask=layer.dispatcher.expert_mask_gpu,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
-            swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
+            swiglu_limit=(
+                aiter_swiglu_oai_limit(self.moe_runner_config)
+                or self.moe_runner_config.swiglu_limit
+                or 0.0
+            ),
             fused_moe_kwargs=_fused_moe_kwargs,
         )
         return self.runner.run(dispatch_output, quant_info)
+
+    def _process_weights_triton_w4a16(self, layer: torch.nn.Module) -> None:
+        from triton_kernels.matmul import FlexCtx, PrecisionConfig
+
+        from sglang.srt.layers.quantization.mxfp4 import _swizzle_mxfp4
+
+        assert (
+            self.is_checkpoint_mxfp4_serialized and self.dequantization_config is None
+        ), "The W4A16 triton path only supports serialized MXFP4 checkpoints."
+        assert self.moe_runner_config.activation == "silu", (
+            f"The W4A16 triton path only supports silu, got {self.moe_runner_config.activation}"
+        )
+        self.num_experts = layer.w13_weight.shape[0]
+        self.intermediate_size = layer.w13_weight.shape[1] // 2
+        precision_configs = []
+        for name in ("w13", "w2"):
+            weight, flex, scale = _swizzle_mxfp4(
+                getattr(layer, f"{name}_weight").data,
+                getattr(layer, f"{name}_weight_scale").data,
+                _TRITON_W4A16_NUM_WARPS,
+            )
+            setattr(self, f"{name}_triton_weight", weight)
+            precision_configs.append(
+                PrecisionConfig(
+                    b_mx_scale=scale,
+                    b_microblock_size=OCP_MX_BLOCK_SIZE,
+                    flex_ctx=FlexCtx(rhs_data=flex),
+                    # w2's scattered rows are summed over top_k below; keep them
+                    # in fp32 until then.
+                    out_dtype=torch.float32 if name == "w2" else None,
+                )
+            )
+        self.w13_precision_config, self.w2_precision_config = precision_configs
+        # The swizzled copies above own the data now; drop the loaded tensors.
+        for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+            delattr(layer, name)
+        torch.cuda.empty_cache()
+
+    def _apply_triton_w4a16(
+        self, layer: torch.nn.Module, dispatch_output: StandardDispatchOutput
+    ) -> CombineInput:
+        from sgl_kernel import silu_and_mul
+        from triton_kernels.matmul import matmul
+        from triton_kernels.tensor import make_ragged_tensor_metadata
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        num_tokens, top_k = topk_ids.shape
+
+        # Expert-major routing for triton_kernels: row i of the grouped GEMM is flat
+        # slot combine[i] (= token * top_k + j), sorted by expert id. Everything
+        # stays on device (no bincount) so this is CUDA-graph capturable.
+        flat_ids = topk_ids.reshape(-1).to(torch.int64)
+        combine = torch.argsort(flat_ids, stable=True).to(torch.int32)
+        gather = torch.div(combine, top_k, rounding_mode="trunc")
+        counts = torch.zeros(self.num_experts, dtype=torch.int32, device=x.device)
+        counts.scatter_add_(0, flat_ids, torch.ones_like(flat_ids, dtype=torch.int32))
+        ragged = make_ragged_tensor_metadata(counts, num_tokens * top_k)
+        gammas = topk_weights.reshape(-1).to(torch.float32)[combine]
+
+        gate_up = matmul(
+            x,
+            self.w13_triton_weight,
+            None,
+            a_ragged_metadata=ragged,
+            gather_indx=gather,
+            precision_config=self.w13_precision_config,
+        )
+        act = torch.empty(
+            (gate_up.shape[0], self.intermediate_size), dtype=x.dtype, device=x.device
+        )
+        silu_and_mul(gate_up.view(-1, 2 * self.intermediate_size), act)
+        out = matmul(
+            act,
+            self.w2_triton_weight,
+            None,
+            a_ragged_metadata=ragged,
+            scatter_indx=combine,
+            gammas=gammas,
+            precision_config=self.w2_precision_config,
+        )
+        # The scatter writes row i to flat slot combine[i] (num_tokens * top_k
+        # rows) without reducing over top_k, so do the reduction here.
+        out = out.view(num_tokens, top_k, -1).sum(dim=1)
+        return StandardCombineInput(hidden_states=out.to(x.dtype))

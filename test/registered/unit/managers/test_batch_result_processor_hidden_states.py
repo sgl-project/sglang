@@ -10,6 +10,7 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
     SamplingMaskStatus,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -19,7 +20,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProcessor:
@@ -38,7 +39,9 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         disaggregation_mode=None,
         enable_overlap=False,
         enable_overlap_mlx=False,
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(
+            think_end_ids=None, self_opened_think_start_ids=None
+        ),
         token_to_kv_pool_allocator=Mock(),
         tree_cache=None,
         hisparse_coordinator=None,
@@ -169,6 +172,7 @@ class _PrefillReq:
         self.require_reasoning = False
         self.customized_info = None
         self.beam_group = None
+        self.discard_output_reason = None
 
     def finished(self):
         return False
@@ -178,6 +182,8 @@ class _PrefillReq:
 
 
 class _DecodeReq:
+    request_finish = Req.request_finish
+
     def __init__(self):
         self.return_hidden_states = "last"
         self.hidden_states = []
@@ -318,6 +324,66 @@ class TestPrefillSkippedOutput(CustomTestCase):
         )
 
 
+class TestMixedBatchKvRelease(CustomTestCase):
+    def test_decode_req_finishing_in_mixed_batch_gets_release_hook(self):
+        """A decode req that finishes inside a mixed batch goes through the
+        worker's pre-release hook, as it would in a decode batch; a prefill
+        req finishing on its first token does not."""
+        prefill_req = _PrefillReq(
+            rid="prefill", inflight_middle_chunks=0, return_hidden_states=False
+        )
+        decode_req = _PrefillReq(
+            rid="decode", inflight_middle_chunks=0, return_hidden_states=False
+        )
+        for req in (prefill_req, decode_req):
+            req.finished = lambda req=req: bool(req.output_ids)
+            req.kv = SimpleNamespace(kv_committed_len=0)
+        batch = SimpleNamespace(
+            reqs=[prefill_req, decode_req],
+            decoding_reqs=[decode_req],
+            return_logprob=False,
+            return_hidden_states=False,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            spec_info=None,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=SimpleNamespace(
+                hidden_states=None, customized_info=None, sampling_mask_output=None
+            ),
+            next_token_ids=torch.tensor([5, 6]),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+            skipped_output_comm=False,
+        )
+        processor = _make_processor(self)
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "batch_result_processor.release_kv_cache"
+            ) as release,
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_collect_routed_experts"
+            ),
+            patch.object(SchedulerBatchResultProcessor, "_maybe_collect_indexer_topk"),
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        self.assertEqual(release.call_count, 2)
+        processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(
+            decode_req
+        )
+
+
 class TestDecodeWithoutLogits(CustomTestCase):
     def test_pipeline_result_commits_token_without_sampling_metadata(self):
         processor = _make_processor(self)
@@ -415,7 +481,9 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
         def result(hidden_states):
             return GenerationBatchResult(
                 logits_output=SimpleNamespace(
-                    hidden_states=hidden_states, sampling_mask_output=None
+                    hidden_states=hidden_states,
+                    customized_info=None,
+                    sampling_mask_output=None,
                 ),
                 speculative_num_draft_tokens=4,
             )

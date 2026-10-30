@@ -18,6 +18,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs import NemotronHConfig
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -70,8 +71,7 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
                 output_size=config.hidden_size,
                 bias=False,
                 gather_output=not _dp_attn,
-                tp_rank=get_parallel().attn_tp_rank if _dp_attn else None,
-                tp_size=get_parallel().attn_tp_size if _dp_attn else None,
+                parallel_group="attn_tp" if _dp_attn else "tp",
                 params_dtype=(
                     config.dtype if hasattr(config, "dtype") else torch.bfloat16
                 ),
@@ -138,6 +138,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=prefix,
+            is_nextn=True,
         )
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
@@ -152,8 +153,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
                 output_size=config.hidden_size,
                 bias=False,
                 gather_output=not _dp_attn,
-                tp_rank=get_parallel().attn_tp_rank if _dp_attn else None,
-                tp_size=get_parallel().attn_tp_size if _dp_attn else None,
+                parallel_group="attn_tp" if _dp_attn else "tp",
                 params_dtype=(
                     config.dtype if hasattr(config, "dtype") else torch.bfloat16
                 ),
@@ -304,12 +304,13 @@ class NemotronHMultiTokenPredictor(nn.Module):
         hidden_states = forward_batch.spec_info.hidden_states
         residual_batch.start(forward_batch)
 
-        for i in range(self.pattern_len):
-            hidden_states = self.layers[str(i)](
-                inputs_embeds=inputs_embeds,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            for i in range(self.pattern_len):
+                hidden_states = self.layers[str(i)](
+                    inputs_embeds=inputs_embeds,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
         return residual_batch.take_output(hidden_states, forward_batch)
 
 

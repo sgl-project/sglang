@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path, PurePosixPath
+from stat import S_ISDIR
 
 import psutil
 
@@ -18,6 +19,23 @@ def _unescape_mount_path(value: str) -> str:
 def _memory_stat(directory: Path) -> dict[str, int]:
     lines = (directory / "memory.stat").read_text().splitlines()
     return {key: int(value) for key, value in map(str.split, lines)}
+
+
+def _has_protected_descendants(directory: Path) -> bool:
+    """Treat configured or unreadable descendant memory.min as protected."""
+    pending = [directory]
+    try:
+        while pending:
+            for child in pending.pop().iterdir():
+                if not S_ISDIR(child.stat().st_mode):
+                    continue
+                if int((child / "memory.min").read_text()) != 0:
+                    return True
+                pending.append(child)
+    except (OSError, ValueError):
+        # Unknown protection only disables cache credit, not the cgroup bound.
+        return True
+    return False
 
 
 def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
@@ -78,6 +96,7 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
             else ("total_active_file", "total_inactive_file")
         )
         while True:
+            usage = None
             for name in limits:
                 try:
                     value = (directory / name).read_text().strip()
@@ -89,11 +108,20 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
                 limit = int(value)
                 # Do not silently ignore an unreadable usage file for a known
                 # limit: falling back to host RAM could overrun the container.
-                usage = int((directory / usage_name).read_text())
-                stat = _memory_stat(directory)
-                page_cache = sum(stat[key] for key in page_cache_keys)
-                # Charged page cache is reclaimed under the limit, not used.
-                remaining = max(0, limit - max(0, usage - page_cache))
+                if usage is None:
+                    usage = int((directory / usage_name).read_text())
+                    stat = _memory_stat(directory)
+                    page_cache = sum(stat[key] for key in page_cache_keys)
+                    # Protection is relative to the reclaim target: its own min
+                    # does not prevent reclaim, but descendants' min can.
+                    if (
+                        filesystem == "cgroup2"
+                        and page_cache > 0
+                        and _has_protected_descendants(directory)
+                    ):
+                        page_cache = 0
+                    usage = max(0, usage - page_cache)
+                remaining = max(0, limit - usage)
                 headroom = remaining if headroom is None else min(headroom, remaining)
             if directory == mount:
                 break

@@ -10,9 +10,10 @@ Two capture-trace modes plus their precedence:
   * **Per-batch-size traces** (``SGLANG_GRAPH_BATCH_CAPTURE``): a *scheduled*
     profiler (``wait=2, warmup=0, active=1, repeat=0``) with the trace-export
     knobs (record_shapes / with_stack / with_flops / profile_memory) and an
-    ``on_trace_ready`` hook that writes one trace per batch size to
+    ``on_trace_ready`` hook that writes one trace per captured shape to
     ``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile/`` named
-    ``{runner_name}_bs_{bs}_rank{rank}.json.gz``.
+    ``{runner_name}_{tag}_rank{rank}.json.gz``, where ``tag`` comes from
+    ``_set_profile_trace_tag`` (bs plus whichever variants are active).
   * **Precedence**: when both env vars are set, the original single-trace path
     wins (no per-bs schedule / dir / bookkeeping).
 
@@ -28,6 +29,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -36,7 +39,7 @@ from sglang.srt.utils import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _CAPTURE_TRACE = "SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE"
 _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
@@ -49,7 +52,23 @@ def _make_fake_self(capture_bs):
     fake_self._graph_batch_capture_active = (
         DecodeCudaGraphRunner._graph_batch_capture_active.__get__(fake_self)
     )
+    # _profiler is the gate _set_profile_trace_tag checks.
+    fake_self._profiler = mock.Mock()
+    fake_self._set_profile_trace_tag = (
+        DecodeCudaGraphRunner._set_profile_trace_tag.__get__(fake_self)
+    )
+    fake_self._profile_runner_name = DecodeCudaGraphRunner._profile_runner_name.__get__(
+        fake_self
+    )
     return fake_self
+
+
+def _make_runner(cls, *, is_draft_worker):
+    """Uninitialized runner of ``cls`` with only the model_runner flag the
+    trace-naming helper reads."""
+    runner = cls.__new__(cls)
+    runner.model_runner = SimpleNamespace(is_draft_worker=is_draft_worker)
+    return runner
 
 
 class TestInitProfileBatchMode(CustomTestCase):
@@ -85,12 +104,10 @@ class TestInitProfileBatchMode(CustomTestCase):
             self._invoke(capture_bs=[1, 2, 4], profiler_dir=tmp)
             self.assertTrue(os.path.isdir(os.path.join(tmp, "graph_capture_profile")))
 
-    def test_primes_reversed_bs_list_and_zero_index(self):
+    def test_primes_empty_trace_tag(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake_self, *_ = self._invoke(capture_bs=[1, 2, 4, 8], profiler_dir=tmp)
-            # Capture iterates large -> small, so the bs list is reversed.
-            self.assertEqual(fake_self._profile_bs_list, [8, 4, 2, 1])
-            self.assertEqual(fake_self._profile_bs_idx, 0)
+            self.assertIsNone(fake_self._profile_trace_tag)
 
 
 class TestInitProfileOriginalMode(CustomTestCase):
@@ -122,7 +139,7 @@ class TestInitProfileOriginalMode(CustomTestCase):
             self.assertIsNone(kwargs.get("on_trace_ready"))
             mock_schedule.assert_not_called()
             self.assertFalse(os.path.isdir(os.path.join(tmp, "graph_capture_profile")))
-            self.assertFalse(hasattr(fake_self, "_profile_bs_list"))
+            self.assertFalse(hasattr(fake_self, "_profile_trace_tag"))
 
     def test_no_flags(self):
         self._invoke_original(env={})
@@ -135,8 +152,11 @@ class TestInitProfileOriginalMode(CustomTestCase):
 
 
 class TestOnTraceReadyNaming(CustomTestCase):
-    def _build_on_trace_ready(self, *, capture_bs, rank, tmp):
+    @staticmethod
+    def _build_on_trace_ready(*, capture_bs, rank, tmp, runner_name=None):
         fake_self = _make_fake_self(capture_bs)
+        if runner_name is not None:
+            fake_self._profile_runner_name = lambda: runner_name
         with (
             mock.patch.dict(
                 os.environ,
@@ -155,23 +175,24 @@ class TestOnTraceReadyNaming(CustomTestCase):
         on_trace_ready = mock_profile.call_args.kwargs["on_trace_ready"]
         return fake_self, on_trace_ready
 
-    def test_exports_one_named_trace_per_bs_and_advances_index(self):
+    @staticmethod
+    def _flush(on_trace_ready, exported):
+        prof = mock.Mock()
+        prof.export_chrome_trace.side_effect = exported.append
+        on_trace_ready(prof)
+
+    def test_single_variant_keeps_bs_only_naming(self):
         with tempfile.TemporaryDirectory() as tmp:
-            capture_bs = [1, 2, 4]  # reversed -> [4, 2, 1]
             fake_self, on_trace_ready = self._build_on_trace_ready(
-                capture_bs=capture_bs, rank=0, tmp=tmp
+                capture_bs=[1, 2, 4], rank=0, tmp=tmp
             )
             trace_dir = os.path.join(tmp, "graph_capture_profile")
             runner = type(fake_self).__name__
 
             exported = []
-            for expected_bs in [4, 2, 1]:
-                prof = mock.Mock()
-                prof.export_chrome_trace.side_effect = lambda p: exported.append(p)
-                on_trace_ready(prof)
-                prof.export_chrome_trace.assert_called_once_with(
-                    os.path.join(trace_dir, f"{runner}_bs_{expected_bs}_rank0.json.gz")
-                )
+            for bs in (4, 2, 1):
+                fake_self._set_profile_trace_tag(bs, None, None, None)
+                self._flush(on_trace_ready, exported)
 
             self.assertEqual(
                 exported,
@@ -181,8 +202,52 @@ class TestOnTraceReadyNaming(CustomTestCase):
                     os.path.join(trace_dir, f"{runner}_bs_1_rank0.json.gz"),
                 ],
             )
-            # Index advanced once per flush.
-            self.assertEqual(fake_self._profile_bs_idx, 3)
+
+    def test_dual_attention_variants_name_both_traces(self):
+        """DSA models capture dense + sparse per bs, so two flushes per bs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_self, on_trace_ready = self._build_on_trace_ready(
+                capture_bs=[1, 2], rank=0, tmp=tmp
+            )
+            trace_dir = os.path.join(tmp, "graph_capture_profile")
+            runner = type(fake_self).__name__
+
+            exported = []
+            for bs in (2, 1):
+                for attention_variant in ("dense", "sparse"):
+                    fake_self._set_profile_trace_tag(bs, None, None, attention_variant)
+                    self._flush(on_trace_ready, exported)
+
+            self.assertEqual(
+                exported,
+                [
+                    os.path.join(trace_dir, f"{runner}_bs_2_dense_rank0.json.gz"),
+                    os.path.join(trace_dir, f"{runner}_bs_2_sparse_rank0.json.gz"),
+                    os.path.join(trace_dir, f"{runner}_bs_1_dense_rank0.json.gz"),
+                    os.path.join(trace_dir, f"{runner}_bs_1_sparse_rank0.json.gz"),
+                ],
+            )
+            self.assertEqual(len(set(exported)), len(exported))
+
+    def test_more_flushes_than_batch_sizes_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_self, on_trace_ready = self._build_on_trace_ready(
+                capture_bs=[1, 2], rank=0, tmp=tmp
+            )
+            exported = []
+            for i in range(6):
+                fake_self._set_profile_trace_tag(2, None, None, f"v{i}")
+                self._flush(on_trace_ready, exported)
+            self.assertEqual(len(exported), 6)
+
+    def test_unset_tag_skips_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, on_trace_ready = self._build_on_trace_ready(
+                capture_bs=[8], rank=0, tmp=tmp
+            )
+            prof = mock.Mock()
+            on_trace_ready(prof)  # tag never set by the capture loop
+            prof.export_chrome_trace.assert_not_called()
 
     def test_rank_in_trace_filename(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -190,6 +255,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
                 capture_bs=[8], rank=3, tmp=tmp
             )
             runner = type(fake_self).__name__
+            fake_self._set_profile_trace_tag(8, None, None, None)
             prof = mock.Mock()
             on_trace_ready(prof)
             prof.export_chrome_trace.assert_called_once_with(
@@ -197,6 +263,64 @@ class TestOnTraceReadyNaming(CustomTestCase):
                     tmp, "graph_capture_profile", f"{runner}_bs_8_rank3.json.gz"
                 )
             )
+
+
+class TestProfileTraceTag(CustomTestCase):
+    """_set_profile_trace_tag composition."""
+
+    def test_bs_only_when_no_variants(self):
+        fake_self = _make_fake_self([1])
+        fake_self._set_profile_trace_tag(16, None, None, None)
+        self.assertEqual(fake_self._profile_trace_tag, "bs_16")
+
+    def test_appends_attention_lora_and_stream(self):
+        fake_self = _make_fake_self([1])
+        fake_self._set_profile_trace_tag(8, 1, "nolora", "sparse")
+        self.assertEqual(fake_self._profile_trace_tag, "bs_8_sparse_nolora_stream_1")
+
+    def test_noop_without_scheduled_profiler(self):
+        fake_self = _make_fake_self([1])
+        fake_self._profiler = None
+        fake_self._set_profile_trace_tag(8, None, None, "sparse")
+        self.assertFalse(hasattr(fake_self, "_profile_trace_tag"))
+
+
+class TestProfileRunnerName(CustomTestCase):
+    """DSPARK / DFLASH drafts capture with the base class at the target's
+    shapes, so their traces must not share the target's runner name."""
+
+    def test_target_keeps_class_name(self):
+        runner = _make_runner(DecodeCudaGraphRunner, is_draft_worker=False)
+        self.assertEqual(runner._profile_runner_name(), "DecodeCudaGraphRunner")
+
+    def test_base_class_draft_worker_is_prefixed(self):
+        runner = _make_runner(DecodeCudaGraphRunner, is_draft_worker=True)
+        self.assertEqual(runner._profile_runner_name(), "DraftDecodeCudaGraphRunner")
+
+    def test_draft_subclass_keeps_class_name(self):
+        class EAGLEDraftLikeRunner(DecodeCudaGraphRunner):
+            pass
+
+        runner = _make_runner(EAGLEDraftLikeRunner, is_draft_worker=True)
+        self.assertEqual(runner._profile_runner_name(), "EAGLEDraftLikeRunner")
+
+    def test_target_and_draft_traces_do_not_collide(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exported = []
+            for is_draft_worker in (False, True):
+                name = _make_runner(
+                    DecodeCudaGraphRunner, is_draft_worker=is_draft_worker
+                )._profile_runner_name()
+                fake_self, on_trace_ready = (
+                    TestOnTraceReadyNaming._build_on_trace_ready(
+                        capture_bs=[1, 2], rank=0, tmp=tmp, runner_name=name
+                    )
+                )
+                for bs in (2, 1):
+                    fake_self._set_profile_trace_tag(bs, None, None, None)
+                    TestOnTraceReadyNaming._flush(on_trace_ready, exported)
+            self.assertEqual(len(exported), 4)
+            self.assertEqual(len(set(exported)), len(exported))
 
 
 class TestOriginalTraceExport(CustomTestCase):
@@ -244,6 +368,335 @@ class TestOriginalTraceExport(CustomTestCase):
                 self.assertFalse(
                     os.path.isdir(os.path.join(tmp, "graph_capture_profile"))
                 )
+
+
+class TestAttentionVariantSizes(CustomTestCase):
+    """Variants captured only at some batch sizes, such as a megakernel's where its
+    step runs, are captured and replayed by label there and once elsewhere."""
+
+    def test_each_label_is_captured_and_replayed_only_at_its_batch_sizes(self):
+        import contextlib
+
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_attention_variant,
+        )
+
+        variants = SimpleNamespace(
+            capture_labels=("short", "long"),
+            select=lambda fb: (
+                "long" if fb.attention_kv_len_lower_bound >= 8 else "short"
+            ),
+        )
+        both = [("short", "short"), ("long", "long")]
+        for sizes, captures, replays in (
+            # the megakernel runs bs 1 only: one graph at bs 4 and 2, both labels at 1
+            (
+                frozenset({1}),
+                {4: [(None, None)], 2: [(None, None)], 1: both},
+                {1: "long", 2: None},
+            ),
+            # unrestricted (the DSA and candidate variants): every label everywhere
+            (None, {4: both, 2: both, 1: both}, {1: "long", 2: "long"}),
+        ):
+            with self.subTest(sizes=sizes):
+                runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+                runner.capture_bs, runner.compile_bs = [1, 2, 4], []
+                runner.captured_req_width, runner.record_nolora_graph = 7, False
+                runner.model_runner = SimpleNamespace(
+                    model=None, device="cpu", gpu_id=0
+                )
+                runner.attention_graph_variants = variants
+                runner.attention_variant_sizes = sizes
+                captured = {}
+
+                def capture_one_shape(bs, forward, stream_idx, lora, label):
+                    # the label a capture runs under, and what the model reads
+                    seen = (label, get_capture_attention_variant())
+                    captured.setdefault(bs, []).append(seen)
+
+                runner.capture_one_shape = capture_one_shape
+                with (
+                    mock.patch.object(
+                        mod,
+                        "get_parallel",
+                        return_value=SimpleNamespace(tp_rank=1, tp_group=None),
+                    ),
+                    mock.patch.object(mod, "get_available_gpu_memory", return_value=0),
+                    mock.patch.object(
+                        mod.torch_compile_decoration,
+                        "patch_model",
+                        side_effect=lambda *a, **k: contextlib.nullcontext(),
+                    ),
+                ):
+                    runner._capture_one_stream()
+                self.assertEqual(captured, captures)
+                self.assertIsNone(get_capture_attention_variant())
+                long_batch = SimpleNamespace(attention_kv_len_lower_bound=8)
+                for bs, label in replays.items():
+                    replayed = runner._resolve_attention_variant(long_batch, bs)
+                    self.assertEqual(replayed, label, bs)
+
+
+class TestRaggedVerifyLayoutPerTier(CustomTestCase):
+    """Every graph variant of a token tier must replay the staged live layout."""
+
+    def test_replay_stages_layout_of_every_variant(self):
+        import torch
+
+        from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.max_bs = 8
+        runner.captured_req_width = 6
+        runner.capture_num_tokens = [6, 12, 24, 48]
+        runner.device = "cpu"
+        runner._captured_ragged_layouts = {}
+        with mock.patch.dict(
+            os.environ, {"SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": "0"}
+        ):
+            captured = {
+                variant: runner._capture_ragged_verify_layout(24)
+                for variant in ("candidate_unfiltered", "candidate_filtered")
+            }
+
+        live = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([6, 1, 6, 3, 6], dtype=torch.int32),
+            graph_num_tokens=24,
+        )
+        expected = live.padded_to_bucket(padded_bs=8, cap=6)
+        runner._stage_ragged_verify_layout(live, 24)
+        for variant, layout in captured.items():
+            with self.subTest(variant=variant):
+                torch.testing.assert_close(
+                    layout.qo_indptr_device, expected.qo_indptr_device
+                )
+                torch.testing.assert_close(layout.verify_lens, expected.verify_lens)
+
+
+class TestPrePlannedReplayRestage(CustomTestCase):
+    """A pre-planned replay may skip copying input_ids and positions again only when
+    the full load copied the same tensors, unwritten since, on the same stream."""
+
+    def _runner(self, stream):
+        import torch
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.dllm_uses_input_embeds = False
+        runner.dllm_input_preparation = None
+        runner.ragged_verify_mode = False
+        runner.enable_pdmux = False
+        runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
+        runner.bs, runner.captured_req_width, runner.raw_num_token = 2, 2, 4
+        runner.buffers = SimpleNamespace(
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            positions=torch.zeros(4, dtype=torch.int64),
+            pp_proxy_tensors=None,
+        )
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_dflash_family=lambda: False),
+            is_draft_worker=False,
+        )
+        runner.device_module = SimpleNamespace(current_stream=lambda: stream[0])
+        runner._capture_graph_size = lambda **_: 2
+        runner._set_dp_real_num_tokens = lambda _: None
+        runner._resolve_lora_variant = lambda _: None
+        runner._resolve_attention_variant = lambda *_: None
+        runner._make_graph_key = lambda *key: key
+        # SGLANG_Q35MF_MKH_N3B on
+        runner._restage_skip, runner._staged_inputs = True, None
+        return runner
+
+    def test_replay_copies_unless_the_full_load_staged_the_same_inputs(self):
+        import torch
+
+        changes = {
+            "nothing": lambda fb, stream: None,
+            "input_ids written": lambda fb, stream: fb.input_ids.add_(1),
+            "input_ids replaced": lambda fb, stream: setattr(
+                fb, "input_ids", fb.input_ids + 1
+            ),
+            "positions written": lambda fb, stream: fb.positions.add_(1),
+            "positions replaced": lambda fb, stream: setattr(
+                fb, "positions", fb.positions + 1
+            ),
+            "another stream": lambda fb, stream: stream.__setitem__(0, "plan"),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                stream = ["forward"]
+                runner = self._runner(stream)
+                fb = SimpleNamespace(
+                    needs_forward_metadata_init=lambda: False,
+                    input_ids=torch.tensor([5, 6, 7, 8]),
+                    positions=torch.tensor([20, 21, 22, 23]),
+                    input_embeds=None,
+                )
+                # what the full load_batch leaves behind
+                runner._staged_inputs = runner._staged_signature(fb)
+                change(fb, stream)
+                for load in range(2):
+                    runner.buffers.input_ids.fill_(-1)
+                    runner.buffers.positions.fill_(-1)
+                    runner.load_batch(fb)
+                    skipped = name == "nothing" and load == 0
+                    for buf, src in (
+                        (runner.buffers.input_ids, fb.input_ids),
+                        (runner.buffers.positions, fb.positions),
+                    ):
+                        want = [-1] * 4 if skipped else src.tolist()
+                        self.assertEqual(buf.tolist(), want, (name, load))
+
+    def test_inference_tensors_are_always_copied(self):
+        """SGLANG_ENABLE_TORCH_INFERENCE_MODE: inference tensors keep no version, so
+        a write since the full load cannot be ruled out."""
+        import torch
+
+        runner = self._runner(["forward"])
+        with torch.inference_mode():
+            fb = SimpleNamespace(
+                needs_forward_metadata_init=lambda: False,
+                input_ids=torch.tensor([5, 6, 7, 8]),
+                positions=torch.tensor([20, 21, 22, 23]),
+                input_embeds=None,
+            )
+            runner._staged_inputs = runner._staged_signature(fb)
+            runner.buffers.input_ids.fill_(-1)
+            runner.buffers.positions.fill_(-1)
+            runner.load_batch(fb)
+        self.assertEqual(runner.buffers.input_ids.tolist(), [5, 6, 7, 8])
+        self.assertEqual(runner.buffers.positions.tolist(), [20, 21, 22, 23])
+
+
+class TestSkipPrefilledInputs(CustomTestCase):
+    """SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS: a pre-planned verify replay skips
+    re-copying input_ids / positions only when they are the very tensors the plan-time
+    load copied; any other source, even with equal values, is copied."""
+
+    def _runner(self):
+        r = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        r.buffers = SimpleNamespace(
+            input_ids=torch.full((8,), -1, dtype=torch.int64),
+            positions=torch.full((8,), -1, dtype=torch.int64),
+        )
+        r.raw_num_token = 3
+        r._prefilled_inputs = None
+        r.num_prefilled_input_skips = 0
+        return r
+
+    def _batch(self):
+        return SimpleNamespace(
+            input_ids=torch.arange(10, 13), positions=torch.arange(3) + 100
+        )
+
+    def _copied(self, r):
+        return r.buffers.input_ids[:3].tolist(), r.buffers.positions[:3].tolist()
+
+    def test_copies_without_a_plan_time_fill(self):
+        r = self._runner()
+        r._copy_replay_inputs(self._batch())
+        self.assertEqual(self._copied(r), ([10, 11, 12], [100, 101, 102]))
+
+    def test_skips_only_the_plan_time_tensors_and_only_once(self):
+        r, fb = self._runner(), self._batch()
+        r._prefilled_inputs = (fb.input_ids, fb.positions)
+        r._copy_replay_inputs(fb)
+        # Untouched: the plan-time load owns these rows.
+        self.assertEqual(self._copied(r), ([-1] * 3, [-1] * 3))
+        # The record is consumed: the next replay copies again.
+        r._copy_replay_inputs(fb)
+        self.assertEqual(self._copied(r), ([10, 11, 12], [100, 101, 102]))
+
+    def test_equal_values_from_other_tensors_are_copied(self):
+        r, other = self._runner(), self._batch()
+        r._prefilled_inputs = (other.input_ids, other.positions)
+        r._copy_replay_inputs(self._batch())
+        self.assertEqual(self._copied(r), ([10, 11, 12], [100, 101, 102]))
+
+
+class _RecordingGlue(mod.MetadataGlueGraph):
+    """SGLang's glue graph, with each key either captured or not yet."""
+
+    def __init__(self, captured_keys=()):
+        super().__init__("cpu")
+        self.captured_keys = set(captured_keys)
+        self.calls = []
+
+    def is_captured(self, key):
+        return key in self.captured_keys
+
+    def replay(self, key):
+        self.calls.append(("replay", key))
+
+    def reinstall(self, key):
+        self.calls.append(("reinstall", key))
+
+    def run(self, attn_backend, fb_view, key):
+        self.calls.append(("run", fb_view, key))
+
+
+class TestReplayAttnMetadataWiring(CustomTestCase):
+    """Each replay's metadata prep: a staged one only reinstalls; a captured glue key
+    replays without the replay view (SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW); before its
+    capture the glue runs on a view; unrouted replays run the eager prep on a view."""
+
+    KEY = (2, "TARGET_VERIFY", "TARGET_VERIFY")
+
+    def _replay(self, glue, *, raw_bs=2, bs=2, skip=True, staged=False):
+        runner = mod.DecodeCudaGraphRunner.__new__(mod.DecodeCudaGraphRunner)
+        runner._metadata_glue = glue
+        runner._skip_glued_replay_view = skip
+        runner.enable_two_batch_overlap = False
+        runner.enable_pdmux = False
+        runner.model_runner = SimpleNamespace(lora_manager=None)
+        runner.capture_forward_mode = mod.ForwardMode.TARGET_VERIFY
+        eager = []
+        runner.attn_backend = SimpleNamespace(
+            init_forward_metadata_out_graph=eager.append
+        )
+        runner.buffers = None
+        runner.seq_len_fill_value = 1
+        runner.is_encoder_decoder = False
+        runner._global_num_tokens_for_graph = lambda num_tokens: None
+        views = []
+
+        def build_view(**kwargs):
+            views.append(SimpleNamespace(out_cache_loc=None, **kwargs))
+            return views[-1]
+
+        with mock.patch.object(mod, "build_replay_fb_view", build_view):
+            runner._init_replay_attn_metadata(
+                SimpleNamespace(forward_mode=mod.ForwardMode.TARGET_VERIFY),
+                raw_bs=raw_bs,
+                bs=bs,
+                num_tokens=12,
+                glue_key=self.KEY,
+                early_staged=staged,
+                attention_variant=None,
+            )
+        return views, eager
+
+    def test_replay_routes(self):
+        key = self.KEY
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, staged=True)
+        self.assertEqual((glue.calls, views, eager), ([("reinstall", key)], [], []))
+
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue)
+        self.assertEqual((glue.calls, views, eager), ([("replay", key)], [], []))
+
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, skip=False)
+        self.assertEqual((glue.calls, eager), ([("run", views[0], key)], []))
+
+        glue = _RecordingGlue()
+        views, eager = self._replay(glue)
+        self.assertEqual((glue.calls, eager), ([("run", views[0], key)], []))
+
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, raw_bs=1)
+        self.assertEqual((glue.calls, eager), ([], views))
 
 
 if __name__ == "__main__":

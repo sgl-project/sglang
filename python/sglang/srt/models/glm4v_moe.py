@@ -10,7 +10,7 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
@@ -44,8 +44,10 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.quant_config = quant_config
-        self.num_fused_shared_experts = 0
-        self.determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
+        if self.num_fused_shared_experts:
+            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         self.model = Glm4MoeModel(
             config,
@@ -97,15 +99,13 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             return "Shared experts fusion is not supported when Deepep MoE backend is enabled."
         return None
 
-    def determine_num_fused_shared_experts(self):
-        # The decision was installed by the loader; this only reads it.
-        if is_shared_experts_fusion_disabled():
-            return
-        self.num_fused_shared_experts = self.config.n_shared_experts
-        assert self.num_fused_shared_experts == 1, (
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Shared experts fused as routed slots when fusion is on."""
+        assert hf_config.n_shared_experts == 1, (
             "Only 1 fused shared expert is supported for Glm4vMoeForConditionalGeneration"
         )
-        log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+        return hf_config.n_shared_experts
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:

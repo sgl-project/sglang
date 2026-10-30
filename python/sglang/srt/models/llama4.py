@@ -43,6 +43,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -124,7 +125,12 @@ class Llama4MoE(nn.Module):
             reduce_results=False,
             quant_config=quant_config,
             apply_router_weight_on_input=True,
+            routing_method_type=RoutingMethodType.Llama4,
             prefix=add_prefix("experts", prefix),
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
 
         self.shared_expert = LlamaMLP(
@@ -212,7 +218,6 @@ class Llama4Attention(nn.Module):
         self.use_rope = (layer_id + 1) % 4 != 0
         self.use_qk_norm = config.use_qk_norm and self.use_rope
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -264,8 +269,7 @@ class Llama4Attention(nn.Module):
             bias=bias,
             quant_config=qkv_quant_config,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.o_proj = RowParallelLinear(
@@ -274,8 +278,7 @@ class Llama4Attention(nn.Module):
             bias=bias_o_proj,
             quant_config=o_quant_config,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
         )
         is_neox_style = True

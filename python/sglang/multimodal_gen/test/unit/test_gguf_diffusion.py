@@ -17,6 +17,10 @@ import numpy as np
 import torch
 from gguf import GGMLQuantizationType as WeightType
 
+from sglang.multimodal_gen.configs.models.dits.qwenimage21 import (
+    QwenImage21ArchConfig,
+    QwenImage21DitConfig,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -34,6 +38,13 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     names_gguf_checkpoint,
     read_gguf_tensor_meta,
     remap_gguf_tensor_meta,
+)
+from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    _resolve_gguf_quant_load_spec,
+)
+from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
+    QwenImage21Attention,
+    QwenImage21Transformer2DModel,
 )
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
@@ -948,6 +959,74 @@ class TestGGUFRejectsLoraConversion(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "LoRA is not supported"):
             pipeline.set_lora("n", lora_path="p")
         entered.assert_not_called()
+
+
+class TestQwenImage21GGUF(unittest.TestCase):
+    """Community Qwen-Image 2.1 GGUFs also quantize the DiT's plain nn.Linear layers."""
+
+    def test_plain_linears_dequantize_while_block_linears_stay_packed(self):
+        """A packed `modulation.1.qweight` has no nn.Linear to land in and failed the load."""
+        payload = bytes(4 * 512 // _Q4_K_BLOCK * _Q4_K_TYPE_SIZE)
+        server_args = Mock(
+            use_fsdp_inference=False,
+            lora_path=None,
+            minimax_h3_adaln_online=False,
+            minimax_h3_adaln_cache_path=None,
+            quantization=None,
+            nunchaku_config=None,
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch(
+                "sglang.multimodal_gen.runtime.loader.transformer_load_utils.current_platform"
+            ) as platform,
+        ):
+            path = str(Path(tmp) / "qwen21.gguf")
+            _write_gguf(
+                Path(path),
+                [
+                    ("modulation.1.weight", [512, 4], _Q4_K, payload),
+                    ("transformer_blocks.0.attn.to_q.weight", [512, 4], _Q4_K, payload),
+                ],
+            )
+            platform.is_cuda.return_value = True
+            spec = _resolve_gguf_quant_load_spec(
+                gguf_file=path,
+                server_args=server_args,
+                model_cls=QwenImage21Transformer2DModel,
+            )
+            loaded = dict(gguf_weights_iterator(path, spec.quant_config.tensor_meta))
+
+        self.assertEqual(loaded["modulation.1.weight"].dtype, torch.bfloat16)
+        self.assertIn("transformer_blocks.0.attn.to_q.qweight", loaded)
+
+    def test_every_plain_linear_is_covered_by_dequantize_prefixes(self):
+        """A new nn.Linear outside the blocks must also join gguf_dequantize_prefixes."""
+        config = QwenImage21DitConfig(arch_config=QwenImage21ArchConfig(num_layers=0))
+        with torch.device("meta"):
+            model = QwenImage21Transformer2DModel(config, {})
+        prefixes = QwenImage21Transformer2DModel.gguf_dequantize_prefixes
+
+        for name, module in model.named_modules():
+            if type(module) is torch.nn.Linear:
+                self.assertTrue(f"{name}.weight".startswith(prefixes), name)
+
+    def test_qkv_packing_skips_gguf_projections(self):
+        """GGUF projections register only `qweight`; reading `.weight` crashed post-load."""
+        meta = GGUFTensorMeta(
+            ggml_type=int(_Q4_K),
+            logical_shape=(4, 512),
+            stored_shape=(4, 288),
+            stored_dtype=torch.uint8,
+            param_name="w.qweight",
+        )
+        config = GGUFConfig("/dev/null", {"w.weight": meta})
+        projection = ReplicatedLinear(
+            512, 4, bias=False, quant_config=config, prefix="w"
+        )
+        attention = SimpleNamespace(to_q=projection, to_k=projection, to_v=projection)
+
+        self.assertIsNone(QwenImage21Attention.packed_qkv_weight(attention))
 
 
 if __name__ == "__main__":

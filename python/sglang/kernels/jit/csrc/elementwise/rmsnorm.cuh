@@ -222,7 +222,7 @@ struct RMSNormWarpKernel {
     auto SO = SymbolicSize{"output_stride"};
     auto device = SymbolicDevice{};
     D.set_value(kDim);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, D})  // input
         .with_strides({SI, 1})
@@ -276,7 +276,7 @@ struct RMSNormKernel {
     auto SO = SymbolicSize{"output_stride"};
     auto device = SymbolicDevice{};
     D.set_value(kDim);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, D})  // input
         .with_strides({SI, 1})
@@ -335,7 +335,7 @@ struct RMSNormHalfKernel {
     auto SO = SymbolicSize{"output_stride"};
     auto device = SymbolicDevice{};
     D.set_value(kDim);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, D})  // input
         .with_strides({SI, 1})

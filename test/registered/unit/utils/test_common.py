@@ -1,3 +1,4 @@
+import gc
 import io
 import sys
 import unittest
@@ -11,6 +12,7 @@ from sglang.srt.utils.common import (
     _get_device_sm_via_nvml,
     _load_image,
     flatten_arrays_to_int64_tensor,
+    freeze_gc,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
 )
@@ -21,8 +23,8 @@ from sglang.test.ci.ci_register import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -249,6 +251,16 @@ class TestGetDeviceSmViaNvml(CustomTestCase):
         ):
             self.assertIsNone(_get_device_sm_via_nvml())
         self.assertFalse(fake.initialized, "must not query NVML without the mapping")
+
+
+class TestFreezeGc(CustomTestCase):
+    def setUp(self):
+        self.addCleanup(gc.set_threshold, *gc.get_threshold())
+        self.addCleanup(gc.unfreeze)
+
+    def test_applies_configured_threshold(self):
+        freeze_gc("test", [700, 10, 1000])
+        self.assertEqual(gc.get_threshold(), (700, 10, 1000))
 
 
 if __name__ == "__main__":

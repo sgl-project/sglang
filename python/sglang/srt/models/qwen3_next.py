@@ -1,4 +1,5 @@
 import enum
+import functools
 import logging
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -31,6 +32,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -62,8 +64,10 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     make_layers,
@@ -76,7 +80,30 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# The fused attention prologue is a gfx950-only aiter op; gate the arch here so
+# other HIP devices never take the fused path (and never pay a double qkv_proj).
+_use_fused_prologue = _use_aiter and is_gfx95_supported()
 _is_amx_available = cpu_has_amx_support()
+
+
+@functools.lru_cache(maxsize=1)
+def _fused_attention_prologue():
+    """Return the aiter fused-prologue ops, or None if this build lacks them.
+
+    Fails closed: a build whose aiter does not ship the op falls back to the
+    native prologue instead of raising ImportError.
+    """
+    if not _use_fused_prologue:
+        return None
+    try:
+        from aiter.ops.triton.attention.fused_attention_qk_norm_rope import (
+            fused_attention_qk_norm_rope,
+            fused_attention_qk_norm_rope_supported,
+        )
+    except ImportError:
+        return None
+    return fused_attention_qk_norm_rope, fused_attention_qk_norm_rope_supported
 
 
 if _is_npu:
@@ -132,8 +159,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             output_size=self.conv_dim,
             bias=False,
             quant_config=None,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("conv1d", prefix),
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
@@ -145,8 +171,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             value_dim=self.value_dim,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_qkvz", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.in_proj_ba = MergedColumnParallelLinear(
@@ -155,8 +180,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("in_proj_ba", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         # Override weight_loader for packed checkpoint format.
@@ -194,8 +218,14 @@ class Qwen3GatedDeltaNet(nn.Module):
             torch.zeros(self.num_v_heads // self.attn_tp_size, dtype=torch.float32)
         )
 
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.A_log,
+            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+        )
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+        )
         self.norm = (
             RMSNormGated(
                 self.head_v_dim,
@@ -231,8 +261,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             quant_config=quant_config,
             input_is_parallel=True,
             reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("out_proj", prefix),
         )
 
@@ -286,9 +315,14 @@ class Qwen3GatedDeltaNet(nn.Module):
                 # Fused checkpoint: weight is in packed (per-head-group)
                 # format. Do contiguous TP slice like ColumnParallelLinear.
                 output_dim = getattr(param, "output_dim", None)
-                if output_dim is not None and module.tp_size > 1:
+                group = module.tp_group
+                if (
+                    output_dim is not None
+                    and group is not None
+                    and group.world_size > 1
+                ):
                     shard_size = param.data.shape[output_dim]
-                    start_idx = module.tp_rank * shard_size
+                    start_idx = group.rank_in_group * shard_size
                     if (
                         _is_cpu and _is_amx_available
                     ) and start_idx + shard_size > loaded_weight.shape[output_dim]:
@@ -319,8 +353,8 @@ class Qwen3GatedDeltaNet(nn.Module):
         value_dim: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> MergedColumnParallelLinear:
         return MergedColumnParallelLinear(
             input_size=hidden_size,
@@ -328,8 +362,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=prefix,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
 
     def fix_query_key_value_ordering(
@@ -641,8 +674,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 and quant_config.get_name() != "modelopt_fp4"
                 else None
             ),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -652,8 +684,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -735,6 +766,31 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
+    def forward_prepare_fused(self, positions, hidden_states):
+        # gfx950 single-launch prologue: [Q||gate] split + Q/K GemmaRMSNorm +
+        # partial RoPE. Returns None when unavailable or unsupported so the
+        # caller falls back to the native prologue.
+        ops = _fused_attention_prologue()
+        if ops is None:
+            return None
+        fused_prologue, prologue_supported = ops
+        qkv, _ = self.qkv_proj(hidden_states)
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        ok, _ = prologue_supported(
+            qkv, self.q_norm.weight, self.k_norm.weight, positions, cos_sin_cache
+        )
+        if not ok:
+            return None
+        query, gate, key, value = fused_prologue(
+            qkv, self.q_norm.weight, self.k_norm.weight, positions, cos_sin_cache
+        )
+        return (
+            query.reshape(-1, self.q_size),
+            key.reshape(-1, self.kv_size),
+            value.reshape(-1, self.kv_size),
+            gate.reshape(-1, self.q_size),
+        )
+
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
@@ -781,7 +837,12 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if (
+        fused = None
+        if _use_fused_prologue and self.attn_output_gate:
+            fused = self.forward_prepare_fused(positions, hidden_states)
+        if fused is not None:
+            q, k, v, gate = fused
+        elif (
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
             or not self.attn_output_gate
@@ -801,11 +862,11 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
 
         if self.attn_output_gate:
             if _is_hip:
-                from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
-                    sigmoid_gate_mul,
+                from sglang.kernels.ops.elementwise.elementwise import (
+                    fused_sigmoid_mul,
                 )
 
-                attn_output = sigmoid_gate_mul(attn_output, gate)
+                attn_output = fused_sigmoid_mul(attn_output, gate)
             else:
                 gate = torch.sigmoid(gate)
                 attn_output = attn_output * gate

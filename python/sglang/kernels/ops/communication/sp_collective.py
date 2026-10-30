@@ -117,20 +117,6 @@ def get_dispatch(
     )
 
 
-def get_tuning(
-    kind: str,
-    world_size: int,
-    hidden_size: int,
-    num_tokens: int,
-    device: torch.device,
-) -> Optional[Tuning]:
-    """Compatibility helper for callers that only support staging push."""
-    dispatch = get_dispatch(kind, world_size, hidden_size, num_tokens, device)
-    if dispatch is None or dispatch.strategy != "push":
-        return None
-    return dispatch.tuning
-
-
 def get_fusion_dispatch(
     kind: str,
     world_size: int,
