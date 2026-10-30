@@ -192,15 +192,26 @@ class StreamingSession:
         finished_len = (
             req.finished_len if req.finished_len is not None else len(req.output_ids)
         )
-        target = len(req.origin_input_ids) + finished_len
+        # The scheduler drops the current step from the count after processing
+        # its result. A second step can already have advanced the same state.
+        if req.kv.holds_mamba and (
+            req.kv.kv_committed_len > len(req.origin_input_ids) + finished_len
+            or req.inflight_steps > 1
+        ):
+            # Recurrent state cannot be rewound, and it went past the visible
+            # output or may still be in use by another forward. Release it
+            # without publishing the state, and keep the turn in the history.
+            del self.slots[req.session.session_id]
+            req.lock, slot.lock = slot.lock, None
+            req.skip_radix_cache_insert = True
+            req.output_ids = req.output_ids[:finished_len]
+            req.session.finish_req(req)
+            return False
         self._trim_overshoot(req, finished_len)
 
         req.detach_kv()
         req.swa_branching_seqlen = None
         slot.publishes_prompt = False
-        # Use the finished length, not the req clock (it lags an in-flight verify
-        # by ~1 under overlap); clamp so committed <= allocated.
-        slot.kv.commit_finished(target)
         # The slot keeps its row until the next turn, with nothing running.
         self._storage().park_row(slot)
 
@@ -312,7 +323,11 @@ class StreamingSession:
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
         """Spec v2 can commit past max_new_tokens; the next turn's input is
         output_ids[:finished_len], so release the KV past it."""
-        target = len(req.origin_input_ids) + finished_len
+        # Keep only what a forward computed: a verify computes no KV or
+        # recurrent state for its bonus token, which the req clock excludes, so
+        # a turn ending on one keeps one token less and the next turn prefills
+        # it. A decode commits at allocation, so this changes nothing there.
+        target = min(len(req.origin_input_ids) + finished_len, req.kv.kv_committed_len)
         if self.cache.page_size > 1 and req.kv.max_evicted_seqlen > target:
             # Same hazard as the match-path rewind: the cursor must stay
             # page-aligned; the partial page is re-prefilled next turn.
