@@ -27,7 +27,7 @@ TP_SIZE, TP_RANK = 8, 5
 HEADS, KV_HEADS, HEAD_DIM, HIDDEN = 16, 8, 8, 64
 
 
-def fp8_dynamic(ignore=()):
+def fp8_dynamic(ignore=(), targets=("Linear",)):
     # Scheme of reflection/Beam-1.0-501B-A23B-FP8 (llm-compressor FP8_DYNAMIC).
     scheme = {"num_bits": 8, "type": "float", "symmetric": True}
     return CompressedTensorsConfig.from_config(
@@ -38,7 +38,7 @@ def fp8_dynamic(ignore=()):
             "config_groups": {
                 "FP8_DYNAMIC": {
                     "format": "float-quantized",
-                    "targets": ["Linear"],
+                    "targets": list(targets),
                     "weights": dict(scheme, strategy="channel", dynamic=False),
                     "input_activations": dict(scheme, strategy="token", dynamic=True),
                 }
@@ -142,6 +142,13 @@ class TestBeamFp8AttentionPacking(CustomTestCase):
                 self.assertFalse(attn.use_packed_projection)
                 self.assertIsInstance(attn.qkv_proj.quant_method, qkv_method)
                 self.assertIsInstance(attn.gate_proj.quant_method, gate_method)
+
+        named = fp8_dynamic(targets=[r"re:.*\.(qkv_proj|gate_proj|o_proj)$"])
+        _, by_name = self.build(1, named)
+        self.assertFalse(by_name.use_packed_projection)
+        self.assertIsInstance(
+            by_name.qkv_proj.quant_method, CompressedTensorsLinearMethod
+        )
 
         nvfp4 = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,

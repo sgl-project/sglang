@@ -1282,13 +1282,19 @@ def _packs_attention_projection(
     # Unquantized shards of a quantized checkpoint (NVFP4 attention, FP8 ignores)
     # stay split; packing changes their BF16 GEMM rounding at small M.
     # TODO(ischencheng): pack them too after a B300 accuracy run.
-    return quant_scheme == "fp8" and not any(
-        should_ignore_layer(
-            add_prefix(proj, prefix),
-            ignore=quant_config.ignore,
-            fused_mapping=quant_config.packed_modules_mapping,
+    # The packed name resolves through the Linear class target, which Beam's FP8
+    # checkpoint uses; configs that only name layers keep the split projections.
+    return (
+        quant_scheme == "fp8"
+        and "Linear" in quant_config.target_scheme_map
+        and not any(
+            should_ignore_layer(
+                add_prefix(proj, prefix),
+                ignore=quant_config.ignore,
+                fused_mapping=quant_config.packed_modules_mapping,
+            )
+            for proj in ("qkv_proj", "gate_proj")
         )
-        for proj in ("qkv_proj", "gate_proj")
     )
 
 
