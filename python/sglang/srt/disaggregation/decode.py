@@ -2929,13 +2929,38 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             else:
                 committed_output_id = output_id[0].item()
-            decode_req.req.output_ids.append(committed_output_id)
-            # The handoff token is generated on the prefill worker, so it does
-            # not pass through the decode worker's normal batch-result path.
-            # Account for it here using the same request-selected reasoning
-            # terminator matcher as subsequent decode tokens.
-            self.scheduler.batch_result_processor._maybe_update_reasoning_tokens(
-                decode_req.req, committed_output_id
+            req = decode_req.req
+            logprob_token_id = logprob = top_logprobs_val = top_logprobs_idx = None
+            if req.return_logprob:
+                top_logprobs_num = req.logprob.top_logprobs_num
+                logprob_token_id = output_token_logprobs_idx[0].item()
+                logprob = output_token_logprobs_val[0].item()
+                top_logprobs_val = output_top_logprobs_val[:top_logprobs_num].tolist()
+                top_logprobs_idx = output_top_logprobs_idx[:top_logprobs_num].tolist()
+            sampling_mask_idx = sampling_mask_logprobs = None
+            if req.return_sampling_mask:
+                assert output_token_sampling_mask_idx is not None, (
+                    "sampling mask buffer disabled on decode side"
+                )
+                sampling_mask_len = int(output_token_sampling_mask_len[0].item())
+                num_logprobs = (
+                    sampling_mask_len if req.sampling_logprobs_mode == "support" else 1
+                )
+                sampling_mask_idx = (
+                    output_token_sampling_mask_idx[:sampling_mask_len].cpu().numpy()
+                )
+                sampling_mask_logprobs = (
+                    output_token_sampling_logprobs[:num_logprobs].cpu().numpy()
+                )
+            self.scheduler.batch_result_processor.commit_handoff_token(
+                req,
+                committed_output_id,
+                logprob_token_id=logprob_token_id,
+                logprob=logprob,
+                top_logprobs_val=top_logprobs_val,
+                top_logprobs_idx=top_logprobs_idx,
+                sampling_mask_idx=sampling_mask_idx,
+                sampling_mask_logprobs=sampling_mask_logprobs,
             )
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
@@ -2964,42 +2989,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ):
                 output_dsa_topk_indices = None
             decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
-
-        if decode_req.req.return_logprob and not resumes_output:
-            decode_req.req.logprob.output_token_logprobs_val.append(
-                output_token_logprobs_val[0].item()
-            )
-            decode_req.req.logprob.output_token_logprobs_idx.append(
-                output_token_logprobs_idx[0].item()
-            )
-            decode_req.req.logprob.output_top_logprobs_val.append(
-                output_top_logprobs_val[
-                    : decode_req.req.logprob.top_logprobs_num
-                ].tolist()
-            )
-            decode_req.req.logprob.output_top_logprobs_idx.append(
-                output_top_logprobs_idx[
-                    : decode_req.req.logprob.top_logprobs_num
-                ].tolist()
-            )
-            if decode_req.req.logprob.token_ids_logprob is not None:
-                # Prefill omits these scores; reserve a row for the streaming offset.
-                decode_req.req.logprob.output_token_ids_logprobs_val.append([])
-                decode_req.req.logprob.output_token_ids_logprobs_idx.append([])
-        if decode_req.req.return_sampling_mask and not resumes_output:
-            assert output_token_sampling_mask_idx is not None, (
-                "sampling mask buffer disabled on decode side"
-            )
-            sampling_mask_len = int(output_token_sampling_mask_len[0].item())
-            num_logprobs = (
-                sampling_mask_len
-                if decode_req.req.sampling_logprobs_mode == "support"
-                else 1
-            )
-            decode_req.req.sampling_mask_rows.append(
-                output_token_sampling_mask_idx[:sampling_mask_len].cpu().numpy(),
-                output_token_sampling_logprobs[:num_logprobs].cpu().numpy(),
-            )
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None

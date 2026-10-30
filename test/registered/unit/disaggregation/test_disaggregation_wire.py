@@ -1,4 +1,5 @@
 import concurrent.futures
+import dataclasses
 import threading
 import unittest
 from collections import defaultdict
@@ -49,6 +50,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
+from sglang.srt.managers.scheduler_components.logprob_result_processor import (
+    SchedulerLogprobResultProcessor,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     c4_state_transfer_indices,
@@ -70,6 +77,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=23, suite="base-a-test-cpu")
+
+
+def _handoff_processor() -> SchedulerBatchResultProcessor:
+    fields = dict.fromkeys(
+        f.name for f in dataclasses.fields(SchedulerBatchResultProcessor)
+    )
+    fields.update(
+        model_config=SimpleNamespace(
+            think_end_ids=[999], self_opened_think_start_ids=None
+        ),
+        logprob_result_processor=SchedulerLogprobResultProcessor(model_config=None),
+    )
+    return SchedulerBatchResultProcessor(**fields)
 
 
 def _static_storage(pool, draft=None, total_kv_layers=None) -> StaticKVStorage:
@@ -1848,9 +1868,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
                 queue.scheduler = SimpleNamespace(
                     kv_checksum_computer=None,
-                    batch_result_processor=SimpleNamespace(
-                        _maybe_update_reasoning_tokens=lambda req, token_id: None
-                    ),
+                    batch_result_processor=_handoff_processor(),
                 )
                 queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
                 queue.metadata_buffers = buffers
@@ -1859,6 +1877,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     bootstrap_host="127.0.0.1",
                     bootstrap_room=9,
                     output_ids=[],
+                    require_reasoning=False,
                     return_logprob=False,
                     return_sampling_mask=True,
                     sampling_logprobs_mode=mode,
