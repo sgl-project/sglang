@@ -1,7 +1,9 @@
 """DSv41 native work must outlive cancellation of its preprocessing waiter."""
 
 import asyncio
+import base64
 import contextvars
+import io
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -10,11 +12,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import torch
+from PIL import Image
 
+import sglang.srt.multimodal.deepseek_v41_image_processing as image_processing
 import sglang.srt.multimodal.processors.deepseek_v41 as dsv41
+from sglang.srt.configs.deepseek_v41 import DeepseekV41Config
 from sglang.srt.managers.multimodal_preprocessing_admission import (
     MultimodalPreprocessingAdmission,
 )
+from sglang.srt.runtime_context import create_context, use_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -25,6 +32,21 @@ _REQUEST_CONTEXT = contextvars.ContextVar("dsv41_admission_test_context", defaul
 
 class _NativeFailure(BaseException):
     pass
+
+
+class _ImageTokenizer:
+    """Local token fixture; image loading and preprocessing use real code."""
+
+    def encode(self, text):
+        if text:
+            raise AssertionError("pre-tokenized input must not be encoded again")
+        return []
+
+    def convert_ids_to_tokens(self, token):
+        return {7: "before", 42: "<image>", 9: "after"}[token]
+
+    def decode(self, tokens):
+        return "".join(self.convert_ids_to_tokens(token) for token in tokens)
 
 
 class TestDeepseekV41PreprocessingAdmission(unittest.IsolatedAsyncioTestCase):
@@ -177,6 +199,109 @@ class TestDeepseekV41PreprocessingAdmission(unittest.IsolatedAsyncioTestCase):
                         await asyncio.gather(task, return_exceptions=True)
                         await self._drain_executor()
                 self._assert_reusable(admission)
+
+    async def test_real_png_prepare_cancel_then_reuse_constructed_processor(self):
+        # Only model/tokenizer configuration is synthetic. Construct the actual
+        # processor and retain its loaders, patchifier, and CPU transport path.
+        args = ServerArgs(
+            model_path="dummy",
+            device="cpu",
+            image_processor_backend="pil",
+            mm_feature_transport="cpu",
+            mm_process_config={},
+            mm_preprocess_cache_size_mb=0,
+            mm_io_worker_num=1,
+            mm_processor_worker_num=1,
+        )
+        config = DeepseekV41Config(
+            image_token_id=42,
+            vision_patch_size=4,
+            vision_downsample_ratio=2,
+            vision_max_n_token=32,
+            vision_min_pixels=0,
+            vision_max_wh_ratio=None,
+        )
+        pixels = bytes(
+            channel for i in range(45) for channel in (i * 5, i * 3, 255 - i * 4)
+        )
+        image = Image.frombytes("RGB", (9, 5), pixels)
+        png = io.BytesIO()
+        image.save(png, format="PNG")
+        data_url = "data:image/png;base64," + base64.b64encode(png.getvalue()).decode()
+        expected, _, _, _, _ = image_processing.patchify_image(image, config)
+        admission = MultimodalPreprocessingAdmission(1)
+        started = asyncio.Event()
+        release = self._release_event()
+        decoded_images = []
+        original_to_rgb = image_processing.to_rgb
+
+        def gated_to_rgb(decoded):
+            rgb = original_to_rgb(decoded)
+            decoded_images.append((decoded, threading.get_ident()))
+            # This hook is inside the original patchify_image, after real RGB
+            # conversion. After release, its resize/normalize/patchify continues.
+            self.loop.call_soon_threadsafe(started.set)
+            if not release.wait(_TIMEOUT):
+                raise TimeoutError("test did not release real image preparation")
+            return rgb
+
+        with use_context(create_context(args, role="tokenizer")):
+            processor = dsv41.DeepseekV41ImageProcessor(
+                config,
+                args,
+                _ImageTokenizer(),
+                transport_mode="local",
+                skip_mm_pool=True,
+            )
+            try:
+                self.assertIs(processor.cpu_patchify, image_processing.patchify_image)
+
+                async def process_image():
+                    lease = admission.acquire(1)
+                    try:
+                        with lease.activate():
+                            return await processor.process_mm_data_async(
+                                image_data=[data_url],
+                                input_text=[7, 42, 9],
+                                request_obj=None,
+                            )
+                    finally:
+                        lease.release()
+
+                with patch.object(image_processing, "to_rgb", gated_to_rgb):
+                    task = asyncio.create_task(process_image())
+                    try:
+                        await asyncio.wait_for(started.wait(), _TIMEOUT)
+                        decoded, worker_thread = decoded_images[0]
+                        self.assertEqual(decoded.format, "PNG")
+                        self.assertEqual(decoded.tobytes(), image.tobytes())
+                        self.assertNotEqual(worker_thread, threading.get_ident())
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                        self.assertEqual(admission.inflight_items, 1)
+                        self.assertIsNone(admission.try_acquire(1))
+                    finally:
+                        release.set()
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                        await self._drain_executor()
+                    self._assert_reusable(admission)
+                    output = await process_image()
+                self.assertEqual(len(decoded_images), 2)
+                self.assertEqual(output.input_ids, [7] + [42] * 5 + [9])
+                self.assertEqual(output.im_token_id, 42)
+                self.assertEqual(len(output.mm_items), 1)
+                item = output.mm_items[0]
+                self.assertEqual(item.offsets, [(1, 5)])
+                self.assertEqual(item.model_specific_data, {"n_vit_h": 2, "n_vit_w": 3})
+                self.assertEqual(item.feature.shape, (6, 3, 4, 4))
+                self.assertEqual(item.feature.dtype, torch.bfloat16)
+                self.assertEqual(item.feature.device.type, "cpu")
+                torch.testing.assert_close(item.feature, expected, rtol=0, atol=0)
+                self._assert_reusable(admission)
+            finally:
+                processor.shutdown()
 
     async def test_cancelled_queued_wrapper_skips_native_even_if_it_runs_later(self):
         admission = MultimodalPreprocessingAdmission(1)
