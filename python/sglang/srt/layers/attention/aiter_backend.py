@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -3362,10 +3363,12 @@ class AiterAttnBackend(AttentionBackend):
                         swa_page_table=_swa_page_table,
                     )
                 else:
-                    custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
+                    custom_mask = None
+                    if spec_info.custom_mask is not None:
+                        custom_mask = self.cuda_graph_custom_mask
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
                     seq_mask_len = max_q_len * (seq_lens + max_q_len)
                     mask_indptr = self.mask_indptr[: bs + 1]
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -4187,6 +4190,8 @@ class AiterAttnBackend(AttentionBackend):
                     num_queries_per_kv = layer.tp_q_head_num // layer.tp_k_head_num
                     use_unified_attention_3d_mtp = (
                         is_gfx95_supported()
+                        # this kernel is causal-only
+                        and layer.attn_type != AttentionType.ENCODER_ONLY
                         and 1 < self.forward_metadata.max_q_len <= 4
                         and max_kv_len > 512
                         and (
@@ -4260,7 +4265,7 @@ class AiterAttnBackend(AttentionBackend):
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
-                        causal=True,
+                        causal=layer.attn_type != AttentionType.ENCODER_ONLY,
                         window_size=window_size,
                         block_table=page_table,
                         softcap=layer.logit_cap,
@@ -4284,7 +4289,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.forward_metadata.kv_indptr,
                     self.forward_metadata.kv_indices,
                     self.forward_metadata.custom_mask,
-                    True,  # causal
+                    layer.attn_type != AttentionType.ENCODER_ONLY,  # causal
                     self.forward_metadata.mask_indptr,
                     self.forward_metadata.max_extend_len,
                     1.0,  # k_scale
