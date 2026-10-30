@@ -2849,6 +2849,59 @@ def apply_fp8_ptpc_linear(
     return output.view(*output_shape)
 
 
+# Tiles for the batch-invariant channel-wise FP8 GEMM: one program per output tile loops
+# over K in BLOCK_K steps, so every row is reduced in the same order at any M. The tile
+# depends only on N (measured on MI350X: 128x256x64 for wide layers, else 128x128x128).
+def _batch_invariant_fp8_channel_tile(n: int) -> Tuple[int, int, int, int]:
+    """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps) for an output width n."""
+    if n >= 16384:
+        return 128, 256, 64, 8
+    return 128, 128, 128, 8
+
+
+def apply_fp8_channel_linear_batch_invariant(
+    input: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP8 linear with per-channel weight scales and per-token activation scales,
+    computed the same way for a row whatever the number of rows.
+
+    ``weight`` is (K, N), not preshuffled. Used by deterministic inference on ROCm,
+    where the AITER/CK and hipBLASLt GEMMs choose their kernel by M.
+    """
+    if isinstance(input, tuple):
+        q_input, x_scale = input[0], input[1]
+        output_dtype = input[2] if len(input) > 2 else torch.bfloat16
+        q_input = q_input.view(-1, q_input.shape[-1])
+        output_shape = [*input[0].shape[:-1], weight.shape[1]]
+    else:
+        input_2d = input.view(-1, input.shape[-1])
+        output_dtype = input.dtype
+        output_shape = [*input.shape[:-1], weight.shape[1]]
+        q_input, x_scale = per_token_group_quant_fp8(
+            input_2d, group_size=input_2d.shape[1]
+        )
+    block_m, block_n, block_k, num_warps = _batch_invariant_fp8_channel_tile(
+        weight.shape[1]
+    )
+    output = triton_scaled_mm(
+        q_input,
+        weight,
+        x_scale,
+        weight_scale,
+        output_dtype,
+        bias,
+        block_size_m=block_m,
+        block_size_n=block_n,
+        block_size_k=block_k,
+        use_heuristic=False,
+        num_warps=num_warps,
+    )
+    return output.view(*output_shape)
+
+
 def validate_fp8_block_shape(
     layer: LinearBase,
     input_size: int,
